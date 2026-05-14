@@ -1,0 +1,7 @@
+/target
+/.maco
+/.maco-cache
+/.agent/temp/*
+/.agent/storage/*
+!/.agent/temp/.gitkeep
+!/.agent/storage/.gitkeep
