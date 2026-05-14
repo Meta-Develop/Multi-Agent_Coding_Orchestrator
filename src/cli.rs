@@ -1,4 +1,8 @@
-use crate::worktree::{RepositoryInfo, WorktreeCreateOptions, WorktreeManager, WorktreeRecord};
+use crate::{
+    sync::ClaimToken,
+    sync_store::{OwnerReport, SyncStore},
+    worktree::{RepositoryInfo, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
+};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -20,6 +24,7 @@ impl Cli {
                 print_repository_info(&info, args.json)
             }
             Command::Worktree(command) => command.run(),
+            Command::Sync(command) => command.run(),
         }
     }
 }
@@ -30,6 +35,8 @@ enum Command {
     Init(InitArgs),
     /// Manage linked Git worktrees for sub-agents.
     Worktree(WorktreeCommand),
+    /// Manage repository-local sync path claims.
+    Sync(SyncCommand),
 }
 
 #[derive(Debug, Args)]
@@ -90,6 +97,119 @@ impl WorktreeCommand {
             }
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct SyncCommand {
+    #[command(subcommand)]
+    command: SyncSubcommand,
+}
+
+impl SyncCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            SyncSubcommand::Claim(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let claim = store.claim_paths(&args.agent_id, args.paths)?;
+                print_path_claim("Claim", &claim, args.json)
+            }
+            SyncSubcommand::Release(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let released = store.release(ClaimToken::from_u64(args.token))?;
+                print_path_claim("Released", &released, args.json)
+            }
+            SyncSubcommand::ReleaseAgent(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let released = store.release_by_agent(&args.agent_id)?;
+                print_claims(&released, args.json, "No claims released.")
+            }
+            SyncSubcommand::Owner(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let report = store.owner_of(args.path)?;
+                print_owner_report(&report, args.json)
+            }
+            SyncSubcommand::Status(args) => {
+                let store = SyncStore::open(args.repo)?;
+                let claims = store.snapshot()?;
+                print_claims(&claims, args.json, "No active claims.")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncSubcommand {
+    /// Record an exclusive claim for one or more repository-relative paths.
+    Claim(ClaimSyncArgs),
+    /// Release one claim by token.
+    Release(ReleaseSyncArgs),
+    /// Release every claim owned by an agent.
+    ReleaseAgent(ReleaseAgentSyncArgs),
+    /// Report the agent that currently owns a path.
+    Owner(OwnerSyncArgs),
+    /// List active path claims.
+    Status(StatusSyncArgs),
+}
+
+#[derive(Debug, Args)]
+struct ClaimSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable agent id. Allowed characters: ASCII letters, digits, '.', '_' and '-'.
+    agent_id: String,
+    /// Repository-relative paths to claim.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReleaseSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Claim token to release.
+    token: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReleaseAgentSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable agent id whose claims should be released.
+    agent_id: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OwnerSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Repository-relative path to inspect.
+    path: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,6 +290,50 @@ fn print_worktree_record(record: &WorktreeRecord, json: bool) -> Result<()> {
         println!("Worktree: {}", record.name);
         println!("Branch: {}", record.branch);
         println!("Path: {}", record.path.display());
+    }
+    Ok(())
+}
+
+fn print_path_claim(label: &str, claim: &crate::sync::PathClaim, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(claim)?);
+    } else {
+        println!("{label}: {}", claim.token.get());
+        println!("Agent: {}", claim.agent_id);
+        println!("Paths:");
+        for path in &claim.paths {
+            println!("  {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn print_claims(claims: &[crate::sync::PathClaim], json: bool, empty_message: &str) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(claims)?);
+    } else if claims.is_empty() {
+        println!("{empty_message}");
+    } else {
+        for claim in claims {
+            let paths = claim
+                .paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("{}\t{}\t{}", claim.token.get(), claim.agent_id, paths);
+        }
+    }
+    Ok(())
+}
+
+fn print_owner_report(report: &OwnerReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else if let Some(owner) = &report.owner {
+        println!("{}\t{}", report.path.display(), owner);
+    } else {
+        println!("{}\t<unclaimed>", report.path.display());
     }
     Ok(())
 }

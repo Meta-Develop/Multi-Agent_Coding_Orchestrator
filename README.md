@@ -9,8 +9,16 @@ The current implementation covers Phase 1 and the first Phase 2 foundation:
 - `maco worktree list` lists registered agent worktrees.
 - `maco worktree remove <agent-id>` removes an agent worktree, refusing dirty worktrees unless `--force` is passed.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
+- `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
+- `maco sync release <token>` releases one durable claim.
+- `maco sync release-agent <agent-id>` releases all claims for an agent.
+- `maco sync owner <path>` reports the owner of a path, if one exists.
+- `maco sync status` lists active durable claims.
 
 Later phases will add the AST repository mapper, LLM agent wrappers, and orchestration loop.
+
+Durable sync state is stored under the repository-local ignored path
+`.maco/state/claims.json`.
 
 ## Development
 
@@ -56,4 +64,34 @@ Remove a clean worktree and delete its default branch:
 
 ```bash
 cargo run -- worktree remove agent-a --repo . --delete-branch
+```
+
+Claim paths for an agent:
+
+```bash
+cargo run -- sync claim agent-a src README.md --repo . --json
+```
+
+Check the current owner for a path:
+
+```bash
+cargo run -- sync owner src/lib.rs --repo .
+```
+
+List active claims:
+
+```bash
+cargo run -- sync status --repo . --json
+```
+
+Release one claim by token:
+
+```bash
+cargo run -- sync release 1 --repo .
+```
+
+Release all claims for an agent:
+
+```bash
+cargo run -- sync release-agent agent-a --repo .
 ```

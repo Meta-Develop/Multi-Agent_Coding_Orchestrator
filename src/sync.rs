@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
@@ -6,21 +6,40 @@ use std::{
 };
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct ClaimToken(u64);
 
 impl ClaimToken {
+    pub fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
     pub fn get(self) -> u64 {
         self.0
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PathClaim {
     pub token: ClaimToken,
     pub agent_id: String,
     pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SyncSnapshot {
+    pub next_token: u64,
+    pub claims: Vec<PathClaim>,
+}
+
+impl Default for SyncSnapshot {
+    fn default() -> Self {
+        Self {
+            next_token: 1,
+            claims: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,6 +86,12 @@ pub enum SyncError {
     Conflict { path: PathBuf, owner: String },
     #[error("claim token is not active: {0}")]
     UnknownToken(u64),
+    #[error("claim token cannot be zero")]
+    InvalidToken,
+    #[error("claim token appears more than once: {0}")]
+    DuplicateToken(u64),
+    #[error("claim token space is exhausted")]
+    TokenExhausted,
     #[error("sync coordinator lock is poisoned")]
     Poisoned,
 }
@@ -78,6 +103,33 @@ impl SyncCoordinator {
         Self::default()
     }
 
+    pub fn from_snapshot(snapshot: SyncSnapshot) -> Result<Self> {
+        let mut inner = Inner::default();
+        let mut seen_tokens = BTreeSet::new();
+        let mut max_token = 0;
+
+        for claim in snapshot.claims {
+            let token = claim.token;
+            if token.get() == 0 {
+                return Err(SyncError::InvalidToken);
+            }
+            if !seen_tokens.insert(token) {
+                return Err(SyncError::DuplicateToken(token.get()));
+            }
+
+            let agent_id = normalize_agent_id(&claim.agent_id)?;
+            let paths = normalize_claim_paths(claim.paths)?;
+            insert_claim(&mut inner.claims, token, agent_id, paths)?;
+            max_token = max_token.max(token.get());
+        }
+
+        inner.next_token = snapshot.next_token.max(max_token.saturating_add(1)).max(1);
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
     pub fn claim_paths<I, P>(&self, agent_id: impl AsRef<str>, paths: I) -> Result<PathClaim>
     where
         I: IntoIterator<Item = P>,
@@ -87,26 +139,12 @@ impl SyncCoordinator {
         let paths = normalize_claim_paths(paths)?;
         let mut inner = self.lock_inner()?;
 
-        for requested in &paths {
-            if let Some((path, entry)) = find_conflict(&inner.claims, requested) {
-                return Err(SyncError::Conflict {
-                    path,
-                    owner: entry.agent_id.clone(),
-                });
-            }
-        }
-
         let token = ClaimToken(inner.next_token);
-        inner.next_token += 1;
-        for path in &paths {
-            inner.claims.insert(
-                path.clone(),
-                ClaimEntry {
-                    token,
-                    agent_id: agent_id.clone(),
-                },
-            );
-        }
+        inner.next_token = inner
+            .next_token
+            .checked_add(1)
+            .ok_or(SyncError::TokenExhausted)?;
+        insert_claim(&mut inner.claims, token, agent_id.clone(), paths.clone())?;
 
         Ok(PathClaim {
             token,
@@ -168,9 +206,21 @@ impl SyncCoordinator {
         Ok(group_claims(&inner.claims).into_values().collect())
     }
 
+    pub fn to_snapshot(&self) -> Result<SyncSnapshot> {
+        let inner = self.lock_inner()?;
+        Ok(SyncSnapshot {
+            next_token: inner.next_token,
+            claims: group_claims(&inner.claims).into_values().collect(),
+        })
+    }
+
     fn lock_inner(&self) -> Result<MutexGuard<'_, Inner>> {
         self.inner.lock().map_err(|_| SyncError::Poisoned)
     }
+}
+
+pub fn normalize_repo_relative_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+    normalize_repo_path(path.as_ref())
 }
 
 fn normalize_agent_id(agent_id: &str) -> Result<String> {
@@ -219,9 +269,11 @@ fn normalize_repo_path(path: &Path) -> Result<PathBuf> {
             Component::Normal(segment) => normalized.push(segment),
             Component::CurDir => {}
             Component::ParentDir => {
-                return Err(SyncError::EscapingPath {
-                    path: path.to_path_buf(),
-                });
+                if !normalized.pop() {
+                    return Err(SyncError::EscapingPath {
+                        path: path.to_path_buf(),
+                    });
+                }
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(SyncError::AbsolutePath {
@@ -262,6 +314,34 @@ fn find_conflict(
             None
         }
     })
+}
+
+fn insert_claim(
+    claims: &mut BTreeMap<PathBuf, ClaimEntry>,
+    token: ClaimToken,
+    agent_id: String,
+    paths: Vec<PathBuf>,
+) -> Result<()> {
+    for requested in &paths {
+        if let Some((path, entry)) = find_conflict(claims, requested) {
+            return Err(SyncError::Conflict {
+                path,
+                owner: entry.agent_id,
+            });
+        }
+    }
+
+    for path in paths {
+        claims.insert(
+            path,
+            ClaimEntry {
+                token,
+                agent_id: agent_id.clone(),
+            },
+        );
+    }
+
+    Ok(())
 }
 
 fn paths_overlap(a: &Path, b: &Path) -> bool {
@@ -397,6 +477,31 @@ mod tests {
         assert!(matches!(
             coordinator.claim_paths("agent-a", ["."]),
             Err(SyncError::EmptyPath)
+        ));
+    }
+
+    #[test]
+    fn normalizes_non_escaping_parent_segments() {
+        let coordinator = SyncCoordinator::new();
+
+        let claim = coordinator
+            .claim_paths("agent-a", ["src/../README.md"])
+            .expect("claim normalized path");
+
+        assert_eq!(claim.paths, vec![PathBuf::from("README.md")]);
+        assert_eq!(
+            coordinator.owner_of("README.md").expect("owner"),
+            Some("agent-a".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_parent_segments_that_escape_repository() {
+        let coordinator = SyncCoordinator::new();
+
+        assert!(matches!(
+            coordinator.claim_paths("agent-a", ["src/../../README.md"]),
+            Err(SyncError::EscapingPath { .. })
         ));
     }
 
