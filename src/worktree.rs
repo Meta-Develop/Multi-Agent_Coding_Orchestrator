@@ -186,7 +186,7 @@ fn repository_info(repo: &Repository) -> Result<RepositoryInfo> {
     })
 }
 
-fn normalize_agent_id(agent_id: &str) -> Result<String> {
+pub fn normalize_agent_id(agent_id: &str) -> Result<String> {
     let trimmed = agent_id.trim();
     if trimmed.is_empty() {
         bail!("agent id cannot be empty");

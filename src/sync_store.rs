@@ -8,7 +8,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    process,
+    process::{self, Command},
+    thread,
+    time::Duration,
 };
 
 const STATE_VERSION: u32 = 1;
@@ -49,12 +51,12 @@ impl SyncStore {
                 repo_path.as_ref().display()
             )
         })?;
-        let repo_root = repo
-            .workdir()
-            .context("sync state requires a non-bare repository")?;
-
         Ok(Self {
-            state_path: repo_root.join(".maco").join("state").join("claims.json"),
+            state_path: repo
+                .commondir()
+                .join("maco")
+                .join("state")
+                .join("claims.json"),
         })
     }
 
@@ -211,17 +213,27 @@ impl StateLock {
         })?;
 
         let path = parent.join("claims.lock");
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                bail!(
-                    "sync state is locked at {}; remove the lock file only if no maco sync command is running",
-                    path.display()
-                );
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to create sync lock {}", path.display()))
+        let mut attempts = 0;
+        let mut file = loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => break file,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if remove_stale_lock(&path)? {
+                        continue;
+                    }
+                    attempts += 1;
+                    if attempts >= 50 {
+                        bail!(
+                            "sync state is locked at {}; another maco sync command may be running",
+                            path.display()
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to create sync lock {}", path.display()))
+                }
             }
         };
 
@@ -247,10 +259,58 @@ impl Drop for StateLock {
     }
 }
 
+fn remove_stale_lock(path: &Path) -> Result<bool> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect sync lock {}", path.display()))
+        }
+    };
+    let Some(pid) = parse_lock_pid(&contents) else {
+        return Ok(false);
+    };
+    if process_is_running(pid) {
+        return Ok(false);
+    }
+
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove stale sync lock {}", path.display()))?;
+    Ok(true)
+}
+
+fn parse_lock_pid(contents: &str) -> Option<u32> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.trim().parse().ok())
+}
+
+#[cfg(target_family = "unix")]
+fn process_is_running(pid: u32) -> bool {
+    if Path::new("/proc").exists() {
+        return Path::new("/proc").join(pid.to_string()).exists();
+    }
+
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(target_family = "unix"))]
+fn process_is_running(_pid: u32) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::worktree::WorktreeManager;
+    use git2::{Oid, Repository, Signature};
     use tempfile::TempDir;
 
     #[test]
@@ -340,5 +400,76 @@ mod tests {
 
         assert_eq!(report.path, PathBuf::from("src/lib.rs"));
         assert_eq!(report.owner, Some("agent-a".to_string()));
+    }
+
+    #[test]
+    fn linked_worktrees_share_sync_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create(crate::worktree::WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+
+        let worktree_store = SyncStore::open(&worktree.path).expect("open worktree store");
+        worktree_store
+            .claim_paths("agent-a", ["README.md"])
+            .expect("claim from worktree");
+        let main_store = SyncStore::open(&repo_path).expect("open main store");
+
+        assert_eq!(
+            main_store.owner_of("README.md").expect("owner").owner,
+            Some("agent-a".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_lock_file_is_removed() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let lock_path = store
+            .state_path()
+            .parent()
+            .expect("state parent")
+            .join("claims.lock");
+        fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("state dir");
+        fs::write(&lock_path, "pid=4294967295\n").expect("write stale lock");
+
+        assert_eq!(store.snapshot().expect("snapshot"), Vec::<PathClaim>::new());
+        assert!(!lock_path.exists());
+    }
+
+    fn commit_readme(repo: &Repository) -> Result<Oid> {
+        let workdir = repo.workdir().context("test repo must have workdir")?;
+        fs::write(workdir.join("README.md"), "# Test\n").context("write README")?;
+
+        let mut index = repo.index().context("open index")?;
+        index
+            .add_path(Path::new("README.md"))
+            .context("add README")?;
+        index.write().context("write index")?;
+        let tree_id = index.write_tree().context("write tree")?;
+        let tree = repo.find_tree(tree_id).context("find tree")?;
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").context("signature")?;
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .context("commit")
     }
 }
