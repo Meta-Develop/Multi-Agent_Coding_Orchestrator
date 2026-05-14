@@ -2,14 +2,15 @@
 
 Rust CLI and runtime foundation for a local-first multi-agent coding orchestrator.
 
-The current implementation covers Phase 1:
+The current implementation covers Phase 1 and the first Phase 2 foundation:
 
 - `maco init` initializes a Git repository.
 - `maco worktree create <agent-id>` creates a linked Git worktree on `maco/<agent-id>`.
 - `maco worktree list` lists registered agent worktrees.
 - `maco worktree remove <agent-id>` removes an agent worktree, refusing dirty worktrees unless `--force` is passed.
+- `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 
-Later phases will add the fast sync layer, AST repository mapper, LLM agent wrappers, and orchestration loop.
+Later phases will add the AST repository mapper, LLM agent wrappers, and orchestration loop.
 
 ## Development
 
