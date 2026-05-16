@@ -2,7 +2,7 @@
 name = "multi-agent-coding-orchestrator"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance multi-agent coding orchestrator"
+description = "Local-first multi-agent coding orchestrator"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

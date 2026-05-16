@@ -22,7 +22,7 @@ reviewable and recoverable:
 
 ## Current Status
 
-The current implementation covers a release-candidate local command-line slice:
+The current implementation covers a local-first command-line slice:
 
 - `maco init` initializes a Git repository.
 - `maco worktree create <agent-id>` creates a linked Git worktree for branch `maco/<agent-id>`.
@@ -37,38 +37,38 @@ The current implementation covers a release-candidate local command-line slice:
 - `maco repo map` prints a read-only repository file map with coarse file categories and Git status.
 - `maco repo map --semantic` builds a parser-backed Rust semantic map for modules, symbols, impls, imports, public re-exports, module declarations, import dependencies, and parse errors.
 - `maco repo query symbol <name>` and `maco repo query path <path>` search the semantic Rust map.
+- `maco repo query risk --path <path> --json` reports touched symbols, dependency impacts, and impacted files for changed Rust paths.
 - `maco orchestrate validate <plan-file>` validates a local JSON orchestration plan.
-- `maco orchestrate run <plan-file>` creates or reuses clean agent worktrees, claims paths, runs configured local shell commands, runs per-agent validation commands in agent worktrees, enforces path-claim boundaries, optionally writes patches and checkpoints, releases claims, and emits a run summary.
+- `maco orchestrate run <plan-file>` creates or reuses agent worktrees, claims paths, runs configured local shell commands, runs per-agent validation commands in agent worktrees, enforces path-claim boundaries, optionally writes patches and checkpoints, releases claims, and emits a run summary.
+- `maco orchestrate resume <checkpoint-file>` validates the checkpoint, repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims before skipping completed agents and running only pending work.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
-- `maco merge preview` and `maco merge apply` collect agent output and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, validation, and apply-check safety reports.
+- `maco merge preview` and `maco merge apply` collect agent output and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report`.
 - `maco llm providers` and `maco llm prompt-preview` expose the provider-neutral prompt boundary without network calls.
+- `maco agent run` runs a local fake-provider-backed proposal in an isolated worktree with durable claims, boundary checks, validation, merge-preview reporting, and no real network providers by default.
 
 ## Roadmap
 
-Implemented release-candidate foundations:
+Implemented local foundations:
 
 1. Result collection, merge preview, and guarded patch apply for agent worktrees.
 2. Parser-backed Rust repository maps for modules, symbols, impls, imports, and
-   dependency edges.
+   dependency edges, plus semantic risk reports for changed paths.
 3. Local orchestration with dependency scheduling, path claims, timeouts,
-   per-agent validation, repo-level validation, run ids, and checkpoint writes.
+   per-agent validation, repo-level validation, run ids, checkpoint writes,
+   safe checkpoint resume, and guarded `reuse=reset`.
 4. Provider-neutral LLM adapter boundaries with deterministic fake-provider
-   tests.
+   tests and local fake-provider-backed `maco agent run` execution.
 
 Remaining release-readiness work:
 
-1. Add checkpoint resume behavior. Checkpoints are written today, but runs do
-   not resume from them.
-2. Implement or remove `reuse=reset`. The value is parsed and serialized but
-   intentionally refused because it would need destructive Git cleanup.
-3. Add richer merge conflict classification and validation gates around merge
-   apply. Current apply uses `git apply` safety checks and reports blockers, but
-   does not classify conflicts by symbol or dependency impact.
-4. Add semantic task planning that proposes path claims and orchestration plans.
-5. Add opt-in real LLM providers and provider-backed agent execution only after
-   explicit approval and additional invariant tests.
-6. Add semantic-map caching and broader language adapters after the Rust path is
+1. Add richer merge conflict classification. Current apply uses Git apply
+   safety checks and reports structured blockers, but does not classify
+   conflicts by symbol or dependency impact.
+2. Add semantic task planning that proposes path claims and orchestration plans.
+3. Add opt-in real LLM providers only after explicit approval and additional
+   invariant tests.
+4. Add semantic-map caching and broader language adapters after the Rust path is
    stable.
 
 Network-facing LLM behavior should remain optional. The default development and
@@ -116,6 +116,7 @@ cargo run -- repo map --repo . --json
 cargo run -- repo map --semantic --repo . --json
 cargo run -- repo query symbol WorktreeManager --repo . --json
 cargo run -- repo query path src/worktree.rs --repo . --json
+cargo run -- repo query risk --path src/worktree.rs --repo . --json
 ```
 
 Create a worktree from the current repository HEAD:
@@ -209,6 +210,7 @@ Run a local orchestration plan:
 ```bash
 cargo run -- orchestrate validate plan.json --json
 cargo run -- orchestrate run plan.json --repo . --jobs 2 --patch-dir .maco/patches --reuse clean --run-id demo --checkpoint-dir .maco/checkpoints --json
+cargo run -- orchestrate resume .maco/checkpoints/demo.json --repo . --plan-file plan.json --jobs 2 --patch-dir .maco/patches --json
 ```
 
 The orchestrator validates that plan paths do not overlap, dependencies are
@@ -220,7 +222,9 @@ agent's `validation_commands` in that agent worktree after its command succeeds,
 verifies that each command only changed claimed paths, and releases claims at
 the end. Use `--keep-claims` to leave acquired claims active for debugging.
 `clean` is the default reuse policy, `required` requires existing clean
-worktrees, `fresh` refuses existing worktrees, and `reset` is parsed but refused.
+worktrees, `fresh` refuses existing worktrees, and `reset` moves a clean,
+unclaimed stale worktree to the current primary HEAD while refusing dirty,
+untracked, or actively claimed worktrees.
 
 Run summaries include command status, duration, timeout state, changed paths,
 unclaimed changed paths, captured stdout/stderr summaries, and optional patch
@@ -229,6 +233,13 @@ changed worktrees. Repo-level validation commands currently run in the primary
 worktree after agent commands complete; use agent validation commands for checks
 that must see unmerged agent worktree changes.
 
+`maco orchestrate resume <checkpoint-file>` only resumes checkpoints whose run
+id matches the checkpoint filename, whose recorded repository matches the
+requested repository, whose primary HEAD and plan snapshot still match, and
+whose recorded worktrees still exist at the expected paths and branches.
+Completed agents are validated against their recorded changed paths and skipped;
+pending agents must have clean worktrees before they are run.
+
 Collect and preview agent output:
 
 ```bash
@@ -236,7 +247,8 @@ cargo run -- worktree diff agent-a --repo . --json
 cargo run -- worktree diff agent-a --repo . --claim src --full-diff --json
 cargo run -- orchestrate collect summary.json --repo . --json
 cargo run -- merge preview agent-a --repo . --claim src --json
-cargo run -- merge apply agent-a --repo . --claim src
+cargo run -- merge preview agent-a --repo . --claim src --validation-report validation.json --json
+cargo run -- merge apply agent-a --repo . --claim src --validation-report validation.json
 cargo run -- merge apply agent-a --repo . --claim src --force-dirty-primary --force-stale-base --force-unclaimed-edits
 ```
 
@@ -245,8 +257,12 @@ validation failures, and apply conflicts unless the matching explicit force flag
 is passed. Apply-check failures themselves are still blocking unless
 `--force-apply-conflicts` allows a successful three-way apply check. Validation
 failures are considered when validation reports are supplied from collected run
-summaries; direct `merge preview/apply` commands do not yet accept external
-validation-report input.
+summaries or from direct `--validation-report` JSON files. External validation
+JSON may be a single report, an array, an object with `validation`,
+`validations`, or `reports`, or an orchestration summary with per-agent
+validation. With `--json`, a blocked apply emits a machine-readable report with
+readiness blockers, blocker details, and related paths before exiting with an
+error.
 
 Preview the local LLM boundary without credentials or network access:
 
@@ -255,8 +271,34 @@ cargo run -- llm providers --json
 cargo run -- llm prompt-preview task.md --agent-id agent-a --path src/lib.rs --repo . --json
 ```
 
-There is not yet a network provider, `maco agent run`, or provider-backed
-orchestration command.
+Run a deterministic local fake-provider proposal in an isolated worktree:
+
+```json
+{
+  "summary": "update README",
+  "commands": [
+    {
+      "command": "printf '# Updated\\n' > README.md",
+      "working_directory": null,
+      "purpose": "implement"
+    }
+  ],
+  "patches": [],
+  "notes": []
+}
+```
+
+```bash
+cargo run -- agent run task.md --agent-id agent-a --path README.md --fake-proposal proposal.json --validation "cargo test" --repo . --json
+```
+
+`maco agent run` currently accepts only the local `fake` provider. It renders
+the same provider-neutral prompt boundary used by `llm prompt-preview`, applies
+fake-provider proposed patches and commands inside the agent worktree, runs
+provider-proposed and CLI-supplied validation commands, collects a merge
+candidate and preview, reports path-boundary violations, and releases durable
+claims unless `--keep-claims` is supplied. Real network providers remain
+unconfigured by default.
 
 Cleanup examples:
 

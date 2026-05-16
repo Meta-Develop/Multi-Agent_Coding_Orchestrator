@@ -4,10 +4,13 @@ use proc_macro2::{LineColumn, Span};
 use quote::ToTokens;
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
-use syn::{spanned::Spanned, ImplItem, Item, TraitItem, UseTree, Visibility};
+use syn::{
+    spanned::Spanned, Attribute, Expr, ImplItem, Item, Lit, Meta, TraitItem, UseTree, Visibility,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticRepoMap {
@@ -112,6 +115,31 @@ pub struct SemanticScanError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDependencyDirection {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticDependencyImpact {
+    pub direction: SemanticDependencyDirection,
+    pub changed_path: PathBuf,
+    pub related_file: Option<PathBuf>,
+    pub dependency: SemanticDependency,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SemanticRiskReport {
+    pub changed_paths: Vec<PathBuf>,
+    pub touched_files: Vec<SemanticFile>,
+    pub touched_symbols: Vec<SemanticSymbol>,
+    pub dependency_impacts: Vec<SemanticDependencyImpact>,
+    pub impacted_files: Vec<PathBuf>,
+    pub errors: Vec<SemanticScanError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct SourceSpan {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -151,6 +179,90 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<SemanticRepoMap> {
 
     sort_map(&mut map);
     Ok(map)
+}
+
+pub fn risk_report_for_paths<I, P>(map: &SemanticRepoMap, paths: I) -> SemanticRiskReport
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let mut changed_paths = paths
+        .into_iter()
+        .map(|path| normalize_query_path(&map.root, path.as_ref()))
+        .collect::<Vec<_>>();
+    changed_paths.sort();
+    changed_paths.dedup();
+    let changed_set = changed_paths.iter().cloned().collect::<BTreeSet<_>>();
+
+    let touched_files = map
+        .files
+        .iter()
+        .filter(|file| changed_set.contains(&file.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let touched_symbols = map
+        .symbols
+        .iter()
+        .filter(|symbol| changed_set.contains(&symbol.file))
+        .cloned()
+        .collect::<Vec<_>>();
+    let errors = map
+        .errors
+        .iter()
+        .filter(|error| changed_set.contains(&error.file))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut impacted_files = BTreeSet::new();
+    let mut dependency_impacts = Vec::new();
+    for changed_path in &changed_paths {
+        for dependency in &map.dependencies {
+            if dependency.from_file == *changed_path {
+                if let Some(related_file) = &dependency.to_file {
+                    if related_file != changed_path {
+                        impacted_files.insert(related_file.clone());
+                    }
+                }
+                dependency_impacts.push(SemanticDependencyImpact {
+                    direction: SemanticDependencyDirection::Outgoing,
+                    changed_path: changed_path.clone(),
+                    related_file: dependency.to_file.clone(),
+                    dependency: dependency.clone(),
+                });
+            }
+
+            if dependency.to_file.as_deref() == Some(changed_path.as_path())
+                && dependency.from_file != *changed_path
+            {
+                impacted_files.insert(dependency.from_file.clone());
+                dependency_impacts.push(SemanticDependencyImpact {
+                    direction: SemanticDependencyDirection::Incoming,
+                    changed_path: changed_path.clone(),
+                    related_file: Some(dependency.from_file.clone()),
+                    dependency: dependency.clone(),
+                });
+            }
+        }
+    }
+
+    dependency_impacts.sort_by(|left, right| {
+        left.changed_path
+            .cmp(&right.changed_path)
+            .then_with(|| left.direction.cmp(&right.direction))
+            .then_with(|| left.related_file.cmp(&right.related_file))
+            .then_with(|| left.dependency.from_file.cmp(&right.dependency.from_file))
+            .then_with(|| left.dependency.kind.cmp(&right.dependency.kind))
+            .then_with(|| left.dependency.to.cmp(&right.dependency.to))
+    });
+
+    SemanticRiskReport {
+        changed_paths,
+        touched_files,
+        touched_symbols,
+        dependency_impacts,
+        impacted_files: impacted_files.into_iter().collect(),
+        errors,
+    }
 }
 
 fn collect_rust_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -276,7 +388,16 @@ impl FileScanner<'_> {
                     from_file: self.file.to_path_buf(),
                     from_module: module_path.to_vec(),
                     to: qualified_path.join("::"),
-                    to_file: resolve_module_file(self.root, self.file, &name),
+                    to_file: if item_mod.content.is_some() {
+                        None
+                    } else {
+                        resolve_module_file(
+                            self.root,
+                            self.file,
+                            &name,
+                            module_path_attribute(&item_mod.attrs),
+                        )
+                    },
                     kind: dependency_kind,
                     span,
                 });
@@ -514,6 +635,7 @@ impl FileScanner<'_> {
         let visibility_text = visibility_text(visibility);
         let imports = flatten_use_tree(tree);
         for import in imports {
+            let to_file = resolve_import_file(self.root, module_path, &import.path);
             self.imports.push(SemanticImport {
                 file: self.file.to_path_buf(),
                 module_path: module_path.to_vec(),
@@ -538,7 +660,7 @@ impl FileScanner<'_> {
                 from_file: self.file.to_path_buf(),
                 from_module: module_path.to_vec(),
                 to: import.path,
-                to_file: None,
+                to_file,
                 kind: SemanticDependencyKind::Import,
                 span,
             });
@@ -652,19 +774,15 @@ fn collect_use_tree(tree: &UseTree, prefix: Vec<String>, imports: &mut Vec<UseIm
             collect_use_tree(&path.tree, next, imports);
         }
         UseTree::Name(name) => {
-            let mut path = prefix;
-            path.push(name.ident.to_string());
             imports.push(UseImport {
-                path: path.join("::"),
+                path: use_path_with_ident(&prefix, &name.ident.to_string()),
                 alias: None,
                 glob: false,
             });
         }
         UseTree::Rename(rename) => {
-            let mut path = prefix;
-            path.push(rename.ident.to_string());
             imports.push(UseImport {
-                path: path.join("::"),
+                path: use_path_with_ident(&prefix, &rename.ident.to_string()),
                 alias: Some(rename.rename.to_string()),
                 glob: false,
             });
@@ -684,7 +802,30 @@ fn collect_use_tree(tree: &UseTree, prefix: Vec<String>, imports: &mut Vec<UseIm
     }
 }
 
-fn resolve_module_file(root: &Path, file: &Path, module_name: &str) -> Option<PathBuf> {
+fn use_path_with_ident(prefix: &[String], ident: &str) -> String {
+    if ident == "self" {
+        if prefix.is_empty() {
+            ident.to_string()
+        } else {
+            prefix.join("::")
+        }
+    } else {
+        let mut path = prefix.to_vec();
+        path.push(ident.to_string());
+        path.join("::")
+    }
+}
+
+fn resolve_module_file(
+    root: &Path,
+    file: &Path,
+    module_name: &str,
+    path_attribute: Option<String>,
+) -> Option<PathBuf> {
+    if let Some(path_attribute) = path_attribute {
+        return resolve_path_attribute_file(root, file, &path_attribute);
+    }
+
     let base = module_base_path(file);
     let flat = base.join(format!("{module_name}.rs"));
     if root.join(&flat).is_file() {
@@ -692,6 +833,121 @@ fn resolve_module_file(root: &Path, file: &Path, module_name: &str) -> Option<Pa
     }
 
     let nested = base.join(module_name).join("mod.rs");
+    if root.join(&nested).is_file() {
+        return Some(nested);
+    }
+
+    None
+}
+
+fn module_path_attribute(attrs: &[Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("path") {
+            return None;
+        }
+
+        match &attr.meta {
+            Meta::NameValue(meta) => match &meta.value {
+                Expr::Lit(expr_lit) => match &expr_lit.lit {
+                    Lit::Str(value) => Some(value.value()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+fn resolve_path_attribute_file(root: &Path, file: &Path, path_attribute: &str) -> Option<PathBuf> {
+    let base = file.parent().unwrap_or_else(|| Path::new(""));
+    let candidate = normalize_relative_path(&base.join(path_attribute));
+    if root.join(&candidate).is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn resolve_import_file(root: &Path, module_path: &[String], import_path: &str) -> Option<PathBuf> {
+    let absolute_path = absolute_import_path(module_path, import_path)?;
+    resolve_module_segments(root, &absolute_path)
+}
+
+fn absolute_import_path(module_path: &[String], import_path: &str) -> Option<Vec<String>> {
+    let mut segments = import_path
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let first = segments.first()?.as_str();
+
+    match first {
+        "crate" => Some(segments),
+        "self" => {
+            segments.remove(0);
+            let mut absolute = module_path.to_vec();
+            absolute.extend(segments);
+            Some(absolute)
+        }
+        "super" => {
+            let mut absolute = module_path.to_vec();
+            while segments.first().is_some_and(|segment| segment == "super") {
+                if absolute.len() > 1 {
+                    absolute.pop();
+                }
+                segments.remove(0);
+            }
+            absolute.extend(segments);
+            Some(absolute)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_module_segments(root: &Path, absolute_path: &[String]) -> Option<PathBuf> {
+    if absolute_path.first().map(String::as_str) != Some("crate") {
+        return None;
+    }
+
+    for end in (1..=absolute_path.len()).rev() {
+        if let Some(file) = module_segments_to_file(root, &absolute_path[..end]) {
+            return Some(file);
+        }
+    }
+
+    None
+}
+
+fn module_segments_to_file(root: &Path, segments: &[String]) -> Option<PathBuf> {
+    if segments.first().map(String::as_str) != Some("crate") {
+        return None;
+    }
+
+    if segments.len() == 1 {
+        for candidate in [PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")] {
+            if root.join(&candidate).is_file() {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+
+    let module_segments = &segments[1..];
+    let mut flat = PathBuf::from("src");
+    for segment in module_segments {
+        flat.push(segment);
+    }
+    flat.set_extension("rs");
+    if root.join(&flat).is_file() {
+        return Some(flat);
+    }
+
+    let mut nested = PathBuf::from("src");
+    for segment in module_segments {
+        nested.push(segment);
+    }
+    nested.push("mod.rs");
     if root.join(&nested).is_file() {
         return Some(nested);
     }
@@ -832,6 +1088,34 @@ fn is_ignored_path(path: &Path) -> bool {
         || path.starts_with(".agent/temp")
         || path == Path::new(".agent/storage")
         || path.starts_with(".agent/storage")
+        || path == Path::new(".agents/temp")
+        || path.starts_with(".agents/temp")
+        || path == Path::new(".agents/storage")
+        || path.starts_with(".agents/storage")
+}
+
+fn normalize_query_path(root: &Path, path: &Path) -> PathBuf {
+    let repo_relative = if path.is_absolute() {
+        path.strip_prefix(root).unwrap_or(path)
+    } else {
+        path
+    };
+    normalize_relative_path(repo_relative)
+}
+
+fn normalize_relative_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 fn line_count(source: &str) -> usize {
@@ -962,6 +1246,32 @@ mod inline {
     }
 
     #[test]
+    fn resolves_path_attributed_module_declarations() {
+        let (_temp, repo) = init_repo();
+        write_file(
+            &repo,
+            "src/lib.rs",
+            r#"
+#[path = "generated/api_surface.rs"]
+pub mod api;
+"#,
+        );
+        write_file(
+            &repo,
+            "src/generated/api_surface.rs",
+            "pub fn endpoint() {}\n",
+        );
+
+        let map = scan_repository(&repo).expect("scan");
+
+        assert!(map.dependencies.iter().any(|dependency| {
+            dependency.kind == SemanticDependencyKind::ModuleDeclaration
+                && dependency.to == "crate::api"
+                && dependency.to_file == Some(PathBuf::from("src/generated/api_surface.rs"))
+        }));
+    }
+
+    #[test]
     fn captures_traits_impls_and_methods() {
         let (_temp, repo) = init_repo();
         write_file(
@@ -1024,43 +1334,107 @@ impl Worker {
             &repo,
             "src/lib.rs",
             r#"
+pub mod api;
 use std::{collections::BTreeMap as Map, fmt::Display};
-pub use crate::api::endpoint;
+pub use crate::api::{self as api_mod, endpoint};
 pub(crate) use crate::api as api_mod;
+"#,
+        );
+        write_file(
+            &repo,
+            "src/api.rs",
+            r#"
+pub mod inner;
+pub use self::inner::Helper;
+pub fn endpoint() {}
+"#,
+        );
+        write_file(&repo, "src/api/inner.rs", "pub struct Helper;\n");
+
+        let map = scan_repository(&repo).expect("scan");
+
+        assert!(map.imports.iter().any(|import| {
+            import.path == "crate::api"
+                && import.alias.as_deref() == Some("api_mod")
+                && import.visibility == "public"
+        }));
+        assert!(map.imports.iter().any(|import| {
+            import.path == "crate::api::endpoint"
+                && import.alias.is_none()
+                && import.visibility == "public"
+        }));
+        assert!(map.imports.iter().any(|import| {
+            import.path == "self::inner::Helper"
+                && import.alias.is_none()
+                && import.visibility == "public"
+        }));
+        assert!(map.re_exports.iter().any(|export| {
+            export.path == "crate::api" && export.alias.as_deref() == Some("api_mod")
+        }));
+        assert!(map
+            .re_exports
+            .iter()
+            .any(|export| { export.path == "crate::api::endpoint" && export.alias.is_none() }));
+        assert!(map.dependencies.iter().any(|dependency| {
+            dependency.kind == SemanticDependencyKind::Import
+                && dependency.to == "std::collections::BTreeMap"
+                && dependency.to_file.is_none()
+        }));
+        assert!(map.dependencies.iter().any(|dependency| {
+            dependency.kind == SemanticDependencyKind::Import
+                && dependency.to == "crate::api::endpoint"
+                && dependency.to_file == Some(PathBuf::from("src/api.rs"))
+        }));
+        assert!(map.dependencies.iter().any(|dependency| {
+            dependency.kind == SemanticDependencyKind::Import
+                && dependency.to == "self::inner::Helper"
+                && dependency.to_file == Some(PathBuf::from("src/api/inner.rs"))
+        }));
+    }
+
+    #[test]
+    fn risk_report_lists_touched_symbols_and_dependency_impact() {
+        let (_temp, repo) = init_repo();
+        write_file(
+            &repo,
+            "src/lib.rs",
+            r#"
+pub mod api;
+pub use crate::api::endpoint;
+"#,
+        );
+        write_file(
+            &repo,
+            "src/api.rs",
+            r#"
+pub struct Api;
+pub fn endpoint() {}
 "#,
         );
 
         let map = scan_repository(&repo).expect("scan");
+        let report = risk_report_for_paths(&map, [PathBuf::from("src/api.rs")]);
 
+        assert_eq!(report.changed_paths, vec![PathBuf::from("src/api.rs")]);
         assert_eq!(
-            map.imports
+            report
+                .touched_symbols
                 .iter()
-                .map(|import| (
-                    import.path.as_str(),
-                    import.alias.as_deref(),
-                    import.visibility.as_str()
-                ))
+                .map(|symbol| symbol.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                ("std::collections::BTreeMap", Some("Map"), "private"),
-                ("std::fmt::Display", None, "private"),
-                ("crate::api::endpoint", None, "public"),
-                ("crate::api", Some("api_mod"), "crate"),
-            ]
+            vec!["Api", "endpoint"]
         );
-        assert_eq!(
-            map.re_exports
-                .iter()
-                .map(|export| (export.path.as_str(), export.alias.as_deref()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("crate::api::endpoint", None),
-                ("crate::api", Some("api_mod"))
-            ]
-        );
-        assert!(map.dependencies.iter().any(|dependency| {
-            dependency.kind == SemanticDependencyKind::Import
-                && dependency.to == "std::collections::BTreeMap"
+        assert_eq!(report.impacted_files, vec![PathBuf::from("src/lib.rs")]);
+        assert!(report.dependency_impacts.iter().any(|impact| {
+            impact.direction == SemanticDependencyDirection::Incoming
+                && impact.changed_path == Path::new("src/api.rs")
+                && impact.related_file.as_deref() == Some(Path::new("src/lib.rs"))
+                && impact.dependency.kind == SemanticDependencyKind::ModuleDeclaration
+        }));
+        assert!(report.dependency_impacts.iter().any(|impact| {
+            impact.direction == SemanticDependencyDirection::Incoming
+                && impact.dependency.kind == SemanticDependencyKind::Import
+                && impact.dependency.to == "crate::api::endpoint"
         }));
     }
 
@@ -1072,7 +1446,10 @@ pub(crate) use crate::api as api_mod;
         write_file(&repo, "target/generated.rs", "pub fn generated() {}\n");
         write_file(&repo, ".maco/state/skipped.rs", "pub fn skipped() {}\n");
         write_file(&repo, ".agent/temp/skipped.rs", "pub fn skipped() {}\n");
-        write_file(&repo, ".agent/docs/context.rs", "pub fn context() {}\n");
+        write_file(&repo, ".agent/storage/skipped.rs", "pub fn skipped() {}\n");
+        write_file(&repo, ".agents/temp/skipped.rs", "pub fn skipped() {}\n");
+        write_file(&repo, ".agents/storage/skipped.rs", "pub fn skipped() {}\n");
+        write_file(&repo, ".agents/docs/context.rs", "pub fn context() {}\n");
 
         let map = scan_repository(&repo).expect("scan");
 
@@ -1082,7 +1459,7 @@ pub(crate) use crate::api as api_mod;
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>(),
             vec![
-                PathBuf::from(".agent/docs/context.rs"),
+                PathBuf::from(".agents/docs/context.rs"),
                 PathBuf::from("src/a.rs"),
                 PathBuf::from("src/z.rs")
             ]

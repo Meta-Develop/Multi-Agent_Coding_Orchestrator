@@ -1,12 +1,16 @@
 use crate::{
-    llm::{PromptContext, ProviderCapabilities, Redactor, RepoExcerpt},
+    agent::{
+        self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
+        ProviderCommandPolicy,
+    },
+    llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
         self, MergeApplyOptions, MergeApplyPreview, MergeApplyReport, MergeCandidate,
         MergeCollectOptions, MergeForceOptions, MergePreviewOptions, ValidationReport,
     },
     orchestrator::{
-        self, AgentRunStatus, OrchestrationRunControls, OrchestrationRunOptions,
-        OrchestrationSummary, RunId, WorktreeReusePolicy,
+        self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
+        OrchestrationRunOptions, OrchestrationSummary, RunId, WorktreeReusePolicy,
     },
     repo_map::{self, RepoEntryKind, RepoMap},
     repo_semantic::{self, SemanticRepoMap},
@@ -22,6 +26,7 @@ use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 #[derive(Debug, Parser)]
@@ -45,6 +50,7 @@ impl Cli {
             Command::Merge(command) => command.run(),
             Command::Sync(command) => command.run(),
             Command::Orchestrate(command) => command.run(),
+            Command::Agent(command) => command.run(),
             Command::Llm(command) => command.run(),
         }
     }
@@ -64,6 +70,8 @@ enum Command {
     Sync(SyncCommand),
     /// Run local orchestration plans.
     Orchestrate(OrchestrateCommand),
+    /// Run a provider-backed agent in an isolated worktree.
+    Agent(AgentCommand),
     /// Inspect local LLM adapter boundaries without network calls.
     Llm(LlmCommand),
 }
@@ -123,6 +131,11 @@ impl RepoQueryCommand {
                 let report = SemanticPathQueryReport::from_map(&map, &args.path);
                 print_query_report(&report, args.json)
             }
+            RepoQuerySubcommand::Risk(args) => {
+                let map = repo_semantic::scan_repository(args.repo)?;
+                let report = repo_semantic::risk_report_for_paths(&map, args.paths);
+                print_query_report(&report, args.json)
+            }
         }
     }
 }
@@ -154,6 +167,8 @@ enum RepoQuerySubcommand {
     Symbol(QuerySymbolArgs),
     /// Find semantic map entries connected to a repository path.
     Path(QueryPathArgs),
+    /// Report touched symbols and dependency impact for changed paths.
+    Risk(QueryRiskArgs),
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +187,19 @@ struct QuerySymbolArgs {
 struct QueryPathArgs {
     /// Repository-relative path to inspect.
     path: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct QueryRiskArgs {
+    /// Changed repository-relative path. Repeat to report multiple changed paths.
+    #[arg(long = "path", required = true)]
+    paths: Vec<PathBuf>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -204,6 +232,23 @@ impl OrchestrateCommand {
                         worktree_reuse_policy: args.reuse,
                     },
                 )?;
+                print_orchestration_summary(&summary, args.json)?;
+                if !summary.success {
+                    if let Some(agent_id) = summary.first_failed_agent() {
+                        bail!("orchestration failed for agent '{agent_id}'");
+                    }
+                    bail!("orchestration failed");
+                }
+                Ok(())
+            }
+            OrchestrateSubcommand::Resume(args) => {
+                let summary = orchestrator::resume_plan_file(OrchestrationResumeOptions {
+                    checkpoint_file: args.checkpoint_file,
+                    repo: args.repo,
+                    plan_file: args.plan_file,
+                    jobs: args.jobs,
+                    patch_dir: args.patch_dir,
+                })?;
                 print_orchestration_summary(&summary, args.json)?;
                 if !summary.success {
                     if let Some(agent_id) = summary.first_failed_agent() {
@@ -252,6 +297,8 @@ impl OrchestrateCommand {
 enum OrchestrateSubcommand {
     /// Run a local JSON orchestration plan.
     Run(RunOrchestrateArgs),
+    /// Resume a local orchestration checkpoint.
+    Resume(ResumeOrchestrateArgs),
     /// Collect merge candidates from a previous orchestration summary JSON.
     Collect(CollectOrchestrateArgs),
     /// Validate a local JSON orchestration plan without running commands.
@@ -289,6 +336,27 @@ struct RunOrchestrateArgs {
 }
 
 #[derive(Debug, Args)]
+struct ResumeOrchestrateArgs {
+    /// Checkpoint JSON file written by `maco orchestrate run --checkpoint-dir`.
+    checkpoint_file: PathBuf,
+    /// Repository path. Defaults to the repository recorded in the checkpoint.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Plan file. Defaults to the plan recorded in the checkpoint.
+    #[arg(long)]
+    plan_file: Option<PathBuf>,
+    /// Maximum number of pending agents to run concurrently when dependencies allow it.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
+    /// Write per-agent git patches for pending agents that change worktrees.
+    #[arg(long)]
+    patch_dir: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct CollectOrchestrateArgs {
     /// JSON summary emitted by `maco orchestrate run --json`.
     summary_json: PathBuf,
@@ -307,6 +375,141 @@ struct ValidateOrchestrateArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AgentCommand {
+    #[command(subcommand)]
+    command: AgentSubcommand,
+}
+
+impl AgentCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            AgentSubcommand::Run(args) => {
+                let json = args.json;
+                if json {
+                    let failure_context = AgentRunFailureContext::from_args(&args);
+                    match run_agent_from_args(args) {
+                        Ok(report) => {
+                            print_agent_run_report(&report, true)?;
+                            if !report.success {
+                                bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
+                            }
+                        }
+                        Err(error) => {
+                            let report = failure_context.into_report(error.to_string());
+                            print_agent_run_failure_report(&report)?;
+                            bail!("{}", report.error);
+                        }
+                    }
+                } else {
+                    let report = run_agent_from_args(args)?;
+                    print_agent_run_report(&report, false)?;
+                    if !report.success {
+                        bail!("{}", report.error.as_deref().unwrap_or("agent run failed"));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentSubcommand {
+    /// Run a local provider-backed agent proposal in an isolated worktree.
+    Run(RunAgentArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunAgentArgs {
+    /// Task file to render into the provider-neutral prompt.
+    task_file: PathBuf,
+    /// Stable agent id for the run and linked worktree.
+    #[arg(long)]
+    agent_id: String,
+    /// Repository-relative path to claim. Repeat for multiple paths.
+    #[arg(long = "path", required = true)]
+    paths: Vec<PathBuf>,
+    /// Provider id. Only `fake` is available without explicit real-provider support.
+    #[arg(long, default_value = "fake")]
+    provider: String,
+    /// Deterministic fake provider proposal JSON file.
+    #[arg(long)]
+    fake_proposal: Option<PathBuf>,
+    /// Request id used to select the fake provider response.
+    #[arg(long)]
+    request_id: Option<String>,
+    /// Model label recorded in the provider-neutral request.
+    #[arg(long)]
+    model: Option<String>,
+    /// Validation shell command to run in the agent worktree after proposal execution.
+    #[arg(long = "validation")]
+    validation_commands: Vec<String>,
+    /// Allow provider-proposed shell commands to run in the agent worktree.
+    #[arg(long)]
+    allow_provider_commands: bool,
+    /// Timeout for each provider or validation command, in seconds.
+    #[arg(long, default_value_t = 30, value_parser = parse_positive_seconds)]
+    command_timeout_seconds: u64,
+    /// Keep acquired path claims after the run.
+    #[arg(long)]
+    keep_claims: bool,
+    /// Worktree reuse policy for this agent run.
+    #[arg(long, default_value = "clean", value_parser = parse_agent_worktree_reuse_policy)]
+    reuse: AgentWorktreeReusePolicy,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AgentRunFailureContext {
+    repo: PathBuf,
+    agent_id: String,
+    provider_id: String,
+    request_id: String,
+}
+
+impl AgentRunFailureContext {
+    fn from_args(args: &RunAgentArgs) -> Self {
+        Self {
+            repo: args.repo.clone(),
+            agent_id: args.agent_id.clone(),
+            provider_id: args.provider.clone(),
+            request_id: args
+                .request_id
+                .clone()
+                .unwrap_or_else(|| agent::default_request_id(&args.agent_id)),
+        }
+    }
+
+    fn into_report(self, error: String) -> AgentRunFailureReport {
+        AgentRunFailureReport {
+            success: false,
+            status: "failed",
+            repo: self.repo,
+            agent_id: self.agent_id,
+            provider_id: self.provider_id,
+            request_id: self.request_id,
+            error,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRunFailureReport {
+    success: bool,
+    status: &'static str,
+    repo: PathBuf,
+    agent_id: String,
+    provider_id: String,
+    request_id: String,
+    error: String,
 }
 
 #[derive(Debug, Args)]
@@ -498,8 +701,9 @@ impl LlmCommand {
                         kind: "local_fake".to_string(),
                         configured: true,
                         network_required: false,
-                        notes: "Deterministic test provider; no credentials or network required."
-                            .to_string(),
+                        notes:
+                            "Deterministic test provider for prompt preview and agent run; no credentials or network required."
+                                .to_string(),
                         capabilities: ProviderCapabilities::local_fake(),
                     }],
                     network_providers_required: false,
@@ -668,11 +872,13 @@ fn preview_merge_from_args(
     repo: PathBuf,
     agent_id: String,
     explicit_claims: Vec<PathBuf>,
+    validation_report_paths: Vec<PathBuf>,
     forces: MergeForceOptions,
 ) -> Result<MergeApplyPreview> {
     let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
+    let validations = load_validation_reports(&validation_report_paths, &agent_id)?;
     merge::preview_merge_apply(MergePreviewOptions {
-        collect: collect_options_from_claims(&repo, &agent_id, claims, true, Vec::new()),
+        collect: collect_options_from_claims(&repo, &agent_id, claims, true, validations),
         forces,
     })
 }
@@ -691,23 +897,41 @@ impl MergeCommand {
                     args.repo,
                     args.agent_id,
                     args.claim,
+                    args.validation_report,
                     args.forces.into_force_options(),
                 )?;
                 print_merge_preview(&preview, args.json)
             }
             MergeSubcommand::Apply(args) => {
-                let report = merge::apply_merge_result(MergeApplyOptions {
-                    preview: MergePreviewOptions {
-                        collect: collect_options_from_claims(
-                            &args.repo,
-                            &args.agent_id,
-                            resolve_claims(&args.repo, &args.agent_id, args.claim)?,
-                            true,
-                            Vec::new(),
-                        ),
-                        forces: args.forces.into_force_options(),
-                    },
-                })?;
+                let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
+                let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+                let preview_options = MergePreviewOptions {
+                    collect: collect_options_from_claims(
+                        &args.repo,
+                        &args.agent_id,
+                        claims,
+                        true,
+                        validations,
+                    ),
+                    forces: args.forces.into_force_options(),
+                };
+                let report = if args.json {
+                    let preview = merge::preview_merge_apply(preview_options)?;
+                    if preview.safety.readiness.status == merge::ApplyReadinessStatus::Blocked {
+                        let report = merge::blocked_merge_apply_report(preview);
+                        print_merge_apply_report(&report, true)?;
+                        let message = report
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "merge apply refused".to_string());
+                        bail!("{message}");
+                    }
+                    merge::apply_prechecked_merge(preview)?
+                } else {
+                    merge::apply_merge_result(MergeApplyOptions {
+                        preview: preview_options,
+                    })?
+                };
                 print_merge_apply_report(&report, args.json)
             }
         }
@@ -732,6 +956,9 @@ struct MergePreviewArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long)]
     claim: Vec<PathBuf>,
+    /// JSON validation report file. Repeat to supply multiple reports.
+    #[arg(long)]
+    validation_report: Vec<PathBuf>,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
@@ -749,6 +976,9 @@ struct MergeApplyArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long)]
     claim: Vec<PathBuf>,
+    /// JSON validation report file. Repeat to supply multiple reports.
+    #[arg(long)]
+    validation_report: Vec<PathBuf>,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
@@ -816,7 +1046,9 @@ fn collect_orchestration_results(
             .context("summary agent is missing string id")?;
         let claims = agent_paths_from_summary(agent)
             .with_context(|| format!("summary agent '{agent_id}' has invalid paths"))?;
-        let validations = validation_reports_from_summary(agent);
+        let validations = validation_reports_from_summary(agent).with_context(|| {
+            format!("summary agent '{agent_id}' has invalid validation reports")
+        })?;
         candidates.push(merge::collect_agent_result(MergeCollectOptions {
             repo: repo.to_path_buf(),
             agent_id: agent_id.to_string(),
@@ -850,41 +1082,36 @@ fn agent_paths_from_summary(agent: &Value) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn validation_reports_from_summary(agent: &Value) -> Vec<ValidationReport> {
-    let mut reports = agent
-        .get("validation")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(validation_report_from_value)
-        .collect::<Vec<_>>();
-    reports.sort_by(|left, right| left.name.cmp(&right.name));
-    reports
+fn validation_reports_from_summary(agent: &Value) -> Result<Vec<ValidationReport>> {
+    if agent.get("validation").is_some()
+        || agent.get("validations").is_some()
+        || agent.get("reports").is_some()
+    {
+        merge::validation_reports_from_json(agent)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
-fn validation_report_from_value(value: &Value) -> Option<ValidationReport> {
-    let name = value
-        .get("name")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("command").and_then(Value::as_str))?
-        .to_string();
-    let status = match value.get("status").and_then(Value::as_str) {
-        Some("succeeded") => merge::ValidationStatus::Passed,
-        Some("failed") => merge::ValidationStatus::Failed,
-        Some("skipped") => merge::ValidationStatus::Skipped,
-        Some("pending") => merge::ValidationStatus::NotRun,
-        _ => merge::ValidationStatus::NotRun,
-    };
-    let message = value
-        .get("error")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    Some(ValidationReport {
-        name,
-        status,
-        message,
-    })
+fn load_validation_reports(paths: &[PathBuf], agent_id: &str) -> Result<Vec<ValidationReport>> {
+    let mut reports = Vec::new();
+    for path in paths {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read validation report {}", path.display()))?;
+        let value: Value = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse validation report {}", path.display()))?;
+        reports.extend(
+            merge::validation_reports_from_json_for_agent(&value, Some(agent_id))
+                .with_context(|| format!("invalid validation report {}", path.display()))?,
+        );
+    }
+    reports.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.paths.cmp(&right.paths))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    Ok(reports)
 }
 
 #[derive(Debug, Serialize)]
@@ -1051,6 +1278,62 @@ fn build_prompt_preview(args: LlmPromptPreviewArgs) -> Result<LlmPromptPreviewRe
     })
 }
 
+fn run_agent_from_args(args: RunAgentArgs) -> Result<AgentRunReport> {
+    if args.provider != "fake" {
+        bail!(
+            "provider '{}' is not configured for agent run; only local fake is available",
+            args.provider
+        );
+    }
+
+    let proposal_path = args
+        .fake_proposal
+        .context("fake provider agent run requires --fake-proposal <proposal.json>")?;
+    let proposal = load_fake_proposal(&proposal_path)?;
+    let task = fs::read_to_string(&args.task_file)
+        .with_context(|| format!("failed to read task file {}", args.task_file.display()))?;
+    let request_id = args
+        .request_id
+        .unwrap_or_else(|| agent::default_request_id(&args.agent_id));
+    let model = args
+        .model
+        .unwrap_or_else(|| agent::default_model().to_string());
+    let mut provider = FakeProvider::new("fake", model.clone());
+    provider.push_response(request_id.clone(), proposal);
+
+    agent::run_agent_with_provider(
+        AgentRunOptions {
+            repo: args.repo,
+            agent_id: args.agent_id,
+            task,
+            request_id: Some(request_id),
+            model: Some(model),
+            claimed_paths: args.paths,
+            validation_commands: args
+                .validation_commands
+                .into_iter()
+                .map(AgentValidationCommand::required)
+                .collect(),
+            keep_claims: args.keep_claims,
+            worktree_reuse: args.reuse,
+            provider_command_policy: if args.allow_provider_commands {
+                ProviderCommandPolicy::AllowUnsafeShell
+            } else {
+                ProviderCommandPolicy::Disabled
+            },
+            command_timeout: Duration::from_secs(args.command_timeout_seconds),
+        },
+        &mut provider,
+    )
+}
+
+fn load_fake_proposal(path: &Path) -> Result<WorkProposal> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read fake proposal {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse fake proposal {}", path.display()))
+}
+
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
     let repo = Repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
@@ -1074,6 +1357,28 @@ fn language_for_path(path: &Path) -> String {
         _ => "text",
     }
     .to_string()
+}
+
+fn parse_agent_worktree_reuse_policy(
+    value: &str,
+) -> std::result::Result<AgentWorktreeReusePolicy, String> {
+    match value {
+        "clean" => Ok(AgentWorktreeReusePolicy::Clean),
+        "required" => Ok(AgentWorktreeReusePolicy::Required),
+        "fresh" => Ok(AgentWorktreeReusePolicy::Fresh),
+        _ => Err("expected one of: clean, required, fresh".to_string()),
+    }
+}
+
+fn parse_positive_seconds(value: &str) -> std::result::Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "expected a positive integer number of seconds".to_string())?;
+    if seconds == 0 {
+        Err("timeout must be greater than zero seconds".to_string())
+    } else {
+        Ok(seconds)
+    }
 }
 
 fn parse_worktree_reuse_policy(value: &str) -> std::result::Result<WorktreeReusePolicy, String> {
@@ -1280,6 +1585,41 @@ fn print_orchestration_summary(summary: &OrchestrationSummary, json: bool) -> Re
             }
         }
     }
+    Ok(())
+}
+
+fn print_agent_run_report(report: &AgentRunReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        let status = if report.success {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        println!("Agent run: {status}");
+        println!("Agent: {}", report.agent_id);
+        println!("Provider: {}", report.provider_id);
+        println!("Worktree: {}", report.worktree.path.display());
+        println!("Changed paths: {}", report.candidate.changed_paths.len());
+        for path in &report.candidate.changed_paths {
+            println!("  {}", path.display());
+        }
+        if !report.candidate.unclaimed_changed_paths.is_empty() {
+            println!("Unclaimed edits:");
+            for path in &report.candidate.unclaimed_changed_paths {
+                println!("  {}", path.display());
+            }
+        }
+        if let Some(error) = &report.error {
+            println!("  {error}");
+        }
+    }
+    Ok(())
+}
+
+fn print_agent_run_failure_report(report: &AgentRunFailureReport) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(report)?);
     Ok(())
 }
 

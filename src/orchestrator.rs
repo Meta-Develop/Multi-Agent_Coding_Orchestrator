@@ -4,7 +4,7 @@ use crate::{
     worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::Repository;
+use git2::{Oid, Repository, ResetType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -73,6 +73,15 @@ pub struct OrchestrationRunControls {
     pub worktree_reuse_policy: Option<WorktreeReusePolicy>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OrchestrationResumeOptions {
+    pub checkpoint_file: PathBuf,
+    pub repo: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub jobs: usize,
+    pub patch_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct RunId(String);
@@ -116,7 +125,11 @@ pub struct RunCheckpoint {
     pub run_id: RunId,
     pub stage: RunCheckpointStage,
     pub repo: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_head: Option<String>,
     pub plan_file: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_snapshot: Option<CheckpointPlanSnapshot>,
     pub keep_claims: bool,
     pub worktree_reuse_policy: WorktreeReusePolicy,
     pub success: bool,
@@ -144,6 +157,83 @@ pub struct CheckpointWorktreeRecord {
     pub name: String,
     pub path: PathBuf,
     pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CheckpointPlanSnapshot {
+    pub worktree_reuse_policy: WorktreeReusePolicy,
+    pub repo_validation_commands: Vec<CheckpointValidationCommandSnapshot>,
+    pub agents: Vec<CheckpointAgentPlanSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CheckpointAgentPlanSnapshot {
+    pub id: String,
+    pub paths: Vec<PathBuf>,
+    pub env: BTreeMap<String, String>,
+    pub timeout_seconds: Option<u64>,
+    pub command: String,
+    pub depends_on: Vec<String>,
+    pub working_directory: Option<PathBuf>,
+    pub validation_commands: Vec<CheckpointValidationCommandSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CheckpointValidationCommandSnapshot {
+    pub name: Option<String>,
+    pub command: String,
+    pub env: BTreeMap<String, String>,
+    pub timeout_seconds: Option<u64>,
+    pub working_directory: Option<PathBuf>,
+}
+
+impl From<&OrchestrationPlan> for CheckpointPlanSnapshot {
+    fn from(plan: &OrchestrationPlan) -> Self {
+        Self {
+            worktree_reuse_policy: plan.worktree_reuse_policy,
+            repo_validation_commands: plan
+                .repo_validation_commands
+                .iter()
+                .map(CheckpointValidationCommandSnapshot::from)
+                .collect(),
+            agents: plan
+                .agents
+                .iter()
+                .map(CheckpointAgentPlanSnapshot::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&AgentPlan> for CheckpointAgentPlanSnapshot {
+    fn from(agent: &AgentPlan) -> Self {
+        Self {
+            id: agent.id.clone(),
+            paths: agent.paths.clone(),
+            env: agent.env.clone(),
+            timeout_seconds: agent.timeout.map(|timeout| timeout.as_secs()),
+            command: agent.command.clone(),
+            depends_on: agent.depends_on.clone(),
+            working_directory: agent.working_directory.clone(),
+            validation_commands: agent
+                .validation_commands
+                .iter()
+                .map(CheckpointValidationCommandSnapshot::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&ValidationCommandPlan> for CheckpointValidationCommandSnapshot {
+    fn from(validation: &ValidationCommandPlan) -> Self {
+        Self {
+            name: validation.name.clone(),
+            command: validation.command.clone(),
+            env: validation.env.clone(),
+            timeout_seconds: validation.timeout.map(|timeout| timeout.as_secs()),
+            working_directory: validation.working_directory.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -341,6 +431,7 @@ pub fn run_plan_with_controls(
 
     let repo = discover_repo_root(&options.repo)?;
     let run_id = resolve_run_id(&controls)?;
+    let repo_head = current_head_oid(&repo)?;
     let worktree_reuse_policy = controls
         .worktree_reuse_policy
         .unwrap_or(plan.worktree_reuse_policy);
@@ -354,7 +445,7 @@ pub fn run_plan_with_controls(
     let mut repo_validation = Vec::new();
     let mut acquired_tokens = Vec::new();
 
-    let worktrees = select_worktrees(&manager, &plan, worktree_reuse_policy)?;
+    let worktrees = select_worktrees(&manager, &store, &repo_head, &plan, worktree_reuse_policy)?;
     for (summary, worktree) in summaries.iter_mut().zip(worktrees) {
         summary.worktree_reused = worktree.reused;
         summary.worktree = Some(worktree.record);
@@ -365,7 +456,9 @@ pub fn run_plan_with_controls(
         &run_id,
         CheckpointView {
             repo: &repo,
+            repo_head: &repo_head,
             plan_file: &options.plan_file,
+            plan: &plan,
             keep_claims: options.keep_claims,
             worktree_reuse_policy,
             success: false,
@@ -402,7 +495,9 @@ pub fn run_plan_with_controls(
                     &run_id,
                     CheckpointView {
                         repo: &repo,
+                        repo_head: &repo_head,
                         plan_file: &options.plan_file,
+                        plan: &plan,
                         keep_claims: options.keep_claims,
                         worktree_reuse_policy,
                         success: false,
@@ -435,7 +530,9 @@ pub fn run_plan_with_controls(
         &run_id,
         CheckpointView {
             repo: &repo,
+            repo_head: &repo_head,
             plan_file: &options.plan_file,
+            plan: &plan,
             keep_claims: options.keep_claims,
             worktree_reuse_policy,
             success: false,
@@ -464,7 +561,9 @@ pub fn run_plan_with_controls(
         &run_id,
         CheckpointView {
             repo: &repo,
+            repo_head: &repo_head,
             plan_file: &options.plan_file,
+            plan: &plan,
             keep_claims: options.keep_claims,
             worktree_reuse_policy,
             success: false,
@@ -493,7 +592,9 @@ pub fn run_plan_with_controls(
         &run_id,
         CheckpointView {
             repo: &repo,
+            repo_head: &repo_head,
             plan_file: &options.plan_file,
+            plan: &plan,
             keep_claims: options.keep_claims,
             worktree_reuse_policy,
             success,
@@ -516,6 +617,523 @@ pub fn run_plan_with_controls(
         released_claims,
         release_errors,
     })
+}
+
+pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<OrchestrationSummary> {
+    if options.jobs == 0 {
+        bail!("orchestration jobs must be at least 1");
+    }
+
+    let checkpoint = read_run_checkpoint(&options.checkpoint_file)?;
+    let checkpoint_dir = options
+        .checkpoint_file
+        .parent()
+        .map(Path::to_path_buf)
+        .context("checkpoint file must have a parent directory")?;
+    let expected_checkpoint_path = checkpoint_path(&checkpoint_dir, &checkpoint.run_id);
+    if expected_checkpoint_path != options.checkpoint_file {
+        bail!(
+            "checkpoint file {} does not match run id '{}'; expected {}",
+            options.checkpoint_file.display(),
+            checkpoint.run_id.as_str(),
+            expected_checkpoint_path.display()
+        );
+    }
+
+    let checkpoint_repo = discover_repo_root(&checkpoint.repo).with_context(|| {
+        format!(
+            "failed to validate checkpoint repository {}",
+            checkpoint.repo.display()
+        )
+    })?;
+    let repo = match options.repo.as_deref() {
+        Some(repo) => {
+            let repo = discover_repo_root(repo)?;
+            if repo != checkpoint_repo {
+                bail!(
+                    "checkpoint belongs to repository {}, but resume was requested for {}",
+                    checkpoint_repo.display(),
+                    repo.display()
+                );
+            }
+            repo
+        }
+        None => checkpoint_repo,
+    };
+    let repo_head = current_head_oid(&repo)?;
+    let plan_file = options
+        .plan_file
+        .clone()
+        .unwrap_or_else(|| checkpoint.plan_file.clone());
+    let plan = load_plan(&plan_file)?;
+
+    validate_checkpoint_for_resume(&checkpoint, &plan, &repo_head)?;
+    let manager = WorktreeManager::new(&repo);
+    let store = SyncStore::open(&repo)?;
+    let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
+    validate_resume_worktrees(&manager, &plan, &checkpoint, &mut summaries, &repo_head)?;
+
+    if checkpoint.stage == RunCheckpointStage::Final {
+        return Ok(summary_from_parts(SummaryParts {
+            run_id: checkpoint.run_id,
+            repo,
+            plan_file,
+            keep_claims: checkpoint.keep_claims,
+            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+            summaries,
+            repo_validation: checkpoint.repo_validation,
+            released_claims: checkpoint.released_claims,
+            release_errors: checkpoint.release_errors,
+        }));
+    }
+
+    let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries)?;
+    let controls = OrchestrationRunControls {
+        run_id: Some(checkpoint.run_id.clone()),
+        checkpoint_dir: Some(checkpoint_dir),
+        worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
+    };
+
+    write_checkpoint_if_configured(
+        &controls,
+        RunCheckpointStage::ClaimsAcquired,
+        &Some(checkpoint.run_id.clone()),
+        CheckpointView {
+            repo: &repo,
+            repo_head: &repo_head,
+            plan_file: &plan_file,
+            plan: &plan,
+            keep_claims: checkpoint.keep_claims,
+            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+            success: false,
+            agents: &summaries,
+            repo_validation: &checkpoint.repo_validation,
+            released_claims: &[],
+            release_errors: &[],
+        },
+    )?;
+
+    let had_pending_agents = summaries
+        .iter()
+        .any(|summary| summary.status == AgentRunStatus::Pending);
+    run_agent_schedule(
+        &plan,
+        &mut summaries,
+        options.jobs,
+        options.patch_dir.as_deref(),
+    )?;
+    let repo_validation = if summaries
+        .iter()
+        .all(|summary| summary.status == AgentRunStatus::Succeeded)
+    {
+        if had_pending_agents || checkpoint.repo_validation.is_empty() {
+            run_repo_validation_commands(&plan, &repo)
+        } else {
+            checkpoint.repo_validation.clone()
+        }
+    } else {
+        checkpoint.repo_validation.clone()
+    };
+
+    write_checkpoint_if_configured(
+        &controls,
+        RunCheckpointStage::AgentsCompleted,
+        &Some(checkpoint.run_id.clone()),
+        CheckpointView {
+            repo: &repo,
+            repo_head: &repo_head,
+            plan_file: &plan_file,
+            plan: &plan,
+            keep_claims: checkpoint.keep_claims,
+            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+            success: false,
+            agents: &summaries,
+            repo_validation: &repo_validation,
+            released_claims: &[],
+            release_errors: &[],
+        },
+    )?;
+
+    let (released_claims, release_errors) = if checkpoint.keep_claims {
+        (Vec::new(), Vec::new())
+    } else {
+        release_claims(&store, acquired_tokens)
+    };
+    let success = release_errors.is_empty()
+        && summaries
+            .iter()
+            .all(|summary| summary.status == AgentRunStatus::Succeeded)
+        && repo_validation
+            .iter()
+            .all(|summary| summary.status == AgentRunStatus::Succeeded);
+
+    write_checkpoint_if_configured(
+        &controls,
+        RunCheckpointStage::Final,
+        &Some(checkpoint.run_id.clone()),
+        CheckpointView {
+            repo: &repo,
+            repo_head: &repo_head,
+            plan_file: &plan_file,
+            plan: &plan,
+            keep_claims: checkpoint.keep_claims,
+            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+            success,
+            agents: &summaries,
+            repo_validation: &repo_validation,
+            released_claims: &released_claims,
+            release_errors: &release_errors,
+        },
+    )?;
+
+    Ok(OrchestrationSummary {
+        run_id: Some(checkpoint.run_id),
+        repo,
+        plan_file,
+        keep_claims: checkpoint.keep_claims,
+        worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+        success,
+        agents: summaries,
+        repo_validation,
+        released_claims,
+        release_errors,
+    })
+}
+
+fn validate_checkpoint_for_resume(
+    checkpoint: &RunCheckpoint,
+    plan: &OrchestrationPlan,
+    repo_head: &Oid,
+) -> Result<()> {
+    let Some(checkpoint_head) = checkpoint.repo_head.as_deref() else {
+        bail!(
+            "checkpoint '{}' is missing repository HEAD metadata; start a new run to create a resumable checkpoint",
+            checkpoint.run_id.as_str()
+        );
+    };
+    if checkpoint_head != repo_head.to_string() {
+        bail!(
+            "checkpoint '{}' was created at primary HEAD {}, but the repository is now at {}; start a new run or restore the repository to the checkpoint base",
+            checkpoint.run_id.as_str(),
+            checkpoint_head,
+            repo_head
+        );
+    }
+
+    let current_snapshot = CheckpointPlanSnapshot::from(plan);
+    let Some(checkpoint_snapshot) = checkpoint.plan_snapshot.as_ref() else {
+        bail!(
+            "checkpoint '{}' is missing plan metadata; start a new run to create a resumable checkpoint",
+            checkpoint.run_id.as_str()
+        );
+    };
+    if checkpoint_snapshot != &current_snapshot {
+        bail!(
+            "checkpoint '{}' does not match the current orchestration plan; use the matching plan file or start a new run",
+            checkpoint.run_id.as_str()
+        );
+    }
+
+    if checkpoint.agents.len() != plan.agents.len() {
+        bail!(
+            "checkpoint '{}' has {} agents but the plan has {}; use the matching plan file or start a new run",
+            checkpoint.run_id.as_str(),
+            checkpoint.agents.len(),
+            plan.agents.len()
+        );
+    }
+
+    for (agent, checkpoint_agent) in plan.agents.iter().zip(&checkpoint.agents) {
+        if checkpoint_agent.id != agent.id {
+            bail!(
+                "checkpoint '{}' records agent '{}' where the plan expects '{}'; use the matching plan file or start a new run",
+                checkpoint.run_id.as_str(),
+                checkpoint_agent.id,
+                agent.id
+            );
+        }
+        match checkpoint_agent.status {
+            AgentRunStatus::Pending | AgentRunStatus::Succeeded => {}
+            AgentRunStatus::Failed | AgentRunStatus::Skipped
+                if checkpoint.stage == RunCheckpointStage::Final => {}
+            AgentRunStatus::Failed => {
+                bail!(
+                    "checkpoint '{}' contains failed agent '{}'; resume will not retry failed work automatically, start a new run after fixing the cause",
+                    checkpoint.run_id.as_str(),
+                    checkpoint_agent.id
+                );
+            }
+            AgentRunStatus::Skipped => {
+                bail!(
+                    "checkpoint '{}' contains skipped agent '{}'; resume cannot infer whether it is safe to run, start a new run",
+                    checkpoint.run_id.as_str(),
+                    checkpoint_agent.id
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn summaries_from_checkpoint(
+    plan: &OrchestrationPlan,
+    checkpoint: &RunCheckpoint,
+) -> Result<Vec<AgentRunSummary>> {
+    plan.agents
+        .iter()
+        .zip(&checkpoint.agents)
+        .map(|(agent, checkpoint_agent)| {
+            let mut summary = AgentRunSummary::pending(agent);
+            summary.status = checkpoint_agent.status;
+            summary.worktree = checkpoint_agent.worktree.as_ref().map(WorktreeRecord::from);
+            summary.worktree_reused = summary.worktree.is_some();
+            summary.claim = checkpoint_agent.claim.clone();
+            summary.changed_paths = checkpoint_agent.changed_paths.clone();
+            summary.unclaimed_changed_paths = checkpoint_agent.unclaimed_changed_paths.clone();
+            summary.validation = checkpoint_agent.validation.clone();
+            summary.error = checkpoint_agent.error.clone();
+            Ok(summary)
+        })
+        .collect()
+}
+
+fn validate_resume_worktrees(
+    manager: &WorktreeManager,
+    plan: &OrchestrationPlan,
+    checkpoint: &RunCheckpoint,
+    summaries: &mut [AgentRunSummary],
+    repo_head: &Oid,
+) -> Result<()> {
+    let records = manager
+        .list()?
+        .into_iter()
+        .map(|record| (record.name.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+
+    for ((agent, checkpoint_agent), summary) in plan
+        .agents
+        .iter()
+        .zip(&checkpoint.agents)
+        .zip(summaries.iter_mut())
+    {
+        let Some(recorded) = checkpoint_agent.worktree.as_ref() else {
+            bail!(
+                "checkpoint '{}' is missing worktree metadata for agent '{}'; start a new run",
+                checkpoint.run_id.as_str(),
+                agent.id
+            );
+        };
+        let Some(current) = records.get(&recorded.name) else {
+            bail!(
+                "checkpoint '{}' references missing worktree '{}' for agent '{}'; restore the worktree or start a new run",
+                checkpoint.run_id.as_str(),
+                recorded.name,
+                agent.id
+            );
+        };
+        if current.path != recorded.path || current.branch != recorded.branch {
+            bail!(
+                "checkpoint '{}' worktree metadata for agent '{}' is stale; expected {} on branch {}, found {} on branch {}",
+                checkpoint.run_id.as_str(),
+                agent.id,
+                recorded.path.display(),
+                recorded.branch,
+                current.path.display(),
+                current.branch
+            );
+        }
+
+        let worktree_repo = Repository::open(&current.path).with_context(|| {
+            format!(
+                "failed to inspect checkpoint worktree '{}' at {}",
+                current.name,
+                current.path.display()
+            )
+        })?;
+        let worktree_head = head_oid(&worktree_repo)
+            .with_context(|| format!("failed to inspect HEAD for worktree '{}'", current.name))?;
+        if &worktree_head != repo_head {
+            bail!(
+                "checkpoint '{}' worktree '{}' is based on {}, but primary HEAD is {}; start a new run or restore the checkpoint base",
+                checkpoint.run_id.as_str(),
+                current.name,
+                worktree_head,
+                repo_head
+            );
+        }
+
+        let changed_paths = collect_status_paths(&worktree_repo).with_context(|| {
+            format!(
+                "failed to inspect changes for checkpoint worktree '{}'",
+                current.name
+            )
+        })?;
+        match checkpoint_agent.status {
+            AgentRunStatus::Pending => {
+                if !changed_paths.is_empty() {
+                    bail!(
+                        "checkpoint '{}' marks agent '{}' as pending, but its worktree has changes; clean the worktree or start a new run",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    );
+                }
+            }
+            AgentRunStatus::Succeeded => {
+                if changed_paths != checkpoint_agent.changed_paths {
+                    bail!(
+                        "checkpoint '{}' changed paths for completed agent '{}' no longer match the worktree; start a new run or restore the checkpoint state",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    );
+                }
+                let unclaimed_changed_paths = changed_paths
+                    .iter()
+                    .filter(|path| {
+                        !agent
+                            .paths
+                            .iter()
+                            .any(|claim| path_is_covered_by_claim(path, claim))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !unclaimed_changed_paths.is_empty()
+                    || !checkpoint_agent.unclaimed_changed_paths.is_empty()
+                {
+                    bail!(
+                        "checkpoint '{}' completed agent '{}' has unclaimed changed paths; start a new run after resolving the claim boundary",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    );
+                }
+            }
+            AgentRunStatus::Failed | AgentRunStatus::Skipped => {}
+        }
+        summary.worktree = Some(current.clone());
+        summary.worktree_reused = true;
+    }
+
+    Ok(())
+}
+
+fn acquire_resume_claims(
+    store: &SyncStore,
+    plan: &OrchestrationPlan,
+    summaries: &mut [AgentRunSummary],
+) -> Result<Vec<ClaimToken>> {
+    let mut tokens = Vec::new();
+
+    for (agent, summary) in plan.agents.iter().zip(summaries.iter_mut()) {
+        if let Some(active_claim) = find_active_resume_claim(store, agent, summary.claim.as_ref())?
+        {
+            summary.claim = Some(active_claim.clone());
+            tokens.push(active_claim.token);
+            continue;
+        }
+
+        let claim = store
+            .claim_paths(&agent.id, agent.paths.iter())
+            .with_context(|| {
+                format!(
+                    "failed to acquire resume claim for agent '{}' on checkpoint paths",
+                    agent.id
+                )
+            })?;
+        tokens.push(claim.token);
+        summary.claim = Some(claim);
+    }
+
+    Ok(tokens)
+}
+
+fn find_active_resume_claim(
+    store: &SyncStore,
+    agent: &AgentPlan,
+    checkpoint_claim: Option<&PathClaim>,
+) -> Result<Option<PathClaim>> {
+    for claim in store.snapshot()? {
+        if !claims_overlap_paths(&claim, &agent.paths) {
+            continue;
+        }
+        let same_checkpoint_claim = checkpoint_claim.is_some_and(|checkpoint_claim| {
+            checkpoint_claim.token == claim.token
+                && checkpoint_claim.agent_id == claim.agent_id
+                && paths_match(&checkpoint_claim.paths, &claim.paths)
+        });
+        if same_checkpoint_claim {
+            return Ok(Some(claim));
+        }
+        bail!(
+            "cannot resume agent '{}' because path '{}' is actively claimed by agent '{}' with token {}; release the stale claim or use the matching checkpoint",
+            agent.id,
+            claim
+                .paths
+                .first()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            claim.agent_id,
+            claim.token.get()
+        );
+    }
+
+    Ok(None)
+}
+
+fn claims_overlap_paths(claim: &PathClaim, paths: &[PathBuf]) -> bool {
+    claim
+        .paths
+        .iter()
+        .any(|claimed| paths.iter().any(|path| paths_overlap(claimed, path)))
+}
+
+fn paths_match(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    left.iter().collect::<BTreeSet<_>>() == right.iter().collect::<BTreeSet<_>>()
+}
+
+struct SummaryParts {
+    run_id: RunId,
+    repo: PathBuf,
+    plan_file: PathBuf,
+    keep_claims: bool,
+    worktree_reuse_policy: WorktreeReusePolicy,
+    summaries: Vec<AgentRunSummary>,
+    repo_validation: Vec<ValidationRunSummary>,
+    released_claims: Vec<PathClaim>,
+    release_errors: Vec<String>,
+}
+
+fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
+    let SummaryParts {
+        run_id,
+        repo,
+        plan_file,
+        keep_claims,
+        worktree_reuse_policy,
+        summaries,
+        repo_validation,
+        released_claims,
+        release_errors,
+    } = parts;
+    let success = release_errors.is_empty()
+        && summaries
+            .iter()
+            .all(|summary| summary.status == AgentRunStatus::Succeeded)
+        && repo_validation
+            .iter()
+            .all(|summary| summary.status == AgentRunStatus::Succeeded);
+
+    OrchestrationSummary {
+        run_id: Some(run_id),
+        repo,
+        plan_file,
+        keep_claims,
+        worktree_reuse_policy,
+        success,
+        agents: summaries,
+        repo_validation,
+        released_claims,
+        release_errors,
+    }
 }
 
 fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
@@ -814,15 +1432,11 @@ struct SelectedWorktree {
 
 fn select_worktrees(
     manager: &WorktreeManager,
+    store: &SyncStore,
+    primary_head: &Oid,
     plan: &OrchestrationPlan,
     policy: WorktreeReusePolicy,
 ) -> Result<Vec<SelectedWorktree>> {
-    if policy == WorktreeReusePolicy::Reset {
-        bail!(
-            "worktree reuse policy 'reset' is not supported because it would require destructive git commands"
-        );
-    }
-
     let mut existing = manager
         .list()?
         .into_iter()
@@ -839,7 +1453,15 @@ fn select_worktrees(
                     record.path.display()
                 );
             }
-            ensure_reusable_worktree(&record)?;
+            match policy {
+                WorktreeReusePolicy::Reset => {
+                    reset_reusable_worktree(store, agent, &record, primary_head)?;
+                }
+                WorktreeReusePolicy::Clean | WorktreeReusePolicy::Required => {
+                    ensure_reusable_worktree(&record, primary_head)?;
+                }
+                WorktreeReusePolicy::Fresh => {}
+            }
             selected.push(SelectedWorktree {
                 record,
                 reused: true,
@@ -868,7 +1490,7 @@ fn select_worktrees(
     Ok(selected)
 }
 
-fn ensure_reusable_worktree(record: &WorktreeRecord) -> Result<()> {
+fn ensure_reusable_worktree(record: &WorktreeRecord, primary_head: &Oid) -> Result<()> {
     let repo = Repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing worktree '{}' at {}",
@@ -885,6 +1507,91 @@ fn ensure_reusable_worktree(record: &WorktreeRecord) -> Result<()> {
         );
     }
 
+    let worktree_head = head_oid(&repo)
+        .with_context(|| format!("failed to inspect HEAD for worktree '{}'", record.name))?;
+    if &worktree_head != primary_head {
+        bail!(
+            "refusing to reuse stale worktree '{}' at {}; worktree HEAD {} does not match primary HEAD {}. Use --reuse reset to move a clean, unclaimed worktree to the current primary HEAD",
+            record.name,
+            record.path.display(),
+            worktree_head,
+            primary_head
+        );
+    }
+
+    Ok(())
+}
+
+fn reset_reusable_worktree(
+    store: &SyncStore,
+    agent: &AgentPlan,
+    record: &WorktreeRecord,
+    primary_head: &Oid,
+) -> Result<()> {
+    ensure_no_active_reset_claims(store, agent)?;
+    let repo = Repository::open(&record.path).with_context(|| {
+        format!(
+            "failed to inspect existing worktree '{}' at {}",
+            record.name,
+            record.path.display()
+        )
+    })?;
+    let statuses = collect_status_paths(&repo)?;
+    if !statuses.is_empty() {
+        bail!(
+            "refusing to reset dirty or untracked worktree '{}' at {}; clean or remove changed paths before using --reuse reset",
+            record.name,
+            record.path.display()
+        );
+    }
+
+    let worktree_head = head_oid(&repo)
+        .with_context(|| format!("failed to inspect HEAD for worktree '{}'", record.name))?;
+    if &worktree_head != primary_head {
+        let target = repo
+            .find_object(*primary_head, None)
+            .with_context(|| format!("failed to find primary HEAD object {primary_head}"))?;
+        repo.reset(&target, ResetType::Hard, None)
+            .with_context(|| {
+                format!(
+                    "failed to reset worktree '{}' at {} to primary HEAD {}",
+                    record.name,
+                    record.path.display(),
+                    primary_head
+                )
+            })?;
+    }
+
+    ensure_reusable_worktree(record, primary_head)
+}
+
+fn ensure_no_active_reset_claims(store: &SyncStore, agent: &AgentPlan) -> Result<()> {
+    for claim in store.snapshot()? {
+        if claim.agent_id == agent.id {
+            bail!(
+                "refusing to reset worktree '{}' because agent '{}' has active claim token {}",
+                agent.id,
+                agent.id,
+                claim.token.get()
+            );
+        }
+        for claimed_path in &claim.paths {
+            if agent
+                .paths
+                .iter()
+                .any(|agent_path| paths_overlap(claimed_path, agent_path))
+            {
+                bail!(
+                    "refusing to reset worktree '{}' because path '{}' is actively claimed by agent '{}' with token {}",
+                    agent.id,
+                    claimed_path.display(),
+                    claim.agent_id,
+                    claim.token.get()
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -895,8 +1602,29 @@ fn run_agent_schedule(
     patch_dir: Option<&Path>,
 ) -> Result<()> {
     let jobs = jobs.max(1);
-    let mut remaining = (0..plan.agents.len()).collect::<BTreeSet<_>>();
-    let mut succeeded = BTreeSet::<String>::new();
+    let mut remaining = summaries
+        .iter()
+        .enumerate()
+        .filter(|(_, summary)| summary.status == AgentRunStatus::Pending)
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    let mut succeeded = summaries
+        .iter()
+        .filter(|summary| summary.status == AgentRunStatus::Succeeded)
+        .map(|summary| summary.id.clone())
+        .collect::<BTreeSet<_>>();
+
+    if let Some(failed_id) = summaries
+        .iter()
+        .find(|summary| summary.status == AgentRunStatus::Failed)
+        .map(|summary| summary.id.clone())
+    {
+        for index in remaining {
+            summaries[index].status = AgentRunStatus::Skipped;
+            summaries[index].error = Some(format!("skipped because agent '{}' failed", failed_id));
+        }
+        return Ok(());
+    }
 
     while !remaining.is_empty() {
         let ready = remaining
@@ -1558,7 +2286,9 @@ fn summarize_output(output: &[u8]) -> OutputSummary {
 
 struct CheckpointView<'a> {
     repo: &'a Path,
+    repo_head: &'a Oid,
     plan_file: &'a Path,
+    plan: &'a OrchestrationPlan,
     keep_claims: bool,
     worktree_reuse_policy: WorktreeReusePolicy,
     success: bool,
@@ -1622,7 +2352,9 @@ fn write_checkpoint_if_configured(
         run_id,
         stage,
         repo: view.repo.to_path_buf(),
+        repo_head: Some(view.repo_head.to_string()),
         plan_file: view.plan_file.to_path_buf(),
+        plan_snapshot: Some(CheckpointPlanSnapshot::from(view.plan)),
         keep_claims: view.keep_claims,
         worktree_reuse_policy: view.worktree_reuse_policy,
         success: view.success,
@@ -1656,6 +2388,16 @@ impl From<&AgentRunSummary> for AgentCheckpoint {
 
 impl From<&WorktreeRecord> for CheckpointWorktreeRecord {
     fn from(record: &WorktreeRecord) -> Self {
+        Self {
+            name: record.name.clone(),
+            path: record.path.clone(),
+            branch: record.branch.clone(),
+        }
+    }
+}
+
+impl From<&CheckpointWorktreeRecord> for WorktreeRecord {
+    fn from(record: &CheckpointWorktreeRecord) -> Self {
         Self {
             name: record.name.clone(),
             path: record.path.clone(),
@@ -1750,6 +2492,22 @@ fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
     repo.workdir()
         .map(Path::to_path_buf)
         .context("orchestration requires a non-bare repository")
+}
+
+fn current_head_oid(repo_path: &Path) -> Result<Oid> {
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
+    head_oid(&repo)
+}
+
+fn head_oid(repo: &Repository) -> Result<Oid> {
+    let head = repo
+        .head()
+        .context("repository has no committed HEAD; create an initial commit first")?;
+    let commit = head
+        .peel_to_commit()
+        .context("failed to peel HEAD to a commit")?;
+    Ok(commit.id())
 }
 
 #[cfg(test)]
@@ -1881,7 +2639,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_reuse_policy_defaults_and_rejects_reset_execution() {
+    fn worktree_reuse_policy_defaults_and_accepts_reset_policy() {
         let temp = TempDir::new().expect("tempdir");
         let plan_path = temp.path().join("plan.json");
         fs::write(
@@ -1892,17 +2650,13 @@ mod tests {
         let plan = load_plan(&plan_path).expect("load plan");
         assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Clean);
 
-        let error = select_worktrees(
-            &WorktreeManager::new(temp.path().join("missing-repo")),
-            &OrchestrationPlan {
-                agents: Vec::new(),
-                repo_validation_commands: Vec::new(),
-                worktree_reuse_policy: WorktreeReusePolicy::Reset,
-            },
-            WorktreeReusePolicy::Reset,
+        fs::write(
+            &plan_path,
+            r#"{"worktree_reuse_policy":"reset","agents":[{"id":"agent-a","paths":["src"],"command":"true"}]}"#,
         )
-        .expect_err("reset should be refused before inspecting repo");
-        assert!(error.to_string().contains("not supported"));
+        .expect("write reset plan");
+        let plan = load_plan(&plan_path).expect("load reset plan");
+        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Reset);
     }
 
     #[test]
@@ -2370,6 +3124,337 @@ mod tests {
     }
 
     #[test]
+    fn resume_skips_completed_agent_and_runs_pending_dependent() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("a.txt"), "start\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "start\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+
+        let manager = WorktreeManager::new(&repo_path);
+        let agent_a_worktree = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-a worktree");
+        let agent_b_worktree = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-b".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-b worktree");
+        fs::write(agent_a_worktree.path.join("a.txt"), "done\n").expect("write agent a output");
+
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["a.txt"],
+                  "command": "printf 'rerun\n' >> a.txt"
+                },
+                {
+                  "id": "agent-b",
+                  "paths": ["b.txt"],
+                  "depends_on": ["agent-a"],
+                  "command": "printf 'done\n' > b.txt"
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+        let plan = load_plan(&plan_file).expect("load plan");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let claim_a = store
+            .claim_paths("agent-a", ["a.txt"])
+            .expect("claim agent a");
+        let claim_b = store
+            .claim_paths("agent-b", ["b.txt"])
+            .expect("claim agent b");
+        let run_id = RunId::new("resume-skip").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: run_id.clone(),
+            stage: RunCheckpointStage::ClaimsAcquired,
+            repo: repo_path.clone(),
+            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
+            plan_file: plan_file.clone(),
+            plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            success: false,
+            agents: vec![
+                AgentCheckpoint {
+                    id: "agent-a".to_string(),
+                    status: AgentRunStatus::Succeeded,
+                    worktree: Some(CheckpointWorktreeRecord::from(&agent_a_worktree)),
+                    claim: Some(claim_a),
+                    changed_paths: vec![PathBuf::from("a.txt")],
+                    unclaimed_changed_paths: Vec::new(),
+                    validation: Vec::new(),
+                    error: None,
+                },
+                AgentCheckpoint {
+                    id: "agent-b".to_string(),
+                    status: AgentRunStatus::Pending,
+                    worktree: Some(CheckpointWorktreeRecord::from(&agent_b_worktree)),
+                    claim: Some(claim_b),
+                    changed_paths: Vec::new(),
+                    unclaimed_changed_paths: Vec::new(),
+                    validation: Vec::new(),
+                    error: None,
+                },
+            ],
+            repo_validation: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_file =
+            write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+
+        let summary = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file,
+            repo: Some(repo_path.clone()),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("resume");
+
+        assert!(summary.success);
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
+        assert_eq!(summary.agents[1].status, AgentRunStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(agent_a_worktree.path.join("a.txt")).expect("read a"),
+            "done\n"
+        );
+        assert_eq!(
+            fs::read_to_string(agent_b_worktree.path.join("b.txt")).expect("read b"),
+            "done\n"
+        );
+        assert_eq!(store.snapshot().expect("snapshot"), Vec::<PathClaim>::new());
+        let final_checkpoint =
+            read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
+        assert_eq!(final_checkpoint.stage, RunCheckpointStage::Final);
+        assert!(final_checkpoint.success);
+    }
+
+    #[test]
+    fn resume_refuses_changed_plan_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{"agents":[{"id":"agent-a","paths":["README.md"],"command":"true"}]}"#,
+        )
+        .expect("write plan");
+        let plan = load_plan(&plan_file).expect("load plan");
+        let run_id = RunId::new("changed-plan").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id,
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: repo_path.clone(),
+            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
+            plan_file: plan_file.clone(),
+            plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            success: false,
+            agents: vec![AgentCheckpoint {
+                id: "agent-a".to_string(),
+                status: AgentRunStatus::Pending,
+                worktree: Some(CheckpointWorktreeRecord::from(&worktree)),
+                claim: None,
+                changed_paths: Vec::new(),
+                unclaimed_changed_paths: Vec::new(),
+                validation: Vec::new(),
+                error: None,
+            }],
+            repo_validation: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_file =
+            write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+        fs::write(
+            &plan_file,
+            r#"{"agents":[{"id":"agent-a","paths":["README.md"],"command":"false"}]}"#,
+        )
+        .expect("rewrite plan");
+
+        let error = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file,
+            repo: Some(repo_path),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("resume should reject changed plan");
+
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn reuse_reset_moves_clean_stale_worktree_to_current_head() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# v1\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+        fs::write(repo_path.join("README.md"), "# v2\n").expect("update readme");
+        let current_head = commit_all(&repo, "advance primary").expect("commit update");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "worktree_reuse_policy": "reset",
+              "agents": [
+                {"id": "agent-a", "paths": ["README.md"], "command": "grep '# v2' README.md"}
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path,
+            plan_file,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("run plan");
+
+        assert!(summary.success);
+        assert!(summary.agents[0].worktree_reused);
+        let worktree_repo = Repository::open(worktree.path).expect("open worktree");
+        assert_eq!(
+            head_oid(&worktree_repo).expect("worktree head"),
+            current_head
+        );
+    }
+
+    #[test]
+    fn reuse_reset_refuses_dirty_worktree() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+        fs::write(worktree.path.join("scratch.txt"), "untracked\n").expect("write untracked");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "worktree_reuse_policy": "reset",
+              "agents": [
+                {"id": "agent-a", "paths": ["README.md"], "command": "true"}
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let error = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path,
+            plan_file,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("reset should refuse dirty worktree");
+
+        assert!(error.to_string().contains("dirty or untracked"));
+    }
+
+    #[test]
+    fn reuse_reset_refuses_active_claims() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+        SyncStore::open(&repo_path)
+            .expect("open store")
+            .claim_paths("agent-a", ["README.md"])
+            .expect("claim");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "worktree_reuse_policy": "reset",
+              "agents": [
+                {"id": "agent-a", "paths": ["README.md"], "command": "true"}
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let error = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path,
+            plan_file,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("reset should refuse active claim");
+
+        assert!(error.to_string().contains("active claim"));
+    }
+
+    #[test]
     fn checkpoint_helpers_round_trip_serialized_state() {
         let temp = TempDir::new().expect("tempdir");
         let run_id = RunId::new("run-1").expect("run id");
@@ -2378,7 +3463,22 @@ mod tests {
             run_id: run_id.clone(),
             stage: RunCheckpointStage::Final,
             repo: PathBuf::from("repo"),
+            repo_head: Some("0123456789012345678901234567890123456789".to_string()),
             plan_file: PathBuf::from("plan.json"),
+            plan_snapshot: Some(CheckpointPlanSnapshot {
+                worktree_reuse_policy: WorktreeReusePolicy::Clean,
+                repo_validation_commands: Vec::new(),
+                agents: vec![CheckpointAgentPlanSnapshot {
+                    id: "agent-a".to_string(),
+                    paths: vec![PathBuf::from("README.md")],
+                    env: BTreeMap::new(),
+                    timeout_seconds: None,
+                    command: "true".to_string(),
+                    depends_on: Vec::new(),
+                    working_directory: None,
+                    validation_commands: Vec::new(),
+                }],
+            }),
             keep_claims: false,
             worktree_reuse_policy: WorktreeReusePolicy::Clean,
             success: true,
@@ -2468,7 +3568,16 @@ mod tests {
         let tree = repo.find_tree(tree_id).context("find tree")?;
         let signature =
             Signature::now("maco test", "maco-test@example.invalid").context("signature")?;
-        repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
-            .context("commit")
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .context("commit")
     }
 }

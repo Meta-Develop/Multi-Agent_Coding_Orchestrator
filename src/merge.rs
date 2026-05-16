@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use git2::{ErrorCode, Oid, Repository, Status, StatusOptions};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -103,6 +104,8 @@ pub struct ValidationReport {
     pub name: String,
     pub status: ValidationStatus,
     pub message: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -161,6 +164,7 @@ pub struct ApplyReadiness {
     pub status: ApplyReadinessStatus,
     pub blockers: Vec<ApplyBlocker>,
     pub forced: Vec<ApplyBlocker>,
+    pub details: Vec<ApplyBlockerDetail>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -182,11 +186,37 @@ pub enum ApplyBlocker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApplyBlockerDetail {
+    pub kind: ApplyBlocker,
+    pub disposition: ApplyBlockerDisposition,
+    pub check_status: SafetyCheckStatus,
+    pub paths: Vec<PathBuf>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyBlockerDisposition {
+    Blocked,
+    Forced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MergeApplyReport {
     pub preview: MergeApplyPreview,
+    pub status: MergeApplyReportStatus,
     pub applied: bool,
     pub stdout: OutputSummary,
     pub stderr: OutputSummary,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeApplyReportStatus {
+    Applied,
+    NothingToApply,
+    Blocked,
 }
 
 struct GitCommandOutput {
@@ -288,13 +318,46 @@ pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport
         );
     }
 
+    apply_prechecked_merge(preview)
+}
+
+pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> MergeApplyReport {
+    let error = if preview.safety.readiness.blockers.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "merge apply refused: {}",
+            format_blockers(&preview.safety.readiness.blockers)
+        ))
+    };
+
+    MergeApplyReport {
+        preview,
+        status: MergeApplyReportStatus::Blocked,
+        applied: false,
+        stdout: OutputSummary::default(),
+        stderr: OutputSummary::default(),
+        error,
+    }
+}
+
+pub fn apply_prechecked_merge(preview: MergeApplyPreview) -> Result<MergeApplyReport> {
+    if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
+        bail!(
+            "merge apply refused: {}",
+            format_blockers(&preview.safety.readiness.blockers)
+        );
+    }
+
     let patch = preview.candidate.diff.full.as_deref().unwrap_or_default();
     if patch.is_empty() {
         return Ok(MergeApplyReport {
             preview,
+            status: MergeApplyReportStatus::NothingToApply,
             applied: false,
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
+            error: None,
         });
     }
 
@@ -310,9 +373,11 @@ pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport
     if args.is_empty() {
         return Ok(MergeApplyReport {
             preview,
+            status: MergeApplyReportStatus::NothingToApply,
             applied: false,
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
+            error: None,
         });
     }
 
@@ -327,6 +392,7 @@ pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport
 
     Ok(MergeApplyReport {
         preview,
+        status: MergeApplyReportStatus::Applied,
         applied: true,
         stdout: summarize_text(
             &String::from_utf8_lossy(&output.stdout),
@@ -336,7 +402,74 @@ pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport
             &String::from_utf8_lossy(&output.stderr),
             DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
         ),
+        error: None,
     })
+}
+
+pub fn validation_reports_from_json(value: &Value) -> Result<Vec<ValidationReport>> {
+    validation_reports_from_json_for_agent(value, None)
+}
+
+pub fn validation_reports_from_json_for_agent(
+    value: &Value,
+    agent_id: Option<&str>,
+) -> Result<Vec<ValidationReport>> {
+    if let Some(agents) = value.get("agents").and_then(Value::as_array) {
+        let mut reports = Vec::new();
+        let mut matched_agent = false;
+        for agent in agents {
+            let candidate_id = agent.get("id").and_then(Value::as_str);
+            if agent_id.is_some() && candidate_id != agent_id {
+                continue;
+            }
+            matched_agent = true;
+            reports.extend(validation_reports_from_agent_json(agent).with_context(|| {
+                match candidate_id {
+                    Some(id) => format!("invalid validation reports for agent '{id}'"),
+                    None => "invalid validation reports for summary agent".to_string(),
+                }
+            })?);
+        }
+        if agent_id.is_some() && !matched_agent {
+            let id = agent_id.unwrap_or_default();
+            bail!("validation report summary does not contain agent '{id}'");
+        }
+        sort_validation_reports(&mut reports);
+        return Ok(reports);
+    }
+
+    let report_values = if let Some(validations) = value.get("validation").and_then(Value::as_array)
+    {
+        validations
+    } else if let Some(validations) = value.get("validations").and_then(Value::as_array) {
+        validations
+    } else if let Some(reports) = value.get("reports").and_then(Value::as_array) {
+        reports
+    } else if let Some(array) = value.as_array() {
+        array
+    } else if value.as_object().is_some() {
+        return Ok(vec![validation_report_from_json(value)?]);
+    } else {
+        bail!("validation report JSON must be an object or array");
+    };
+
+    let mut reports = report_values
+        .iter()
+        .map(validation_report_from_json)
+        .collect::<Result<Vec<_>>>()?;
+    sort_validation_reports(&mut reports);
+    Ok(reports)
+}
+
+fn validation_reports_from_agent_json(agent: &Value) -> Result<Vec<ValidationReport>> {
+    if agent.get("validation").is_some()
+        || agent.get("validations").is_some()
+        || agent.get("reports").is_some()
+    {
+        validation_reports_from_json(agent)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 fn collect_metadata(
@@ -519,11 +652,7 @@ fn unclaimed_edits_check(paths: &[PathBuf]) -> SafetyCheck {
 }
 
 fn validation_check(validations: &[ValidationReport]) -> SafetyCheck {
-    let failed = validations
-        .iter()
-        .filter(|validation| validation.status == ValidationStatus::Failed)
-        .map(|validation| PathBuf::from(&validation.name))
-        .collect::<Vec<_>>();
+    let failed = failed_validation_paths(validations);
 
     if !failed.is_empty() {
         return SafetyCheck {
@@ -550,6 +679,30 @@ fn validation_check(validations: &[ValidationReport]) -> SafetyCheck {
     }
 }
 
+fn failed_validation_paths(validations: &[ValidationReport]) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    let mut failed_without_paths = Vec::new();
+
+    for validation in validations
+        .iter()
+        .filter(|validation| validation.status == ValidationStatus::Failed)
+    {
+        if validation.paths.is_empty() {
+            failed_without_paths.push(PathBuf::from(&validation.name));
+        } else {
+            paths.extend(validation.paths.iter().cloned());
+        }
+    }
+
+    if paths.is_empty() {
+        failed_without_paths.sort();
+        failed_without_paths.dedup();
+        return failed_without_paths;
+    }
+
+    paths.into_iter().collect()
+}
+
 fn apply_check(
     repo_root: &Path,
     patch: &str,
@@ -568,6 +721,8 @@ fn apply_check(
 
     let direct = run_git_with_input(repo_root, &["apply", "--check", "--binary"], patch)
         .context("failed to run git apply --check")?;
+    let direct_stderr = git_stderr_text(&direct);
+    let direct_paths = parse_git_apply_error_paths(&direct_stderr);
     if direct.success {
         return Ok((
             SafetyCheck {
@@ -586,6 +741,11 @@ fn apply_check(
             patch,
         )
         .context("failed to run git apply --3way --check")?;
+        let three_way_stderr = git_stderr_text(&three_way);
+        let paths = merge_path_sets(
+            &direct_paths,
+            &parse_git_apply_error_paths(&three_way_stderr),
+        );
         if three_way.success {
             return Ok((
                 SafetyCheck {
@@ -593,7 +753,7 @@ fn apply_check(
                     message: Some(
                         "direct apply check failed; three-way apply check passed".to_string(),
                     ),
-                    paths: Vec::new(),
+                    paths,
                 },
                 ApplyMode::ThreeWay,
             ));
@@ -604,10 +764,10 @@ fn apply_check(
                 status: SafetyCheckStatus::Failed,
                 message: Some(format!(
                     "direct check failed: {}; three-way check failed: {}",
-                    String::from_utf8_lossy(&direct.stderr).trim(),
-                    String::from_utf8_lossy(&three_way.stderr).trim()
+                    direct_stderr.trim(),
+                    three_way_stderr.trim()
                 )),
-                paths: Vec::new(),
+                paths,
             },
             ApplyMode::None,
         ));
@@ -616,8 +776,8 @@ fn apply_check(
     Ok((
         SafetyCheck {
             status: SafetyCheckStatus::Failed,
-            message: Some(String::from_utf8_lossy(&direct.stderr).trim().to_string()),
-            paths: Vec::new(),
+            message: Some(direct_stderr.trim().to_string()),
+            paths: direct_paths,
         },
         ApplyMode::None,
     ))
@@ -657,16 +817,26 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
     ];
     let mut blockers = Vec::new();
     let mut forced = Vec::new();
+    let mut details = Vec::new();
 
     for (check, blocker, force_allowed) in candidates {
         if check.status != SafetyCheckStatus::Failed {
             continue;
         }
-        if force_allowed {
+        let disposition = if force_allowed {
             forced.push(blocker);
+            ApplyBlockerDisposition::Forced
         } else {
             blockers.push(blocker);
-        }
+            ApplyBlockerDisposition::Blocked
+        };
+        details.push(ApplyBlockerDetail {
+            kind: blocker,
+            disposition,
+            check_status: check.status,
+            paths: check.paths.clone(),
+            message: check.message.clone(),
+        });
     }
 
     let status = if !blockers.is_empty() {
@@ -681,6 +851,7 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
         status,
         blockers,
         forced,
+        details,
     }
 }
 
@@ -839,9 +1010,163 @@ fn is_diff_exit(output: &GitCommandOutput) -> bool {
 fn format_blockers(blockers: &[ApplyBlocker]) -> String {
     blockers
         .iter()
-        .map(|blocker| format!("{blocker:?}"))
+        .map(|blocker| blocker_label(*blocker))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn blocker_label(blocker: ApplyBlocker) -> &'static str {
+    match blocker {
+        ApplyBlocker::DirtyPrimary => "dirty_primary",
+        ApplyBlocker::StaleBase => "stale_base",
+        ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
+        ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
+        ApplyBlocker::ValidationFailed => "validation_failed",
+    }
+}
+
+fn git_stderr_text(output: &GitCommandOutput) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn merge_path_sets(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
+    left.iter()
+        .chain(right.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn parse_git_apply_error_paths(stderr: &str) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    for line in stderr.lines().map(str::trim) {
+        if let Some(path) = parse_patch_failed_path(line) {
+            paths.insert(path);
+            continue;
+        }
+        if let Some(path) = parse_error_suffix_path(line) {
+            paths.insert(path);
+            continue;
+        }
+        if let Some(path) = parse_quoted_error_path(line, "error: invalid path ") {
+            paths.insert(path);
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn parse_patch_failed_path(line: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix("error: patch failed: ")?;
+    let (path, line_number) = rest.rsplit_once(':')?;
+    if line_number.chars().all(|c| c.is_ascii_digit()) && !path.is_empty() {
+        Some(PathBuf::from(path))
+    } else {
+        None
+    }
+}
+
+fn parse_error_suffix_path(line: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix("error: ")?;
+    const SUFFIXES: [&str; 8] = [
+        ": patch does not apply",
+        ": already exists in working directory",
+        ": already exists in index",
+        ": does not exist in index",
+        ": No such file or directory",
+        ": does not match index",
+        ": cannot checkout",
+        ": needs merge",
+    ];
+    SUFFIXES
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn parse_quoted_error_path(line: &str, prefix: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix(prefix)?;
+    let path = rest.strip_prefix('\'')?.strip_suffix('\'')?;
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+fn validation_report_from_json(value: &Value) -> Result<ValidationReport> {
+    let object = value
+        .as_object()
+        .context("validation report must be an object")?;
+    let name = ["name", "command", "id"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .unwrap_or("validation")
+        .to_string();
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .map(parse_validation_status)
+        .transpose()?
+        .unwrap_or(ValidationStatus::NotRun);
+    let message = object
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("error").and_then(Value::as_str))
+        .or_else(|| {
+            object
+                .get("stderr")
+                .and_then(|stderr| stderr.get("text"))
+                .and_then(Value::as_str)
+        })
+        .filter(|message| !message.is_empty())
+        .map(str::to_string);
+    let paths = validation_paths_from_json(value)?;
+
+    Ok(ValidationReport {
+        name,
+        status,
+        message,
+        paths,
+    })
+}
+
+fn parse_validation_status(value: &str) -> Result<ValidationStatus> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "not_run" | "not-run" | "pending" => Ok(ValidationStatus::NotRun),
+        "passed" | "pass" | "succeeded" | "success" => Ok(ValidationStatus::Passed),
+        "failed" | "fail" | "failure" => Ok(ValidationStatus::Failed),
+        "skipped" | "skip" => Ok(ValidationStatus::Skipped),
+        other => bail!("unknown validation status '{other}'"),
+    }
+}
+
+fn validation_paths_from_json(value: &Value) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    if let Some(path) = value.get("path").and_then(Value::as_str) {
+        paths.insert(PathBuf::from(path));
+    }
+    if let Some(items) = value.get("paths").and_then(Value::as_array) {
+        for item in items {
+            let path = item
+                .as_str()
+                .context("validation report paths must be strings")?;
+            paths.insert(PathBuf::from(path));
+        }
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+fn sort_validation_reports(reports: &mut [ValidationReport]) {
+    reports.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.paths.cmp(&right.paths))
+            .then_with(|| left.message.cmp(&right.message))
+    });
 }
 
 #[cfg(test)]
@@ -885,7 +1210,7 @@ mod tests {
         let failed = SafetyCheck {
             status: SafetyCheckStatus::Failed,
             message: None,
-            paths: Vec::new(),
+            paths: vec![PathBuf::from("README.md")],
         };
         let passed = SafetyCheck {
             status: SafetyCheckStatus::Passed,
@@ -908,6 +1233,14 @@ mod tests {
             vec![ApplyBlocker::DirtyPrimary, ApplyBlocker::UnclaimedEdits]
         );
         assert!(readiness.forced.is_empty());
+        assert_eq!(readiness.details.len(), 2);
+        assert_eq!(readiness.details[0].kind, ApplyBlocker::DirtyPrimary);
+        assert_eq!(
+            readiness.details[0].disposition,
+            ApplyBlockerDisposition::Blocked
+        );
+        assert_eq!(readiness.details[0].check_status, SafetyCheckStatus::Failed);
+        assert_eq!(readiness.details[0].paths, vec![PathBuf::from("README.md")]);
     }
 
     #[test]
@@ -944,6 +1277,10 @@ mod tests {
         assert_eq!(
             readiness.forced,
             vec![ApplyBlocker::DirtyPrimary, ApplyBlocker::StaleBase]
+        );
+        assert_eq!(
+            readiness.details[0].disposition,
+            ApplyBlockerDisposition::Forced
         );
     }
 
@@ -989,5 +1326,85 @@ mod tests {
         let untruncated = summarize_text("abc", 3);
         assert_eq!(untruncated.text, "abc");
         assert!(!untruncated.truncated);
+    }
+
+    #[test]
+    fn parses_git_apply_paths_from_standard_errors() {
+        let stderr = "\
+error: patch failed: README.md:1
+error: README.md: patch does not apply
+error: src/lib.rs: does not match index
+";
+
+        assert_eq!(
+            parse_git_apply_error_paths(stderr),
+            vec![PathBuf::from("README.md"), PathBuf::from("src/lib.rs")]
+        );
+    }
+
+    #[test]
+    fn validation_reports_accept_external_and_summary_shapes() {
+        let value = serde_json::json!({
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "validation": [
+                        {
+                            "name": "unit",
+                            "status": "failed",
+                            "message": "tests failed",
+                            "paths": ["src/lib.rs"]
+                        }
+                    ]
+                },
+                {
+                    "id": "agent-b",
+                    "validation": [
+                        {"name": "fmt", "status": "succeeded"}
+                    ]
+                }
+            ]
+        });
+
+        let reports = validation_reports_from_json_for_agent(&value, Some("agent-a"))
+            .expect("parse agent validation reports");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].name, "unit");
+        assert_eq!(reports[0].status, ValidationStatus::Failed);
+        assert_eq!(reports[0].message.as_deref(), Some("tests failed"));
+        assert_eq!(reports[0].paths, vec![PathBuf::from("src/lib.rs")]);
+    }
+
+    #[test]
+    fn validation_reports_do_not_treat_agent_summary_as_validation() {
+        let value = serde_json::json!({
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "paths": ["README.md"],
+                    "command": "cargo test",
+                    "status": "succeeded"
+                }
+            ]
+        });
+
+        let reports = validation_reports_from_json_for_agent(&value, Some("agent-a"))
+            .expect("parse empty validation reports");
+
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn validation_check_uses_explicit_paths_for_failures() {
+        let validation = validation_check(&[ValidationReport {
+            name: "unit".to_string(),
+            status: ValidationStatus::Failed,
+            message: Some("failed".to_string()),
+            paths: vec![PathBuf::from("src/lib.rs")],
+        }]);
+
+        assert_eq!(validation.status, SafetyCheckStatus::Failed);
+        assert_eq!(validation.paths, vec![PathBuf::from("src/lib.rs")]);
     }
 }

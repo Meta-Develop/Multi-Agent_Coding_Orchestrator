@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-Release-candidate memo for the first local-first CLI slice of the Multi-Agent
+Release-readiness memo for the first local-first CLI slice of the Multi-Agent
 Coding Orchestrator.
 
 ### Implemented Scope
@@ -11,18 +11,28 @@ Coding Orchestrator.
 - Durable exclusive path claims for coordinating edit ownership.
 - Local JSON orchestration plan validation and command-backed execution with
   dependency ordering, timeouts, per-agent validation commands, optional patch
-  output, checkpoint writes, and path-boundary checks.
+  output, checkpoint writes, checkpoint resume, completed-agent skipping, and
+  path-boundary checks.
+- Safe `reuse=reset` handling for clean, unclaimed stale worktrees, with
+  refusal for dirty, untracked, or actively claimed worktrees.
 - Read-only repository mapping, including parser-backed Rust semantic maps and
-  symbol/path queries.
+  symbol/path/risk queries. Risk reports include touched symbols, dependency
+  impacts, and impacted files for changed paths.
 - Worktree diff collection, orchestration result collection, merge preview, and
   guarded merge apply with dirty-primary, stale-base, unclaimed-edit,
   validation, and apply-check gates.
+- Direct `merge preview/apply --validation-report <file>` support for external
+  validation JSON, including machine-readable blocked apply reports with
+  blocker details and related paths.
 - Provider-neutral LLM provider listing and prompt preview without network
   calls or provider credentials.
+- Local fake-provider-backed `maco agent run` execution in isolated worktrees
+  with durable claims, boundary checks, validation, merge-preview reporting, and
+  no real network providers by default.
 
 ### Verification Expectations
 
-Before tagging, pushing, or publishing a release candidate, run the project
+Before tagging, pushing, or publishing a release, run the project
 checks from a clean working tree:
 
 ```bash
@@ -36,17 +46,14 @@ Nix shell.
 
 ### Known Limitations And Risks
 
-- Checkpoints can be written, but checkpoint resume behavior is not implemented.
-- `reuse=reset` is parsed but intentionally refused because destructive
-  worktree cleanup needs an explicit safety design and tests.
 - Merge apply uses Git apply safety checks and reports blockers, but conflict
   classification is not yet semantic or symbol-aware.
 - Semantic task planning and automatic path-claim proposal are not implemented.
-- Real network LLM providers, provider-backed agent execution, and `maco agent
-  run` are not implemented.
-- Direct `merge preview` and `merge apply` commands do not yet accept external
-  validation reports; collected orchestration summaries should be used when
-  validation state matters.
+- Real network LLM providers are not configured by default. `maco agent run`
+  currently supports only the deterministic local fake provider.
+- Repo-level validation commands run in the primary worktree after agent
+  commands complete; use per-agent validation for checks that need to see
+  unmerged agent worktree changes.
 
 ### Release Operations
 
