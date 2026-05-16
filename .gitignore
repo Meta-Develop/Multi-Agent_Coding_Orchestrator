@@ -1,0 +1,10 @@
+/target
+/.maco
+/.maco-cache
+/.agents/live/claims/worker-*.md
+/.agents/temp/*
+/.agents/storage/*
+!/.agents/temp/.gitkeep
+!/.agents/storage/.gitkeep
+!/.agents/live/claims/CLAIM_TEMPLATE.md
+/.agent
