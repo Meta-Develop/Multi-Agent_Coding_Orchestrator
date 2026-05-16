@@ -153,6 +153,163 @@ fn cli_claim_conflict_still_emits_json_summary() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn cli_worktree_diff_uses_active_claims_for_json() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nchanged\n").context("edit worktree")?;
+    run_success_json([
+        "sync",
+        "claim",
+        "agent-a",
+        "README.md",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+
+    let diff = run_success_json(["worktree", "diff", "agent-a", "--repo", repo, "--json"])?;
+
+    assert_eq!(diff["metadata"]["agent_id"], "agent-a");
+    assert_eq!(diff["claimed_paths"][0], "README.md");
+    assert_eq!(diff["changed_paths"][0], "README.md");
+    assert_eq!(
+        diff["unclaimed_changed_paths"]
+            .as_array()
+            .context("unclaimed array")?
+            .len(),
+        0
+    );
+    assert!(diff["diff"]["summary"]["text"]
+        .as_str()
+        .context("diff summary")?
+        .contains("changed"));
+
+    Ok(())
+}
+
+#[test]
+fn cli_semantic_map_and_queries_emit_json() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub struct Worker;\nimpl Worker { pub fn new() -> Self { Worker } }\n",
+    )
+    .context("write semantic lib")?;
+
+    let map = run_success_json(["repo", "map", "--semantic", "--repo", repo, "--json"])?;
+    assert!(map["symbols"]
+        .as_array()
+        .context("symbols array")?
+        .iter()
+        .any(|symbol| symbol["name"] == "Worker"));
+
+    let symbol = run_success_json([
+        "repo", "query", "symbol", "Worker", "--repo", repo, "--json",
+    ])?;
+    assert_eq!(symbol["matches"][0]["name"], "Worker");
+
+    let path = run_success_json([
+        "repo",
+        "query",
+        "path",
+        "src/lib.rs",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+    assert_eq!(path["files"][0]["path"], "src/lib.rs");
+    assert!(path["symbols"]
+        .as_array()
+        .context("path symbols")?
+        .iter()
+        .any(|symbol| symbol["name"] == "new"));
+
+    Ok(())
+}
+
+#[test]
+fn cli_merge_preview_blocks_unclaimed_edits_json() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nchanged\n").context("edit worktree")?;
+
+    let preview = run_success_json([
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "src/lib.rs",
+        "--json",
+    ])?;
+
+    assert_eq!(preview["safety"]["readiness"]["status"], "blocked");
+    assert!(preview["safety"]["readiness"]["blockers"]
+        .as_array()
+        .context("blockers array")?
+        .iter()
+        .any(|blocker| blocker == "unclaimed_edits"));
+    assert_eq!(
+        preview["candidate"]["unclaimed_changed_paths"][0],
+        "README.md"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_llm_providers_and_prompt_preview_are_network_free_json() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let task_path = temp.path().join("task.md");
+    fs::write(
+        &task_path,
+        "Implement local-only prompt preview.\nAPI_TOKEN=secret\n",
+    )
+    .context("write task")?;
+
+    let providers = run_success_json(["llm", "providers", "--json"])?;
+    assert_eq!(providers["network_providers_required"], false);
+    assert_eq!(providers["providers"][0]["id"], "fake");
+    assert_eq!(providers["providers"][0]["network_required"], false);
+
+    let preview = run_success_json([
+        "llm",
+        "prompt-preview",
+        task_path.to_str().context("task path utf8")?,
+        "--agent-id",
+        "agent-a",
+        "--path",
+        "src/lib.rs",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+    assert_eq!(preview["agent_id"], "agent-a");
+    assert_eq!(preview["provider"]["network_required"], false);
+    assert!(preview["rendered"]
+        .as_str()
+        .context("rendered prompt")?
+        .contains("<redacted:secret>"));
+    assert!(preview["rendered"]
+        .as_str()
+        .context("rendered prompt")?
+        .contains("src/lib.rs"));
+
+    Ok(())
+}
+
 fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {

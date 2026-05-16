@@ -1,14 +1,28 @@
 use crate::{
-    orchestrator::{self, AgentRunStatus, OrchestrationRunOptions, OrchestrationSummary},
+    llm::{PromptContext, ProviderCapabilities, Redactor, RepoExcerpt},
+    merge::{
+        self, MergeApplyOptions, MergeApplyPreview, MergeApplyReport, MergeCandidate,
+        MergeCollectOptions, MergeForceOptions, MergePreviewOptions, ValidationReport,
+    },
+    orchestrator::{
+        self, AgentRunStatus, OrchestrationRunControls, OrchestrationRunOptions,
+        OrchestrationSummary, RunId, WorktreeReusePolicy,
+    },
     repo_map::{self, RepoEntryKind, RepoMap},
+    repo_semantic::{self, SemanticRepoMap},
     sync::ClaimToken,
     sync_store::{OwnerReport, SyncStore},
     worktree::{RepositoryInfo, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use git2::Repository;
 use serde::Serialize;
-use std::path::PathBuf;
+use serde_json::Value;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -28,8 +42,10 @@ impl Cli {
             }
             Command::Repo(command) => command.run(),
             Command::Worktree(command) => command.run(),
+            Command::Merge(command) => command.run(),
             Command::Sync(command) => command.run(),
             Command::Orchestrate(command) => command.run(),
+            Command::Llm(command) => command.run(),
         }
     }
 }
@@ -42,10 +58,14 @@ enum Command {
     Repo(RepoCommand),
     /// Manage linked Git worktrees for sub-agents.
     Worktree(WorktreeCommand),
+    /// Collect and apply merge candidates from agent worktrees.
+    Merge(MergeCommand),
     /// Manage repository-local sync path claims.
     Sync(SyncCommand),
     /// Run local orchestration plans.
     Orchestrate(OrchestrateCommand),
+    /// Inspect local LLM adapter boundaries without network calls.
+    Llm(LlmCommand),
 }
 
 #[derive(Debug, Args)]
@@ -71,8 +91,37 @@ impl RepoCommand {
     fn run(self) -> Result<()> {
         match self.command {
             RepoSubcommand::Map(args) => {
-                let map = repo_map::scan_repository(args.repo)?;
-                print_repo_map(&map, args.json)
+                if args.semantic {
+                    let map = repo_semantic::scan_repository(args.repo)?;
+                    print_semantic_repo_map(&map, args.json)
+                } else {
+                    let map = repo_map::scan_repository(args.repo)?;
+                    print_repo_map(&map, args.json)
+                }
+            }
+            RepoSubcommand::Query(command) => command.run(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct RepoQueryCommand {
+    #[command(subcommand)]
+    command: RepoQuerySubcommand,
+}
+
+impl RepoQueryCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            RepoQuerySubcommand::Symbol(args) => {
+                let map = repo_semantic::scan_repository(args.repo)?;
+                let report = SemanticSymbolQueryReport::from_map(&map, &args.name);
+                print_query_report(&report, args.json)
+            }
+            RepoQuerySubcommand::Path(args) => {
+                let map = repo_semantic::scan_repository(args.repo)?;
+                let report = SemanticPathQueryReport::from_map(&map, &args.path);
+                print_query_report(&report, args.json)
             }
         }
     }
@@ -82,10 +131,47 @@ impl RepoCommand {
 enum RepoSubcommand {
     /// Print a read-only repository map.
     Map(MapRepoArgs),
+    /// Query the semantic repository map.
+    Query(RepoQueryCommand),
 }
 
 #[derive(Debug, Args)]
 struct MapRepoArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Build a Rust semantic map instead of the coarse file map.
+    #[arg(long)]
+    semantic: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoQuerySubcommand {
+    /// Find semantic symbols by short or qualified name.
+    Symbol(QuerySymbolArgs),
+    /// Find semantic map entries connected to a repository path.
+    Path(QueryPathArgs),
+}
+
+#[derive(Debug, Args)]
+struct QuerySymbolArgs {
+    /// Symbol short name or qualified path, for example `run` or `crate::api::run`.
+    name: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct QueryPathArgs {
+    /// Repository-relative path to inspect.
+    path: PathBuf,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -104,19 +190,47 @@ impl OrchestrateCommand {
     fn run(self) -> Result<()> {
         match self.command {
             OrchestrateSubcommand::Run(args) => {
-                let summary = orchestrator::run_plan_file(OrchestrationRunOptions {
-                    repo: args.repo,
-                    plan_file: args.plan_file,
-                    keep_claims: args.keep_claims,
-                    jobs: args.jobs,
-                    patch_dir: args.patch_dir,
-                })?;
+                let summary = orchestrator::run_plan_file_with_controls(
+                    OrchestrationRunOptions {
+                        repo: args.repo,
+                        plan_file: args.plan_file,
+                        keep_claims: args.keep_claims,
+                        jobs: args.jobs,
+                        patch_dir: args.patch_dir,
+                    },
+                    OrchestrationRunControls {
+                        run_id: args.run_id.map(RunId::new).transpose()?,
+                        checkpoint_dir: args.checkpoint_dir,
+                        worktree_reuse_policy: args.reuse,
+                    },
+                )?;
                 print_orchestration_summary(&summary, args.json)?;
                 if !summary.success {
                     if let Some(agent_id) = summary.first_failed_agent() {
                         bail!("orchestration failed for agent '{agent_id}'");
                     }
                     bail!("orchestration failed");
+                }
+                Ok(())
+            }
+            OrchestrateSubcommand::Collect(args) => {
+                let report = collect_orchestration_results(
+                    &args.repo,
+                    &args.summary_json,
+                    merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                )?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("Orchestration collection: {}", args.summary_json.display());
+                    for candidate in &report.candidates {
+                        println!(
+                            "{}\tchanged={}\tunclaimed={}",
+                            candidate.metadata.agent_id,
+                            candidate.changed_paths.len(),
+                            candidate.unclaimed_changed_paths.len()
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -138,6 +252,8 @@ impl OrchestrateCommand {
 enum OrchestrateSubcommand {
     /// Run a local JSON orchestration plan.
     Run(RunOrchestrateArgs),
+    /// Collect merge candidates from a previous orchestration summary JSON.
+    Collect(CollectOrchestrateArgs),
     /// Validate a local JSON orchestration plan without running commands.
     Validate(ValidateOrchestrateArgs),
 }
@@ -158,6 +274,27 @@ struct RunOrchestrateArgs {
     /// Write per-agent git patches for changed worktrees.
     #[arg(long)]
     patch_dir: Option<PathBuf>,
+    /// Worktree reuse policy for this run.
+    #[arg(long, value_parser = parse_worktree_reuse_policy)]
+    reuse: Option<WorktreeReusePolicy>,
+    /// Stable run id used in summaries and checkpoints.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Directory where run checkpoints should be written.
+    #[arg(long)]
+    checkpoint_dir: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectOrchestrateArgs {
+    /// JSON summary emitted by `maco orchestrate run --json`.
+    summary_json: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -214,6 +351,18 @@ impl WorktreeCommand {
                     }
                 }
                 Ok(())
+            }
+            WorktreeSubcommand::Diff(args) => {
+                let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
+                let candidate = merge::collect_agent_result(MergeCollectOptions {
+                    repo: args.repo,
+                    agent_id: args.agent_id,
+                    claimed_paths: claims,
+                    include_full_diff: args.full_diff,
+                    diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                    validations: Vec::new(),
+                })?;
+                print_merge_candidate(&candidate, args.json)
             }
         }
     }
@@ -332,10 +481,80 @@ struct StatusSyncArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct LlmCommand {
+    #[command(subcommand)]
+    command: LlmSubcommand,
+}
+
+impl LlmCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            LlmSubcommand::Providers(args) => {
+                let providers = LlmProvidersReport {
+                    providers: vec![LlmProviderInfo {
+                        id: "fake".to_string(),
+                        model: "deterministic-fake".to_string(),
+                        kind: "local_fake".to_string(),
+                        configured: true,
+                        network_required: false,
+                        notes: "Deterministic test provider; no credentials or network required."
+                            .to_string(),
+                        capabilities: ProviderCapabilities::local_fake(),
+                    }],
+                    network_providers_required: false,
+                    network_providers_configured: false,
+                };
+                print_query_report(&providers, args.json)
+            }
+            LlmSubcommand::PromptPreview(args) => {
+                let json = args.json;
+                let report = build_prompt_preview(args)?;
+                print_query_report(&report, json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum LlmSubcommand {
+    /// List configured provider boundaries without making network calls.
+    Providers(LlmProvidersArgs),
+    /// Render a provider-neutral prompt preview without calling a provider.
+    PromptPreview(LlmPromptPreviewArgs),
+}
+
+#[derive(Debug, Args)]
+struct LlmProvidersArgs {
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LlmPromptPreviewArgs {
+    /// Task file to render into the prompt.
+    task_file: PathBuf,
+    /// Stable agent id for the prompt context.
+    #[arg(long)]
+    agent_id: String,
+    /// Repository-relative path to include as a claimed path and excerpt.
+    #[arg(long = "path", required = true)]
+    paths: Vec<PathBuf>,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum WorktreeSubcommand {
     /// Create a linked worktree for an agent.
     Create(CreateWorktreeArgs),
+    /// Collect an agent worktree diff and claim-boundary report.
+    Diff(DiffWorktreeArgs),
     /// Remove a linked worktree for an agent.
     Remove(RemoveWorktreeArgs),
     /// List registered worktrees.
@@ -358,6 +577,24 @@ struct CreateWorktreeArgs {
     /// Parent directory for agent worktrees.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DiffWorktreeArgs {
+    /// Stable agent id used when the worktree was created.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claimed path. Repeat to provide multiple claims.
+    #[arg(long)]
+    claim: Vec<PathBuf>,
+    /// Include the complete binary-safe git diff in JSON output.
+    #[arg(long)]
+    full_diff: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -389,6 +626,464 @@ struct ListWorktreesArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+fn resolve_claims(
+    repo: &Path,
+    agent_id: &str,
+    explicit_claims: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    if !explicit_claims.is_empty() {
+        return Ok(explicit_claims);
+    }
+
+    let store = SyncStore::open(repo)?;
+    let claims = store
+        .snapshot()?
+        .into_iter()
+        .filter(|claim| claim.agent_id == agent_id)
+        .flat_map(|claim| claim.paths)
+        .collect::<Vec<_>>();
+    Ok(claims)
+}
+
+fn collect_options_from_claims(
+    repo: &Path,
+    agent_id: &str,
+    claimed_paths: Vec<PathBuf>,
+    include_full_diff: bool,
+    validations: Vec<ValidationReport>,
+) -> MergeCollectOptions {
+    MergeCollectOptions {
+        repo: repo.to_path_buf(),
+        agent_id: agent_id.to_string(),
+        claimed_paths,
+        include_full_diff,
+        diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+        validations,
+    }
+}
+
+fn preview_merge_from_args(
+    repo: PathBuf,
+    agent_id: String,
+    explicit_claims: Vec<PathBuf>,
+    forces: MergeForceOptions,
+) -> Result<MergeApplyPreview> {
+    let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
+    merge::preview_merge_apply(MergePreviewOptions {
+        collect: collect_options_from_claims(&repo, &agent_id, claims, true, Vec::new()),
+        forces,
+    })
+}
+
+#[derive(Debug, Args)]
+struct MergeCommand {
+    #[command(subcommand)]
+    command: MergeSubcommand,
+}
+
+impl MergeCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            MergeSubcommand::Preview(args) => {
+                let preview = preview_merge_from_args(
+                    args.repo,
+                    args.agent_id,
+                    args.claim,
+                    args.forces.into_force_options(),
+                )?;
+                print_merge_preview(&preview, args.json)
+            }
+            MergeSubcommand::Apply(args) => {
+                let report = merge::apply_merge_result(MergeApplyOptions {
+                    preview: MergePreviewOptions {
+                        collect: collect_options_from_claims(
+                            &args.repo,
+                            &args.agent_id,
+                            resolve_claims(&args.repo, &args.agent_id, args.claim)?,
+                            true,
+                            Vec::new(),
+                        ),
+                        forces: args.forces.into_force_options(),
+                    },
+                })?;
+                print_merge_apply_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum MergeSubcommand {
+    /// Preview whether an agent worktree diff can be applied to the primary worktree.
+    Preview(MergePreviewArgs),
+    /// Apply an agent worktree diff to the primary worktree after safety checks.
+    Apply(MergeApplyArgs),
+}
+
+#[derive(Debug, Args)]
+struct MergePreviewArgs {
+    /// Stable agent id used when the worktree was created.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claimed path. Repeat to provide multiple claims.
+    #[arg(long)]
+    claim: Vec<PathBuf>,
+    #[command(flatten)]
+    forces: MergeForceArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MergeApplyArgs {
+    /// Stable agent id used when the worktree was created.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claimed path. Repeat to provide multiple claims.
+    #[arg(long)]
+    claim: Vec<PathBuf>,
+    #[command(flatten)]
+    forces: MergeForceArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MergeForceArgs {
+    /// Continue when the primary worktree has local changes.
+    #[arg(long)]
+    force_dirty_primary: bool,
+    /// Continue when the agent branch was based on an older primary HEAD.
+    #[arg(long)]
+    force_stale_base: bool,
+    /// Continue when the agent changed paths outside its claims.
+    #[arg(long)]
+    force_unclaimed_edits: bool,
+    /// Continue when supplied validation reports include failures.
+    #[arg(long)]
+    force_validation_failures: bool,
+    /// Allow three-way apply checks when a direct apply check fails.
+    #[arg(long)]
+    force_apply_conflicts: bool,
+}
+
+impl MergeForceArgs {
+    fn into_force_options(self) -> MergeForceOptions {
+        MergeForceOptions {
+            allow_dirty_primary: self.force_dirty_primary,
+            allow_stale_base: self.force_stale_base,
+            allow_unclaimed_edits: self.force_unclaimed_edits,
+            allow_validation_failures: self.force_validation_failures,
+            allow_apply_conflicts: self.force_apply_conflicts,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OrchestrationCollectReport {
+    repo: PathBuf,
+    summary_json: PathBuf,
+    candidates: Vec<MergeCandidate>,
+}
+
+fn collect_orchestration_results(
+    repo: &Path,
+    summary_json: &Path,
+    diff_summary_char_limit: usize,
+) -> Result<OrchestrationCollectReport> {
+    let contents = fs::read_to_string(summary_json)
+        .with_context(|| format!("failed to read summary JSON {}", summary_json.display()))?;
+    let summary: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse summary JSON {}", summary_json.display()))?;
+    let agents = summary
+        .get("agents")
+        .and_then(Value::as_array)
+        .context("summary JSON must contain an agents array")?;
+    let mut candidates = Vec::new();
+
+    for agent in agents {
+        let agent_id = agent
+            .get("id")
+            .and_then(Value::as_str)
+            .context("summary agent is missing string id")?;
+        let claims = agent_paths_from_summary(agent)
+            .with_context(|| format!("summary agent '{agent_id}' has invalid paths"))?;
+        let validations = validation_reports_from_summary(agent);
+        candidates.push(merge::collect_agent_result(MergeCollectOptions {
+            repo: repo.to_path_buf(),
+            agent_id: agent_id.to_string(),
+            claimed_paths: claims,
+            include_full_diff: false,
+            diff_summary_char_limit,
+            validations,
+        })?);
+    }
+
+    candidates.sort_by(|left, right| left.metadata.agent_id.cmp(&right.metadata.agent_id));
+    Ok(OrchestrationCollectReport {
+        repo: repo.to_path_buf(),
+        summary_json: summary_json.to_path_buf(),
+        candidates,
+    })
+}
+
+fn agent_paths_from_summary(agent: &Value) -> Result<Vec<PathBuf>> {
+    let paths = agent
+        .get("paths")
+        .and_then(Value::as_array)
+        .context("agent summary must contain paths array")?;
+    paths
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .map(PathBuf::from)
+                .context("agent path must be a string")
+        })
+        .collect()
+}
+
+fn validation_reports_from_summary(agent: &Value) -> Vec<ValidationReport> {
+    let mut reports = agent
+        .get("validation")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(validation_report_from_value)
+        .collect::<Vec<_>>();
+    reports.sort_by(|left, right| left.name.cmp(&right.name));
+    reports
+}
+
+fn validation_report_from_value(value: &Value) -> Option<ValidationReport> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("command").and_then(Value::as_str))?
+        .to_string();
+    let status = match value.get("status").and_then(Value::as_str) {
+        Some("succeeded") => merge::ValidationStatus::Passed,
+        Some("failed") => merge::ValidationStatus::Failed,
+        Some("skipped") => merge::ValidationStatus::Skipped,
+        Some("pending") => merge::ValidationStatus::NotRun,
+        _ => merge::ValidationStatus::NotRun,
+    };
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Some(ValidationReport {
+        name,
+        status,
+        message,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticSymbolQueryReport {
+    query: String,
+    matches: Vec<repo_semantic::SemanticSymbol>,
+}
+
+impl SemanticSymbolQueryReport {
+    fn from_map(map: &SemanticRepoMap, query: &str) -> Self {
+        let mut matches = map
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == query || symbol.qualified_path.join("::") == query)
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.file
+                .cmp(&right.file)
+                .then_with(|| left.span.cmp(&right.span))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Self {
+            query: query.to_string(),
+            matches,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticPathQueryReport {
+    query: PathBuf,
+    files: Vec<repo_semantic::SemanticFile>,
+    symbols: Vec<repo_semantic::SemanticSymbol>,
+    imports: Vec<repo_semantic::SemanticImport>,
+    re_exports: Vec<repo_semantic::SemanticReExport>,
+    dependencies: Vec<repo_semantic::SemanticDependency>,
+    errors: Vec<repo_semantic::SemanticScanError>,
+}
+
+impl SemanticPathQueryReport {
+    fn from_map(map: &SemanticRepoMap, query: &Path) -> Self {
+        let query = normalize_display_path(query);
+        Self {
+            query: query.clone(),
+            files: map
+                .files
+                .iter()
+                .filter(|file| file.path == query)
+                .cloned()
+                .collect(),
+            symbols: map
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.file == query)
+                .cloned()
+                .collect(),
+            imports: map
+                .imports
+                .iter()
+                .filter(|import| import.file == query)
+                .cloned()
+                .collect(),
+            re_exports: map
+                .re_exports
+                .iter()
+                .filter(|export| export.file == query)
+                .cloned()
+                .collect(),
+            dependencies: map
+                .dependencies
+                .iter()
+                .filter(|dependency| {
+                    dependency.from_file == query
+                        || dependency.to_file.as_deref() == Some(query.as_path())
+                })
+                .cloned()
+                .collect(),
+            errors: map
+                .errors
+                .iter()
+                .filter(|error| error.file == query)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LlmProvidersReport {
+    providers: Vec<LlmProviderInfo>,
+    network_providers_required: bool,
+    network_providers_configured: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LlmProviderInfo {
+    id: String,
+    model: String,
+    kind: String,
+    configured: bool,
+    network_required: bool,
+    notes: String,
+    capabilities: ProviderCapabilities,
+}
+
+#[derive(Debug, Serialize)]
+struct LlmPromptPreviewReport {
+    task_file: PathBuf,
+    agent_id: String,
+    claimed_paths: Vec<PathBuf>,
+    prompt: crate::llm::Prompt,
+    rendered: String,
+    redactions: crate::llm::RedactionSummary,
+    provider: LlmProviderInfo,
+}
+
+fn build_prompt_preview(args: LlmPromptPreviewArgs) -> Result<LlmPromptPreviewReport> {
+    let repo = discover_repo_root(&args.repo)?;
+    let task = fs::read_to_string(&args.task_file)
+        .with_context(|| format!("failed to read task file {}", args.task_file.display()))?;
+    let mut context = PromptContext::new(task, &args.agent_id);
+    let mut claimed_paths = args
+        .paths
+        .into_iter()
+        .map(normalize_display_path)
+        .collect::<Vec<_>>();
+    claimed_paths.sort();
+    claimed_paths.dedup();
+
+    for path in &claimed_paths {
+        context = context.with_claimed_path(path.clone(), "explicit prompt preview path");
+        let full_path = repo.join(path);
+        if full_path.is_file() {
+            let content = fs::read_to_string(&full_path)
+                .with_context(|| format!("failed to read prompt path {}", path.display()))?;
+            context = context.with_repo_excerpt(
+                RepoExcerpt::new(path.clone(), content).with_language(language_for_path(path)),
+            );
+        }
+    }
+
+    let provider = LlmProviderInfo {
+        id: "fake".to_string(),
+        model: "deterministic-fake".to_string(),
+        kind: "local_fake".to_string(),
+        configured: true,
+        network_required: false,
+        notes: "Prompt preview only; no provider call is made.".to_string(),
+        capabilities: ProviderCapabilities::local_fake(),
+    };
+    let prompt = context.assemble_prompt(&Redactor::new());
+    let rendered = prompt.render();
+    let redactions = prompt.redactions.clone();
+
+    Ok(LlmPromptPreviewReport {
+        task_file: args.task_file,
+        agent_id: args.agent_id,
+        claimed_paths,
+        prompt,
+        rendered,
+        redactions,
+        provider,
+    })
+}
+
+fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
+    let repo = Repository::discover(repo_path)
+        .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .context("repository command requires a non-bare repository")
+}
+
+fn normalize_display_path(path: impl AsRef<Path>) -> PathBuf {
+    path.as_ref().components().collect()
+}
+
+fn language_for_path(path: &Path) -> String {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("rs") => "rust",
+        Some("md") => "markdown",
+        Some("toml") => "toml",
+        Some("json") => "json",
+        Some("yaml" | "yml") => "yaml",
+        Some("sh" | "bash") => "shell",
+        _ => "text",
+    }
+    .to_string()
+}
+
+fn parse_worktree_reuse_policy(value: &str) -> std::result::Result<WorktreeReusePolicy, String> {
+    match value {
+        "clean" => Ok(WorktreeReusePolicy::Clean),
+        "required" => Ok(WorktreeReusePolicy::Required),
+        "fresh" => Ok(WorktreeReusePolicy::Fresh),
+        "reset" => Ok(WorktreeReusePolicy::Reset),
+        _ => Err("expected one of: clean, required, fresh, reset".to_string()),
+    }
 }
 
 fn print_repository_info(info: &RepositoryInfo, json: bool) -> Result<()> {
@@ -424,6 +1119,96 @@ fn print_repo_map(map: &RepoMap, json: bool) -> Result<()> {
                 entry.category
             );
         }
+    }
+    Ok(())
+}
+
+fn print_semantic_repo_map(map: &SemanticRepoMap, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(map)?);
+    } else {
+        println!("Repository: {}", map.root.display());
+        println!("Rust files: {}", map.files.len());
+        println!("Symbols: {}", map.symbols.len());
+        println!("Imports: {}", map.imports.len());
+        println!("Re-exports: {}", map.re_exports.len());
+        println!("Dependencies: {}", map.dependencies.len());
+        if !map.errors.is_empty() {
+            println!("Errors: {}", map.errors.len());
+        }
+        for symbol in &map.symbols {
+            println!(
+                "{}\t{:?}\t{}",
+                symbol.file.display(),
+                symbol.kind,
+                symbol.qualified_path.join("::")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_query_report<T: Serialize + std::fmt::Debug>(report: &T, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("{report:#?}");
+    }
+    Ok(())
+}
+
+fn print_merge_candidate(candidate: &MergeCandidate, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(candidate)?);
+    } else {
+        println!("Agent: {}", candidate.metadata.agent_id);
+        println!("Worktree: {}", candidate.metadata.worktree_path.display());
+        println!("Changed paths: {}", candidate.changed_paths.len());
+        for path in &candidate.changed_paths {
+            println!("  {}", path.display());
+        }
+        if !candidate.unclaimed_changed_paths.is_empty() {
+            println!("Unclaimed edits:");
+            for path in &candidate.unclaimed_changed_paths {
+                println!("  {}", path.display());
+            }
+        }
+        if !candidate.diff.summary.text.is_empty() {
+            println!("{}", candidate.diff.summary.text);
+        }
+    }
+    Ok(())
+}
+
+fn print_merge_preview(preview: &MergeApplyPreview, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(preview)?);
+    } else {
+        print_merge_candidate(&preview.candidate, false)?;
+        println!("Readiness: {:?}", preview.safety.readiness.status);
+        if !preview.safety.readiness.blockers.is_empty() {
+            println!("Blockers: {:?}", preview.safety.readiness.blockers);
+        }
+        if !preview.safety.readiness.forced.is_empty() {
+            println!("Forced: {:?}", preview.safety.readiness.forced);
+        }
+    }
+    Ok(())
+}
+
+fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!(
+            "Merge apply: {}",
+            if report.applied {
+                "applied"
+            } else {
+                "nothing to apply"
+            }
+        );
+        println!("Readiness: {:?}", report.preview.safety.readiness.status);
     }
     Ok(())
 }

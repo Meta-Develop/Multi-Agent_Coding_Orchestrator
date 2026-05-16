@@ -8,18 +8,22 @@ use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{self, Child, Command, ExitStatus, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
+const CHECKPOINT_STATE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationPlan {
     pub agents: Vec<AgentPlan>,
+    pub repo_validation_commands: Vec<ValidationCommandPlan>,
+    pub worktree_reuse_policy: WorktreeReusePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +35,26 @@ pub struct AgentPlan {
     pub command: String,
     pub depends_on: Vec<String>,
     pub working_directory: Option<PathBuf>,
+    pub validation_commands: Vec<ValidationCommandPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCommandPlan {
+    pub name: Option<String>,
+    pub command: String,
+    pub env: BTreeMap<String, String>,
+    pub timeout: Option<Duration>,
+    pub working_directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeReusePolicy {
+    #[default]
+    Clean,
+    Required,
+    Fresh,
+    Reset,
 }
 
 #[derive(Debug, Clone)]
@@ -42,13 +66,96 @@ pub struct OrchestrationRunOptions {
     pub patch_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct OrchestrationSummary {
+#[derive(Debug, Clone, Default)]
+pub struct OrchestrationRunControls {
+    pub run_id: Option<RunId>,
+    pub checkpoint_dir: Option<PathBuf>,
+    pub worktree_reuse_policy: Option<WorktreeReusePolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct RunId(String);
+
+impl RunId {
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        let value = value.as_ref().trim();
+        if value.is_empty() {
+            bail!("run id cannot be empty");
+        }
+        if matches!(value, "." | "..") {
+            bail!("run id cannot be '.' or '..'");
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            bail!("run id may only contain ASCII letters, digits, '.', '_' and '-'");
+        }
+
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunCheckpointStage {
+    WorktreesSelected,
+    ClaimsAcquired,
+    AgentsCompleted,
+    Final,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RunCheckpoint {
+    pub version: u32,
+    pub run_id: RunId,
+    pub stage: RunCheckpointStage,
     pub repo: PathBuf,
     pub plan_file: PathBuf,
     pub keep_claims: bool,
+    pub worktree_reuse_policy: WorktreeReusePolicy,
+    pub success: bool,
+    pub agents: Vec<AgentCheckpoint>,
+    pub repo_validation: Vec<ValidationRunSummary>,
+    pub released_claims: Vec<PathClaim>,
+    pub release_errors: Vec<String>,
+    pub updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentCheckpoint {
+    pub id: String,
+    pub status: AgentRunStatus,
+    pub worktree: Option<CheckpointWorktreeRecord>,
+    pub claim: Option<PathClaim>,
+    pub changed_paths: Vec<PathBuf>,
+    pub unclaimed_changed_paths: Vec<PathBuf>,
+    pub validation: Vec<ValidationRunSummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CheckpointWorktreeRecord {
+    pub name: String,
+    pub path: PathBuf,
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrchestrationSummary {
+    pub run_id: Option<RunId>,
+    pub repo: PathBuf,
+    pub plan_file: PathBuf,
+    pub keep_claims: bool,
+    pub worktree_reuse_policy: WorktreeReusePolicy,
     pub success: bool,
     pub agents: Vec<AgentRunSummary>,
+    pub repo_validation: Vec<ValidationRunSummary>,
     pub released_claims: Vec<PathClaim>,
     pub release_errors: Vec<String>,
 }
@@ -82,6 +189,7 @@ pub struct AgentRunSummary {
     pub patch_path: Option<PathBuf>,
     pub stdout: OutputSummary,
     pub stderr: OutputSummary,
+    pub validation: Vec<ValidationRunSummary>,
     pub error: Option<String>,
 }
 
@@ -106,12 +214,13 @@ impl AgentRunSummary {
             patch_path: None,
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
+            validation: Vec::new(),
             error: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRunStatus {
     Pending,
@@ -120,10 +229,25 @@ pub enum AgentRunStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OutputSummary {
     pub text: String,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationRunSummary {
+    pub name: Option<String>,
+    pub command: String,
+    pub working_directory: Option<PathBuf>,
+    pub timeout_seconds: Option<u64>,
+    pub status: AgentRunStatus,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub timed_out: bool,
+    pub stdout: OutputSummary,
+    pub stderr: OutputSummary,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,6 +256,10 @@ struct RawPlan {
     agents: Vec<RawAgentPlan>,
     #[serde(default)]
     default_timeout_seconds: Option<u64>,
+    #[serde(default, alias = "repo_validations")]
+    repo_validation_commands: Vec<RawValidationCommand>,
+    #[serde(default)]
+    worktree_reuse_policy: WorktreeReusePolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +270,29 @@ struct RawAgentPlan {
     command: String,
     #[serde(default)]
     depends_on: Vec<String>,
+    #[serde(default, alias = "cwd")]
+    working_directory: Option<PathBuf>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default, alias = "validations")]
+    validation_commands: Vec<RawValidationCommand>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawValidationCommand {
+    Shell(String),
+    Detailed(RawValidationCommandDetails),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawValidationCommandDetails {
+    #[serde(default)]
+    name: Option<String>,
+    command: String,
     #[serde(default, alias = "cwd")]
     working_directory: Option<PathBuf>,
     #[serde(default)]
@@ -161,19 +312,38 @@ pub fn load_plan(path: impl AsRef<Path>) -> Result<OrchestrationPlan> {
 }
 
 pub fn run_plan_file(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
+    run_plan_file_with_controls(options, OrchestrationRunControls::default())
+}
+
+pub fn run_plan_file_with_controls(
+    options: OrchestrationRunOptions,
+    controls: OrchestrationRunControls,
+) -> Result<OrchestrationSummary> {
     let plan = load_plan(&options.plan_file)?;
-    run_plan(plan, options)
+    run_plan_with_controls(plan, options, controls)
 }
 
 pub fn run_plan(
     plan: OrchestrationPlan,
     options: OrchestrationRunOptions,
 ) -> Result<OrchestrationSummary> {
+    run_plan_with_controls(plan, options, OrchestrationRunControls::default())
+}
+
+pub fn run_plan_with_controls(
+    plan: OrchestrationPlan,
+    options: OrchestrationRunOptions,
+    controls: OrchestrationRunControls,
+) -> Result<OrchestrationSummary> {
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
     }
 
     let repo = discover_repo_root(&options.repo)?;
+    let run_id = resolve_run_id(&controls)?;
+    let worktree_reuse_policy = controls
+        .worktree_reuse_policy
+        .unwrap_or(plan.worktree_reuse_policy);
     let manager = WorktreeManager::new(&repo);
     let store = SyncStore::open(&repo)?;
     let mut summaries = plan
@@ -181,13 +351,30 @@ pub fn run_plan(
         .iter()
         .map(AgentRunSummary::pending)
         .collect::<Vec<_>>();
+    let mut repo_validation = Vec::new();
     let mut acquired_tokens = Vec::new();
 
-    let worktrees = select_worktrees(&manager, &plan)?;
+    let worktrees = select_worktrees(&manager, &plan, worktree_reuse_policy)?;
     for (summary, worktree) in summaries.iter_mut().zip(worktrees) {
         summary.worktree_reused = worktree.reused;
         summary.worktree = Some(worktree.record);
     }
+    write_checkpoint_if_configured(
+        &controls,
+        RunCheckpointStage::WorktreesSelected,
+        &run_id,
+        CheckpointView {
+            repo: &repo,
+            plan_file: &options.plan_file,
+            keep_claims: options.keep_claims,
+            worktree_reuse_policy,
+            success: false,
+            agents: &summaries,
+            repo_validation: &repo_validation,
+            released_claims: &[],
+            release_errors: &[],
+        },
+    )?;
 
     for (index, agent) in plan.agents.iter().enumerate() {
         let claim = match store.claim_paths(&agent.id, agent.paths.iter()) {
@@ -209,12 +396,31 @@ pub fn run_plan(
                 } else {
                     release_claims(&store, acquired_tokens)
                 };
+                write_checkpoint_if_configured(
+                    &controls,
+                    RunCheckpointStage::Final,
+                    &run_id,
+                    CheckpointView {
+                        repo: &repo,
+                        plan_file: &options.plan_file,
+                        keep_claims: options.keep_claims,
+                        worktree_reuse_policy,
+                        success: false,
+                        agents: &summaries,
+                        repo_validation: &repo_validation,
+                        released_claims: &released_claims,
+                        release_errors: &release_errors,
+                    },
+                )?;
                 return Ok(OrchestrationSummary {
+                    run_id,
                     repo,
                     plan_file: options.plan_file,
                     keep_claims: options.keep_claims,
+                    worktree_reuse_policy,
                     success: false,
                     agents: summaries,
+                    repo_validation,
                     released_claims,
                     release_errors,
                 });
@@ -223,12 +429,50 @@ pub fn run_plan(
         acquired_tokens.push(claim.token);
         summaries[index].claim = Some(claim);
     }
+    write_checkpoint_if_configured(
+        &controls,
+        RunCheckpointStage::ClaimsAcquired,
+        &run_id,
+        CheckpointView {
+            repo: &repo,
+            plan_file: &options.plan_file,
+            keep_claims: options.keep_claims,
+            worktree_reuse_policy,
+            success: false,
+            agents: &summaries,
+            repo_validation: &repo_validation,
+            released_claims: &[],
+            release_errors: &[],
+        },
+    )?;
 
     run_agent_schedule(
         &plan,
         &mut summaries,
         options.jobs,
         options.patch_dir.as_deref(),
+    )?;
+    if summaries
+        .iter()
+        .all(|summary| summary.status == AgentRunStatus::Succeeded)
+    {
+        repo_validation = run_repo_validation_commands(&plan, &repo);
+    }
+    write_checkpoint_if_configured(
+        &controls,
+        RunCheckpointStage::AgentsCompleted,
+        &run_id,
+        CheckpointView {
+            repo: &repo,
+            plan_file: &options.plan_file,
+            keep_claims: options.keep_claims,
+            worktree_reuse_policy,
+            success: false,
+            agents: &summaries,
+            repo_validation: &repo_validation,
+            released_claims: &[],
+            release_errors: &[],
+        },
     )?;
 
     let (released_claims, release_errors) = if options.keep_claims {
@@ -239,14 +483,36 @@ pub fn run_plan(
     let success = release_errors.is_empty()
         && summaries
             .iter()
+            .all(|summary| summary.status == AgentRunStatus::Succeeded)
+        && repo_validation
+            .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded);
+    write_checkpoint_if_configured(
+        &controls,
+        RunCheckpointStage::Final,
+        &run_id,
+        CheckpointView {
+            repo: &repo,
+            plan_file: &options.plan_file,
+            keep_claims: options.keep_claims,
+            worktree_reuse_policy,
+            success,
+            agents: &summaries,
+            repo_validation: &repo_validation,
+            released_claims: &released_claims,
+            release_errors: &release_errors,
+        },
+    )?;
 
     Ok(OrchestrationSummary {
+        run_id,
         repo,
         plan_file: options.plan_file,
         keep_claims: options.keep_claims,
+        worktree_reuse_policy,
         success,
         agents: summaries,
+        repo_validation,
         released_claims,
         release_errors,
     })
@@ -260,6 +526,11 @@ fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
         bail!("default timeout must be greater than zero seconds");
     }
 
+    let repo_validation_commands = normalize_validation_commands(
+        raw.repo_validation_commands,
+        raw.default_timeout_seconds,
+        "repo validation",
+    )?;
     let mut seen_agents = BTreeSet::new();
     let mut claimed_paths = Vec::<PlanPathOwner>::new();
     let mut agents = Vec::with_capacity(raw.agents.len());
@@ -286,6 +557,11 @@ fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
         let working_directory = normalize_working_directory(raw_agent.working_directory)
             .with_context(|| format!("agent '{id}' has invalid working_directory"))?;
         validate_env(&id, &raw_agent.env)?;
+        let validation_commands = normalize_validation_commands(
+            raw_agent.validation_commands,
+            raw.default_timeout_seconds,
+            &format!("agent '{id}' validation"),
+        )?;
 
         let paths = normalize_plan_paths(raw_agent.paths)
             .with_context(|| format!("agent '{id}' has invalid path claims"))?;
@@ -324,12 +600,82 @@ fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
             command,
             depends_on,
             working_directory,
+            validation_commands,
         });
     }
 
     validate_dependencies(&agents, &seen_agents)?;
 
-    Ok(OrchestrationPlan { agents })
+    Ok(OrchestrationPlan {
+        agents,
+        repo_validation_commands,
+        worktree_reuse_policy: raw.worktree_reuse_policy,
+    })
+}
+
+fn normalize_validation_commands(
+    raw_commands: Vec<RawValidationCommand>,
+    default_timeout_seconds: Option<u64>,
+    context_label: &str,
+) -> Result<Vec<ValidationCommandPlan>> {
+    raw_commands
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            normalize_validation_command(raw, default_timeout_seconds)
+                .with_context(|| format!("{context_label} command {} is invalid", index + 1))
+        })
+        .collect()
+}
+
+fn normalize_validation_command(
+    raw: RawValidationCommand,
+    default_timeout_seconds: Option<u64>,
+) -> Result<ValidationCommandPlan> {
+    let (name, command, working_directory, env, timeout_seconds) = match raw {
+        RawValidationCommand::Shell(command) => (
+            None,
+            command,
+            None,
+            BTreeMap::new(),
+            default_timeout_seconds,
+        ),
+        RawValidationCommand::Detailed(details) => {
+            validate_optional_name(details.name.as_deref())?;
+            (
+                details.name,
+                details.command,
+                normalize_working_directory(details.working_directory)?,
+                details.env,
+                details.timeout_seconds.or(default_timeout_seconds),
+            )
+        }
+    };
+
+    let command = command.trim().to_string();
+    if command.is_empty() {
+        bail!("validation command cannot be empty");
+    }
+    validate_env("validation", &env)?;
+    let timeout = timeout_seconds
+        .map(validate_timeout_seconds)
+        .transpose()?
+        .map(Duration::from_secs);
+
+    Ok(ValidationCommandPlan {
+        name,
+        command,
+        env,
+        timeout,
+        working_directory,
+    })
+}
+
+fn validate_optional_name(name: Option<&str>) -> Result<()> {
+    if name.is_some_and(|value| value.trim().is_empty()) {
+        bail!("validation command name cannot be empty");
+    }
+    Ok(())
 }
 
 fn validate_timeout_seconds(seconds: u64) -> Result<u64> {
@@ -469,7 +815,14 @@ struct SelectedWorktree {
 fn select_worktrees(
     manager: &WorktreeManager,
     plan: &OrchestrationPlan,
+    policy: WorktreeReusePolicy,
 ) -> Result<Vec<SelectedWorktree>> {
+    if policy == WorktreeReusePolicy::Reset {
+        bail!(
+            "worktree reuse policy 'reset' is not supported because it would require destructive git commands"
+        );
+    }
+
     let mut existing = manager
         .list()?
         .into_iter()
@@ -479,12 +832,25 @@ fn select_worktrees(
 
     for agent in &plan.agents {
         if let Some(record) = existing.remove(&agent.id) {
+            if policy == WorktreeReusePolicy::Fresh {
+                bail!(
+                    "worktree reuse policy 'fresh' requires no existing worktree for agent '{}' at {}",
+                    agent.id,
+                    record.path.display()
+                );
+            }
             ensure_reusable_worktree(&record)?;
             selected.push(SelectedWorktree {
                 record,
                 reused: true,
             });
             continue;
+        }
+        if policy == WorktreeReusePolicy::Required {
+            bail!(
+                "worktree reuse policy 'required' requires an existing clean worktree for agent '{}'",
+                agent.id
+            );
         }
 
         let record = manager.create(WorktreeCreateOptions {
@@ -559,6 +925,9 @@ fn run_agent_schedule(
 
         for (index, run_result) in outcomes {
             apply_command_result(&mut summaries[index], run_result);
+            if summaries[index].status == AgentRunStatus::Succeeded {
+                run_agent_validation_commands(&plan.agents[index], &mut summaries[index]);
+            }
             inspect_agent_changes(&plan.agents[index], &mut summaries[index], patch_dir);
             remaining.remove(&index);
 
@@ -836,6 +1205,123 @@ fn command_spec(agent: &AgentPlan, summary: &AgentRunSummary) -> Result<CommandR
     })
 }
 
+fn run_agent_validation_commands(agent: &AgentPlan, summary: &mut AgentRunSummary) {
+    let Some(worktree) = summary.worktree.as_ref() else {
+        fail_summary(summary, "agent has no selected worktree for validation");
+        return;
+    };
+    let worktree_path = worktree.path.clone();
+
+    for validation in &agent.validation_commands {
+        let run_summary = run_validation_command(validation, &worktree_path);
+        if run_summary.status != AgentRunStatus::Succeeded {
+            fail_summary(
+                summary,
+                validation_failure_message("agent validation", &run_summary),
+            );
+        }
+        summary.validation.push(run_summary);
+        if summary.status != AgentRunStatus::Succeeded {
+            break;
+        }
+    }
+}
+
+fn run_repo_validation_commands(
+    plan: &OrchestrationPlan,
+    repo: &Path,
+) -> Vec<ValidationRunSummary> {
+    let mut summaries = Vec::new();
+    for validation in &plan.repo_validation_commands {
+        let run_summary = run_validation_command(validation, repo);
+        let failed = run_summary.status != AgentRunStatus::Succeeded;
+        summaries.push(run_summary);
+        if failed {
+            break;
+        }
+    }
+    summaries
+}
+
+fn run_validation_command(validation: &ValidationCommandPlan, root: &Path) -> ValidationRunSummary {
+    let working_directory = validation
+        .working_directory
+        .as_ref()
+        .map(|path| root.join(path))
+        .unwrap_or_else(|| root.to_path_buf());
+    let result = run_agent_command(CommandRunSpec {
+        command: validation.command.clone(),
+        working_directory,
+        env: validation.env.clone(),
+        timeout: validation.timeout,
+    });
+    validation_summary_from_result(validation, result)
+}
+
+fn validation_summary_from_result(
+    validation: &ValidationCommandPlan,
+    result: std::io::Result<CommandRunResult>,
+) -> ValidationRunSummary {
+    let mut summary = ValidationRunSummary {
+        name: validation.name.clone(),
+        command: validation.command.clone(),
+        working_directory: validation.working_directory.clone(),
+        timeout_seconds: validation.timeout.map(|timeout| timeout.as_secs()),
+        status: AgentRunStatus::Pending,
+        exit_code: None,
+        duration_ms: None,
+        timed_out: false,
+        stdout: OutputSummary::default(),
+        stderr: OutputSummary::default(),
+        error: None,
+    };
+
+    match result {
+        Ok(result) => {
+            summary.exit_code = result.status.and_then(|status| status.code());
+            summary.duration_ms = Some(result.duration_ms);
+            summary.timed_out = result.timed_out;
+            summary.stdout = result.stdout;
+            summary.stderr = result.stderr;
+            if let Some(error) = result.process_error {
+                summary.status = AgentRunStatus::Failed;
+                summary.error = Some(error);
+            } else if result.timed_out {
+                summary.status = AgentRunStatus::Failed;
+                summary.error = Some(match summary.timeout_seconds {
+                    Some(seconds) => {
+                        format!("validation command timed out after {seconds} seconds")
+                    }
+                    None => "validation command timed out".to_string(),
+                });
+            } else if result.status.is_some_and(|status| status.success()) {
+                summary.status = AgentRunStatus::Succeeded;
+            } else {
+                summary.status = AgentRunStatus::Failed;
+                summary.error = Some(match result.status.and_then(|status| status.code()) {
+                    Some(code) => format!("validation command exited with status {code}"),
+                    None => "validation command terminated without an exit code".to_string(),
+                });
+            }
+        }
+        Err(error) => {
+            summary.status = AgentRunStatus::Failed;
+            summary.error = Some(format!("failed to run validation command: {error}"));
+        }
+    }
+
+    summary
+}
+
+fn validation_failure_message(scope: &str, summary: &ValidationRunSummary) -> String {
+    let label = summary.name.as_deref().unwrap_or(summary.command.as_str());
+    let reason = summary
+        .error
+        .as_deref()
+        .unwrap_or("validation command failed");
+    format!("{scope} '{label}' failed: {reason}")
+}
+
 #[derive(Debug, Clone)]
 struct CommandRunSpec {
     command: String,
@@ -846,7 +1332,9 @@ struct CommandRunSpec {
 
 fn run_agent_command(spec: CommandRunSpec) -> std::io::Result<CommandRunResult> {
     let started = Instant::now();
-    let mut child = shell_command(&spec.command)
+    let mut command = shell_command(&spec.command);
+    configure_timeout_process_control(&mut command);
+    let mut child = command
         .current_dir(&spec.working_directory)
         .envs(&spec.env)
         .stdout(Stdio::piped())
@@ -866,17 +1354,15 @@ fn run_agent_command(spec: CommandRunSpec) -> std::io::Result<CommandRunResult> 
                 };
             }
 
-            if started.elapsed() >= timeout {
-                let kill_result = child.kill();
+            if command_timed_out(started, timeout) {
+                let process_error = terminate_child_on_timeout(&mut child);
                 let output = child.wait_with_output()?;
                 break TimedOutput {
                     status: Some(output.status),
                     timed_out: true,
                     stdout: output.stdout,
                     stderr: output.stderr,
-                    process_error: kill_result
-                        .err()
-                        .map(|error| format!("command timed out but process kill failed: {error}")),
+                    process_error,
                 };
             }
 
@@ -901,6 +1387,84 @@ fn run_agent_command(spec: CommandRunSpec) -> std::io::Result<CommandRunResult> 
         stderr: summarize_output(&output.stderr),
         process_error: output.process_error,
     })
+}
+
+fn command_timed_out(started: Instant, timeout: Duration) -> bool {
+    started.elapsed() >= timeout
+}
+
+fn configure_timeout_process_control(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
+    #[cfg(unix)]
+    {
+        terminate_unix_process_group(child)
+    }
+
+    #[cfg(not(unix))]
+    {
+        child
+            .kill()
+            .err()
+            .map(|error| format!("command timed out but process kill failed: {error}"))
+    }
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
+    let pid = child.id();
+    let term_error = send_unix_process_group_signal(pid, "TERM").err();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => return Some(format!("command timed out but wait failed: {error}")),
+        }
+    }
+
+    let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
+    kill_result.err().map(|error| {
+        if let Some(term_error) = term_error {
+            format!(
+                "command timed out but process group termination failed: {term_error}; kill failed: {error}"
+            )
+        } else {
+            format!("command timed out but process group kill failed: {error}")
+        }
+    })
+}
+
+#[cfg(unix)]
+fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(unix_process_group_target(pid))
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "kill -{signal} {} exited with {status}",
+            unix_process_group_target(pid)
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_group_target(pid: u32) -> String {
+    format!("-{pid}")
 }
 
 fn shell_command(command: &str) -> Command {
@@ -992,6 +1556,180 @@ fn summarize_output(output: &[u8]) -> OutputSummary {
     }
 }
 
+struct CheckpointView<'a> {
+    repo: &'a Path,
+    plan_file: &'a Path,
+    keep_claims: bool,
+    worktree_reuse_policy: WorktreeReusePolicy,
+    success: bool,
+    agents: &'a [AgentRunSummary],
+    repo_validation: &'a [ValidationRunSummary],
+    released_claims: &'a [PathClaim],
+    release_errors: &'a [String],
+}
+
+pub fn write_run_checkpoint(directory: &Path, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create checkpoint directory {}",
+            directory.display()
+        )
+    })?;
+    let path = checkpoint_path(directory, &checkpoint.run_id);
+    let temp_path = temp_checkpoint_path(&path);
+    let result = write_checkpoint_file(&temp_path, &path, checkpoint);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result?;
+    Ok(path)
+}
+
+pub fn read_run_checkpoint(path: &Path) -> Result<RunCheckpoint> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read checkpoint {}", path.display()))?;
+    let checkpoint: RunCheckpoint = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse checkpoint {}", path.display()))?;
+    if checkpoint.version != CHECKPOINT_STATE_VERSION {
+        bail!(
+            "unsupported checkpoint version {} in {}",
+            checkpoint.version,
+            path.display()
+        );
+    }
+    Ok(checkpoint)
+}
+
+pub fn checkpoint_path(directory: &Path, run_id: &RunId) -> PathBuf {
+    directory.join(format!("{}.json", run_id.as_str()))
+}
+
+fn write_checkpoint_if_configured(
+    controls: &OrchestrationRunControls,
+    stage: RunCheckpointStage,
+    run_id: &Option<RunId>,
+    view: CheckpointView<'_>,
+) -> Result<()> {
+    let Some(directory) = controls.checkpoint_dir.as_deref() else {
+        return Ok(());
+    };
+    let Some(run_id) = run_id.clone() else {
+        return Ok(());
+    };
+
+    let checkpoint = RunCheckpoint {
+        version: CHECKPOINT_STATE_VERSION,
+        run_id,
+        stage,
+        repo: view.repo.to_path_buf(),
+        plan_file: view.plan_file.to_path_buf(),
+        keep_claims: view.keep_claims,
+        worktree_reuse_policy: view.worktree_reuse_policy,
+        success: view.success,
+        agents: view.agents.iter().map(AgentCheckpoint::from).collect(),
+        repo_validation: view.repo_validation.to_vec(),
+        released_claims: view.released_claims.to_vec(),
+        release_errors: view.release_errors.to_vec(),
+        updated_unix_ms: unix_time_millis(),
+    };
+    write_run_checkpoint(directory, &checkpoint)?;
+    Ok(())
+}
+
+impl From<&AgentRunSummary> for AgentCheckpoint {
+    fn from(summary: &AgentRunSummary) -> Self {
+        Self {
+            id: summary.id.clone(),
+            status: summary.status,
+            worktree: summary
+                .worktree
+                .as_ref()
+                .map(CheckpointWorktreeRecord::from),
+            claim: summary.claim.clone(),
+            changed_paths: summary.changed_paths.clone(),
+            unclaimed_changed_paths: summary.unclaimed_changed_paths.clone(),
+            validation: summary.validation.clone(),
+            error: summary.error.clone(),
+        }
+    }
+}
+
+impl From<&WorktreeRecord> for CheckpointWorktreeRecord {
+    fn from(record: &WorktreeRecord) -> Self {
+        Self {
+            name: record.name.clone(),
+            path: record.path.clone(),
+            branch: record.branch.clone(),
+        }
+    }
+}
+
+fn write_checkpoint_file(
+    temp_path: &Path,
+    checkpoint_path: &Path,
+    checkpoint: &RunCheckpoint,
+) -> Result<()> {
+    let mut file = File::create(temp_path).with_context(|| {
+        format!(
+            "failed to create temporary checkpoint {}",
+            temp_path.display()
+        )
+    })?;
+    serde_json::to_writer_pretty(&mut file, checkpoint).with_context(|| {
+        format!(
+            "failed to write temporary checkpoint {}",
+            temp_path.display()
+        )
+    })?;
+    file.write_all(b"\n").with_context(|| {
+        format!(
+            "failed to finish temporary checkpoint {}",
+            temp_path.display()
+        )
+    })?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed to flush temporary checkpoint {}",
+            temp_path.display()
+        )
+    })?;
+    drop(file);
+    fs::rename(temp_path, checkpoint_path).with_context(|| {
+        format!(
+            "failed to replace checkpoint {} with {}",
+            checkpoint_path.display(),
+            temp_path.display()
+        )
+    })
+}
+
+fn temp_checkpoint_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkpoint.json");
+    path.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
+}
+
+fn resolve_run_id(controls: &OrchestrationRunControls) -> Result<Option<RunId>> {
+    match (&controls.run_id, &controls.checkpoint_dir) {
+        (Some(run_id), _) => Ok(Some(run_id.clone())),
+        (None, Some(_)) => generated_run_id().map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn generated_run_id() -> Result<RunId> {
+    RunId::new(format!("run-{}-{}", unix_time_millis(), process::id()))
+}
+
+fn unix_time_millis() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration_millis(duration),
+        Err(_) => 0,
+    }
+}
+
 fn release_claims(store: &SyncStore, tokens: Vec<ClaimToken>) -> (Vec<PathClaim>, Vec<String>) {
     let mut released = Vec::new();
     let mut errors = Vec::new();
@@ -1077,6 +1815,9 @@ mod tests {
         let plan = load_plan(&plan_path).expect("load plan");
 
         assert_eq!(plan.agents[0].timeout, Some(Duration::from_secs(30)));
+        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Clean);
+        assert!(plan.repo_validation_commands.is_empty());
+        assert!(plan.agents[0].validation_commands.is_empty());
         assert_eq!(plan.agents[1].depends_on, vec!["agent-a"]);
         assert_eq!(plan.agents[1].working_directory, Some(PathBuf::from("src")));
         assert_eq!(
@@ -1084,6 +1825,84 @@ mod tests {
             Some("ok")
         );
         assert_eq!(plan.agents[1].timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn load_plan_accepts_validation_commands_and_reuse_policy() {
+        let temp = TempDir::new().expect("tempdir");
+        let plan_path = temp.path().join("plan.json");
+        fs::write(
+            &plan_path,
+            r#"{
+              "worktree_reuse_policy": "required",
+              "repo_validation_commands": [
+                "cargo fmt -- --check",
+                {
+                  "name": "unit tests",
+                  "command": "cargo test",
+                  "working_directory": "src",
+                  "env": {"RUST_BACKTRACE": "1"},
+                  "timeout_seconds": 20
+                }
+              ],
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["src"],
+                  "command": "true",
+                  "validation_commands": [
+                    {"name": "agent check", "command": "cargo check", "timeout_seconds": 10}
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let plan = load_plan(&plan_path).expect("load plan");
+
+        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Required);
+        assert_eq!(plan.repo_validation_commands.len(), 2);
+        assert_eq!(
+            plan.repo_validation_commands[1].working_directory,
+            Some(PathBuf::from("src"))
+        );
+        assert_eq!(
+            plan.repo_validation_commands[1]
+                .env
+                .get("RUST_BACKTRACE")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            plan.agents[0].validation_commands[0].timeout,
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn worktree_reuse_policy_defaults_and_rejects_reset_execution() {
+        let temp = TempDir::new().expect("tempdir");
+        let plan_path = temp.path().join("plan.json");
+        fs::write(
+            &plan_path,
+            r#"{"agents":[{"id":"agent-a","paths":["src"],"command":"true"}]}"#,
+        )
+        .expect("write plan");
+        let plan = load_plan(&plan_path).expect("load plan");
+        assert_eq!(plan.worktree_reuse_policy, WorktreeReusePolicy::Clean);
+
+        let error = select_worktrees(
+            &WorktreeManager::new(temp.path().join("missing-repo")),
+            &OrchestrationPlan {
+                agents: Vec::new(),
+                repo_validation_commands: Vec::new(),
+                worktree_reuse_policy: WorktreeReusePolicy::Reset,
+            },
+            WorktreeReusePolicy::Reset,
+        )
+        .expect_err("reset should be refused before inspecting repo");
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]
@@ -1456,6 +2275,187 @@ mod tests {
         assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
         assert!(summary.agents[0].timed_out);
         assert_eq!(summary.agents[1].status, AgentRunStatus::Skipped);
+    }
+
+    #[test]
+    fn agent_validation_failure_is_reported_with_bounded_output() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["README.md"],
+                  "command": "true",
+                  "validation_commands": [
+                    {"name": "check", "command": "printf 'validation failed' >&2; false"}
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path,
+            plan_file,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("run plan");
+
+        assert!(!summary.success);
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
+        assert_eq!(summary.agents[0].validation.len(), 1);
+        assert_eq!(
+            summary.agents[0].validation[0].status,
+            AgentRunStatus::Failed
+        );
+        assert_eq!(
+            summary.agents[0].validation[0].stderr.text,
+            "validation failed"
+        );
+        assert!(!summary.agents[0].validation[0].stderr.truncated);
+        assert!(summary.agents[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("agent validation 'check' failed"));
+    }
+
+    #[test]
+    fn repo_validation_failure_is_reported_in_summary() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "repo_validation_commands": [
+                {"name": "repo check", "command": "printf 'repo failed' >&2; false"}
+              ],
+              "agents": [
+                {"id": "agent-a", "paths": ["README.md"], "command": "true"}
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path,
+            plan_file,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("run plan");
+
+        assert!(!summary.success);
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
+        assert_eq!(summary.repo_validation.len(), 1);
+        assert_eq!(summary.repo_validation[0].status, AgentRunStatus::Failed);
+        assert_eq!(summary.repo_validation[0].stderr.text, "repo failed");
+    }
+
+    #[test]
+    fn checkpoint_helpers_round_trip_serialized_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let run_id = RunId::new("run-1").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: run_id.clone(),
+            stage: RunCheckpointStage::Final,
+            repo: PathBuf::from("repo"),
+            plan_file: PathBuf::from("plan.json"),
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            success: true,
+            agents: vec![AgentCheckpoint {
+                id: "agent-a".to_string(),
+                status: AgentRunStatus::Succeeded,
+                worktree: Some(CheckpointWorktreeRecord {
+                    name: "agent-a".to_string(),
+                    path: PathBuf::from("worktrees/agent-a"),
+                    branch: "maco/agent-a".to_string(),
+                }),
+                claim: None,
+                changed_paths: vec![PathBuf::from("README.md")],
+                unclaimed_changed_paths: Vec::new(),
+                validation: Vec::new(),
+                error: None,
+            }],
+            repo_validation: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+
+        let path = write_run_checkpoint(temp.path(), &checkpoint).expect("write checkpoint");
+        assert_eq!(path, checkpoint_path(temp.path(), &run_id));
+        let loaded = read_run_checkpoint(&path).expect("read checkpoint");
+        assert_eq!(loaded, checkpoint);
+    }
+
+    #[test]
+    fn checkpoint_controls_write_final_run_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{"agents":[{"id":"agent-a","paths":["README.md"],"command":"true"}]}"#,
+        )
+        .expect("write plan");
+        let run_id = RunId::new("checkpoint-test").expect("run id");
+
+        let summary = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path,
+                plan_file,
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: Some(run_id.clone()),
+                checkpoint_dir: Some(checkpoint_dir.clone()),
+                worktree_reuse_policy: None,
+            },
+        )
+        .expect("run plan");
+
+        assert!(summary.success);
+        let checkpoint =
+            read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
+        assert_eq!(checkpoint.stage, RunCheckpointStage::Final);
+        assert!(checkpoint.success);
+        assert_eq!(checkpoint.agents[0].id, "agent-a");
+    }
+
+    #[test]
+    fn process_control_helpers_are_deterministic() {
+        let started = Instant::now() - Duration::from_millis(5);
+        assert!(command_timed_out(started, Duration::from_millis(1)));
+
+        #[cfg(unix)]
+        assert_eq!(unix_process_group_target(42), "-42");
     }
 
     fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
