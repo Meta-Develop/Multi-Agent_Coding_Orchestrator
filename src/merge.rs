@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -679,6 +680,7 @@ fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
     let paths = collect_changed_paths(&repo, None)?
         .into_iter()
         .map(|change| change.path)
+        .filter(|path| !is_local_runtime_path(path))
         .collect::<Vec<_>>();
 
     if paths.is_empty() {
@@ -694,6 +696,14 @@ fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
             paths,
         })
     }
+}
+
+fn is_local_runtime_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Normal(name))
+            if name == OsStr::new(".maco") || name == OsStr::new(".maco-cache")
+    )
 }
 
 fn stale_base_check(metadata: &WorktreeMergeMetadata) -> SafetyCheck {

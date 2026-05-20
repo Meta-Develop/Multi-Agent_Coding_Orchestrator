@@ -63,6 +63,17 @@ The current implementation covers a local-first command-line slice:
   launching workers or applying changes.
 - `maco supervise collect` reads the structured supervisor final report and
   preserves the same no-automatic-primary-apply boundary.
+- `maco autopilot plan/run/status/collect` provides the first local-first
+  autopilot workflow: normalize a task or plan, run a supervised child worker in
+  fake/local mode by default, publish through the PR safety gates, run an
+  independent reviewer, and write public-safe reports under
+  `.maco/autopilot/runs/<run-id>/`.
+- `maco review pr <number|url>` emits an independent fake structured review
+  report by default, with `ci_reaction_supported=false`.
+- `maco inbox scan/run/status/collect/watch` provides a fake-first reaction
+  loop for issue intake, pull request review feedback, and failing CI checks,
+  converting safe inbox items into autopilot repair plans without network access
+  or automatic merge by default.
 
 ## Roadmap
 
@@ -87,11 +98,19 @@ Known limitations and post-release roadmap for 0.1.0:
 3. PR and issue publication are intentionally narrow. The fake forge is
    deterministic and local-only. GitHub publication is opt-in with explicit
    `--forge github` and shells out to local `git` and `gh`; tests cover the
-   fake adapter without network access. Issue triage metadata remains minimal.
+   fake adapter without network access. Autopilot keeps the same boundary:
+   GitHub publication is selected only by a plan's explicit
+   `forge_mode: "github"`. Inbox intake keeps deterministic fake data as the default;
+   GitHub inbox scanning is selected only with an explicit GitHub source.
+   Issue triage metadata remains minimal.
 4. Real LLM providers remain post-release roadmap work and must be opt-in,
    explicitly approved, and covered by additional invariant tests.
 5. Semantic-map caching and broader language adapters are post-release roadmap
    work after the Rust path is stable.
+6. Automatic merge remains intentionally absent. Autopilot can record
+   `auto_merge=true` as a request, but always reports
+   `auto_merge_performed=false` and leaves human review and merge as the next
+   action.
 
 Network-facing LLM behavior should remain optional. The default development and
 test workflow should continue to run without provider credentials.
@@ -467,6 +486,116 @@ parallel execution limit yet. The command refuses to start when the primary
 worktree is dirty; use `--allow-dirty-primary` only when the operator has
 reviewed that state. Tests use fake subprocesses by default and do not require
 network access, provider credentials, or a real Codex login.
+
+Run the fake-first autopilot workflow:
+
+```json
+{
+  "version": 1,
+  "task": {
+    "title": "Update README",
+    "body": "Make the README clearer without touching Rust code."
+  },
+  "assigned_paths": ["README.md"],
+  "semantic_symbols": [],
+  "semantic_modules": [],
+  "validation_commands": ["cargo test"],
+  "max_repair_attempts": 1,
+  "forge_mode": "fake",
+  "reviewer": {
+    "mode": "fake"
+  },
+  "publish_mode": "draft_only",
+  "auto_merge": false
+}
+```
+
+```bash
+cargo run -- autopilot plan autopilot-plan.json --repo . --json
+cargo run -- autopilot run autopilot-plan.json --repo . --run-id readme-demo --json
+cargo run -- autopilot status readme-demo --repo . --json
+cargo run -- autopilot collect readme-demo --repo . --json
+cargo run -- review pr 123 --repo . --json
+```
+
+Plain task files are accepted too; the first non-empty line becomes the title
+and the default assigned path is `README.md`. Autopilot stores
+`plan.json`, `supervisor-report.json`, `pr-report.json`, `review-report.json`,
+and `final-report.json` under `.maco/autopilot/runs/<run-id>/`. These reports
+use repo-relative paths and omit nested merge-preview paths and full diffs.
+
+By default, autopilot creates a deterministic fake child subprocess locally, uses
+the fake forge, and runs the fake reviewer. It does not require network access,
+credentials, or a real Codex binary. Passing `--codex-bin` opts into an external
+Codex-compatible executable. Setting `forge_mode` to `github` in the plan opts
+into `git push` and `gh pr create`; fake remains the default. Passing
+`--reviewer-command` opts into an external reviewer command. The independent
+review report uses a separate reviewer identity from the child worker, includes
+structured findings with `blocking`, and currently reports
+`ci_reaction_supported=false`.
+
+Autopilot refuses to launch when the primary worktree is dirty unless
+`--allow-dirty-primary` is supplied, when active sync claims exist, when active
+semantic intents exist, or when active/blocked live claim locks exist. It also
+relies on the existing supervise and PR safety gates for stale/dirty child
+worktree reuse and unclaimed edits. Blocking review findings or failed
+validation trigger repair attempts up to `max_repair_attempts`. Autopilot never
+auto-merges: `auto_merge=true` is accepted and reported as requested, but
+`auto_merge_performed` is always `false`.
+
+Run the fake-first inbox reaction loop:
+
+```json
+{
+  "action_policy": "fake",
+  "selection": {"max_items": 2},
+  "max_repair_attempts": 1,
+  "default_validation_commands": [
+    {"name": "smoke", "command": "cargo test", "timeout_seconds": 60}
+  ],
+  "default_assigned_paths": ["README.md"],
+  "privacy": {"allow_private_bodies": false}
+}
+```
+
+```bash
+cargo run -- inbox scan --repo . --json
+cargo run -- inbox run --repo . --run-id inbox-demo --json
+cargo run -- inbox status inbox-demo --repo . --json
+cargo run -- inbox collect inbox-demo --repo . --json
+cargo run -- inbox watch --repo . --poll-seconds 60 --once --json
+```
+
+`maco-inbox.json` is optional. Without it, `maco inbox scan` uses deterministic
+fake local data: one safe issue candidate, one PR candidate with requested review
+changes and failing CI context, one unsafe item that is skipped, and duplicate
+skipping evidence. Public JSON uses the typed schema fields `version`, `repo`,
+`action_policy`, `github_enabled`, `success`, `refused`, `refusals`,
+`candidate_count`, `selected_count`, `items`, and `next_action`; `repo` is the
+public `"."` placeholder rather than a local absolute path. Item bodies are
+bounded summaries with token-like values redacted, private key material refused,
+and local absolute paths such as `/mnt/...`, `/home/...`, or `C:\Users\...`
+rejected.
+
+`maco inbox run` processes selected candidates through the same fake-first
+autopilot flow unless config `action_policy` or CLI `--dry-run` selects dry-run
+mode. `--max-items` overrides config selection for a scan, run, or watch command.
+`timeout_seconds` is honored for validation commands that do not return.
+
+Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
+including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
+`item-<n>-autopilot-report.json`, `item-<n>-github-report.json`, and
+`final-report.json`. Reports use repository-relative paths and do not include
+full diffs, raw secret values, credentials, or local absolute paths.
+
+GitHub inbox intake is explicit opt-in with `--github` or
+`action_policy: "github"` in `maco-inbox.json`. Fake mode remains the default and
+does not require network access or credentials. Inbox also preserves the same
+safety boundary as autopilot: it refuses active local locks, active sync claims,
+active semantic intents, and dirty primary worktree files while ignoring its own
+`.maco/**` and `.maco-cache/**` runtime artifacts. Inbox never performs
+automatic merge; human review remains the next action after a successful
+reaction.
 
 Cleanup examples:
 
