@@ -3,6 +3,8 @@ use crate::{
         self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
         ProviderCommandPolicy,
     },
+    autopilot::{self, AutopilotRunOptions},
+    inbox::{self, InboxRunOptions, InboxScanOptions, InboxWatchOptions},
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
@@ -20,6 +22,7 @@ use crate::{
     },
     repo_map::{self, RepoEntryKind, RepoMap},
     repo_semantic::{self, SemanticRepoMap},
+    review::{self, ReviewPrOptions, ReviewerConfig, ReviewerMode},
     semantic_coord::{
         SemanticCoordinationReport, SemanticIntentRequest, SemanticIntentStore, SemanticIntentToken,
     },
@@ -65,6 +68,9 @@ impl Cli {
             Command::Coord(command) => command.run(),
             Command::Orchestrate(command) => command.run(),
             Command::Supervise(command) => command.run(),
+            Command::Inbox(command) => command.run(),
+            Command::Autopilot(command) => command.run(),
+            Command::Review(command) => command.run(),
             Command::Agent(command) => command.run(),
             Command::Llm(command) => command.run(),
         }
@@ -95,6 +101,12 @@ enum Command {
     Orchestrate(OrchestrateCommand),
     /// Run opt-in Codex CLI supervisor-of-orchestrators plans.
     Supervise(SuperviseCommand),
+    /// Scan and react to safe GitHub issue and pull request inbox items.
+    Inbox(InboxCommand),
+    /// Run local-first autopilot workflow phases.
+    Autopilot(AutopilotCommand),
+    /// Run independent review adapters.
+    Review(ReviewCommand),
     /// Run a provider-backed agent in an isolated worktree.
     Agent(AgentCommand),
     /// Inspect local LLM adapter boundaries without network calls.
@@ -515,6 +527,366 @@ struct CollectSuperviseArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct InboxCommand {
+    #[command(subcommand)]
+    command: InboxSubcommand,
+}
+
+impl InboxCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            InboxSubcommand::Scan(args) => {
+                let report = inbox::scan_inbox(InboxScanOptions {
+                    repo: args.repo,
+                    github: args.github,
+                    max_items: args.max_items,
+                    action_policy_override: None,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox scan refused");
+                }
+                Ok(())
+            }
+            InboxSubcommand::Run(args) => {
+                let report = inbox::run_inbox(InboxRunOptions {
+                    repo: args.repo,
+                    run_id: RunId::new(&args.run_id)?,
+                    github: args.github,
+                    dry_run: args.dry_run,
+                    max_items: args.max_items,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox run failed");
+                }
+                Ok(())
+            }
+            InboxSubcommand::Status(args) => {
+                let report = inbox::inbox_status(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)
+            }
+            InboxSubcommand::Collect(args) => {
+                let report = inbox::collect_inbox_run(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)?;
+                if report
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|success| !success)
+                {
+                    bail!("inbox run failed");
+                }
+                Ok(())
+            }
+            InboxSubcommand::Watch(args) => {
+                let report = inbox::watch_inbox(InboxWatchOptions {
+                    repo: args.repo,
+                    poll_seconds: args.poll_seconds,
+                    once: args.once,
+                    github: args.github,
+                    dry_run: args.dry_run,
+                    max_items: args.max_items,
+                })?;
+                print_query_report(&report, args.json)?;
+                if report.runs.iter().any(|run| !run.success) {
+                    bail!("inbox watch observed a failed run");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum InboxSubcommand {
+    /// Scan safe issue and pull request candidates without launching work.
+    Scan(ScanInboxArgs),
+    /// Scan and process selected inbox items under a stable run id.
+    Run(RunInboxArgs),
+    /// Report durable inbox run artifact state.
+    Status(StatusInboxArgs),
+    /// Collect the durable inbox final report.
+    Collect(CollectInboxArgs),
+    /// Poll for inbox items and react according to policy.
+    Watch(WatchInboxArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScanInboxArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Maximum number of safe items selected for work.
+    #[arg(long)]
+    max_items: Option<usize>,
+    /// Enable real GitHub API reads through the local gh CLI.
+    #[arg(long)]
+    github: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunInboxArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/inbox/runs/<run-id>` artifacts.
+    #[arg(long)]
+    run_id: String,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Maximum number of safe items selected for work.
+    #[arg(long)]
+    max_items: Option<usize>,
+    /// Enable real GitHub API reads/comments and GitHub publication through gh.
+    #[arg(long)]
+    github: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusInboxArgs {
+    /// Run id to inspect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectInboxArgs {
+    /// Run id to collect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchInboxArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Seconds between poll iterations.
+    #[arg(long, default_value_t = 60)]
+    poll_seconds: u64,
+    /// Run one poll iteration and return.
+    #[arg(long)]
+    once: bool,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Maximum number of safe items selected for work.
+    #[arg(long)]
+    max_items: Option<usize>,
+    /// Enable real GitHub API reads/comments and GitHub publication through gh.
+    #[arg(long)]
+    github: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AutopilotCommand {
+    #[command(subcommand)]
+    command: AutopilotSubcommand,
+}
+
+impl AutopilotCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            AutopilotSubcommand::Plan(args) => {
+                let plan = autopilot::autopilot_plan_from_task_file(args.repo, args.task_file)?;
+                print_query_report(&plan, args.json)
+            }
+            AutopilotSubcommand::Run(args) => {
+                let run_id = RunId::new(&args.run_id)?;
+                let report = autopilot::run_autopilot_plan_file(AutopilotRunOptions {
+                    repo: args.repo,
+                    plan_file: args.task_file,
+                    run_id,
+                    codex_bin: args.codex_bin,
+                    reviewer_command: args.reviewer_command,
+                    allow_dirty_primary: args.allow_dirty_primary,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("autopilot run failed");
+                }
+                Ok(())
+            }
+            AutopilotSubcommand::Status(args) => {
+                let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)
+            }
+            AutopilotSubcommand::Collect(args) => {
+                let report =
+                    autopilot::collect_autopilot_run(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)?;
+                if report
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|success| !success)
+                {
+                    bail!("autopilot run failed");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AutopilotSubcommand {
+    /// Normalize a task file or JSON autopilot plan without running it.
+    Plan(PlanAutopilotArgs),
+    /// Run the fake-first autopilot workflow.
+    Run(RunAutopilotArgs),
+    /// Report durable autopilot run artifact state.
+    Status(StatusAutopilotArgs),
+    /// Collect the durable autopilot final report.
+    Collect(CollectAutopilotArgs),
+}
+
+#[derive(Debug, Args)]
+struct PlanAutopilotArgs {
+    /// Task file or JSON autopilot plan file.
+    task_file: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunAutopilotArgs {
+    /// Task file or JSON autopilot plan file.
+    task_file: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts.
+    #[arg(long)]
+    run_id: String,
+    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// External reviewer shell command. Omit for deterministic fake review mode.
+    #[arg(long)]
+    reviewer_command: Option<String>,
+    /// Allow autopilot to run when the primary worktree is dirty.
+    #[arg(long)]
+    allow_dirty_primary: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusAutopilotArgs {
+    /// Run id to inspect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectAutopilotArgs {
+    /// Run id to collect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReviewCommand {
+    #[command(subcommand)]
+    command: ReviewSubcommand,
+}
+
+impl ReviewCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            ReviewSubcommand::Pr(args) => {
+                let target = review::target_from_pr_arg(&args.target)?;
+                let reviewer = if let Some(command) = args.reviewer_command {
+                    ReviewerConfig {
+                        mode: ReviewerMode::ExternalCommand,
+                        command: Some(command),
+                        timeout_seconds: args.timeout_seconds,
+                        ..ReviewerConfig::default()
+                    }
+                } else {
+                    ReviewerConfig {
+                        timeout_seconds: args.timeout_seconds,
+                        ..ReviewerConfig::default()
+                    }
+                };
+                let report = review::review_pr(ReviewPrOptions {
+                    repo: review::repo_path_for_review(args.repo),
+                    target,
+                    reviewer,
+                    attempt: 1,
+                    changed_paths: Vec::new(),
+                    diff_summary: None,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("review pr failed");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ReviewSubcommand {
+    /// Review a pull request target with a fake or explicit external reviewer.
+    Pr(ReviewPrArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReviewPrArgs {
+    /// Pull request number or URL.
+    target: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// External reviewer shell command. Omit for deterministic fake review mode.
+    #[arg(long)]
+    reviewer_command: Option<String>,
+    /// Timeout for the external reviewer command.
+    #[arg(long)]
+    timeout_seconds: Option<u64>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,

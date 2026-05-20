@@ -37,6 +37,22 @@ Coding Orchestrator.
   against the supervisor's starting primary HEAD, rejects unauthorized paths,
   and treats `max_child_processes` as a child assignment fan-out budget rather
   than a parallel execution limit.
+- First local-first autopilot workflow with
+  `maco autopilot plan/run/status/collect`. It normalizes task files or JSON
+  plans, writes durable `.maco/autopilot/runs/<run-id>/` artifacts, launches
+  supervised child work through a fake local subprocess by default, publishes
+  through the PR safety gates, runs an independent reviewer, and records repair
+  attempts for validation failures or blocking review findings.
+- Standalone `maco review pr <number|url>` command with a deterministic fake
+  structured review report by default. Review findings include severity, path,
+  summary, suggested fix, and blocking status. CI reaction is reported as
+  unsupported with `ci_reaction_supported=false`.
+- Fake-first inbox reaction loop with
+  `maco inbox scan/run/status/collect/watch`. It uses deterministic local fake
+  issue and PR data by default, redacts public JSON, skips unsafe or duplicate
+  items, converts issue intake plus PR review and failing CI context into
+  autopilot plans, writes `.maco/inbox/runs/<run-id>/` artifacts, and preserves
+  the no-network, no-credentials, no-automatic-merge default.
 - Opt-in PR and issue publication adapters. `maco pr preview` and
   `maco issue preview` are non-creating previews. `maco pr publish --forge
   fake|github` and `maco issue create --forge fake|github` either use the
@@ -71,9 +87,15 @@ Nix shell.
 - Semantic task planning and automatic path-claim proposal are not implemented.
 - PR and issue publication are intentionally minimal. The fake forge is
   local-only and covered by no-network tests. GitHub mode depends on local
-  `git` and `gh` setup and is selected only with explicit `--forge github`.
-  Issue triage metadata is limited to title, body, and labels. Richer PR
-  status, check, and review import remain future work.
+  `git` and `gh` setup and is selected only with explicit `--forge github` for
+  direct PR commands or `forge_mode: "github"` for autopilot plans. Issue
+  triage metadata is limited to title, body, and labels. Inbox GitHub intake is
+  also explicit opt-in; deterministic fake data remains the default. Richer PR
+  status, check, review import, and CI reaction remain future work.
+- Autopilot intentionally omits automatic merge. It accepts and reports
+  `auto_merge=true`, but always writes `auto_merge_performed=false` and leaves
+  human review and merge as the next action. Inbox reactions keep the same
+  boundary and do not apply or merge repaired work automatically.
 - Live claim liveness uses human-readable Markdown parsing. Missing timestamps
   are reported as stale risk instead of blocking command execution, and
   malformed timestamps are reported as unknown liveness.
