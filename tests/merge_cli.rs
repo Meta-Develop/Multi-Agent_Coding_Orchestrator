@@ -190,6 +190,46 @@ fn merge_preview_reports_unclaimed_edits_with_paths() -> Result<()> {
 }
 
 #[test]
+fn merge_preview_reports_committed_worktree_change() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\ncommitted\n")
+        .context("edit worktree")?;
+    let agent_repo = Repository::open(worktree_path).context("open agent repo")?;
+    commit_all(&agent_repo, "agent committed change").context("commit agent change")?;
+
+    let preview = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+
+    assert_eq!(preview["safety"]["readiness"]["status"], "safe");
+    assert_eq!(preview["candidate"]["changed_paths"][0], "README.md");
+    assert_eq!(
+        preview["candidate"]["unclaimed_changed_paths"]
+            .as_array()
+            .context("unclaimed array")?
+            .len(),
+        0
+    );
+    assert!(preview["candidate"]["diff"]["full"]
+        .as_str()
+        .context("full diff")?
+        .contains("committed"));
+
+    Ok(())
+}
+
+#[test]
 fn merge_validation_failure_blocks_and_force_only_forces_validation() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;

@@ -4,6 +4,24 @@ version = "0.1.0"
 edition = "2021"
 description = "Local-first multi-agent coding orchestrator"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/multi-agent-coding-orchestrator"
+exclude = [
+    ".agent/**",
+    ".agents/**",
+    ".maco/**",
+    ".maco-cache/**",
+    "AGENTS.md",
+]
+default-run = "maco"
+
+[[bin]]
+name = "multi-agent-coding-orchestrator"
+path = "src/main.rs"
+
+[[bin]]
+name = "maco"
+path = "src/bin/maco.rs"
 
 [dependencies]
 anyhow = "1"

@@ -68,6 +68,54 @@ fn cli_semantic_risk_report_emits_touched_symbols_and_dependency_impact() -> Res
     Ok(())
 }
 
+#[test]
+fn cli_semantic_coord_symbol_only_preview_reports_impacted_active_path() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("src")).context("create src")?;
+    Repository::init(&repo_path).context("init repo")?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub mod api;\npub mod client;\n",
+    )
+    .context("write lib")?;
+    fs::write(repo_path.join("src/api.rs"), "pub fn endpoint() {}\n").context("write api")?;
+    fs::write(
+        repo_path.join("src/client.rs"),
+        "use crate::api::endpoint;\npub fn call() { endpoint(); }\n",
+    )
+    .context("write client")?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+
+    let claim = run_success_json([
+        "coord",
+        "claim",
+        "agent-a",
+        "--repo",
+        repo,
+        "--path",
+        "src/client.rs",
+        "--json",
+    ])?;
+    assert_eq!(claim["persisted"], true);
+
+    let preview = run_success_json([
+        "coord", "preview", "agent-b", "--repo", repo, "--symbol", "endpoint", "--json",
+    ])?;
+
+    assert_eq!(preview["persisted"], false);
+    assert_eq!(preview["intent"]["impacted_files"][0], "src/client.rs");
+    assert_eq!(
+        preview["conflicts"][0]["kind"],
+        "impacted_file_overlaps_active_path"
+    );
+    assert_eq!(preview["conflicts"][0]["severity"], "advisory");
+    assert_eq!(preview["has_blocking_conflicts"], false);
+    assert_eq!(preview["has_advisory_conflicts"], true);
+
+    Ok(())
+}
+
 fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {

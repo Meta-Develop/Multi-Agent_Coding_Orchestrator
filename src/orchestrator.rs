@@ -1,10 +1,14 @@
 use crate::{
+    semantic_coord::{
+        SemanticConflict, SemanticCoordinationReport, SemanticIntent, SemanticIntentRequest,
+        SemanticIntentStore, SemanticIntentToken,
+    },
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
     worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::{Oid, Repository, ResetType};
+use git2::{Delta, DiffOptions, Oid, Repository, ResetType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -30,6 +34,8 @@ pub struct OrchestrationPlan {
 pub struct AgentPlan {
     pub id: String,
     pub paths: Vec<PathBuf>,
+    pub semantic_symbols: Vec<String>,
+    pub semantic_modules: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub timeout: Option<Duration>,
     pub command: String,
@@ -57,6 +63,15 @@ pub enum WorktreeReusePolicy {
     Reset,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticCoordinationMode {
+    #[default]
+    Off,
+    Warn,
+    Block,
+}
+
 #[derive(Debug, Clone)]
 pub struct OrchestrationRunOptions {
     pub repo: PathBuf,
@@ -71,6 +86,7 @@ pub struct OrchestrationRunControls {
     pub run_id: Option<RunId>,
     pub checkpoint_dir: Option<PathBuf>,
     pub worktree_reuse_policy: Option<WorktreeReusePolicy>,
+    pub semantic_coordination: SemanticCoordinationMode,
 }
 
 #[derive(Debug, Clone)]
@@ -132,11 +148,17 @@ pub struct RunCheckpoint {
     pub plan_snapshot: Option<CheckpointPlanSnapshot>,
     pub keep_claims: bool,
     pub worktree_reuse_policy: WorktreeReusePolicy,
+    #[serde(default)]
+    pub semantic_coordination: SemanticCoordinationMode,
     pub success: bool,
     pub agents: Vec<AgentCheckpoint>,
     pub repo_validation: Vec<ValidationRunSummary>,
     pub released_claims: Vec<PathClaim>,
     pub release_errors: Vec<String>,
+    #[serde(default)]
+    pub released_semantic_intents: Vec<SemanticIntent>,
+    #[serde(default)]
+    pub semantic_release_errors: Vec<String>,
     pub updated_unix_ms: u64,
 }
 
@@ -146,6 +168,10 @@ pub struct AgentCheckpoint {
     pub status: AgentRunStatus,
     pub worktree: Option<CheckpointWorktreeRecord>,
     pub claim: Option<PathClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_intent: Option<SemanticIntent>,
+    #[serde(default)]
+    pub semantic_conflicts: Vec<SemanticConflict>,
     pub changed_paths: Vec<PathBuf>,
     pub unclaimed_changed_paths: Vec<PathBuf>,
     pub validation: Vec<ValidationRunSummary>,
@@ -170,6 +196,10 @@ pub struct CheckpointPlanSnapshot {
 pub struct CheckpointAgentPlanSnapshot {
     pub id: String,
     pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub semantic_symbols: Vec<String>,
+    #[serde(default)]
+    pub semantic_modules: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub timeout_seconds: Option<u64>,
     pub command: String,
@@ -210,6 +240,8 @@ impl From<&AgentPlan> for CheckpointAgentPlanSnapshot {
         Self {
             id: agent.id.clone(),
             paths: agent.paths.clone(),
+            semantic_symbols: agent.semantic_symbols.clone(),
+            semantic_modules: agent.semantic_modules.clone(),
             env: agent.env.clone(),
             timeout_seconds: agent.timeout.map(|timeout| timeout.as_secs()),
             command: agent.command.clone(),
@@ -243,11 +275,14 @@ pub struct OrchestrationSummary {
     pub plan_file: PathBuf,
     pub keep_claims: bool,
     pub worktree_reuse_policy: WorktreeReusePolicy,
+    pub semantic_coordination: SemanticCoordinationMode,
     pub success: bool,
     pub agents: Vec<AgentRunSummary>,
     pub repo_validation: Vec<ValidationRunSummary>,
     pub released_claims: Vec<PathClaim>,
     pub release_errors: Vec<String>,
+    pub released_semantic_intents: Vec<SemanticIntent>,
+    pub semantic_release_errors: Vec<String>,
 }
 
 impl OrchestrationSummary {
@@ -270,6 +305,8 @@ pub struct AgentRunSummary {
     pub worktree: Option<WorktreeRecord>,
     pub worktree_reused: bool,
     pub claim: Option<PathClaim>,
+    pub semantic_intent: Option<SemanticIntent>,
+    pub semantic_conflicts: Vec<SemanticConflict>,
     pub status: AgentRunStatus,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
@@ -295,6 +332,8 @@ impl AgentRunSummary {
             worktree: None,
             worktree_reused: false,
             claim: None,
+            semantic_intent: None,
+            semantic_conflicts: Vec::new(),
             status: AgentRunStatus::Pending,
             exit_code: None,
             duration_ms: None,
@@ -357,6 +396,10 @@ struct RawPlan {
 struct RawAgentPlan {
     id: String,
     paths: Vec<PathBuf>,
+    #[serde(default)]
+    semantic_symbols: Vec<String>,
+    #[serde(default)]
+    semantic_modules: Vec<String>,
     command: String,
     #[serde(default)]
     depends_on: Vec<String>,
@@ -437,6 +480,8 @@ pub fn run_plan_with_controls(
         .unwrap_or(plan.worktree_reuse_policy);
     let manager = WorktreeManager::new(&repo);
     let store = SyncStore::open(&repo)?;
+    let semantic_store = SemanticIntentStore::open(&repo)?;
+    let semantic_coordination = controls.semantic_coordination;
     let mut summaries = plan
         .agents
         .iter()
@@ -444,6 +489,7 @@ pub fn run_plan_with_controls(
         .collect::<Vec<_>>();
     let mut repo_validation = Vec::new();
     let mut acquired_tokens = Vec::new();
+    let mut acquired_semantic_tokens = Vec::new();
 
     let worktrees = select_worktrees(&manager, &store, &repo_head, &plan, worktree_reuse_policy)?;
     for (summary, worktree) in summaries.iter_mut().zip(worktrees) {
@@ -466,6 +512,8 @@ pub fn run_plan_with_controls(
             repo_validation: &repo_validation,
             released_claims: &[],
             release_errors: &[],
+            released_semantic_intents: &[],
+            semantic_release_errors: &[],
         },
     )?;
 
@@ -489,6 +537,11 @@ pub fn run_plan_with_controls(
                 } else {
                     release_claims(&store, acquired_tokens)
                 };
+                let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
+                    (Vec::new(), Vec::new())
+                } else {
+                    release_semantic_intents(&semantic_store, acquired_semantic_tokens)
+                };
                 write_checkpoint_if_configured(
                     &controls,
                     RunCheckpointStage::Final,
@@ -505,6 +558,8 @@ pub fn run_plan_with_controls(
                         repo_validation: &repo_validation,
                         released_claims: &released_claims,
                         release_errors: &release_errors,
+                        released_semantic_intents: &released_semantic_intents,
+                        semantic_release_errors: &semantic_release_errors,
                     },
                 )?;
                 return Ok(OrchestrationSummary {
@@ -513,16 +568,83 @@ pub fn run_plan_with_controls(
                     plan_file: options.plan_file,
                     keep_claims: options.keep_claims,
                     worktree_reuse_policy,
+                    semantic_coordination,
                     success: false,
                     agents: summaries,
                     repo_validation,
                     released_claims,
                     release_errors,
+                    released_semantic_intents,
+                    semantic_release_errors,
                 });
             }
         };
         acquired_tokens.push(claim.token);
         summaries[index].claim = Some(claim);
+    }
+    if semantic_coordination != SemanticCoordinationMode::Off {
+        if let Some(blocked_index) = coordinate_semantic_intents(
+            &semantic_store,
+            &plan,
+            &mut summaries,
+            semantic_coordination,
+            &mut acquired_semantic_tokens,
+        ) {
+            let blocked_agent = summaries[blocked_index].id.clone();
+            for (skipped_index, skipped) in summaries.iter_mut().enumerate() {
+                if skipped_index != blocked_index && skipped.status == AgentRunStatus::Pending {
+                    skipped.status = AgentRunStatus::Skipped;
+                    skipped.error = Some(format!(
+                        "skipped because semantic coordination failed for agent '{blocked_agent}'"
+                    ));
+                }
+            }
+            let (released_claims, release_errors) = if options.keep_claims {
+                (Vec::new(), Vec::new())
+            } else {
+                release_claims(&store, acquired_tokens)
+            };
+            let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
+                (Vec::new(), Vec::new())
+            } else {
+                release_semantic_intents(&semantic_store, acquired_semantic_tokens)
+            };
+            write_checkpoint_if_configured(
+                &controls,
+                RunCheckpointStage::Final,
+                &run_id,
+                CheckpointView {
+                    repo: &repo,
+                    repo_head: &repo_head,
+                    plan_file: &options.plan_file,
+                    plan: &plan,
+                    keep_claims: options.keep_claims,
+                    worktree_reuse_policy,
+                    success: false,
+                    agents: &summaries,
+                    repo_validation: &repo_validation,
+                    released_claims: &released_claims,
+                    release_errors: &release_errors,
+                    released_semantic_intents: &released_semantic_intents,
+                    semantic_release_errors: &semantic_release_errors,
+                },
+            )?;
+            return Ok(OrchestrationSummary {
+                run_id,
+                repo,
+                plan_file: options.plan_file,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                semantic_coordination,
+                success: false,
+                agents: summaries,
+                repo_validation,
+                released_claims,
+                release_errors,
+                released_semantic_intents,
+                semantic_release_errors,
+            });
+        }
     }
     write_checkpoint_if_configured(
         &controls,
@@ -540,6 +662,8 @@ pub fn run_plan_with_controls(
             repo_validation: &repo_validation,
             released_claims: &[],
             release_errors: &[],
+            released_semantic_intents: &[],
+            semantic_release_errors: &[],
         },
     )?;
 
@@ -548,6 +672,7 @@ pub fn run_plan_with_controls(
         &mut summaries,
         options.jobs,
         options.patch_dir.as_deref(),
+        &repo_head,
     )?;
     if summaries
         .iter()
@@ -571,6 +696,8 @@ pub fn run_plan_with_controls(
             repo_validation: &repo_validation,
             released_claims: &[],
             release_errors: &[],
+            released_semantic_intents: &[],
+            semantic_release_errors: &[],
         },
     )?;
 
@@ -579,7 +706,13 @@ pub fn run_plan_with_controls(
     } else {
         release_claims(&store, acquired_tokens)
     };
+    let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
+        (Vec::new(), Vec::new())
+    } else {
+        release_semantic_intents(&semantic_store, acquired_semantic_tokens)
+    };
     let success = release_errors.is_empty()
+        && semantic_release_errors.is_empty()
         && summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -602,6 +735,8 @@ pub fn run_plan_with_controls(
             repo_validation: &repo_validation,
             released_claims: &released_claims,
             release_errors: &release_errors,
+            released_semantic_intents: &released_semantic_intents,
+            semantic_release_errors: &semantic_release_errors,
         },
     )?;
 
@@ -611,11 +746,14 @@ pub fn run_plan_with_controls(
         plan_file: options.plan_file,
         keep_claims: options.keep_claims,
         worktree_reuse_policy,
+        semantic_coordination,
         success,
         agents: summaries,
         repo_validation,
         released_claims,
         release_errors,
+        released_semantic_intents,
+        semantic_release_errors,
     })
 }
 
@@ -670,6 +808,7 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
     validate_checkpoint_for_resume(&checkpoint, &plan, &repo_head)?;
     let manager = WorktreeManager::new(&repo);
     let store = SyncStore::open(&repo)?;
+    let semantic_store = SemanticIntentStore::open(&repo)?;
     let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
     validate_resume_worktrees(&manager, &plan, &checkpoint, &mut summaries, &repo_head)?;
 
@@ -680,10 +819,13 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
             plan_file,
             keep_claims: checkpoint.keep_claims,
             worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+            semantic_coordination: checkpoint.semantic_coordination,
             summaries,
             repo_validation: checkpoint.repo_validation,
             released_claims: checkpoint.released_claims,
             release_errors: checkpoint.release_errors,
+            released_semantic_intents: checkpoint.released_semantic_intents,
+            semantic_release_errors: checkpoint.semantic_release_errors,
         }));
     }
 
@@ -692,7 +834,83 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
         run_id: Some(checkpoint.run_id.clone()),
         checkpoint_dir: Some(checkpoint_dir),
         worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
+        semantic_coordination: checkpoint.semantic_coordination,
     };
+    let mut acquired_semantic_tokens =
+        active_checkpoint_semantic_tokens(&semantic_store, &summaries)?;
+    let had_pending_agents = summaries
+        .iter()
+        .any(|summary| summary.status == AgentRunStatus::Pending);
+    let has_checkpoint_semantic_reports = summaries
+        .iter()
+        .any(|summary| summary.semantic_intent.is_some() || !summary.semantic_conflicts.is_empty());
+    if checkpoint.semantic_coordination != SemanticCoordinationMode::Off
+        && had_pending_agents
+        && !has_checkpoint_semantic_reports
+    {
+        if let Some(blocked_index) = coordinate_semantic_intents(
+            &semantic_store,
+            &plan,
+            &mut summaries,
+            checkpoint.semantic_coordination,
+            &mut acquired_semantic_tokens,
+        ) {
+            let blocked_agent = summaries[blocked_index].id.clone();
+            for (skipped_index, skipped) in summaries.iter_mut().enumerate() {
+                if skipped_index != blocked_index && skipped.status == AgentRunStatus::Pending {
+                    skipped.status = AgentRunStatus::Skipped;
+                    skipped.error = Some(format!(
+                        "skipped because semantic coordination failed for agent '{blocked_agent}'"
+                    ));
+                }
+            }
+            let (released_claims, release_errors) = if checkpoint.keep_claims {
+                (Vec::new(), Vec::new())
+            } else {
+                release_claims(&store, acquired_tokens)
+            };
+            let (released_semantic_intents, semantic_release_errors) = if checkpoint.keep_claims {
+                (Vec::new(), Vec::new())
+            } else {
+                release_semantic_intents(&semantic_store, acquired_semantic_tokens)
+            };
+            write_checkpoint_if_configured(
+                &controls,
+                RunCheckpointStage::Final,
+                &Some(checkpoint.run_id.clone()),
+                CheckpointView {
+                    repo: &repo,
+                    repo_head: &repo_head,
+                    plan_file: &plan_file,
+                    plan: &plan,
+                    keep_claims: checkpoint.keep_claims,
+                    worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                    success: false,
+                    agents: &summaries,
+                    repo_validation: &checkpoint.repo_validation,
+                    released_claims: &released_claims,
+                    release_errors: &release_errors,
+                    released_semantic_intents: &released_semantic_intents,
+                    semantic_release_errors: &semantic_release_errors,
+                },
+            )?;
+            return Ok(OrchestrationSummary {
+                run_id: Some(checkpoint.run_id),
+                repo,
+                plan_file,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                semantic_coordination: checkpoint.semantic_coordination,
+                success: false,
+                agents: summaries,
+                repo_validation: checkpoint.repo_validation,
+                released_claims,
+                release_errors,
+                released_semantic_intents,
+                semantic_release_errors,
+            });
+        }
+    }
 
     write_checkpoint_if_configured(
         &controls,
@@ -710,17 +928,17 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
             repo_validation: &checkpoint.repo_validation,
             released_claims: &[],
             release_errors: &[],
+            released_semantic_intents: &[],
+            semantic_release_errors: &[],
         },
     )?;
 
-    let had_pending_agents = summaries
-        .iter()
-        .any(|summary| summary.status == AgentRunStatus::Pending);
     run_agent_schedule(
         &plan,
         &mut summaries,
         options.jobs,
         options.patch_dir.as_deref(),
+        &repo_head,
     )?;
     let repo_validation = if summaries
         .iter()
@@ -751,6 +969,8 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
             repo_validation: &repo_validation,
             released_claims: &[],
             release_errors: &[],
+            released_semantic_intents: &[],
+            semantic_release_errors: &[],
         },
     )?;
 
@@ -759,7 +979,13 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
     } else {
         release_claims(&store, acquired_tokens)
     };
+    let (released_semantic_intents, semantic_release_errors) = if checkpoint.keep_claims {
+        (Vec::new(), Vec::new())
+    } else {
+        release_semantic_intents(&semantic_store, acquired_semantic_tokens)
+    };
     let success = release_errors.is_empty()
+        && semantic_release_errors.is_empty()
         && summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -783,6 +1009,8 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
             repo_validation: &repo_validation,
             released_claims: &released_claims,
             release_errors: &release_errors,
+            released_semantic_intents: &released_semantic_intents,
+            semantic_release_errors: &semantic_release_errors,
         },
     )?;
 
@@ -792,11 +1020,14 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
         plan_file,
         keep_claims: checkpoint.keep_claims,
         worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+        semantic_coordination: checkpoint.semantic_coordination,
         success,
         agents: summaries,
         repo_validation,
         released_claims,
         release_errors,
+        released_semantic_intents,
+        semantic_release_errors,
     })
 }
 
@@ -889,6 +1120,8 @@ fn summaries_from_checkpoint(
             summary.worktree = checkpoint_agent.worktree.as_ref().map(WorktreeRecord::from);
             summary.worktree_reused = summary.worktree.is_some();
             summary.claim = checkpoint_agent.claim.clone();
+            summary.semantic_intent = checkpoint_agent.semantic_intent.clone();
+            summary.semantic_conflicts = checkpoint_agent.semantic_conflicts.clone();
             summary.changed_paths = checkpoint_agent.changed_paths.clone();
             summary.unclaimed_changed_paths = checkpoint_agent.unclaimed_changed_paths.clone();
             summary.validation = checkpoint_agent.validation.clone();
@@ -951,26 +1184,26 @@ fn validate_resume_worktrees(
                 current.path.display()
             )
         })?;
-        let worktree_head = head_oid(&worktree_repo)
-            .with_context(|| format!("failed to inspect HEAD for worktree '{}'", current.name))?;
-        if &worktree_head != repo_head {
-            bail!(
-                "checkpoint '{}' worktree '{}' is based on {}, but primary HEAD is {}; start a new run or restore the checkpoint base",
-                checkpoint.run_id.as_str(),
-                current.name,
-                worktree_head,
-                repo_head
-            );
-        }
-
-        let changed_paths = collect_status_paths(&worktree_repo).with_context(|| {
-            format!(
-                "failed to inspect changes for checkpoint worktree '{}'",
-                current.name
-            )
-        })?;
         match checkpoint_agent.status {
             AgentRunStatus::Pending => {
+                let worktree_head = head_oid(&worktree_repo).with_context(|| {
+                    format!("failed to inspect HEAD for worktree '{}'", current.name)
+                })?;
+                if &worktree_head != repo_head {
+                    bail!(
+                        "checkpoint '{}' pending worktree '{}' is at {}, but primary HEAD is {}; start a new run or restore the checkpoint base",
+                        checkpoint.run_id.as_str(),
+                        current.name,
+                        worktree_head,
+                        repo_head
+                    );
+                }
+                let changed_paths = collect_status_paths(&worktree_repo).with_context(|| {
+                    format!(
+                        "failed to inspect changes for checkpoint worktree '{}'",
+                        current.name
+                    )
+                })?;
                 if !changed_paths.is_empty() {
                     bail!(
                         "checkpoint '{}' marks agent '{}' as pending, but its worktree has changes; clean the worktree or start a new run",
@@ -980,6 +1213,19 @@ fn validate_resume_worktrees(
                 }
             }
             AgentRunStatus::Succeeded => {
+                ensure_worktree_descends_from_base(
+                    &worktree_repo,
+                    repo_head,
+                    checkpoint.run_id.as_str(),
+                    &current.name,
+                )?;
+                let changed_paths = collect_paths_changed_since_base(&worktree_repo, repo_head)
+                    .with_context(|| {
+                        format!(
+                            "failed to inspect changes for checkpoint worktree '{}'",
+                            current.name
+                        )
+                    })?;
                 if changed_paths != checkpoint_agent.changed_paths {
                     bail!(
                         "checkpoint '{}' changed paths for completed agent '{}' no longer match the worktree; start a new run or restore the checkpoint state",
@@ -1011,6 +1257,29 @@ fn validate_resume_worktrees(
         }
         summary.worktree = Some(current.clone());
         summary.worktree_reused = true;
+    }
+
+    Ok(())
+}
+
+fn ensure_worktree_descends_from_base(
+    repo: &Repository,
+    base_oid: &Oid,
+    run_id: &str,
+    worktree_name: &str,
+) -> Result<()> {
+    let worktree_head = head_oid(repo)
+        .with_context(|| format!("failed to inspect HEAD for worktree '{worktree_name}'"))?;
+    let merge_base = repo.merge_base(*base_oid, worktree_head).with_context(|| {
+        format!("failed to verify base commit {base_oid} for checkpoint worktree '{worktree_name}'")
+    })?;
+    if merge_base != *base_oid {
+        bail!(
+            "checkpoint '{}' worktree '{}' does not descend from primary HEAD {}; start a new run or restore the checkpoint base",
+            run_id,
+            worktree_name,
+            base_oid
+        );
     }
 
     Ok(())
@@ -1090,16 +1359,103 @@ fn paths_match(left: &[PathBuf], right: &[PathBuf]) -> bool {
     left.iter().collect::<BTreeSet<_>>() == right.iter().collect::<BTreeSet<_>>()
 }
 
+fn active_checkpoint_semantic_tokens(
+    store: &SemanticIntentStore,
+    summaries: &[AgentRunSummary],
+) -> Result<Vec<SemanticIntentToken>> {
+    let active_intents = store.snapshot()?;
+    let active_keys = active_intents
+        .iter()
+        .map(|intent| (intent.token, intent.agent_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let tokens = summaries
+        .iter()
+        .filter_map(|summary| summary.semantic_intent.as_ref())
+        .filter(|intent| active_keys.contains(&(intent.token, intent.agent_id.clone())))
+        .map(|intent| intent.token)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(tokens)
+}
+
+fn coordinate_semantic_intents(
+    store: &SemanticIntentStore,
+    plan: &OrchestrationPlan,
+    summaries: &mut [AgentRunSummary],
+    mode: SemanticCoordinationMode,
+    acquired_tokens: &mut Vec<SemanticIntentToken>,
+) -> Option<usize> {
+    let mut planned_preview_intents = Vec::new();
+    for (index, agent) in plan.agents.iter().enumerate() {
+        let request = semantic_request_for_agent(agent);
+        let report = match mode {
+            SemanticCoordinationMode::Off => return None,
+            SemanticCoordinationMode::Warn => {
+                store.preview_with_additional_active(request, &planned_preview_intents)
+            }
+            SemanticCoordinationMode::Block => store.claim(request),
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                fail_summary(
+                    &mut summaries[index],
+                    format!("semantic coordination failed: {error}"),
+                );
+                return Some(index);
+            }
+        };
+        attach_semantic_report(&mut summaries[index], &report);
+        if mode == SemanticCoordinationMode::Warn {
+            planned_preview_intents.push(report.intent.clone());
+        } else if report.persisted {
+            acquired_tokens.push(report.intent.token);
+        }
+        if mode == SemanticCoordinationMode::Block && report.has_blocking_conflicts {
+            fail_summary(
+                &mut summaries[index],
+                format!(
+                    "semantic coordination blocked intent with {} blocking conflict(s)",
+                    report.blocking_conflict_count
+                ),
+            );
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn semantic_request_for_agent(agent: &AgentPlan) -> SemanticIntentRequest {
+    SemanticIntentRequest {
+        agent_id: agent.id.clone(),
+        paths: agent.paths.clone(),
+        symbols: agent.semantic_symbols.clone(),
+        modules: agent.semantic_modules.clone(),
+        task_file: None,
+        notes: Vec::new(),
+    }
+}
+
+fn attach_semantic_report(summary: &mut AgentRunSummary, report: &SemanticCoordinationReport) {
+    summary.semantic_intent = Some(report.intent.clone());
+    summary.semantic_conflicts = report.conflicts.clone();
+}
+
 struct SummaryParts {
     run_id: RunId,
     repo: PathBuf,
     plan_file: PathBuf,
     keep_claims: bool,
     worktree_reuse_policy: WorktreeReusePolicy,
+    semantic_coordination: SemanticCoordinationMode,
     summaries: Vec<AgentRunSummary>,
     repo_validation: Vec<ValidationRunSummary>,
     released_claims: Vec<PathClaim>,
     release_errors: Vec<String>,
+    released_semantic_intents: Vec<SemanticIntent>,
+    semantic_release_errors: Vec<String>,
 }
 
 fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
@@ -1109,12 +1465,16 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
         plan_file,
         keep_claims,
         worktree_reuse_policy,
+        semantic_coordination,
         summaries,
         repo_validation,
         released_claims,
         release_errors,
+        released_semantic_intents,
+        semantic_release_errors,
     } = parts;
     let success = release_errors.is_empty()
+        && semantic_release_errors.is_empty()
         && summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -1128,11 +1488,14 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
         plan_file,
         keep_claims,
         worktree_reuse_policy,
+        semantic_coordination,
         success,
         agents: summaries,
         repo_validation,
         released_claims,
         release_errors,
+        released_semantic_intents,
+        semantic_release_errors,
     }
 }
 
@@ -1213,6 +1576,8 @@ fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
         agents.push(AgentPlan {
             id,
             paths,
+            semantic_symbols: normalize_semantic_items(raw_agent.semantic_symbols),
+            semantic_modules: normalize_semantic_items(raw_agent.semantic_modules),
             env: raw_agent.env,
             timeout,
             command,
@@ -1399,6 +1764,16 @@ fn normalize_plan_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     }
 
     Ok(collapse_covered_paths(paths))
+}
+
+fn normalize_semantic_items(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
@@ -1600,6 +1975,7 @@ fn run_agent_schedule(
     summaries: &mut [AgentRunSummary],
     jobs: usize,
     patch_dir: Option<&Path>,
+    base_oid: &Oid,
 ) -> Result<()> {
     let jobs = jobs.max(1);
     let mut remaining = summaries
@@ -1656,7 +2032,12 @@ fn run_agent_schedule(
             if summaries[index].status == AgentRunStatus::Succeeded {
                 run_agent_validation_commands(&plan.agents[index], &mut summaries[index]);
             }
-            inspect_agent_changes(&plan.agents[index], &mut summaries[index], patch_dir);
+            inspect_agent_changes(
+                &plan.agents[index],
+                &mut summaries[index],
+                patch_dir,
+                base_oid,
+            );
             remaining.remove(&index);
 
             if summaries[index].status == AgentRunStatus::Succeeded {
@@ -1726,6 +2107,7 @@ fn inspect_agent_changes(
     agent: &AgentPlan,
     summary: &mut AgentRunSummary,
     patch_dir: Option<&Path>,
+    base_oid: &Oid,
 ) {
     let Some(worktree) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree");
@@ -1747,7 +2129,7 @@ fn inspect_agent_changes(
         }
     };
 
-    let changed_paths = match collect_status_paths(&repo) {
+    let changed_paths = match collect_paths_changed_since_base(&repo, base_oid) {
         Ok(paths) => paths,
         Err(error) => {
             fail_summary(summary, format!("failed to collect changed paths: {error}"));
@@ -1782,7 +2164,7 @@ fn inspect_agent_changes(
     }
 
     if let Some(patch_dir) = patch_dir {
-        match write_agent_patch(&worktree_path, &agent.id, patch_dir) {
+        match write_agent_patch(&worktree_path, &agent.id, patch_dir, base_oid) {
             Ok(Some(path)) => summary.patch_path = Some(path),
             Ok(None) => {}
             Err(error) => fail_summary(summary, format!("failed to write patch: {error}")),
@@ -1819,6 +2201,57 @@ fn collect_status_paths(repo: &Repository) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn collect_paths_changed_since_base(repo: &Repository, base_oid: &Oid) -> Result<Vec<PathBuf>> {
+    let base_commit = repo
+        .find_commit(*base_oid)
+        .with_context(|| format!("failed to find base commit {base_oid}"))?;
+    let base_tree = base_commit
+        .tree()
+        .with_context(|| format!("failed to read tree for base commit {base_oid}"))?;
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_typechange(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
+        .context("failed to diff worktree against base commit")?;
+    let mut paths = BTreeSet::new();
+    diff.foreach(
+        &mut |delta, _| {
+            collect_delta_paths(delta, &mut paths);
+            true
+        },
+        None,
+        None,
+        None,
+    )
+    .context("failed to inspect changed paths")?;
+
+    Ok(paths.into_iter().collect())
+}
+
+fn collect_delta_paths(delta: git2::DiffDelta<'_>, paths: &mut BTreeSet<PathBuf>) {
+    match delta.status() {
+        Delta::Deleted => {
+            insert_delta_path(delta.old_file().path(), paths);
+        }
+        Delta::Renamed | Delta::Copied => {
+            insert_delta_path(delta.old_file().path(), paths);
+            insert_delta_path(delta.new_file().path(), paths);
+        }
+        _ => {
+            insert_delta_path(delta.new_file().path(), paths);
+        }
+    }
+}
+
+fn insert_delta_path(path: Option<&Path>, paths: &mut BTreeSet<PathBuf>) {
+    if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+        paths.insert(path.to_path_buf());
+    }
+}
+
 fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
     path == claim || path.starts_with(claim)
 }
@@ -1827,6 +2260,7 @@ fn write_agent_patch(
     worktree_path: &Path,
     agent_id: &str,
     patch_dir: &Path,
+    base_oid: &Oid,
 ) -> Result<Option<PathBuf>> {
     fs::create_dir_all(patch_dir)
         .with_context(|| format!("failed to create patch directory {}", patch_dir.display()))?;
@@ -1837,7 +2271,7 @@ fn write_agent_patch(
         .arg(worktree_path)
         .arg("diff")
         .arg("--binary")
-        .arg("HEAD")
+        .arg(base_oid.to_string())
         .output()
         .with_context(|| format!("failed to run git diff in {}", worktree_path.display()))?;
     if !output.status.success() {
@@ -2296,6 +2730,8 @@ struct CheckpointView<'a> {
     repo_validation: &'a [ValidationRunSummary],
     released_claims: &'a [PathClaim],
     release_errors: &'a [String],
+    released_semantic_intents: &'a [SemanticIntent],
+    semantic_release_errors: &'a [String],
 }
 
 pub fn write_run_checkpoint(directory: &Path, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
@@ -2357,11 +2793,14 @@ fn write_checkpoint_if_configured(
         plan_snapshot: Some(CheckpointPlanSnapshot::from(view.plan)),
         keep_claims: view.keep_claims,
         worktree_reuse_policy: view.worktree_reuse_policy,
+        semantic_coordination: controls.semantic_coordination,
         success: view.success,
         agents: view.agents.iter().map(AgentCheckpoint::from).collect(),
         repo_validation: view.repo_validation.to_vec(),
         released_claims: view.released_claims.to_vec(),
         release_errors: view.release_errors.to_vec(),
+        released_semantic_intents: view.released_semantic_intents.to_vec(),
+        semantic_release_errors: view.semantic_release_errors.to_vec(),
         updated_unix_ms: unix_time_millis(),
     };
     write_run_checkpoint(directory, &checkpoint)?;
@@ -2378,6 +2817,8 @@ impl From<&AgentRunSummary> for AgentCheckpoint {
                 .as_ref()
                 .map(CheckpointWorktreeRecord::from),
             claim: summary.claim.clone(),
+            semantic_intent: summary.semantic_intent.clone(),
+            semantic_conflicts: summary.semantic_conflicts.clone(),
             changed_paths: summary.changed_paths.clone(),
             unclaimed_changed_paths: summary.unclaimed_changed_paths.clone(),
             validation: summary.validation.clone(),
@@ -2486,6 +2927,26 @@ fn release_claims(store: &SyncStore, tokens: Vec<ClaimToken>) -> (Vec<PathClaim>
     (released, errors)
 }
 
+fn release_semantic_intents(
+    store: &SemanticIntentStore,
+    tokens: Vec<SemanticIntentToken>,
+) -> (Vec<SemanticIntent>, Vec<String>) {
+    let mut released = Vec::new();
+    let mut errors = Vec::new();
+
+    for token in tokens {
+        match store.release(token) {
+            Ok(intent) => released.push(intent),
+            Err(error) => errors.push(format!(
+                "failed to release semantic intent {}: {error}",
+                token.get()
+            )),
+        }
+    }
+
+    (released, errors)
+}
+
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
     let repo = Repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
@@ -2513,6 +2974,9 @@ fn head_oid(repo: &Repository) -> Result<Oid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic_coord::{
+        SemanticConflictKind, SemanticConflictSeverity, SemanticIntentRequest, SemanticIntentStore,
+    };
     use crate::sync_store::SyncStore;
     use crate::worktree::WorktreeManager;
     use git2::{Oid, Repository, Signature};
@@ -2891,6 +3355,313 @@ mod tests {
     }
 
     #[test]
+    fn semantic_coordination_warn_compares_against_planned_preview_intents_without_persisting() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n").expect("write lib");
+        fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["a.txt"],
+                  "semantic_symbols": ["Shared"],
+                  "command": "true"
+                },
+                {
+                  "id": "agent-b",
+                  "paths": ["b.txt"],
+                  "semantic_symbols": ["Shared"],
+                  "command": "true"
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file,
+                keep_claims: false,
+                jobs: 2,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: None,
+                checkpoint_dir: None,
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Warn,
+            },
+        )
+        .expect("run plan");
+
+        assert!(summary.success);
+        assert_eq!(
+            summary.semantic_coordination,
+            SemanticCoordinationMode::Warn
+        );
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
+        assert!(summary.agents[0].semantic_conflicts.is_empty());
+        assert_eq!(
+            summary.agents[0]
+                .semantic_intent
+                .as_ref()
+                .map(|intent| intent.token.get()),
+            Some(1)
+        );
+        assert_eq!(summary.agents[1].status, AgentRunStatus::Succeeded);
+        assert_eq!(
+            summary.agents[1]
+                .semantic_intent
+                .as_ref()
+                .map(|intent| intent.token.get()),
+            Some(2)
+        );
+        assert!(summary.agents[1].semantic_conflicts.iter().any(|conflict| {
+            conflict.severity == SemanticConflictSeverity::Blocking
+                && conflict.kind == SemanticConflictKind::SymbolOverlap
+                && conflict.active_agent_id.as_deref() == Some("agent-a")
+        }));
+        assert!(summary.released_semantic_intents.is_empty());
+        assert_eq!(
+            SemanticIntentStore::open(&repo_path)
+                .expect("open semantic store")
+                .status()
+                .expect("semantic status"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn semantic_coordination_block_reports_overlapping_symbols() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n").expect("write lib");
+        fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["a.txt"],
+                  "semantic_symbols": ["Shared"],
+                  "command": "true"
+                },
+                {
+                  "id": "agent-b",
+                  "paths": ["b.txt"],
+                  "semantic_symbols": ["Shared"],
+                  "command": "true"
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file,
+                keep_claims: false,
+                jobs: 2,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: None,
+                checkpoint_dir: None,
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Block,
+            },
+        )
+        .expect("run plan");
+
+        assert!(!summary.success);
+        assert_eq!(
+            summary.semantic_coordination,
+            SemanticCoordinationMode::Block
+        );
+        assert_eq!(summary.first_failed_agent(), Some("agent-b"));
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Skipped);
+        assert_eq!(summary.agents[1].status, AgentRunStatus::Failed);
+        assert!(summary.agents[1]
+            .semantic_conflicts
+            .iter()
+            .any(|conflict| conflict.kind
+                == crate::semantic_coord::SemanticConflictKind::SymbolOverlap));
+        assert_eq!(summary.released_semantic_intents.len(), 1);
+        assert_eq!(
+            SemanticIntentStore::open(&repo_path)
+                .expect("open semantic store")
+                .status()
+                .expect("semantic status"),
+            Vec::new()
+        );
+        assert_eq!(
+            SyncStore::open(&repo_path)
+                .expect("open store")
+                .snapshot()
+                .expect("snapshot"),
+            Vec::<PathClaim>::new()
+        );
+    }
+
+    #[test]
+    fn semantic_coordination_block_unresolved_symbol_fails_summary_and_releases_claims() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(repo_path.join("src/lib.rs"), "pub struct Existing;\n").expect("write lib");
+        fs::write(repo_path.join("owned.txt"), "owned\n").expect("write owned");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["owned.txt"],
+                  "semantic_symbols": ["MissingSymbol"],
+                  "command": "true"
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file,
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: None,
+                checkpoint_dir: None,
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Block,
+            },
+        )
+        .expect("run plan");
+
+        assert!(!summary.success);
+        assert_eq!(summary.first_failed_agent(), Some("agent-a"));
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
+        let error = summary.agents[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("unresolved semantic symbol"));
+        assert!(error.contains("MissingSymbol"));
+        assert_eq!(
+            SyncStore::open(&repo_path)
+                .expect("open store")
+                .snapshot()
+                .expect("snapshot"),
+            Vec::<PathClaim>::new()
+        );
+        assert_eq!(
+            SemanticIntentStore::open(&repo_path)
+                .expect("open semantic store")
+                .snapshot()
+                .expect("semantic snapshot"),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn semantic_coordination_block_allows_disjoint_intents() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub struct Alpha;\npub struct Beta;\n",
+        )
+        .expect("write lib");
+        fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["a.txt"],
+                  "semantic_symbols": ["Alpha"],
+                  "command": "true"
+                },
+                {
+                  "id": "agent-b",
+                  "paths": ["b.txt"],
+                  "semantic_symbols": ["Beta"],
+                  "command": "true"
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file,
+                keep_claims: false,
+                jobs: 2,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: None,
+                checkpoint_dir: None,
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Block,
+            },
+        )
+        .expect("run plan");
+
+        assert!(summary.success);
+        assert_eq!(
+            summary.semantic_coordination,
+            SemanticCoordinationMode::Block
+        );
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
+        assert_eq!(summary.agents[1].status, AgentRunStatus::Succeeded);
+        assert!(summary.agents.iter().all(|agent| agent
+            .semantic_intent
+            .as_ref()
+            .is_some_and(|intent| !intent.symbols.is_empty())));
+        assert_eq!(summary.released_semantic_intents.len(), 2);
+        assert_eq!(
+            SemanticIntentStore::open(&repo_path)
+                .expect("open semantic store")
+                .status()
+                .expect("semantic status"),
+            Vec::new()
+        );
+    }
+
+    #[test]
     fn run_plan_reports_unclaimed_changes_and_releases_claims() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -3192,6 +3963,7 @@ mod tests {
             plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
             keep_claims: false,
             worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
             success: false,
             agents: vec![
                 AgentCheckpoint {
@@ -3199,6 +3971,8 @@ mod tests {
                     status: AgentRunStatus::Succeeded,
                     worktree: Some(CheckpointWorktreeRecord::from(&agent_a_worktree)),
                     claim: Some(claim_a),
+                    semantic_intent: None,
+                    semantic_conflicts: Vec::new(),
                     changed_paths: vec![PathBuf::from("a.txt")],
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
@@ -3209,6 +3983,8 @@ mod tests {
                     status: AgentRunStatus::Pending,
                     worktree: Some(CheckpointWorktreeRecord::from(&agent_b_worktree)),
                     claim: Some(claim_b),
+                    semantic_intent: None,
+                    semantic_conflicts: Vec::new(),
                     changed_paths: Vec::new(),
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
@@ -3218,6 +3994,8 @@ mod tests {
             repo_validation: Vec::new(),
             released_claims: Vec::new(),
             release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
             updated_unix_ms: 1,
         };
         let checkpoint_file =
@@ -3248,6 +4026,319 @@ mod tests {
             read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
         assert_eq!(final_checkpoint.stage, RunCheckpointStage::Final);
         assert!(final_checkpoint.success);
+    }
+
+    #[test]
+    fn resume_preserves_and_releases_checkpoint_semantic_intents() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub struct Alpha;\npub struct Beta;\n",
+        )
+        .expect("write lib");
+        fs::write(repo_path.join("a.txt"), "start\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "start\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+
+        let manager = WorktreeManager::new(&repo_path);
+        let agent_a_worktree = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-a worktree");
+        let agent_b_worktree = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-b".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-b worktree");
+        fs::write(agent_a_worktree.path.join("a.txt"), "done\n").expect("write agent a output");
+
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["a.txt"],
+                  "semantic_symbols": ["Alpha"],
+                  "command": "printf 'rerun\n' >> a.txt"
+                },
+                {
+                  "id": "agent-b",
+                  "paths": ["b.txt"],
+                  "semantic_symbols": ["Beta"],
+                  "depends_on": ["agent-a"],
+                  "command": "printf 'done\n' > b.txt"
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+        let plan = load_plan(&plan_file).expect("load plan");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let claim_a = store
+            .claim_paths("agent-a", ["a.txt"])
+            .expect("claim agent a");
+        let claim_b = store
+            .claim_paths("agent-b", ["b.txt"])
+            .expect("claim agent b");
+        let semantic_store = SemanticIntentStore::open(&repo_path).expect("open semantic store");
+        let semantic_a = semantic_store
+            .claim(SemanticIntentRequest {
+                agent_id: "agent-a".to_string(),
+                paths: vec![PathBuf::from("a.txt")],
+                symbols: vec!["Alpha".to_string()],
+                modules: Vec::new(),
+                task_file: None,
+                notes: Vec::new(),
+            })
+            .expect("claim semantic a");
+        let semantic_b = semantic_store
+            .claim(SemanticIntentRequest {
+                agent_id: "agent-b".to_string(),
+                paths: vec![PathBuf::from("b.txt")],
+                symbols: vec!["Beta".to_string()],
+                modules: Vec::new(),
+                task_file: None,
+                notes: Vec::new(),
+            })
+            .expect("claim semantic b");
+        let run_id = RunId::new("resume-semantic").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: run_id.clone(),
+            stage: RunCheckpointStage::ClaimsAcquired,
+            repo: repo_path.clone(),
+            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
+            plan_file: plan_file.clone(),
+            plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Block,
+            success: false,
+            agents: vec![
+                AgentCheckpoint {
+                    id: "agent-a".to_string(),
+                    status: AgentRunStatus::Succeeded,
+                    worktree: Some(CheckpointWorktreeRecord::from(&agent_a_worktree)),
+                    claim: Some(claim_a),
+                    semantic_intent: Some(semantic_a.intent.clone()),
+                    semantic_conflicts: semantic_a.conflicts.clone(),
+                    changed_paths: vec![PathBuf::from("a.txt")],
+                    unclaimed_changed_paths: Vec::new(),
+                    validation: Vec::new(),
+                    error: None,
+                },
+                AgentCheckpoint {
+                    id: "agent-b".to_string(),
+                    status: AgentRunStatus::Pending,
+                    worktree: Some(CheckpointWorktreeRecord::from(&agent_b_worktree)),
+                    claim: Some(claim_b),
+                    semantic_intent: Some(semantic_b.intent.clone()),
+                    semantic_conflicts: semantic_b.conflicts.clone(),
+                    changed_paths: Vec::new(),
+                    unclaimed_changed_paths: Vec::new(),
+                    validation: Vec::new(),
+                    error: None,
+                },
+            ],
+            repo_validation: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_file =
+            write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+
+        let summary = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file,
+            repo: Some(repo_path.clone()),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("resume");
+
+        assert!(summary.success);
+        assert_eq!(
+            summary.semantic_coordination,
+            SemanticCoordinationMode::Block
+        );
+        assert!(summary
+            .agents
+            .iter()
+            .all(|agent| agent.semantic_intent.is_some()));
+        assert_eq!(summary.released_semantic_intents.len(), 2);
+        assert!(summary.semantic_release_errors.is_empty());
+        assert_eq!(
+            semantic_store.status().expect("semantic status"),
+            Vec::new()
+        );
+        let final_checkpoint =
+            read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
+        assert_eq!(
+            final_checkpoint.semantic_coordination,
+            SemanticCoordinationMode::Block
+        );
+        assert_eq!(final_checkpoint.released_semantic_intents.len(), 2);
+        assert!(final_checkpoint.semantic_release_errors.is_empty());
+    }
+
+    #[test]
+    fn resume_runs_missing_semantic_coordination_before_pending_agents() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n").expect("write lib");
+        fs::write(repo_path.join("a.txt"), "start\n").expect("write a");
+        fs::write(repo_path.join("b.txt"), "start\n").expect("write b");
+        commit_all(&repo, "initial commit").expect("commit");
+
+        let manager = WorktreeManager::new(&repo_path);
+        let agent_a_worktree = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-a worktree");
+        let agent_b_worktree = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-b".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-b worktree");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [
+                {
+                  "id": "agent-a",
+                  "paths": ["a.txt"],
+                  "semantic_symbols": ["Shared"],
+                  "command": "printf 'done\n' > a.txt"
+                },
+                {
+                  "id": "agent-b",
+                  "paths": ["b.txt"],
+                  "semantic_symbols": ["Shared"],
+                  "command": "printf 'done\n' > b.txt"
+                }
+              ]
+            }"#,
+        )
+        .expect("write plan");
+        let plan = load_plan(&plan_file).expect("load plan");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let claim_a = store
+            .claim_paths("agent-a", ["a.txt"])
+            .expect("claim agent a");
+        let claim_b = store
+            .claim_paths("agent-b", ["b.txt"])
+            .expect("claim agent b");
+        let run_id = RunId::new("resume-semantic-missing").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: run_id.clone(),
+            stage: RunCheckpointStage::ClaimsAcquired,
+            repo: repo_path.clone(),
+            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
+            plan_file: plan_file.clone(),
+            plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Block,
+            success: false,
+            agents: vec![
+                AgentCheckpoint {
+                    id: "agent-a".to_string(),
+                    status: AgentRunStatus::Pending,
+                    worktree: Some(CheckpointWorktreeRecord::from(&agent_a_worktree)),
+                    claim: Some(claim_a),
+                    semantic_intent: None,
+                    semantic_conflicts: Vec::new(),
+                    changed_paths: Vec::new(),
+                    unclaimed_changed_paths: Vec::new(),
+                    validation: Vec::new(),
+                    error: None,
+                },
+                AgentCheckpoint {
+                    id: "agent-b".to_string(),
+                    status: AgentRunStatus::Pending,
+                    worktree: Some(CheckpointWorktreeRecord::from(&agent_b_worktree)),
+                    claim: Some(claim_b),
+                    semantic_intent: None,
+                    semantic_conflicts: Vec::new(),
+                    changed_paths: Vec::new(),
+                    unclaimed_changed_paths: Vec::new(),
+                    validation: Vec::new(),
+                    error: None,
+                },
+            ],
+            repo_validation: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_file =
+            write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+
+        let summary = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file,
+            repo: Some(repo_path.clone()),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("resume");
+
+        assert!(!summary.success);
+        assert_eq!(
+            summary.semantic_coordination,
+            SemanticCoordinationMode::Block
+        );
+        assert_eq!(summary.first_failed_agent(), Some("agent-b"));
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Skipped);
+        assert_eq!(summary.agents[1].status, AgentRunStatus::Failed);
+        assert_eq!(summary.released_semantic_intents.len(), 1);
+        assert_eq!(
+            SemanticIntentStore::open(&repo_path)
+                .expect("open semantic store")
+                .status()
+                .expect("semantic status"),
+            Vec::new()
+        );
+        let final_checkpoint =
+            read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
+        assert_eq!(final_checkpoint.stage, RunCheckpointStage::Final);
+        assert_eq!(
+            final_checkpoint.semantic_coordination,
+            SemanticCoordinationMode::Block
+        );
+        assert_eq!(final_checkpoint.released_semantic_intents.len(), 1);
     }
 
     #[test]
@@ -3285,12 +4376,15 @@ mod tests {
             plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
             keep_claims: false,
             worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
             success: false,
             agents: vec![AgentCheckpoint {
                 id: "agent-a".to_string(),
                 status: AgentRunStatus::Pending,
                 worktree: Some(CheckpointWorktreeRecord::from(&worktree)),
                 claim: None,
+                semantic_intent: None,
+                semantic_conflicts: Vec::new(),
                 changed_paths: Vec::new(),
                 unclaimed_changed_paths: Vec::new(),
                 validation: Vec::new(),
@@ -3299,6 +4393,8 @@ mod tests {
             repo_validation: Vec::new(),
             released_claims: Vec::new(),
             release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
             updated_unix_ms: 1,
         };
         let checkpoint_file =
@@ -3471,6 +4567,8 @@ mod tests {
                 agents: vec![CheckpointAgentPlanSnapshot {
                     id: "agent-a".to_string(),
                     paths: vec![PathBuf::from("README.md")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
                     env: BTreeMap::new(),
                     timeout_seconds: None,
                     command: "true".to_string(),
@@ -3481,6 +4579,7 @@ mod tests {
             }),
             keep_claims: false,
             worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Warn,
             success: true,
             agents: vec![AgentCheckpoint {
                 id: "agent-a".to_string(),
@@ -3491,6 +4590,8 @@ mod tests {
                     branch: "maco/agent-a".to_string(),
                 }),
                 claim: None,
+                semantic_intent: None,
+                semantic_conflicts: Vec::new(),
                 changed_paths: vec![PathBuf::from("README.md")],
                 unclaimed_changed_paths: Vec::new(),
                 validation: Vec::new(),
@@ -3499,6 +4600,8 @@ mod tests {
             repo_validation: Vec::new(),
             released_claims: Vec::new(),
             release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
             updated_unix_ms: 1,
         };
 
@@ -3537,6 +4640,7 @@ mod tests {
                 run_id: Some(run_id.clone()),
                 checkpoint_dir: Some(checkpoint_dir.clone()),
                 worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Off,
             },
         )
         .expect("run plan");
