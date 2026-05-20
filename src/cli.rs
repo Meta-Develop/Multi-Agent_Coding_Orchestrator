@@ -3,6 +3,7 @@ use crate::{
         self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
         ProviderCommandPolicy,
     },
+    live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
         self, MergeApplyOptions, MergeApplyPreview, MergeApplyReport, MergeCandidate,
@@ -10,10 +11,19 @@ use crate::{
     },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
-        OrchestrationRunOptions, OrchestrationSummary, RunId, WorktreeReusePolicy,
+        OrchestrationRunOptions, OrchestrationSummary, RunId, SemanticCoordinationMode,
+        WorktreeReusePolicy,
+    },
+    publication::{
+        self, ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
+        PrPublicationStatus,
     },
     repo_map::{self, RepoEntryKind, RepoMap},
     repo_semantic::{self, SemanticRepoMap},
+    semantic_coord::{
+        SemanticCoordinationReport, SemanticIntentRequest, SemanticIntentStore, SemanticIntentToken,
+    },
+    supervise::{self, SupervisorRunOptions},
     sync::ClaimToken,
     sync_store::{OwnerReport, SyncStore},
     worktree::{RepositoryInfo, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
@@ -48,8 +58,13 @@ impl Cli {
             Command::Repo(command) => command.run(),
             Command::Worktree(command) => command.run(),
             Command::Merge(command) => command.run(),
+            Command::Live(command) => command.run(),
+            Command::Pr(command) => command.run(),
+            Command::Issue(command) => command.run(),
             Command::Sync(command) => command.run(),
+            Command::Coord(command) => command.run(),
             Command::Orchestrate(command) => command.run(),
+            Command::Supervise(command) => command.run(),
             Command::Agent(command) => command.run(),
             Command::Llm(command) => command.run(),
         }
@@ -66,10 +81,20 @@ enum Command {
     Worktree(WorktreeCommand),
     /// Collect and apply merge candidates from agent worktrees.
     Merge(MergeCommand),
+    /// Inspect and update human-readable live claim files.
+    Live(LiveCommand),
+    /// Preview and publish agent pull requests through an explicit forge.
+    Pr(PrCommand),
+    /// Preview and create issues through an explicit forge.
+    Issue(IssueCommand),
     /// Manage repository-local sync path claims.
     Sync(SyncCommand),
+    /// Manage repository-local semantic coordination intents.
+    Coord(CoordCommand),
     /// Run local orchestration plans.
     Orchestrate(OrchestrateCommand),
+    /// Run opt-in Codex CLI supervisor-of-orchestrators plans.
+    Supervise(SuperviseCommand),
     /// Run a provider-backed agent in an isolated worktree.
     Agent(AgentCommand),
     /// Inspect local LLM adapter boundaries without network calls.
@@ -230,6 +255,7 @@ impl OrchestrateCommand {
                         run_id: args.run_id.map(RunId::new).transpose()?,
                         checkpoint_dir: args.checkpoint_dir,
                         worktree_reuse_policy: args.reuse,
+                        semantic_coordination: args.semantic_coordination,
                     },
                 )?;
                 print_orchestration_summary(&summary, args.json)?;
@@ -330,6 +356,9 @@ struct RunOrchestrateArgs {
     /// Directory where run checkpoints should be written.
     #[arg(long)]
     checkpoint_dir: Option<PathBuf>,
+    /// Semantic coordination mode for this run.
+    #[arg(long, default_value = "off", value_parser = parse_semantic_coordination_mode)]
+    semantic_coordination: SemanticCoordinationMode,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -372,6 +401,120 @@ struct CollectOrchestrateArgs {
 struct ValidateOrchestrateArgs {
     /// JSON plan file to validate.
     plan_file: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SuperviseCommand {
+    #[command(subcommand)]
+    command: SuperviseSubcommand,
+}
+
+impl SuperviseCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            SuperviseSubcommand::Plan(args) => {
+                let plan = supervise::supervisor_plan_from_task_file(args.repo, args.task_file)?;
+                print_query_report(&plan, args.json)
+            }
+            SuperviseSubcommand::Run(args) => {
+                let run_id = RunId::new(&args.run_id)?;
+                let report = supervise::run_supervisor_plan_file(SupervisorRunOptions {
+                    repo: args.repo,
+                    plan_file: args.supervisor_plan,
+                    run_id,
+                    codex_bin: args.codex_bin,
+                    allow_dirty_primary: args.allow_dirty_primary,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("supervise run failed");
+                }
+                Ok(())
+            }
+            SuperviseSubcommand::Status(args) => {
+                let report = supervise::supervisor_status(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)
+            }
+            SuperviseSubcommand::Collect(args) => {
+                let report =
+                    supervise::collect_supervisor_run(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("supervise run failed");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SuperviseSubcommand {
+    /// Convert a task file or JSON supervisor plan into a normalized supervisor plan.
+    Plan(PlanSuperviseArgs),
+    /// Run a supervisor plan with child Codex CLI orchestrators.
+    Run(RunSuperviseArgs),
+    /// Report durable run artifact status.
+    Status(StatusSuperviseArgs),
+    /// Collect the durable supervisor final report.
+    Collect(CollectSuperviseArgs),
+}
+
+#[derive(Debug, Args)]
+struct PlanSuperviseArgs {
+    /// Task file or JSON supervisor plan file.
+    task_file: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunSuperviseArgs {
+    /// JSON supervisor plan file to run.
+    supervisor_plan: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/o2/runs/<run-id>` artifacts.
+    #[arg(long)]
+    run_id: String,
+    /// Codex-compatible executable to invoke. Tests should pass a fake executable.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+    /// Allow supervise to run when the primary worktree is dirty.
+    #[arg(long)]
+    allow_dirty_primary: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusSuperviseArgs {
+    /// Run id to inspect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectSuperviseArgs {
+    /// Run id to collect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -676,6 +819,257 @@ struct OwnerSyncArgs {
 
 #[derive(Debug, Args)]
 struct StatusSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveCommand {
+    #[command(subcommand)]
+    command: LiveSubcommand,
+}
+
+impl LiveCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            LiveSubcommand::Status(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::status(args.repo, &now)?;
+                print_query_report(&report, args.json)
+            }
+            LiveSubcommand::Validate(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::validate(args.repo, &now)?;
+                print_query_report(&report, args.json)
+            }
+            LiveSubcommand::Heartbeat(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::heartbeat(args.repo, &args.claim_id, &args.by, &now)?;
+                print_query_report(&report, args.json)
+            }
+            LiveSubcommand::OverrideRelease(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::override_release(
+                    args.repo,
+                    &args.claim_id,
+                    &args.by,
+                    &args.reason,
+                    &now,
+                )?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum LiveSubcommand {
+    /// List live claims and liveness state.
+    Status(LiveStatusArgs),
+    /// Validate live claim file fields.
+    Validate(LiveValidateArgs),
+    /// Refresh a claim heartbeat timestamp.
+    Heartbeat(LiveHeartbeatArgs),
+    /// Move a stale active claim to handoff by explicit override.
+    OverrideRelease(LiveOverrideReleaseArgs),
+}
+
+#[derive(Debug, Args)]
+struct LiveStatusArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveValidateArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveHeartbeatArgs {
+    /// Claim id to refresh.
+    claim_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Actor refreshing the claim.
+    #[arg(long)]
+    by: String,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveOverrideReleaseArgs {
+    /// Claim id to move to handoff.
+    claim_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Actor performing the override.
+    #[arg(long)]
+    by: String,
+    /// Reason recorded in the audit log.
+    #[arg(long)]
+    reason: String,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CoordCommand {
+    #[command(subcommand)]
+    command: CoordSubcommand,
+}
+
+impl CoordCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            CoordSubcommand::Preview(args) => {
+                let json = args.json;
+                let store = SemanticIntentStore::open(&args.repo)?;
+                let report = store.preview(args.into_request())?;
+                print_semantic_coordination_report(&report, json)
+            }
+            CoordSubcommand::Claim(args) => {
+                let json = args.json;
+                let store = SemanticIntentStore::open(&args.repo)?;
+                let report = store.claim(args.into_request())?;
+                print_semantic_coordination_report(&report, json)?;
+                if report.has_blocking_conflicts {
+                    bail!(
+                        "semantic claim refused with {} blocking conflict(s)",
+                        report.blocking_conflict_count
+                    );
+                }
+                Ok(())
+            }
+            CoordSubcommand::Release(args) => {
+                let store = SemanticIntentStore::open(args.repo)?;
+                let released = store.release(SemanticIntentToken::from_u64(args.token))?;
+                print_query_report(&released, args.json)
+            }
+            CoordSubcommand::ReleaseAgent(args) => {
+                let store = SemanticIntentStore::open(args.repo)?;
+                let released = store.release_by_agent(&args.agent_id)?;
+                print_query_report(&released, args.json)
+            }
+            CoordSubcommand::Status(args) => {
+                let store = SemanticIntentStore::open(args.repo)?;
+                let intents = store.status()?;
+                print_query_report(&intents, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum CoordSubcommand {
+    /// Preview semantic conflicts without persisting an intent.
+    Preview(CoordIntentArgs),
+    /// Claim a semantic intent if it has no blocking conflicts.
+    Claim(CoordIntentArgs),
+    /// Release one semantic intent by token.
+    Release(ReleaseCoordArgs),
+    /// Release every semantic intent owned by an agent.
+    ReleaseAgent(ReleaseAgentCoordArgs),
+    /// List active semantic intents.
+    Status(StatusCoordArgs),
+}
+
+#[derive(Debug, Args)]
+struct CoordIntentArgs {
+    /// Stable agent id. Allowed characters: ASCII letters, digits, '.', '_' and '-'.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Repository-relative path included in the semantic intent.
+    #[arg(long = "path")]
+    paths: Vec<PathBuf>,
+    /// Rust symbol name, qualified path, or symbol id. Repeat for multiple symbols.
+    #[arg(long = "symbol")]
+    symbols: Vec<String>,
+    /// Rust module path. Repeat for multiple modules.
+    #[arg(long = "module")]
+    modules: Vec<String>,
+    /// Repository-relative task file summarized with the intent.
+    #[arg(long = "task")]
+    task_file: Option<PathBuf>,
+    /// Note attached to the intent. Repeat for multiple notes.
+    #[arg(long = "note")]
+    notes: Vec<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+impl CoordIntentArgs {
+    fn into_request(self) -> SemanticIntentRequest {
+        SemanticIntentRequest {
+            agent_id: self.agent_id,
+            paths: self.paths,
+            symbols: self.symbols,
+            modules: self.modules,
+            task_file: self.task_file,
+            notes: self.notes,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct ReleaseCoordArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Semantic intent token to release.
+    token: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReleaseAgentCoordArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable agent id whose semantic intents should be released.
+    agent_id: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusCoordArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -1015,6 +1409,232 @@ impl MergeForceArgs {
             allow_apply_conflicts: self.force_apply_conflicts,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct PrCommand {
+    #[command(subcommand)]
+    command: PrSubcommand,
+}
+
+impl PrCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            PrSubcommand::Preview(args) => {
+                let json = args.json;
+                let report = publication::preview_pr(pr_options_from_preview_args(args)?)?;
+                print_pr_publication_report(&report, json)
+            }
+            PrSubcommand::Publish(args) => {
+                let json = args.json;
+                let report = publication::publish_pr(pr_options_from_publish_args(args)?)?;
+                print_pr_publication_report(&report, json)?;
+                if report.status == PrPublicationStatus::Blocked {
+                    bail!("pr publish refused: merge-preview blockers remain");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum PrSubcommand {
+    /// Preview whether an agent worktree is ready to publish as a pull request.
+    Preview(PrPreviewArgs),
+    /// Publish an agent worktree through an explicit forge.
+    Publish(PrPublishArgs),
+}
+
+#[derive(Debug, Args)]
+struct PrPreviewArgs {
+    /// Stable agent id used when the worktree was created.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claimed path. Repeat to provide multiple claims.
+    #[arg(long, required = true)]
+    claim: Vec<PathBuf>,
+    /// JSON validation report file. Repeat to supply multiple reports.
+    #[arg(long)]
+    validation_report: Vec<PathBuf>,
+    /// Forge label recorded in the preview report.
+    #[arg(long, default_value = "fake", value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Mark the eventual pull request ready for review instead of draft.
+    #[arg(long)]
+    ready: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PrPublishArgs {
+    /// Stable agent id used when the worktree was created.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claimed path. Repeat to provide multiple claims.
+    #[arg(long, required = true)]
+    claim: Vec<PathBuf>,
+    /// JSON validation report file. Repeat to supply multiple reports.
+    #[arg(long)]
+    validation_report: Vec<PathBuf>,
+    /// Forge adapter. `fake` is deterministic and local-only; `github` shells out explicitly.
+    #[arg(long, value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Mark the pull request ready for review instead of draft.
+    #[arg(long)]
+    ready: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct IssueCommand {
+    #[command(subcommand)]
+    command: IssueSubcommand,
+}
+
+impl IssueCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            IssueSubcommand::Preview(args) => {
+                let json = args.json;
+                let report = publication::preview_issue(issue_options_from_args(
+                    args.repo,
+                    args.title,
+                    args.body,
+                    args.body_file,
+                    args.label,
+                    args.forge,
+                )?)?;
+                print_query_report(&report, json)
+            }
+            IssueSubcommand::Create(args) => {
+                let json = args.json;
+                let report = publication::create_issue(issue_options_from_args(
+                    args.repo,
+                    args.title,
+                    args.body,
+                    args.body_file,
+                    args.label,
+                    args.forge,
+                )?)?;
+                print_query_report(&report, json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum IssueSubcommand {
+    /// Preview issue content after redaction.
+    Preview(IssuePreviewArgs),
+    /// Create an issue through an explicit forge.
+    Create(IssueCreateArgs),
+}
+
+#[derive(Debug, Args)]
+struct IssuePreviewArgs {
+    /// Issue title.
+    #[arg(long)]
+    title: String,
+    /// Issue body text.
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    /// File containing issue body text.
+    #[arg(long, conflicts_with = "body")]
+    body_file: Option<PathBuf>,
+    /// Issue label. Repeat for multiple labels.
+    #[arg(long = "label")]
+    label: Vec<String>,
+    /// Repository path used only by forge adapters that need repository context.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Forge label recorded in the preview report. Preview never creates remote issues.
+    #[arg(long, default_value = "fake", value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct IssueCreateArgs {
+    /// Issue title.
+    #[arg(long)]
+    title: String,
+    /// Issue body text.
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    /// File containing issue body text.
+    #[arg(long, conflicts_with = "body")]
+    body_file: Option<PathBuf>,
+    /// Issue label. Repeat for multiple labels.
+    #[arg(long = "label")]
+    label: Vec<String>,
+    /// Repository path used only by forge adapters that need repository context.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Forge adapter. `fake` is deterministic and local-only; `github` shells out explicitly.
+    #[arg(long, value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn pr_options_from_preview_args(args: PrPreviewArgs) -> Result<PrPublicationOptions> {
+    let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+    Ok(PrPublicationOptions {
+        repo: args.repo,
+        agent_id: args.agent_id,
+        claimed_paths: args.claim,
+        validations,
+        forge: args.forge,
+        draft: !args.ready,
+    })
+}
+
+fn pr_options_from_publish_args(args: PrPublishArgs) -> Result<PrPublicationOptions> {
+    let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+    Ok(PrPublicationOptions {
+        repo: args.repo,
+        agent_id: args.agent_id,
+        claimed_paths: args.claim,
+        validations,
+        forge: args.forge,
+        draft: !args.ready,
+    })
+}
+
+fn issue_options_from_args(
+    repo: PathBuf,
+    title: String,
+    body: Option<String>,
+    body_file: Option<PathBuf>,
+    labels: Vec<String>,
+    forge: ForgeKind,
+) -> Result<IssuePublicationOptions> {
+    let body = match (body, body_file) {
+        (Some(body), None) => body,
+        (None, Some(path)) => fs::read_to_string(&path)
+            .with_context(|| format!("failed to read issue body file {}", path.display()))?,
+        (None, None) => String::new(),
+        (Some(_), Some(_)) => bail!("use either --body or --body-file, not both"),
+    };
+    Ok(IssuePublicationOptions {
+        repo,
+        title,
+        body,
+        labels,
+        forge,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1391,6 +2011,28 @@ fn parse_worktree_reuse_policy(value: &str) -> std::result::Result<WorktreeReuse
     }
 }
 
+fn parse_semantic_coordination_mode(
+    value: &str,
+) -> std::result::Result<SemanticCoordinationMode, String> {
+    match value {
+        "off" => Ok(SemanticCoordinationMode::Off),
+        "warn" => Ok(SemanticCoordinationMode::Warn),
+        "block" => Ok(SemanticCoordinationMode::Block),
+        _ => Err("expected one of: off, warn, block".to_string()),
+    }
+}
+
+fn parse_forge_kind(value: &str) -> std::result::Result<ForgeKind, String> {
+    ForgeKind::parse(value)
+}
+
+fn live_clock(value: Option<&str>) -> Result<LiveClock> {
+    match value {
+        Some(value) => LiveClock::parse(value),
+        None => Ok(LiveClock::now()),
+    }
+}
+
 fn print_repository_info(info: &RepositoryInfo, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(info)?);
@@ -1462,6 +2104,30 @@ fn print_query_report<T: Serialize + std::fmt::Debug>(report: &T, json: bool) ->
     Ok(())
 }
 
+fn print_semantic_coordination_report(
+    report: &SemanticCoordinationReport,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("Semantic intent: {}", report.intent.token.get());
+        println!("Agent: {}", report.intent.agent_id);
+        println!("Persisted: {}", report.persisted);
+        println!(
+            "Conflicts: blocking={} advisory={}",
+            report.blocking_conflict_count, report.advisory_conflict_count
+        );
+        for conflict in &report.conflicts {
+            println!(
+                "  {:?}\t{:?}\t{}",
+                conflict.severity, conflict.kind, conflict.message
+            );
+        }
+    }
+    Ok(())
+}
+
 fn print_merge_candidate(candidate: &MergeCandidate, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(candidate)?);
@@ -1514,6 +2180,26 @@ fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()>
             }
         );
         println!("Readiness: {:?}", report.preview.safety.readiness.status);
+    }
+    Ok(())
+}
+
+fn print_pr_publication_report(report: &PrPublicationReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("PR publication: {:?}", report.status);
+        println!("Agent: {}", report.agent_id);
+        println!("Branch: {}", report.branch);
+        println!("Base: {}", report.base);
+        println!("Readiness: {:?}", report.readiness);
+        if !report.blockers.is_empty() {
+            println!("Blockers: {:?}", report.blockers);
+        }
+        if let Some(url) = &report.pr_url {
+            println!("URL: {url}");
+        }
+        println!("Next: {}", report.next_action);
     }
     Ok(())
 }

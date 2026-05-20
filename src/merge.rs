@@ -3,7 +3,7 @@ use crate::{
     worktree::{normalize_agent_id, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::{ErrorCode, Oid, Repository, Status, StatusOptions};
+use git2::{Delta, DiffOptions, ErrorCode, Oid, Repository, Status, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -248,13 +248,14 @@ pub fn collect_agent_result(options: MergeCollectOptions) -> Result<MergeCandida
 
     let metadata = collect_metadata(&primary_repo, &agent_repo, &record, repo_root)?;
     let claimed_paths = normalize_claim_paths(options.claimed_paths)?;
-    let changes = collect_changed_paths(&agent_repo)?;
+    let diff_base = collection_base_oid(&metadata)?;
+    let changes = collect_changed_paths(&agent_repo, diff_base)?;
     let changed_paths = changes
         .iter()
         .map(|change| change.path.clone())
         .collect::<Vec<_>>();
     let unclaimed_changed_paths = unclaimed_paths(&changed_paths, &claimed_paths);
-    let full_diff = collect_full_diff(&record.path)?;
+    let full_diff = collect_full_diff(&record.path, diff_base)?;
     let diff = DiffOutput {
         summary: summarize_text(&full_diff, options.diff_summary_char_limit),
         full: options.include_full_diff.then_some(full_diff),
@@ -501,7 +502,20 @@ fn collect_metadata(
     })
 }
 
-fn collect_changed_paths(repo: &Repository) -> Result<Vec<ChangedPath>> {
+fn collection_base_oid(metadata: &WorktreeMergeMetadata) -> Result<Option<Oid>> {
+    metadata
+        .merge_base
+        .as_deref()
+        .or(metadata.primary_head.as_deref())
+        .map(|oid| Oid::from_str(oid).context("failed to parse collection base oid"))
+        .transpose()
+}
+
+fn collect_changed_paths(repo: &Repository, base_oid: Option<Oid>) -> Result<Vec<ChangedPath>> {
+    if let Some(base_oid) = base_oid {
+        return collect_changed_paths_since_base(repo, base_oid);
+    }
+
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
@@ -525,14 +539,81 @@ fn collect_changed_paths(repo: &Repository) -> Result<Vec<ChangedPath>> {
         .collect())
 }
 
-fn collect_full_diff(worktree_path: &Path) -> Result<String> {
-    let tracked =
-        run_git_capture(worktree_path, &["diff", "--binary", "HEAD"]).with_context(|| {
-            format!(
-                "failed to collect tracked diff in {}",
-                worktree_path.display()
-            )
-        })?;
+fn collect_changed_paths_since_base(repo: &Repository, base_oid: Oid) -> Result<Vec<ChangedPath>> {
+    let base_commit = repo
+        .find_commit(base_oid)
+        .with_context(|| format!("failed to find base commit {base_oid}"))?;
+    let base_tree = base_commit
+        .tree()
+        .with_context(|| format!("failed to read tree for base commit {base_oid}"))?;
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_typechange(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
+        .context("failed to diff worktree against base commit")?;
+    let mut changes = BTreeMap::<PathBuf, ChangeKind>::new();
+    diff.foreach(
+        &mut |delta, _| {
+            collect_delta_changes(delta, &mut changes);
+            true
+        },
+        None,
+        None,
+        None,
+    )
+    .context("failed to inspect changed paths")?;
+
+    Ok(changes
+        .into_iter()
+        .map(|(path, kind)| ChangedPath { path, kind })
+        .collect())
+}
+
+fn collect_delta_changes(delta: git2::DiffDelta<'_>, changes: &mut BTreeMap<PathBuf, ChangeKind>) {
+    let kind = classify_delta(delta.status());
+    match delta.status() {
+        Delta::Deleted => {
+            insert_delta_change(delta.old_file().path(), kind, changes);
+        }
+        Delta::Renamed | Delta::Copied => {
+            insert_delta_change(delta.old_file().path(), kind, changes);
+            insert_delta_change(delta.new_file().path(), kind, changes);
+        }
+        _ => {
+            insert_delta_change(delta.new_file().path(), kind, changes);
+        }
+    }
+}
+
+fn insert_delta_change(
+    path: Option<&Path>,
+    kind: ChangeKind,
+    changes: &mut BTreeMap<PathBuf, ChangeKind>,
+) {
+    if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
+        changes.insert(path.to_path_buf(), kind);
+    }
+}
+
+fn collect_full_diff(worktree_path: &Path, base_oid: Option<Oid>) -> Result<String> {
+    let mut args = vec!["diff", "--binary"];
+    let base_arg;
+    if let Some(base_oid) = base_oid {
+        base_arg = base_oid.to_string();
+        args.push(base_arg.as_str());
+    } else {
+        args.push("HEAD");
+    }
+
+    let tracked = run_git_capture(worktree_path, &args).with_context(|| {
+        format!(
+            "failed to collect tracked diff in {}",
+            worktree_path.display()
+        )
+    })?;
     if !tracked.success {
         bail!(
             "git diff failed: {}",
@@ -595,7 +676,7 @@ fn collect_untracked_paths(worktree_path: &Path) -> Result<Vec<PathBuf>> {
 fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
-    let paths = collect_changed_paths(&repo)?
+    let paths = collect_changed_paths(&repo, None)?
         .into_iter()
         .map(|change| change.path)
         .collect::<Vec<_>>();
@@ -909,6 +990,19 @@ fn classify_status(status: Status) -> ChangeKind {
         ChangeKind::Modified
     } else {
         ChangeKind::Unknown
+    }
+}
+
+fn classify_delta(delta: Delta) -> ChangeKind {
+    match delta {
+        Delta::Added => ChangeKind::Added,
+        Delta::Modified => ChangeKind::Modified,
+        Delta::Deleted => ChangeKind::Deleted,
+        Delta::Renamed | Delta::Copied => ChangeKind::Renamed,
+        Delta::Typechange => ChangeKind::Typechange,
+        Delta::Untracked => ChangeKind::Untracked,
+        Delta::Conflicted => ChangeKind::Conflicted,
+        _ => ChangeKind::Unknown,
     }
 }
 
