@@ -262,12 +262,14 @@ fn should_skip_dir(name: &str) -> bool {
 }
 
 fn is_runtime_path(path: &Path) -> bool {
-    path.components().next().is_some_and(|component| {
-        matches!(
-            component.as_os_str().to_str(),
-            Some(".maco" | ".maco-cache" | "target")
-        )
-    })
+    path.starts_with(".maco")
+        || path.starts_with(".maco-cache")
+        || path.starts_with("target")
+        || path.starts_with(".agent/temp")
+        || path.starts_with(".agent/storage")
+        || path.starts_with(".agents/temp")
+        || path.starts_with(".agents/storage")
+        || path.starts_with(".agents/live")
 }
 
 fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
@@ -280,4 +282,33 @@ fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
         collapsed.push(path);
     }
     collapsed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_repo_files_excludes_local_agent_runtime_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        fs::create_dir_all(repo.join(".agents/temp")).expect("create agents temp");
+        fs::create_dir_all(repo.join(".agents/storage")).expect("create agents storage");
+        fs::create_dir_all(repo.join(".agents/live/claims")).expect("create agents live");
+        fs::create_dir_all(repo.join(".agents/docs")).expect("create agents docs");
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::write(repo.join(".agents/temp/scratch.md"), "scratch\n").expect("write temp");
+        fs::write(repo.join(".agents/storage/cache.md"), "cache\n").expect("write storage");
+        fs::write(repo.join(".agents/live/claims/worker.md"), "# Claim\n").expect("write live");
+        fs::write(repo.join(".agents/docs/PROJECT_RULES.md"), "# Rules\n").expect("write docs");
+        fs::write(repo.join("src/lib.rs"), "pub fn ok() {}\n").expect("write src");
+
+        let files = collect_repo_files(repo).expect("collect repo files");
+
+        assert!(files.contains(&PathBuf::from(".agents/docs/PROJECT_RULES.md")));
+        assert!(files.contains(&PathBuf::from("src/lib.rs")));
+        assert!(!files.iter().any(|path| path.starts_with(".agents/temp")));
+        assert!(!files.iter().any(|path| path.starts_with(".agents/storage")));
+        assert!(!files.iter().any(|path| path.starts_with(".agents/live")));
+    }
 }

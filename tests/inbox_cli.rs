@@ -162,6 +162,89 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
 }
 
 #[test]
+fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+
+    let report = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--dry-run",
+        "--max-items",
+        "1",
+        "--json",
+    ])?;
+    let run_id = report["run_id"].as_str().context("generated run id")?;
+    assert!(run_id.starts_with("inbox-"));
+    assert!(repo_path
+        .join(".maco/inbox/runs")
+        .join(run_id)
+        .join("final-report.json")
+        .exists());
+
+    let refused = run_failure_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        run_id,
+        "--dry-run",
+        "--json",
+    ])?;
+    assert_eq!(refused["status"], "refused");
+    assert!(refused["message"]
+        .as_str()
+        .context("reuse message")?
+        .contains("already exists"));
+
+    let old_dir = repo_path.join(".maco/inbox/runs/aa-old");
+    let new_dir = repo_path.join(".maco/inbox/runs/zz-new");
+    fs::create_dir_all(&old_dir).context("create old run")?;
+    fs::create_dir_all(&new_dir).context("create new run")?;
+    write_json_file(
+        &old_dir.join("final-report.json"),
+        &json!({"status": "failed", "success": false}),
+    )?;
+    write_json_file(
+        &new_dir.join("final-report.json"),
+        &json!({"status": "succeeded", "success": true}),
+    )?;
+
+    let latest = run_success_json(&[
+        "inbox",
+        "artifacts",
+        "latest",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(latest["run"]["run_id"], "zz-new");
+    assert_eq!(latest["run"]["final_report_status"], "succeeded");
+
+    let prune = run_success_json(&[
+        "inbox",
+        "artifacts",
+        "prune",
+        "--repo",
+        path_str(&repo_path)?,
+        "--keep",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(prune["dry_run"], false);
+    assert_eq!(prune["deleted_count"], 2);
+    assert!(new_dir.exists(), "latest run must be kept");
+    assert!(!old_dir.exists(), "old run should be pruned");
+    assert!(repo_path.join(".maco/inbox").exists());
+    assert!(repo_path.join(".maco").exists());
+
+    Ok(())
+}
+
+#[test]
 fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;

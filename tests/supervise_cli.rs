@@ -124,6 +124,77 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
 }
 
 #[test]
+fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "generated supervise id",
+          "max_depth": 2,
+          "max_child_assignments": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-generated", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_success_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+    let run_id = report["run_id"].as_str().context("generated run id")?;
+    assert!(run_id.starts_with("o2-"));
+    assert!(repo_path
+        .join(".maco/o2/runs")
+        .join(run_id)
+        .join("reports/supervisor-final.json")
+        .exists());
+
+    let listed = run_success_json_args(&[
+        "supervise",
+        "artifacts",
+        "list",
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--json",
+    ])?;
+    assert_eq!(listed["runs"][0]["run_id"], run_id);
+    assert_eq!(listed["runs"][0]["final_report_status"], "succeeded");
+    assert_eq!(listed["runs"][0]["final_report_success"], true);
+
+    let refused = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        run_id,
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+    assert_eq!(refused["status"], "refused");
+    assert!(refused["message"]
+        .as_str()
+        .context("reuse message")?
+        .contains("already exists"));
+
+    Ok(())
+}
+
+#[test]
 fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -627,7 +698,7 @@ fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
         fake_codex.to_str().context("fake codex path utf8")?,
         "--json",
     ])?;
-    assert!(String::from_utf8_lossy(&budget_output.stderr).contains("max_child_processes"));
+    assert!(String::from_utf8_lossy(&budget_output.stderr).contains("max_child_assignments"));
 
     Ok(())
 }
@@ -668,6 +739,8 @@ fn supervise_plan_json_output_is_stable() -> Result<()> {
 
     assert_eq!(plan["version"], 1);
     assert_eq!(plan["max_depth"], 2);
+    assert_eq!(plan["max_child_assignments"], 1);
+    assert_eq!(plan.get("max_child_processes"), None);
     assert_eq!(plan["semantic_coordination"], "off");
     assert_eq!(plan["assignments"][0]["role"], "child_orchestrator");
     assert_eq!(plan["assignments"][0]["semantic_symbols"][0], "Readme");
@@ -678,6 +751,62 @@ fn supervise_plan_json_output_is_stable() -> Result<()> {
             .len(),
         1
     );
+
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_accepts_new_child_assignment_name_and_legacy_alias() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let new_name = temp.path().join("new-name.json");
+    write_plan(
+        &new_name,
+        r#"{
+          "version": 1,
+          "task": "new child assignment name",
+          "max_depth": 2,
+          "max_child_assignments": 1,
+          "assignments": [
+            {"id": "child-a", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+    let legacy_alias = temp.path().join("legacy-alias.json");
+    write_plan(
+        &legacy_alias,
+        r#"{
+          "version": 1,
+          "task": "legacy child process alias",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "assignments": [
+            {"id": "child-a", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let new_plan = run_success_json_args(&[
+        "supervise",
+        "plan",
+        new_name.to_str().context("new name path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--json",
+    ])?;
+    let legacy_plan = run_success_json_args(&[
+        "supervise",
+        "plan",
+        legacy_alias.to_str().context("legacy path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(new_plan["max_child_assignments"], 1);
+    assert_eq!(legacy_plan["max_child_assignments"], 1);
+    assert_eq!(new_plan.get("max_child_processes"), None);
+    assert_eq!(legacy_plan.get("max_child_processes"), None);
 
     Ok(())
 }

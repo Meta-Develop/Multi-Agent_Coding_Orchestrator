@@ -1,4 +1,5 @@
 use crate::{
+    artifacts::{self, RunArtifactFamily},
     live_claim::{self, LiveClock},
     merge::{
         self, ApplyBlocker, ApplyReadinessStatus, SafetyCheckStatus, ValidationReport,
@@ -382,6 +383,7 @@ pub fn autopilot_plan_from_task_file(
 pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
     let repo = discover_repo_root(&options.repo)?;
     let run_dir = autopilot_run_dir(&repo, &options.run_id);
+    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Autopilot, &options.run_id)?;
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create autopilot run dir {}", run_dir.display()))?;
     let mut plan = autopilot_plan_from_task_file(&repo, &options.plan_file)?;
@@ -777,7 +779,7 @@ fn supervisor_plan_for_attempt(
         task: task.clone(),
         task_file: None,
         max_depth: 2,
-        max_child_processes: 1,
+        max_child_assignments: 1,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         assignments: vec![OrchestratorAssignment {

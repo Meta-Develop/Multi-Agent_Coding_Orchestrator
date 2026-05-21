@@ -3,6 +3,7 @@ use crate::{
         self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
         ProviderCommandPolicy,
     },
+    artifacts::{self, ResolvedRunId, RunArtifactFamily},
     autopilot::{self, AutopilotRunOptions},
     inbox::{self, InboxRunOptions, InboxScanOptions, InboxWatchOptions},
     live_claim::{self, LiveClock},
@@ -433,11 +434,16 @@ impl SuperviseCommand {
                 print_query_report(&plan, args.json)
             }
             SuperviseSubcommand::Run(args) => {
-                let run_id = RunId::new(&args.run_id)?;
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Supervise,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
                 let report = supervise::run_supervisor_plan_file(SupervisorRunOptions {
-                    repo: args.repo,
+                    repo: resolved.repo,
                     plan_file: args.supervisor_plan,
-                    run_id,
+                    run_id: resolved.run_id,
                     codex_bin: args.codex_bin,
                     allow_dirty_primary: args.allow_dirty_primary,
                 })?;
@@ -460,6 +466,7 @@ impl SuperviseCommand {
                 }
                 Ok(())
             }
+            SuperviseSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Supervise),
         }
     }
 }
@@ -474,6 +481,8 @@ enum SuperviseSubcommand {
     Status(StatusSuperviseArgs),
     /// Collect the durable supervisor final report.
     Collect(CollectSuperviseArgs),
+    /// List, inspect, or prune durable run artifacts.
+    Artifacts(ArtifactsCommand),
 }
 
 #[derive(Debug, Args)]
@@ -495,9 +504,9 @@ struct RunSuperviseArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Stable run id for durable `.maco/o2/runs/<run-id>` artifacts.
+    /// Stable run id for durable `.maco/o2/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
-    run_id: String,
+    run_id: Option<String>,
     /// Codex-compatible executable to invoke. Tests should pass a fake executable.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
@@ -556,9 +565,15 @@ impl InboxCommand {
                 Ok(())
             }
             InboxSubcommand::Run(args) => {
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Inbox,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
                 let report = inbox::run_inbox(InboxRunOptions {
-                    repo: args.repo,
-                    run_id: RunId::new(&args.run_id)?,
+                    repo: resolved.repo,
+                    run_id: resolved.run_id,
                     github: args.github,
                     dry_run: args.dry_run,
                     max_items: args.max_items,
@@ -600,6 +615,7 @@ impl InboxCommand {
                 }
                 Ok(())
             }
+            InboxSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Inbox),
         }
     }
 }
@@ -616,6 +632,8 @@ enum InboxSubcommand {
     Collect(CollectInboxArgs),
     /// Poll for inbox items and react according to policy.
     Watch(WatchInboxArgs),
+    /// List, inspect, or prune durable run artifacts.
+    Artifacts(ArtifactsCommand),
 }
 
 #[derive(Debug, Args)]
@@ -639,9 +657,9 @@ struct RunInboxArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Stable run id for durable `.maco/inbox/runs/<run-id>` artifacts.
+    /// Stable run id for durable `.maco/inbox/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
-    run_id: String,
+    run_id: Option<String>,
     /// Plan item work and reports without launching autopilot.
     #[arg(long)]
     dry_run: bool,
@@ -719,11 +737,16 @@ impl AutopilotCommand {
                 print_query_report(&plan, args.json)
             }
             AutopilotSubcommand::Run(args) => {
-                let run_id = RunId::new(&args.run_id)?;
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Autopilot,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
                 let report = autopilot::run_autopilot_plan_file(AutopilotRunOptions {
-                    repo: args.repo,
+                    repo: resolved.repo,
                     plan_file: args.task_file,
-                    run_id,
+                    run_id: resolved.run_id,
                     codex_bin: args.codex_bin,
                     reviewer_command: args.reviewer_command,
                     allow_dirty_primary: args.allow_dirty_primary,
@@ -751,6 +774,7 @@ impl AutopilotCommand {
                 }
                 Ok(())
             }
+            AutopilotSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Autopilot),
         }
     }
 }
@@ -765,6 +789,8 @@ enum AutopilotSubcommand {
     Status(StatusAutopilotArgs),
     /// Collect the durable autopilot final report.
     Collect(CollectAutopilotArgs),
+    /// List, inspect, or prune durable run artifacts.
+    Artifacts(ArtifactsCommand),
 }
 
 #[derive(Debug, Args)]
@@ -786,9 +812,9 @@ struct RunAutopilotArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts.
+    /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
-    run_id: String,
+    run_id: Option<String>,
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
@@ -822,6 +848,67 @@ struct CollectAutopilotArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArtifactsCommand {
+    #[command(subcommand)]
+    command: ArtifactsSubcommand,
+}
+
+impl ArtifactsCommand {
+    fn run(self, family: RunArtifactFamily) -> Result<()> {
+        match self.command {
+            ArtifactsSubcommand::List(args) => {
+                let report = artifacts::list_runs(args.repo, family)?;
+                print_query_report(&report, args.json)
+            }
+            ArtifactsSubcommand::Latest(args) => {
+                let report = artifacts::latest_run(args.repo, family)?;
+                print_query_report(&report, args.json)
+            }
+            ArtifactsSubcommand::Prune(args) => {
+                let report = artifacts::prune_runs(args.repo, family, args.keep, args.dry_run)?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ArtifactsSubcommand {
+    /// List run artifact directories newest first.
+    List(ListArtifactsArgs),
+    /// Show the latest run artifact directory.
+    Latest(ListArtifactsArgs),
+    /// Delete old run artifact directories under this command family's run root.
+    Prune(PruneArtifactsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ListArtifactsArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PruneArtifactsArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Keep the latest N run directories.
+    #[arg(long, default_value_t = 10)]
+    keep: usize,
+    /// Report deletions without deleting.
+    #[arg(long)]
+    dry_run: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2510,6 +2597,67 @@ fn print_query_report<T: Serialize + std::fmt::Debug>(report: &T, json: bool) ->
         println!("{report:#?}");
     }
     Ok(())
+}
+
+fn resolve_run_id_for_run(
+    repo: &Path,
+    family: RunArtifactFamily,
+    explicit: Option<&str>,
+    json: bool,
+) -> Result<ResolvedRunId> {
+    match artifacts::resolve_run_id(repo, family, explicit) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) => {
+            if json {
+                let report = RunArtifactRefusalReport::new(repo, family, explicit, &error);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RunArtifactRefusalReport {
+    family: RunArtifactFamily,
+    success: bool,
+    status: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_dir: Option<PathBuf>,
+    error_kind: &'static str,
+    message: String,
+    next_action: &'static str,
+}
+
+impl RunArtifactRefusalReport {
+    fn new(
+        repo: &Path,
+        family: RunArtifactFamily,
+        explicit: Option<&str>,
+        error: &anyhow::Error,
+    ) -> Self {
+        let run_id = explicit.map(ToOwned::to_owned);
+        let run_dir = explicit
+            .and_then(|value| RunId::new(value).ok())
+            .and_then(|run_id| {
+                artifacts::discover_repo_root(repo)
+                    .ok()
+                    .map(|repo| (repo, run_id))
+            })
+            .map(|(_, run_id)| family.run_root().join(run_id.as_str()));
+        Self {
+            family,
+            success: false,
+            status: "refused",
+            run_id,
+            run_dir,
+            error_kind: "run_artifact_refused",
+            message: error.to_string(),
+            next_action: "choose a new --run-id or prune old artifacts first",
+        }
+    }
 }
 
 fn print_semantic_coordination_report(

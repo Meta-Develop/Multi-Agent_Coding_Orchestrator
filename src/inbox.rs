@@ -1,4 +1,5 @@
 use crate::{
+    artifacts::{self, RunArtifactFamily},
     autopilot::{
         self, AutopilotForgeMode, AutopilotPlan, AutopilotPublishMode, AutopilotRunOptions,
         AutopilotTask, AutopilotValidationCommand,
@@ -23,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 const INBOX_SCHEMA_VERSION: u32 = 1;
@@ -519,6 +520,7 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
 pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
     let repo = discover_repo_root(&options.repo)?;
     let run_dir = inbox_run_dir(&repo, &options.run_id);
+    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &options.run_id)?;
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create inbox run dir {}", run_dir.display()))?;
     let artifacts = run_artifacts(&options.run_id);
@@ -679,7 +681,10 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);
-        let run_id = RunId::new(format!("watch-{}-{iteration}", current_unix_seconds()))?;
+        let run_id =
+            artifacts::generate_run_id(&repo, RunArtifactFamily::Inbox).with_context(|| {
+                format!("failed to generate inbox watch run id for iteration {iteration}")
+            })?;
         let report = run_inbox(InboxRunOptions {
             repo: repo.clone(),
             run_id,
@@ -2098,13 +2103,6 @@ fn push_redacted_token(output: &mut String, token: &str) {
         output.push_str("<redacted:token>");
     } else {
         output.push_str(token);
-    }
-}
-
-fn current_unix_seconds() -> u64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(_) => 0,
     }
 }
 

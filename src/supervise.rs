@@ -1,4 +1,5 @@
 use crate::{
+    artifacts::{self, RunArtifactFamily},
     external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
     orchestrator::{RunId, SemanticCoordinationMode},
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
@@ -19,7 +20,7 @@ use std::{
 };
 
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
-const DEFAULT_MAX_CHILD_PROCESSES: usize = 4;
+const DEFAULT_MAX_CHILD_ASSIGNMENTS: usize = 4;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
@@ -41,8 +42,11 @@ pub struct SupervisorPlan {
     pub task_file: Option<PathBuf>,
     #[serde(default = "default_max_depth")]
     pub max_depth: u8,
-    #[serde(default = "default_max_child_processes")]
-    pub max_child_processes: usize,
+    #[serde(
+        default = "default_max_child_assignments",
+        alias = "max_child_processes"
+    )]
+    pub max_child_assignments: usize,
     #[serde(default = "default_child_timeout_seconds")]
     pub child_timeout_seconds: u64,
     #[serde(default)]
@@ -289,7 +293,7 @@ pub fn supervisor_plan_from_task_file(
         task,
         task_file: Some(path_relative_to(&repo, task_file)),
         max_depth: default_max_depth(),
-        max_child_processes: DEFAULT_MAX_CHILD_PROCESSES,
+        max_child_assignments: DEFAULT_MAX_CHILD_ASSIGNMENTS,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         assignments: Vec::new(),
@@ -505,6 +509,7 @@ fn run_supervisor_plan(
     let primary_head = current_head_oid(&repo)?;
 
     let run_dir = run_dir(&repo, &options.run_id);
+    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Supervise, &options.run_id)?;
     let dirs = RunDirs::create(&run_dir)?;
     let manager = WorktreeManager::new(&repo);
     let sync_store = SyncStore::open(&repo)?;
@@ -719,8 +724,8 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
     if plan.max_depth != 2 {
         bail!("supervisor max_depth must be exactly 2");
     }
-    if plan.max_child_processes == 0 {
-        bail!("max_child_processes must be at least 1");
+    if plan.max_child_assignments == 0 {
+        bail!("max_child_assignments must be at least 1 (legacy max_child_processes is accepted as an alias)");
     }
     if plan.child_timeout_seconds == 0 {
         bail!("child_timeout_seconds must be greater than zero");
@@ -728,11 +733,11 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
     if plan.assignments.is_empty() {
         bail!("supervisor plan must include at least one orchestrator assignment");
     }
-    if plan.assignments.len() > plan.max_child_processes {
+    if plan.assignments.len() > plan.max_child_assignments {
         bail!(
-            "supervisor plan has {} child orchestrators but max_child_processes is {}",
+            "supervisor plan has {} child orchestrators but max_child_assignments is {}",
             plan.assignments.len(),
-            plan.max_child_processes
+            plan.max_child_assignments
         );
     }
 
@@ -1495,8 +1500,8 @@ fn default_max_depth() -> u8 {
     2
 }
 
-fn default_max_child_processes() -> usize {
-    DEFAULT_MAX_CHILD_PROCESSES
+fn default_max_child_assignments() -> usize {
+    DEFAULT_MAX_CHILD_ASSIGNMENTS
 }
 
 fn default_child_timeout_seconds() -> u64 {

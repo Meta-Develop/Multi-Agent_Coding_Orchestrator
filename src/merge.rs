@@ -1049,6 +1049,10 @@ impl CandidateValidationSandbox {
                 String::from_utf8_lossy(&add_output.stderr).trim()
             );
         }
+        let sandbox = Self {
+            primary_repo_root,
+            path,
+        };
 
         let patch = preview.candidate.diff.full.as_deref().unwrap_or_default();
         let args = match preview.safety.apply_mode {
@@ -1057,7 +1061,7 @@ impl CandidateValidationSandbox {
             ApplyMode::None => Vec::new(),
         };
         if !args.is_empty() {
-            let apply_output = run_git_with_input(&path, &args, patch)
+            let apply_output = run_git_with_input(&sandbox.path, &args, patch)
                 .context("failed to apply candidate patch to validation worktree")?;
             if !apply_output.success {
                 bail!(
@@ -1067,10 +1071,7 @@ impl CandidateValidationSandbox {
             }
         }
 
-        Ok(Self {
-            primary_repo_root,
-            path,
-        })
+        Ok(sandbox)
     }
 
     fn path(&self) -> &Path {
@@ -1716,6 +1717,7 @@ fn sort_validation_reports(reports: &mut [ValidationReport]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::Signature;
 
     #[test]
     fn classifies_unclaimed_paths_by_repo_relative_claim_coverage() {
@@ -1870,6 +1872,99 @@ mod tests {
 
         assert_eq!(readiness.status, ApplyReadinessStatus::Blocked);
         assert_eq!(readiness.blockers, vec![ApplyBlocker::ApplyCheckFailed]);
+    }
+
+    #[test]
+    fn candidate_validation_sandbox_is_removed_when_patch_apply_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir(&repo_path).expect("create repo dir");
+        let repo = Repository::init(&repo_path).expect("init repo");
+        fs::write(repo_path.join("README.md"), "# Smoke\n").expect("write readme");
+        let mut index = repo.index().expect("open index");
+        index.add_path(Path::new("README.md")).expect("add readme");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("create signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .expect("commit");
+
+        let passed = SafetyCheck {
+            status: SafetyCheckStatus::Passed,
+            message: None,
+            paths: Vec::new(),
+        };
+        let preview = MergeApplyPreview {
+            candidate: MergeCandidate {
+                metadata: WorktreeMergeMetadata {
+                    agent_id: "agent-a".to_string(),
+                    worktree_path: repo_path.clone(),
+                    branch: "maco/agent-a".to_string(),
+                    primary_repo_root: repo_path.clone(),
+                    primary_head: None,
+                    agent_head: None,
+                    merge_base: None,
+                    base_matches_primary: Some(true),
+                },
+                claimed_paths: vec![PathBuf::from("README.md")],
+                changed_paths: vec![PathBuf::from("README.md")],
+                changes: vec![ChangedPath {
+                    path: PathBuf::from("README.md"),
+                    kind: ChangeKind::Modified,
+                }],
+                unclaimed_changed_paths: Vec::new(),
+                diff: DiffOutput {
+                    summary: OutputSummary {
+                        text: "invalid patch".to_string(),
+                        truncated: false,
+                    },
+                    full: Some("this is not a patch\n".to_string()),
+                },
+                validations: Vec::new(),
+            },
+            safety: MergeApplySafety {
+                dirty_primary: passed.clone(),
+                stale_base: passed.clone(),
+                apply_check: passed.clone(),
+                unclaimed_edits: passed.clone(),
+                validation: passed,
+                validation_required: false,
+                candidate_validation_commands: Vec::new(),
+                force_options: MergeForceOptions::default(),
+                apply_mode: ApplyMode::Direct,
+                readiness: ApplyReadiness {
+                    status: ApplyReadinessStatus::Safe,
+                    blockers: Vec::new(),
+                    forced: Vec::new(),
+                    details: Vec::new(),
+                },
+            },
+        };
+
+        let result = CandidateValidationSandbox::create(&preview);
+
+        assert!(result.is_err());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("list worktrees");
+        assert!(output.status.success());
+        let worktrees = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !worktrees.contains("maco-candidate-validation-"),
+            "{worktrees}"
+        );
     }
 
     #[test]

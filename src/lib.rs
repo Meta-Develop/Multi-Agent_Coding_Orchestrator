@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod artifacts;
 pub mod autopilot;
 pub mod cli;
 pub mod external_agent;

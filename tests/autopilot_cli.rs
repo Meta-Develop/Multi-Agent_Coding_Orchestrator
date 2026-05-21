@@ -163,6 +163,98 @@ fn fake_autopilot_run_creates_durable_reports() -> Result<()> {
 }
 
 #[test]
+fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let task_path = temp.path().join("task.md");
+    write_file(
+        &task_path,
+        "Update the README through generated autopilot.\n",
+    )?;
+
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let run_id = report["run_id"].as_str().context("generated run id")?;
+    assert!(run_id.starts_with("autopilot-"));
+    assert!(repo_path
+        .join(".maco/autopilot/runs")
+        .join(run_id)
+        .join("final-report.json")
+        .exists());
+
+    let latest = run_success_json(&[
+        "autopilot",
+        "artifacts",
+        "latest",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(latest["run"]["run_id"], run_id);
+    assert_eq!(latest["run"]["final_report_status"], "succeeded");
+    assert_eq!(latest["run"]["final_report_success"], true);
+
+    let refused = run_failure_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        run_id,
+        "--json",
+    ])?;
+    assert_eq!(refused["status"], "refused");
+    assert!(refused["message"]
+        .as_str()
+        .context("reuse message")?
+        .contains("already exists"));
+
+    let corrupt_dir = repo_path.join(".maco/autopilot/runs/zz-corrupt");
+    fs::create_dir_all(&corrupt_dir).context("create corrupt run dir")?;
+    write_file(&corrupt_dir.join("final-report.json"), "{not json")?;
+    let listed = run_success_json(&[
+        "autopilot",
+        "artifacts",
+        "list",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let runs = listed["runs"].as_array().context("runs")?;
+    let corrupt = runs
+        .iter()
+        .find(|run| run["run_id"] == "zz-corrupt")
+        .context("corrupt run")?;
+    assert_eq!(corrupt["final_report_exists"], true);
+    assert_eq!(corrupt["final_report_status"], "malformed");
+    assert_eq!(corrupt["final_report_corrupt"], true);
+
+    let prune = run_success_json(&[
+        "autopilot",
+        "artifacts",
+        "prune",
+        "--repo",
+        path_str(&repo_path)?,
+        "--keep",
+        "1",
+        "--dry-run",
+        "--json",
+    ])?;
+    assert_eq!(prune["dry_run"], true);
+    assert_eq!(prune["deleted_count"], 0);
+    assert!(corrupt_dir.exists(), "dry-run prune must not delete");
+
+    Ok(())
+}
+
+#[test]
 fn fake_autopilot_run_ignores_local_runtime_state_without_gitignore_entry() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
