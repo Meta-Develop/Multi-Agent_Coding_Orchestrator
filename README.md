@@ -38,6 +38,9 @@ The current implementation covers a local-first command-line slice:
 - `maco repo map --semantic` builds a parser-backed Rust semantic map for modules, symbols, impls, imports, public re-exports, module declarations, import dependencies, and parse errors.
 - `maco repo query symbol <name>` and `maco repo query path <path>` search the semantic Rust map.
 - `maco repo query risk --path <path> --json` reports touched symbols, dependency impacts, and impacted files for changed Rust paths.
+- `maco coord preview/claim/status/release/release-agent` provides standalone
+  repo-local semantic intent coordination for paths, modules, and symbols
+  without automatic task planning.
 - `maco orchestrate validate <plan-file>` validates a local JSON orchestration plan.
 - `maco orchestrate run <plan-file>` creates or reuses agent worktrees, claims paths, runs configured local shell commands, runs per-agent validation commands in agent worktrees, enforces path-claim boundaries, optionally writes patches and checkpoints, releases claims, and emits a run summary.
 - `maco orchestrate resume <checkpoint-file>` validates the checkpoint, repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims before skipping completed agents and running only pending work.

@@ -18,6 +18,9 @@ Coding Orchestrator.
 - Read-only repository mapping, including parser-backed Rust semantic maps and
   symbol/path/risk queries. Risk reports include touched symbols, dependency
   impacts, and impacted files for changed paths.
+- Standalone repo-local semantic intent coordination commands:
+  `maco coord preview/claim/status/release/release-agent` for path, module, and
+  symbol intents.
 - Worktree diff collection, orchestration result collection, merge preview, and
   guarded merge apply with dirty-primary, stale-base, unclaimed-edit,
   validation, and apply-check gates.
