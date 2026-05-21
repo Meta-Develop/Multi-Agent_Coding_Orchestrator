@@ -91,7 +91,7 @@ Implemented local foundations:
 4. Provider-neutral LLM adapter boundaries with deterministic fake-provider
    tests and local fake-provider-backed `maco agent run` execution.
 
-Known limitations and post-release roadmap for 0.1.0:
+Known limitations and roadmap for 0.2.0:
 
 1. Richer merge conflict classification is a known limitation. Current apply
    uses Git apply safety checks and reports structured blockers, but does not
