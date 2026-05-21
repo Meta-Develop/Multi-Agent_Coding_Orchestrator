@@ -54,6 +54,59 @@ fn autopilot_plan_json_normalizes_defaults_and_aliases() -> Result<()> {
 }
 
 #[test]
+fn autopilot_plan_proposes_paths_from_plain_and_empty_tasks() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_file(&repo_path.join("src/inbox.rs"), "pub struct InboxRepair;\n")?;
+    commit_all(&Repository::open(&repo_path)?, "add inbox module")?;
+
+    let task_path = temp.path().join("task.md");
+    write_file(
+        &task_path,
+        "Update README.md and repair InboxRepair in src/inbox.rs.\n",
+    )?;
+    let plain_plan = run_success_json(&[
+        "autopilot",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(
+        plain_plan["assigned_paths"],
+        serde_json::json!(["README.md", "src/inbox.rs"])
+    );
+
+    let plan_path = temp.path().join("empty-paths.json");
+    write_file(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": {
+            "title": "Repair inbox command",
+            "body": "Fix InboxRepair handling."
+          },
+          "assigned_paths": []
+        }"#,
+    )?;
+    let json_plan = run_success_json(&[
+        "autopilot",
+        "plan",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(
+        json_plan["assigned_paths"],
+        serde_json::json!(["src/inbox.rs"])
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fake_autopilot_run_creates_durable_reports() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -333,6 +386,10 @@ fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
     ])?;
     let sync_report = run_autopilot_refusal(&sync_repo, temp.path(), "sync-refusal")?;
     assert_refusal_kind(&sync_report, "active_sync_claims")?;
+    let sync_refusal = refusal_by_kind(&sync_report, "active_sync_claims")?;
+    assert_eq!(sync_refusal["paths"], serde_json::json!(["README.md"]));
+    assert_eq!(sync_refusal["lock_details"][0]["owner"], "other-agent");
+    assert_eq!(sync_refusal["lock_details"][0]["token"], 1);
 
     let semantic_repo = create_committed_repo(&temp.path().join("semantic"))?;
     run_success_json(&[
@@ -347,11 +404,74 @@ fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
     ])?;
     let semantic_report = run_autopilot_refusal(&semantic_repo, temp.path(), "semantic-refusal")?;
     assert_refusal_kind(&semantic_report, "active_semantic_intents")?;
+    let semantic_refusal = refusal_by_kind(&semantic_report, "active_semantic_intents")?;
+    assert_eq!(semantic_refusal["paths"], serde_json::json!(["README.md"]));
+    assert_eq!(
+        semantic_refusal["lock_details"][0]["owner"],
+        "semantic-agent"
+    );
+    assert_eq!(semantic_refusal["lock_details"][0]["token"], 1);
 
     let live_repo = create_committed_repo(&temp.path().join("live"))?;
     write_live_claim(&live_repo, "active-live", "active", "README.md")?;
     let live_report = run_autopilot_refusal(&live_repo, temp.path(), "live-refusal")?;
     assert_refusal_kind(&live_report, "active_live_locks")?;
+    let live_refusal = refusal_by_kind(&live_report, "active_live_locks")?;
+    assert_eq!(live_refusal["paths"], serde_json::json!(["README.md"]));
+    assert_eq!(live_refusal["lock_details"][0]["owner"], "worker-a");
+    assert_eq!(live_refusal["lock_details"][0]["claim_id"], "active-live");
+
+    Ok(())
+}
+
+#[test]
+fn non_overlapping_locks_do_not_refuse_autopilot() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_success_json(&[
+        "sync",
+        "claim",
+        "other-agent",
+        "src/lib.rs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    run_success_json(&[
+        "coord",
+        "claim",
+        "semantic-agent",
+        "--path",
+        "src/lib.rs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    write_live_claim(&repo_path, "active-live", "active", "src/lib.rs")?;
+    commit_all(
+        &Repository::open(&repo_path)?,
+        "track non-overlapping live claim",
+    )?;
+
+    let task_path = temp.path().join("readme-task.md");
+    write_file(&task_path, "Update README.md through fake autopilot.\n")?;
+    let report = run_success_json(&[
+        "autopilot",
+        "run",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "non-overlap",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["safety"]["refused"], false);
+    assert_eq!(
+        report["plan"]["assigned_paths"],
+        serde_json::json!(["README.md"])
+    );
 
     Ok(())
 }
@@ -447,7 +567,7 @@ fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
 
 fn run_autopilot_refusal(repo: &Path, temp: &Path, run_id: &str) -> Result<Value> {
     let task_path = temp.join(format!("{run_id}.md"));
-    write_file(&task_path, "Refuse autopilot.\n")?;
+    write_file(&task_path, "Refuse autopilot on README.md.\n")?;
     run_failure_json(&[
         "autopilot",
         "run",
@@ -469,6 +589,15 @@ fn assert_refusal_kind(report: &Value, kind: &str) -> Result<()> {
         anyhow::bail!("expected refusal kind {kind}: {refusals:?}");
     }
     Ok(())
+}
+
+fn refusal_by_kind<'a>(report: &'a Value, kind: &str) -> Result<&'a Value> {
+    report["safety"]["refusals"]
+        .as_array()
+        .context("refusals")?
+        .iter()
+        .find(|refusal| refusal["kind"] == kind)
+        .with_context(|| format!("expected refusal kind {kind}"))
 }
 
 fn write_live_claim(repo: &Path, claim_id: &str, status: &str, path: &str) -> Result<()> {

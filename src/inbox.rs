@@ -6,6 +6,7 @@ use crate::{
     live_claim::{self, LiveClock},
     llm::{RedactionSummary, Redactor},
     orchestrator::RunId,
+    planning,
     review::{ReviewerConfig, ReviewerMode},
     semantic_coord::SemanticIntentStore,
     sync::normalize_repo_relative_path,
@@ -17,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -183,6 +183,19 @@ pub struct InboxRefusal {
     pub kind: String,
     pub message: String,
     pub paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock_details: Vec<InboxLockRefusalDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxLockRefusalDetail {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -425,24 +438,6 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
         load_config_with_overrides(&repo, options.max_items, options.action_policy_override)?;
     let action_policy = effective_action_policy(loaded.config.action_policy, options.github);
     let github_enabled = action_policy == InboxActionPolicy::Github;
-    let refusals = preflight_refusals(&repo)?;
-    if !refusals.is_empty() {
-        return Ok(InboxScanReport {
-            version: INBOX_SCHEMA_VERSION,
-            repo: public_repo_path(),
-            config_path: loaded.path,
-            action_policy,
-            github_enabled,
-            success: false,
-            refused: true,
-            refusals,
-            candidate_count: 0,
-            selected_count: 0,
-            items: Vec::new(),
-            next_action: "resolve inbox safety refusals, then scan again".to_string(),
-        });
-    }
-
     let duplicate_keys = load_duplicate_keys(&repo)?;
     let mut items = Vec::new();
     if loaded.config.selection.issues {
@@ -483,6 +478,24 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
 
     let selected_count = items.iter().filter(|item| item.selected).count();
     let candidate_count = items.len();
+    let target_paths = selected_target_paths(&items, &loaded.config)?;
+    let refusals = preflight_refusals(&repo, &target_paths)?;
+    if !refusals.is_empty() {
+        return Ok(InboxScanReport {
+            version: INBOX_SCHEMA_VERSION,
+            repo: public_repo_path(),
+            config_path: loaded.path,
+            action_policy,
+            github_enabled,
+            success: false,
+            refused: true,
+            refusals,
+            candidate_count,
+            selected_count,
+            items,
+            next_action: "resolve inbox safety refusals, then scan again".to_string(),
+        });
+    }
     Ok(InboxScanReport {
         version: INBOX_SCHEMA_VERSION,
         repo: public_repo_path(),
@@ -881,21 +894,66 @@ fn task_body_for_item(item: &InboxItem) -> String {
                 .collect::<Vec<_>>()
                 .join("\n");
             let reviews = pr.review_feedback.summaries.join("\n");
+            let failing_checks = pr
+                .checks
+                .iter()
+                .filter(|check| {
+                    check_failed(check.conclusion.as_deref(), check.status.as_deref())
+                })
+                .map(|check| check.name.clone())
+                .collect::<Vec<_>>();
+            let path_reasons = pr_path_reasons(pr, &failing_checks);
+            let validation_expectation = pr_validation_expectation(&failing_checks);
             format!(
-                "React to GitHub PR #{}.\nURL: {}\nHead: {}\nBase: {}\n\nChanged files:\n{}\n\nChecks:\n{}\n\nReview feedback:\n{}\n\nRepair failing checks or requested changes in isolated autopilot work. Do not merge automatically.",
+                "React to GitHub PR #{}.\nURL: {}\nHead: {}\nBase: {}\n\nChanged files:\n{}\n\nTarget paths and reasons:\n{}\n\nChecks:\n{}\n\nReview feedback:\n{}\n\nValidation expectation:\n{}\n\nRepair failing checks or requested changes in isolated autopilot work. Do not merge automatically.",
                 pr.number,
                 pr.url.as_deref().unwrap_or("unknown"),
                 pr.head_ref.as_deref().unwrap_or("unknown"),
                 pr.base_ref.as_deref().unwrap_or("unknown"),
                 path_list(&pr.changed_files),
+                path_reasons,
                 if checks.is_empty() { "no failing check metadata" } else { &checks },
-                if reviews.is_empty() { "no review summaries" } else { &reviews }
+                if reviews.is_empty() { "no review summaries" } else { &reviews },
+                validation_expectation
             )
         }
         _ => format!(
             "React to inbox item {}. Do not merge automatically.",
             item.item_id
         ),
+    }
+}
+
+fn pr_path_reasons(pr: &GithubPrCandidate, failing_checks: &[String]) -> String {
+    let check_reason = if failing_checks.is_empty() {
+        "review feedback requested changes".to_string()
+    } else {
+        format!(
+            "review feedback requested changes; failing checks: {}",
+            failing_checks.join(", ")
+        )
+    };
+    let paths = if pr.changed_files.is_empty() {
+        vec![PathBuf::from("README.md")]
+    } else {
+        pr.changed_files.clone()
+    };
+    paths
+        .iter()
+        .map(|path| format!("- {}: {}", path.display(), check_reason))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn pr_validation_expectation(failing_checks: &[String]) -> String {
+    if failing_checks.is_empty() {
+        "preserve configured validation and confirm requested review changes are addressed"
+            .to_string()
+    } else {
+        format!(
+            "run or preserve configured validation and address failing check context: {}",
+            failing_checks.join(", ")
+        )
     }
 }
 
@@ -1363,7 +1421,7 @@ fn review_feedback_from_value(value: &Value) -> GithubReviewFeedbackSummary {
     }
 }
 
-fn preflight_refusals(repo: &Path) -> Result<Vec<InboxRefusal>> {
+fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<InboxRefusal>> {
     let mut refusals = Vec::new();
     let dirty_paths = dirty_primary_paths(repo)?;
     if !dirty_paths.is_empty() {
@@ -1371,57 +1429,93 @@ fn preflight_refusals(repo: &Path) -> Result<Vec<InboxRefusal>> {
             kind: "dirty_primary".to_string(),
             message: "primary worktree has local changes outside ignored runtime paths".to_string(),
             paths: dirty_paths,
+            lock_details: Vec::new(),
         });
     }
 
     let sync_claims = SyncStore::open(repo)?.snapshot()?;
-    if !sync_claims.is_empty() {
+    let mut sync_details = Vec::new();
+    for claim in &sync_claims {
+        for path in planning::any_path_overlaps(target_paths, &claim.paths) {
+            sync_details.push(InboxLockRefusalDetail {
+                path,
+                owner: Some(claim.agent_id.clone()),
+                token: Some(claim.token.get()),
+                claim_id: None,
+            });
+        }
+    }
+    if !sync_details.is_empty() {
         refusals.push(InboxRefusal {
             kind: "active_sync_claims".to_string(),
-            message: "active durable sync claims exist".to_string(),
-            paths: sync_claims
-                .iter()
-                .flat_map(|claim| claim.paths.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            message: "active durable sync claims overlap selected inbox target paths".to_string(),
+            paths: inbox_detail_paths(&sync_details),
+            lock_details: sync_details,
         });
     }
 
     let semantic_intents = SemanticIntentStore::open(repo)?.snapshot()?;
-    if !semantic_intents.is_empty() {
+    let mut semantic_details = Vec::new();
+    for intent in &semantic_intents {
+        let related_paths = intent
+            .paths
+            .iter()
+            .chain(intent.impacted_files.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for path in planning::any_path_overlaps(target_paths, &related_paths) {
+            semantic_details.push(InboxLockRefusalDetail {
+                path,
+                owner: Some(intent.agent_id.clone()),
+                token: Some(intent.token.get()),
+                claim_id: None,
+            });
+        }
+    }
+    if !semantic_details.is_empty() {
         refusals.push(InboxRefusal {
             kind: "active_semantic_intents".to_string(),
-            message: "active semantic coordination intents exist".to_string(),
-            paths: semantic_intents
-                .iter()
-                .flat_map(|intent| intent.paths.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            message: "active semantic coordination intents overlap selected inbox target paths"
+                .to_string(),
+            paths: inbox_detail_paths(&semantic_details),
+            lock_details: semantic_details,
         });
     }
 
     let live = live_claim::status(repo, &LiveClock::now())?;
-    let live_locks = live
-        .claims
-        .into_iter()
-        .filter(|claim| claim.is_lock)
-        .collect::<Vec<_>>();
-    if !live_locks.is_empty() {
+    let mut live_details = Vec::new();
+    for claim in live.claims.into_iter().filter(|claim| claim.is_lock) {
+        for path in planning::any_path_overlaps(target_paths, &claim.owned_files) {
+            live_details.push(InboxLockRefusalDetail {
+                path,
+                owner: claim.owner.clone(),
+                token: None,
+                claim_id: Some(claim.claim_id.clone()),
+            });
+        }
+    }
+    if !live_details.is_empty() {
         refusals.push(InboxRefusal {
             kind: "active_live_locks".to_string(),
-            message: "active or blocked live claim locks exist".to_string(),
-            paths: live_locks
-                .iter()
-                .flat_map(|claim| claim.owned_files.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            message: "active or blocked live claim locks overlap selected inbox target paths"
+                .to_string(),
+            paths: inbox_detail_paths(&live_details),
+            lock_details: live_details,
         });
     }
 
     Ok(refusals)
+}
+
+fn inbox_detail_paths(details: &[InboxLockRefusalDetail]) -> Vec<PathBuf> {
+    details
+        .iter()
+        .map(|detail| detail.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
@@ -1532,6 +1626,14 @@ fn assigned_paths_for_item(item: &InboxItem, config: &InboxConfig) -> Result<Vec
         (_, Some(pr)) => normalize_or_default(pr.changed_files.clone(), config),
         _ => normalize_or_default(Vec::new(), config),
     }
+}
+
+fn selected_target_paths(items: &[InboxItem], config: &InboxConfig) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for item in items.iter().filter(|item| item.selected) {
+        paths.extend(assigned_paths_for_item(item, config)?);
+    }
+    Ok(paths.into_iter().collect())
 }
 
 fn privacy_scan(body: &str, policy: &InboxPrivacyPolicy) -> PrivacyScanResult {
@@ -1799,11 +1901,11 @@ fn effective_action_policy(configured: InboxActionPolicy, github: bool) -> Inbox
 }
 
 fn is_ignored_runtime_path(path: &Path) -> bool {
-    matches!(
-        path.components().next(),
-        Some(std::path::Component::Normal(name))
-            if name == OsStr::new(".maco") || name == OsStr::new(".maco-cache")
-    )
+    path.starts_with(".maco")
+        || path.starts_with(".maco-cache")
+        || path.starts_with(".agents/live")
+        || path.starts_with(".agents/temp")
+        || path.starts_with(".agents/storage")
 }
 
 fn sorted_unique_strings(values: Vec<String>) -> Vec<String> {

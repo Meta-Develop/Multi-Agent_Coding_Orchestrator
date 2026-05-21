@@ -7,6 +7,7 @@ pub mod live_claim;
 pub mod llm;
 pub mod merge;
 pub mod orchestrator;
+pub mod planning;
 pub mod publication;
 pub mod repo_map;
 pub mod repo_semantic;

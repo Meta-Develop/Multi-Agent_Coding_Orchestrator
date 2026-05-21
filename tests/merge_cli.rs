@@ -311,6 +311,140 @@ fn merge_validation_failure_blocks_and_force_only_forces_validation() -> Result<
     Ok(())
 }
 
+#[test]
+fn merge_preview_required_validation_blocks_missing_not_run_and_skipped_evidence() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nagent change\n")
+        .context("edit worktree")?;
+
+    let missing = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_eq!(missing["safety"]["readiness"]["status"], "blocked");
+    assert_contains(
+        &missing["safety"]["readiness"]["blockers"],
+        "validation_missing",
+    )?;
+    assert_detail_path(
+        &missing["safety"]["readiness"]["details"],
+        "validation_missing",
+        "README.md",
+    )?;
+    assert!(
+        missing["safety"]["readiness"]["details"][0]["next_safe_operation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--validation-report")
+    );
+
+    let validation_path = temp.path().join("validation.json");
+    fs::write(
+        &validation_path,
+        r#"[
+            {"name":"unit","status":"not_run","paths":["README.md"]},
+            {"name":"fmt","status":"skipped","paths":["src/lib.rs"]}
+        ]"#,
+    )
+    .context("write validation report")?;
+    let incomplete = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_contains(
+        &incomplete["safety"]["readiness"]["blockers"],
+        "validation_not_run",
+    )?;
+    assert_contains(
+        &incomplete["safety"]["readiness"]["blockers"],
+        "validation_skipped",
+    )?;
+    assert_detail_path(
+        &incomplete["safety"]["readiness"]["details"],
+        "validation_not_run",
+        "README.md",
+    )?;
+    assert_detail_path(
+        &incomplete["safety"]["readiness"]["details"],
+        "validation_skipped",
+        "src/lib.rs",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn merge_apply_candidate_validation_failure_blocks_before_primary_apply() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\ncandidate\n")
+        .context("edit worktree")?;
+
+    let report = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-command",
+        "grep -q candidate README.md && printf failed >&2 && false",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(report["applied"], false);
+    assert_contains(
+        &report["preview"]["safety"]["readiness"]["blockers"],
+        "validation_failed",
+    )?;
+    assert_eq!(
+        report["preview"]["candidate"]["validations"][0]["status"],
+        "failed"
+    );
+    assert_eq!(
+        report["preview"]["safety"]["candidate_validation_commands"][0],
+        "grep -q candidate README.md && printf failed >&2 && false"
+    );
+    assert_detail_path(
+        &report["preview"]["safety"]["readiness"]["details"],
+        "validation_failed",
+        "README.md",
+    )?;
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
+        "# Smoke\n"
+    );
+
+    Ok(())
+}
+
 fn run_success_json(args: &[&str]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {

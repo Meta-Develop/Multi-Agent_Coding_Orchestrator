@@ -8,8 +8,9 @@ use crate::{
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
-        self, MergeApplyOptions, MergeApplyPreview, MergeApplyReport, MergeCandidate,
-        MergeCollectOptions, MergeForceOptions, MergePreviewOptions, ValidationReport,
+        self, CandidateValidationCommand, MergeApplyOptions, MergeApplyPreview, MergeApplyReport,
+        MergeCandidate, MergeCollectOptions, MergeForceOptions, MergePreviewOptions,
+        ValidationReport,
     },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
@@ -1640,12 +1641,14 @@ fn preview_merge_from_args(
     explicit_claims: Vec<PathBuf>,
     validation_report_paths: Vec<PathBuf>,
     forces: MergeForceOptions,
+    require_validation: bool,
 ) -> Result<MergeApplyPreview> {
     let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
     let validations = load_validation_reports(&validation_report_paths, &agent_id)?;
     merge::preview_merge_apply(MergePreviewOptions {
         collect: collect_options_from_claims(&repo, &agent_id, claims, true, validations),
         forces,
+        require_validation,
     })
 }
 
@@ -1665,12 +1668,18 @@ impl MergeCommand {
                     args.claim,
                     args.validation_report,
                     args.forces.into_force_options(),
+                    args.require_validation,
                 )?;
                 print_merge_preview(&preview, args.json)
             }
             MergeSubcommand::Apply(args) => {
                 let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
                 let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+                let candidate_validation_commands = args
+                    .validation_command
+                    .into_iter()
+                    .map(|command| CandidateValidationCommand { command })
+                    .collect::<Vec<_>>();
                 let preview_options = MergePreviewOptions {
                     collect: collect_options_from_claims(
                         &args.repo,
@@ -1680,11 +1689,14 @@ impl MergeCommand {
                         validations,
                     ),
                     forces: args.forces.into_force_options(),
+                    require_validation: args.require_validation,
                 };
                 let report = if args.json {
-                    let preview = merge::preview_merge_apply(preview_options)?;
-                    if preview.safety.readiness.status == merge::ApplyReadinessStatus::Blocked {
-                        let report = merge::blocked_merge_apply_report(preview);
+                    let report = merge::merge_apply_report(MergeApplyOptions {
+                        preview: preview_options,
+                        candidate_validation_commands,
+                    })?;
+                    if report.status == merge::MergeApplyReportStatus::Blocked {
                         print_merge_apply_report(&report, true)?;
                         let message = report
                             .error
@@ -1692,10 +1704,11 @@ impl MergeCommand {
                             .unwrap_or_else(|| "merge apply refused".to_string());
                         bail!("{message}");
                     }
-                    merge::apply_prechecked_merge(preview)?
+                    report
                 } else {
                     merge::apply_merge_result(MergeApplyOptions {
                         preview: preview_options,
+                        candidate_validation_commands,
                     })?
                 };
                 print_merge_apply_report(&report, args.json)
@@ -1725,6 +1738,9 @@ struct MergePreviewArgs {
     /// JSON validation report file. Repeat to supply multiple reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report before preview is considered safe.
+    #[arg(long)]
+    require_validation: bool,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
@@ -1745,6 +1761,12 @@ struct MergeApplyArgs {
     /// JSON validation report file. Repeat to supply multiple reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report or candidate validation command.
+    #[arg(long)]
+    require_validation: bool,
+    /// Shell command to validate the temporary merged candidate before applying to primary.
+    #[arg(long = "validation-command")]
+    validation_command: Vec<String>,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
@@ -1794,12 +1816,20 @@ impl PrCommand {
         match self.command {
             PrSubcommand::Preview(args) => {
                 let json = args.json;
-                let report = publication::preview_pr(pr_options_from_preview_args(args)?)?;
+                let require_validation = args.require_validation;
+                let report = publication::preview_pr_with_validation_requirement(
+                    pr_options_from_preview_args(args)?,
+                    require_validation,
+                )?;
                 print_pr_publication_report(&report, json)
             }
             PrSubcommand::Publish(args) => {
                 let json = args.json;
-                let report = publication::publish_pr(pr_options_from_publish_args(args)?)?;
+                let require_validation = args.require_validation;
+                let report = publication::publish_pr_with_validation_requirement(
+                    pr_options_from_publish_args(args)?,
+                    require_validation,
+                )?;
                 print_pr_publication_report(&report, json)?;
                 if report.status == PrPublicationStatus::Blocked {
                     bail!("pr publish refused: merge-preview blockers remain");
@@ -1831,6 +1861,9 @@ struct PrPreviewArgs {
     /// JSON validation report file. Repeat to supply multiple reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report before PR preview is publishable.
+    #[arg(long)]
+    require_validation: bool,
     /// Forge label recorded in the preview report.
     #[arg(long, default_value = "fake", value_parser = parse_forge_kind)]
     forge: ForgeKind,
@@ -1855,6 +1888,9 @@ struct PrPublishArgs {
     /// JSON validation report file. Repeat to supply multiple reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report before PR publication.
+    #[arg(long)]
+    require_validation: bool,
     /// Forge adapter. `fake` is deterministic and local-only; `github` shells out explicitly.
     #[arg(long, value_parser = parse_forge_kind)]
     forge: ForgeKind,

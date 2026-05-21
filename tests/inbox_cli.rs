@@ -136,6 +136,15 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert_eq!(plan["publish_mode"], "draft_only");
     assert_eq!(plan["auto_merge"], false);
 
+    let pr_plan = read_json_file(&run_dir.join("item-2-plan.json"))?;
+    assert_eq!(pr_plan["assigned_paths"], json!(["README.md"]));
+    let pr_body = pr_plan["task"]["body"].as_str().context("pr plan body")?;
+    assert!(pr_body.contains("Target paths and reasons:"));
+    assert!(pr_body.contains("- README.md:"));
+    assert!(pr_body.contains("failing checks: fake-ci"));
+    assert!(pr_body.contains("Validation expectation:"));
+    assert!(pr_body.contains("address failing check context: fake-ci"));
+
     let autopilot = read_json_file(&run_dir.join("item-1-autopilot-report.json"))?;
     assert_eq!(autopilot["success"], true);
     assert_eq!(autopilot["auto_merge_performed"], false);
@@ -363,6 +372,10 @@ fn active_live_lock_refuses_run() -> Result<()> {
     let report = run_inbox_refusal(&repo_path, "live-lock")?;
 
     assert_refusal_kind(&report, "active_live_locks")?;
+    let refusal = refusal_by_kind(&report, "active_live_locks")?;
+    assert_eq!(refusal["paths"], json!(["README.md"]));
+    assert_eq!(refusal["lock_details"][0]["owner"], "worker-c-test");
+    assert_eq!(refusal["lock_details"][0]["claim_id"], "active-live");
     assert_eq!(report["selected_item_count"], 0);
     assert_eq!(report["item_reports"].as_array().context("items")?.len(), 0);
 
@@ -386,6 +399,10 @@ fn active_sync_claim_refuses_run() -> Result<()> {
     let report = run_inbox_refusal(&repo_path, "sync-lock")?;
 
     assert_refusal_kind(&report, "active_sync_claims")?;
+    let refusal = refusal_by_kind(&report, "active_sync_claims")?;
+    assert_eq!(refusal["paths"], json!(["README.md"]));
+    assert_eq!(refusal["lock_details"][0]["owner"], "other-worker");
+    assert_eq!(refusal["lock_details"][0]["token"], 1);
     assert_eq!(report["selected_item_count"], 0);
 
     Ok(())
@@ -409,7 +426,65 @@ fn active_semantic_intent_refuses_run() -> Result<()> {
     let report = run_inbox_refusal(&repo_path, "semantic-lock")?;
 
     assert_refusal_kind(&report, "active_semantic_intents")?;
+    let refusal = refusal_by_kind(&report, "active_semantic_intents")?;
+    assert_eq!(refusal["paths"], json!(["README.md"]));
+    assert_eq!(refusal["lock_details"][0]["owner"], "semantic-worker");
+    assert_eq!(refusal["lock_details"][0]["token"], 1);
     assert_eq!(report["selected_item_count"], 0);
+
+    Ok(())
+}
+
+#[test]
+fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_success_json(&[
+        "sync",
+        "claim",
+        "other-worker",
+        "src/lib.rs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    run_success_json(&[
+        "coord",
+        "claim",
+        "semantic-worker",
+        "--path",
+        "src/lib.rs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    write_live_claim(&repo_path, "active-live", "active", "src/lib.rs")?;
+    commit_all(
+        &Repository::open(&repo_path)?,
+        "track non-overlapping live claim",
+    )?;
+
+    let report = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "non-overlap",
+        "--max-items",
+        "1",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["selected_item_count"], 1);
+    assert!(
+        report.get("refusals").is_none()
+            || report["refusals"]
+                .as_array()
+                .is_some_and(|items| items.is_empty())
+    );
 
     Ok(())
 }
@@ -578,6 +653,15 @@ fn assert_refusal_kind(report: &Value, kind: &str) -> Result<()> {
         anyhow::bail!("expected refusal kind {kind}: {refusal_items:?}");
     }
     Ok(())
+}
+
+fn refusal_by_kind<'a>(report: &'a Value, kind: &str) -> Result<&'a Value> {
+    report["refusals"]
+        .as_array()
+        .context("refusals")?
+        .iter()
+        .find(|refusal| refusal["kind"] == kind)
+        .with_context(|| format!("expected refusal kind {kind}"))
 }
 
 fn array_contains(value: &Value, expected: &str) -> Result<bool> {

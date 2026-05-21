@@ -74,6 +74,7 @@ pub struct PrPublicationReport {
     pub body_summary: OutputSummary,
     pub changed_paths: Vec<PathBuf>,
     pub validation_status: SafetyCheckStatus,
+    pub validation_required: bool,
     pub readiness: ApplyReadinessStatus,
     pub blockers: Vec<ApplyBlocker>,
     pub commit_id: Option<String>,
@@ -104,7 +105,14 @@ struct GithubPrResult {
 }
 
 pub fn preview_pr(options: PrPublicationOptions) -> Result<PrPublicationReport> {
-    let preview = build_merge_preview(&options)?;
+    preview_pr_with_validation_requirement(options, false)
+}
+
+pub fn preview_pr_with_validation_requirement(
+    options: PrPublicationOptions,
+    require_validation: bool,
+) -> Result<PrPublicationReport> {
+    let preview = build_merge_preview(&options, require_validation)?;
     let primary_repo = Repository::open(&preview.candidate.metadata.primary_repo_root)
         .context("failed to open primary repository")?;
     let base = current_branch_name(&primary_repo).unwrap_or_else(|| "HEAD".to_string());
@@ -134,6 +142,7 @@ pub fn preview_pr(options: PrPublicationOptions) -> Result<PrPublicationReport> 
         body_summary: summarize_text(&body, SUMMARY_LIMIT),
         changed_paths: preview.candidate.changed_paths.clone(),
         validation_status: preview.safety.validation.status,
+        validation_required: preview.safety.validation_required,
         readiness: preview.safety.readiness.status,
         blockers: preview.safety.readiness.blockers.clone(),
         commit_id: None,
@@ -147,7 +156,14 @@ pub fn preview_pr(options: PrPublicationOptions) -> Result<PrPublicationReport> 
 }
 
 pub fn publish_pr(options: PrPublicationOptions) -> Result<PrPublicationReport> {
-    let mut report = preview_pr(options)?;
+    publish_pr_with_validation_requirement(options, false)
+}
+
+pub fn publish_pr_with_validation_requirement(
+    options: PrPublicationOptions,
+    require_validation: bool,
+) -> Result<PrPublicationReport> {
+    let mut report = preview_pr_with_validation_requirement(options, require_validation)?;
     if report.readiness == ApplyReadinessStatus::Blocked {
         return Ok(report);
     }
@@ -241,7 +257,10 @@ pub fn create_issue(options: IssuePublicationOptions) -> Result<IssuePublication
     Ok(report)
 }
 
-fn build_merge_preview(options: &PrPublicationOptions) -> Result<MergeApplyPreview> {
+fn build_merge_preview(
+    options: &PrPublicationOptions,
+    require_validation: bool,
+) -> Result<MergeApplyPreview> {
     merge::preview_merge_apply(MergePreviewOptions {
         collect: MergeCollectOptions {
             repo: options.repo.clone(),
@@ -252,6 +271,7 @@ fn build_merge_preview(options: &PrPublicationOptions) -> Result<MergeApplyPrevi
             validations: options.validations.clone(),
         },
         forces: MergeForceOptions::default(),
+        require_validation,
     })
 }
 

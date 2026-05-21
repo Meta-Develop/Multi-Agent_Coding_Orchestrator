@@ -131,6 +131,46 @@ fn pr_publish_fake_blocks_unclaimed_worktree_edits_with_json_report() -> Result<
 }
 
 #[test]
+fn pr_publish_required_validation_blocks_missing_evidence() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\npublish\n").context("edit worktree")?;
+
+    let report = run_failure_json(&[
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--forge",
+        "fake",
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(report["created"], false);
+    assert_eq!(report["validation_required"], true);
+    assert_contains(&report["blockers"], "validation_missing")?;
+    assert_eq!(
+        report["preview"]["safety"]["readiness"]["details"][0]["kind"],
+        "validation_missing"
+    );
+    assert_eq!(
+        report["preview"]["safety"]["readiness"]["details"][0]["paths"][0],
+        "README.md"
+    );
+    assert_eq!(git_status_porcelain(worktree_path)?, " M README.md\n");
+
+    Ok(())
+}
+
+#[test]
 fn issue_preview_redacts_body_and_does_not_create_issue() -> Result<()> {
     let report = run_success_json(&[
         "issue",
