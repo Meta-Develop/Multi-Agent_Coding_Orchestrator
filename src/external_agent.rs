@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -267,31 +267,99 @@ fn wait_for_child(
     started: Instant,
     timeout: Duration,
 ) -> std::io::Result<TimedOutput> {
+    let output_drainers = start_output_drainers(&mut child);
     loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
+        if let Some(status) = child.try_wait()? {
+            let (stdout, stderr) = output_drainers.finish()?;
             return Ok(TimedOutput {
-                status: Some(output.status),
+                status: Some(status),
                 timed_out: false,
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout,
+                stderr,
                 process_error: None,
             });
         }
 
         if started.elapsed() >= timeout {
             let process_error = terminate_child_on_timeout(&mut child);
-            let output = child.wait_with_output()?;
+            let status = child.wait()?;
+            let (stdout, stderr) = output_drainers.finish()?;
             return Ok(TimedOutput {
-                status: Some(output.status),
+                status: Some(status),
                 timed_out: true,
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout,
+                stderr,
                 process_error,
             });
         }
 
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+struct OutputDrainers {
+    stdout: PipeReader,
+    stderr: PipeReader,
+}
+
+impl OutputDrainers {
+    fn finish(self) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        let stdout = self.stdout.finish()?;
+        let stderr = self.stderr.finish()?;
+        Ok((stdout, stderr))
+    }
+}
+
+enum PipeReader {
+    Thread {
+        stream_name: &'static str,
+        handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    },
+    Missing,
+}
+
+impl PipeReader {
+    fn finish(self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Self::Thread {
+                stream_name,
+                handle,
+            } => handle.join().map_err(|_| {
+                std::io::Error::other(format!(
+                    "external agent {stream_name} reader thread panicked"
+                ))
+            })?,
+            Self::Missing => Ok(Vec::new()),
+        }
+    }
+}
+
+fn start_output_drainers(child: &mut Child) -> OutputDrainers {
+    OutputDrainers {
+        stdout: child
+            .stdout
+            .take()
+            .map(|stdout| start_pipe_reader("stdout", stdout))
+            .unwrap_or(PipeReader::Missing),
+        stderr: child
+            .stderr
+            .take()
+            .map(|stderr| start_pipe_reader("stderr", stderr))
+            .unwrap_or(PipeReader::Missing),
+    }
+}
+
+fn start_pipe_reader<R>(stream_name: &'static str, mut stream: R) -> PipeReader
+where
+    R: Read + Send + 'static,
+{
+    PipeReader::Thread {
+        stream_name,
+        handle: thread::spawn(move || {
+            let mut output = Vec::new();
+            stream.read_to_end(&mut output)?;
+            Ok(output)
+        }),
     }
 }
 
@@ -393,5 +461,70 @@ fn duration_millis(duration: Duration) -> u64 {
         u64::MAX
     } else {
         millis as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_external_agent_drains_large_stdout_and_stderr_while_child_runs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+while IFS= read -r _line; do
+    :
+done
+i=0
+while [ "$i" -lt 256 ]; do
+    printf '%4096s' 'O'
+    i=$((i + 1))
+done
+i=0
+while [ "$i" -lt 256 ]; do
+    printf '%4096s' 'E' >&2
+    i=$((i + 1))
+done
+printf '\n{"type":"done"}\n'
+"#,
+        )?;
+        let mut permissions = fs::metadata(&agent)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&agent, permissions)?;
+
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "run the fake external agent\n")?;
+
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            temp.path().join("last-message.txt"),
+            Duration::from_secs(3),
+        );
+
+        let report = run_external_agent(&spec);
+
+        assert_eq!(report.exit_code, Some(0));
+        assert!(
+            !report.timed_out,
+            "large output child should exit before timeout: {report:?}"
+        );
+        assert_eq!(report.error, None);
+        assert!(report.succeeded());
+        assert!(report.stdout.truncated);
+        assert!(report.stderr.truncated);
+        assert!(report.stdout.text.len() >= OUTPUT_CHAR_LIMIT);
+        assert!(report.stderr.text.len() >= OUTPUT_CHAR_LIMIT);
+        assert!(fs::metadata(&spec.json_log)?.len() > (OUTPUT_CHAR_LIMIT as u64 * 2));
+
+        Ok(())
     }
 }

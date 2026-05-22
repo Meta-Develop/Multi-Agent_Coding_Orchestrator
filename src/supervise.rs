@@ -445,7 +445,8 @@ Safety requirements:
 - Do not edit outside the assigned paths, symbols, or modules.
 - Do not mutate the primary worktree.
 - Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
-- Write your final OrchestratorReviewReport as JSON to:
+- Return your OrchestratorReviewReport JSON as your final response.
+- Do not write the orchestrator report file yourself with tools; Codex CLI --output-last-message records your final response at this MACO collection target:
 {report_path}
 - The orchestrator review report schema path is:
 {schema_path}
@@ -512,6 +513,7 @@ Rules:
 - Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
 - If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over.
 - Only write a report file when an explicit report_path is assigned.
+- If the explicit report path is <none>, do not write any report file; only return WorkerReport JSON in your final response.
 - Use the worker report schema path: {schema_path}
 
 Supervisor task:
@@ -1431,17 +1433,38 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "OrchestratorReviewReport",
             "type": "object",
-            "required": ["id", "role", "accepted", "rejected", "status", "remaining_risk", "next_safe_action"],
+            "additionalProperties": false,
+            "required": [
+                "id",
+                "role",
+                "assigned_paths",
+                "semantic_symbols",
+                "semantic_modules",
+                "commands_run",
+                "files_changed",
+                "validation_results",
+                "findings",
+                "worker_reports",
+                "accepted",
+                "rejected",
+                "status",
+                "remaining_risk",
+                "next_safe_action"
+            ],
             "properties": {
                 "id": {"type": "string"},
-                "role": {"const": "child_orchestrator"},
+                "role": {"type": "string", "const": "child_orchestrator"},
                 "assigned_paths": {"type": "array", "items": {"type": "string"}},
                 "semantic_symbols": {"type": "array", "items": {"type": "string"}},
                 "semantic_modules": {"type": "array", "items": {"type": "string"}},
+                "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+                "files_changed": {"type": "array", "items": {"type": "string"}},
+                "validation_results": {"type": "array", "items": validation_result_schema_value()},
+                "findings": {"type": "array", "items": finding_schema_value()},
                 "worker_reports": {"type": "array", "items": worker_report_schema_value()},
                 "accepted": {"type": "boolean"},
                 "rejected": {"type": "boolean"},
-                "status": {"enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+                "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
                 "remaining_risk": {"type": "string"},
                 "next_safe_action": {"type": "string"}
             }
@@ -1458,23 +1481,98 @@ fn worker_report_schema_value() -> serde_json::Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "WorkerReport",
         "type": "object",
-        "required": ["id", "role", "no_further_delegation", "accepted", "rejected", "status", "remaining_risk", "next_safe_action"],
+        "additionalProperties": false,
+        "required": [
+            "id",
+            "role",
+            "assigned_paths",
+            "semantic_symbols",
+            "semantic_modules",
+            "commands_run",
+            "files_changed",
+            "validation_results",
+            "findings",
+            "no_further_delegation",
+            "accepted",
+            "rejected",
+            "status",
+            "remaining_risk",
+            "next_safe_action"
+        ],
         "properties": {
             "id": {"type": "string"},
-            "role": {"const": "worker"},
+            "role": {"type": "string", "const": "worker"},
             "assigned_paths": {"type": "array", "items": {"type": "string"}},
             "semantic_symbols": {"type": "array", "items": {"type": "string"}},
             "semantic_modules": {"type": "array", "items": {"type": "string"}},
-            "commands_run": {"type": "array"},
+            "commands_run": {"type": "array", "items": command_run_record_schema_value()},
             "files_changed": {"type": "array", "items": {"type": "string"}},
-            "validation_results": {"type": "array"},
-            "findings": {"type": "array"},
-            "no_further_delegation": {"const": true},
+            "validation_results": {"type": "array", "items": validation_result_schema_value()},
+            "findings": {"type": "array", "items": finding_schema_value()},
+            "no_further_delegation": {"type": "boolean", "const": true},
             "accepted": {"type": "boolean"},
             "rejected": {"type": "boolean"},
-            "status": {"enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
             "remaining_risk": {"type": "string"},
             "next_safe_action": {"type": "string"}
+        }
+    })
+}
+
+fn command_run_record_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "command",
+            "cwd",
+            "exit_code",
+            "status",
+            "timeout_seconds",
+            "duration_ms",
+            "timed_out",
+            "stdout",
+            "stderr",
+            "error"
+        ],
+        "properties": {
+            "command": {"type": "array", "items": {"type": "string"}},
+            "cwd": {"type": "string"},
+            "exit_code": {"type": ["integer", "null"]},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "timeout_seconds": {"type": "integer"},
+            "duration_ms": {"type": "integer"},
+            "timed_out": {"type": "boolean"},
+            "stdout": {"type": "string"},
+            "stderr": {"type": "string"},
+            "error": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn validation_result_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "command", "message"],
+        "properties": {
+            "name": {"type": "string"},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "command": {"type": "array", "items": {"type": "string"}},
+            "message": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn finding_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "message", "paths"],
+        "properties": {
+            "severity": {"type": "string", "enum": ["info", "warning", "error"]},
+            "message": {"type": "string"},
+            "paths": {"type": "array", "items": {"type": "string"}}
         }
     })
 }

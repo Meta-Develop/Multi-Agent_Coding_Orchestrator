@@ -122,10 +122,18 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
     assert!(child_a_prompt.contains("Report such escalation candidates"));
     assert!(child_a_prompt.contains("must not launch further workers"));
     assert!(child_a_prompt.contains("worker-report.schema.json"));
+    assert!(
+        child_a_prompt.contains("Return your OrchestratorReviewReport JSON as your final response")
+    );
+    assert!(child_a_prompt.contains("Codex CLI --output-last-message records your final response"));
+    assert!(child_a_prompt.contains("MACO collection target"));
+    assert!(!child_a_prompt.contains("Write your final OrchestratorReviewReport as JSON to:"));
     assert!(child_a_prompt.contains("Return WorkerReport JSON in your final response"));
     assert!(child_a_prompt.contains("\"no_further_delegation\": true"));
     assert!(child_a_prompt
         .contains("Only write a report file when an explicit report_path is assigned"));
+    assert!(child_a_prompt.contains("If the explicit report path is <none>"));
+    assert!(child_a_prompt.contains("only return WorkerReport JSON in your final response"));
     assert!(!child_a_prompt.contains("The only allowed depth"));
     let worker_schema_line = child_a_prompt
         .lines()
@@ -133,19 +141,77 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         .context("worker schema line")?;
     assert!(worker_schema_line.contains("worker-report.schema.json"));
     assert!(!worker_schema_line.contains("orchestrator-review-report.schema.json"));
-    let worker_schema = fs::read_to_string(
-        repo_path.join(".maco/o2/runs/supervise-two/schemas/worker-report.schema.json"),
+    let worker_schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            repo_path.join(".maco/o2/runs/supervise-two/schemas/worker-report.schema.json"),
+        )
+        .context("read worker schema")?,
     )
-    .context("read worker schema")?;
-    assert!(worker_schema.contains("\"no_further_delegation\""));
-    assert!(worker_schema.contains("\"const\": true"));
-    let orchestrator_schema = fs::read_to_string(
-        repo_path
-            .join(".maco/o2/runs/supervise-two/schemas/orchestrator-review-report.schema.json"),
+    .context("parse worker schema")?;
+    assert_object_schema_sealed(&worker_schema, "worker schema")?;
+    assert_all_array_schemas_define_items(&worker_schema, "worker schema")?;
+    assert_string_const_schema_property(&worker_schema, "worker schema", "role", "worker")?;
+    assert_boolean_const_schema_property(
+        &worker_schema,
+        "worker schema",
+        "no_further_delegation",
+        true,
+    )?;
+    assert_string_enum_schema_property(
+        &worker_schema,
+        "worker schema",
+        "status",
+        &["pending", "succeeded", "failed", "rejected", "missing"],
+    )?;
+    assert_report_array_item_schemas(&worker_schema, "worker schema")?;
+    let orchestrator_schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            repo_path
+                .join(".maco/o2/runs/supervise-two/schemas/orchestrator-review-report.schema.json"),
+        )
+        .context("read orchestrator schema")?,
     )
-    .context("read orchestrator schema")?;
-    assert!(orchestrator_schema.contains("\"worker_reports\""));
-    assert!(orchestrator_schema.contains("\"no_further_delegation\""));
+    .context("parse orchestrator schema")?;
+    assert_object_schema_sealed(&orchestrator_schema, "orchestrator schema")?;
+    assert_all_array_schemas_define_items(&orchestrator_schema, "orchestrator schema")?;
+    assert_string_const_schema_property(
+        &orchestrator_schema,
+        "orchestrator schema",
+        "role",
+        "child_orchestrator",
+    )?;
+    assert_string_enum_schema_property(
+        &orchestrator_schema,
+        "orchestrator schema",
+        "status",
+        &["pending", "succeeded", "failed", "rejected", "missing"],
+    )?;
+    assert_report_array_item_schemas(&orchestrator_schema, "orchestrator schema")?;
+    let nested_worker_schema = &orchestrator_schema["properties"]["worker_reports"]["items"];
+    assert_object_schema_sealed(nested_worker_schema, "nested worker schema")?;
+    assert_string_const_schema_property(
+        nested_worker_schema,
+        "nested worker schema",
+        "role",
+        "worker",
+    )?;
+    assert_boolean_const_schema_property(
+        nested_worker_schema,
+        "nested worker schema",
+        "no_further_delegation",
+        true,
+    )?;
+    assert_string_enum_schema_property(
+        nested_worker_schema,
+        "nested worker schema",
+        "status",
+        &["pending", "succeeded", "failed", "rejected", "missing"],
+    )?;
+    assert_report_array_item_schemas(nested_worker_schema, "nested worker schema")?;
+    assert!(orchestrator_schema["properties"]
+        .as_object()
+        .context("orchestrator properties")?
+        .contains_key("worker_reports"));
 
     let status = run_success_json_args(&[
         "supervise",
@@ -1029,6 +1095,217 @@ fn command_contains_sequence(command: &[Value], expected: &[&str]) -> bool {
             .zip(expected)
             .all(|(value, expected)| value.as_str() == Some(*expected))
     })
+}
+
+fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
+    let command_items = assert_array_property_has_items(schema, label, "commands_run")?;
+    assert_object_schema_sealed(command_items, &format!("{label}.commands_run items"))?;
+    assert_schema_required_contains(
+        command_items,
+        &format!("{label}.commands_run items"),
+        &[
+            "command",
+            "cwd",
+            "exit_code",
+            "status",
+            "timeout_seconds",
+            "duration_ms",
+            "timed_out",
+            "stdout",
+            "stderr",
+            "error",
+        ],
+    )?;
+    let command = schema_property(
+        command_items,
+        &format!("{label}.commands_run items"),
+        "command",
+    )?;
+    assert_schema_array_has_items(command, &format!("{label}.commands_run items.command"))?;
+
+    let validation_items = assert_array_property_has_items(schema, label, "validation_results")?;
+    assert_object_schema_sealed(
+        validation_items,
+        &format!("{label}.validation_results items"),
+    )?;
+    assert_schema_required_contains(
+        validation_items,
+        &format!("{label}.validation_results items"),
+        &["name", "status", "command", "message"],
+    )?;
+    let validation_command = schema_property(
+        validation_items,
+        &format!("{label}.validation_results items"),
+        "command",
+    )?;
+    assert_schema_array_has_items(
+        validation_command,
+        &format!("{label}.validation_results items.command"),
+    )?;
+
+    let finding_items = assert_array_property_has_items(schema, label, "findings")?;
+    assert_object_schema_sealed(finding_items, &format!("{label}.findings items"))?;
+    assert_schema_required_contains(
+        finding_items,
+        &format!("{label}.findings items"),
+        &["severity", "message", "paths"],
+    )?;
+    let paths = schema_property(finding_items, &format!("{label}.findings items"), "paths")?;
+    assert_schema_array_has_items(paths, &format!("{label}.findings items.paths"))?;
+
+    Ok(())
+}
+
+fn assert_all_array_schemas_define_items(schema: &Value, label: &str) -> Result<()> {
+    match schema {
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("array") {
+                assert_schema_array_has_items(schema, label)?;
+            }
+            for (key, value) in object {
+                assert_all_array_schemas_define_items(value, &format!("{label}.{key}"))?;
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                assert_all_array_schemas_define_items(value, &format!("{label}[{index}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn assert_array_property_has_items<'a>(
+    schema: &'a Value,
+    label: &str,
+    property: &str,
+) -> Result<&'a Value> {
+    let property_schema = schema_property(schema, label, property)?;
+    assert_schema_array_has_items(property_schema, &format!("{label}.{property}"))
+}
+
+fn assert_schema_array_has_items<'a>(schema: &'a Value, label: &str) -> Result<&'a Value> {
+    assert_schema_type(schema, label, "array")?;
+    schema
+        .get("items")
+        .with_context(|| format!("{label} array schema must define items: {schema:?}"))
+}
+
+fn assert_object_schema_sealed(schema: &Value, label: &str) -> Result<()> {
+    assert_schema_type(schema, label, "object")?;
+    if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
+        anyhow::bail!("{label} must set additionalProperties to false: {schema:?}");
+    }
+    Ok(())
+}
+
+fn assert_schema_required_contains(
+    schema: &Value,
+    label: &str,
+    expected_required: &[&str],
+) -> Result<()> {
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} must define required fields: {schema:?}"))?;
+    for expected in expected_required {
+        if !required
+            .iter()
+            .any(|value| value.as_str() == Some(*expected))
+        {
+            anyhow::bail!("{label} required fields must include {expected:?}: {required:?}");
+        }
+    }
+    Ok(())
+}
+
+fn assert_string_const_schema_property(
+    schema: &Value,
+    label: &str,
+    property: &str,
+    expected_const: &str,
+) -> Result<()> {
+    let property_schema = schema_property(schema, label, property)?;
+    assert_schema_property_type(property_schema, label, property, "string")?;
+    if property_schema.get("const").and_then(Value::as_str) != Some(expected_const) {
+        anyhow::bail!(
+            "{label}.{property} must set const to {expected_const:?}: {property_schema:?}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_boolean_const_schema_property(
+    schema: &Value,
+    label: &str,
+    property: &str,
+    expected_const: bool,
+) -> Result<()> {
+    let property_schema = schema_property(schema, label, property)?;
+    assert_schema_property_type(property_schema, label, property, "boolean")?;
+    if property_schema.get("const").and_then(Value::as_bool) != Some(expected_const) {
+        anyhow::bail!(
+            "{label}.{property} must set const to {expected_const:?}: {property_schema:?}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_string_enum_schema_property(
+    schema: &Value,
+    label: &str,
+    property: &str,
+    expected_enum: &[&str],
+) -> Result<()> {
+    let property_schema = schema_property(schema, label, property)?;
+    assert_schema_property_type(property_schema, label, property, "string")?;
+    let actual_enum = property_schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label}.{property} must define enum: {property_schema:?}"))?;
+    let actual_enum = actual_enum
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("{label}.{property} enum values must be strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if actual_enum != expected_enum {
+        anyhow::bail!(
+            "{label}.{property} enum mismatch; expected {expected_enum:?}, got {actual_enum:?}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_schema_property_type(
+    property_schema: &Value,
+    label: &str,
+    property: &str,
+    expected_type: &str,
+) -> Result<()> {
+    assert_schema_type(
+        property_schema,
+        &format!("{label}.{property}"),
+        expected_type,
+    )
+}
+
+fn assert_schema_type(schema: &Value, label: &str, expected_type: &str) -> Result<()> {
+    if schema.get("type").and_then(Value::as_str) != Some(expected_type) {
+        anyhow::bail!("{label} must set type to {expected_type:?}: {schema:?}");
+    }
+    Ok(())
+}
+
+fn schema_property<'a>(schema: &'a Value, label: &str, property: &str) -> Result<&'a Value> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(property))
+        .with_context(|| format!("{label} missing {property} property schema: {schema:?}"))
 }
 
 fn assert_finding(
