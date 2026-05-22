@@ -136,6 +136,17 @@ fn fake_autopilot_run_creates_durable_reports() -> Result<()> {
     ] {
         assert!(run_dir.join(artifact).exists(), "missing {artifact}");
     }
+    let child_report_path =
+        repo_path.join(".maco/o2/runs/durable-attempt-1/reports/autopilot-durable-a1.json");
+    let child_report: Value = serde_json::from_str(
+        &fs::read_to_string(&child_report_path)
+            .with_context(|| format!("read {}", child_report_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", child_report_path.display()))?;
+    assert_eq!(
+        child_report["worker_reports"][0]["no_further_delegation"],
+        true
+    );
 
     let status = run_success_json(&[
         "autopilot",

@@ -119,6 +119,8 @@ pub struct WorkerReport {
     pub validation_results: Vec<ValidationResult>,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_further_delegation: Option<bool>,
     pub accepted: bool,
     pub rejected: bool,
     pub status: ReviewStatus,
@@ -276,6 +278,18 @@ pub struct ChildPromptClaimContext<'a> {
     pub semantic_intent_token: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ChildOrchestratorPromptContext<'a> {
+    pub plan: &'a SupervisorPlan,
+    pub assignment: &'a OrchestratorAssignment,
+    pub run_dir: &'a Path,
+    pub worktree: &'a WorktreeRecord,
+    pub report_path: &'a Path,
+    pub schema_path: &'a Path,
+    pub worker_schema_path: &'a Path,
+    pub claim_context: ChildPromptClaimContext<'a>,
+}
+
 pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -378,25 +392,28 @@ pub fn collect_supervisor_run(
     })
 }
 
-pub fn child_orchestrator_prompt(
-    plan: &SupervisorPlan,
-    assignment: &OrchestratorAssignment,
-    run_dir: &Path,
-    worktree: &WorktreeRecord,
-    report_path: &Path,
-    schema_path: &Path,
-    claim_context: ChildPromptClaimContext<'_>,
-) -> Result<String> {
+pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) -> Result<String> {
+    let ChildOrchestratorPromptContext {
+        plan,
+        assignment,
+        run_dir,
+        worktree,
+        report_path,
+        schema_path,
+        worker_schema_path,
+        claim_context,
+    } = context;
     let assignment_json = serde_json::to_string_pretty(assignment)
         .context("failed to serialize orchestrator assignment")?;
     let worker_prompts = assignment
         .worker_assignments
         .iter()
-        .map(|worker| worker_prompt(plan, assignment, worker, run_dir, schema_path))
+        .map(|worker| worker_prompt(plan, assignment, worker, run_dir, worker_schema_path))
         .collect::<Result<Vec<_>>>()?
         .join("\n\n--- worker prompt contract ---\n\n");
     Ok(format!(
-        r#"You are a child orchestrator in an opt-in local Codex CLI supervisor run.
+        r#"ROLE: O1_CHILD_ORCHESTRATOR
+You are a child orchestrator in an opt-in local Codex CLI supervisor run.
 You are not the top supervisor. You are not alone in the repository.
 Primary worktree mutation is forbidden. Work only in this assigned child worktree:
 {worktree_path}
@@ -410,10 +427,18 @@ Ownership:
 - Semantic intent token: {semantic_intent_token}
 
 Runtime hierarchy:
-- The only allowed depth is supervisor -> child orchestrator -> worker.
-- You must launch worker Codex CLI subprocesses only inside assigned worktrees.
-- Do not launch further workers unless they are listed in the assignment.
-- Workers must write WorkerReport JSON matching the report contract.
+- Current supervise run contract: O2 supervisor -> O1 child orchestrator -> terminal worker/researcher.
+- You are the O1 child orchestrator for this assignment.
+- Workers and researchers are terminal: they must not launch further workers, delegate to another worker, or take over peer coordination.
+- You must not spawn, impersonate, or take over a peer O2 supervisor.
+- The top O2/supervisor may launch peer O2 supervisors as parallel scopes for newly discovered large cross-cutting problems. Report such escalation candidates in findings and remaining_risk instead of taking them over.
+
+Required behavior:
+- First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
+- Use Codex native SubAgent/delegated-worker mechanisms for worker assignments when available, following AGENTS.md and .agents instructions.
+- Do not force raw Codex CLI subprocess workers as the primary worker path.
+- If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
+- Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
 - Review every WorkerReport before writing your own OrchestratorReviewReport.
 
 Safety requirements:
@@ -422,8 +447,10 @@ Safety requirements:
 - Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
 - Write your final OrchestratorReviewReport as JSON to:
 {report_path}
-- The report schema path is:
+- The orchestrator review report schema path is:
 {schema_path}
+- Worker reports must use this schema path:
+{worker_schema_path}
 
 Supervisor task:
 {task}
@@ -446,6 +473,7 @@ Worker prompt templates:
             .unwrap_or_else(|| "<none>".to_string()),
         report_path = report_path.display(),
         schema_path = schema_path.display(),
+        worker_schema_path = worker_schema_path.display(),
         task = plan.task,
         assignment_json = assignment_json,
         worker_prompts = worker_prompts,
@@ -462,9 +490,11 @@ pub fn worker_prompt(
     let worker_json =
         serde_json::to_string_pretty(worker).context("failed to serialize worker assignment")?;
     Ok(format!(
-        r#"You are a worker in an opt-in local Codex CLI supervised run.
+        r#"ROLE: TERMINAL_WORKER
+You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
+Current supervise run contract: O2 supervisor -> O1 child orchestrator -> terminal worker/researcher.
 Your parent is child orchestrator `{orchestrator_id}`. You are not the supervisor.
-Do not launch further workers unless explicitly assigned by your child orchestrator.
+Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
 
 Ownership:
 - Worker id: {worker_id}
@@ -472,13 +502,17 @@ Ownership:
 - Semantic symbols: {semantic_symbols}
 - Semantic modules: {semantic_modules}
 - Run artifact root: {run_dir}
+- Explicit report path: {report_path}
 
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
 - Do not mutate the primary worktree.
 - Run validation or record why validation was not run.
-- Write WorkerReport JSON with changed files, commands run, validation results, findings, remaining risk, and next safe action.
-- Use the report schema path: {schema_path}
+- Return WorkerReport JSON in your final response with changed files, commands run, validation results, findings, remaining risk, and next safe action.
+- Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
+- If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over.
+- Only write a report file when an explicit report_path is assigned.
+- Use the worker report schema path: {schema_path}
 
 Supervisor task:
 {task}
@@ -492,6 +526,11 @@ Worker assignment JSON:
         semantic_symbols = worker.semantic_symbols.join(", "),
         semantic_modules = worker.semantic_modules.join(", "),
         run_dir = run_dir.display(),
+        report_path = worker
+            .report_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
         schema_path = schema_path.display(),
         task = worker.task.as_deref().unwrap_or(&plan.task),
         worker_json = worker_json,
@@ -566,18 +605,20 @@ fn run_supervisor_plan(
                 .join(format!("{}.prompt.md", assignment.id));
             let log_path = dirs.logs.join(format!("{}.jsonl", assignment.id));
             let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
-            let prompt = child_orchestrator_prompt(
-                &plan,
+            let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+            let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
+                plan: &plan,
                 assignment,
-                &run_dir,
-                &worktree,
-                &report_path,
-                &schema_path,
-                ChildPromptClaimContext {
+                run_dir: &run_dir,
+                worktree: &worktree,
+                report_path: &report_path,
+                schema_path: &schema_path,
+                worker_schema_path: &worker_schema_path,
+                claim_context: ChildPromptClaimContext {
                     claim: &claim,
                     semantic_intent_token: semantic_token,
                 },
-            )?;
+            })?;
             fs::write(&prompt_path, prompt)
                 .with_context(|| format!("failed to write prompt {}", prompt_path.display()))?;
 
@@ -954,8 +995,91 @@ fn collect_child_report(
             missing_child_report(assignment, report_path, external_run, error.to_string())
         }
     };
+    validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     verify_child_report_paths(assignment, worktree_path, primary_head, &mut report);
     report
+}
+
+fn validate_worker_report_delegation_attestations(
+    assignment: &OrchestratorAssignment,
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    let mut invalid_workers = Vec::new();
+    let actual_worker_ids = report
+        .worker_reports
+        .iter()
+        .map(|worker_report| worker_report.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing_workers = assignment
+        .worker_assignments
+        .iter()
+        .filter(|worker| !actual_worker_ids.contains(worker.id.as_str()))
+        .map(|worker| worker.id.clone())
+        .collect::<Vec<_>>();
+
+    for worker_report in &mut report.worker_reports {
+        if worker_report.no_further_delegation == Some(true) {
+            continue;
+        }
+        let message = match worker_report.no_further_delegation {
+            Some(false) => "worker report indicates further delegation".to_string(),
+            None => "worker report omitted no_further_delegation terminal-worker attestation"
+                .to_string(),
+            Some(true) => continue,
+        };
+        worker_report.status = ReviewStatus::Failed;
+        worker_report.accepted = false;
+        worker_report.rejected = true;
+        worker_report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message,
+            paths: vec![report_path.to_path_buf()],
+        });
+        invalid_workers.push(worker_report.id.clone());
+    }
+
+    if invalid_workers.is_empty() && missing_workers.is_empty() {
+        return;
+    }
+
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+
+    if !invalid_workers.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' included worker reports without terminal no-delegation attestation: {}",
+                report.id,
+                invalid_workers.join(", ")
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+
+    if !missing_workers.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' omitted required worker reports for assignment worker IDs: {}",
+                report.id,
+                missing_workers.join(", ")
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+
+    report.remaining_risk = if missing_workers.is_empty() {
+        "one or more worker reports indicate delegation beyond the terminal worker contract"
+            .to_string()
+    } else {
+        "one or more required worker reports are missing terminal no-delegation attestations"
+            .to_string()
+    };
+    report.next_safe_action =
+        "inspect worker output and rerun the child scope with terminal workers only".to_string();
 }
 
 fn verify_child_report_paths(
@@ -1314,7 +1438,7 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
                 "assigned_paths": {"type": "array", "items": {"type": "string"}},
                 "semantic_symbols": {"type": "array", "items": {"type": "string"}},
                 "semantic_modules": {"type": "array", "items": {"type": "string"}},
-                "worker_reports": {"type": "array"},
+                "worker_reports": {"type": "array", "items": worker_report_schema_value()},
                 "accepted": {"type": "boolean"},
                 "rejected": {"type": "boolean"},
                 "status": {"enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
@@ -1326,29 +1450,33 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
 }
 
 fn write_worker_schema(path: &Path) -> Result<()> {
-    write_schema(
-        path,
-        json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "title": "WorkerReport",
-            "type": "object",
-            "required": ["id", "role", "accepted", "rejected", "status", "remaining_risk", "next_safe_action"],
-            "properties": {
-                "id": {"type": "string"},
-                "role": {"const": "worker"},
-                "assigned_paths": {"type": "array", "items": {"type": "string"}},
-                "commands_run": {"type": "array"},
-                "files_changed": {"type": "array", "items": {"type": "string"}},
-                "validation_results": {"type": "array"},
-                "findings": {"type": "array"},
-                "accepted": {"type": "boolean"},
-                "rejected": {"type": "boolean"},
-                "status": {"enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
-                "remaining_risk": {"type": "string"},
-                "next_safe_action": {"type": "string"}
-            }
-        }),
-    )
+    write_schema(path, worker_report_schema_value())
+}
+
+fn worker_report_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "WorkerReport",
+        "type": "object",
+        "required": ["id", "role", "no_further_delegation", "accepted", "rejected", "status", "remaining_risk", "next_safe_action"],
+        "properties": {
+            "id": {"type": "string"},
+            "role": {"const": "worker"},
+            "assigned_paths": {"type": "array", "items": {"type": "string"}},
+            "semantic_symbols": {"type": "array", "items": {"type": "string"}},
+            "semantic_modules": {"type": "array", "items": {"type": "string"}},
+            "commands_run": {"type": "array"},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "validation_results": {"type": "array"},
+            "findings": {"type": "array"},
+            "no_further_delegation": {"const": true},
+            "accepted": {"type": "boolean"},
+            "rejected": {"type": "boolean"},
+            "status": {"enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "remaining_risk": {"type": "string"},
+            "next_safe_action": {"type": "string"}
+        }
+    })
 }
 
 fn write_schema(path: &Path, schema: serde_json::Value) -> Result<()> {

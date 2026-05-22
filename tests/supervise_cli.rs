@@ -82,6 +82,10 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         .as_array()
         .context("first command")?;
     assert!(first_command.iter().any(|arg| arg == "--json"));
+    assert!(command_contains_sequence(
+        first_command,
+        &["--enable", "multi_agent"]
+    ));
     assert!(!first_command
         .iter()
         .any(|arg| arg.as_str().is_some_and(|value| value.ends_with(".jsonl"))));
@@ -97,6 +101,51 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
             .context("read child-a json log")?;
     assert!(child_a_log.contains(r#""event":"fake-start""#));
     assert!(child_a_log.contains(r#""prompt_from_stdin":true"#));
+    assert!(child_a_log.contains(r#""multi_agent":true"#));
+
+    let child_a_prompt = fs::read_to_string(
+        repo_path.join(".maco/o2/runs/supervise-two/assignments/child-a.prompt.md"),
+    )
+    .context("read child-a prompt")?;
+    assert!(child_a_prompt.starts_with("ROLE: O1_CHILD_ORCHESTRATOR\n"));
+    assert!(child_a_prompt.contains("ROLE: TERMINAL_WORKER\n"));
+    assert!(child_a_prompt.contains("First, read and follow AGENTS.md"));
+    assert!(child_a_prompt.contains(".agents/skills/agent-orchestration/SKILL.md"));
+    assert!(child_a_prompt.contains(".agents/docs/AGENT_ORCHESTRATION.md"));
+    assert!(child_a_prompt.contains("Use Codex native SubAgent/delegated-worker mechanisms"));
+    assert!(child_a_prompt.contains("If no delegated-worker mechanism is available"));
+    assert!(child_a_prompt.contains("exact blocked worker task"));
+    assert!(child_a_prompt
+        .contains("O2 supervisor -> O1 child orchestrator -> terminal worker/researcher"));
+    assert!(child_a_prompt.contains("You must not spawn, impersonate, or take over a peer O2"));
+    assert!(child_a_prompt.contains("top O2/supervisor may launch peer O2 supervisors"));
+    assert!(child_a_prompt.contains("Report such escalation candidates"));
+    assert!(child_a_prompt.contains("must not launch further workers"));
+    assert!(child_a_prompt.contains("worker-report.schema.json"));
+    assert!(child_a_prompt.contains("Return WorkerReport JSON in your final response"));
+    assert!(child_a_prompt.contains("\"no_further_delegation\": true"));
+    assert!(child_a_prompt
+        .contains("Only write a report file when an explicit report_path is assigned"));
+    assert!(!child_a_prompt.contains("The only allowed depth"));
+    let worker_schema_line = child_a_prompt
+        .lines()
+        .find(|line| line.contains("Use the worker report schema path:"))
+        .context("worker schema line")?;
+    assert!(worker_schema_line.contains("worker-report.schema.json"));
+    assert!(!worker_schema_line.contains("orchestrator-review-report.schema.json"));
+    let worker_schema = fs::read_to_string(
+        repo_path.join(".maco/o2/runs/supervise-two/schemas/worker-report.schema.json"),
+    )
+    .context("read worker schema")?;
+    assert!(worker_schema.contains("\"no_further_delegation\""));
+    assert!(worker_schema.contains("\"const\": true"));
+    let orchestrator_schema = fs::read_to_string(
+        repo_path
+            .join(".maco/o2/runs/supervise-two/schemas/orchestrator-review-report.schema.json"),
+    )
+    .context("read orchestrator schema")?;
+    assert!(orchestrator_schema.contains("\"worker_reports\""));
+    assert!(orchestrator_schema.contains("\"no_further_delegation\""));
 
     let status = run_success_json_args(&[
         "supervise",
@@ -315,6 +364,135 @@ fn supervise_run_failed_worker_report_marks_final_failure() -> Result<()> {
         .as_str()
         .context("risk")?
         .contains("failed"));
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_worker_report_that_delegated_further() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "reject non-terminal worker",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-delegated",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-delegated", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-delegated-worker",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    let child_report = &report["orchestrator_reports"][0];
+    assert_eq!(child_report["status"], "failed");
+    assert_eq!(child_report["accepted"], false);
+    assert_eq!(child_report["rejected"], true);
+    let worker_report = &child_report["worker_reports"][0];
+    assert_eq!(worker_report["status"], "failed");
+    assert_eq!(worker_report["accepted"], false);
+    assert_eq!(worker_report["rejected"], true);
+    assert_eq!(worker_report["no_further_delegation"], false);
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "without terminal no-delegation attestation",
+    )?;
+    assert_json_findings_contain_message(
+        &worker_report["findings"],
+        "worker report indicates further delegation",
+    )?;
+    assert!(report["remaining_risk"]
+        .as_str()
+        .context("risk")?
+        .contains("failed"));
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_missing_worker_reports_for_assigned_workers() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "reject missing worker reports",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-omits-workers",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-omitted", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-missing-worker-reports",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    let child_report = &report["orchestrator_reports"][0];
+    assert_eq!(child_report["status"], "failed");
+    assert_eq!(child_report["accepted"], false);
+    assert_eq!(child_report["rejected"], true);
+    assert_eq!(
+        child_report["worker_reports"]
+            .as_array()
+            .context("worker reports")?
+            .len(),
+        0
+    );
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "omitted required worker reports for assignment worker IDs: worker-omitted",
+    )?;
+    assert!(child_report["remaining_risk"]
+        .as_str()
+        .context("child risk")?
+        .contains("missing terminal no-delegation attestations"));
 
     Ok(())
 }
@@ -811,12 +989,46 @@ fn supervise_plan_accepts_new_child_assignment_name_and_legacy_alias() -> Result
     Ok(())
 }
 
+#[test]
+fn supervise_readme_documents_o2_o1_contract_without_worker_fallback() -> Result<()> {
+    let readme = fs::read_to_string("README.md").context("read README")?;
+
+    assert!(readme.contains("O2 supervisor -> O1 child orchestrator -> terminal worker/researcher"));
+    assert!(readme.contains("peer O2 supervisors"));
+    assert!(readme.contains("report peer-O2 escalation"));
+    assert!(readme.contains("report escalation"));
+    assert!(!readme.contains("command-backed worker execution is fallback behavior"));
+
+    Ok(())
+}
+
 fn assert_json_array_contains(value: &Value, expected: &str) -> Result<()> {
     let values = value.as_array().context("json array")?;
     if !values.iter().any(|value| value == expected) {
         anyhow::bail!("expected JSON array to contain {expected}: {values:?}");
     }
     Ok(())
+}
+
+fn assert_json_findings_contain_message(value: &Value, expected: &str) -> Result<()> {
+    let findings = value.as_array().context("findings array")?;
+    if findings.iter().any(|finding| {
+        finding["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(expected))
+    }) {
+        return Ok(());
+    }
+    anyhow::bail!("expected finding containing '{expected}': {findings:?}");
+}
+
+fn command_contains_sequence(command: &[Value], expected: &[&str]) -> bool {
+    command.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .zip(expected)
+            .all(|(value, expected)| value.as_str() == Some(*expected))
+    })
 }
 
 fn assert_finding(
@@ -852,7 +1064,10 @@ set -eu
 report=
 worktree=
 json_seen=false
+multi_agent_seen=false
 prompt_arg=
+no_further_delegation=true
+worker_reports_json=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     exec)
@@ -867,6 +1082,12 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --output-schema|--sandbox|-c)
+      shift 2
+      ;;
+    --enable)
+      if [ "$2" = "multi_agent" ]; then
+        multi_agent_seen=true
+      fi
       shift 2
       ;;
     --cd)
@@ -887,6 +1108,10 @@ if [ "$json_seen" != "true" ]; then
   echo "missing --json flag" >&2
   exit 64
 fi
+if [ "$multi_agent_seen" != "true" ]; then
+  echo "missing --enable multi_agent flag" >&2
+  exit 64
+fi
 if [ "$prompt_arg" != "-" ]; then
   echo "expected prompt from stdin marker '-'" >&2
   exit 64
@@ -901,7 +1126,7 @@ case "$prompt_body" in
     ;;
 esac
 mkdir -p "$(dirname "$report")"
-printf '{"event":"fake-start","worktree":"%s","prompt_from_stdin":%s}\n' "$worktree" "$prompt_from_stdin"
+printf '{"event":"fake-start","worktree":"%s","prompt_from_stdin":%s,"multi_agent":%s}\n' "$worktree" "$prompt_from_stdin" "$multi_agent_seen"
 name="$(basename "$report" .json)"
 edit=true
 files_changed_json=
@@ -920,6 +1145,18 @@ case "$name" in
     path="README.md"
     edit_path="src/lib.rs"
     worker="worker-unauthorized"
+    ;;
+  child-delegated)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-delegated"
+    no_further_delegation=false
+    ;;
+  child-omits-workers)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-omitted"
+    worker_reports_json='[]'
     ;;
   child-omits-assigned)
     path="README.md"
@@ -968,6 +1205,32 @@ else
   risk="none"
   next="review diff"
 fi
+if [ -z "$worker_reports_json" ]; then
+  worker_reports_json=$(cat <<JSON
+[
+    {
+      "id": "$worker",
+      "role": "worker",
+      "assigned_paths": ["$path"],
+      "semantic_symbols": [],
+      "semantic_modules": [],
+      "commands_run": [],
+      "files_changed": $files_changed_json,
+      "validation_results": [
+        {"name": "fake worker validation", "status": "$status", "command": [], "message": null}
+      ],
+      "findings": [],
+      "no_further_delegation": $no_further_delegation,
+      "accepted": $accepted,
+      "rejected": $rejected,
+      "status": "$status",
+      "remaining_risk": "$risk",
+      "next_safe_action": "$next"
+    }
+  ]
+JSON
+)
+fi
 cat > "$report" <<JSON
 {
   "id": "$name",
@@ -981,26 +1244,7 @@ cat > "$report" <<JSON
     {"name": "fake validation", "status": "$status", "command": [], "message": null}
   ],
   "findings": [],
-  "worker_reports": [
-    {
-      "id": "$worker",
-      "role": "worker",
-      "assigned_paths": ["$path"],
-      "semantic_symbols": [],
-      "semantic_modules": [],
-      "commands_run": [],
-      "files_changed": $files_changed_json,
-      "validation_results": [
-        {"name": "fake worker validation", "status": "$status", "command": [], "message": null}
-      ],
-      "findings": [],
-      "accepted": $accepted,
-      "rejected": $rejected,
-      "status": "$status",
-      "remaining_risk": "$risk",
-      "next_safe_action": "$next"
-    }
-  ],
+  "worker_reports": $worker_reports_json,
   "accepted": $accepted,
   "rejected": $rejected,
   "status": "$status",

@@ -1165,6 +1165,7 @@ cat > "$report" <<JSON
         {{"name": "fake worker validation", "status": "succeeded", "command": [], "message": null}}
       ],
       "findings": [],
+      "no_further_delegation": true,
       "accepted": true,
       "rejected": false,
       "status": "succeeded",

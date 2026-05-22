@@ -63,10 +63,13 @@ The current implementation covers a local-first command-line slice:
 - `maco agent run` runs a local fake-provider-backed proposal in an isolated worktree with durable claims, boundary checks, validation, merge-preview reporting, and no real network providers by default.
 - `maco supervise plan` normalizes an opt-in supervisor task or JSON plan for
   Codex CLI subprocess orchestration.
-- `maco supervise run` serially launches opt-in Codex CLI child orchestrators
-  in isolated child worktrees with durable path claims, semantic coordination, and
-  structured reports; worker changes are not applied to the primary worktree
-  automatically.
+- `maco supervise run` serially launches opt-in O1 child orchestrators through
+  the Codex CLI in isolated child worktrees under an O2 supervisor. Each child
+  is instructed to read `AGENTS.md` and project-local `.agents` guidance before
+  acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
+  worker/researcher assignments when available, report peer-O2 escalation
+  candidates instead of taking them over, and preserve structured reporting
+  without applying worker changes to the primary worktree automatically.
 - `maco supervise status` reports durable supervisor run artifact state without
   launching workers or applying changes.
 - `maco supervise collect` reads the structured supervisor final report and
@@ -535,16 +538,31 @@ cargo run -- supervise artifacts latest --repo . --json
 `maco supervise run` is opt-in process-level orchestration. It shells out to the
 configured Codex-compatible executable, creates isolated child worktrees, claims
 each assignment's paths, records semantic coordination metadata when the plan
-requests it, and writes structured logs and reports under the run directory. It
-does not apply worker changes to the primary worktree automatically. Child
-orchestrator execution is currently serial: the supervisor starts and waits for
-one child process at a time. `max_child_assignments` bounds the number of child
-assignments in the plan, and therefore the allowed fan-out, but it is not a
-parallel execution limit yet. `max_child_processes` is accepted only as a
-legacy JSON alias and normalized out of reports. The command refuses to start
-when the primary worktree is dirty; use `--allow-dirty-primary` only when the
-operator has reviewed that state. Tests use fake subprocesses by default and do
-not require network access, provider credentials, or a real Codex login.
+requests it, and writes structured logs and reports under the run directory.
+Each Codex CLI child orchestrator is instructed to read `AGENTS.md` and
+project-local `.agents` guidance before acting. The generated prompt contract is
+O2 supervisor -> O1 child orchestrator -> terminal worker/researcher. Workers
+and researchers are terminal and must attest `no_further_delegation=true` in
+their WorkerReport. O1 child orchestrators must not spawn peer O2 supervisors;
+when they discover newly large cross-cutting problems, they report escalation
+candidates in their structured report instead of taking those scopes over. The
+top O2/supervisor may then launch peer O2 supervisors as separate parallel
+scopes.
+
+For worker assignments, child orchestrators should use Codex native
+SubAgent/delegated-worker mechanisms when available so the project
+manager/worker boundary is preserved. If no delegated-worker mechanism is
+available, the child should stop before mutation and report the exact blocked
+worker task. `maco supervise run` does not apply worker changes to the primary
+worktree automatically. Child orchestrator execution is currently serial: the
+supervisor starts and waits for one child process at a time.
+`max_child_assignments` bounds the number of child assignments in the plan, and
+therefore the allowed fan-out, but it is not a parallel execution limit yet.
+`max_child_processes` is accepted only as a legacy JSON alias and normalized out
+of reports. The command refuses to start when the primary worktree is dirty; use
+`--allow-dirty-primary` only when the operator has reviewed that state. Tests use
+fake subprocesses by default and do not require network access, provider
+credentials, or a real Codex login.
 
 Run the fake-first autopilot workflow:
 

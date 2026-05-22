@@ -191,6 +191,8 @@ fn codex_argv(spec: &ExternalAgentCommand) -> Vec<String> {
         spec.cwd.display().to_string(),
         "--sandbox".to_string(),
         spec.sandbox_mode.clone(),
+        "--enable".to_string(),
+        "multi_agent".to_string(),
     ];
     if let Some(approval_mode) = &spec.approval_mode {
         argv.push("-c".to_string());
