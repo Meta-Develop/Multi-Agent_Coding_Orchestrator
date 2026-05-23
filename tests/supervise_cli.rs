@@ -109,10 +109,17 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
     .context("read child-a prompt")?;
     assert!(child_a_prompt.starts_with("ROLE: O1_CHILD_ORCHESTRATOR\n"));
     assert!(child_a_prompt.contains("ROLE: TERMINAL_WORKER\n"));
+    let embedded_worker_prompt = child_a_prompt
+        .split_once("Worker prompt templates:\n")
+        .map(|(_, prompt)| prompt)
+        .context("embedded worker prompt templates block")?;
+    assert!(embedded_worker_prompt.starts_with("ROLE: TERMINAL_WORKER\n"));
     assert!(child_a_prompt.contains("First, read and follow AGENTS.md"));
     assert!(child_a_prompt.contains(".agents/skills/agent-orchestration/SKILL.md"));
     assert!(child_a_prompt.contains(".agents/docs/AGENT_ORCHESTRATION.md"));
     assert!(child_a_prompt.contains("Use Codex native SubAgent/delegated-worker mechanisms"));
+    assert!(child_a_prompt.contains("use the generated worker prompt template verbatim"));
+    assert!(child_a_prompt.contains("preserve ROLE: TERMINAL_WORKER as line 1 with no preamble"));
     assert!(child_a_prompt.contains("If no delegated-worker mechanism is available"));
     assert!(child_a_prompt.contains("exact blocked worker task"));
     assert!(child_a_prompt

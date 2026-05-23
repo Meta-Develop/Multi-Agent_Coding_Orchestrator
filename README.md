@@ -543,7 +543,9 @@ Each Codex CLI child orchestrator is instructed to read `AGENTS.md` and
 project-local `.agents` guidance before acting. The generated prompt contract is
 O2 supervisor -> O1 child orchestrator -> terminal worker/researcher. Workers
 and researchers are terminal and must attest `no_further_delegation=true` in
-their WorkerReport. O1 child orchestrators must not spawn peer O2 supervisors;
+their WorkerReport. Embedded worker prompt templates begin with
+`ROLE: TERMINAL_WORKER` and must be passed to worker sessions without preamble.
+O1 child orchestrators must not spawn peer O2 supervisors;
 when they discover newly large cross-cutting problems, they report escalation
 candidates in their structured report instead of taking those scopes over. The
 top O2/supervisor may then launch peer O2 supervisors as separate parallel

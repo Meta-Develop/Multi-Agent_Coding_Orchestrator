@@ -436,6 +436,7 @@ Runtime hierarchy:
 Required behavior:
 - First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
 - Use Codex native SubAgent/delegated-worker mechanisms for worker assignments when available, following AGENTS.md and .agents instructions.
+- When launching a worker, use the generated worker prompt template verbatim and preserve ROLE: TERMINAL_WORKER as line 1 with no preamble.
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
 - If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
