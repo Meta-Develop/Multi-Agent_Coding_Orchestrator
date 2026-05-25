@@ -135,6 +135,7 @@ impl<'de> Deserialize<'de> for AutopilotValidationCommand {
 pub enum AutopilotForgeMode {
     #[default]
     Fake,
+    Git,
     Github,
 }
 
@@ -1568,6 +1569,7 @@ impl AutopilotForgeMode {
     fn into_publication_forge(self) -> ForgeKind {
         match self {
             Self::Fake => ForgeKind::Fake,
+            Self::Git => ForgeKind::Git,
             Self::Github => ForgeKind::Github,
         }
     }
@@ -1584,6 +1586,7 @@ fn pr_status_label(status: PrPublicationStatus) -> &'static str {
 fn forge_label(forge: ForgeKind) -> &'static str {
     match forge {
         ForgeKind::Fake => "fake",
+        ForgeKind::Git => "git",
         ForgeKind::Github => "github",
     }
 }

@@ -20,6 +20,7 @@ const SUMMARY_LIMIT: usize = 12 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum ForgeKind {
     Fake,
+    Git,
     Github,
 }
 
@@ -27,8 +28,9 @@ impl ForgeKind {
     pub fn parse(value: &str) -> std::result::Result<Self, String> {
         match value {
             "fake" => Ok(Self::Fake),
+            "git" => Ok(Self::Git),
             "github" => Ok(Self::Github),
-            _ => Err("expected one of: fake, github".to_string()),
+            _ => Err("expected one of: fake, git, github".to_string()),
         }
     }
 }
@@ -170,11 +172,20 @@ pub fn publish_pr_with_validation_requirement(
 
     let primary_repo = Repository::open(&report.preview.candidate.metadata.primary_repo_root)
         .context("failed to open primary repository")?;
-    if report.forge == ForgeKind::Github {
-        report.remote = Some(
-            remote_url(&primary_repo, "origin")
-                .context("GitHub PR publication requires an 'origin' remote")?,
-        );
+    match report.forge {
+        ForgeKind::Fake => {}
+        ForgeKind::Git => {
+            report.remote = Some(
+                remote_url(&primary_repo, "origin")
+                    .context("Git publication requires an 'origin' remote")?,
+            );
+        }
+        ForgeKind::Github => {
+            report.remote = Some(
+                remote_url(&primary_repo, "origin")
+                    .context("GitHub PR publication requires an 'origin' remote")?,
+            );
+        }
     }
 
     let worktree_path = report.preview.candidate.metadata.worktree_path.clone();
@@ -201,6 +212,13 @@ pub fn publish_pr_with_validation_requirement(
             ));
             report.created = true;
             report.next_action = "review the fake pull request report locally".to_string();
+        }
+        ForgeKind::Git => {
+            push_git_branch(&worktree_path, "origin", &report.branch)?;
+            report.pushed = true;
+            report.created = false;
+            report.pr_url = None;
+            report.next_action = "open a pull request on your Git host manually".to_string();
         }
         ForgeKind::Github => {
             let body = pr_body(&report.preview);
@@ -243,6 +261,7 @@ pub fn create_issue(options: IssuePublicationOptions) -> Result<IssuePublication
     let mut report = preview_issue(options)?;
     let url = match report.forge {
         ForgeKind::Fake => fake_issue_url(&report.title, &report.redacted_body, &report.labels),
+        ForgeKind::Git => bail!("git forge does not create issues; use fake or github"),
         ForgeKind::Github => {
             create_github_issue(&repo, &report.title, &report.redacted_body, &report.labels)?
         }
@@ -251,6 +270,7 @@ pub fn create_issue(options: IssuePublicationOptions) -> Result<IssuePublication
     report.created = true;
     report.next_action = match report.forge {
         ForgeKind::Fake => "review the fake issue report locally",
+        ForgeKind::Git => "use fake or github issue publication",
         ForgeKind::Github => "review the created GitHub issue",
     }
     .to_string();
@@ -442,11 +462,7 @@ fn create_github_pr(
     body: &str,
     draft: bool,
 ) -> Result<GithubPrResult> {
-    let mut push = Command::new("git");
-    push.arg("-C")
-        .arg(worktree_path)
-        .args(["push", "-u", remote, branch]);
-    run_command(&mut push, "git push")?;
+    push_git_branch(worktree_path, remote, branch)?;
 
     let mut command = Command::new("gh");
     command
@@ -467,6 +483,15 @@ fn create_github_pr(
         pushed: true,
         created: true,
     })
+}
+
+fn push_git_branch(worktree_path: &Path, remote: &str, branch: &str) -> Result<()> {
+    let mut push = Command::new("git");
+    push.arg("-C")
+        .arg(worktree_path)
+        .args(["push", "-u", remote, branch]);
+    run_command(&mut push, "git push")?;
+    Ok(())
 }
 
 fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) -> Result<String> {

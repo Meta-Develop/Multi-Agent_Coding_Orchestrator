@@ -634,7 +634,7 @@ Run the fake-first inbox reaction loop:
 
 ```json
 {
-  "action_policy": "fake",
+  "permission_mode": "fake",
   "selection": {"max_items": 2},
   "max_repair_attempts": 1,
   "default_validation_commands": [
@@ -648,6 +648,7 @@ Run the fake-first inbox reaction loop:
 ```bash
 cargo run -- inbox scan --repo . --json
 cargo run -- inbox run --repo . --run-id inbox-demo --json
+cargo run -- inbox run --repo . --run-id inbox-codex --permission github_local --codex-bin codex --json
 cargo run -- inbox status inbox-demo --repo . --json
 cargo run -- inbox collect inbox-demo --repo . --json
 cargo run -- inbox watch --repo . --poll-seconds 60 --once --json
@@ -668,7 +669,10 @@ rejected.
 `maco inbox run` processes selected candidates through the same fake-first
 autopilot flow unless config `action_policy` or CLI `--dry-run` selects dry-run
 mode. `--max-items` overrides config selection for a scan, run, or watch command.
-`timeout_seconds` is honored for validation commands that do not return.
+`--codex-bin` on `run` or `watch`, or `codex_bin` in `maco-inbox.json`, passes a
+Codex-compatible executable through to autopilot; omitted keeps deterministic
+fake child execution. `timeout_seconds` is honored for validation commands that
+do not return.
 
 Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
 including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
@@ -676,18 +680,25 @@ including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
 `final-report.json`. Reports use repository-relative paths and do not include
 full diffs, raw secret values, credentials, or local absolute paths.
 
-GitHub inbox intake is explicit opt-in with `--github` or
-`action_policy: "github"` in `maco-inbox.json`. Fake mode remains the default and
-does not require network access or credentials. Fake PR review and failing CI
-context are converted into autopilot repair plans with assigned paths, reasons,
-and validation expectations; richer live GitHub reaction remains explicit
-opt-in and future hardening work. Inbox also preserves the same path-scoped
-safety boundary as autopilot: it refuses dirty primary worktree files, active
-local locks, active sync claims, active semantic intents, and active/blocked
-live claim locks only when they overlap selected target paths, while ignoring
-its own `.maco/**` and `.maco-cache/**` runtime artifacts. Refusal JSON includes
-paths and lock details. Inbox never performs automatic merge; human review
-remains the next action after a successful reaction.
+GitHub inbox intake is explicit opt-in. `--permission fake` is the default and
+does not require network access or credentials. `github_read` reads live issues
+and PRs through `gh` but only writes plans and reports. `github_local` reads live
+GitHub and runs local repair with fake PR publication and no source comments.
+`github_pr` reads live GitHub, runs repair, and publishes a draft PR through the
+GitHub forge without commenting on the source item. `github_full` also comments
+on the source issue or PR after success. `github_git` reads live GitHub issue/PR
+items through `gh`, runs repair, pushes the branch through real Git, and does
+not create a GitHub PR or comment on the source item. Hyphen aliases such as
+`github-read` are accepted. Legacy `--github` and `action_policy: "github"` keep
+the old full behavior unless `permission_mode` explicitly overrides them. Fake
+PR review and failing CI context are converted into autopilot repair plans with
+assigned paths, reasons, and validation expectations. Inbox also preserves the
+same path-scoped safety boundary as autopilot: it refuses dirty primary worktree
+files, active local locks, active sync claims, active semantic intents, and
+active/blocked live claim locks only when they overlap selected target paths,
+while ignoring its own `.maco/**` and `.maco-cache/**` runtime artifacts.
+Refusal JSON includes paths and lock details. Inbox never performs automatic
+merge; human review remains the next action after a successful reaction.
 
 Cleanup examples:
 

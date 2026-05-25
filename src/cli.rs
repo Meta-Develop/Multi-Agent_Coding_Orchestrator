@@ -5,7 +5,7 @@ use crate::{
     },
     artifacts::{self, ResolvedRunId, RunArtifactFamily},
     autopilot::{self, AutopilotRunOptions},
-    inbox::{self, InboxRunOptions, InboxScanOptions, InboxWatchOptions},
+    inbox::{self, InboxPermissionMode, InboxRunOptions, InboxScanOptions, InboxWatchOptions},
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
@@ -555,6 +555,7 @@ impl InboxCommand {
                 let report = inbox::scan_inbox(InboxScanOptions {
                     repo: args.repo,
                     github: args.github,
+                    permission_mode: args.permission,
                     max_items: args.max_items,
                     action_policy_override: None,
                 })?;
@@ -575,8 +576,10 @@ impl InboxCommand {
                     repo: resolved.repo,
                     run_id: resolved.run_id,
                     github: args.github,
+                    permission_mode: args.permission,
                     dry_run: args.dry_run,
                     max_items: args.max_items,
+                    codex_bin: args.codex_bin,
                 })?;
                 print_query_report(&report, args.json)?;
                 if !report.success {
@@ -606,8 +609,10 @@ impl InboxCommand {
                     poll_seconds: args.poll_seconds,
                     once: args.once,
                     github: args.github,
+                    permission_mode: args.permission,
                     dry_run: args.dry_run,
                     max_items: args.max_items,
+                    codex_bin: args.codex_bin,
                 })?;
                 print_query_report(&report, args.json)?;
                 if report.runs.iter().any(|run| !run.success) {
@@ -647,6 +652,9 @@ struct ScanInboxArgs {
     /// Enable real GitHub API reads through the local gh CLI.
     #[arg(long)]
     github: bool,
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    #[arg(long, value_parser = parse_inbox_permission_mode)]
+    permission: Option<InboxPermissionMode>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -669,6 +677,12 @@ struct RunInboxArgs {
     /// Enable real GitHub API reads/comments and GitHub publication through gh.
     #[arg(long)]
     github: bool,
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    #[arg(long, value_parser = parse_inbox_permission_mode)]
+    permission: Option<InboxPermissionMode>,
+    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -718,6 +732,12 @@ struct WatchInboxArgs {
     /// Enable real GitHub API reads/comments and GitHub publication through gh.
     #[arg(long)]
     github: bool,
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    #[arg(long, value_parser = parse_inbox_permission_mode)]
+    permission: Option<InboxPermissionMode>,
+    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2519,6 +2539,10 @@ fn parse_semantic_coordination_mode(
 
 fn parse_forge_kind(value: &str) -> std::result::Result<ForgeKind, String> {
     ForgeKind::parse(value)
+}
+
+fn parse_inbox_permission_mode(value: &str) -> std::result::Result<InboxPermissionMode, String> {
+    InboxPermissionMode::parse(value)
 }
 
 fn live_clock(value: Option<&str>) -> Result<LiveClock> {

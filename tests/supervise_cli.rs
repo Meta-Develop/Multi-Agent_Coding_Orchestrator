@@ -5,6 +5,22 @@ use std::{fs, path::Path, process::Command};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const CHILD_A_O1_PREFIX: &str = "\
+ROLE: O1_CHILD_ORCHESTRATOR
+AGENT_KIND: orchestrator
+AGENT_LABEL: child-a
+PARENT_THREAD_ID: none
+THREAD_DEPTH: 1
+NO_FURTHER_DELEGATION: false
+";
+const WORKER_A_PREFIX: &str = "\
+ROLE: TERMINAL_WORKER
+AGENT_KIND: worker
+AGENT_LABEL: worker-a
+PARENT_THREAD_ID: none
+THREAD_DEPTH: 2
+NO_FURTHER_DELEGATION: true
+";
 
 #[test]
 fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() -> Result<()> {
@@ -86,6 +102,22 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         first_command,
         &["--enable", "multi_agent"]
     ));
+    let child_a_report_arg = repo_path
+        .join(".maco/o2/runs/supervise-two/reports/child-a.json")
+        .display()
+        .to_string();
+    assert!(command_contains_sequence(
+        first_command,
+        &["--output-last-message", child_a_report_arg.as_str()]
+    ));
+    let orchestrator_schema_arg = repo_path
+        .join(".maco/o2/runs/supervise-two/schemas/orchestrator-review-report.schema.json")
+        .display()
+        .to_string();
+    assert!(command_contains_sequence(
+        first_command,
+        &["--output-schema", orchestrator_schema_arg.as_str()]
+    ));
     assert!(!first_command
         .iter()
         .any(|arg| arg.as_str().is_some_and(|value| value.ends_with(".jsonl"))));
@@ -102,24 +134,26 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
     assert!(child_a_log.contains(r#""event":"fake-start""#));
     assert!(child_a_log.contains(r#""prompt_from_stdin":true"#));
     assert!(child_a_log.contains(r#""multi_agent":true"#));
+    assert!(child_a_log.contains(r#""o1_role_prefix":true"#));
 
     let child_a_prompt = fs::read_to_string(
         repo_path.join(".maco/o2/runs/supervise-two/assignments/child-a.prompt.md"),
     )
     .context("read child-a prompt")?;
-    assert!(child_a_prompt.starts_with("ROLE: O1_CHILD_ORCHESTRATOR\n"));
-    assert!(child_a_prompt.contains("ROLE: TERMINAL_WORKER\n"));
+    assert_prompt_starts_with_prefix(&child_a_prompt, CHILD_A_O1_PREFIX)?;
+    assert!(child_a_prompt.contains(WORKER_A_PREFIX));
     let embedded_worker_prompt = child_a_prompt
         .split_once("Worker prompt templates:\n")
         .map(|(_, prompt)| prompt)
         .context("embedded worker prompt templates block")?;
-    assert!(embedded_worker_prompt.starts_with("ROLE: TERMINAL_WORKER\n"));
+    assert_prompt_starts_with_prefix(embedded_worker_prompt, WORKER_A_PREFIX)?;
     assert!(child_a_prompt.contains("First, read and follow AGENTS.md"));
     assert!(child_a_prompt.contains(".agents/skills/agent-orchestration/SKILL.md"));
     assert!(child_a_prompt.contains(".agents/docs/AGENT_ORCHESTRATION.md"));
     assert!(child_a_prompt.contains("Use Codex native SubAgent/delegated-worker mechanisms"));
     assert!(child_a_prompt.contains("use the generated worker prompt template verbatim"));
-    assert!(child_a_prompt.contains("preserve ROLE: TERMINAL_WORKER as line 1 with no preamble"));
+    assert!(child_a_prompt
+        .contains("preserve its six-line TERMINAL_WORKER role-prefix block with no preamble"));
     assert!(child_a_prompt.contains("If no delegated-worker mechanism is available"));
     assert!(child_a_prompt.contains("exact blocked worker task"));
     assert!(child_a_prompt
@@ -170,6 +204,7 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         "status",
         &["pending", "succeeded", "failed", "rejected", "missing"],
     )?;
+    assert_report_token_schemas(&worker_schema, "worker schema")?;
     assert_report_array_item_schemas(&worker_schema, "worker schema")?;
     let orchestrator_schema: Value = serde_json::from_str(
         &fs::read_to_string(
@@ -193,6 +228,7 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         "status",
         &["pending", "succeeded", "failed", "rejected", "missing"],
     )?;
+    assert_report_token_schemas(&orchestrator_schema, "orchestrator schema")?;
     assert_report_array_item_schemas(&orchestrator_schema, "orchestrator schema")?;
     let nested_worker_schema = &orchestrator_schema["properties"]["worker_reports"]["items"];
     assert_object_schema_sealed(nested_worker_schema, "nested worker schema")?;
@@ -214,6 +250,7 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         "status",
         &["pending", "succeeded", "failed", "rejected", "missing"],
     )?;
+    assert_report_token_schemas(nested_worker_schema, "nested worker schema")?;
     assert_report_array_item_schemas(nested_worker_schema, "nested worker schema")?;
     assert!(orchestrator_schema["properties"]
         .as_object()
@@ -1104,6 +1141,14 @@ fn command_contains_sequence(command: &[Value], expected: &[&str]) -> bool {
     })
 }
 
+fn assert_prompt_starts_with_prefix(prompt: &str, expected_prefix: &str) -> Result<()> {
+    if prompt.starts_with(expected_prefix) {
+        return Ok(());
+    }
+    let actual = prompt.lines().take(6).collect::<Vec<_>>();
+    anyhow::bail!("prompt did not start with expected role prefix; first six lines: {actual:?}");
+}
+
 fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
     let command_items = assert_array_property_has_items(schema, label, "commands_run")?;
     assert_object_schema_sealed(command_items, &format!("{label}.commands_run items"))?;
@@ -1113,15 +1158,18 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
         &[
             "command",
             "cwd",
-            "exit_code",
             "status",
             "timeout_seconds",
             "duration_ms",
             "timed_out",
             "stdout",
             "stderr",
-            "error",
         ],
+    )?;
+    assert_schema_required_excludes(
+        command_items,
+        &format!("{label}.commands_run items"),
+        &["exit_code", "error"],
     )?;
     let command = schema_property(
         command_items,
@@ -1129,6 +1177,16 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
         "command",
     )?;
     assert_schema_array_has_items(command, &format!("{label}.commands_run items.command"))?;
+    assert_integer_nullable_schema_property(
+        command_items,
+        &format!("{label}.commands_run items"),
+        "exit_code",
+    )?;
+    assert_string_nullable_schema_property(
+        command_items,
+        &format!("{label}.commands_run items"),
+        "error",
+    )?;
 
     let validation_items = assert_array_property_has_items(schema, label, "validation_results")?;
     assert_object_schema_sealed(
@@ -1138,7 +1196,12 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
     assert_schema_required_contains(
         validation_items,
         &format!("{label}.validation_results items"),
-        &["name", "status", "command", "message"],
+        &["name", "status", "command"],
+    )?;
+    assert_schema_required_excludes(
+        validation_items,
+        &format!("{label}.validation_results items"),
+        &["message"],
     )?;
     let validation_command = schema_property(
         validation_items,
@@ -1148,6 +1211,11 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
     assert_schema_array_has_items(
         validation_command,
         &format!("{label}.validation_results items.command"),
+    )?;
+    assert_string_nullable_schema_property(
+        validation_items,
+        &format!("{label}.validation_results items"),
+        "message",
     )?;
 
     let finding_items = assert_array_property_has_items(schema, label, "findings")?;
@@ -1160,6 +1228,13 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
     let paths = schema_property(finding_items, &format!("{label}.findings items"), "paths")?;
     assert_schema_array_has_items(paths, &format!("{label}.findings items.paths"))?;
 
+    Ok(())
+}
+
+fn assert_report_token_schemas(schema: &Value, label: &str) -> Result<()> {
+    assert_schema_required_excludes(schema, label, &["claim_token", "semantic_intent_token"])?;
+    assert_integer_nullable_schema_property(schema, label, "claim_token")?;
+    assert_integer_nullable_schema_property(schema, label, "semantic_intent_token")?;
     Ok(())
 }
 
@@ -1225,6 +1300,49 @@ fn assert_schema_required_contains(
         }
     }
     Ok(())
+}
+
+fn assert_schema_required_excludes(
+    schema: &Value,
+    label: &str,
+    expected_absent: &[&str],
+) -> Result<()> {
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} must define required fields: {schema:?}"))?;
+    for absent in expected_absent {
+        if required.iter().any(|value| value.as_str() == Some(*absent)) {
+            anyhow::bail!("{label} required fields must not include {absent:?}: {required:?}");
+        }
+    }
+    Ok(())
+}
+
+fn assert_integer_nullable_schema_property(
+    schema: &Value,
+    label: &str,
+    property: &str,
+) -> Result<()> {
+    assert_schema_property_types(
+        schema_property(schema, label, property)?,
+        label,
+        property,
+        &["integer", "null"],
+    )
+}
+
+fn assert_string_nullable_schema_property(
+    schema: &Value,
+    label: &str,
+    property: &str,
+) -> Result<()> {
+    assert_schema_property_types(
+        schema_property(schema, label, property)?,
+        label,
+        property,
+        &["string", "null"],
+    )
 }
 
 fn assert_string_const_schema_property(
@@ -1298,6 +1416,32 @@ fn assert_schema_property_type(
         &format!("{label}.{property}"),
         expected_type,
     )
+}
+
+fn assert_schema_property_types(
+    property_schema: &Value,
+    label: &str,
+    property: &str,
+    expected_types: &[&str],
+) -> Result<()> {
+    let actual_types = property_schema
+        .get("type")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label}.{property} must set type array: {property_schema:?}"))?;
+    let actual_types = actual_types
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("{label}.{property} type values must be strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if actual_types != expected_types {
+        anyhow::bail!(
+            "{label}.{property} type mismatch; expected {expected_types:?}, got {actual_types:?}"
+        );
+    }
+    Ok(())
 }
 
 fn assert_schema_type(schema: &Value, label: &str, expected_type: &str) -> Result<()> {
@@ -1409,9 +1553,23 @@ case "$prompt_body" in
     prompt_from_stdin=false
     ;;
 esac
-mkdir -p "$(dirname "$report")"
-printf '{"event":"fake-start","worktree":"%s","prompt_from_stdin":%s,"multi_agent":%s}\n' "$worktree" "$prompt_from_stdin" "$multi_agent_seen"
 name="$(basename "$report" .json)"
+expected_o1_prefix="ROLE: O1_CHILD_ORCHESTRATOR
+AGENT_KIND: orchestrator
+AGENT_LABEL: $name
+PARENT_THREAD_ID: none
+THREAD_DEPTH: 1
+NO_FURTHER_DELEGATION: false"
+case "$prompt_body" in
+  "$expected_o1_prefix"*)
+    o1_role_prefix=true
+    ;;
+  *)
+    o1_role_prefix=false
+    ;;
+esac
+mkdir -p "$(dirname "$report")"
+printf '{"event":"fake-start","worktree":"%s","prompt_from_stdin":%s,"multi_agent":%s,"o1_role_prefix":%s}\n' "$worktree" "$prompt_from_stdin" "$multi_agent_seen" "$o1_role_prefix"
 edit=true
 files_changed_json=
 case "$name" in

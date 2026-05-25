@@ -39,6 +39,7 @@ const COMMENT_BODY_LIMIT: usize = 6 * 1024;
 pub struct InboxScanOptions {
     pub repo: PathBuf,
     pub github: bool,
+    pub permission_mode: Option<InboxPermissionMode>,
     pub max_items: Option<usize>,
     pub action_policy_override: Option<InboxActionPolicy>,
 }
@@ -48,8 +49,10 @@ pub struct InboxRunOptions {
     pub repo: PathBuf,
     pub run_id: RunId,
     pub github: bool,
+    pub permission_mode: Option<InboxPermissionMode>,
     pub dry_run: bool,
     pub max_items: Option<usize>,
+    pub codex_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,8 +61,10 @@ pub struct InboxWatchOptions {
     pub poll_seconds: u64,
     pub once: bool,
     pub github: bool,
+    pub permission_mode: Option<InboxPermissionMode>,
     pub dry_run: bool,
     pub max_items: Option<usize>,
+    pub codex_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -70,6 +75,8 @@ pub struct InboxConfig {
     pub selection: InboxSelectionConfig,
     #[serde(default)]
     pub action_policy: InboxActionPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<InboxPermissionMode>,
     #[serde(default = "default_max_repair_attempts")]
     pub max_repair_attempts: usize,
     #[serde(default)]
@@ -80,6 +87,8 @@ pub struct InboxConfig {
     pub privacy: InboxPrivacyPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_bin: Option<PathBuf>,
 }
 
 impl Default for InboxConfig {
@@ -88,11 +97,13 @@ impl Default for InboxConfig {
             repository: InboxRepositoryConfig::default(),
             selection: InboxSelectionConfig::default(),
             action_policy: InboxActionPolicy::default(),
+            permission_mode: None,
             max_repair_attempts: default_max_repair_attempts(),
             default_validation_commands: Vec::new(),
             default_assigned_paths: default_assigned_paths(),
             privacy: InboxPrivacyPolicy::default(),
             timeout_seconds: None,
+            codex_bin: None,
         }
     }
 }
@@ -142,6 +153,67 @@ pub enum InboxActionPolicy {
     Github,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxPermissionMode {
+    #[default]
+    Fake,
+    #[serde(alias = "github-read")]
+    GithubRead,
+    #[serde(alias = "github-local")]
+    GithubLocal,
+    #[serde(alias = "github-git")]
+    GithubGit,
+    #[serde(alias = "github-pr")]
+    GithubPr,
+    #[serde(alias = "github-full", alias = "github")]
+    GithubFull,
+}
+
+impl InboxPermissionMode {
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value.replace('-', "_").as_str() {
+            "fake" => Ok(Self::Fake),
+            "github_read" => Ok(Self::GithubRead),
+            "github_local" => Ok(Self::GithubLocal),
+            "github_git" => Ok(Self::GithubGit),
+            "github_pr" => Ok(Self::GithubPr),
+            "github_full" | "github" => Ok(Self::GithubFull),
+            _ => Err(
+                "expected one of: fake, github_read, github_local, github_git, github_pr, github_full"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn uses_github_intake(self) -> bool {
+        matches!(
+            self,
+            Self::GithubRead
+                | Self::GithubLocal
+                | Self::GithubGit
+                | Self::GithubPr
+                | Self::GithubFull
+        )
+    }
+
+    fn launches_autopilot(self) -> bool {
+        !matches!(self, Self::GithubRead)
+    }
+
+    fn publishes_github_pr(self) -> bool {
+        matches!(self, Self::GithubPr | Self::GithubFull)
+    }
+
+    fn publishes_git_branch(self) -> bool {
+        matches!(self, Self::GithubGit)
+    }
+
+    fn comments_on_source(self) -> bool {
+        matches!(self, Self::GithubFull)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InboxPrivacyPolicy {
     #[serde(default)]
@@ -169,6 +241,7 @@ pub struct InboxScanReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<PathBuf>,
     pub action_policy: InboxActionPolicy,
+    pub permission_mode: InboxPermissionMode,
     pub github_enabled: bool,
     pub success: bool,
     pub refused: bool,
@@ -311,6 +384,7 @@ pub struct InboxRunReport {
     pub run_id: RunId,
     pub repo: PathBuf,
     pub action_policy: InboxActionPolicy,
+    pub permission_mode: InboxPermissionMode,
     pub github_enabled: bool,
     pub success: bool,
     pub status: InboxRunStatus,
@@ -330,6 +404,7 @@ pub enum InboxRunStatus {
     Failed,
     Refused,
     DryRun,
+    Planned,
     NoItems,
 }
 
@@ -362,6 +437,7 @@ pub struct InboxItemRunReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InboxGithubActionReport {
     pub mode: InboxActionPolicy,
+    pub permission_mode: InboxPermissionMode,
     pub status: String,
     pub success: bool,
     pub target: String,
@@ -437,8 +513,10 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
     let repo = discover_repo_root(&options.repo)?;
     let loaded =
         load_config_with_overrides(&repo, options.max_items, options.action_policy_override)?;
-    let action_policy = effective_action_policy(loaded.config.action_policy, options.github);
-    let github_enabled = action_policy == InboxActionPolicy::Github;
+    let permission_mode =
+        effective_permission_mode(&loaded.config, options.github, options.permission_mode);
+    let action_policy = effective_action_policy(loaded.config.action_policy, permission_mode);
+    let github_enabled = permission_mode.uses_github_intake();
     let duplicate_keys = load_duplicate_keys(&repo)?;
     let mut items = Vec::new();
     if loaded.config.selection.issues {
@@ -487,6 +565,7 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
             repo: public_repo_path(),
             config_path: loaded.path,
             action_policy,
+            permission_mode,
             github_enabled,
             success: false,
             refused: true,
@@ -502,6 +581,7 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
         repo: public_repo_path(),
         config_path: loaded.path,
         action_policy,
+        permission_mode,
         github_enabled,
         success: true,
         refused: false,
@@ -527,6 +607,7 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
     let scan = scan_inbox(InboxScanOptions {
         repo: repo.clone(),
         github: options.github,
+        permission_mode: options.permission_mode,
         max_items: options.max_items,
         action_policy_override: if options.dry_run {
             Some(InboxActionPolicy::DryRun)
@@ -550,6 +631,7 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
             run_id: options.run_id,
             repo: public_repo_path(),
             action_policy: scan.action_policy,
+            permission_mode: scan.permission_mode,
             github_enabled: scan.github_enabled,
             success: false,
             status: InboxRunStatus::Refused,
@@ -570,6 +652,7 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
             run_id: options.run_id,
             repo: public_repo_path(),
             action_policy: scan.action_policy,
+            permission_mode: scan.permission_mode,
             github_enabled: scan.github_enabled,
             success: true,
             status: InboxRunStatus::NoItems,
@@ -594,24 +677,35 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
         },
     )?;
     let action_policy = scan.action_policy;
+    let permission_mode = scan.permission_mode;
+    let item_context = InboxItemRunContext {
+        repo: &repo,
+        run_dir: &run_dir,
+        run_id: &options.run_id,
+        config: &loaded.config,
+        action_policy,
+        permission_mode,
+        codex_bin: options
+            .codex_bin
+            .clone()
+            .or_else(|| loaded.config.codex_bin.clone()),
+    };
     let mut item_reports = Vec::new();
     for (zero_index, item) in selected_items.iter().enumerate() {
         let item_index = zero_index.saturating_add(1);
-        let item_report = run_inbox_item(
-            &repo,
-            &run_dir,
-            &options.run_id,
+        let item_report = run_inbox_item(InboxItemRunInput {
+            context: &item_context,
             item_index,
             item,
-            &loaded.config,
-            action_policy,
-        )?;
+        })?;
         item_reports.push(item_report);
     }
 
     let success = item_reports.iter().all(|report| report.success);
     let status = if action_policy == InboxActionPolicy::DryRun {
         InboxRunStatus::DryRun
+    } else if !permission_mode.launches_autopilot() {
+        InboxRunStatus::Planned
     } else if success {
         InboxRunStatus::Succeeded
     } else {
@@ -622,6 +716,7 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
         run_id: options.run_id,
         repo: public_repo_path(),
         action_policy,
+        permission_mode,
         github_enabled: scan.github_enabled,
         success,
         status,
@@ -689,8 +784,10 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
             repo: repo.clone(),
             run_id,
             github: options.github,
+            permission_mode: options.permission_mode,
             dry_run: options.dry_run,
             max_items: options.max_items,
+            codex_bin: options.codex_bin.clone(),
         })?;
         runs.push(report);
         if options.once {
@@ -707,38 +804,68 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
     })
 }
 
-fn run_inbox_item(
-    repo: &Path,
-    run_dir: &Path,
-    run_id: &RunId,
-    item_index: usize,
-    item: &InboxItem,
-    config: &InboxConfig,
+struct InboxItemRunContext<'a> {
+    repo: &'a Path,
+    run_dir: &'a Path,
+    run_id: &'a RunId,
+    config: &'a InboxConfig,
     action_policy: InboxActionPolicy,
-) -> Result<InboxItemRunReport> {
-    let plan = autopilot_plan_for_item(item, config, action_policy)?;
-    let plan_path = run_dir.join(format!("item-{item_index}-plan.json"));
+    permission_mode: InboxPermissionMode,
+    codex_bin: Option<PathBuf>,
+}
+
+struct InboxItemRunInput<'a> {
+    context: &'a InboxItemRunContext<'a>,
+    item_index: usize,
+    item: &'a InboxItem,
+}
+
+fn run_inbox_item(input: InboxItemRunInput<'_>) -> Result<InboxItemRunReport> {
+    let context = input.context;
+    let item_index = input.item_index;
+    let item = input.item;
+    let repo = context.repo;
+    let run_id = context.run_id;
+    let action_policy = context.action_policy;
+    let permission_mode = context.permission_mode;
+    let config = context.config;
+    let plan = autopilot_plan_for_item(item, config, permission_mode)?;
+    let plan_path = context.run_dir.join(format!("item-{item_index}-plan.json"));
     write_json_file(&plan_path, &plan)?;
-    let autopilot_report_path = run_dir.join(format!("item-{item_index}-autopilot-report.json"));
-    let github_report_path = run_dir.join(format!("item-{item_index}-github-report.json"));
+    let autopilot_report_path = context
+        .run_dir
+        .join(format!("item-{item_index}-autopilot-report.json"));
+    let github_report_path = context
+        .run_dir
+        .join(format!("item-{item_index}-github-report.json"));
     let autopilot_run_id = RunId::new(format!("{}-item-{item_index}", run_id.as_str()))?;
 
-    if action_policy == InboxActionPolicy::DryRun {
+    if action_policy == InboxActionPolicy::DryRun || !permission_mode.launches_autopilot() {
+        let planned_only = action_policy != InboxActionPolicy::DryRun;
         write_json_file(
             &autopilot_report_path,
             &json!({
                 "status": "skipped",
                 "success": true,
-                "reason": "dry_run action policy does not launch autopilot"
+                "reason": if planned_only {
+                    "permission mode does not launch autopilot"
+                } else {
+                    "dry_run action policy does not launch autopilot"
+                }
             }),
         )?;
         let github_report = InboxGithubActionReport {
             mode: action_policy,
+            permission_mode,
             status: "skipped".to_string(),
             success: true,
             target: item_target(item),
             comment_url: None,
-            message: Some("dry_run action policy does not comment or publish".to_string()),
+            message: Some(if planned_only {
+                "permission mode does not comment or publish".to_string()
+            } else {
+                "dry_run action policy does not comment or publish".to_string()
+            }),
         };
         write_json_file(&github_report_path, &github_report)?;
         return Ok(InboxItemRunReport {
@@ -747,7 +874,11 @@ fn run_inbox_item(
             kind: item.kind,
             title: item.title.clone(),
             success: true,
-            status: "dry_run".to_string(),
+            status: if planned_only {
+                "planned".to_string()
+            } else {
+                "dry_run".to_string()
+            },
             plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
             autopilot_run_id: autopilot_run_id.as_str().to_string(),
             autopilot_report_path: public_item_path(
@@ -760,7 +891,11 @@ fn run_inbox_item(
             ),
             autopilot_success: None,
             github_success: true,
-            next_action: "review the dry-run plan; no work was launched".to_string(),
+            next_action: if planned_only {
+                "review the plan; this permission mode does not launch work".to_string()
+            } else {
+                "review the dry-run plan; no work was launched".to_string()
+            },
         });
     }
 
@@ -768,7 +903,7 @@ fn run_inbox_item(
         repo: repo.to_path_buf(),
         plan_file: plan_path.clone(),
         run_id: autopilot_run_id.clone(),
-        codex_bin: None,
+        codex_bin: context.codex_bin.clone(),
         reviewer_command: None,
         allow_dirty_primary: false,
     });
@@ -800,6 +935,7 @@ fn run_inbox_item(
         repo,
         config,
         action_policy,
+        permission_mode,
         item,
         autopilot_success,
         autopilot_message,
@@ -840,7 +976,7 @@ fn run_inbox_item(
 fn autopilot_plan_for_item(
     item: &InboxItem,
     config: &InboxConfig,
-    action_policy: InboxActionPolicy,
+    permission_mode: InboxPermissionMode,
 ) -> Result<AutopilotPlan> {
     let assigned_paths = assigned_paths_for_item(item, config)?;
     let mut validation_commands = config.default_validation_commands.clone();
@@ -860,8 +996,10 @@ fn autopilot_plan_for_item(
         semantic_modules: Vec::new(),
         validation_commands,
         max_repair_attempts: config.max_repair_attempts,
-        forge_mode: if action_policy == InboxActionPolicy::Github {
+        forge_mode: if permission_mode.publishes_github_pr() {
             AutopilotForgeMode::Github
+        } else if permission_mode.publishes_git_branch() {
+            AutopilotForgeMode::Git
         } else {
             AutopilotForgeMode::Fake
         },
@@ -966,23 +1104,29 @@ fn github_action_for_item(
     repo: &Path,
     config: &InboxConfig,
     action_policy: InboxActionPolicy,
+    permission_mode: InboxPermissionMode,
     item: &InboxItem,
     autopilot_success: bool,
     autopilot_message: Option<String>,
 ) -> InboxGithubActionReport {
-    if action_policy != InboxActionPolicy::Github {
+    if !permission_mode.comments_on_source() {
         return InboxGithubActionReport {
             mode: action_policy,
+            permission_mode,
             status: "local_report_only".to_string(),
             success: true,
             target: item_target(item),
             comment_url: None,
-            message: Some("GitHub comments are disabled outside explicit github mode".to_string()),
+            message: Some(format!(
+                "GitHub source comments are disabled in permission mode {}",
+                permission_mode_label(permission_mode)
+            )),
         };
     }
     if !autopilot_success {
         return InboxGithubActionReport {
             mode: action_policy,
+            permission_mode,
             status: "skipped".to_string(),
             success: true,
             target: item_target(item),
@@ -994,6 +1138,7 @@ fn github_action_for_item(
     let Some(number) = item_number(item) else {
         return InboxGithubActionReport {
             mode: action_policy,
+            permission_mode,
             status: "failed".to_string(),
             success: false,
             target: item_target(item),
@@ -1024,6 +1169,7 @@ fn github_action_for_item(
     match run_gh_text(repo, config, &args, "gh comment") {
         Ok(stdout) => InboxGithubActionReport {
             mode: action_policy,
+            permission_mode,
             status: "commented".to_string(),
             success: true,
             target: item_target(item),
@@ -1032,6 +1178,7 @@ fn github_action_for_item(
         },
         Err(error) => InboxGithubActionReport {
             mode: action_policy,
+            permission_mode,
             status: "failed".to_string(),
             success: false,
             target: item_target(item),
@@ -1897,11 +2044,45 @@ fn public_item_path(run_id: &RunId, file_name: &str) -> PathBuf {
     public_run_dir().join(run_id.as_str()).join(file_name)
 }
 
-fn effective_action_policy(configured: InboxActionPolicy, github: bool) -> InboxActionPolicy {
-    if github {
+fn effective_permission_mode(
+    config: &InboxConfig,
+    github: bool,
+    override_mode: Option<InboxPermissionMode>,
+) -> InboxPermissionMode {
+    if let Some(mode) = override_mode {
+        mode
+    } else if github {
+        InboxPermissionMode::GithubFull
+    } else if let Some(mode) = config.permission_mode {
+        mode
+    } else if config.action_policy == InboxActionPolicy::Github {
+        InboxPermissionMode::GithubFull
+    } else {
+        InboxPermissionMode::Fake
+    }
+}
+
+fn effective_action_policy(
+    configured: InboxActionPolicy,
+    permission_mode: InboxPermissionMode,
+) -> InboxActionPolicy {
+    if configured == InboxActionPolicy::DryRun {
+        InboxActionPolicy::DryRun
+    } else if permission_mode.uses_github_intake() {
         InboxActionPolicy::Github
     } else {
-        configured
+        InboxActionPolicy::Fake
+    }
+}
+
+fn permission_mode_label(mode: InboxPermissionMode) -> &'static str {
+    match mode {
+        InboxPermissionMode::Fake => "fake",
+        InboxPermissionMode::GithubRead => "github_read",
+        InboxPermissionMode::GithubLocal => "github_local",
+        InboxPermissionMode::GithubGit => "github_git",
+        InboxPermissionMode::GithubPr => "github_pr",
+        InboxPermissionMode::GithubFull => "github_full",
     }
 }
 

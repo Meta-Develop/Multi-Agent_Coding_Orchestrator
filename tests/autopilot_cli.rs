@@ -23,7 +23,7 @@ fn autopilot_plan_json_normalizes_defaults_and_aliases() -> Result<()> {
             "true",
             {"name": " smoke ", "command": " true "}
           ],
-          "forge": "fake",
+          "forge": "git",
           "auto_merge": true
         }"#,
     )?;
@@ -44,7 +44,7 @@ fn autopilot_plan_json_normalizes_defaults_and_aliases() -> Result<()> {
     assert_eq!(plan["semantic_symbols"], serde_json::json!(["Thing"]));
     assert_eq!(plan["semantic_modules"], serde_json::json!(["crate::a"]));
     assert_eq!(plan["max_repair_attempts"], 1);
-    assert_eq!(plan["forge_mode"], "fake");
+    assert_eq!(plan["forge_mode"], "git");
     assert_eq!(plan["reviewer"]["mode"], "fake");
     assert_eq!(plan["publish_mode"], "draft_only");
     assert_eq!(plan["auto_merge"], true);

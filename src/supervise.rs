@@ -392,6 +392,64 @@ pub fn collect_supervisor_run(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisePromptRole {
+    O2TopSupervisor,
+    O1ChildOrchestrator,
+    TerminalWorker,
+    Researcher,
+}
+
+impl SupervisePromptRole {
+    fn canonical_role(self) -> &'static str {
+        match self {
+            Self::O2TopSupervisor => "O2_TOP_SUPERVISOR",
+            Self::O1ChildOrchestrator => "O1_CHILD_ORCHESTRATOR",
+            Self::TerminalWorker => "TERMINAL_WORKER",
+            Self::Researcher => "RESEARCHER",
+        }
+    }
+
+    fn agent_kind(self) -> &'static str {
+        match self {
+            Self::O2TopSupervisor | Self::O1ChildOrchestrator => "orchestrator",
+            Self::TerminalWorker => "worker",
+            Self::Researcher => "researcher",
+        }
+    }
+
+    fn thread_depth(self) -> u8 {
+        match self {
+            Self::O2TopSupervisor => 0,
+            Self::O1ChildOrchestrator => 1,
+            Self::TerminalWorker | Self::Researcher => 2,
+        }
+    }
+
+    fn no_further_delegation(self) -> bool {
+        match self {
+            Self::O2TopSupervisor | Self::O1ChildOrchestrator => false,
+            Self::TerminalWorker | Self::Researcher => true,
+        }
+    }
+}
+
+pub fn supervise_role_prefix(
+    role: SupervisePromptRole,
+    label: &str,
+    parent_thread_id: Option<&str>,
+) -> String {
+    format!(
+        "ROLE: {}\nAGENT_KIND: {}\nAGENT_LABEL: {}\nPARENT_THREAD_ID: {}\nTHREAD_DEPTH: {}\nNO_FURTHER_DELEGATION: {}\n",
+        role.canonical_role(),
+        role.agent_kind(),
+        label,
+        parent_thread_id.unwrap_or("none"),
+        role.thread_depth(),
+        role.no_further_delegation()
+    )
+}
+
 pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) -> Result<String> {
     let ChildOrchestratorPromptContext {
         plan,
@@ -411,9 +469,13 @@ pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) ->
         .map(|worker| worker_prompt(plan, assignment, worker, run_dir, worker_schema_path))
         .collect::<Result<Vec<_>>>()?
         .join("\n\n--- worker prompt contract ---\n\n");
+    let role_prefix = supervise_role_prefix(
+        SupervisePromptRole::O1ChildOrchestrator,
+        &assignment.id,
+        None,
+    );
     Ok(format!(
-        r#"ROLE: O1_CHILD_ORCHESTRATOR
-You are a child orchestrator in an opt-in local Codex CLI supervisor run.
+        r#"{role_prefix}You are a child orchestrator in an opt-in local Codex CLI supervisor run.
 You are not the top supervisor. You are not alone in the repository.
 Primary worktree mutation is forbidden. Work only in this assigned child worktree:
 {worktree_path}
@@ -436,7 +498,7 @@ Runtime hierarchy:
 Required behavior:
 - First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
 - Use Codex native SubAgent/delegated-worker mechanisms for worker assignments when available, following AGENTS.md and .agents instructions.
-- When launching a worker, use the generated worker prompt template verbatim and preserve ROLE: TERMINAL_WORKER as line 1 with no preamble.
+- When launching a worker, use the generated worker prompt template verbatim and preserve its six-line TERMINAL_WORKER role-prefix block with no preamble.
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
 - If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
@@ -463,6 +525,7 @@ Orchestrator assignment JSON:
 Worker prompt templates:
 {worker_prompts}
 "#,
+        role_prefix = role_prefix,
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
         assigned_paths = display_paths(&assignment.assigned_paths),
@@ -491,9 +554,9 @@ pub fn worker_prompt(
 ) -> Result<String> {
     let worker_json =
         serde_json::to_string_pretty(worker).context("failed to serialize worker assignment")?;
+    let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     Ok(format!(
-        r#"ROLE: TERMINAL_WORKER
-You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
+        r#"{role_prefix}You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: O2 supervisor -> O1 child orchestrator -> terminal worker/researcher.
 Your parent is child orchestrator `{orchestrator_id}`. You are not the supervisor.
 Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
@@ -523,6 +586,7 @@ Supervisor task:
 Worker assignment JSON:
 {worker_json}
 "#,
+        role_prefix = role_prefix,
         orchestrator_id = orchestrator.id,
         worker_id = worker.id,
         assigned_paths = display_paths(&worker.assigned_paths),
@@ -1458,6 +1522,8 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
                 "assigned_paths": {"type": "array", "items": {"type": "string"}},
                 "semantic_symbols": {"type": "array", "items": {"type": "string"}},
                 "semantic_modules": {"type": "array", "items": {"type": "string"}},
+                "claim_token": {"type": ["integer", "null"]},
+                "semantic_intent_token": {"type": ["integer", "null"]},
                 "commands_run": {"type": "array", "items": command_run_record_schema_value()},
                 "files_changed": {"type": "array", "items": {"type": "string"}},
                 "validation_results": {"type": "array", "items": validation_result_schema_value()},
@@ -1506,6 +1572,8 @@ fn worker_report_schema_value() -> serde_json::Value {
             "assigned_paths": {"type": "array", "items": {"type": "string"}},
             "semantic_symbols": {"type": "array", "items": {"type": "string"}},
             "semantic_modules": {"type": "array", "items": {"type": "string"}},
+            "claim_token": {"type": ["integer", "null"]},
+            "semantic_intent_token": {"type": ["integer", "null"]},
             "commands_run": {"type": "array", "items": command_run_record_schema_value()},
             "files_changed": {"type": "array", "items": {"type": "string"}},
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
@@ -1527,14 +1595,12 @@ fn command_run_record_schema_value() -> serde_json::Value {
         "required": [
             "command",
             "cwd",
-            "exit_code",
             "status",
             "timeout_seconds",
             "duration_ms",
             "timed_out",
             "stdout",
-            "stderr",
-            "error"
+            "stderr"
         ],
         "properties": {
             "command": {"type": "array", "items": {"type": "string"}},
@@ -1555,7 +1621,7 @@ fn validation_result_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "status", "command", "message"],
+        "required": ["name", "status", "command"],
         "properties": {
             "name": {"type": "string"},
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
@@ -1755,4 +1821,29 @@ pub fn generated_run_id() -> Result<RunId> {
         .context("system clock is before UNIX epoch")?
         .as_secs();
     RunId::new(format!("o2-{now}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervise_role_prefixes_match_runtime_contract() {
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::O2TopSupervisor, "supervisor", None),
+            "ROLE: O2_TOP_SUPERVISOR\nAGENT_KIND: orchestrator\nAGENT_LABEL: supervisor\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 0\nNO_FURTHER_DELEGATION: false\n"
+        );
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::O1ChildOrchestrator, "child-a", None),
+            "ROLE: O1_CHILD_ORCHESTRATOR\nAGENT_KIND: orchestrator\nAGENT_LABEL: child-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 1\nNO_FURTHER_DELEGATION: false\n"
+        );
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::TerminalWorker, "worker-a", None),
+            "ROLE: TERMINAL_WORKER\nAGENT_KIND: worker\nAGENT_LABEL: worker-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n"
+        );
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::Researcher, "researcher-a", None),
+            "ROLE: RESEARCHER\nAGENT_KIND: researcher\nAGENT_LABEL: researcher-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n"
+        );
+    }
 }
