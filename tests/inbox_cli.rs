@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::{json, Value};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
@@ -136,6 +140,15 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert_eq!(plan["publish_mode"], "draft_only");
     assert_eq!(plan["auto_merge"], false);
 
+    let pr_plan = read_json_file(&run_dir.join("item-2-plan.json"))?;
+    assert_eq!(pr_plan["assigned_paths"], json!(["README.md"]));
+    let pr_body = pr_plan["task"]["body"].as_str().context("pr plan body")?;
+    assert!(pr_body.contains("Target paths and reasons:"));
+    assert!(pr_body.contains("- README.md:"));
+    assert!(pr_body.contains("failing checks: fake-ci"));
+    assert!(pr_body.contains("Validation expectation:"));
+    assert!(pr_body.contains("address failing check context: fake-ci"));
+
     let autopilot = read_json_file(&run_dir.join("item-1-autopilot-report.json"))?;
     assert_eq!(autopilot["success"], true);
     assert_eq!(autopilot["auto_merge_performed"], false);
@@ -148,6 +161,89 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
 
     let serialized = serde_json::to_string(&report).context("serialize report")?;
     assert_public_json_is_sanitized(&serialized, &repo_path);
+
+    Ok(())
+}
+
+#[test]
+fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+
+    let report = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--dry-run",
+        "--max-items",
+        "1",
+        "--json",
+    ])?;
+    let run_id = report["run_id"].as_str().context("generated run id")?;
+    assert!(run_id.starts_with("inbox-"));
+    assert!(repo_path
+        .join(".maco/inbox/runs")
+        .join(run_id)
+        .join("final-report.json")
+        .exists());
+
+    let refused = run_failure_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        run_id,
+        "--dry-run",
+        "--json",
+    ])?;
+    assert_eq!(refused["status"], "refused");
+    assert!(refused["message"]
+        .as_str()
+        .context("reuse message")?
+        .contains("already exists"));
+
+    let old_dir = repo_path.join(".maco/inbox/runs/aa-old");
+    let new_dir = repo_path.join(".maco/inbox/runs/zz-new");
+    fs::create_dir_all(&old_dir).context("create old run")?;
+    fs::create_dir_all(&new_dir).context("create new run")?;
+    write_json_file(
+        &old_dir.join("final-report.json"),
+        &json!({"status": "failed", "success": false}),
+    )?;
+    write_json_file(
+        &new_dir.join("final-report.json"),
+        &json!({"status": "succeeded", "success": true}),
+    )?;
+
+    let latest = run_success_json(&[
+        "inbox",
+        "artifacts",
+        "latest",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(latest["run"]["run_id"], "zz-new");
+    assert_eq!(latest["run"]["final_report_status"], "succeeded");
+
+    let prune = run_success_json(&[
+        "inbox",
+        "artifacts",
+        "prune",
+        "--repo",
+        path_str(&repo_path)?,
+        "--keep",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(prune["dry_run"], false);
+    assert_eq!(prune["deleted_count"], 2);
+    assert!(new_dir.exists(), "latest run must be kept");
+    assert!(!old_dir.exists(), "old run should be pruned");
+    assert!(repo_path.join(".maco/inbox").exists());
+    assert!(repo_path.join(".maco").exists());
 
     Ok(())
 }
@@ -274,6 +370,288 @@ fn dry_run_config_does_not_require_cli_flag() -> Result<()> {
 }
 
 #[test]
+fn permission_config_overrides_legacy_action_policy() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({
+            "action_policy": "github",
+            "permission_mode": "fake",
+            "selection": {"max_items": 1}
+        }),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox permission config")?;
+
+    let scan = run_success_json(&["inbox", "scan", "--repo", path_str(&repo_path)?, "--json"])?;
+
+    assert_eq!(scan["action_policy"], "fake");
+    assert_eq!(scan["permission_mode"], "fake");
+    assert_eq!(scan["github_enabled"], false);
+    assert!(scan["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .all(|item| item["url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("fake://")));
+
+    Ok(())
+}
+
+#[test]
+fn github_read_permission_plans_without_launching_autopilot() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({"selection": {"pull_requests": false, "max_items": 1}}),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox github read config")?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let report = run_success_json_with_path(
+        &[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "github-read",
+            "--permission",
+            "github-read",
+            "--json",
+        ],
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(report["action_policy"], "github");
+    assert_eq!(report["permission_mode"], "github_read");
+    assert_eq!(report["github_enabled"], true);
+    assert_eq!(report["status"], "planned");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["item_reports"][0]["status"], "planned");
+    assert_eq!(report["item_reports"][0]["autopilot_success"], Value::Null);
+    assert!(!repo_path.join(".maco/autopilot/runs").exists());
+
+    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-read/item-1-plan.json"))?;
+    assert_eq!(plan["forge_mode"], "fake");
+    let skipped = read_json_file(
+        &repo_path.join(".maco/inbox/runs/github-read/item-1-autopilot-report.json"),
+    )?;
+    assert_eq!(skipped["status"], "skipped");
+    assert_eq!(
+        skipped["reason"],
+        "permission mode does not launch autopilot"
+    );
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert!(gh_log.contains("issue list"));
+    assert!(!gh_log.contains("comment"));
+    assert!(!gh_log.contains("pr create"));
+
+    Ok(())
+}
+
+#[test]
+fn github_local_reads_live_github_but_publishes_and_comments_locally() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({"selection": {"pull_requests": false, "max_items": 1}}),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox github local config")?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let report = run_success_json_with_path(
+        &[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "github-local",
+            "--permission",
+            "github_local",
+            "--json",
+        ],
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(report["permission_mode"], "github_local");
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["item_reports"][0]["autopilot_success"], true);
+
+    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-local/item-1-plan.json"))?;
+    assert_eq!(plan["forge_mode"], "fake");
+    let github =
+        read_json_file(&repo_path.join(".maco/inbox/runs/github-local/item-1-github-report.json"))?;
+    assert_eq!(github["mode"], "github");
+    assert_eq!(github["permission_mode"], "github_local");
+    assert_eq!(github["status"], "local_report_only");
+
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert!(gh_log.contains("issue list"));
+    assert!(!gh_log.contains("comment"));
+    assert!(!gh_log.contains("pr create"));
+
+    Ok(())
+}
+
+#[test]
+fn github_pr_permission_dry_run_plans_github_publish_without_commenting() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({"selection": {"pull_requests": false, "max_items": 1}}),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox github pr config")?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let report = run_success_json_with_path(
+        &[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "github-pr-dry",
+            "--permission",
+            "github-pr",
+            "--dry-run",
+            "--json",
+        ],
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(report["action_policy"], "dry_run");
+    assert_eq!(report["permission_mode"], "github_pr");
+    assert_eq!(report["status"], "dry_run");
+    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-pr-dry/item-1-plan.json"))?;
+    assert_eq!(plan["forge_mode"], "github");
+    let github = read_json_file(
+        &repo_path.join(".maco/inbox/runs/github-pr-dry/item-1-github-report.json"),
+    )?;
+    assert_eq!(github["permission_mode"], "github_pr");
+    assert_eq!(github["status"], "skipped");
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert!(!gh_log.contains("comment"));
+
+    Ok(())
+}
+
+#[test]
+fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({"selection": {"pull_requests": false, "max_items": 1}}),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox github git config")?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let report = run_success_json_with_path(
+        &[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "github-git-dry",
+            "--permission",
+            "github-git",
+            "--dry-run",
+            "--json",
+        ],
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(report["action_policy"], "dry_run");
+    assert_eq!(report["permission_mode"], "github_git");
+    assert_eq!(report["github_enabled"], true);
+    assert_eq!(report["status"], "dry_run");
+    let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-git-dry/item-1-plan.json"))?;
+    assert_eq!(plan["forge_mode"], "git");
+    let github = read_json_file(
+        &repo_path.join(".maco/inbox/runs/github-git-dry/item-1-github-report.json"),
+    )?;
+    assert_eq!(github["permission_mode"], "github_git");
+    assert_eq!(github["status"], "skipped");
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert!(gh_log.contains("issue list"));
+    assert!(!gh_log.contains("comment"));
+    assert!(!gh_log.contains("pr create"));
+
+    Ok(())
+}
+
+#[test]
+fn run_passes_codex_bin_to_autopilot() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let codex = write_fake_codex(temp.path())?;
+
+    let report = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "codex-bin",
+        "--max-items",
+        "1",
+        "--codex-bin",
+        path_str(&codex.script_path)?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    let codex_log = fs::read_to_string(&codex.log_path).context("read codex log")?;
+    assert!(codex_log.contains("exec"));
+    assert!(codex_log.contains("--output-last-message"));
+
+    let serialized = serde_json::to_string(&report).context("serialize report")?;
+    assert_public_json_is_sanitized(&serialized, &repo_path);
+    assert!(!serialized.contains(path_str(&codex.script_path)?));
+
+    Ok(())
+}
+
+#[test]
+fn watch_once_passes_codex_bin_to_autopilot() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let codex = write_fake_codex(temp.path())?;
+
+    let report = run_success_json(&[
+        "inbox",
+        "watch",
+        "--repo",
+        path_str(&repo_path)?,
+        "--poll-seconds",
+        "1",
+        "--once",
+        "--max-items",
+        "1",
+        "--codex-bin",
+        path_str(&codex.script_path)?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["iteration_count"], 1);
+    assert_eq!(report["runs"][0]["status"], "succeeded");
+    let codex_log = fs::read_to_string(&codex.log_path).context("read codex log")?;
+    assert!(codex_log.contains("exec"));
+
+    Ok(())
+}
+
+#[test]
 fn max_items_limits_selected_items_without_hiding_skip_evidence() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -363,6 +741,10 @@ fn active_live_lock_refuses_run() -> Result<()> {
     let report = run_inbox_refusal(&repo_path, "live-lock")?;
 
     assert_refusal_kind(&report, "active_live_locks")?;
+    let refusal = refusal_by_kind(&report, "active_live_locks")?;
+    assert_eq!(refusal["paths"], json!(["README.md"]));
+    assert_eq!(refusal["lock_details"][0]["owner"], "worker-c-test");
+    assert_eq!(refusal["lock_details"][0]["claim_id"], "active-live");
     assert_eq!(report["selected_item_count"], 0);
     assert_eq!(report["item_reports"].as_array().context("items")?.len(), 0);
 
@@ -386,6 +768,10 @@ fn active_sync_claim_refuses_run() -> Result<()> {
     let report = run_inbox_refusal(&repo_path, "sync-lock")?;
 
     assert_refusal_kind(&report, "active_sync_claims")?;
+    let refusal = refusal_by_kind(&report, "active_sync_claims")?;
+    assert_eq!(refusal["paths"], json!(["README.md"]));
+    assert_eq!(refusal["lock_details"][0]["owner"], "other-worker");
+    assert_eq!(refusal["lock_details"][0]["token"], 1);
     assert_eq!(report["selected_item_count"], 0);
 
     Ok(())
@@ -409,7 +795,65 @@ fn active_semantic_intent_refuses_run() -> Result<()> {
     let report = run_inbox_refusal(&repo_path, "semantic-lock")?;
 
     assert_refusal_kind(&report, "active_semantic_intents")?;
+    let refusal = refusal_by_kind(&report, "active_semantic_intents")?;
+    assert_eq!(refusal["paths"], json!(["README.md"]));
+    assert_eq!(refusal["lock_details"][0]["owner"], "semantic-worker");
+    assert_eq!(refusal["lock_details"][0]["token"], 1);
     assert_eq!(report["selected_item_count"], 0);
+
+    Ok(())
+}
+
+#[test]
+fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_success_json(&[
+        "sync",
+        "claim",
+        "other-worker",
+        "src/lib.rs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    run_success_json(&[
+        "coord",
+        "claim",
+        "semantic-worker",
+        "--path",
+        "src/lib.rs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    write_live_claim(&repo_path, "active-live", "active", "src/lib.rs")?;
+    commit_all(
+        &Repository::open(&repo_path)?,
+        "track non-overlapping live claim",
+    )?;
+
+    let report = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "non-overlap",
+        "--max-items",
+        "1",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["selected_item_count"], 1);
+    assert!(
+        report.get("refusals").is_none()
+            || report["refusals"]
+                .as_array()
+                .is_some_and(|items| items.is_empty())
+    );
 
     Ok(())
 }
@@ -580,6 +1024,15 @@ fn assert_refusal_kind(report: &Value, kind: &str) -> Result<()> {
     Ok(())
 }
 
+fn refusal_by_kind<'a>(report: &'a Value, kind: &str) -> Result<&'a Value> {
+    report["refusals"]
+        .as_array()
+        .context("refusals")?
+        .iter()
+        .find(|refusal| refusal["kind"] == kind)
+        .with_context(|| format!("expected refusal kind {kind}"))
+}
+
 fn array_contains(value: &Value, expected: &str) -> Result<bool> {
     Ok(value
         .as_array()
@@ -633,6 +1086,26 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
     })
 }
 
+fn run_success_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
+    let output = Command::new(BIN)
+        .args(args)
+        .env("PATH", path_with_prefix(path_dir)?)
+        .output()
+        .context("run maco")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "maco command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse success json from stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
 fn run_failure_json(args: &[&str]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if output.status.success() {
@@ -645,6 +1118,148 @@ fn run_failure_json(args: &[&str]) -> Result<Value> {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+struct FakeGh {
+    path_dir: PathBuf,
+    log_path: PathBuf,
+}
+
+struct FakeCodex {
+    script_path: PathBuf,
+    log_path: PathBuf,
+}
+
+fn write_fake_gh(root: &Path) -> Result<FakeGh> {
+    let path_dir = root.join("bin");
+    let script_path = path_dir.join("gh");
+    let log_path = root.join("gh.log");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '{}'
+case "$1 $2" in
+  "issue list")
+    cat <<'JSON'
+[{{"number":11,"title":"Live issue","body":"Please update the smoke README.","labels":[],"author":{{"login":"octo"}},"url":"https://github.test/acme/demo/issues/11","updatedAt":"2026-05-23T00:00:00Z"}}]
+JSON
+    ;;
+  "pr list")
+    printf '[]\n'
+    ;;
+  "issue comment"|"pr comment")
+    printf 'https://github.test/acme/demo/comment/1\n'
+    ;;
+  "pr create")
+    printf 'https://github.test/acme/demo/pull/1\n'
+    ;;
+  *)
+    printf '[]\n'
+    ;;
+esac
+"#,
+        log_path.display()
+    );
+    write_executable(&script_path, &script)?;
+    Ok(FakeGh { path_dir, log_path })
+}
+
+fn write_fake_codex(root: &Path) -> Result<FakeCodex> {
+    let script_path = root.join("fake-codex");
+    let log_path = root.join("codex.log");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '{}'
+report=
+worktree=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message)
+      report="$2"
+      shift 2
+      ;;
+    --cd)
+      worktree="$2"
+      shift 2
+      ;;
+    --output-schema|--sandbox|-c|--enable)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+cat >/dev/null
+mkdir -p "$(dirname "$report")"
+printf '\ninbox fake codex repair\n' >> "$worktree/README.md"
+name="$(basename "$report" .json)"
+cat > "$report" <<JSON
+{{
+  "id": "$name",
+  "role": "child_orchestrator",
+  "assigned_paths": ["README.md"],
+  "semantic_symbols": [],
+  "semantic_modules": [],
+  "commands_run": [],
+  "files_changed": ["README.md"],
+  "validation_results": [
+    {{"name": "fake codex validation", "status": "succeeded", "command": [], "message": null}}
+  ],
+  "findings": [],
+  "worker_reports": [
+    {{
+      "id": "$name-worker",
+      "role": "worker",
+      "assigned_paths": ["README.md"],
+      "semantic_symbols": [],
+      "semantic_modules": [],
+      "commands_run": [],
+      "files_changed": ["README.md"],
+      "validation_results": [
+        {{"name": "fake worker validation", "status": "succeeded", "command": [], "message": null}}
+      ],
+      "findings": [],
+      "no_further_delegation": true,
+      "accepted": true,
+      "rejected": false,
+      "status": "succeeded",
+      "remaining_risk": "none",
+      "next_safe_action": "publish through autopilot PR gate"
+    }}
+  ],
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded",
+  "remaining_risk": "none",
+  "next_safe_action": "publish through autopilot PR gate"
+}}
+JSON
+"#,
+        log_path.display()
+    );
+    write_executable(&script_path, &script)?;
+    Ok(FakeCodex {
+        script_path,
+        log_path,
+    })
+}
+
+fn write_executable(path: &Path, contents: &str) -> Result<()> {
+    write_file(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn path_with_prefix(path_dir: &Path) -> Result<String> {
+    let existing = std::env::var("PATH").unwrap_or_default();
+    Ok(format!("{}:{existing}", path_str(path_dir)?))
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

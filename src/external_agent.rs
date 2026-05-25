@@ -3,14 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
+const PIPE_READ_CHUNK_SIZE: usize = 8 * 1024;
+const TIMEOUT_OUTPUT_DRAIN_GRACE_MS: u64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAgentCommand {
@@ -191,6 +194,8 @@ fn codex_argv(spec: &ExternalAgentCommand) -> Vec<String> {
         spec.cwd.display().to_string(),
         "--sandbox".to_string(),
         spec.sandbox_mode.clone(),
+        "--enable".to_string(),
+        "multi_agent".to_string(),
     ];
     if let Some(approval_mode) = &spec.approval_mode {
         argv.push("-c".to_string());
@@ -265,31 +270,244 @@ fn wait_for_child(
     started: Instant,
     timeout: Duration,
 ) -> std::io::Result<TimedOutput> {
+    let mut output_drainers = start_output_drainers(&mut child);
+    let mut status = None;
     loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
+        output_drainers.drain_ready()?;
+
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+
+        if status.is_some() && output_drainers.is_complete() {
+            let (stdout, stderr) = output_drainers.into_outputs();
             return Ok(TimedOutput {
-                status: Some(output.status),
+                status,
                 timed_out: false,
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout,
+                stderr,
                 process_error: None,
             });
         }
 
         if started.elapsed() >= timeout {
-            let process_error = terminate_child_on_timeout(&mut child);
-            let output = child.wait_with_output()?;
+            let mut process_error = terminate_child_on_timeout(&mut child);
+            if status.is_none() {
+                status = Some(child.wait()?);
+            }
+            let drain_deadline =
+                Instant::now() + Duration::from_millis(TIMEOUT_OUTPUT_DRAIN_GRACE_MS);
+            if !output_drainers.finish_until(drain_deadline)? {
+                process_error = append_process_error(
+                    process_error,
+                    format!(
+                        "external agent timed out and output pipes did not close within {} ms",
+                        TIMEOUT_OUTPUT_DRAIN_GRACE_MS
+                    ),
+                );
+            }
+            let (stdout, stderr) = output_drainers.into_outputs();
             return Ok(TimedOutput {
-                status: Some(output.status),
+                status,
                 timed_out: true,
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout,
+                stderr,
                 process_error,
             });
         }
 
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+struct OutputDrainers {
+    stdout: PipeReader,
+    stderr: PipeReader,
+}
+
+impl OutputDrainers {
+    fn drain_ready(&mut self) -> std::io::Result<()> {
+        self.stdout.drain_ready()?;
+        self.stderr.drain_ready()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.stdout.is_complete() && self.stderr.is_complete()
+    }
+
+    fn finish_until(&mut self, deadline: Instant) -> std::io::Result<bool> {
+        loop {
+            self.drain_ready()?;
+            if self.is_complete() {
+                return Ok(true);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let wait = remaining.min(Duration::from_millis(10));
+            if !self.stdout.is_complete() {
+                self.stdout.wait_for_event(wait)?;
+            } else if !self.stderr.is_complete() {
+                self.stderr.wait_for_event(wait)?;
+            }
+            self.stderr.drain_ready()?;
+        }
+    }
+
+    fn into_outputs(self) -> (Vec<u8>, Vec<u8>) {
+        (self.stdout.into_output(), self.stderr.into_output())
+    }
+}
+
+enum PipeReader {
+    Thread {
+        stream_name: &'static str,
+        receiver: Receiver<PipeReadEvent>,
+        output: Vec<u8>,
+        complete: bool,
+    },
+    Missing,
+}
+
+impl PipeReader {
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Thread { complete, .. } => *complete,
+            Self::Missing => true,
+        }
+    }
+
+    fn drain_ready(&mut self) -> std::io::Result<()> {
+        let Self::Thread {
+            stream_name,
+            receiver,
+            output,
+            complete,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        while !*complete {
+            match receiver.try_recv() {
+                Ok(event) => apply_pipe_event(stream_name, output, complete, event)?,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(std::io::Error::other(format!(
+                        "external agent {stream_name} reader thread stopped unexpectedly"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_event(&mut self, timeout: Duration) -> std::io::Result<()> {
+        let Self::Thread {
+            stream_name,
+            receiver,
+            output,
+            complete,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        if *complete {
+            return Ok(());
+        }
+
+        match receiver.recv_timeout(timeout) {
+            Ok(event) => apply_pipe_event(stream_name, output, complete, event),
+            Err(RecvTimeoutError::Timeout) => Ok(()),
+            Err(RecvTimeoutError::Disconnected) => Err(std::io::Error::other(format!(
+                "external agent {stream_name} reader thread stopped unexpectedly"
+            ))),
+        }
+    }
+
+    fn into_output(self) -> Vec<u8> {
+        match self {
+            Self::Thread { output, .. } => output,
+            Self::Missing => Vec::new(),
+        }
+    }
+}
+
+enum PipeReadEvent {
+    Chunk(Vec<u8>),
+    Finished,
+    Error(std::io::Error),
+}
+
+fn apply_pipe_event(
+    stream_name: &'static str,
+    output: &mut Vec<u8>,
+    complete: &mut bool,
+    event: PipeReadEvent,
+) -> std::io::Result<()> {
+    match event {
+        PipeReadEvent::Chunk(chunk) => output.extend(chunk),
+        PipeReadEvent::Finished => *complete = true,
+        PipeReadEvent::Error(error) => {
+            *complete = true;
+            return Err(std::io::Error::other(format!(
+                "failed to read external agent {stream_name}: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn start_output_drainers(child: &mut Child) -> OutputDrainers {
+    OutputDrainers {
+        stdout: child
+            .stdout
+            .take()
+            .map(|stdout| start_pipe_reader("stdout", stdout))
+            .unwrap_or(PipeReader::Missing),
+        stderr: child
+            .stderr
+            .take()
+            .map(|stderr| start_pipe_reader("stderr", stderr))
+            .unwrap_or(PipeReader::Missing),
+    }
+}
+
+fn start_pipe_reader<R>(stream_name: &'static str, mut stream: R) -> PipeReader
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || loop {
+        let mut buffer = vec![0_u8; PIPE_READ_CHUNK_SIZE];
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                let _ = sender.send(PipeReadEvent::Finished);
+                break;
+            }
+            Ok(bytes_read) => {
+                buffer.truncate(bytes_read);
+                if sender.send(PipeReadEvent::Chunk(buffer)).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(PipeReadEvent::Error(error));
+                break;
+            }
+        }
+    });
+
+    PipeReader::Thread {
+        stream_name,
+        receiver,
+        output: Vec::new(),
+        complete: false,
     }
 }
 
@@ -334,19 +552,7 @@ fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
 fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
     let pid = child.id();
     let term_error = send_unix_process_group_signal(pid, "TERM").err();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                return Some(format!(
-                    "external agent timed out but process wait failed: {error}"
-                ))
-            }
-        }
-    }
-
+    thread::sleep(Duration::from_millis(100));
     let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
     kill_result.err().map(|error| {
         if let Some(term_error) = term_error {
@@ -357,6 +563,13 @@ fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
             format!("external agent timed out but process group kill failed: {error}")
         }
     })
+}
+
+fn append_process_error(existing: Option<String>, message: String) -> Option<String> {
+    match existing {
+        Some(existing) => Some(format!("{existing}; {message}")),
+        None => Some(message),
+    }
 }
 
 #[cfg(unix)]
@@ -391,5 +604,129 @@ fn duration_millis(duration: Duration) -> u64 {
         u64::MAX
     } else {
         millis as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_external_agent_drains_large_stdout_and_stderr_while_child_runs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+while IFS= read -r _line; do
+    :
+done
+i=0
+while [ "$i" -lt 256 ]; do
+    printf '%4096s' 'O'
+    i=$((i + 1))
+done
+i=0
+while [ "$i" -lt 256 ]; do
+    printf '%4096s' 'E' >&2
+    i=$((i + 1))
+done
+printf '\n{"type":"done"}\n'
+"#,
+        )?;
+        let mut permissions = fs::metadata(&agent)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&agent, permissions)?;
+
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "run the fake external agent\n")?;
+
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            temp.path().join("last-message.txt"),
+            Duration::from_secs(3),
+        );
+
+        let report = run_external_agent(&spec);
+
+        assert_eq!(report.exit_code, Some(0));
+        assert!(
+            !report.timed_out,
+            "large output child should exit before timeout: {report:?}"
+        );
+        assert_eq!(report.error, None);
+        assert!(report.succeeded());
+        assert!(report.stdout.truncated);
+        assert!(report.stderr.truncated);
+        assert!(report.stdout.text.len() >= OUTPUT_CHAR_LIMIT);
+        assert!(report.stderr.text.len() >= OUTPUT_CHAR_LIMIT);
+        assert!(fs::metadata(&spec.json_log)?.len() > (OUTPUT_CHAR_LIMIT as u64 * 2));
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_external_agent_times_out_when_descendant_holds_output_pipes_open() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+while IFS= read -r _line; do
+    :
+done
+(
+    trap '' TERM
+    printf 'descendant started\n'
+    printf 'descendant stderr started\n' >&2
+    while :; do
+        sleep 1
+    done
+) &
+printf 'parent exiting\n'
+exit 0
+"#,
+        )?;
+        let mut permissions = fs::metadata(&agent)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&agent, permissions)?;
+
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "run the fake external agent\n")?;
+
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            temp.path().join("last-message.txt"),
+            Duration::from_millis(200),
+        );
+
+        let started = Instant::now();
+        let report = run_external_agent(&spec);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout path should return promptly instead of hanging: {report:?}"
+        );
+        assert!(
+            report.timed_out,
+            "descendant-held output pipes should be treated as timeout: {report:?}"
+        );
+        assert!(report.stdout.text.contains("parent exiting"));
+        assert!(report.stdout.text.contains("descendant started"));
+        assert!(report.stderr.text.contains("descendant stderr started"));
+
+        Ok(())
     }
 }

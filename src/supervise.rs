@@ -1,4 +1,5 @@
 use crate::{
+    artifacts::{self, RunArtifactFamily},
     external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
     orchestrator::{RunId, SemanticCoordinationMode},
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
@@ -19,7 +20,7 @@ use std::{
 };
 
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
-const DEFAULT_MAX_CHILD_PROCESSES: usize = 4;
+const DEFAULT_MAX_CHILD_ASSIGNMENTS: usize = 4;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
@@ -41,8 +42,11 @@ pub struct SupervisorPlan {
     pub task_file: Option<PathBuf>,
     #[serde(default = "default_max_depth")]
     pub max_depth: u8,
-    #[serde(default = "default_max_child_processes")]
-    pub max_child_processes: usize,
+    #[serde(
+        default = "default_max_child_assignments",
+        alias = "max_child_processes"
+    )]
+    pub max_child_assignments: usize,
     #[serde(default = "default_child_timeout_seconds")]
     pub child_timeout_seconds: u64,
     #[serde(default)]
@@ -115,6 +119,8 @@ pub struct WorkerReport {
     pub validation_results: Vec<ValidationResult>,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_further_delegation: Option<bool>,
     pub accepted: bool,
     pub rejected: bool,
     pub status: ReviewStatus,
@@ -272,6 +278,18 @@ pub struct ChildPromptClaimContext<'a> {
     pub semantic_intent_token: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ChildOrchestratorPromptContext<'a> {
+    pub plan: &'a SupervisorPlan,
+    pub assignment: &'a OrchestratorAssignment,
+    pub run_dir: &'a Path,
+    pub worktree: &'a WorktreeRecord,
+    pub report_path: &'a Path,
+    pub schema_path: &'a Path,
+    pub worker_schema_path: &'a Path,
+    pub claim_context: ChildPromptClaimContext<'a>,
+}
+
 pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -289,7 +307,7 @@ pub fn supervisor_plan_from_task_file(
         task,
         task_file: Some(path_relative_to(&repo, task_file)),
         max_depth: default_max_depth(),
-        max_child_processes: DEFAULT_MAX_CHILD_PROCESSES,
+        max_child_assignments: DEFAULT_MAX_CHILD_ASSIGNMENTS,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         assignments: Vec::new(),
@@ -374,25 +392,90 @@ pub fn collect_supervisor_run(
     })
 }
 
-pub fn child_orchestrator_prompt(
-    plan: &SupervisorPlan,
-    assignment: &OrchestratorAssignment,
-    run_dir: &Path,
-    worktree: &WorktreeRecord,
-    report_path: &Path,
-    schema_path: &Path,
-    claim_context: ChildPromptClaimContext<'_>,
-) -> Result<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisePromptRole {
+    O2TopSupervisor,
+    O1ChildOrchestrator,
+    TerminalWorker,
+    Researcher,
+}
+
+impl SupervisePromptRole {
+    fn canonical_role(self) -> &'static str {
+        match self {
+            Self::O2TopSupervisor => "O2_TOP_SUPERVISOR",
+            Self::O1ChildOrchestrator => "O1_CHILD_ORCHESTRATOR",
+            Self::TerminalWorker => "TERMINAL_WORKER",
+            Self::Researcher => "RESEARCHER",
+        }
+    }
+
+    fn agent_kind(self) -> &'static str {
+        match self {
+            Self::O2TopSupervisor | Self::O1ChildOrchestrator => "orchestrator",
+            Self::TerminalWorker => "worker",
+            Self::Researcher => "researcher",
+        }
+    }
+
+    fn thread_depth(self) -> u8 {
+        match self {
+            Self::O2TopSupervisor => 0,
+            Self::O1ChildOrchestrator => 1,
+            Self::TerminalWorker | Self::Researcher => 2,
+        }
+    }
+
+    fn no_further_delegation(self) -> bool {
+        match self {
+            Self::O2TopSupervisor | Self::O1ChildOrchestrator => false,
+            Self::TerminalWorker | Self::Researcher => true,
+        }
+    }
+}
+
+pub fn supervise_role_prefix(
+    role: SupervisePromptRole,
+    label: &str,
+    parent_thread_id: Option<&str>,
+) -> String {
+    format!(
+        "ROLE: {}\nAGENT_KIND: {}\nAGENT_LABEL: {}\nPARENT_THREAD_ID: {}\nTHREAD_DEPTH: {}\nNO_FURTHER_DELEGATION: {}\n",
+        role.canonical_role(),
+        role.agent_kind(),
+        label,
+        parent_thread_id.unwrap_or("none"),
+        role.thread_depth(),
+        role.no_further_delegation()
+    )
+}
+
+pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) -> Result<String> {
+    let ChildOrchestratorPromptContext {
+        plan,
+        assignment,
+        run_dir,
+        worktree,
+        report_path,
+        schema_path,
+        worker_schema_path,
+        claim_context,
+    } = context;
     let assignment_json = serde_json::to_string_pretty(assignment)
         .context("failed to serialize orchestrator assignment")?;
     let worker_prompts = assignment
         .worker_assignments
         .iter()
-        .map(|worker| worker_prompt(plan, assignment, worker, run_dir, schema_path))
+        .map(|worker| worker_prompt(plan, assignment, worker, run_dir, worker_schema_path))
         .collect::<Result<Vec<_>>>()?
         .join("\n\n--- worker prompt contract ---\n\n");
+    let role_prefix = supervise_role_prefix(
+        SupervisePromptRole::O1ChildOrchestrator,
+        &assignment.id,
+        None,
+    );
     Ok(format!(
-        r#"You are a child orchestrator in an opt-in local Codex CLI supervisor run.
+        r#"{role_prefix}You are a child orchestrator in an opt-in local Codex CLI supervisor run.
 You are not the top supervisor. You are not alone in the repository.
 Primary worktree mutation is forbidden. Work only in this assigned child worktree:
 {worktree_path}
@@ -406,20 +489,32 @@ Ownership:
 - Semantic intent token: {semantic_intent_token}
 
 Runtime hierarchy:
-- The only allowed depth is supervisor -> child orchestrator -> worker.
-- You must launch worker Codex CLI subprocesses only inside assigned worktrees.
-- Do not launch further workers unless they are listed in the assignment.
-- Workers must write WorkerReport JSON matching the report contract.
+- Current supervise run contract: O2 supervisor -> O1 child orchestrator -> terminal worker/researcher.
+- You are the O1 child orchestrator for this assignment.
+- Workers and researchers are terminal: they must not launch further workers, delegate to another worker, or take over peer coordination.
+- You must not spawn, impersonate, or take over a peer O2 supervisor.
+- The top O2/supervisor may launch peer O2 supervisors as parallel scopes for newly discovered large cross-cutting problems. Report such escalation candidates in findings and remaining_risk instead of taking them over.
+
+Required behavior:
+- First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
+- Use Codex native SubAgent/delegated-worker mechanisms for worker assignments when available, following AGENTS.md and .agents instructions.
+- When launching a worker, use the generated worker prompt template verbatim and preserve its six-line TERMINAL_WORKER role-prefix block with no preamble.
+- Do not force raw Codex CLI subprocess workers as the primary worker path.
+- If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
+- Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
 - Review every WorkerReport before writing your own OrchestratorReviewReport.
 
 Safety requirements:
 - Do not edit outside the assigned paths, symbols, or modules.
 - Do not mutate the primary worktree.
 - Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
-- Write your final OrchestratorReviewReport as JSON to:
+- Return your OrchestratorReviewReport JSON as your final response.
+- Do not write the orchestrator report file yourself with tools; Codex CLI --output-last-message records your final response at this MACO collection target:
 {report_path}
-- The report schema path is:
+- The orchestrator review report schema path is:
 {schema_path}
+- Worker reports must use this schema path:
+{worker_schema_path}
 
 Supervisor task:
 {task}
@@ -430,6 +525,7 @@ Orchestrator assignment JSON:
 Worker prompt templates:
 {worker_prompts}
 "#,
+        role_prefix = role_prefix,
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
         assigned_paths = display_paths(&assignment.assigned_paths),
@@ -442,6 +538,7 @@ Worker prompt templates:
             .unwrap_or_else(|| "<none>".to_string()),
         report_path = report_path.display(),
         schema_path = schema_path.display(),
+        worker_schema_path = worker_schema_path.display(),
         task = plan.task,
         assignment_json = assignment_json,
         worker_prompts = worker_prompts,
@@ -457,10 +554,12 @@ pub fn worker_prompt(
 ) -> Result<String> {
     let worker_json =
         serde_json::to_string_pretty(worker).context("failed to serialize worker assignment")?;
+    let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     Ok(format!(
-        r#"You are a worker in an opt-in local Codex CLI supervised run.
+        r#"{role_prefix}You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
+Current supervise run contract: O2 supervisor -> O1 child orchestrator -> terminal worker/researcher.
 Your parent is child orchestrator `{orchestrator_id}`. You are not the supervisor.
-Do not launch further workers unless explicitly assigned by your child orchestrator.
+Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
 
 Ownership:
 - Worker id: {worker_id}
@@ -468,13 +567,18 @@ Ownership:
 - Semantic symbols: {semantic_symbols}
 - Semantic modules: {semantic_modules}
 - Run artifact root: {run_dir}
+- Explicit report path: {report_path}
 
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
 - Do not mutate the primary worktree.
 - Run validation or record why validation was not run.
-- Write WorkerReport JSON with changed files, commands run, validation results, findings, remaining risk, and next safe action.
-- Use the report schema path: {schema_path}
+- Return WorkerReport JSON in your final response with changed files, commands run, validation results, findings, remaining risk, and next safe action.
+- Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
+- If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over.
+- Only write a report file when an explicit report_path is assigned.
+- If the explicit report path is <none>, do not write any report file; only return WorkerReport JSON in your final response.
+- Use the worker report schema path: {schema_path}
 
 Supervisor task:
 {task}
@@ -482,12 +586,18 @@ Supervisor task:
 Worker assignment JSON:
 {worker_json}
 "#,
+        role_prefix = role_prefix,
         orchestrator_id = orchestrator.id,
         worker_id = worker.id,
         assigned_paths = display_paths(&worker.assigned_paths),
         semantic_symbols = worker.semantic_symbols.join(", "),
         semantic_modules = worker.semantic_modules.join(", "),
         run_dir = run_dir.display(),
+        report_path = worker
+            .report_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
         schema_path = schema_path.display(),
         task = worker.task.as_deref().unwrap_or(&plan.task),
         worker_json = worker_json,
@@ -505,6 +615,7 @@ fn run_supervisor_plan(
     let primary_head = current_head_oid(&repo)?;
 
     let run_dir = run_dir(&repo, &options.run_id);
+    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Supervise, &options.run_id)?;
     let dirs = RunDirs::create(&run_dir)?;
     let manager = WorktreeManager::new(&repo);
     let sync_store = SyncStore::open(&repo)?;
@@ -561,18 +672,20 @@ fn run_supervisor_plan(
                 .join(format!("{}.prompt.md", assignment.id));
             let log_path = dirs.logs.join(format!("{}.jsonl", assignment.id));
             let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
-            let prompt = child_orchestrator_prompt(
-                &plan,
+            let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+            let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
+                plan: &plan,
                 assignment,
-                &run_dir,
-                &worktree,
-                &report_path,
-                &schema_path,
-                ChildPromptClaimContext {
+                run_dir: &run_dir,
+                worktree: &worktree,
+                report_path: &report_path,
+                schema_path: &schema_path,
+                worker_schema_path: &worker_schema_path,
+                claim_context: ChildPromptClaimContext {
                     claim: &claim,
                     semantic_intent_token: semantic_token,
                 },
-            )?;
+            })?;
             fs::write(&prompt_path, prompt)
                 .with_context(|| format!("failed to write prompt {}", prompt_path.display()))?;
 
@@ -719,8 +832,8 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
     if plan.max_depth != 2 {
         bail!("supervisor max_depth must be exactly 2");
     }
-    if plan.max_child_processes == 0 {
-        bail!("max_child_processes must be at least 1");
+    if plan.max_child_assignments == 0 {
+        bail!("max_child_assignments must be at least 1 (legacy max_child_processes is accepted as an alias)");
     }
     if plan.child_timeout_seconds == 0 {
         bail!("child_timeout_seconds must be greater than zero");
@@ -728,11 +841,11 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
     if plan.assignments.is_empty() {
         bail!("supervisor plan must include at least one orchestrator assignment");
     }
-    if plan.assignments.len() > plan.max_child_processes {
+    if plan.assignments.len() > plan.max_child_assignments {
         bail!(
-            "supervisor plan has {} child orchestrators but max_child_processes is {}",
+            "supervisor plan has {} child orchestrators but max_child_assignments is {}",
             plan.assignments.len(),
-            plan.max_child_processes
+            plan.max_child_assignments
         );
     }
 
@@ -949,8 +1062,91 @@ fn collect_child_report(
             missing_child_report(assignment, report_path, external_run, error.to_string())
         }
     };
+    validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     verify_child_report_paths(assignment, worktree_path, primary_head, &mut report);
     report
+}
+
+fn validate_worker_report_delegation_attestations(
+    assignment: &OrchestratorAssignment,
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    let mut invalid_workers = Vec::new();
+    let actual_worker_ids = report
+        .worker_reports
+        .iter()
+        .map(|worker_report| worker_report.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing_workers = assignment
+        .worker_assignments
+        .iter()
+        .filter(|worker| !actual_worker_ids.contains(worker.id.as_str()))
+        .map(|worker| worker.id.clone())
+        .collect::<Vec<_>>();
+
+    for worker_report in &mut report.worker_reports {
+        if worker_report.no_further_delegation == Some(true) {
+            continue;
+        }
+        let message = match worker_report.no_further_delegation {
+            Some(false) => "worker report indicates further delegation".to_string(),
+            None => "worker report omitted no_further_delegation terminal-worker attestation"
+                .to_string(),
+            Some(true) => continue,
+        };
+        worker_report.status = ReviewStatus::Failed;
+        worker_report.accepted = false;
+        worker_report.rejected = true;
+        worker_report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message,
+            paths: vec![report_path.to_path_buf()],
+        });
+        invalid_workers.push(worker_report.id.clone());
+    }
+
+    if invalid_workers.is_empty() && missing_workers.is_empty() {
+        return;
+    }
+
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+
+    if !invalid_workers.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' included worker reports without terminal no-delegation attestation: {}",
+                report.id,
+                invalid_workers.join(", ")
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+
+    if !missing_workers.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' omitted required worker reports for assignment worker IDs: {}",
+                report.id,
+                missing_workers.join(", ")
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+
+    report.remaining_risk = if missing_workers.is_empty() {
+        "one or more worker reports indicate delegation beyond the terminal worker contract"
+            .to_string()
+    } else {
+        "one or more required worker reports are missing terminal no-delegation attestations"
+            .to_string()
+    };
+    report.next_safe_action =
+        "inspect worker output and rerun the child scope with terminal workers only".to_string();
 }
 
 fn verify_child_report_paths(
@@ -1302,17 +1498,40 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "OrchestratorReviewReport",
             "type": "object",
-            "required": ["id", "role", "accepted", "rejected", "status", "remaining_risk", "next_safe_action"],
+            "additionalProperties": false,
+            "required": [
+                "id",
+                "role",
+                "assigned_paths",
+                "semantic_symbols",
+                "semantic_modules",
+                "commands_run",
+                "files_changed",
+                "validation_results",
+                "findings",
+                "worker_reports",
+                "accepted",
+                "rejected",
+                "status",
+                "remaining_risk",
+                "next_safe_action"
+            ],
             "properties": {
                 "id": {"type": "string"},
-                "role": {"const": "child_orchestrator"},
+                "role": {"type": "string", "const": "child_orchestrator"},
                 "assigned_paths": {"type": "array", "items": {"type": "string"}},
                 "semantic_symbols": {"type": "array", "items": {"type": "string"}},
                 "semantic_modules": {"type": "array", "items": {"type": "string"}},
-                "worker_reports": {"type": "array"},
+                "claim_token": {"type": ["integer", "null"]},
+                "semantic_intent_token": {"type": ["integer", "null"]},
+                "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+                "files_changed": {"type": "array", "items": {"type": "string"}},
+                "validation_results": {"type": "array", "items": validation_result_schema_value()},
+                "findings": {"type": "array", "items": finding_schema_value()},
+                "worker_reports": {"type": "array", "items": worker_report_schema_value()},
                 "accepted": {"type": "boolean"},
                 "rejected": {"type": "boolean"},
-                "status": {"enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+                "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
                 "remaining_risk": {"type": "string"},
                 "next_safe_action": {"type": "string"}
             }
@@ -1321,29 +1540,108 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
 }
 
 fn write_worker_schema(path: &Path) -> Result<()> {
-    write_schema(
-        path,
-        json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "title": "WorkerReport",
-            "type": "object",
-            "required": ["id", "role", "accepted", "rejected", "status", "remaining_risk", "next_safe_action"],
-            "properties": {
-                "id": {"type": "string"},
-                "role": {"const": "worker"},
-                "assigned_paths": {"type": "array", "items": {"type": "string"}},
-                "commands_run": {"type": "array"},
-                "files_changed": {"type": "array", "items": {"type": "string"}},
-                "validation_results": {"type": "array"},
-                "findings": {"type": "array"},
-                "accepted": {"type": "boolean"},
-                "rejected": {"type": "boolean"},
-                "status": {"enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
-                "remaining_risk": {"type": "string"},
-                "next_safe_action": {"type": "string"}
-            }
-        }),
-    )
+    write_schema(path, worker_report_schema_value())
+}
+
+fn worker_report_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "WorkerReport",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "id",
+            "role",
+            "assigned_paths",
+            "semantic_symbols",
+            "semantic_modules",
+            "commands_run",
+            "files_changed",
+            "validation_results",
+            "findings",
+            "no_further_delegation",
+            "accepted",
+            "rejected",
+            "status",
+            "remaining_risk",
+            "next_safe_action"
+        ],
+        "properties": {
+            "id": {"type": "string"},
+            "role": {"type": "string", "const": "worker"},
+            "assigned_paths": {"type": "array", "items": {"type": "string"}},
+            "semantic_symbols": {"type": "array", "items": {"type": "string"}},
+            "semantic_modules": {"type": "array", "items": {"type": "string"}},
+            "claim_token": {"type": ["integer", "null"]},
+            "semantic_intent_token": {"type": ["integer", "null"]},
+            "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "validation_results": {"type": "array", "items": validation_result_schema_value()},
+            "findings": {"type": "array", "items": finding_schema_value()},
+            "no_further_delegation": {"type": "boolean", "const": true},
+            "accepted": {"type": "boolean"},
+            "rejected": {"type": "boolean"},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "remaining_risk": {"type": "string"},
+            "next_safe_action": {"type": "string"}
+        }
+    })
+}
+
+fn command_run_record_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "command",
+            "cwd",
+            "status",
+            "timeout_seconds",
+            "duration_ms",
+            "timed_out",
+            "stdout",
+            "stderr"
+        ],
+        "properties": {
+            "command": {"type": "array", "items": {"type": "string"}},
+            "cwd": {"type": "string"},
+            "exit_code": {"type": ["integer", "null"]},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "timeout_seconds": {"type": "integer"},
+            "duration_ms": {"type": "integer"},
+            "timed_out": {"type": "boolean"},
+            "stdout": {"type": "string"},
+            "stderr": {"type": "string"},
+            "error": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn validation_result_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "command"],
+        "properties": {
+            "name": {"type": "string"},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "command": {"type": "array", "items": {"type": "string"}},
+            "message": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn finding_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "message", "paths"],
+        "properties": {
+            "severity": {"type": "string", "enum": ["info", "warning", "error"]},
+            "message": {"type": "string"},
+            "paths": {"type": "array", "items": {"type": "string"}}
+        }
+    })
 }
 
 fn write_schema(path: &Path, schema: serde_json::Value) -> Result<()> {
@@ -1495,8 +1793,8 @@ fn default_max_depth() -> u8 {
     2
 }
 
-fn default_max_child_processes() -> usize {
-    DEFAULT_MAX_CHILD_PROCESSES
+fn default_max_child_assignments() -> usize {
+    DEFAULT_MAX_CHILD_ASSIGNMENTS
 }
 
 fn default_child_timeout_seconds() -> u64 {
@@ -1523,4 +1821,29 @@ pub fn generated_run_id() -> Result<RunId> {
         .context("system clock is before UNIX epoch")?
         .as_secs();
     RunId::new(format!("o2-{now}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervise_role_prefixes_match_runtime_contract() {
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::O2TopSupervisor, "supervisor", None),
+            "ROLE: O2_TOP_SUPERVISOR\nAGENT_KIND: orchestrator\nAGENT_LABEL: supervisor\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 0\nNO_FURTHER_DELEGATION: false\n"
+        );
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::O1ChildOrchestrator, "child-a", None),
+            "ROLE: O1_CHILD_ORCHESTRATOR\nAGENT_KIND: orchestrator\nAGENT_LABEL: child-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 1\nNO_FURTHER_DELEGATION: false\n"
+        );
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::TerminalWorker, "worker-a", None),
+            "ROLE: TERMINAL_WORKER\nAGENT_KIND: worker\nAGENT_LABEL: worker-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n"
+        );
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::Researcher, "researcher-a", None),
+            "ROLE: RESEARCHER\nAGENT_KIND: researcher\nAGENT_LABEL: researcher-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n"
+        );
+    }
 }

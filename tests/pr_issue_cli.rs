@@ -96,6 +96,72 @@ fn pr_publish_fake_commits_uncommitted_worktree_changes_without_pushing() -> Res
 }
 
 #[test]
+fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let origin_path = init_bare_origin(temp.path())?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        path_str(&origin_path)?,
+    ])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\ngit push\n").context("edit worktree")?;
+    let fake_bin = temp.path().join("bin");
+    let gh_log = write_failing_gh(&fake_bin)?;
+    let path = path_with_prefix(&fake_bin)?;
+
+    let report = run_success_json_with_env(
+        &[
+            "pr",
+            "publish",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--forge",
+            "git",
+            "--json",
+        ],
+        &[("PATH", path.as_os_str())],
+    )?;
+
+    assert_eq!(report["status"], "published");
+    assert_eq!(report["forge"], "git");
+    assert_eq!(report["pushed"], true);
+    assert_eq!(report["created"], false);
+    assert_eq!(report["pr_url"], Value::Null);
+    assert_eq!(
+        report["next_action"],
+        "open a pull request on your Git host manually"
+    );
+    assert!(report["commit_id"].as_str().context("commit id")?.len() >= 12);
+    assert_eq!(report["head_id"], report["commit_id"]);
+
+    let branch = report["branch"].as_str().context("branch string")?;
+    let remote_head = git_rev_parse(&origin_path, &format!("refs/heads/{branch}"))?;
+    assert_eq!(remote_head, report["head_id"].as_str().context("head id")?);
+    assert_eq!(git_status_porcelain(worktree_path)?, "");
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
+        "# Smoke\n"
+    );
+    assert!(
+        !gh_log.exists(),
+        "git forge must not call gh; log was {}",
+        gh_log.display()
+    );
+
+    Ok(())
+}
+
+#[test]
 fn pr_publish_fake_blocks_unclaimed_worktree_edits_with_json_report() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -123,6 +189,46 @@ fn pr_publish_fake_blocks_unclaimed_worktree_edits_with_json_report() -> Result<
     assert_contains(&report["blockers"], "unclaimed_edits")?;
     assert_eq!(
         report["preview"]["candidate"]["unclaimed_changed_paths"][0],
+        "README.md"
+    );
+    assert_eq!(git_status_porcelain(worktree_path)?, " M README.md\n");
+
+    Ok(())
+}
+
+#[test]
+fn pr_publish_required_validation_blocks_missing_evidence() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\npublish\n").context("edit worktree")?;
+
+    let report = run_failure_json(&[
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--forge",
+        "fake",
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(report["created"], false);
+    assert_eq!(report["validation_required"], true);
+    assert_contains(&report["blockers"], "validation_missing")?;
+    assert_eq!(
+        report["preview"]["safety"]["readiness"]["details"][0]["kind"],
+        "validation_missing"
+    );
+    assert_eq!(
+        report["preview"]["safety"]["readiness"]["details"][0]["paths"][0],
         "README.md"
     );
     assert_eq!(git_status_porcelain(worktree_path)?, " M README.md\n");
@@ -340,6 +446,78 @@ fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
         &parents,
     )
     .context("commit")
+}
+
+fn init_bare_origin(root: &Path) -> Result<PathBuf> {
+    let origin_path = root.join("origin.git");
+    let output = Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&origin_path)
+        .output()
+        .context("git init --bare")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(origin_path)
+}
+
+fn write_failing_gh(path_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(path_dir).context("create fake bin dir")?;
+    let gh_path = path_dir.join("gh");
+    let log_path = path_dir.join("gh-called.log");
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 99\n",
+            log_path.display()
+        ),
+    )
+    .context("write fake gh")?;
+    let mut permissions = fs::metadata(&gh_path)
+        .context("stat fake gh")?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&gh_path, permissions).context("chmod fake gh")?;
+    Ok(log_path)
+}
+
+fn path_with_prefix(prefix: &Path) -> Result<std::ffi::OsString> {
+    let original_path = env::var_os("PATH").unwrap_or_default();
+    let mut entries = vec![prefix.to_path_buf()];
+    entries.extend(env::split_paths(&original_path));
+    env::join_paths(entries).context("join PATH")
+}
+
+fn run_git(args: &[&str]) -> Result<()> {
+    let output = Command::new("git").args(args).output().context("run git")?;
+    if !output.status.success() {
+        anyhow::bail!("git failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
+}
+
+fn git_rev_parse(bare_repo: &Path, ref_name: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(bare_repo)
+        .args(["rev-parse", ref_name])
+        .output()
+        .context("git rev-parse")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn path_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
 fn git_status_porcelain(worktree_path: &Path) -> Result<String> {

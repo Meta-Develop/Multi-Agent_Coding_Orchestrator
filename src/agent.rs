@@ -375,6 +375,7 @@ where
             validations,
         },
         forces: MergeForceOptions::default(),
+        require_validation: false,
     })?;
 
     let boundary_error = if candidate.unclaimed_changed_paths.is_empty() {

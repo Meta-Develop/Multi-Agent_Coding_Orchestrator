@@ -1,11 +1,12 @@
 [package]
 name = "multi-agent-coding-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Local-first multi-agent coding orchestrator"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 readme = "README.md"
 documentation = "https://docs.rs/multi-agent-coding-orchestrator"
+repository = "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator"
 exclude = [
     ".agent/**",
     ".agents/**",

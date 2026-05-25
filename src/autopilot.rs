@@ -1,10 +1,12 @@
 use crate::{
+    artifacts::{self, RunArtifactFamily},
     live_claim::{self, LiveClock},
     merge::{
         self, ApplyBlocker, ApplyReadinessStatus, SafetyCheckStatus, ValidationReport,
         ValidationStatus,
     },
     orchestrator::{RunId, SemanticCoordinationMode},
+    planning,
     publication::{
         self, ForgeKind, PrPublicationOptions, PrPublicationReport, PrPublicationStatus,
     },
@@ -27,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
-    ffi::OsStr,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -134,6 +135,7 @@ impl<'de> Deserialize<'de> for AutopilotValidationCommand {
 pub enum AutopilotForgeMode {
     #[default]
     Fake,
+    Git,
     Github,
 }
 
@@ -219,6 +221,19 @@ pub struct AutopilotSafetyRefusal {
     pub kind: String,
     pub message: String,
     pub paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock_details: Vec<AutopilotLockRefusalDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotLockRefusalDetail {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -337,35 +352,39 @@ pub fn autopilot_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
 ) -> Result<AutopilotPlan> {
-    let _repo = discover_repo_root(repo.as_ref())?;
+    let repo = discover_repo_root(repo.as_ref())?;
     let task_file = task_file.as_ref();
     let contents = fs::read_to_string(task_file)
         .with_context(|| format!("failed to read autopilot task file {}", task_file.display()))?;
     if let Ok(plan) = serde_json::from_str::<AutopilotPlan>(&contents) {
-        return validate_autopilot_plan(plan);
+        return validate_autopilot_plan(&repo, plan);
     }
 
-    validate_autopilot_plan(AutopilotPlan {
-        version: AUTOPILOT_SCHEMA_VERSION,
-        task: AutopilotTask {
-            title: title_from_plain_task(&contents),
-            body: contents,
+    validate_autopilot_plan(
+        &repo,
+        AutopilotPlan {
+            version: AUTOPILOT_SCHEMA_VERSION,
+            task: AutopilotTask {
+                title: title_from_plain_task(&contents),
+                body: contents,
+            },
+            assigned_paths: Vec::new(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            validation_commands: Vec::new(),
+            max_repair_attempts: default_max_repair_attempts(),
+            forge_mode: AutopilotForgeMode::Fake,
+            reviewer: ReviewerConfig::default(),
+            publish_mode: AutopilotPublishMode::DraftOnly,
+            auto_merge: false,
         },
-        assigned_paths: vec![PathBuf::from("README.md")],
-        semantic_symbols: Vec::new(),
-        semantic_modules: Vec::new(),
-        validation_commands: Vec::new(),
-        max_repair_attempts: default_max_repair_attempts(),
-        forge_mode: AutopilotForgeMode::Fake,
-        reviewer: ReviewerConfig::default(),
-        publish_mode: AutopilotPublishMode::DraftOnly,
-        auto_merge: false,
-    })
+    )
 }
 
 pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
     let repo = discover_repo_root(&options.repo)?;
     let run_dir = autopilot_run_dir(&repo, &options.run_id);
+    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Autopilot, &options.run_id)?;
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create autopilot run dir {}", run_dir.display()))?;
     let mut plan = autopilot_plan_from_task_file(&repo, &options.plan_file)?;
@@ -376,7 +395,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
     let artifacts = artifact_paths();
     write_json_file(&run_dir.join(&artifacts.plan), &plan)?;
 
-    let safety = safety_report(&repo, options.allow_dirty_primary)?;
+    let safety = safety_report(&repo, options.allow_dirty_primary, &plan.assigned_paths)?;
     if safety.refused {
         write_skipped_stage_reports(&run_dir, "safety_refusal")?;
         let validation = AutopilotValidationSummary {
@@ -603,7 +622,7 @@ pub fn collect_autopilot_run(repo: impl AsRef<Path>, run_id: RunId) -> Result<Va
     }))
 }
 
-fn validate_autopilot_plan(mut plan: AutopilotPlan) -> Result<AutopilotPlan> {
+fn validate_autopilot_plan(repo: &Path, mut plan: AutopilotPlan) -> Result<AutopilotPlan> {
     if plan.version != AUTOPILOT_SCHEMA_VERSION {
         bail!("unsupported autopilot plan version {}", plan.version);
     }
@@ -616,7 +635,8 @@ fn validate_autopilot_plan(mut plan: AutopilotPlan) -> Result<AutopilotPlan> {
         plan.task.body = plan.task.title.clone();
     }
     if plan.assigned_paths.is_empty() {
-        plan.assigned_paths.push(PathBuf::from("README.md"));
+        plan.assigned_paths = planning::propose_task_paths(repo, &plan.task.title, &plan.task.body)
+            .context("failed to propose autopilot assigned paths")?;
     }
     plan.assigned_paths = normalize_paths(std::mem::take(&mut plan.assigned_paths))
         .context("autopilot assigned paths are invalid")?;
@@ -642,7 +662,11 @@ fn validate_autopilot_plan(mut plan: AutopilotPlan) -> Result<AutopilotPlan> {
     Ok(plan)
 }
 
-fn safety_report(repo: &Path, allow_dirty_primary: bool) -> Result<AutopilotSafetyReport> {
+fn safety_report(
+    repo: &Path,
+    allow_dirty_primary: bool,
+    target_paths: &[PathBuf],
+) -> Result<AutopilotSafetyReport> {
     let mut refusals = Vec::new();
     if !allow_dirty_primary {
         let dirty_paths = dirty_primary_paths(repo)?;
@@ -651,54 +675,81 @@ fn safety_report(repo: &Path, allow_dirty_primary: bool) -> Result<AutopilotSafe
                 kind: "dirty_primary".to_string(),
                 message: "primary worktree has local changes".to_string(),
                 paths: dirty_paths,
+                lock_details: Vec::new(),
             });
         }
     }
 
     let sync_claims = SyncStore::open(repo)?.snapshot()?;
-    if !sync_claims.is_empty() {
+    let mut sync_details = Vec::new();
+    for claim in &sync_claims {
+        for path in planning::any_path_overlaps(target_paths, &claim.paths) {
+            sync_details.push(AutopilotLockRefusalDetail {
+                path,
+                owner: Some(claim.agent_id.clone()),
+                token: Some(claim.token.get()),
+                claim_id: None,
+            });
+        }
+    }
+    if !sync_details.is_empty() {
         refusals.push(AutopilotSafetyRefusal {
             kind: "active_sync_claims".to_string(),
-            message: "active durable sync claims exist".to_string(),
-            paths: sync_claims
-                .iter()
-                .flat_map(|claim| claim.paths.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            message: "active durable sync claims overlap autopilot target paths".to_string(),
+            paths: detail_paths(&sync_details),
+            lock_details: sync_details,
         });
     }
 
     let semantic_intents = SemanticIntentStore::open(repo)?.snapshot()?;
-    if !semantic_intents.is_empty() {
+    let mut semantic_details = Vec::new();
+    for intent in &semantic_intents {
+        let related_paths = intent
+            .paths
+            .iter()
+            .chain(intent.impacted_files.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for path in planning::any_path_overlaps(target_paths, &related_paths) {
+            semantic_details.push(AutopilotLockRefusalDetail {
+                path,
+                owner: Some(intent.agent_id.clone()),
+                token: Some(intent.token.get()),
+                claim_id: None,
+            });
+        }
+    }
+    if !semantic_details.is_empty() {
         refusals.push(AutopilotSafetyRefusal {
             kind: "active_semantic_intents".to_string(),
-            message: "active semantic coordination intents exist".to_string(),
-            paths: semantic_intents
-                .iter()
-                .flat_map(|intent| intent.paths.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            message: "active semantic coordination intents overlap autopilot target paths"
+                .to_string(),
+            paths: detail_paths(&semantic_details),
+            lock_details: semantic_details,
         });
     }
 
     let live = live_claim::status(repo, &LiveClock::now())?;
-    let live_locks = live
-        .claims
-        .into_iter()
-        .filter(|claim| claim.is_lock)
-        .collect::<Vec<_>>();
-    if !live_locks.is_empty() {
+    let mut live_details = Vec::new();
+    for claim in live.claims.into_iter().filter(|claim| claim.is_lock) {
+        for path in planning::any_path_overlaps(target_paths, &claim.owned_files) {
+            live_details.push(AutopilotLockRefusalDetail {
+                path,
+                owner: claim.owner.clone(),
+                token: None,
+                claim_id: Some(claim.claim_id.clone()),
+            });
+        }
+    }
+    if !live_details.is_empty() {
         refusals.push(AutopilotSafetyRefusal {
             kind: "active_live_locks".to_string(),
-            message: "active or blocked live claim locks exist".to_string(),
-            paths: live_locks
-                .iter()
-                .flat_map(|claim| claim.owned_files.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            message: "active or blocked live claim locks overlap autopilot target paths"
+                .to_string(),
+            paths: detail_paths(&live_details),
+            lock_details: live_details,
         });
     }
 
@@ -706,6 +757,15 @@ fn safety_report(repo: &Path, allow_dirty_primary: bool) -> Result<AutopilotSafe
         refused: !refusals.is_empty(),
         refusals,
     })
+}
+
+fn detail_paths(details: &[AutopilotLockRefusalDetail]) -> Vec<PathBuf> {
+    details
+        .iter()
+        .map(|detail| detail.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn supervisor_plan_for_attempt(
@@ -720,7 +780,7 @@ fn supervisor_plan_for_attempt(
         task: task.clone(),
         task_file: None,
         max_depth: 2,
-        max_child_processes: 1,
+        max_child_assignments: 1,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         assignments: vec![OrchestratorAssignment {
@@ -1106,6 +1166,7 @@ cat > "$report" <<JSON
         {{"name": "fake worker validation", "status": "succeeded", "command": [], "message": null}}
       ],
       "findings": [],
+      "no_further_delegation": true,
       "accepted": true,
       "rejected": false,
       "status": "succeeded",
@@ -1398,11 +1459,11 @@ fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn is_local_runtime_path(path: &Path) -> bool {
-    matches!(
-        path.components().next(),
-        Some(std::path::Component::Normal(name))
-            if name == OsStr::new(".maco") || name == OsStr::new(".maco-cache")
-    )
+    path.starts_with(".maco")
+        || path.starts_with(".maco-cache")
+        || path.starts_with(".agents/live")
+        || path.starts_with(".agents/temp")
+        || path.starts_with(".agents/storage")
 }
 
 fn normalize_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -1508,6 +1569,7 @@ impl AutopilotForgeMode {
     fn into_publication_forge(self) -> ForgeKind {
         match self {
             Self::Fake => ForgeKind::Fake,
+            Self::Git => ForgeKind::Git,
             Self::Github => ForgeKind::Github,
         }
     }
@@ -1524,6 +1586,7 @@ fn pr_status_label(status: PrPublicationStatus) -> &'static str {
 fn forge_label(forge: ForgeKind) -> &'static str {
     match forge {
         ForgeKind::Fake => "fake",
+        ForgeKind::Git => "git",
         ForgeKind::Github => "github",
     }
 }
@@ -1550,6 +1613,9 @@ fn blocker_label(blocker: ApplyBlocker) -> &'static str {
         ApplyBlocker::StaleBase => "stale_base",
         ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
         ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
+        ApplyBlocker::ValidationMissing => "validation_missing",
+        ApplyBlocker::ValidationNotRun => "validation_not_run",
+        ApplyBlocker::ValidationSkipped => "validation_skipped",
         ApplyBlocker::ValidationFailed => "validation_failed",
     }
 }
