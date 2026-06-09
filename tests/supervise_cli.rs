@@ -7,7 +7,7 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 const CHILD_A_O1_PREFIX: &str = "\
 ROLE: O1_CHILD_ORCHESTRATOR
-AGENT_KIND: orchestrator
+AGENT_KIND: child_orchestrator
 AGENT_LABEL: child-a
 PARENT_THREAD_ID: none
 THREAD_DEPTH: 1
@@ -17,6 +17,14 @@ const WORKER_A_PREFIX: &str = "\
 ROLE: TERMINAL_WORKER
 AGENT_KIND: worker
 AGENT_LABEL: worker-a
+PARENT_THREAD_ID: none
+THREAD_DEPTH: 2
+NO_FURTHER_DELEGATION: true
+";
+const CHILD_A_AUDITOR_PREFIX: &str = "\
+ROLE: REVIEW_AUDITOR
+AGENT_KIND: auditor
+AGENT_LABEL: child-a-review-auditor
 PARENT_THREAD_ID: none
 THREAD_DEPTH: 2
 NO_FURTHER_DELEGATION: true
@@ -79,7 +87,7 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
     );
     assert_eq!(
         report["commands_run"].as_array().context("commands")?.len(),
-        2
+        4
     );
     assert_eq!(
         report["released_claims"]
@@ -92,12 +100,26 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         .join(".maco/o2/runs/supervise-two/logs/child-a.jsonl")
         .exists());
     assert!(repo_path
+        .join(".maco/o2/runs/supervise-two/logs/child-a-review-auditor.jsonl")
+        .exists());
+    assert!(repo_path
         .join(".maco/o2/runs/supervise-two/reports/child-b.json")
+        .exists());
+    assert!(repo_path
+        .join(".maco/o2/runs/supervise-two/reports/child-a-review-auditor.json")
         .exists());
     let first_command = report["commands_run"][0]["command"]
         .as_array()
         .context("first command")?;
     assert!(first_command.iter().any(|arg| arg == "--json"));
+    assert!(command_contains_sequence(
+        first_command,
+        &["--sandbox", "danger-full-access"]
+    ));
+    assert!(command_contains_sequence(
+        first_command,
+        &["--enable", "goals"]
+    ));
     assert!(command_contains_sequence(
         first_command,
         &["--enable", "multi_agent"]
@@ -128,13 +150,54 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
             .context("prompt arg")?,
         "-"
     );
+    let auditor_command = report["commands_run"][1]["command"]
+        .as_array()
+        .context("auditor command")?;
+    let child_a_auditor_report_arg = repo_path
+        .join(".maco/o2/runs/supervise-two/reports/child-a-review-auditor.json")
+        .display()
+        .to_string();
+    let auditor_schema_arg = repo_path
+        .join(".maco/o2/runs/supervise-two/schemas/auditor-report.schema.json")
+        .display()
+        .to_string();
+    assert!(command_contains_sequence(
+        auditor_command,
+        &["--sandbox", "read-only"]
+    ));
+    assert!(command_contains_sequence(
+        auditor_command,
+        &["--enable", "goals"]
+    ));
+    assert!(command_contains_sequence(
+        auditor_command,
+        &["--enable", "multi_agent"]
+    ));
+    assert!(command_contains_sequence(
+        auditor_command,
+        &["--output-last-message", child_a_auditor_report_arg.as_str()]
+    ));
+    assert!(command_contains_sequence(
+        auditor_command,
+        &["--output-schema", auditor_schema_arg.as_str()]
+    ));
     let child_a_log =
         fs::read_to_string(repo_path.join(".maco/o2/runs/supervise-two/logs/child-a.jsonl"))
             .context("read child-a json log")?;
     assert!(child_a_log.contains(r#""event":"fake-start""#));
     assert!(child_a_log.contains(r#""prompt_from_stdin":true"#));
+    assert!(child_a_log.contains(r#""goals":true"#));
     assert!(child_a_log.contains(r#""multi_agent":true"#));
     assert!(child_a_log.contains(r#""o1_role_prefix":true"#));
+    assert!(child_a_log.contains(r#""sandbox":"danger-full-access""#));
+    let child_a_auditor_log = fs::read_to_string(
+        repo_path.join(".maco/o2/runs/supervise-two/logs/child-a-review-auditor.jsonl"),
+    )
+    .context("read child-a auditor json log")?;
+    assert!(child_a_auditor_log.contains(r#""auditor_role_prefix":true"#));
+    assert!(child_a_auditor_log.contains(r#""goals":true"#));
+    assert!(child_a_auditor_log.contains(r#""multi_agent":true"#));
+    assert!(child_a_auditor_log.contains(r#""sandbox":"read-only""#));
 
     let child_a_prompt = fs::read_to_string(
         repo_path.join(".maco/o2/runs/supervise-two/assignments/child-a.prompt.md"),
@@ -142,25 +205,76 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
     .context("read child-a prompt")?;
     assert_prompt_starts_with_prefix(&child_a_prompt, CHILD_A_O1_PREFIX)?;
     assert!(child_a_prompt.contains(WORKER_A_PREFIX));
+    assert!(child_a_prompt.contains(CHILD_A_AUDITOR_PREFIX));
     let embedded_worker_prompt = child_a_prompt
         .split_once("Worker prompt templates:\n")
         .map(|(_, prompt)| prompt)
         .context("embedded worker prompt templates block")?;
     assert_prompt_starts_with_prefix(embedded_worker_prompt, WORKER_A_PREFIX)?;
+    let embedded_auditor_prompt = child_a_prompt
+        .split_once("Review auditor prompt template:\n")
+        .map(|(_, prompt)| prompt)
+        .context("embedded auditor prompt template block")?;
+    assert_prompt_starts_with_prefix(embedded_auditor_prompt, CHILD_A_AUDITOR_PREFIX)?;
     assert!(child_a_prompt.contains("First, read and follow AGENTS.md"));
     assert!(child_a_prompt.contains(".agents/skills/agent-orchestration/SKILL.md"));
     assert!(child_a_prompt.contains(".agents/docs/AGENT_ORCHESTRATION.md"));
-    assert!(child_a_prompt.contains("Use Codex native SubAgent/delegated-worker mechanisms"));
+    assert!(child_a_prompt.contains(
+        "Use Codex native SubAgent/delegated-worker mechanisms only for lightweight terminal worker or researcher assignments"
+    ));
+    assert!(!child_a_prompt
+        .contains("Use Codex native SubAgent/delegated-worker mechanisms for worker assignments"));
+    assert!(child_a_prompt.contains(
+        "You must not use native SubAgent/delegated-worker mechanisms to bind, spawn, impersonate, or take over O1 or O2 roles"
+    ));
     assert!(child_a_prompt.contains("use the generated worker prompt template verbatim"));
     assert!(child_a_prompt
         .contains("preserve its six-line TERMINAL_WORKER role-prefix block with no preamble"));
     assert!(child_a_prompt.contains("If no delegated-worker mechanism is available"));
     assert!(child_a_prompt.contains("exact blocked worker task"));
-    assert!(child_a_prompt
-        .contains("O2 supervisor -> O1 child orchestrator -> terminal worker/researcher"));
+    assert!(child_a_prompt.contains(
+        "user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor"
+    ));
+    assert!(child_a_prompt.contains("Durable role names are canonical"));
+    assert!(child_a_prompt.contains(
+        "Runtime labels belong in runtime bridge metadata such as AGENT_LABEL, never in ROLE"
+    ));
+    assert!(!child_a_prompt.contains("ROLE: expert-coder"));
+    assert!(child_a_prompt.contains("You may collect advisory child-side review-auditor evidence"));
+    assert!(child_a_prompt.contains("six-line REVIEW_AUDITOR role-prefix block"));
+    assert!(child_a_prompt.contains(
+        "Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles"
+    ));
+    assert!(child_a_prompt.contains(
+        "a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate"
+    ));
+    assert!(child_a_prompt.contains("audit_reports"));
+    assert!(child_a_prompt.contains("AuditorReport JSON"));
+    assert!(child_a_prompt.contains("auditor-report.schema.json"));
     assert!(child_a_prompt.contains("You must not spawn, impersonate, or take over a peer O2"));
-    assert!(child_a_prompt.contains("top O2/supervisor may launch peer O2 supervisors"));
-    assert!(child_a_prompt.contains("Report such escalation candidates"));
+    assert!(child_a_prompt.contains("O1 reports peer-O2 escalation candidates upward"));
+    assert!(child_a_prompt.contains(
+        "user-root O2 or an autonomous O2 durable queue may launch bounded peer O2 supervisors through MACO/Codex CLI subprocess orchestration"
+    ));
+    assert!(child_a_prompt.contains(
+        "Autonomous O2-to-O2 follow-up must go through durable queue state such as NEXT_O2_TASKS.tsv, not native SubAgent"
+    ));
+    assert!(child_a_prompt.contains(
+        "You were launched as a Codex CLI subprocess with this O1/O2 orchestration boundary:"
+    ));
+    assert!(child_a_prompt.contains("- --sandbox danger-full-access"));
+    assert!(child_a_prompt.contains("- --enable goals"));
+    assert!(child_a_prompt.contains("- --enable multi_agent"));
+    assert!(child_a_prompt.contains(
+        "Nested O2/O1 subprocess chains must preserve this boundary for orchestrator roles"
+    ));
+    assert!(child_a_prompt.contains("Do not use workspace-write for O2/O1 subprocess chains"));
+    assert!(child_a_prompt.contains(
+        "nested Codex state DB access can collide, corrupt, or fail under workspace-write style restrictions"
+    ));
+    assert!(!child_a_prompt
+        .contains("The top O2/supervisor may launch peer O2 supervisors as parallel scopes"));
+    assert!(child_a_prompt.contains("O1 reports peer-O2 escalation candidates upward"));
     assert!(child_a_prompt.contains("must not launch further workers"));
     assert!(child_a_prompt.contains("worker-report.schema.json"));
     assert!(
@@ -256,6 +370,75 @@ fn supervise_run_launches_two_fake_child_orchestrators_and_collects_reports() ->
         .as_object()
         .context("orchestrator properties")?
         .contains_key("worker_reports"));
+    assert!(orchestrator_schema["properties"]
+        .as_object()
+        .context("orchestrator properties")?
+        .contains_key("audit_reports"));
+    let nested_auditor_schema = &orchestrator_schema["properties"]["audit_reports"]["items"];
+    assert_object_schema_sealed(nested_auditor_schema, "nested auditor schema")?;
+    assert_string_const_schema_property(
+        nested_auditor_schema,
+        "nested auditor schema",
+        "role",
+        "auditor",
+    )?;
+    assert_boolean_const_schema_property(
+        nested_auditor_schema,
+        "nested auditor schema",
+        "no_further_delegation",
+        true,
+    )?;
+    assert_boolean_const_schema_property(
+        nested_auditor_schema,
+        "nested auditor schema",
+        "read_only",
+        true,
+    )?;
+    assert_string_enum_schema_property(
+        nested_auditor_schema,
+        "nested auditor schema",
+        "status",
+        &["pending", "succeeded", "failed", "rejected", "missing"],
+    )?;
+    assert_report_array_item_schemas(nested_auditor_schema, "nested auditor schema")?;
+    let auditor_schema: Value = serde_json::from_str(
+        &fs::read_to_string(
+            repo_path.join(".maco/o2/runs/supervise-two/schemas/auditor-report.schema.json"),
+        )
+        .context("read auditor schema")?,
+    )
+    .context("parse auditor schema")?;
+    assert_object_schema_sealed(&auditor_schema, "auditor schema")?;
+    assert_all_array_schemas_define_items(&auditor_schema, "auditor schema")?;
+    assert_string_const_schema_property(&auditor_schema, "auditor schema", "role", "auditor")?;
+    assert_boolean_const_schema_property(
+        &auditor_schema,
+        "auditor schema",
+        "no_further_delegation",
+        true,
+    )?;
+    assert_boolean_const_schema_property(&auditor_schema, "auditor schema", "read_only", true)?;
+    assert_report_array_item_schemas(&auditor_schema, "auditor schema")?;
+    let child_a_report: Value = serde_json::from_str(
+        &fs::read_to_string(repo_path.join(".maco/o2/runs/supervise-two/reports/child-a.json"))
+            .context("read gated child-a report")?,
+    )
+    .context("parse gated child-a report")?;
+    assert_eq!(
+        child_a_report["audit_reports"]
+            .as_array()
+            .context("gated audit reports")?
+            .len(),
+        1
+    );
+    assert_eq!(
+        child_a_report["audit_reports"][0]["id"],
+        "child-a-review-auditor"
+    );
+    assert_eq!(
+        child_a_report["audit_reports"][0]["reviewed_worker_ids"][0],
+        "worker-a"
+    );
 
     let status = run_success_json_args(&[
         "supervise",
@@ -595,6 +778,17 @@ fn supervise_run_rejects_missing_worker_reports_for_assigned_workers() -> Result
             .len(),
         0
     );
+    assert_eq!(
+        child_report["audit_reports"]
+            .as_array()
+            .context("audit reports")?
+            .len(),
+        0
+    );
+    assert_eq!(
+        report["commands_run"].as_array().context("commands")?.len(),
+        1
+    );
     assert_json_findings_contain_message(
         &child_report["findings"],
         "omitted required worker reports for assignment worker IDs: worker-omitted",
@@ -603,6 +797,351 @@ fn supervise_run_rejects_missing_worker_reports_for_assigned_workers() -> Result
         .as_str()
         .context("child risk")?
         .contains("missing terminal no-delegation attestations"));
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_skips_parent_auditor_when_child_report_is_unusable() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "skip parent auditor when child report is unusable",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-missing",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-missing-child", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-unusable-child-skips-parent-auditor",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(
+        report["commands_run"].as_array().context("commands")?.len(),
+        1
+    );
+    let child_report = &report["orchestrator_reports"][0];
+    assert_eq!(child_report["status"], "failed");
+    assert_eq!(
+        child_report["worker_reports"]
+            .as_array()
+            .context("worker reports")?
+            .len(),
+        0
+    );
+    assert_eq!(
+        child_report["audit_reports"]
+            .as_array()
+            .context("audit reports")?
+            .len(),
+        0
+    );
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "required child report is missing or invalid",
+    )?;
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "omitted required worker reports for assignment worker IDs: worker-missing-child",
+    )?;
+    assert!(!repo_path
+        .join(
+            ".maco/o2/runs/supervise-unusable-child-skips-parent-auditor/logs/child-missing-review-auditor.jsonl"
+        )
+        .exists());
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_missing_parent_auditor_report_for_assigned_workers() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "reject missing parent auditor report",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-auditor-missing",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-auditor-missing", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-missing-parent-auditor-report",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    let child_report = &report["orchestrator_reports"][0];
+    assert_eq!(child_report["status"], "failed");
+    assert_eq!(child_report["accepted"], false);
+    assert_eq!(child_report["rejected"], true);
+    assert_eq!(
+        child_report["audit_reports"]
+            .as_array()
+            .context("audit reports")?
+            .len(),
+        1
+    );
+    assert_eq!(child_report["audit_reports"][0]["status"], "failed");
+    assert_json_findings_contain_message(
+        &child_report["audit_reports"][0]["findings"],
+        "required parent-launched auditor report is missing or invalid",
+    )?;
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "lacks accepted parent-launched review auditor report",
+    )?;
+    assert!(child_report["remaining_risk"]
+        .as_str()
+        .context("child risk")?
+        .contains("terminal review-auditor evidence"));
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_invalid_auditor_report_for_assigned_workers() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "reject invalid auditor reports",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-invalid-auditor",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-invalid-auditor", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-invalid-parent-auditor-report",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    let child_report = &report["orchestrator_reports"][0];
+    assert_eq!(child_report["status"], "failed");
+    assert_eq!(child_report["accepted"], false);
+    assert_eq!(child_report["rejected"], true);
+    let auditor_report = &child_report["audit_reports"][0];
+    assert_eq!(auditor_report["status"], "failed");
+    assert_eq!(auditor_report["accepted"], false);
+    assert_eq!(auditor_report["rejected"], true);
+    assert_eq!(
+        auditor_report["reviewed_worker_ids"][0],
+        "worker-invalid-auditor"
+    );
+    assert_json_findings_contain_message(
+        &auditor_report["findings"],
+        "auditor report omitted reviewed_paths evidence",
+    )?;
+    assert_json_findings_contain_message(
+        &auditor_report["findings"],
+        "auditor report omitted remaining_risk evidence",
+    )?;
+    assert_json_findings_contain_message(
+        &auditor_report["findings"],
+        "auditor report omitted next_safe_action evidence",
+    )?;
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "included invalid review auditor reports: child-invalid-auditor-review-auditor",
+    )?;
+    assert!(child_report["remaining_risk"]
+        .as_str()
+        .context("child risk")?
+        .contains("terminal review-auditor evidence"));
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_parent_auditor_path_coverage_mismatch() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "reject auditor path coverage mismatch",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-auditor-path-mismatch",
+              "assigned_paths": ["src/lib.rs"],
+              "worker_assignments": [
+                {"id": "worker-auditor-path-mismatch", "assigned_paths": ["src/lib.rs"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-auditor-path-mismatch",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    let child_report = &report["orchestrator_reports"][0];
+    let auditor_report = &child_report["audit_reports"][0];
+    assert_eq!(auditor_report["status"], "failed");
+    assert_eq!(auditor_report["accepted"], false);
+    assert_json_findings_contain_message(
+        &auditor_report["findings"],
+        "parent auditor reviewed_paths omitted required assignment/change path coverage for: src/lib.rs",
+    )?;
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "lacks accepted parent-launched review auditor report",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_parent_auditor_missing_schema_required_evidence() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "reject auditor missing schema evidence",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-auditor-evidence-missing",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-auditor-evidence-missing", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-auditor-missing-schema-evidence",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    let child_report = &report["orchestrator_reports"][0];
+    let auditor_report = &child_report["audit_reports"][0];
+    assert_eq!(auditor_report["status"], "failed");
+    assert_eq!(auditor_report["accepted"], false);
+    assert_eq!(
+        auditor_report["commands_run"]
+            .as_array()
+            .context("parent auditor command evidence")?
+            .len(),
+        1
+    );
+    assert_json_findings_contain_message(
+        &auditor_report["findings"],
+        "auditor report omitted validation_results evidence",
+    )?;
+    assert_json_findings_contain_message(
+        &child_report["findings"],
+        "included invalid review auditor reports: child-auditor-evidence-missing-review-auditor",
+    )?;
 
     Ok(())
 }
@@ -1102,12 +1641,47 @@ fn supervise_plan_accepts_new_child_assignment_name_and_legacy_alias() -> Result
 #[test]
 fn supervise_readme_documents_o2_o1_contract_without_worker_fallback() -> Result<()> {
     let readme = fs::read_to_string("README.md").context("read README")?;
+    let readme_words = readme.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    assert!(readme.contains("O2 supervisor -> O1 child orchestrator -> terminal worker/researcher"));
+    assert!(readme_words.contains(
+        "user-directed root O2 -> autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor"
+    ));
+    assert!(readme.contains("human/user-directed root O2"));
+    assert!(readme_words.contains("not counted against autonomous depth"));
+    assert!(readme.contains("NEXT_O2_TASKS.tsv"));
+    assert!(readme.contains("STATE.tsv"));
+    assert!(readme.contains("HEARTBEAT.tsv"));
+    assert!(readme.contains("ROLE: REVIEW_AUDITOR"));
+    assert!(readme.contains("audit_reports"));
+    assert!(readme_words.contains("Native SubAgent/delegated-worker use is limited to lightweight"));
+    assert!(readme_words
+        .contains("terminal worker and researcher roles; O1 child orchestrators must not bind O1"));
+    assert!(readme.contains("or O2 roles to native SubAgent sessions"));
+    assert!(readme_words.contains("instead of taking those scopes over"));
+    assert!(readme_words.contains(
+        "user-root O2 or an autonomous O2 durable queue may then launch bounded peer O2 supervisors"
+    ));
+    assert!(readme_words.contains("runtime labels belong in the runtime bridge and `AGENT_LABEL`"));
+    assert!(!readme.contains("ROLE: expert-coder"));
+    assert!(readme.contains("O1/O2 subprocess orchestration uses a Codex CLI launch boundary"));
+    assert!(readme.contains("`--sandbox danger-full-access`, `--enable goals`, and"));
+    assert!(readme.contains("`--enable multi_agent`"));
+    assert!(readme_words.contains(
+        "Nested O2/O1 subprocess chains must preserve that boundary for orchestrator roles"
+    ));
+    assert!(readme.contains("Do not use `workspace-write` for O2/O1 subprocess chains"));
+    assert!(readme_words.contains(
+        "nested Codex state DB access can collide, corrupt, or fail under workspace-write style restrictions"
+    ));
+    assert!(readme.contains("leave O1/O2 hierarchy and"));
+    assert!(readme_words.contains("enforced audit gates to MACO/Codex CLI subprocess workflows"));
+    assert!(readme_words.contains(
+        "A child-side review auditor is advisory unless the parent MACO/O2 acceptance gate collects and accepts it"
+    ));
     assert!(readme.contains("peer O2 supervisors"));
     assert!(readme.contains("report peer-O2 escalation"));
-    assert!(readme.contains("report escalation"));
     assert!(!readme.contains("command-backed worker execution is fallback behavior"));
+    assert!(!readme.contains("SubAgent/delegated-worker mechanisms when available so the project"));
 
     Ok(())
 }
@@ -1158,18 +1732,15 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
         &[
             "command",
             "cwd",
+            "exit_code",
             "status",
             "timeout_seconds",
             "duration_ms",
             "timed_out",
             "stdout",
             "stderr",
+            "error",
         ],
-    )?;
-    assert_schema_required_excludes(
-        command_items,
-        &format!("{label}.commands_run items"),
-        &["exit_code", "error"],
     )?;
     let command = schema_property(
         command_items,
@@ -1196,12 +1767,7 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
     assert_schema_required_contains(
         validation_items,
         &format!("{label}.validation_results items"),
-        &["name", "status", "command"],
-    )?;
-    assert_schema_required_excludes(
-        validation_items,
-        &format!("{label}.validation_results items"),
-        &["message"],
+        &["name", "status", "command", "message"],
     )?;
     let validation_command = schema_property(
         validation_items,
@@ -1232,7 +1798,7 @@ fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
 }
 
 fn assert_report_token_schemas(schema: &Value, label: &str) -> Result<()> {
-    assert_schema_required_excludes(schema, label, &["claim_token", "semantic_intent_token"])?;
+    assert_schema_required_contains(schema, label, &["claim_token", "semantic_intent_token"])?;
     assert_integer_nullable_schema_property(schema, label, "claim_token")?;
     assert_integer_nullable_schema_property(schema, label, "semantic_intent_token")?;
     Ok(())
@@ -1279,6 +1845,24 @@ fn assert_object_schema_sealed(schema: &Value, label: &str) -> Result<()> {
     if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
         anyhow::bail!("{label} must set additionalProperties to false: {schema:?}");
     }
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .with_context(|| format!("{label} must define properties: {schema:?}"))?;
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} must define required fields: {schema:?}"))?;
+    for property in properties.keys() {
+        if !required
+            .iter()
+            .any(|value| value.as_str() == Some(property.as_str()))
+        {
+            anyhow::bail!(
+                "{label} required fields must include property {property:?}: {required:?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1297,23 +1881,6 @@ fn assert_schema_required_contains(
             .any(|value| value.as_str() == Some(*expected))
         {
             anyhow::bail!("{label} required fields must include {expected:?}: {required:?}");
-        }
-    }
-    Ok(())
-}
-
-fn assert_schema_required_excludes(
-    schema: &Value,
-    label: &str,
-    expected_absent: &[&str],
-) -> Result<()> {
-    let required = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .with_context(|| format!("{label} must define required fields: {schema:?}"))?;
-    for absent in expected_absent {
-        if required.iter().any(|value| value.as_str() == Some(*absent)) {
-            anyhow::bail!("{label} required fields must not include {absent:?}: {required:?}");
         }
     }
     Ok(())
@@ -1491,11 +2058,14 @@ fn write_fake_codex(root: &Path) -> Result<std::path::PathBuf> {
 set -eu
 report=
 worktree=
+sandbox_mode=
 json_seen=false
+goals_seen=false
 multi_agent_seen=false
 prompt_arg=
 no_further_delegation=true
 worker_reports_json=
+audit_reports_json=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     exec)
@@ -1509,13 +2079,22 @@ while [ "$#" -gt 0 ]; do
       report="$2"
       shift 2
       ;;
-    --output-schema|--sandbox|-c)
+    --sandbox)
+      sandbox_mode="$2"
+      shift 2
+      ;;
+    --output-schema|-c)
       shift 2
       ;;
     --enable)
-      if [ "$2" = "multi_agent" ]; then
-        multi_agent_seen=true
-      fi
+      case "$2" in
+        goals)
+          goals_seen=true
+          ;;
+        multi_agent)
+          multi_agent_seen=true
+          ;;
+      esac
       shift 2
       ;;
     --cd)
@@ -1534,6 +2113,10 @@ while [ "$#" -gt 0 ]; do
 done
 if [ "$json_seen" != "true" ]; then
   echo "missing --json flag" >&2
+  exit 64
+fi
+if [ "$goals_seen" != "true" ]; then
+  echo "missing --enable goals flag" >&2
   exit 64
 fi
 if [ "$multi_agent_seen" != "true" ]; then
@@ -1555,7 +2138,7 @@ case "$prompt_body" in
 esac
 name="$(basename "$report" .json)"
 expected_o1_prefix="ROLE: O1_CHILD_ORCHESTRATOR
-AGENT_KIND: orchestrator
+AGENT_KIND: child_orchestrator
 AGENT_LABEL: $name
 PARENT_THREAD_ID: none
 THREAD_DEPTH: 1
@@ -1568,10 +2151,131 @@ case "$prompt_body" in
     o1_role_prefix=false
     ;;
 esac
+expected_auditor_prefix="ROLE: REVIEW_AUDITOR
+AGENT_KIND: auditor
+AGENT_LABEL: $name
+PARENT_THREAD_ID: none
+THREAD_DEPTH: 2
+NO_FURTHER_DELEGATION: true"
+case "$prompt_body" in
+  "$expected_auditor_prefix"*)
+    auditor_role_prefix=true
+    ;;
+  *)
+    auditor_role_prefix=false
+    ;;
+esac
 mkdir -p "$(dirname "$report")"
-printf '{"event":"fake-start","worktree":"%s","prompt_from_stdin":%s,"multi_agent":%s,"o1_role_prefix":%s}\n' "$worktree" "$prompt_from_stdin" "$multi_agent_seen" "$o1_role_prefix"
+printf '{"event":"fake-start","worktree":"%s","prompt_from_stdin":%s,"goals":%s,"multi_agent":%s,"o1_role_prefix":%s,"auditor_role_prefix":%s,"sandbox":"%s"}\n' "$worktree" "$prompt_from_stdin" "$goals_seen" "$multi_agent_seen" "$o1_role_prefix" "$auditor_role_prefix" "$sandbox_mode"
 edit=true
 files_changed_json=
+if [ "$auditor_role_prefix" = "true" ]; then
+  child_name="$name"
+  case "$child_name" in
+    *-review-auditor)
+      child_name="${child_name%-review-auditor}"
+      ;;
+  esac
+  case "$child_name" in
+    child-b)
+      path="src/lib.rs"
+      worker="worker-b"
+      ;;
+    child-auditor-missing)
+      path="README.md"
+      worker="worker-auditor-missing"
+      ;;
+    child-invalid-auditor)
+      path="README.md"
+      worker="worker-invalid-auditor"
+      ;;
+    child-auditor-path-mismatch)
+      path="README.md"
+      worker="worker-auditor-path-mismatch"
+      ;;
+    child-auditor-evidence-missing)
+      path="README.md"
+      worker="worker-auditor-evidence-missing"
+      ;;
+    child-fail)
+      path="README.md"
+      worker="worker-fail"
+      ;;
+    child-delegated)
+      path="README.md"
+      worker="worker-delegated"
+      ;;
+    child-omits-workers)
+      path="README.md"
+      worker="worker-omitted"
+      ;;
+    *)
+      path="README.md"
+      worker="worker-a"
+      ;;
+  esac
+  if [ "$name" = "child-auditor-missing-review-auditor" ]; then
+    exit 0
+  fi
+  if [ "$name" = "child-invalid-auditor-review-auditor" ]; then
+    cat > "$report" <<JSON
+{
+  "id": "$name",
+  "role": "auditor",
+  "reviewed_worker_ids": ["$worker"],
+  "commands_run": [],
+  "validation_results": [],
+  "findings": [],
+  "no_further_delegation": true,
+  "read_only": true,
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded"
+}
+JSON
+    exit 0
+  fi
+  if [ "$name" = "child-auditor-evidence-missing-review-auditor" ]; then
+    cat > "$report" <<JSON
+{
+  "id": "$name",
+  "role": "auditor",
+  "reviewed_worker_ids": ["$worker"],
+  "reviewed_paths": ["$path"],
+  "findings": [],
+  "no_further_delegation": true,
+  "read_only": true,
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded",
+  "remaining_risk": "none",
+  "next_safe_action": "review audited diff"
+}
+JSON
+    exit 0
+  fi
+  cat > "$report" <<JSON
+{
+  "id": "$name",
+  "role": "auditor",
+  "reviewed_worker_ids": ["$worker"],
+  "reviewed_paths": ["$path"],
+  "commands_run": [],
+  "validation_results": [
+    {"name": "fake parent auditor validation", "status": "succeeded", "command": [], "message": null}
+  ],
+  "findings": [],
+  "no_further_delegation": true,
+  "read_only": true,
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded",
+  "remaining_risk": "none",
+  "next_safe_action": "review audited diff"
+}
+JSON
+  exit 0
+fi
 case "$name" in
   child-b)
     path="src/lib.rs"
@@ -1599,6 +2303,26 @@ case "$name" in
     edit_path="README.md"
     worker="worker-omitted"
     worker_reports_json='[]'
+    ;;
+  child-auditor-missing)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-auditor-missing"
+    ;;
+  child-invalid-auditor)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-invalid-auditor"
+    ;;
+  child-auditor-path-mismatch)
+    path="src/lib.rs"
+    edit_path="src/lib.rs"
+    worker="worker-auditor-path-mismatch"
+    ;;
+  child-auditor-evidence-missing)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-auditor-evidence-missing"
     ;;
   child-omits-assigned)
     path="README.md"
@@ -1673,6 +2397,9 @@ if [ -z "$worker_reports_json" ]; then
 JSON
 )
 fi
+if [ -z "$audit_reports_json" ]; then
+  audit_reports_json='[]'
+fi
 cat > "$report" <<JSON
 {
   "id": "$name",
@@ -1687,6 +2414,7 @@ cat > "$report" <<JSON
   ],
   "findings": [],
   "worker_reports": $worker_reports_json,
+  "audit_reports": $audit_reports_json,
   "accepted": $accepted,
   "rejected": $rejected,
   "status": "$status",

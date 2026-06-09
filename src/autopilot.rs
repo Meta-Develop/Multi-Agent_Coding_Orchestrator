@@ -1131,6 +1131,34 @@ paths_file="$(dirname "$report")/$name.assigned-paths"
 cat > "$paths_file" <<'PATHS'
 {paths_text}
 PATHS
+if [ "${{name%-review-auditor}}" != "$name" ]; then
+  case "$prompt_body" in
+    "ROLE: REVIEW_AUDITOR"*)
+      child_name="${{name%-review-auditor}}"
+      cat > "$report" <<JSON
+{{
+  "id": "$name",
+  "role": "auditor",
+  "reviewed_worker_ids": ["$child_name-worker"],
+  "reviewed_paths": $assigned_paths_json,
+  "commands_run": [],
+  "validation_results": [
+    {{"name": "fake parent auditor validation", "status": "succeeded", "command": [], "message": null}}
+  ],
+  "findings": [],
+  "no_further_delegation": true,
+  "read_only": true,
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded",
+  "remaining_risk": "none",
+  "next_safe_action": "review fake autopilot diff"
+}}
+JSON
+      exit 0
+      ;;
+  esac
+fi
 while IFS= read -r relpath; do
   [ -n "$relpath" ] || continue
   target="$worktree/$relpath"

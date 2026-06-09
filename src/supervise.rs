@@ -95,6 +95,7 @@ pub enum AgentRole {
     Supervisor,
     ChildOrchestrator,
     Worker,
+    Auditor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -131,6 +132,33 @@ pub struct WorkerReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AuditorReport {
+    pub id: String,
+    pub role: AgentRole,
+    #[serde(default)]
+    pub reviewed_worker_ids: Vec<String>,
+    #[serde(default)]
+    pub reviewed_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub commands_run: Vec<CommandRunRecord>,
+    #[serde(default)]
+    pub validation_results: Vec<ValidationResult>,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_further_delegation: Option<bool>,
+    #[serde(default)]
+    pub read_only: bool,
+    pub accepted: bool,
+    pub rejected: bool,
+    pub status: ReviewStatus,
+    #[serde(default)]
+    pub remaining_risk: String,
+    #[serde(default)]
+    pub next_safe_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorReviewReport {
     pub id: String,
     pub role: AgentRole,
@@ -154,6 +182,8 @@ pub struct OrchestratorReviewReport {
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub worker_reports: Vec<WorkerReport>,
+    #[serde(default)]
+    pub audit_reports: Vec<AuditorReport>,
     pub accepted: bool,
     pub rejected: bool,
     pub status: ReviewStatus,
@@ -287,6 +317,7 @@ pub struct ChildOrchestratorPromptContext<'a> {
     pub report_path: &'a Path,
     pub schema_path: &'a Path,
     pub worker_schema_path: &'a Path,
+    pub auditor_schema_path: &'a Path,
     pub claim_context: ChildPromptClaimContext<'a>,
 }
 
@@ -398,6 +429,7 @@ pub enum SupervisePromptRole {
     O1ChildOrchestrator,
     TerminalWorker,
     Researcher,
+    ReviewAuditor,
 }
 
 impl SupervisePromptRole {
@@ -407,14 +439,17 @@ impl SupervisePromptRole {
             Self::O1ChildOrchestrator => "O1_CHILD_ORCHESTRATOR",
             Self::TerminalWorker => "TERMINAL_WORKER",
             Self::Researcher => "RESEARCHER",
+            Self::ReviewAuditor => "REVIEW_AUDITOR",
         }
     }
 
     fn agent_kind(self) -> &'static str {
         match self {
-            Self::O2TopSupervisor | Self::O1ChildOrchestrator => "orchestrator",
+            Self::O2TopSupervisor => "orchestrator",
+            Self::O1ChildOrchestrator => "child_orchestrator",
             Self::TerminalWorker => "worker",
             Self::Researcher => "researcher",
+            Self::ReviewAuditor => "auditor",
         }
     }
 
@@ -422,14 +457,14 @@ impl SupervisePromptRole {
         match self {
             Self::O2TopSupervisor => 0,
             Self::O1ChildOrchestrator => 1,
-            Self::TerminalWorker | Self::Researcher => 2,
+            Self::TerminalWorker | Self::Researcher | Self::ReviewAuditor => 2,
         }
     }
 
     fn no_further_delegation(self) -> bool {
         match self {
             Self::O2TopSupervisor | Self::O1ChildOrchestrator => false,
-            Self::TerminalWorker | Self::Researcher => true,
+            Self::TerminalWorker | Self::Researcher | Self::ReviewAuditor => true,
         }
     }
 }
@@ -459,6 +494,7 @@ pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) ->
         report_path,
         schema_path,
         worker_schema_path,
+        auditor_schema_path,
         claim_context,
     } = context;
     let assignment_json = serde_json::to_string_pretty(assignment)
@@ -469,6 +505,7 @@ pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) ->
         .map(|worker| worker_prompt(plan, assignment, worker, run_dir, worker_schema_path))
         .collect::<Result<Vec<_>>>()?
         .join("\n\n--- worker prompt contract ---\n\n");
+    let auditor_prompt = review_auditor_prompt(plan, assignment, run_dir, auditor_schema_path)?;
     let role_prefix = supervise_role_prefix(
         SupervisePromptRole::O1ChildOrchestrator,
         &assignment.id,
@@ -489,20 +526,37 @@ Ownership:
 - Semantic intent token: {semantic_intent_token}
 
 Runtime hierarchy:
-- Current supervise run contract: O2 supervisor -> O1 child orchestrator -> terminal worker/researcher.
+- Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 - You are the O1 child orchestrator for this assignment.
-- Workers and researchers are terminal: they must not launch further workers, delegate to another worker, or take over peer coordination.
+- Workers, researchers, and review auditors are terminal: they must not launch further workers, delegate to another worker, or take over peer coordination.
+- You must not use native SubAgent/delegated-worker mechanisms to bind, spawn, impersonate, or take over O1 or O2 roles.
+- Durable role names are canonical. Runtime labels belong in runtime bridge metadata such as AGENT_LABEL, never in ROLE.
 - You must not spawn, impersonate, or take over a peer O2 supervisor.
-- The top O2/supervisor may launch peer O2 supervisors as parallel scopes for newly discovered large cross-cutting problems. Report such escalation candidates in findings and remaining_risk instead of taking them over.
+- O1 reports peer-O2 escalation candidates upward in findings and remaining_risk instead of taking them over.
+- The user-root O2 or an autonomous O2 durable queue may launch bounded peer O2 supervisors through MACO/Codex CLI subprocess orchestration. Autonomous O2-to-O2 follow-up must go through durable queue state such as NEXT_O2_TASKS.tsv, not native SubAgent.
+
+Runtime boundary:
+- You were launched as a Codex CLI subprocess with this O1/O2 orchestration boundary:
+  - --sandbox danger-full-access
+  - --enable goals
+  - --enable multi_agent
+- Nested O2/O1 subprocess chains must preserve this boundary for orchestrator roles.
+- Do not use workspace-write for O2/O1 subprocess chains because nested Codex state DB access can collide, corrupt, or fail under workspace-write style restrictions.
 
 Required behavior:
 - First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
-- Use Codex native SubAgent/delegated-worker mechanisms for worker assignments when available, following AGENTS.md and .agents instructions.
+- Use Codex native SubAgent/delegated-worker mechanisms only for lightweight terminal worker or researcher assignments when available, following AGENTS.md and .agents instructions.
 - When launching a worker, use the generated worker prompt template verbatim and preserve its six-line TERMINAL_WORKER role-prefix block with no preamble.
+- You may collect advisory child-side review-auditor evidence with the generated REVIEW_AUDITOR prompt template, but it is not an acceptance gate unless MACO/O2 collects it through the parent-enforced gate.
+- When collecting advisory child-side review-auditor evidence, preserve its six-line REVIEW_AUDITOR role-prefix block with no preamble.
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
 - If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
+- Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
+- Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
+- Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
 - Review every WorkerReport before writing your own OrchestratorReviewReport.
+- Include at least one accepted review-auditor report in audit_reports that covers all assigned worker ids; MACO rejects child reports with worker assignments that omit terminal audit evidence.
 
 Safety requirements:
 - Do not edit outside the assigned paths, symbols, or modules.
@@ -515,6 +569,8 @@ Safety requirements:
 {schema_path}
 - Worker reports must use this schema path:
 {worker_schema_path}
+- Review auditor reports must use this schema path:
+{auditor_schema_path}
 
 Supervisor task:
 {task}
@@ -524,6 +580,9 @@ Orchestrator assignment JSON:
 
 Worker prompt templates:
 {worker_prompts}
+
+Review auditor prompt template:
+{auditor_prompt}
 "#,
         role_prefix = role_prefix,
         worktree_path = worktree.path.display(),
@@ -539,9 +598,11 @@ Worker prompt templates:
         report_path = report_path.display(),
         schema_path = schema_path.display(),
         worker_schema_path = worker_schema_path.display(),
+        auditor_schema_path = auditor_schema_path.display(),
         task = plan.task,
         assignment_json = assignment_json,
         worker_prompts = worker_prompts,
+        auditor_prompt = auditor_prompt,
     ))
 }
 
@@ -557,7 +618,7 @@ pub fn worker_prompt(
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     Ok(format!(
         r#"{role_prefix}You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
-Current supervise run contract: O2 supervisor -> O1 child orchestrator -> terminal worker/researcher.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 Your parent is child orchestrator `{orchestrator_id}`. You are not the supervisor.
 Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
 
@@ -575,7 +636,7 @@ Rules:
 - Run validation or record why validation was not run.
 - Return WorkerReport JSON in your final response with changed files, commands run, validation results, findings, remaining risk, and next safe action.
 - Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
-- If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over.
+- If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over. O2-to-O2 follow-up belongs to the user-root O2 or autonomous O2 durable queue, not this terminal role.
 - Only write a report file when an explicit report_path is assigned.
 - If the explicit report path is <none>, do not write any report file; only return WorkerReport JSON in your final response.
 - Use the worker report schema path: {schema_path}
@@ -601,6 +662,144 @@ Worker assignment JSON:
         schema_path = schema_path.display(),
         task = worker.task.as_deref().unwrap_or(&plan.task),
         worker_json = worker_json,
+    ))
+}
+
+pub fn review_auditor_prompt(
+    plan: &SupervisorPlan,
+    orchestrator: &OrchestratorAssignment,
+    run_dir: &Path,
+    schema_path: &Path,
+) -> Result<String> {
+    let worker_ids = orchestrator
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let auditor_id = format!("{}-review-auditor", orchestrator.id);
+    let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
+    Ok(format!(
+        r#"{role_prefix}You are a terminal read-only review auditor in an opt-in local Codex CLI supervised run.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
+Your parent is child orchestrator `{orchestrator_id}`. You are not an O1 child orchestrator, O2 supervisor, worker, or peer coordinator.
+Do not launch further workers, delegate, mutate files, run mutating commands, or spawn/impersonate O1 or O2 roles.
+
+Ownership:
+- Review auditor id: {auditor_id}
+- Assigned worker ids to audit: {worker_ids}
+- Assigned paths to review: {assigned_paths}
+- Semantic symbols: {semantic_symbols}
+- Semantic modules: {semantic_modules}
+- Run artifact root: {run_dir}
+
+Rules:
+- Stay read-only. Inspect worker reports, child diffs, validation evidence, findings, remaining risk, and claimed path boundaries.
+- Do not edit files, create durable artifacts, apply patches, claim paths, or change Git state.
+- Produce structured AuditorReport JSON in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action.
+- Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
+- Include "read_only": true in AuditorReport JSON to attest this audit stayed read-only.
+- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
+- Use the auditor report schema path: {schema_path}
+
+Supervisor task:
+{task}
+"#,
+        role_prefix = role_prefix,
+        orchestrator_id = orchestrator.id,
+        auditor_id = auditor_id,
+        worker_ids = if worker_ids.is_empty() {
+            "<none>".to_string()
+        } else {
+            worker_ids
+        },
+        assigned_paths = display_paths(&orchestrator.assigned_paths),
+        semantic_symbols = orchestrator.semantic_symbols.join(", "),
+        semantic_modules = orchestrator.semantic_modules.join(", "),
+        run_dir = run_dir.display(),
+        schema_path = schema_path.display(),
+        task = plan.task,
+    ))
+}
+
+struct ParentReviewAuditorPromptContext<'a> {
+    plan: &'a SupervisorPlan,
+    assignment: &'a OrchestratorAssignment,
+    run_dir: &'a Path,
+    worktree_path: &'a Path,
+    child_report_path: &'a Path,
+    auditor_report_path: &'a Path,
+    schema_path: &'a Path,
+    child_report: &'a OrchestratorReviewReport,
+}
+
+fn parent_review_auditor_prompt(context: ParentReviewAuditorPromptContext<'_>) -> Result<String> {
+    let ParentReviewAuditorPromptContext {
+        plan,
+        assignment,
+        run_dir,
+        worktree_path,
+        child_report_path,
+        auditor_report_path,
+        schema_path,
+        child_report,
+    } = context;
+    let auditor_id = parent_auditor_id(assignment);
+    let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
+    let child_report_json = serde_json::to_string_pretty(child_report)
+        .context("failed to serialize child report for auditor prompt")?;
+    Ok(format!(
+        r#"{role_prefix}You are the parent-launched read-only review auditor in an opt-in local Codex CLI supervised run.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher, plus this parent-enforced terminal REVIEW_AUDITOR gate.
+Your parent is MACO/O2. You are not an O1 child orchestrator, worker, researcher, or peer coordinator.
+Do not launch further workers, delegate, mutate files, run mutating commands, claim paths, apply patches, or change Git state.
+
+Runtime boundary:
+- MACO requested the Codex CLI read-only sandbox for this subprocess with --sandbox read-only.
+- Stay read-only even if the local runtime cannot enforce stronger filesystem isolation.
+- Return AuditorReport JSON as your final response. Codex CLI --output-last-message records that final response at the auditor report path.
+
+Evidence to review:
+- Supervisor task: {task}
+- Child assignment id: {assignment_id}
+- Child worktree path: {worktree_path}
+- Run artifact root: {run_dir}
+- Child report path: {child_report_path}
+- Parent auditor report path: {auditor_report_path}
+- Auditor report schema path: {schema_path}
+- Assigned worker ids: {worker_ids}
+- Assigned paths: {assigned_paths}
+- Child-reported and supervisor-inspected changed paths: {changed_paths}
+
+Review requirements:
+- Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
+- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence.
+- Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
+- Set role="auditor", no_further_delegation=true, read_only=true.
+- Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
+- Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
+
+Child report JSON:
+{child_report_json}
+"#,
+        role_prefix = role_prefix,
+        task = plan.task,
+        assignment_id = assignment.id,
+        worktree_path = worktree_path.display(),
+        run_dir = run_dir.display(),
+        child_report_path = child_report_path.display(),
+        auditor_report_path = auditor_report_path.display(),
+        schema_path = schema_path.display(),
+        worker_ids = display_strings(
+            &assignment
+                .worker_assignments
+                .iter()
+                .map(|worker| worker.id.clone())
+                .collect::<Vec<_>>()
+        ),
+        assigned_paths = display_paths(&assignment.assigned_paths),
+        changed_paths = display_paths(&child_report.files_changed),
+        child_report_json = child_report_json,
     ))
 }
 
@@ -631,6 +830,7 @@ fn run_supervisor_plan(
         write_plan_snapshot(&dirs.assignments.join("supervisor-plan.json"), &plan)?;
         write_orchestrator_schema(&dirs.schemas.join("orchestrator-review-report.schema.json"))?;
         write_worker_schema(&dirs.schemas.join("worker-report.schema.json"))?;
+        write_auditor_schema(&dirs.schemas.join("auditor-report.schema.json"))?;
 
         let existing = manager
             .list()?
@@ -673,6 +873,7 @@ fn run_supervisor_plan(
             let log_path = dirs.logs.join(format!("{}.jsonl", assignment.id));
             let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
             let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+            let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
             let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
                 plan: &plan,
                 assignment,
@@ -681,6 +882,7 @@ fn run_supervisor_plan(
                 report_path: &report_path,
                 schema_path: &schema_path,
                 worker_schema_path: &worker_schema_path,
+                auditor_schema_path: &auditor_schema_path,
                 claim_context: ChildPromptClaimContext {
                     claim: &claim,
                     semantic_intent_token: semantic_token,
@@ -701,17 +903,73 @@ fn run_supervisor_plan(
 
             let external_run = run_external_agent(&command);
             command_records.push(command_record_from_external(&external_run));
-            let child_report = collect_child_report(
+            let mut child_report = collect_child_report(
                 assignment,
                 &report_path,
                 &external_run,
                 &worktree.path,
                 &primary_head,
             );
+            if !assignment.worker_assignments.is_empty() && !child_report.worker_reports.is_empty()
+            {
+                let auditor_id = parent_auditor_id(assignment);
+                let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
+                let auditor_report_path = dirs.reports.join(format!("{auditor_id}.json"));
+                let auditor_log_path = dirs.logs.join(format!("{auditor_id}.jsonl"));
+                let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+                let auditor_prompt =
+                    parent_review_auditor_prompt(ParentReviewAuditorPromptContext {
+                        plan: &plan,
+                        assignment,
+                        run_dir: &run_dir,
+                        worktree_path: &worktree.path,
+                        child_report_path: &report_path,
+                        auditor_report_path: &auditor_report_path,
+                        schema_path: &auditor_schema_path,
+                        child_report: &child_report,
+                    })?;
+                fs::write(&auditor_prompt_path, auditor_prompt).with_context(|| {
+                    format!(
+                        "failed to write auditor prompt {}",
+                        auditor_prompt_path.display()
+                    )
+                })?;
+
+                let mut auditor_command = ExternalAgentCommand::codex(
+                    &options.codex_bin,
+                    &worktree.path,
+                    &auditor_prompt_path,
+                    &auditor_log_path,
+                    &auditor_report_path,
+                    Duration::from_secs(plan.child_timeout_seconds),
+                );
+                auditor_command.output_schema = Some(auditor_schema_path);
+                auditor_command.sandbox_mode = "read-only".to_string();
+
+                let auditor_run = run_external_agent(&auditor_command);
+                let auditor_command_record = command_record_from_external(&auditor_run);
+                command_records.push(auditor_command_record.clone());
+                child_report.commands_run.push(auditor_command_record);
+                let auditor_report =
+                    collect_parent_auditor_report(assignment, &auditor_report_path, &auditor_run);
+                child_report.audit_reports.push(auditor_report);
+            }
+            validate_auditor_reports(assignment, &report_path, &mut child_report);
+            write_child_report(&report_path, &child_report)?;
             if child_report.status != ReviewStatus::Succeeded {
                 findings.push(Finding {
                     severity: FindingSeverity::Error,
                     message: format!("child orchestrator '{}' failed", assignment.id),
+                    paths: vec![report_path.clone()],
+                });
+            }
+            if child_report.audit_reports.iter().any(report_failed) {
+                findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: format!(
+                        "child orchestrator '{}' failed enforced parent review auditor gate",
+                        assignment.id
+                    ),
                     paths: vec![report_path.clone()],
                 });
             }
@@ -1067,6 +1325,259 @@ fn collect_child_report(
     report
 }
 
+fn collect_parent_auditor_report(
+    assignment: &OrchestratorAssignment,
+    report_path: &Path,
+    external_run: &ExternalAgentRun,
+) -> AuditorReport {
+    let expected_id = parent_auditor_id(assignment);
+    let mut report = match read_auditor_report(report_path) {
+        Ok(mut report) => {
+            if report.id != expected_id {
+                report.status = ReviewStatus::Failed;
+                report.accepted = false;
+                report.rejected = true;
+                report.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: format!(
+                        "parent auditor report id '{}' does not match expected '{}'",
+                        report.id, expected_id
+                    ),
+                    paths: vec![report_path.to_path_buf()],
+                });
+            }
+            if !external_run.succeeded() && report.status == ReviewStatus::Succeeded {
+                report.status = ReviewStatus::Failed;
+                report.accepted = false;
+                report.rejected = true;
+                report.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: "external parent review auditor process failed despite report success"
+                        .to_string(),
+                    paths: vec![report_path.to_path_buf()],
+                });
+            }
+            report
+        }
+        Err(error) => missing_parent_auditor_report(&expected_id, report_path, external_run, error),
+    };
+    report
+        .commands_run
+        .push(command_record_from_external(external_run));
+    report
+}
+
+fn validate_auditor_reports(
+    assignment: &OrchestratorAssignment,
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    if assignment.worker_assignments.is_empty() || report.worker_reports.is_empty() {
+        return;
+    }
+
+    let required_worker_ids = assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let required_parent_auditor_id = parent_auditor_id(assignment);
+    let required_reviewed_paths = required_auditor_review_paths(assignment, report);
+    let mut covered_worker_ids = BTreeSet::new();
+    let mut parent_auditor_accepted = false;
+    let mut invalid_auditors = Vec::new();
+
+    for audit_report in &mut report.audit_reports {
+        let mut valid = true;
+        let mut messages = Vec::new();
+        if audit_report.role != AgentRole::Auditor {
+            valid = false;
+            messages.push("auditor report role must be auditor".to_string());
+        }
+        if audit_report.no_further_delegation != Some(true) {
+            valid = false;
+            messages.push(match audit_report.no_further_delegation {
+                Some(false) => "auditor report indicates further delegation".to_string(),
+                None => "auditor report omitted no_further_delegation terminal-auditor attestation"
+                    .to_string(),
+                Some(true) => String::new(),
+            });
+        }
+        if !audit_report.read_only {
+            valid = false;
+            messages.push("auditor report omitted read_only review-only attestation".to_string());
+        }
+        if audit_report.reviewed_worker_ids.is_empty() {
+            valid = false;
+            messages.push("auditor report omitted reviewed_worker_ids evidence".to_string());
+        }
+        if audit_report.reviewed_paths.is_empty() {
+            valid = false;
+            messages.push("auditor report omitted reviewed_paths evidence".to_string());
+        }
+        if audit_report.commands_run.is_empty() {
+            valid = false;
+            messages.push("auditor report omitted commands_run evidence".to_string());
+        }
+        if audit_report.validation_results.is_empty() {
+            valid = false;
+            messages.push("auditor report omitted validation_results evidence".to_string());
+        }
+        if audit_report.remaining_risk.trim().is_empty() {
+            valid = false;
+            messages.push("auditor report omitted remaining_risk evidence".to_string());
+        }
+        if audit_report.next_safe_action.trim().is_empty() {
+            valid = false;
+            messages.push("auditor report omitted next_safe_action evidence".to_string());
+        }
+        if !audit_report.accepted
+            || audit_report.rejected
+            || audit_report.status != ReviewStatus::Succeeded
+        {
+            valid = false;
+            messages.push("auditor report was not accepted as succeeded".to_string());
+        }
+        if audit_report.id == required_parent_auditor_id {
+            match missing_auditor_review_paths(audit_report, &required_reviewed_paths) {
+                Ok(missing_paths) if missing_paths.is_empty() => {}
+                Ok(missing_paths) => {
+                    valid = false;
+                    messages.push(format!(
+                        "parent auditor reviewed_paths omitted required assignment/change path coverage for: {}",
+                        display_paths(&missing_paths)
+                    ));
+                }
+                Err(error) => {
+                    valid = false;
+                    messages.push(format!(
+                        "auditor report reviewed_paths are invalid: {error}"
+                    ));
+                }
+            }
+        }
+
+        if valid {
+            if audit_report.id == required_parent_auditor_id {
+                parent_auditor_accepted = true;
+            }
+            covered_worker_ids.extend(
+                audit_report
+                    .reviewed_worker_ids
+                    .iter()
+                    .filter(|id| required_worker_ids.contains(id.as_str()))
+                    .map(String::as_str),
+            );
+            continue;
+        }
+
+        audit_report.status = ReviewStatus::Failed;
+        audit_report.accepted = false;
+        audit_report.rejected = true;
+        for message in messages.into_iter().filter(|message| !message.is_empty()) {
+            audit_report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message,
+                paths: vec![report_path.to_path_buf()],
+            });
+        }
+        invalid_auditors.push(audit_report.id.clone());
+    }
+
+    let missing_worker_ids = required_worker_ids
+        .difference(&covered_worker_ids)
+        .map(|id| (*id).to_string())
+        .collect::<Vec<_>>();
+
+    if invalid_auditors.is_empty() && missing_worker_ids.is_empty() && parent_auditor_accepted {
+        return;
+    }
+
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+
+    if report.audit_reports.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' omitted required review auditor report for worker assignments",
+                report.id
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    } else if !missing_worker_ids.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' omitted accepted review auditor coverage for worker IDs: {}",
+                report.id,
+                missing_worker_ids.join(", ")
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+
+    if !parent_auditor_accepted {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' lacks accepted parent-launched review auditor report '{}'",
+                report.id, required_parent_auditor_id
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+
+    if !invalid_auditors.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' included invalid review auditor reports: {}",
+                report.id,
+                invalid_auditors.join(", ")
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+
+    report.remaining_risk =
+        "required terminal review-auditor evidence is missing or invalid".to_string();
+    report.next_safe_action =
+        "rerun the child scope with a read-only review auditor before finalizing".to_string();
+}
+
+fn required_auditor_review_paths(
+    assignment: &OrchestratorAssignment,
+    report: &OrchestratorReviewReport,
+) -> Vec<PathBuf> {
+    collapse_covered_paths(
+        assignment
+            .assigned_paths
+            .iter()
+            .chain(report.files_changed.iter())
+            .cloned()
+            .collect(),
+    )
+}
+
+fn missing_auditor_review_paths(
+    audit_report: &AuditorReport,
+    required_paths: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let reviewed_paths = normalize_paths(audit_report.reviewed_paths.clone())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(required_paths
+        .iter()
+        .filter(|required| {
+            !reviewed_paths
+                .iter()
+                .any(|reviewed| path_is_covered_by_claim(required, reviewed))
+        })
+        .cloned()
+        .collect())
+}
+
 fn validate_worker_report_delegation_attestations(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
@@ -1230,6 +1741,22 @@ fn read_child_report(path: &Path) -> Result<OrchestratorReviewReport> {
         .with_context(|| format!("failed to parse child report {}", path.display()))
 }
 
+fn write_child_report(path: &Path, report: &OrchestratorReviewReport) -> Result<()> {
+    let mut file = File::create(path)
+        .with_context(|| format!("failed to update child report {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, report)
+        .with_context(|| format!("failed to write updated child report {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to finish updated child report {}", path.display()))
+}
+
+fn read_auditor_report(path: &Path) -> Result<AuditorReport> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read auditor report {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse auditor report {}", path.display()))
+}
+
 fn missing_child_report(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
@@ -1253,11 +1780,43 @@ fn missing_child_report(
             paths: vec![report_path.to_path_buf()],
         }],
         worker_reports: Vec::new(),
+        audit_reports: Vec::new(),
         accepted: false,
         rejected: true,
         status: ReviewStatus::Missing,
         remaining_risk: "child orchestrator did not produce a usable report".to_string(),
         next_safe_action: "inspect child logs and rerun the failed assignment".to_string(),
+    }
+}
+
+fn missing_parent_auditor_report(
+    expected_id: &str,
+    report_path: &Path,
+    _external_run: &ExternalAgentRun,
+    error: anyhow::Error,
+) -> AuditorReport {
+    AuditorReport {
+        id: expected_id.to_string(),
+        role: AgentRole::Auditor,
+        reviewed_worker_ids: Vec::new(),
+        reviewed_paths: Vec::new(),
+        commands_run: Vec::new(),
+        validation_results: Vec::new(),
+        findings: vec![Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "required parent-launched auditor report is missing or invalid: {error}"
+            ),
+            paths: vec![report_path.to_path_buf()],
+        }],
+        no_further_delegation: Some(true),
+        read_only: true,
+        accepted: false,
+        rejected: true,
+        status: ReviewStatus::Missing,
+        remaining_risk: "parent-launched review auditor did not produce a usable report"
+            .to_string(),
+        next_safe_action: "inspect auditor logs and rerun the child scope".to_string(),
     }
 }
 
@@ -1286,6 +1845,20 @@ impl ReportStatus for OrchestratorReviewReport {
 }
 
 impl ReportStatus for WorkerReport {
+    fn accepted(&self) -> bool {
+        self.accepted
+    }
+
+    fn rejected(&self) -> bool {
+        self.rejected
+    }
+
+    fn status(&self) -> ReviewStatus {
+        self.status
+    }
+}
+
+impl ReportStatus for AuditorReport {
     fn accepted(&self) -> bool {
         self.accepted
     }
@@ -1505,11 +2078,14 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
                 "assigned_paths",
                 "semantic_symbols",
                 "semantic_modules",
+                "claim_token",
+                "semantic_intent_token",
                 "commands_run",
                 "files_changed",
                 "validation_results",
                 "findings",
                 "worker_reports",
+                "audit_reports",
                 "accepted",
                 "rejected",
                 "status",
@@ -1529,6 +2105,7 @@ fn write_orchestrator_schema(path: &Path) -> Result<()> {
                 "validation_results": {"type": "array", "items": validation_result_schema_value()},
                 "findings": {"type": "array", "items": finding_schema_value()},
                 "worker_reports": {"type": "array", "items": worker_report_schema_value()},
+                "audit_reports": {"type": "array", "items": auditor_report_schema_value()},
                 "accepted": {"type": "boolean"},
                 "rejected": {"type": "boolean"},
                 "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
@@ -1543,6 +2120,51 @@ fn write_worker_schema(path: &Path) -> Result<()> {
     write_schema(path, worker_report_schema_value())
 }
 
+fn write_auditor_schema(path: &Path) -> Result<()> {
+    write_schema(path, auditor_report_schema_value())
+}
+
+fn auditor_report_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "AuditorReport",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "id",
+            "role",
+            "reviewed_worker_ids",
+            "reviewed_paths",
+            "commands_run",
+            "validation_results",
+            "findings",
+            "no_further_delegation",
+            "read_only",
+            "accepted",
+            "rejected",
+            "status",
+            "remaining_risk",
+            "next_safe_action"
+        ],
+        "properties": {
+            "id": {"type": "string"},
+            "role": {"type": "string", "const": "auditor"},
+            "reviewed_worker_ids": {"type": "array", "items": {"type": "string"}},
+            "reviewed_paths": {"type": "array", "items": {"type": "string"}},
+            "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+            "validation_results": {"type": "array", "items": validation_result_schema_value()},
+            "findings": {"type": "array", "items": finding_schema_value()},
+            "no_further_delegation": {"type": "boolean", "const": true},
+            "read_only": {"type": "boolean", "const": true},
+            "accepted": {"type": "boolean"},
+            "rejected": {"type": "boolean"},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "remaining_risk": {"type": "string"},
+            "next_safe_action": {"type": "string"}
+        }
+    })
+}
+
 fn worker_report_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1555,6 +2177,8 @@ fn worker_report_schema_value() -> serde_json::Value {
             "assigned_paths",
             "semantic_symbols",
             "semantic_modules",
+            "claim_token",
+            "semantic_intent_token",
             "commands_run",
             "files_changed",
             "validation_results",
@@ -1595,12 +2219,14 @@ fn command_run_record_schema_value() -> serde_json::Value {
         "required": [
             "command",
             "cwd",
+            "exit_code",
             "status",
             "timeout_seconds",
             "duration_ms",
             "timed_out",
             "stdout",
-            "stderr"
+            "stderr",
+            "error"
         ],
         "properties": {
             "command": {"type": "array", "items": {"type": "string"}},
@@ -1621,7 +2247,7 @@ fn validation_result_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "status", "command"],
+        "required": ["name", "status", "command", "message"],
         "properties": {
             "name": {"type": "string"},
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
@@ -1760,6 +2386,10 @@ fn sorted_unique_strings(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn parent_auditor_id(assignment: &OrchestratorAssignment) -> String {
+    format!("{}-review-auditor", assignment.id)
+}
+
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
@@ -1777,6 +2407,13 @@ fn display_paths(paths: &[PathBuf]) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn display_strings(values: &[String]) -> String {
+    if values.is_empty() {
+        return "<none>".to_string();
+    }
+    values.join(", ")
 }
 
 fn path_relative_to(repo: &Path, path: &Path) -> PathBuf {
@@ -1835,7 +2472,7 @@ mod tests {
         );
         assert_eq!(
             supervise_role_prefix(SupervisePromptRole::O1ChildOrchestrator, "child-a", None),
-            "ROLE: O1_CHILD_ORCHESTRATOR\nAGENT_KIND: orchestrator\nAGENT_LABEL: child-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 1\nNO_FURTHER_DELEGATION: false\n"
+            "ROLE: O1_CHILD_ORCHESTRATOR\nAGENT_KIND: child_orchestrator\nAGENT_LABEL: child-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 1\nNO_FURTHER_DELEGATION: false\n"
         );
         assert_eq!(
             supervise_role_prefix(SupervisePromptRole::TerminalWorker, "worker-a", None),
@@ -1845,5 +2482,15 @@ mod tests {
             supervise_role_prefix(SupervisePromptRole::Researcher, "researcher-a", None),
             "ROLE: RESEARCHER\nAGENT_KIND: researcher\nAGENT_LABEL: researcher-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n"
         );
+        assert_eq!(
+            supervise_role_prefix(SupervisePromptRole::ReviewAuditor, "auditor-a", None),
+            "ROLE: REVIEW_AUDITOR\nAGENT_KIND: auditor\nAGENT_LABEL: auditor-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n"
+        );
+
+        let runtime_labeled_worker =
+            supervise_role_prefix(SupervisePromptRole::TerminalWorker, "expert-coder", None);
+        assert!(runtime_labeled_worker.starts_with("ROLE: TERMINAL_WORKER\n"));
+        assert!(runtime_labeled_worker.contains("AGENT_LABEL: expert-coder\n"));
+        assert!(!runtime_labeled_worker.contains("ROLE: expert-coder"));
     }
 }

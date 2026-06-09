@@ -47,7 +47,7 @@ impl ExternalAgentCommand {
             output_schema: None,
             timeout,
             env_allowlist: default_env_allowlist(),
-            sandbox_mode: "workspace-write".to_string(),
+            sandbox_mode: "danger-full-access".to_string(),
             approval_mode: None,
         }
     }
@@ -194,6 +194,8 @@ fn codex_argv(spec: &ExternalAgentCommand) -> Vec<String> {
         spec.cwd.display().to_string(),
         "--sandbox".to_string(),
         spec.sandbox_mode.clone(),
+        "--enable".to_string(),
+        "goals".to_string(),
         "--enable".to_string(),
         "multi_agent".to_string(),
     ];

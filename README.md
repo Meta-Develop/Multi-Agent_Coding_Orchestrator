@@ -67,15 +67,24 @@ The current implementation covers a local-first command-line slice:
   the Codex CLI in isolated child worktrees under an O2 supervisor. Each child
   is instructed to read `AGENTS.md` and project-local `.agents` guidance before
   acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
-  worker/researcher assignments when available, report peer-O2 escalation
-  candidates instead of taking them over, and preserve structured reporting
-  without applying worker changes to the primary worktree automatically.
+  worker/researcher assignments when available, preserve the O1/O2 subprocess
+  launch boundary of `--sandbox danger-full-access`, `--enable goals`, and
+  `--enable multi_agent`, leave O1/O2 hierarchy and enforced audit gates to
+  MACO/Codex CLI subprocess workflows, report peer-O2 escalation candidates
+  instead of taking them over, and preserve structured reporting without
+  applying worker changes to the primary worktree
+  automatically.
 - `maco supervise status` reports durable supervisor run artifact state without
   launching workers or applying changes.
 - `maco supervise collect` reads the structured supervisor final report and
   preserves the same no-automatic-primary-apply boundary.
 - `maco supervise artifacts list/latest/prune` inspects or prunes durable
   supervisor run artifacts.
+- `.agents/scripts/o2-autopilot` runs bounded autonomous O2 supervisors under
+  a separate human/user-directed root O2. The root O2 is out-of-band and is not
+  counted against autonomous depth; autonomous O2-to-O2 follow-up uses
+  `NEXT_O2_TASKS.tsv` durable queue state and run ledgers such as `STATE.tsv`,
+  `HEARTBEAT.tsv`, task prompts, captured outputs, and `SUMMARY.md`.
 - `maco autopilot plan/run/status/collect` provides the first local-first
   autopilot workflow: normalize a task or plan, run a supervised child worker in
   fake/local mode by default, publish through the PR safety gates, run an
@@ -541,23 +550,52 @@ each assignment's paths, records semantic coordination metadata when the plan
 requests it, and writes structured logs and reports under the run directory.
 Each Codex CLI child orchestrator is instructed to read `AGENTS.md` and
 project-local `.agents` guidance before acting. The generated prompt contract is
-O2 supervisor -> O1 child orchestrator -> terminal worker/researcher. Workers
-and researchers are terminal and must attest `no_further_delegation=true` in
-their WorkerReport. Embedded worker prompt templates begin with
-`ROLE: TERMINAL_WORKER` and must be passed to worker sessions without preamble.
-O1 child orchestrators must not spawn peer O2 supervisors;
-when they discover newly large cross-cutting problems, they report escalation
-candidates in their structured report instead of taking those scopes over. The
-top O2/supervisor may then launch peer O2 supervisors as separate parallel
-scopes.
+user-directed root O2 -> autonomous O2 supervisor -> O1 child orchestrator ->
+terminal worker/researcher/review-auditor. Human-invoked agents are treated as
+the user-directed root O2: they are out-of-band supervisors, can launch several
+bounded autonomous O2 supervisors, and are not counted against autonomous
+`task_depth`. Workers, researchers, and review auditors are terminal. Workers
+must attest `no_further_delegation=true` in their WorkerReport, and review
+auditors must attest it in their AuditorReport. Embedded worker prompt
+templates begin with `ROLE: TERMINAL_WORKER`; embedded review auditor prompt
+templates begin with `ROLE: REVIEW_AUDITOR`; both must be passed to terminal
+sessions without preamble. Native SubAgent/delegated-worker use is limited to
+lightweight terminal worker and researcher roles; O1 child orchestrators must
+not bind O1 or O2 roles to native SubAgent sessions. Durable roles use canonical
+role names only; runtime labels belong in the runtime bridge and `AGENT_LABEL`,
+never in `ROLE`. O1 child orchestrators must not spawn peer O2 supervisors;
+when they discover newly large cross-cutting problems, they report peer-O2
+escalation candidates upward in their structured report instead of taking those
+scopes over. The user-root O2 or an autonomous O2 durable queue may then launch
+bounded peer O2 supervisors as separate MACO/Codex CLI subprocess scopes.
+
+Long-running O2 supervision is durable run state, not one expanding LLM context.
+Autonomous O2 runs carry context through `STATE.tsv`, `HEARTBEAT.tsv`,
+`queue.tsv`, `NEXT_O2_TASKS.tsv`, task prompts, captured final messages,
+event streams, and `SUMMARY.md` under `.maco/o2-autopilot/runs/<run-id>/`.
+
+O1/O2 subprocess orchestration uses a Codex CLI launch boundary of
+`--sandbox danger-full-access`, `--enable goals`, and `--enable multi_agent`.
+Nested O2/O1 subprocess chains must preserve that boundary for orchestrator
+roles. Do not use `workspace-write` for O2/O1 subprocess chains because nested
+Codex state DB access can collide, corrupt, or fail under workspace-write style
+restrictions.
 
 For worker assignments, child orchestrators should use Codex native
-SubAgent/delegated-worker mechanisms when available so the project
-manager/worker boundary is preserved. If no delegated-worker mechanism is
-available, the child should stop before mutation and report the exact blocked
-worker task. `maco supervise run` does not apply worker changes to the primary
-worktree automatically. Child orchestrator execution is currently serial: the
-supervisor starts and waits for one child process at a time.
+SubAgent/delegated-worker mechanisms when available only for terminal worker or
+researcher execution so the project manager/worker boundary is preserved. If no
+delegated-worker mechanism is available, the child should stop before mutation
+and report the exact blocked worker task. For child assignments with workers,
+`maco supervise run` requires structured terminal audit evidence before
+accepting the child report: the parent launches a read-only `REVIEW_AUDITOR`
+subprocess and requires an accepted AuditorReport with `role=auditor`,
+`no_further_delegation=true`, `read_only=true`, and coverage for all assigned
+worker ids. A child-side review auditor is advisory unless the parent MACO/O2
+acceptance gate collects and accepts it. The accepted parent-launched
+AuditorReport is appended to the child `audit_reports` field.
+`maco supervise run` does not apply worker changes to the primary worktree
+automatically. Child orchestrator execution is currently serial: the supervisor
+starts and waits for one child process at a time.
 `max_child_assignments` bounds the number of child assignments in the plan, and
 therefore the allowed fan-out, but it is not a parallel execution limit yet.
 `max_child_processes` is accepted only as a legacy JSON alias and normalized out

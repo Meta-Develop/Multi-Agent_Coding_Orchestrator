@@ -1191,10 +1191,38 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
-cat >/dev/null
+prompt_body="$(cat)"
 mkdir -p "$(dirname "$report")"
-printf '\ninbox fake codex repair\n' >> "$worktree/README.md"
 name="$(basename "$report" .json)"
+if [ "${{name%-review-auditor}}" != "$name" ]; then
+  case "$prompt_body" in
+    "ROLE: REVIEW_AUDITOR"*)
+      child_name="${{name%-review-auditor}}"
+      cat > "$report" <<JSON
+{{
+  "id": "$name",
+  "role": "auditor",
+  "reviewed_worker_ids": ["$child_name-worker"],
+  "reviewed_paths": ["README.md"],
+  "commands_run": [],
+  "validation_results": [
+    {{"name": "fake parent auditor validation", "status": "succeeded", "command": [], "message": null}}
+  ],
+  "findings": [],
+  "no_further_delegation": true,
+  "read_only": true,
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded",
+  "remaining_risk": "none",
+  "next_safe_action": "publish through autopilot PR gate"
+}}
+JSON
+      exit 0
+      ;;
+  esac
+fi
+printf '\ninbox fake codex repair\n' >> "$worktree/README.md"
 cat > "$report" <<JSON
 {{
   "id": "$name",
