@@ -21,10 +21,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
-    path::{Path, PathBuf},
-    process::Command,
+    path::{Component, Path, PathBuf},
+    process::{self, Command},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const INBOX_SCHEMA_VERSION: u32 = 1;
@@ -67,6 +67,28 @@ pub struct InboxWatchOptions {
     pub codex_bin: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InboxWorkspaceScanOptions {
+    pub config: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboxWorkspaceRunOptions {
+    pub config: PathBuf,
+    pub run_id: RunId,
+    pub dry_run: bool,
+    pub codex_bin: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboxWorkspaceWatchOptions {
+    pub config: PathBuf,
+    pub poll_seconds: u64,
+    pub once: bool,
+    pub dry_run: bool,
+    pub codex_bin: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InboxConfig {
     #[serde(default)]
@@ -104,6 +126,65 @@ impl Default for InboxConfig {
             privacy: InboxPrivacyPolicy::default(),
             timeout_seconds: None,
             codex_bin: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InboxWorkspaceConfig {
+    pub version: u32,
+    #[serde(default = "default_workspace_permission_mode")]
+    pub default_permission_mode: InboxPermissionMode,
+    #[serde(default = "default_max_items")]
+    pub default_max_items_per_repo: usize,
+    #[serde(default)]
+    pub strict: bool,
+    #[serde(default)]
+    pub repositories: Vec<InboxWorkspaceRepositoryConfig>,
+    #[serde(default)]
+    pub safety: InboxWorkspaceSafetyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InboxWorkspaceRepositoryConfig {
+    pub id: String,
+    pub path: PathBuf,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub permission_mode: Option<InboxPermissionMode>,
+    #[serde(default)]
+    pub max_items: Option<usize>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default = "default_true")]
+    pub include_pull_requests: bool,
+    #[serde(default = "default_true")]
+    pub include_issues: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InboxWorkspaceSafetyConfig {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub allow_auto_approval: bool,
+    #[serde(default)]
+    pub allow_auto_merge: bool,
+    #[serde(default = "default_true")]
+    pub require_clean_primary: bool,
+    #[serde(default = "default_true")]
+    pub require_validation_for_publication: bool,
+}
+
+impl Default for InboxWorkspaceSafetyConfig {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            allow_auto_approval: false,
+            allow_auto_merge: false,
+            require_clean_primary: true,
+            require_validation_for_publication: true,
         }
     }
 }
@@ -207,6 +288,10 @@ impl InboxPermissionMode {
 
     fn publishes_git_branch(self) -> bool {
         matches!(self, Self::GithubGit)
+    }
+
+    fn publishes_real_branch_or_pr(self) -> bool {
+        self.publishes_git_branch() || self.publishes_github_pr()
     }
 
     fn comments_on_source(self) -> bool {
@@ -475,10 +560,124 @@ pub struct InboxWatchReport {
     pub runs: Vec<InboxRunReport>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxWorkspaceScanReport {
+    pub version: u32,
+    pub config_path: PathBuf,
+    pub strict: bool,
+    pub success: bool,
+    pub repo_count: usize,
+    pub enabled_repo_count: usize,
+    pub disabled_repo_count: usize,
+    pub successful_repo_count: usize,
+    pub failed_repo_count: usize,
+    pub refused_repo_count: usize,
+    pub repo_counts: InboxWorkspaceRepoCounts,
+    pub repositories: Vec<InboxWorkspaceRepoReport>,
+    pub next_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxWorkspaceRunReport {
+    pub version: u32,
+    pub run_id: RunId,
+    pub config_path: PathBuf,
+    pub run_dir: PathBuf,
+    pub strict: bool,
+    pub success: bool,
+    pub repo_count: usize,
+    pub enabled_repo_count: usize,
+    pub disabled_repo_count: usize,
+    pub successful_repo_count: usize,
+    pub failed_repo_count: usize,
+    pub refused_repo_count: usize,
+    pub repo_counts: InboxWorkspaceRepoCounts,
+    pub artifacts: InboxWorkspaceRunArtifacts,
+    pub auto_merge_performed: bool,
+    pub auto_approval_performed: bool,
+    pub repositories: Vec<InboxWorkspaceRepoReport>,
+    pub next_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxWorkspaceRunArtifacts {
+    pub run_dir: PathBuf,
+    pub scan_report: PathBuf,
+    pub final_report: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxWorkspaceWatchReport {
+    pub version: u32,
+    pub config_path: PathBuf,
+    pub poll_seconds: u64,
+    pub once: bool,
+    pub success: bool,
+    pub iteration_count: usize,
+    pub auto_merge_performed: bool,
+    pub auto_approval_performed: bool,
+    pub runs: Vec<InboxWorkspaceRunReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct InboxWorkspaceRepoCounts {
+    pub total: usize,
+    pub enabled: usize,
+    pub disabled: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub refused: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxWorkspaceRepoReport {
+    pub id: String,
+    pub enabled: bool,
+    pub permission_mode: InboxPermissionMode,
+    pub status: String,
+    pub success: bool,
+    pub refused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_report: Option<InboxScanReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_report: Option<InboxRunReport>,
+}
+
 #[derive(Debug, Clone)]
 struct LoadedConfig {
     config: InboxConfig,
     path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedWorkspaceConfig {
+    config: InboxWorkspaceConfig,
+    config_dir: PathBuf,
+    public_config_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceRepoSpec {
+    id: String,
+    artifact_id: String,
+    repo_path: PathBuf,
+    enabled: bool,
+    permission_mode: InboxPermissionMode,
+    max_items: usize,
+    labels: Vec<String>,
+    include_issues: bool,
+    include_pull_requests: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InboxConfigOverrides {
+    max_items: Option<usize>,
+    action_policy: Option<InboxActionPolicy>,
+    labels: Option<Vec<String>>,
+    issues: Option<bool>,
+    pull_requests: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -510,9 +709,21 @@ struct RawPrCandidate {
 }
 
 pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
+    scan_inbox_with_overrides(options, InboxConfigOverrides::default())
+}
+
+fn scan_inbox_with_overrides(
+    options: InboxScanOptions,
+    mut overrides: InboxConfigOverrides,
+) -> Result<InboxScanReport> {
     let repo = discover_repo_root(&options.repo)?;
-    let loaded =
-        load_config_with_overrides(&repo, options.max_items, options.action_policy_override)?;
+    if options.max_items.is_some() {
+        overrides.max_items = options.max_items;
+    }
+    if options.action_policy_override.is_some() {
+        overrides.action_policy = options.action_policy_override;
+    }
+    let loaded = load_config_with_config_overrides(&repo, overrides)?;
     let permission_mode =
         effective_permission_mode(&loaded.config, options.github, options.permission_mode);
     let action_policy = effective_action_policy(loaded.config.action_policy, permission_mode);
@@ -598,23 +809,35 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
 }
 
 pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
+    run_inbox_with_overrides(options, InboxConfigOverrides::default())
+}
+
+fn run_inbox_with_overrides(
+    options: InboxRunOptions,
+    mut overrides: InboxConfigOverrides,
+) -> Result<InboxRunReport> {
     let repo = discover_repo_root(&options.repo)?;
     let run_dir = inbox_run_dir(&repo, &options.run_id);
     artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &options.run_id)?;
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create inbox run dir {}", run_dir.display()))?;
     let artifacts = run_artifacts(&options.run_id);
-    let scan = scan_inbox(InboxScanOptions {
-        repo: repo.clone(),
-        github: options.github,
-        permission_mode: options.permission_mode,
-        max_items: options.max_items,
-        action_policy_override: if options.dry_run {
-            Some(InboxActionPolicy::DryRun)
-        } else {
-            None
+    if options.max_items.is_some() {
+        overrides.max_items = options.max_items;
+    }
+    if options.dry_run {
+        overrides.action_policy = Some(InboxActionPolicy::DryRun);
+    }
+    let scan = scan_inbox_with_overrides(
+        InboxScanOptions {
+            repo: repo.clone(),
+            github: options.github,
+            permission_mode: options.permission_mode,
+            max_items: None,
+            action_policy_override: None,
         },
-    })?;
+        overrides.clone(),
+    )?;
     write_json_file(&run_dir.join("scan-report.json"), &scan)?;
 
     let selected_items = scan
@@ -667,15 +890,7 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
         return Ok(report);
     }
 
-    let loaded = load_config_with_overrides(
-        &repo,
-        options.max_items,
-        if options.dry_run {
-            Some(InboxActionPolicy::DryRun)
-        } else {
-            None
-        },
-    )?;
+    let loaded = load_config_with_config_overrides(&repo, overrides)?;
     let action_policy = scan.action_policy;
     let permission_mode = scan.permission_mode;
     let item_context = InboxItemRunContext {
@@ -802,6 +1017,626 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
         iteration_count: runs.len(),
         runs,
     })
+}
+
+pub fn scan_workspace_inbox(
+    options: InboxWorkspaceScanOptions,
+) -> Result<InboxWorkspaceScanReport> {
+    let loaded = load_workspace_config(&options.config)?;
+    let specs = workspace_repo_specs(&loaded)?;
+    Ok(scan_workspace_specs(&loaded, &specs))
+}
+
+pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWorkspaceRunReport> {
+    let loaded = load_workspace_config(&options.config)?;
+    let specs = workspace_repo_specs(&loaded)?;
+    let run_dir = workspace_run_dir(&loaded.config_dir, &options.run_id);
+    ensure_workspace_run_dir_available(&run_dir, &options.run_id)?;
+    fs::create_dir_all(&run_dir).with_context(|| {
+        format!(
+            "failed to create inbox workspace run dir {}",
+            run_dir.display()
+        )
+    })?;
+
+    let scan_report = scan_workspace_specs(&loaded, &specs);
+    write_json_file(&run_dir.join("scan-report.json"), &scan_report)?;
+    for entry in &scan_report.repositories {
+        if let Some(scan) = &entry.scan_report {
+            let artifact_id = workspace_artifact_id_for_entry(&specs, &entry.id)?;
+            write_json_file(&run_dir.join(repo_scan_file_name(&artifact_id)), scan)?;
+        } else if entry.enabled {
+            let artifact_id = workspace_artifact_id_for_entry(&specs, &entry.id)?;
+            write_json_file(
+                &run_dir.join(repo_scan_file_name(&artifact_id)),
+                &workspace_repo_failure_value(entry, "scan"),
+            )?;
+        }
+    }
+
+    let mut repositories = Vec::new();
+    let dry_run = options.dry_run || loaded.config.safety.dry_run;
+    for spec in specs {
+        if !spec.enabled {
+            repositories.push(disabled_workspace_repo_report(&spec));
+            continue;
+        }
+
+        let scan_report = scan_report
+            .repositories
+            .iter()
+            .find(|entry| entry.id == spec.id)
+            .and_then(|entry| entry.scan_report.clone());
+        if let Some(entry) = workspace_publication_validation_refusal(
+            &spec,
+            dry_run,
+            loaded.config.safety.require_validation_for_publication,
+            scan_report.clone(),
+        )? {
+            write_json_file(
+                &run_dir.join(repo_run_file_name(&spec.artifact_id)),
+                &workspace_repo_failure_value(&entry, "run"),
+            )?;
+            repositories.push(entry);
+            continue;
+        }
+        let repo_run_id = workspace_repo_run_id(&options.run_id, &spec.artifact_id)?;
+        let run_result = run_inbox_with_overrides(
+            InboxRunOptions {
+                repo: spec.repo_path.clone(),
+                run_id: repo_run_id,
+                github: false,
+                permission_mode: Some(spec.permission_mode),
+                dry_run,
+                max_items: None,
+                codex_bin: options.codex_bin.clone(),
+            },
+            workspace_overrides_for_repo(&spec),
+        );
+        match run_result {
+            Ok(run_report) => {
+                let refused = run_report.status == InboxRunStatus::Refused;
+                let message = if refused {
+                    run_report
+                        .refusals
+                        .first()
+                        .map(|refusal| refusal.message.clone())
+                } else {
+                    None
+                };
+                write_json_file(
+                    &run_dir.join(repo_run_file_name(&spec.artifact_id)),
+                    &run_report,
+                )?;
+                repositories.push(InboxWorkspaceRepoReport {
+                    id: spec.id,
+                    enabled: true,
+                    permission_mode: spec.permission_mode,
+                    status: inbox_run_status_label(run_report.status).to_string(),
+                    success: run_report.success,
+                    refused,
+                    message,
+                    scan_report,
+                    run_report: Some(run_report),
+                });
+            }
+            Err(error) => {
+                let entry = InboxWorkspaceRepoReport {
+                    id: spec.id,
+                    enabled: true,
+                    permission_mode: spec.permission_mode,
+                    status: "failed".to_string(),
+                    success: false,
+                    refused: false,
+                    message: Some(sanitize_public_field(
+                        &error.to_string(),
+                        GH_DIAGNOSTIC_LIMIT,
+                    )),
+                    scan_report,
+                    run_report: None,
+                };
+                write_json_file(
+                    &run_dir.join(repo_run_file_name(&spec.artifact_id)),
+                    &workspace_repo_failure_value(&entry, "run"),
+                )?;
+                repositories.push(entry);
+            }
+        }
+    }
+
+    let repo_counts = workspace_repo_counts(&repositories);
+    let success = workspace_success(loaded.config.strict, &repo_counts);
+    let public_run_dir = public_workspace_run_dir().join(options.run_id.as_str());
+    let artifacts = InboxWorkspaceRunArtifacts {
+        run_dir: public_run_dir.clone(),
+        scan_report: public_run_dir.join("scan-report.json"),
+        final_report: public_run_dir.join("final-report.json"),
+    };
+    let report = InboxWorkspaceRunReport {
+        version: INBOX_SCHEMA_VERSION,
+        run_id: options.run_id,
+        config_path: loaded.public_config_path,
+        run_dir: public_run_dir,
+        strict: loaded.config.strict,
+        success,
+        repo_count: repo_counts.total,
+        enabled_repo_count: repo_counts.enabled,
+        disabled_repo_count: repo_counts.disabled,
+        successful_repo_count: repo_counts.succeeded,
+        failed_repo_count: repo_counts.failed,
+        refused_repo_count: repo_counts.refused,
+        repo_counts,
+        artifacts,
+        auto_merge_performed: false,
+        auto_approval_performed: false,
+        repositories,
+        next_action: workspace_next_action(success, loaded.config.strict, "workspace run"),
+    };
+    write_json_file(&run_dir.join("final-report.json"), &report)?;
+    Ok(report)
+}
+
+pub fn watch_workspace_inbox(
+    options: InboxWorkspaceWatchOptions,
+) -> Result<InboxWorkspaceWatchReport> {
+    if options.poll_seconds == 0 {
+        bail!("poll-seconds must be greater than zero");
+    }
+    let public_config_path = public_config_path(&options.config);
+    let mut runs = Vec::new();
+    loop {
+        let run_id = generate_workspace_run_id(&options.config)?;
+        let report = run_workspace_inbox(InboxWorkspaceRunOptions {
+            config: options.config.clone(),
+            run_id,
+            dry_run: options.dry_run,
+            codex_bin: options.codex_bin.clone(),
+        })?;
+        runs.push(report);
+        if options.once {
+            break;
+        }
+        thread::sleep(Duration::from_secs(options.poll_seconds));
+    }
+    let success = runs.iter().all(|run| run.success);
+    Ok(InboxWorkspaceWatchReport {
+        version: INBOX_SCHEMA_VERSION,
+        config_path: public_config_path,
+        poll_seconds: options.poll_seconds,
+        once: options.once,
+        success,
+        iteration_count: runs.len(),
+        auto_merge_performed: false,
+        auto_approval_performed: false,
+        runs,
+    })
+}
+
+fn scan_workspace_specs(
+    loaded: &LoadedWorkspaceConfig,
+    specs: &[WorkspaceRepoSpec],
+) -> InboxWorkspaceScanReport {
+    let mut repositories = Vec::new();
+    for spec in specs {
+        if !spec.enabled {
+            repositories.push(disabled_workspace_repo_report(spec));
+            continue;
+        }
+        let scan_result = scan_inbox_with_overrides(
+            InboxScanOptions {
+                repo: spec.repo_path.clone(),
+                github: false,
+                permission_mode: Some(spec.permission_mode),
+                max_items: None,
+                action_policy_override: None,
+            },
+            workspace_overrides_for_repo(spec),
+        );
+        match scan_result {
+            Ok(scan_report) => repositories.push(InboxWorkspaceRepoReport {
+                id: spec.id.clone(),
+                enabled: true,
+                permission_mode: spec.permission_mode,
+                status: if scan_report.refused {
+                    "refused".to_string()
+                } else {
+                    "scanned".to_string()
+                },
+                success: scan_report.success,
+                refused: scan_report.refused,
+                message: None,
+                scan_report: Some(scan_report),
+                run_report: None,
+            }),
+            Err(error) => repositories.push(InboxWorkspaceRepoReport {
+                id: spec.id.clone(),
+                enabled: true,
+                permission_mode: spec.permission_mode,
+                status: "failed".to_string(),
+                success: false,
+                refused: false,
+                message: Some(sanitize_public_field(
+                    &error.to_string(),
+                    GH_DIAGNOSTIC_LIMIT,
+                )),
+                scan_report: None,
+                run_report: None,
+            }),
+        }
+    }
+    let repo_counts = workspace_repo_counts(&repositories);
+    let success = workspace_success(loaded.config.strict, &repo_counts);
+    InboxWorkspaceScanReport {
+        version: INBOX_SCHEMA_VERSION,
+        config_path: loaded.public_config_path.clone(),
+        strict: loaded.config.strict,
+        success,
+        repo_count: repo_counts.total,
+        enabled_repo_count: repo_counts.enabled,
+        disabled_repo_count: repo_counts.disabled,
+        successful_repo_count: repo_counts.succeeded,
+        failed_repo_count: repo_counts.failed,
+        refused_repo_count: repo_counts.refused,
+        repo_counts,
+        repositories,
+        next_action: workspace_next_action(success, loaded.config.strict, "workspace scan"),
+    }
+}
+
+fn load_workspace_config(path: &Path) -> Result<LoadedWorkspaceConfig> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory")?
+            .join(path)
+    };
+    let contents = fs::read_to_string(&absolute_path)
+        .with_context(|| format!("failed to read workspace inbox config {}", path.display()))?;
+    let config = serde_json::from_str::<InboxWorkspaceConfig>(&contents)
+        .with_context(|| format!("failed to parse workspace inbox config {}", path.display()))?;
+    let canonical_path = fs::canonicalize(&absolute_path).with_context(|| {
+        format!(
+            "failed to resolve workspace inbox config {}",
+            path.display()
+        )
+    })?;
+    let config_dir = canonical_path
+        .parent()
+        .map(Path::to_path_buf)
+        .context("workspace inbox config path must have a parent directory")?;
+    Ok(LoadedWorkspaceConfig {
+        config: validate_workspace_config(config)?,
+        config_dir,
+        public_config_path: public_config_path(path),
+    })
+}
+
+fn validate_workspace_config(mut config: InboxWorkspaceConfig) -> Result<InboxWorkspaceConfig> {
+    if config.version != INBOX_SCHEMA_VERSION {
+        bail!(
+            "workspace inbox config version must be {}; got {}",
+            INBOX_SCHEMA_VERSION,
+            config.version
+        );
+    }
+    if config.default_max_items_per_repo == 0 {
+        bail!("workspace default_max_items_per_repo must be greater than zero");
+    }
+    if config.safety.allow_auto_approval {
+        bail!("workspace inbox safety.allow_auto_approval=true is not supported");
+    }
+    if config.safety.allow_auto_merge {
+        bail!("workspace inbox safety.allow_auto_merge=true is not supported");
+    }
+    if !config.safety.require_clean_primary {
+        bail!("workspace inbox requires safety.require_clean_primary=true");
+    }
+    if !config.safety.require_validation_for_publication {
+        bail!("workspace inbox requires safety.require_validation_for_publication=true");
+    }
+
+    let mut ids = BTreeSet::new();
+    let mut artifact_ids = BTreeSet::new();
+    for (index, repository) in config.repositories.iter_mut().enumerate() {
+        repository.id = repository.id.trim().to_string();
+        if repository.id.is_empty() {
+            bail!("workspace repository {} id cannot be empty", index + 1);
+        }
+        if !ids.insert(repository.id.clone()) {
+            bail!("workspace repository id '{}' is duplicated", repository.id);
+        }
+        let artifact_id = sanitize_workspace_repo_id(&repository.id);
+        if !artifact_ids.insert(artifact_id.clone()) {
+            bail!(
+                "workspace repository id '{}' collides with another sanitized id '{}'",
+                repository.id,
+                artifact_id
+            );
+        }
+        if repository.path.as_os_str().is_empty() {
+            bail!(
+                "workspace repository '{}' path cannot be empty",
+                repository.id
+            );
+        }
+        if matches!(repository.max_items, Some(0)) {
+            bail!(
+                "workspace repository '{}' max_items must be greater than zero",
+                repository.id
+            );
+        }
+        repository.labels = sorted_unique_strings(std::mem::take(&mut repository.labels));
+    }
+    Ok(config)
+}
+
+fn workspace_repo_specs(loaded: &LoadedWorkspaceConfig) -> Result<Vec<WorkspaceRepoSpec>> {
+    let mut specs = Vec::new();
+    for repository in &loaded.config.repositories {
+        let repo_path = if repository.path.is_absolute() {
+            repository.path.clone()
+        } else {
+            loaded.config_dir.join(&repository.path)
+        };
+        specs.push(WorkspaceRepoSpec {
+            id: repository.id.clone(),
+            artifact_id: sanitize_workspace_repo_id(&repository.id),
+            repo_path,
+            enabled: repository.enabled,
+            permission_mode: repository
+                .permission_mode
+                .unwrap_or(loaded.config.default_permission_mode),
+            max_items: repository
+                .max_items
+                .unwrap_or(loaded.config.default_max_items_per_repo),
+            labels: repository.labels.clone(),
+            include_issues: repository.include_issues,
+            include_pull_requests: repository.include_pull_requests,
+        });
+    }
+    Ok(specs)
+}
+
+fn workspace_publication_validation_refusal(
+    spec: &WorkspaceRepoSpec,
+    dry_run: bool,
+    require_validation_for_publication: bool,
+    scan_report: Option<InboxScanReport>,
+) -> Result<Option<InboxWorkspaceRepoReport>> {
+    if dry_run
+        || !require_validation_for_publication
+        || !spec.permission_mode.publishes_real_branch_or_pr()
+        || scan_report.is_none()
+    {
+        return Ok(None);
+    }
+    let loaded =
+        load_config_with_config_overrides(&spec.repo_path, workspace_overrides_for_repo(spec))?;
+    if !loaded.config.default_validation_commands.is_empty() {
+        return Ok(None);
+    }
+
+    let permission_mode = permission_mode_label(spec.permission_mode);
+    Ok(Some(InboxWorkspaceRepoReport {
+        id: spec.id.clone(),
+        enabled: true,
+        permission_mode: spec.permission_mode,
+        status: "refused".to_string(),
+        success: false,
+        refused: true,
+        message: Some(format!(
+            "workspace publication requires at least one validation command for permission mode {permission_mode}"
+        )),
+        scan_report,
+        run_report: None,
+    }))
+}
+
+fn workspace_overrides_for_repo(spec: &WorkspaceRepoSpec) -> InboxConfigOverrides {
+    InboxConfigOverrides {
+        max_items: Some(spec.max_items),
+        action_policy: None,
+        labels: Some(spec.labels.clone()),
+        issues: Some(spec.include_issues),
+        pull_requests: Some(spec.include_pull_requests),
+    }
+}
+
+fn disabled_workspace_repo_report(spec: &WorkspaceRepoSpec) -> InboxWorkspaceRepoReport {
+    InboxWorkspaceRepoReport {
+        id: spec.id.clone(),
+        enabled: false,
+        permission_mode: spec.permission_mode,
+        status: "disabled".to_string(),
+        success: true,
+        refused: false,
+        message: Some("repository is disabled in workspace inbox config".to_string()),
+        scan_report: None,
+        run_report: None,
+    }
+}
+
+fn workspace_repo_counts(repositories: &[InboxWorkspaceRepoReport]) -> InboxWorkspaceRepoCounts {
+    let total = repositories.len();
+    let disabled = repositories.iter().filter(|repo| !repo.enabled).count();
+    let enabled = total.saturating_sub(disabled);
+    let succeeded = repositories
+        .iter()
+        .filter(|repo| repo.enabled && repo.success)
+        .count();
+    let refused = repositories
+        .iter()
+        .filter(|repo| repo.enabled && repo.refused)
+        .count();
+    let failed = repositories
+        .iter()
+        .filter(|repo| repo.enabled && !repo.success && !repo.refused)
+        .count();
+    InboxWorkspaceRepoCounts {
+        total,
+        enabled,
+        disabled,
+        succeeded,
+        failed,
+        refused,
+    }
+}
+
+fn workspace_success(strict: bool, repo_counts: &InboxWorkspaceRepoCounts) -> bool {
+    !strict || (repo_counts.failed == 0 && repo_counts.refused == 0)
+}
+
+fn workspace_next_action(success: bool, strict: bool, label: &str) -> String {
+    if success {
+        format!("{label} complete; no automatic approval or merge was performed")
+    } else if strict {
+        format!("{label} failed because strict mode or safety refusals require attention")
+    } else {
+        format!("{label} recorded per-repository safety refusals for review")
+    }
+}
+
+fn workspace_artifact_id_for_entry(specs: &[WorkspaceRepoSpec], id: &str) -> Result<String> {
+    specs
+        .iter()
+        .find(|spec| spec.id == id)
+        .map(|spec| spec.artifact_id.clone())
+        .with_context(|| format!("workspace repository '{id}' was not found"))
+}
+
+fn workspace_repo_failure_value(entry: &InboxWorkspaceRepoReport, phase: &str) -> Value {
+    json!({
+        "version": INBOX_SCHEMA_VERSION,
+        "repo_id": entry.id,
+        "phase": phase,
+        "status": entry.status,
+        "success": entry.success,
+        "refused": entry.refused,
+        "message": entry.message,
+    })
+}
+
+fn workspace_repo_run_id(workspace_run_id: &RunId, artifact_id: &str) -> Result<RunId> {
+    RunId::new(format!(
+        "{}-repo-{}",
+        workspace_run_id.as_str(),
+        artifact_id
+    ))
+}
+
+fn repo_scan_file_name(artifact_id: &str) -> String {
+    format!("repo-{artifact_id}-scan-report.json")
+}
+
+fn repo_run_file_name(artifact_id: &str) -> String {
+    format!("repo-{artifact_id}-run-report.json")
+}
+
+fn inbox_run_status_label(status: InboxRunStatus) -> &'static str {
+    match status {
+        InboxRunStatus::Succeeded => "succeeded",
+        InboxRunStatus::Failed => "failed",
+        InboxRunStatus::Refused => "refused",
+        InboxRunStatus::DryRun => "dry_run",
+        InboxRunStatus::Planned => "planned",
+        InboxRunStatus::NoItems => "no_items",
+    }
+}
+
+fn sanitize_workspace_repo_id(id: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_separator = false;
+    for character in id.trim().chars() {
+        let safe = if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+            character
+        } else {
+            '-'
+        };
+        if safe == '-' {
+            if last_was_separator {
+                continue;
+            }
+            last_was_separator = true;
+        } else {
+            last_was_separator = false;
+        }
+        output.push(safe);
+    }
+    let trimmed = output.trim_matches(|character| matches!(character, '-' | '.'));
+    if trimmed.is_empty() || matches!(trimmed, "." | "..") {
+        "repo".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn public_config_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return public_config_file_name(path);
+    }
+    let mut public_path = PathBuf::new();
+    for component in path.components() {
+        if let Component::Normal(part) = component {
+            public_path.push(part);
+        }
+    }
+    if public_path.as_os_str().is_empty() {
+        public_config_file_name(path)
+    } else {
+        public_path
+    }
+}
+
+fn public_config_file_name(path: &Path) -> PathBuf {
+    path.file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("workspace-inbox.json"))
+}
+
+fn public_workspace_run_dir() -> PathBuf {
+    PathBuf::from(".maco").join("inbox-workspace").join("runs")
+}
+
+fn workspace_run_dir(config_dir: &Path, run_id: &RunId) -> PathBuf {
+    config_dir
+        .join(public_workspace_run_dir())
+        .join(run_id.as_str())
+}
+
+fn ensure_workspace_run_dir_available(run_dir: &Path, run_id: &RunId) -> Result<()> {
+    if run_dir.exists() {
+        bail!(
+            "inbox workspace run id '{}' already exists at {}; choose a new --run-id",
+            run_id.as_str(),
+            public_workspace_run_dir().join(run_id.as_str()).display()
+        );
+    }
+    Ok(())
+}
+
+fn generate_workspace_run_id(config_path: &Path) -> Result<RunId> {
+    let loaded = load_workspace_config(config_path)?;
+    let run_root = loaded.config_dir.join(public_workspace_run_dir());
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_millis();
+    for suffix in 0..1000u16 {
+        let candidate = RunId::new(format!(
+            "inbox-workspace-{}-{}-{}",
+            millis,
+            process::id(),
+            suffix
+        ))?;
+        if !run_root.join(candidate.as_str()).exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "failed to generate a collision-free inbox workspace run id under {}",
+        public_workspace_run_dir().display()
+    )
 }
 
 struct InboxItemRunContext<'a> {
@@ -1707,20 +2542,28 @@ fn load_config(repo: &Path) -> Result<LoadedConfig> {
     })
 }
 
-fn load_config_with_overrides(
+fn load_config_with_config_overrides(
     repo: &Path,
-    max_items: Option<usize>,
-    action_policy_override: Option<InboxActionPolicy>,
+    overrides: InboxConfigOverrides,
 ) -> Result<LoadedConfig> {
     let mut loaded = load_config(repo)?;
-    if let Some(max_items) = max_items {
+    if let Some(max_items) = overrides.max_items {
         if max_items == 0 {
             bail!("inbox max-items must be greater than zero");
         }
         loaded.config.selection.max_items = max_items;
     }
-    if let Some(action_policy) = action_policy_override {
+    if let Some(action_policy) = overrides.action_policy {
         loaded.config.action_policy = action_policy;
+    }
+    if let Some(labels) = overrides.labels {
+        loaded.config.selection.labels = sorted_unique_strings(labels);
+    }
+    if let Some(issues) = overrides.issues {
+        loaded.config.selection.issues = issues;
+    }
+    if let Some(pull_requests) = overrides.pull_requests {
+        loaded.config.selection.pull_requests = pull_requests;
     }
     Ok(loaded)
 }
@@ -2229,11 +3072,8 @@ fn contains_private_key_material(text: &str) -> bool {
 }
 
 fn contains_local_absolute_path(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    text.contains("/mnt/")
-        || text.contains("/home/")
-        || lower.contains("c:\\users\\")
-        || lower.contains("c:/users/")
+    text.split_whitespace()
+        .any(token_contains_local_absolute_path)
 }
 
 fn redact_local_absolute_paths(text: &str) -> String {
@@ -2253,11 +3093,57 @@ fn redact_local_absolute_paths(text: &str) -> String {
 }
 
 fn push_redacted_path_token(output: &mut String, token: &str) {
-    if contains_local_absolute_path(token) {
+    if token_contains_local_absolute_path(token) {
         output.push_str("<redacted:local-path>");
     } else {
         output.push_str(token);
     }
+}
+
+fn token_contains_local_absolute_path(token: &str) -> bool {
+    contains_windows_home_path(token) || contains_unix_absolute_path(token)
+}
+
+fn contains_windows_home_path(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.contains("c:\\users\\") || lower.contains("c:/users/")
+}
+
+fn contains_unix_absolute_path(token: &str) -> bool {
+    if token.starts_with("//") {
+        return false;
+    }
+    for (index, character) in token.char_indices() {
+        if character == '/' && is_unix_absolute_path_start(token, index) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_unix_absolute_path_start(token: &str, index: usize) -> bool {
+    if token[index..].starts_with("//") || token_url_prefix_start(token, index).is_some() {
+        return false;
+    }
+    let Some(next) = token[index..].chars().nth(1) else {
+        return false;
+    };
+    if !is_unix_path_component_char(next) {
+        return false;
+    }
+    let previous = token[..index].chars().next_back();
+    !previous.is_some_and(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+    })
+}
+
+fn token_url_prefix_start(token: &str, index: usize) -> Option<usize> {
+    let marker = token.find("://")?;
+    (index > marker).then_some(marker)
+}
+
+fn is_unix_path_component_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
 }
 
 fn redact_token_like_words(text: &str) -> String {
@@ -2293,6 +3179,10 @@ fn default_true() -> bool {
 
 fn default_max_items() -> usize {
     DEFAULT_MAX_ITEMS
+}
+
+fn default_workspace_permission_mode() -> InboxPermissionMode {
+    InboxPermissionMode::GithubRead
 }
 
 fn default_max_repair_attempts() -> usize {

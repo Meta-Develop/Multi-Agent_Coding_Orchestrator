@@ -590,6 +590,268 @@ fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Resul
 }
 
 #[test]
+fn github_git_permission_pushes_without_creating_github_pr_when_validated() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let origin_path = init_bare_origin(temp.path(), "github-git-origin.git")?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        path_str(&origin_path)?,
+    ])?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({
+            "selection": {"pull_requests": false, "max_items": 1},
+            "default_validation_commands": ["true"]
+        }),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox github git config")?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let report = run_success_json_with_path(
+        &[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "github-git-publish",
+            "--permission",
+            "github_git",
+            "--json",
+        ],
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(report["permission_mode"], "github_git");
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    let autopilot = read_json_file(
+        &repo_path.join(".maco/inbox/runs/github-git-publish/item-1-autopilot-report.json"),
+    )?;
+    assert_eq!(autopilot["validation"]["status"], "passed");
+    assert_eq!(autopilot["pr"]["forge"], "git");
+    assert_eq!(autopilot["pr"]["draft"], true);
+    assert_eq!(autopilot["pr"]["pushed"], true);
+    assert_eq!(autopilot["pr"]["created"], false);
+    assert!(autopilot["pr"]["pr_url"].is_null());
+    let github = read_json_file(
+        &repo_path.join(".maco/inbox/runs/github-git-publish/item-1-github-report.json"),
+    )?;
+    assert_eq!(github["status"], "local_report_only");
+
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert!(gh_log.contains("issue list"));
+    assert!(!gh_log.contains("comment"));
+    assert!(!gh_log.contains("pr create"));
+    assert_no_approval_or_merge_in_gh_log(&gh_log);
+
+    Ok(())
+}
+
+#[test]
+fn github_pr_permission_creates_draft_pr_only_when_explicit_and_validated() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let origin_path = init_bare_origin(temp.path(), "github-pr-origin.git")?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        path_str(&origin_path)?,
+    ])?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({
+            "selection": {"pull_requests": false, "max_items": 1},
+            "default_validation_commands": ["true"]
+        }),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox github pr config")?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let report = run_success_json_with_path(
+        &[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "github-pr-publish",
+            "--permission",
+            "github_pr",
+            "--json",
+        ],
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(report["permission_mode"], "github_pr");
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    let autopilot = read_json_file(
+        &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-autopilot-report.json"),
+    )?;
+    assert_eq!(autopilot["validation"]["status"], "passed");
+    assert_eq!(autopilot["pr"]["forge"], "github");
+    assert_eq!(autopilot["pr"]["draft"], true);
+    assert_eq!(autopilot["pr"]["pushed"], true);
+    assert_eq!(autopilot["pr"]["created"], true);
+    assert_eq!(
+        autopilot["pr"]["pr_url"],
+        "https://github.test/acme/demo/pull/1"
+    );
+    let github = read_json_file(
+        &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-github-report.json"),
+    )?;
+    assert_eq!(github["status"], "local_report_only");
+
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert!(gh_log.contains("issue list"));
+    assert!(gh_log.contains("pr create"));
+    assert!(gh_log.contains("--draft"));
+    assert!(!gh_log.contains("comment"));
+    assert_no_approval_or_merge_in_gh_log(&gh_log);
+
+    Ok(())
+}
+
+#[test]
+fn github_full_permission_comments_only_after_success_when_explicit_and_validated() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let success_repo = create_named_committed_repo(temp.path(), "github-full-success")?;
+    let fail_repo = create_named_committed_repo(temp.path(), "github-full-fail")?;
+    for (repo_path, origin_name, validation) in [
+        (&success_repo, "github-full-success-origin.git", "true"),
+        (&fail_repo, "github-full-fail-origin.git", "false"),
+    ] {
+        let origin_path = init_bare_origin(temp.path(), origin_name)?;
+        run_git(&[
+            "-C",
+            path_str(repo_path)?,
+            "remote",
+            "add",
+            "origin",
+            path_str(&origin_path)?,
+        ])?;
+        write_json_file(
+            &repo_path.join("maco-inbox.json"),
+            &json!({
+                "selection": {"pull_requests": false, "max_items": 1},
+                "default_validation_commands": [validation]
+            }),
+        )?;
+        commit_all(&Repository::open(repo_path)?, "inbox github full config")?;
+    }
+    let gh = write_fake_gh(temp.path())?;
+    let config_path = temp.path().join("workspace-github-full.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "github_full",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "success",
+                    "path": path_str(&success_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "failed-validation",
+                    "path": path_str(&fail_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let report = run_success_json_in_dir_with_path(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&config_path)?,
+            "--run-id",
+            "workspace-github-full",
+            "--json",
+        ],
+        temp.path(),
+        &gh.path_dir,
+    )?;
+
+    let success_entry = workspace_repo_entry(&report, "success")?;
+    assert_eq!(success_entry["permission_mode"], "github_full");
+    assert_eq!(success_entry["status"], "succeeded");
+    assert_eq!(
+        success_entry["run_report"]["item_reports"][0]["autopilot_success"],
+        true
+    );
+    assert_eq!(
+        success_entry["run_report"]["item_reports"][0]["github_success"],
+        true
+    );
+    let success_github = read_json_file(
+        &success_repo.join(
+            success_entry["run_report"]["item_reports"][0]["github_report_path"]
+                .as_str()
+                .context("success github report path")?,
+        ),
+    )?;
+    assert_eq!(success_github["status"], "commented");
+    assert_eq!(
+        success_github["comment_url"],
+        "https://github.test/acme/demo/comment/1"
+    );
+
+    let failed_entry = workspace_repo_entry(&report, "failed-validation")?;
+    assert_eq!(failed_entry["permission_mode"], "github_full");
+    assert_eq!(failed_entry["status"], "failed");
+    assert_eq!(
+        failed_entry["run_report"]["item_reports"][0]["autopilot_success"],
+        false
+    );
+    let failed_github = read_json_file(
+        &fail_repo.join(
+            failed_entry["run_report"]["item_reports"][0]["github_report_path"]
+                .as_str()
+                .context("failed github report path")?,
+        ),
+    )?;
+    assert_eq!(failed_github["status"], "skipped");
+    assert_eq!(
+        failed_github["message"],
+        "autopilot did not succeed; GitHub comment skipped"
+    );
+
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert_eq!(gh_log.matches("issue list").count(), 4);
+    assert_eq!(gh_log.matches("pr create").count(), 1);
+    assert_eq!(gh_log.matches("issue comment").count(), 1);
+    assert_no_approval_or_merge_in_gh_log(&gh_log);
+
+    let serialized = serde_json::to_string(&report).context("serialize report")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+
+    Ok(())
+}
+
+#[test]
 fn run_passes_codex_bin_to_autopilot() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -728,6 +990,932 @@ fn watch_once_runs_one_poll_iteration() -> Result<()> {
     assert_eq!(report["iteration_count"], 1);
     assert_eq!(report["runs"].as_array().context("runs")?.len(), 1);
     assert_eq!(report["runs"][0]["status"], "dry_run");
+
+    Ok(())
+}
+
+#[test]
+fn workspace_scan_aggregates_multiple_fake_repos_without_leaking_paths() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let issue_repo = create_named_committed_repo(temp.path(), "issue-repo")?;
+    let mixed_repo = create_named_committed_repo(temp.path(), "mixed-repo")?;
+    let disabled_repo = create_named_committed_repo(temp.path(), "disabled-repo")?;
+    let config_path = temp.path().join("workspace-inbox.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "fake",
+            "default_max_items_per_repo": 2,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "issue-only",
+                    "path": path_str(&issue_repo)?,
+                    "enabled": true,
+                    "max_items": 1,
+                    "labels": ["triage"],
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "mixed",
+                    "path": path_str(&mixed_repo)?,
+                    "enabled": true,
+                    "labels": ["triage"],
+                    "include_pull_requests": true,
+                    "include_issues": true
+                },
+                {
+                    "id": "disabled",
+                    "path": path_str(&disabled_repo)?,
+                    "enabled": false,
+                    "include_pull_requests": true,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "require_clean_primary": true,
+                "require_validation_for_publication": true,
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let scan = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "scan",
+            "--config",
+            path_str(&config_path)?,
+            "--json",
+        ],
+        temp.path(),
+    )?;
+
+    assert_eq!(scan["version"], 1);
+    assert_public_config_path(&scan, "workspace-inbox.json")?;
+    assert_eq!(scan["strict"], false);
+    assert_eq!(scan["success"], true);
+    assert_eq!(scan["repo_counts"]["total"], 3);
+    assert_eq!(scan["repo_counts"]["enabled"], 2);
+    assert_eq!(scan["repo_counts"]["disabled"], 1);
+    assert_eq!(scan["repo_counts"]["succeeded"], 2);
+    assert_eq!(scan["repo_counts"]["refused"], 0);
+
+    let issue_entry = workspace_repo_entry(&scan, "issue-only")?;
+    assert_eq!(issue_entry["enabled"], true);
+    assert_eq!(issue_entry["permission_mode"], "fake");
+    assert_eq!(issue_entry["status"], "scanned");
+    assert_eq!(issue_entry["success"], true);
+    assert_eq!(issue_entry["refused"], false);
+    assert_eq!(issue_entry["scan_report"]["selected_count"], 1);
+    assert_eq!(issue_entry["scan_report"]["candidate_count"], 3);
+
+    let mixed_entry = workspace_repo_entry(&scan, "mixed")?;
+    assert_eq!(mixed_entry["enabled"], true);
+    assert_eq!(mixed_entry["permission_mode"], "fake");
+    assert_eq!(mixed_entry["scan_report"]["selected_count"], 2);
+    assert_eq!(mixed_entry["scan_report"]["candidate_count"], 4);
+
+    let disabled_entry = workspace_repo_entry(&scan, "disabled")?;
+    assert_eq!(disabled_entry["enabled"], false);
+    assert_eq!(disabled_entry["status"], "disabled");
+    assert_eq!(disabled_entry["success"], true);
+    assert_eq!(disabled_entry["refused"], false);
+    assert!(disabled_entry["scan_report"].is_null());
+
+    let serialized = serde_json::to_string(&scan).context("serialize workspace scan")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+    assert!(!serialized.contains("secret-value"));
+    assert!(!issue_repo.join(".maco/autopilot/runs").exists());
+    assert!(!mixed_repo.join(".maco/autopilot/runs").exists());
+    assert!(!disabled_repo.join(".maco/autopilot/runs").exists());
+
+    Ok(())
+}
+
+#[test]
+fn workspace_scan_uses_default_github_read_and_repo_fake_override() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let github_repo = create_named_committed_repo(temp.path(), "github-repo")?;
+    let fake_repo = create_named_committed_repo(temp.path(), "fake-repo")?;
+    let config_path = temp.path().join("workspace-inbox-permissions.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "github_read",
+            "default_max_items_per_repo": 2,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "github-default",
+                    "path": path_str(&github_repo)?,
+                    "enabled": true,
+                    "max_items": 1,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "fake-override",
+                    "path": path_str(&fake_repo)?,
+                    "enabled": true,
+                    "permission_mode": "fake",
+                    "include_pull_requests": true,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let scan = run_success_json_in_dir_with_path(
+        &[
+            "inbox",
+            "workspace",
+            "scan",
+            "--config",
+            path_str(&config_path)?,
+            "--json",
+        ],
+        temp.path(),
+        &gh.path_dir,
+    )?;
+
+    let github_entry = workspace_repo_entry(&scan, "github-default")?;
+    assert_eq!(github_entry["permission_mode"], "github_read");
+    assert_eq!(github_entry["scan_report"]["github_enabled"], true);
+    assert_eq!(github_entry["scan_report"]["selected_count"], 1);
+    assert!(github_entry["scan_report"]["items"][0]["url"]
+        .as_str()
+        .context("github item url")?
+        .starts_with("https://github.test/"));
+
+    let fake_entry = workspace_repo_entry(&scan, "fake-override")?;
+    assert_eq!(fake_entry["permission_mode"], "fake");
+    assert_eq!(fake_entry["scan_report"]["github_enabled"], false);
+    assert_eq!(fake_entry["scan_report"]["selected_count"], 2);
+    assert!(fake_entry["scan_report"]["items"]
+        .as_array()
+        .context("fake items")?
+        .iter()
+        .filter(|item| item["selected"] == true)
+        .all(|item| item["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("fake://"))));
+
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert_eq!(gh_log.matches("issue list").count(), 1);
+    assert!(!gh_log.contains("pr list"));
+    assert_no_approval_or_merge_in_gh_log(&gh_log);
+    assert!(!github_repo.join(".maco/autopilot/runs").exists());
+    assert!(!fake_repo.join(".maco/autopilot/runs").exists());
+
+    let serialized = serde_json::to_string(&scan).context("serialize workspace scan")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+    assert!(serialized.contains("https://github.test/acme/demo/issues/11"));
+
+    Ok(())
+}
+
+#[test]
+fn workspace_watch_once_runs_one_workspace_iteration() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_named_committed_repo(temp.path(), "watch-repo")?;
+    let config_path = temp.path().join("workspace-watch.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "fake",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "watch",
+                    "path": path_str(&repo_path)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let report = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "watch",
+            "--config",
+            path_str(&config_path)?,
+            "--poll-seconds",
+            "1",
+            "--once",
+            "--dry-run",
+            "--json",
+        ],
+        temp.path(),
+    )?;
+
+    assert_eq!(report["version"], 1);
+    assert_public_config_path(&report, "workspace-watch.json")?;
+    assert_eq!(report["poll_seconds"], 1);
+    assert_eq!(report["once"], true);
+    assert_eq!(report["success"], true);
+    assert_eq!(report["iteration_count"], 1);
+    assert_eq!(report["auto_merge_performed"], false);
+    assert_eq!(report["auto_approval_performed"], false);
+    let runs = report["runs"].as_array().context("workspace runs")?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["status"], Value::Null);
+    assert_eq!(runs[0]["success"], true);
+    assert_eq!(runs[0]["auto_merge_performed"], false);
+    assert_eq!(runs[0]["auto_approval_performed"], false);
+    assert!(runs[0]["run_id"]
+        .as_str()
+        .context("generated workspace run id")?
+        .starts_with("inbox-workspace-"));
+    assert!(runs[0]["run_dir"]
+        .as_str()
+        .context("workspace run dir")?
+        .starts_with(".maco/inbox-workspace/runs/inbox-workspace-"));
+    let repo_entry = workspace_repo_entry(&runs[0], "watch")?;
+    assert_eq!(repo_entry["status"], "dry_run");
+    assert_eq!(repo_entry["success"], true);
+    assert_eq!(repo_entry["run_report"]["status"], "dry_run");
+    assert!(temp
+        .path()
+        .join(
+            runs[0]["artifacts"]["final_report"]
+                .as_str()
+                .context("workspace final report")?
+        )
+        .exists());
+
+    let serialized = serde_json::to_string(&report).context("serialize watch report")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+
+    Ok(())
+}
+
+#[test]
+fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let good_repo = create_named_committed_repo(temp.path(), "good-repo")?;
+    let dirty_repo = create_named_committed_repo(temp.path(), "dirty-repo")?;
+    write_file(
+        &dirty_repo.join("README.md"),
+        "# Smoke\n\nuncommitted primary change\n",
+    )?;
+
+    let non_strict_config = temp.path().join("workspace-non-strict.json");
+    write_json_file(
+        &non_strict_config,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "fake",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "good",
+                    "path": path_str(&good_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "dirty",
+                    "path": path_str(&dirty_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "require_clean_primary": true,
+                "require_validation_for_publication": true,
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let report = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&non_strict_config)?,
+            "--run-id",
+            "workspace-partial",
+            "--json",
+        ],
+        temp.path(),
+    )?;
+
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["run_id"], "workspace-partial");
+    assert_eq!(report["strict"], false);
+    assert_eq!(report["success"], true);
+    assert_eq!(report["repo_counts"]["total"], 2);
+    assert_eq!(report["repo_counts"]["succeeded"], 1);
+    assert_eq!(report["repo_counts"]["refused"], 1);
+    assert_eq!(
+        report["run_dir"],
+        ".maco/inbox-workspace/runs/workspace-partial"
+    );
+    assert_eq!(report["auto_merge_performed"], false);
+    assert_eq!(report["auto_approval_performed"], false);
+    assert!(temp
+        .path()
+        .join(".maco/inbox-workspace/runs/workspace-partial/final-report.json")
+        .exists());
+
+    let good_entry = workspace_repo_entry(&report, "good")?;
+    assert_eq!(good_entry["status"], "succeeded");
+    assert_eq!(good_entry["success"], true);
+    assert_eq!(good_entry["refused"], false);
+    assert_eq!(good_entry["run_report"]["selected_item_count"], 1);
+    let good_final = good_entry["run_report"]["artifacts"]["final_report"]
+        .as_str()
+        .context("good final report path")?;
+    assert!(good_repo.join(good_final).exists());
+
+    let dirty_entry = workspace_repo_entry(&report, "dirty")?;
+    assert_eq!(dirty_entry["status"], "refused");
+    assert_eq!(dirty_entry["success"], false);
+    assert_eq!(dirty_entry["refused"], true);
+    assert_eq!(dirty_entry["run_report"]["status"], "refused");
+    assert_refusal_kind(&dirty_entry["run_report"], "dirty_primary")?;
+
+    let strict_config = temp.path().join("workspace-strict.json");
+    write_json_file(
+        &strict_config,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "fake",
+            "default_max_items_per_repo": 1,
+            "strict": true,
+            "repositories": [
+                {
+                    "id": "good",
+                    "path": path_str(&good_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "dirty",
+                    "path": path_str(&dirty_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "require_clean_primary": true,
+                "require_validation_for_publication": true,
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let strict_report = run_failure_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&strict_config)?,
+            "--run-id",
+            "workspace-strict",
+            "--json",
+        ],
+        temp.path(),
+    )?;
+    assert_eq!(strict_report["strict"], true);
+    assert_eq!(strict_report["success"], false);
+    assert_eq!(strict_report["repo_counts"]["refused"], 1);
+    assert_eq!(
+        workspace_repo_entry(&strict_report, "dirty")?["refused"],
+        true
+    );
+
+    let serialized =
+        serde_json::to_string(&(report, strict_report)).context("serialize reports")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+
+    Ok(())
+}
+
+#[test]
+fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let read_repo = create_named_committed_repo(temp.path(), "read-repo")?;
+    let local_repo = create_named_committed_repo(temp.path(), "local-repo")?;
+    let read_local_config = temp.path().join("workspace-read-local.json");
+    write_json_file(
+        &read_local_config,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "github_read",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "read",
+                    "path": path_str(&read_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "local",
+                    "path": path_str(&local_repo)?,
+                    "enabled": true,
+                    "permission_mode": "github_local",
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let read_local = run_success_json_in_dir_with_path(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&read_local_config)?,
+            "--run-id",
+            "workspace-read-local",
+            "--json",
+        ],
+        temp.path(),
+        &gh.path_dir,
+    )?;
+
+    let read_entry = workspace_repo_entry(&read_local, "read")?;
+    assert_eq!(read_entry["permission_mode"], "github_read");
+    assert_eq!(read_entry["status"], "planned");
+    assert_eq!(read_entry["run_report"]["status"], "planned");
+    assert_eq!(
+        read_entry["run_report"]["item_reports"][0]["autopilot_success"],
+        Value::Null
+    );
+    assert!(!read_repo.join(".maco/autopilot/runs").exists());
+
+    let local_entry = workspace_repo_entry(&read_local, "local")?;
+    assert_eq!(local_entry["permission_mode"], "github_local");
+    assert_eq!(local_entry["status"], "succeeded");
+    assert_eq!(
+        local_entry["run_report"]["item_reports"][0]["autopilot_success"],
+        true
+    );
+    assert!(local_repo.join(".maco/autopilot/runs").exists());
+    let local_github_report = read_json_file(
+        &local_repo.join(
+            local_entry["run_report"]["item_reports"][0]["github_report_path"]
+                .as_str()
+                .context("local github report path")?,
+        ),
+    )?;
+    assert_eq!(local_github_report["status"], "local_report_only");
+
+    let git_repo = create_named_committed_repo(temp.path(), "git-repo")?;
+    let pr_repo = create_named_committed_repo(temp.path(), "pr-repo")?;
+    let dry_publish_config = temp.path().join("workspace-dry-publish.json");
+    write_json_file(
+        &dry_publish_config,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "github_git",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "git-default",
+                    "path": path_str(&git_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "github-pr",
+                    "path": path_str(&pr_repo)?,
+                    "enabled": true,
+                    "permission_mode": "github_pr",
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let dry_publish = run_success_json_in_dir_with_path(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&dry_publish_config)?,
+            "--run-id",
+            "workspace-dry-publish",
+            "--dry-run",
+            "--json",
+        ],
+        temp.path(),
+        &gh.path_dir,
+    )?;
+    let git_entry = workspace_repo_entry(&dry_publish, "git-default")?;
+    assert_eq!(git_entry["permission_mode"], "github_git");
+    assert_eq!(git_entry["status"], "dry_run");
+    assert_eq!(
+        first_workspace_item_plan(&git_repo, git_entry)?["forge_mode"],
+        "git"
+    );
+    assert!(!git_repo.join(".maco/autopilot/runs").exists());
+
+    let pr_entry = workspace_repo_entry(&dry_publish, "github-pr")?;
+    assert_eq!(pr_entry["permission_mode"], "github_pr");
+    assert_eq!(pr_entry["status"], "dry_run");
+    assert_eq!(
+        first_workspace_item_plan(&pr_repo, pr_entry)?["forge_mode"],
+        "github"
+    );
+    assert!(!pr_repo.join(".maco/autopilot/runs").exists());
+
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert!(gh_log.contains("issue list"));
+    assert!(!gh_log.contains("issue comment"));
+    assert!(!gh_log.contains("pr comment"));
+    assert!(!gh_log.contains("pr create"));
+    assert_no_approval_or_merge_in_gh_log(&gh_log);
+
+    let serialized =
+        serde_json::to_string(&(read_local, dry_publish)).context("serialize reports")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+
+    Ok(())
+}
+
+#[test]
+fn workspace_run_refuses_real_publication_modes_without_validation_commands() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let git_repo = create_named_committed_repo(temp.path(), "publish-no-validation-git-repo")?;
+    let pr_repo = create_named_committed_repo(temp.path(), "publish-no-validation-pr-repo")?;
+    let full_repo = create_named_committed_repo(temp.path(), "publish-no-validation-full-repo")?;
+    for (repo_path, origin_name) in [
+        (&git_repo, "publish-no-validation-git-origin.git"),
+        (&pr_repo, "publish-no-validation-pr-origin.git"),
+        (&full_repo, "publish-no-validation-full-origin.git"),
+    ] {
+        let origin_path = init_bare_origin(temp.path(), origin_name)?;
+        run_git(&[
+            "-C",
+            path_str(repo_path)?,
+            "remote",
+            "add",
+            "origin",
+            path_str(&origin_path)?,
+        ])?;
+    }
+    let config_path = temp.path().join("workspace-publish-no-validation.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "github_pr",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "github-git",
+                    "path": path_str(&git_repo)?,
+                    "enabled": true,
+                    "permission_mode": "github_git",
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "github-pr",
+                    "path": path_str(&pr_repo)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                },
+                {
+                    "id": "github-full",
+                    "path": path_str(&full_repo)?,
+                    "enabled": true,
+                    "permission_mode": "github_full",
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "require_clean_primary": true,
+                "require_validation_for_publication": true,
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+    let gh = write_fake_gh(temp.path())?;
+
+    let report = run_success_json_in_dir_with_path(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&config_path)?,
+            "--run-id",
+            "workspace-publish-no-validation",
+            "--json",
+        ],
+        temp.path(),
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(report["strict"], false);
+    assert_eq!(report["success"], true);
+    assert_eq!(report["repo_counts"]["succeeded"], 0);
+    assert_eq!(report["repo_counts"]["refused"], 3);
+    for (id, permission_mode) in [
+        ("github-git", "github_git"),
+        ("github-pr", "github_pr"),
+        ("github-full", "github_full"),
+    ] {
+        let entry = workspace_repo_entry(&report, id)?;
+        assert_eq!(entry["permission_mode"], permission_mode);
+        assert_eq!(entry["status"], "refused");
+        assert_eq!(entry["success"], false);
+        assert_eq!(entry["refused"], true);
+        let message = entry["message"].as_str().context("refusal message")?;
+        assert!(message.contains("requires at least one validation command"));
+        assert!(message.contains(&format!("permission mode {permission_mode}")));
+        assert!(entry["run_report"].is_null());
+    }
+
+    let repo_run_artifact = read_json_file(&temp.path().join(
+        ".maco/inbox-workspace/runs/workspace-publish-no-validation/repo-github-pr-run-report.json",
+    ))?;
+    assert_eq!(repo_run_artifact["phase"], "run");
+    assert_eq!(repo_run_artifact["status"], "refused");
+    assert_eq!(repo_run_artifact["success"], false);
+    assert_eq!(repo_run_artifact["refused"], true);
+    assert!(repo_run_artifact["message"]
+        .as_str()
+        .context("artifact refusal message")?
+        .contains("requires at least one validation command"));
+    assert!(!git_repo.join(".maco/autopilot/runs").exists());
+    assert!(!pr_repo.join(".maco/autopilot/runs").exists());
+    assert!(!full_repo.join(".maco/autopilot/runs").exists());
+
+    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
+    assert_eq!(gh_log.matches("issue list").count(), 3);
+    assert!(!gh_log.contains("pr create"));
+    assert!(!gh_log.contains("comment"));
+    assert_no_approval_or_merge_in_gh_log(&gh_log);
+
+    let serialized = serde_json::to_string(&report).context("serialize report")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+
+    Ok(())
+}
+
+#[test]
+fn workspace_scan_error_redacts_generic_temp_absolute_paths() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let secret_path = PathBuf::from(format!("/tmp/maco-secret-path-{}", std::process::id()));
+    let config_path = temp.path().join("workspace-redact-generic-path.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "fake",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "missing",
+                    "path": path_str(&secret_path)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let scan = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "scan",
+            "--config",
+            path_str(&config_path)?,
+            "--json",
+        ],
+        temp.path(),
+    )?;
+
+    let entry = workspace_repo_entry(&scan, "missing")?;
+    assert_eq!(entry["status"], "failed");
+    assert_eq!(entry["success"], false);
+    assert_eq!(entry["refused"], false);
+    assert!(entry["message"]
+        .as_str()
+        .context("scan failure message")?
+        .contains("<redacted:local-path>"));
+
+    let serialized = serde_json::to_string(&scan).context("serialize workspace scan")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+    assert!(!serialized.contains("/tmp/maco-secret-path"));
+    assert!(!serialized.contains(path_str(&secret_path)?));
+
+    Ok(())
+}
+
+#[test]
+fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_named_committed_repo(temp.path(), "duplicate-repo")?;
+    let config_path = temp.path().join("workspace-duplicates.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "fake",
+            "default_max_items_per_repo": 1,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "solo",
+                    "path": path_str(&repo_path)?,
+                    "enabled": true,
+                    "include_pull_requests": false,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let first = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&config_path)?,
+            "--run-id",
+            "workspace-duplicates-1",
+            "--json",
+        ],
+        temp.path(),
+    )?;
+    assert_eq!(
+        workspace_repo_entry(&first, "solo")?["run_report"]["selected_item_count"],
+        1
+    );
+
+    let scan = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "scan",
+            "--config",
+            path_str(&config_path)?,
+            "--json",
+        ],
+        temp.path(),
+    )?;
+    let scan_entry = workspace_repo_entry(&scan, "solo")?;
+    assert_eq!(scan_entry["scan_report"]["selected_count"], 0);
+    assert!(scan_entry["scan_report"]["items"]
+        .as_array()
+        .context("duplicate scan items")?
+        .iter()
+        .any(|item| item["skip_reason"] == "duplicate"
+            && item["duplicate"]["matched_run_id"]
+                .as_str()
+                .is_some_and(|run_id| run_id.starts_with("workspace-duplicates-1"))));
+
+    let second = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&config_path)?,
+            "--run-id",
+            "workspace-duplicates-2",
+            "--json",
+        ],
+        temp.path(),
+    )?;
+    let second_entry = workspace_repo_entry(&second, "solo")?;
+    assert_eq!(second_entry["status"], "no_items");
+    assert_eq!(second_entry["run_report"]["selected_item_count"], 0);
+    assert!(!repo_path
+        .join(".maco/autopilot/runs/workspace-duplicates-2")
+        .exists());
+
+    let serialized = serde_json::to_string(&(first, scan, second)).context("serialize reports")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+
+    Ok(())
+}
+
+#[test]
+fn workspace_public_json_redacts_temp_paths_and_secret_like_values() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_named_committed_repo(temp.path(), "public-json-repo")?;
+    let config_path = temp.path().join("workspace-public-json.json");
+    write_json_file(
+        &config_path,
+        &json!({
+            "version": 1,
+            "default_permission_mode": "fake",
+            "default_max_items_per_repo": 4,
+            "strict": false,
+            "repositories": [
+                {
+                    "id": "public-json",
+                    "path": path_str(&repo_path)?,
+                    "enabled": true,
+                    "include_pull_requests": true,
+                    "include_issues": true
+                }
+            ],
+            "safety": {
+                "allow_auto_approval": false,
+                "allow_auto_merge": false
+            }
+        }),
+    )?;
+
+    let scan = run_success_json_in_dir(
+        &[
+            "inbox",
+            "workspace",
+            "scan",
+            "--config",
+            path_str(&config_path)?,
+            "--json",
+        ],
+        temp.path(),
+    )?;
+    let entry = workspace_repo_entry(&scan, "public-json")?;
+    let unsafe_item = entry["scan_report"]["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .find(|item| item["item_id"] == "issue-303")
+        .context("unsafe fake issue")?;
+    assert_eq!(unsafe_item["selected"], false);
+    assert_eq!(unsafe_item["skip_reason"], "privacy_refused");
+
+    let serialized = serde_json::to_string(&scan).context("serialize workspace scan")?;
+    assert_public_json_is_sanitized(&serialized, temp.path());
+    assert!(!serialized.contains("secret-value"));
+    assert!(!serialized.contains("/home/example"));
+    assert!(!serialized.contains(path_str(&config_path)?));
+    assert!(!serialized.contains(path_str(&repo_path)?));
 
     Ok(())
 }
@@ -1033,6 +2221,48 @@ fn refusal_by_kind<'a>(report: &'a Value, kind: &str) -> Result<&'a Value> {
         .with_context(|| format!("expected refusal kind {kind}"))
 }
 
+fn workspace_repo_entry<'a>(report: &'a Value, id: &str) -> Result<&'a Value> {
+    report["repositories"]
+        .as_array()
+        .context("workspace repositories")?
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(id))
+        .with_context(|| format!("expected workspace repository entry {id}"))
+}
+
+fn first_workspace_item_plan(repo: &Path, entry: &Value) -> Result<Value> {
+    let plan_path = entry["run_report"]["item_reports"][0]["plan_path"]
+        .as_str()
+        .context("first item plan path")?;
+    read_json_file(&repo.join(plan_path))
+}
+
+fn assert_public_config_path(report: &Value, expected_file_name: &str) -> Result<()> {
+    let config_path = report["config_path"].as_str().context("config_path")?;
+    assert!(config_path.ends_with(expected_file_name));
+    assert!(
+        !Path::new(config_path).is_absolute(),
+        "config_path should be public-safe, got {config_path}"
+    );
+    Ok(())
+}
+
+fn assert_no_approval_or_merge_in_gh_log(gh_log: &str) {
+    for forbidden in [
+        "pr merge",
+        "pr review",
+        "--approve",
+        "approve",
+        "approval",
+        "merge --auto",
+    ] {
+        assert!(
+            !gh_log.contains(forbidden),
+            "fake gh log unexpectedly contained {forbidden}: {gh_log}"
+        );
+    }
+}
+
 fn array_contains(value: &Value, expected: &str) -> Result<bool> {
     Ok(value
         .as_array()
@@ -1045,6 +2275,7 @@ fn assert_public_json_is_sanitized(serialized: &str, repo_path: &Path) {
     assert!(!serialized.contains(&repo_path.display().to_string()));
     assert!(!serialized.contains("/mnt/d/"));
     assert!(!serialized.contains("/home/"));
+    assert!(!serialized.contains("/tmp/maco-secret-path"));
     assert!(!serialized.contains("C:\\Users\\"));
 }
 
@@ -1071,49 +2302,57 @@ fn write_live_claim(repo: &Path, claim_id: &str, status: &str, path: &str) -> Re
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "maco command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "parse success json from stdout: {}",
-            String::from_utf8_lossy(&output.stdout)
-        )
-    })
+    run_json_command(args, None, None, true)
 }
 
 fn run_success_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
-    let output = Command::new(BIN)
-        .args(args)
-        .env("PATH", path_with_prefix(path_dir)?)
-        .output()
-        .context("run maco")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "maco command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "parse success json from stdout: {}",
-            String::from_utf8_lossy(&output.stdout)
-        )
-    })
+    run_json_command(args, None, Some(path_dir), true)
+}
+
+fn run_success_json_in_dir(args: &[&str], cwd: &Path) -> Result<Value> {
+    run_json_command(args, Some(cwd), None, true)
+}
+
+fn run_success_json_in_dir_with_path(args: &[&str], cwd: &Path, path_dir: &Path) -> Result<Value> {
+    run_json_command(args, Some(cwd), Some(path_dir), true)
 }
 
 fn run_failure_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
-    if output.status.success() {
+    run_json_command(args, None, None, false)
+}
+
+fn run_failure_json_in_dir(args: &[&str], cwd: &Path) -> Result<Value> {
+    run_json_command(args, Some(cwd), None, false)
+}
+
+fn run_json_command(
+    args: &[&str],
+    cwd: Option<&Path>,
+    path_dir: Option<&Path>,
+    expect_success: bool,
+) -> Result<Value> {
+    let mut command = Command::new(BIN);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    if let Some(path_dir) = path_dir {
+        command.env("PATH", path_with_prefix(path_dir)?);
+    }
+    let output = command.output().context("run maco")?;
+    if expect_success && !output.status.success() {
+        anyhow::bail!(
+            "maco command failed: stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !expect_success && output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
     serde_json::from_slice(&output.stdout).with_context(|| {
         format!(
-            "parse failure json from stdout: {} stderr: {}",
+            "parse json from stdout: {} stderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )
@@ -1291,7 +2530,11 @@ fn path_with_prefix(path_dir: &Path) -> Result<String> {
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
-    create_committed_repo_with_gitignore(root, ".maco/\n.maco-cache/\n")
+    create_named_committed_repo(root, "repo")
+}
+
+fn create_named_committed_repo(root: &Path, name: &str) -> Result<std::path::PathBuf> {
+    create_named_committed_repo_with_gitignore(root, name, ".maco/\n.maco-cache/\n")
 }
 
 fn create_committed_repo_without_maco_ignore(root: &Path) -> Result<std::path::PathBuf> {
@@ -1302,7 +2545,15 @@ fn create_committed_repo_with_gitignore(
     root: &Path,
     gitignore_contents: &str,
 ) -> Result<std::path::PathBuf> {
-    let repo_path = root.join("repo");
+    create_named_committed_repo_with_gitignore(root, "repo", gitignore_contents)
+}
+
+fn create_named_committed_repo_with_gitignore(
+    root: &Path,
+    name: &str,
+    gitignore_contents: &str,
+) -> Result<std::path::PathBuf> {
+    let repo_path = root.join(name);
     let output = Command::new(BIN)
         .args(["init", "--repo", path_str(&repo_path)?, "--json"])
         .output()
@@ -1329,6 +2580,29 @@ fn create_committed_repo_with_gitignore(
     commit_all(&repo, "initial commit")?;
 
     Ok(repo_path)
+}
+
+fn init_bare_origin(root: &Path, name: &str) -> Result<PathBuf> {
+    let origin_path = root.join(name);
+    let output = Command::new("git")
+        .args(["init", "--bare", path_str(&origin_path)?])
+        .output()
+        .context("init bare origin")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "init bare origin failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(origin_path)
+}
+
+fn run_git(args: &[&str]) -> Result<()> {
+    let output = Command::new("git").args(args).output().context("run git")?;
+    if !output.status.success() {
+        anyhow::bail!("git failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
 }
 
 fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {

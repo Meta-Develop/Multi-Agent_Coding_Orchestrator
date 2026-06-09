@@ -5,7 +5,10 @@ use crate::{
     },
     artifacts::{self, ResolvedRunId, RunArtifactFamily},
     autopilot::{self, AutopilotRunOptions},
-    inbox::{self, InboxPermissionMode, InboxRunOptions, InboxScanOptions, InboxWatchOptions},
+    inbox::{
+        self, InboxPermissionMode, InboxRunOptions, InboxScanOptions, InboxWatchOptions,
+        InboxWorkspaceRunOptions, InboxWorkspaceScanOptions, InboxWorkspaceWatchOptions,
+    },
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
@@ -620,6 +623,7 @@ impl InboxCommand {
                 }
                 Ok(())
             }
+            InboxSubcommand::Workspace(command) => command.run(),
             InboxSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Inbox),
         }
     }
@@ -637,8 +641,121 @@ enum InboxSubcommand {
     Collect(CollectInboxArgs),
     /// Poll for inbox items and react according to policy.
     Watch(WatchInboxArgs),
+    /// Scan or run inbox supervision across multiple repositories.
+    Workspace(WorkspaceInboxCommand),
     /// List, inspect, or prune durable run artifacts.
     Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceInboxCommand {
+    #[command(subcommand)]
+    command: WorkspaceInboxSubcommand,
+}
+
+impl WorkspaceInboxCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            WorkspaceInboxSubcommand::Scan(args) => {
+                let report = inbox::scan_workspace_inbox(InboxWorkspaceScanOptions {
+                    config: args.config,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox workspace scan failed");
+                }
+                Ok(())
+            }
+            WorkspaceInboxSubcommand::Run(args) => {
+                let report = inbox::run_workspace_inbox(InboxWorkspaceRunOptions {
+                    config: args.config,
+                    run_id: RunId::new(&args.run_id)?,
+                    dry_run: args.dry_run,
+                    codex_bin: args.codex_bin,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox workspace run failed");
+                }
+                Ok(())
+            }
+            WorkspaceInboxSubcommand::Watch(args) => {
+                let report = inbox::watch_workspace_inbox(InboxWorkspaceWatchOptions {
+                    config: args.config,
+                    poll_seconds: args.poll_seconds,
+                    once: args.once,
+                    dry_run: args.dry_run,
+                    codex_bin: args.codex_bin,
+                })?;
+                print_query_report(&report, args.json)?;
+                if report.runs.iter().any(|run| !run.success) {
+                    bail!("inbox workspace watch observed a failed run");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceInboxSubcommand {
+    /// Scan configured repositories without launching work.
+    Scan(ScanWorkspaceInboxArgs),
+    /// Run configured repositories under a workspace run id.
+    Run(RunWorkspaceInboxArgs),
+    /// Poll configured repositories and run workspace inbox supervision.
+    Watch(WatchWorkspaceInboxArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScanWorkspaceInboxArgs {
+    /// Workspace inbox JSON config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunWorkspaceInboxArgs {
+    /// Workspace inbox JSON config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Stable workspace run id for `.maco/inbox-workspace/runs/<run-id>` artifacts.
+    #[arg(long)]
+    run_id: String,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Codex-compatible executable to pass through to per-repository inbox runs.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchWorkspaceInboxArgs {
+    /// Workspace inbox JSON config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Seconds between poll iterations.
+    #[arg(long, default_value_t = 60)]
+    poll_seconds: u64,
+    /// Run one poll iteration and return.
+    #[arg(long)]
+    once: bool,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Codex-compatible executable to pass through to per-repository inbox runs.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]

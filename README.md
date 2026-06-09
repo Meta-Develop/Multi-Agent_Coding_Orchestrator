@@ -738,6 +738,70 @@ while ignoring its own `.maco/**` and `.maco-cache/**` runtime artifacts.
 Refusal JSON includes paths and lock details. Inbox never performs automatic
 merge; human review remains the next action after a successful reaction.
 
+Run the cross-repository inbox workspace supervisor:
+
+```json
+{
+  "version": 1,
+  "default_permission_mode": "github_read",
+  "default_max_items_per_repo": 2,
+  "strict": false,
+  "repositories": [
+    {
+      "id": "orchestrator",
+      "path": "../Multi-Agent_Coding_Orchestrator",
+      "enabled": true,
+      "permission_mode": "github_local",
+      "max_items": 1,
+      "labels": ["bug"],
+      "include_pull_requests": true,
+      "include_issues": true
+    },
+    {
+      "id": "docs",
+      "path": "../project-docs",
+      "enabled": false,
+      "include_pull_requests": true,
+      "include_issues": true
+    }
+  ],
+  "safety": {
+    "require_clean_primary": true,
+    "require_validation_for_publication": true,
+    "allow_auto_approval": false,
+    "allow_auto_merge": false
+  }
+}
+```
+
+```bash
+cargo run -- inbox workspace scan --config workspace-inbox.json --json
+cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-demo --json
+cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-dry --dry-run --json
+cargo run -- inbox workspace watch --config workspace-inbox.json --poll-seconds 60 --once --json
+```
+
+Workspace inbox supervises the same inbox flow across multiple configured local
+repositories. The aggregate JSON reports `version`, a public-safe `config_path`,
+`strict`, repo counts, and one entry per repository with `id`, `enabled`,
+`permission_mode`, `status`, `success`, `refused`, optional `message`, and an
+embedded `scan_report` or `run_report`. Workspace run artifacts are written
+under `.maco/inbox-workspace/runs/<run-id>/`, while per-repo repair artifacts
+remain under each repository's `.maco/inbox/runs/<run-id>/` tree. Public reports
+must not expose local temp paths, credentials, raw secrets, or private bodies.
+
+`strict: false` keeps scanning or running later repositories when one repository
+is disabled, empty, dirty, or refused; the per-repo entry records the failure.
+`strict: true` turns a repository refusal or failure into an aggregate command
+failure. Permission modes inherit from `default_permission_mode` and can be
+overridden per repository. `github_read` only scans and plans through `gh`,
+`github_local` can run local repair without source comments, `github_git` can
+plan or perform Git branch publication without GitHub PR creation, and
+`github_pr`/`github_full` are used only when explicitly configured. Workspace
+inbox is cross-repository supervision, not approval or merge automation:
+automatic approval and automatic merge are unsupported, and reports keep
+`auto_approval_performed=false` and `auto_merge_performed=false`.
+
 Cleanup examples:
 
 ```bash

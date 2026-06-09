@@ -76,6 +76,14 @@ Multi-Agent Coding Orchestrator.
   items, converts issue intake plus PR review and failing CI context into
   autopilot plans, writes `.maco/inbox/runs/<run-id>/` artifacts, and preserves
   the no-network, no-credentials, no-automatic-merge default.
+- Cross-repository inbox workspace supervision with
+  `maco inbox workspace scan/run/watch --config <path>`. Workspace configs
+  select enabled repositories, per-repo or default permission modes, per-repo
+  item limits, issue/PR inclusion, labels, strict failure behavior, and safety
+  flags. Aggregate reports use public-safe config and artifact paths, include
+  repo counts and per-repo scan or run reports, continue across repository
+  refusals in non-strict mode, fail the aggregate command in strict mode, and
+  write workspace artifacts under `.maco/inbox-workspace/runs/<run-id>/`.
 - Fake PR review and failing CI context enrich inbox-generated repair plans
   with paths, reasons, and validation expectations. Richer live GitHub review
   and CI reaction remains explicit opt-in and future hardening work.
@@ -130,6 +138,12 @@ Nix shell.
   `auto_merge=true`, but always writes `auto_merge_performed=false` and leaves
   human review and merge as the next action. Inbox reactions keep the same
   boundary and do not apply or merge repaired work automatically.
+- Workspace inbox is cross-repository supervision, not approval or merge
+  automation. Safety flags do not enable automatic approval or automatic merge;
+  workspace reports keep `auto_approval_performed=false` and
+  `auto_merge_performed=false`. GitHub PR publication and source comments remain
+  limited to explicitly configured permission modes, and Git-only publication
+  does not create GitHub PRs.
 - Live claim liveness uses human-readable Markdown parsing. Missing timestamps
   are reported as stale risk instead of blocking command execution, and
   malformed timestamps are reported as unknown liveness.
