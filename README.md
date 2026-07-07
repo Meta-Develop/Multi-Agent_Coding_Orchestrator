@@ -120,13 +120,13 @@ Implemented local foundations:
 4. Provider-neutral LLM adapter boundaries with deterministic fake-provider
    tests and local fake-provider-backed `maco agent run` execution.
 
-Known limitations and roadmap for 0.2.0:
+Known limitations and roadmap for 0.3.0:
 
 1. Richer merge conflict classification is a known limitation. Current apply
    uses Git apply safety checks and reports structured blockers, but does not
    classify conflicts by symbol or dependency impact.
 2. Semantic task planning, including automatic path-claim and orchestration-plan
-   proposal, is post-release roadmap work. Current task-to-path proposals are
+   proposal, is post-0.3.0 roadmap work. Current task-to-path proposals are
    conservative helpers for autopilot and inbox defaults; claim gates remain
    authoritative.
 3. PR and issue publication are intentionally narrow. The fake forge is
@@ -137,9 +137,9 @@ Known limitations and roadmap for 0.2.0:
    `forge_mode: "github"`. Inbox intake keeps deterministic fake data as the default;
    GitHub inbox scanning is selected only with an explicit GitHub source.
    Issue triage metadata remains minimal.
-4. Real LLM providers remain post-release roadmap work and must be opt-in,
+4. Real LLM providers remain post-0.3.0 roadmap work and must be opt-in,
    explicitly approved, and covered by additional invariant tests.
-5. Semantic-map caching and broader language adapters are post-release roadmap
+5. Semantic-map caching and broader language adapters are post-0.3.0 roadmap
    work after the Rust path is stable.
 6. Automatic merge remains intentionally absent. Autopilot can record
    `auto_merge=true` as a request, but always reports

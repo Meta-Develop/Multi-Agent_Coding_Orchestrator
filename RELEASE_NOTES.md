@@ -1,5 +1,76 @@
 # Release Notes
 
+## 0.3.0
+
+Release-readiness memo for the current 0.3.0 local-first CLI release line of
+the Multi-Agent Coding Orchestrator.
+
+### Implemented Scope
+
+- Crate packaging metadata now includes crates.io keywords and categories for
+  command-line and development-tool discovery.
+- Task-path proposal helpers are more precise: word-boundary symbol matching,
+  no arbitrary first-file fallback, Git-ignore-aware planning repository walks,
+  and degraded-scan diagnostics surfaced in autopilot and inbox reports.
+- Supervisor child-report enforcement is hardened with lenient JSON report
+  recovery from noisy child output, structural failure for assigned workers
+  that do not report, parent audit of zero-worker children with non-empty
+  diffs, primary-worktree integrity rechecks, opt-in corrective retry through
+  `max_child_retries`, and claim-conflict diagnostics that name current owners.
+- Supervise evidence handling now includes worker-evidence cross-checks,
+  canonical child-report artifacts, per-assignment task override, and stable
+  child-diff baselines for auditable child results.
+- New terminal cross-runtime CONSULTANT role with `maco consult ask` and
+  `maco consult artifacts list/latest/prune`. Consultation is fake-first by
+  default, supports explicit read-only Codex and Claude CLI adapters, and can
+  be wired into supervise planning only by opt-in configuration.
+- Focused inbox unit tests cover the reaction loop and fixed two exposed bugs:
+  token-like `privacy_scan` predicate matching and `.maco` runtime-path
+  filtering in lock-overlap checks.
+- `maco worktree remove --force` has a hardened removal fallback and
+  idempotent re-removal behavior for safer cleanup of stale or partially
+  removed agent worktrees.
+
+### Verification Expectations
+
+This document does not authorize tagging, pushing, publishing a crate, or
+creating a GitHub release. Before any separate release-manager operation, run
+the project checks from a clean working tree:
+
+```bash
+cargo fmt -- --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+If Rust is not available globally, run the same commands through the documented
+Nix shell.
+
+### Known Limitations And Risks
+
+- Richer merge conflict classification remains a known limitation. Current
+  apply uses Git apply safety checks and reports structured blockers, but does
+  not classify conflicts by symbol or dependency impact.
+- Full semantic task planning remains roadmap work. Current task-to-path
+  proposals are conservative helpers for autopilot and inbox defaults; claim
+  gates remain authoritative.
+- Consultant results are advisory evidence only. Real Codex and Claude
+  consultant adapters are explicit local-process opt-ins, remain read-only, and
+  do not override assigned ownership, validation, review, or merge gates.
+- PR and issue publication remain intentionally narrow and opt-in for live
+  GitHub paths. Fake forge and fake inbox data stay the no-network defaults.
+- Real network LLM providers remain absent from `maco agent run` and must be
+  separately approved, adapter-bound, and covered by no-network invariant
+  tests before introduction.
+- Automatic merge remains intentionally absent. Autopilot and inbox can record
+  merge intent, but leave human review and merge as the next action.
+
+### Release Operations
+
+This memo does not tag a commit, push a branch, publish a crate, create a
+GitHub release, or publish any release artifact. Those operations remain
+separate release-manager actions.
+
 ## 0.2.0
 
 Release-readiness memo for the current local-first CLI release line of the
