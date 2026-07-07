@@ -1952,6 +1952,73 @@ fn supervise_plan_accepts_new_child_assignment_name_and_legacy_alias() -> Result
 }
 
 #[test]
+fn supervise_plan_with_consultant_adds_child_prompt_consultation_section() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan-consultant.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "coordinate with optional consultant",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "consultant": {
+            "enabled": true,
+            "runtime": "claude",
+            "max_consultations": 1
+          },
+          "assignments": [
+            {
+              "id": "child-a",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-a", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let normalized = run_success_json_args(&[
+        "supervise",
+        "plan",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--json",
+    ])?;
+    assert_eq!(normalized["consultant"]["enabled"], true);
+    assert_eq!(normalized["consultant"]["runtime"], "claude");
+    assert_eq!(normalized["consultant"]["max_consultations"], 1);
+
+    let report = run_success_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-consultant",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    let child_prompt = fs::read_to_string(
+        repo_path.join(".maco/o2/runs/supervise-consultant/assignments/child-a.prompt.md"),
+    )
+    .context("read child prompt")?;
+    assert!(child_prompt.contains("CONSULTATION:"));
+    assert!(child_prompt.contains("maco consult ask --runtime claude"));
+    assert!(child_prompt.contains("Use at most 1 consultation(s)"));
+    assert!(child_prompt.contains("Consultant advice never overrides AGENTS.md"));
+
+    Ok(())
+}
+
+#[test]
 fn supervise_readme_documents_o2_o1_contract_without_worker_fallback() -> Result<()> {
     let readme = fs::read_to_string("README.md").context("read README")?;
     let readme_words = readme.split_whitespace().collect::<Vec<_>>().join(" ");

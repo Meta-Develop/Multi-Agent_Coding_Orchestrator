@@ -14,6 +14,7 @@ use std::{
 #[serde(rename_all = "snake_case")]
 pub enum RunArtifactFamily {
     Autopilot,
+    Consult,
     Inbox,
     Supervise,
 }
@@ -22,6 +23,7 @@ impl RunArtifactFamily {
     pub fn label(self) -> &'static str {
         match self {
             Self::Autopilot => "autopilot",
+            Self::Consult => "consult",
             Self::Inbox => "inbox",
             Self::Supervise => "supervise",
         }
@@ -30,6 +32,7 @@ impl RunArtifactFamily {
     pub fn generated_prefix(self) -> &'static str {
         match self {
             Self::Autopilot => "autopilot",
+            Self::Consult => "consult",
             Self::Inbox => "inbox",
             Self::Supervise => "o2",
         }
@@ -38,6 +41,7 @@ impl RunArtifactFamily {
     pub fn run_root(self) -> PathBuf {
         match self {
             Self::Autopilot => PathBuf::from(".maco").join("autopilot").join("runs"),
+            Self::Consult => PathBuf::from(".maco").join("consult").join("runs"),
             Self::Inbox => PathBuf::from(".maco").join("inbox").join("runs"),
             Self::Supervise => PathBuf::from(".maco").join("o2").join("runs"),
         }
@@ -46,6 +50,7 @@ impl RunArtifactFamily {
     pub fn final_report_relative_path(self) -> PathBuf {
         match self {
             Self::Autopilot | Self::Inbox => PathBuf::from("final-report.json"),
+            Self::Consult => PathBuf::from("consultant-report.json"),
             Self::Supervise => PathBuf::from("reports").join("supervisor-final.json"),
         }
     }

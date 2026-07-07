@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{Delta, DiffFindOptions, DiffOptions, Oid, Repository, StatusOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -58,6 +58,38 @@ pub struct SupervisorPlan {
     pub semantic_coordination: SemanticCoordinationMode,
     #[serde(default)]
     pub assignments: Vec<OrchestratorAssignment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SupervisorConsultantPlan {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_consultant_runtime")]
+    pub runtime: String,
+    #[serde(default = "default_max_consultations")]
+    pub max_consultations: u32,
+}
+
+impl Default for SupervisorConsultantPlan {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            runtime: default_consultant_runtime(),
+            max_consultations: default_max_consultations(),
+        }
+    }
+}
+
+impl SupervisorConsultantPlan {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedSupervisorPlan {
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -323,6 +355,7 @@ pub struct ChildOrchestratorPromptContext<'a> {
     pub schema_path: &'a Path,
     pub worker_schema_path: &'a Path,
     pub auditor_schema_path: &'a Path,
+    pub consultant: &'a SupervisorConsultantPlan,
     pub claim_context: ChildPromptClaimContext<'a>,
 }
 
@@ -330,39 +363,101 @@ pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
 ) -> Result<SupervisorPlan> {
+    Ok(supervisor_plan_and_consultant_from_task_file(repo, task_file)?.plan)
+}
+
+pub fn supervisor_plan_document_from_task_file(
+    repo: impl AsRef<Path>,
+    task_file: impl AsRef<Path>,
+) -> Result<Value> {
+    let loaded = supervisor_plan_and_consultant_from_task_file(repo, task_file)?;
+    supervisor_plan_value(&loaded.plan, &loaded.consultant)
+}
+
+fn supervisor_plan_and_consultant_from_task_file(
+    repo: impl AsRef<Path>,
+    task_file: impl AsRef<Path>,
+) -> Result<LoadedSupervisorPlan> {
     let repo = discover_repo_root(repo.as_ref())?;
     let task_file = task_file.as_ref();
     let task = fs::read_to_string(task_file)
         .with_context(|| format!("failed to read task file {}", task_file.display()))?;
-    if let Ok(plan) = serde_json::from_str::<SupervisorPlan>(&task) {
-        return validate_supervisor_plan(plan);
+    if serde_json::from_str::<Value>(&task).is_ok() {
+        return parse_supervisor_plan_with_consultant(&task)
+            .with_context(|| format!("failed to parse supervisor plan {}", task_file.display()));
     }
 
-    Ok(SupervisorPlan {
-        version: SUPERVISOR_SCHEMA_VERSION,
-        task,
-        task_file: Some(path_relative_to(&repo, task_file)),
-        max_depth: default_max_depth(),
-        max_child_assignments: DEFAULT_MAX_CHILD_ASSIGNMENTS,
-        max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
-        child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
-        semantic_coordination: SemanticCoordinationMode::Off,
-        assignments: Vec::new(),
+    Ok(LoadedSupervisorPlan {
+        plan: SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task,
+            task_file: Some(path_relative_to(&repo, task_file)),
+            max_depth: default_max_depth(),
+            max_child_assignments: DEFAULT_MAX_CHILD_ASSIGNMENTS,
+            max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
+            child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            assignments: Vec::new(),
+        },
+        consultant: SupervisorConsultantPlan::default(),
     })
 }
 
 pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPlan> {
+    Ok(load_supervisor_plan_file_with_consultant(path)?.plan)
+}
+
+fn load_supervisor_plan_file_with_consultant(
+    path: impl AsRef<Path>,
+) -> Result<LoadedSupervisorPlan> {
     let path = path.as_ref();
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read supervisor plan {}", path.display()))?;
-    let plan: SupervisorPlan = serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse supervisor plan {}", path.display()))?;
-    validate_supervisor_plan(plan)
+    parse_supervisor_plan_with_consultant(&contents)
+        .with_context(|| format!("failed to parse supervisor plan {}", path.display()))
+}
+
+fn parse_supervisor_plan_with_consultant(contents: &str) -> Result<LoadedSupervisorPlan> {
+    let value: Value = serde_json::from_str(contents).context("supervisor plan is not JSON")?;
+    let consultant = consultant_from_plan_value(&value)?;
+    let plan: SupervisorPlan =
+        serde_json::from_value(value).context("supervisor plan fields are invalid")?;
+    let plan = validate_supervisor_plan(plan)?;
+    validate_consultant_plan(&consultant)?;
+    Ok(LoadedSupervisorPlan { plan, consultant })
+}
+
+fn consultant_from_plan_value(value: &Value) -> Result<SupervisorConsultantPlan> {
+    match value.get("consultant") {
+        Some(consultant) => {
+            serde_json::from_value(consultant.clone()).context("consultant plan field is invalid")
+        }
+        None => Ok(SupervisorConsultantPlan::default()),
+    }
+}
+
+fn supervisor_plan_value(
+    plan: &SupervisorPlan,
+    consultant: &SupervisorConsultantPlan,
+) -> Result<Value> {
+    let mut value =
+        serde_json::to_value(plan).context("failed to serialize normalized supervisor plan")?;
+    if !consultant.is_default() {
+        let object = value
+            .as_object_mut()
+            .context("normalized supervisor plan did not serialize to an object")?;
+        object.insert(
+            "consultant".to_string(),
+            serde_json::to_value(consultant)
+                .context("failed to serialize consultant plan field")?,
+        );
+    }
+    Ok(value)
 }
 
 pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<SupervisorFinalReport> {
-    let plan = load_supervisor_plan_file(&options.plan_file)?;
-    run_supervisor_plan(plan, options)
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    run_supervisor_plan(loaded.plan, loaded.consultant, options)
 }
 
 pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<SupervisorStatusReport> {
@@ -501,6 +596,7 @@ pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) ->
         schema_path,
         worker_schema_path,
         auditor_schema_path,
+        consultant,
         claim_context,
     } = context;
     let assignment_json = serde_json::to_string_pretty(assignment)
@@ -517,6 +613,7 @@ pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) ->
         &assignment.id,
         None,
     );
+    let consultation_section = consultation_prompt_section(consultant);
     Ok(format!(
         r#"{role_prefix}You are a child orchestrator in an opt-in local Codex CLI supervisor run.
 You are not the top supervisor. You are not alone in the repository.
@@ -563,6 +660,7 @@ Required behavior:
 - Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
 - Review every WorkerReport before writing your own OrchestratorReviewReport.
 - Include at least one accepted review-auditor report in audit_reports that covers all assigned worker ids; MACO rejects child reports with worker assignments that omit terminal audit evidence.
+{consultation_section}
 
 Safety requirements:
 - Do not edit outside the assigned paths, symbols, or modules.
@@ -609,7 +707,27 @@ Review auditor prompt template:
         assignment_json = assignment_json,
         worker_prompts = worker_prompts,
         auditor_prompt = auditor_prompt,
+        consultation_section = consultation_section,
     ))
+}
+
+fn consultation_prompt_section(consultant: &SupervisorConsultantPlan) -> String {
+    if !consultant.enabled {
+        return String::new();
+    }
+    format!(
+        r#"
+CONSULTATION:
+- If you are blocked after a genuine attempt, you may ask a terminal read-only CONSULTANT for a cross-runtime second opinion.
+- Use `maco consult ask --runtime {runtime} --repo <this-child-worktree> --question <focused question> --context-path <repo-relative-path> ...`.
+- The consultation path is advisory and read-only. It must not create worktrees, claims, patches, or repository mutations.
+- Use at most {max_consultations} consultation(s) for this child assignment.
+- Record each consultation in OrchestratorReviewReport findings with the question summary and whether it unblocked you.
+- Consultant advice never overrides AGENTS.md, project rules, assigned ownership, validation requirements, or acceptance gates.
+"#,
+        runtime = consultant.runtime.as_str(),
+        max_consultations = consultant.max_consultations
+    )
 }
 
 pub fn worker_prompt(
@@ -851,6 +969,7 @@ Return only a compliant OrchestratorReviewReport JSON final response matching th
 
 fn run_supervisor_plan(
     plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
     options: SupervisorRunOptions,
 ) -> Result<SupervisorFinalReport> {
     let repo = discover_repo_root(&options.repo)?;
@@ -873,7 +992,11 @@ fn run_supervisor_plan(
     let mut findings = Vec::new();
 
     let run_result = (|| -> Result<()> {
-        write_plan_snapshot(&dirs.assignments.join("supervisor-plan.json"), &plan)?;
+        write_plan_snapshot(
+            &dirs.assignments.join("supervisor-plan.json"),
+            &plan,
+            &consultant,
+        )?;
         write_orchestrator_schema(&dirs.schemas.join("orchestrator-review-report.schema.json"))?;
         write_worker_schema(&dirs.schemas.join("worker-report.schema.json"))?;
         write_auditor_schema(&dirs.schemas.join("auditor-report.schema.json"))?;
@@ -935,6 +1058,7 @@ fn run_supervisor_plan(
                 schema_path: &schema_path,
                 worker_schema_path: &worker_schema_path,
                 auditor_schema_path: &auditor_schema_path,
+                consultant: &consultant,
                 claim_context: ChildPromptClaimContext {
                     claim: &claim,
                     semantic_intent_token: semantic_token,
@@ -1272,6 +1396,16 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
     }
 
     Ok(plan)
+}
+
+fn validate_consultant_plan(consultant: &SupervisorConsultantPlan) -> Result<()> {
+    if !matches!(consultant.runtime.as_str(), "fake" | "codex" | "claude") {
+        bail!("consultant.runtime must be one of: fake, codex, claude");
+    }
+    if consultant.enabled && consultant.max_consultations == 0 {
+        bail!("consultant.max_consultations must be greater than zero when consultant is enabled");
+    }
+    Ok(())
 }
 
 fn validate_worker_assignments(assignment: &mut OrchestratorAssignment) -> Result<()> {
@@ -2512,10 +2646,15 @@ fn union_paths(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn write_plan_snapshot(path: &Path, plan: &SupervisorPlan) -> Result<()> {
+fn write_plan_snapshot(
+    path: &Path,
+    plan: &SupervisorPlan,
+    consultant: &SupervisorConsultantPlan,
+) -> Result<()> {
     let mut file = File::create(path)
         .with_context(|| format!("failed to create plan snapshot {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, plan)
+    let value = supervisor_plan_value(plan, consultant)?;
+    serde_json::to_writer_pretty(&mut file, &value)
         .with_context(|| format!("failed to write plan snapshot {}", path.display()))?;
     file.write_all(b"\n")
         .with_context(|| format!("failed to finish plan snapshot {}", path.display()))
@@ -2897,6 +3036,14 @@ fn default_max_child_retries() -> u8 {
 
 fn default_child_timeout_seconds() -> u64 {
     DEFAULT_CHILD_TIMEOUT_SECONDS
+}
+
+fn default_consultant_runtime() -> String {
+    "fake".to_string()
+}
+
+fn default_max_consultations() -> u32 {
+    2
 }
 
 fn child_orchestrator_role() -> AgentRole {

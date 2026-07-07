@@ -80,6 +80,12 @@ The current implementation covers a local-first command-line slice:
   preserves the same no-automatic-primary-apply boundary.
 - `maco supervise artifacts list/latest/prune` inspects or prunes durable
   supervisor run artifacts.
+- `maco consult ask` asks a terminal read-only cross-runtime consultant for
+  advisory help, using deterministic fake mode by default or an explicit
+  Codex/Claude-compatible executable when selected. Consultant runs write local
+  artifacts under `.maco/consult/runs/<run-id>/`.
+- `maco consult artifacts list/latest/prune` inspects or prunes durable
+  consultant run artifacts.
 - `.agents/scripts/o2-autopilot` runs bounded autonomous O2 supervisors under
   a separate human/user-directed root O2. The root O2 is out-of-band and is not
   counted against autonomous depth; autonomous O2-to-O2 follow-up uses
@@ -194,11 +200,59 @@ cargo run -- autopilot artifacts latest --repo . --json
 cargo run -- autopilot artifacts prune --repo . --keep 10 --dry-run --json
 cargo run -- inbox artifacts list --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
+cargo run -- consult artifacts list --repo . --json
 ```
 
 `prune` orders runs newest first, keeps the requested number, and supports
 `--dry-run` before deletion. It is scoped to the selected family root, such as
-`.maco/autopilot/runs`, `.maco/inbox/runs`, or `.maco/o2/runs`.
+`.maco/autopilot/runs`, `.maco/consult/runs`, `.maco/inbox/runs`, or
+`.maco/o2/runs`.
+
+## Cross-runtime consultant
+
+`maco consult ask` is a read-only second-opinion path for stuck agents. It does
+not create worktrees, claim paths, apply patches, or mutate repository files.
+The fake runtime is the default and needs no network or external binaries:
+
+```bash
+cargo run -- consult ask \
+  --repo . \
+  --question "Why is this validation failing after the worker change?" \
+  --context-path README.md \
+  --json
+```
+
+Real runtime adapters are explicit and local-process only. Codex consultant
+mode uses a read-only sandbox and does not enable goals or multi-agent worker
+delegation:
+
+```bash
+cargo run -- consult ask \
+  --repo . \
+  --runtime codex \
+  --consultant-bin codex \
+  --question-file consult-question.md \
+  --context-path src/supervise.rs \
+  --json
+```
+
+Claude consultant mode expects a Claude-compatible executable that supports
+`claude -p --output-format json` and returns the answer in the JSON envelope's
+`result` field:
+
+```bash
+cargo run -- consult ask \
+  --repo . \
+  --runtime claude \
+  --consultant-bin claude \
+  --question "What narrow fix should I inspect next?" \
+  --context-path tests/supervise_cli.rs \
+  --json
+```
+
+Consultant advice is advisory evidence only. It does not override project
+rules, assigned ownership, validation requirements, review gates, or merge
+gates.
 
 Durable project guidance under `.agents/docs`, `.agents/skills`, and
 `.agents/workflows` may appear in repository maps. Local-only agent scratch

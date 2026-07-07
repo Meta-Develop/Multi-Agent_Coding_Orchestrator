@@ -5,6 +5,7 @@ use crate::{
     },
     artifacts::{self, ResolvedRunId, RunArtifactFamily},
     autopilot::{self, AutopilotRunOptions},
+    consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
     inbox::{
         self, InboxPermissionMode, InboxRunOptions, InboxScanOptions, InboxWatchOptions,
         InboxWorkspaceRunOptions, InboxWorkspaceScanOptions, InboxWorkspaceWatchOptions,
@@ -73,6 +74,7 @@ impl Cli {
             Command::Coord(command) => command.run(),
             Command::Orchestrate(command) => command.run(),
             Command::Supervise(command) => command.run(),
+            Command::Consult(command) => command.run(),
             Command::Inbox(command) => command.run(),
             Command::Autopilot(command) => command.run(),
             Command::Review(command) => command.run(),
@@ -106,6 +108,8 @@ enum Command {
     Orchestrate(OrchestrateCommand),
     /// Run opt-in Codex CLI supervisor-of-orchestrators plans.
     Supervise(SuperviseCommand),
+    /// Ask a read-only cross-runtime consultant for advice.
+    Consult(ConsultCommand),
     /// Scan and react to safe GitHub issue and pull request inbox items.
     Inbox(InboxCommand),
     /// Run local-first autopilot workflow phases.
@@ -433,7 +437,8 @@ impl SuperviseCommand {
     fn run(self) -> Result<()> {
         match self.command {
             SuperviseSubcommand::Plan(args) => {
-                let plan = supervise::supervisor_plan_from_task_file(args.repo, args.task_file)?;
+                let plan =
+                    supervise::supervisor_plan_document_from_task_file(args.repo, args.task_file)?;
                 print_query_report(&plan, args.json)
             }
             SuperviseSubcommand::Run(args) => {
@@ -543,6 +548,92 @@ struct CollectSuperviseArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConsultCommand {
+    #[command(subcommand)]
+    command: ConsultSubcommand,
+}
+
+impl ConsultCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            ConsultSubcommand::Ask(args) => {
+                let question = consult_question(&args)?;
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Consult,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
+                let report = consult::ask_consultant(ConsultAskOptions {
+                    repo: resolved.repo,
+                    run_id: resolved.run_id,
+                    runtime: args.runtime,
+                    consultant_bin: args.consultant_bin,
+                    question,
+                    context_paths: args.context_path,
+                    timeout_seconds: args.timeout_seconds,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("consult ask failed");
+                }
+                Ok(())
+            }
+            ConsultSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Consult),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ConsultSubcommand {
+    /// Ask a read-only terminal consultant for advice.
+    Ask(AskConsultArgs),
+    /// List, inspect, or prune durable consult run artifacts.
+    Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct AskConsultArgs {
+    /// Question text to send to the consultant after redaction.
+    #[arg(long)]
+    question: Option<String>,
+    /// File containing the question text.
+    #[arg(long)]
+    question_file: Option<PathBuf>,
+    /// Consultant runtime to use. Real runtimes require --consultant-bin.
+    #[arg(long, default_value = "fake")]
+    runtime: ConsultantRuntime,
+    /// Codex- or Claude-compatible executable for real consultant runtimes.
+    #[arg(long)]
+    consultant_bin: Option<PathBuf>,
+    /// Repo-relative existing path to mention as context. Contents are not inlined.
+    #[arg(long = "context-path")]
+    context_path: Vec<PathBuf>,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/consult/runs/<run-id>` artifacts. Omit to generate one.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Seconds before a real consultant subprocess is terminated.
+    #[arg(long, default_value_t = DEFAULT_CONSULT_TIMEOUT_SECONDS)]
+    timeout_seconds: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn consult_question(args: &AskConsultArgs) -> Result<String> {
+    match (&args.question, &args.question_file) {
+        (Some(_), Some(_)) => bail!("use only one of --question or --question-file"),
+        (Some(question), None) => Ok(question.clone()),
+        (None, Some(path)) => fs::read_to_string(path)
+            .with_context(|| format!("failed to read question file {}", path.display())),
+        (None, None) => bail!("one of --question or --question-file is required"),
+    }
 }
 
 #[derive(Debug, Args)]

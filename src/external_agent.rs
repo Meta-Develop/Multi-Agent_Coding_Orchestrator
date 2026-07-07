@@ -17,6 +17,7 @@ const TIMEOUT_OUTPUT_DRAIN_GRACE_MS: u64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAgentCommand {
+    pub invocation: ExternalAgentInvocation,
     pub program: PathBuf,
     pub cwd: PathBuf,
     pub prompt: PathBuf,
@@ -29,6 +30,13 @@ pub struct ExternalAgentCommand {
     pub approval_mode: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAgentInvocation {
+    CodexSupervisor,
+    CodexConsultant,
+    ClaudeConsultant,
+}
+
 impl ExternalAgentCommand {
     pub fn codex(
         program: impl Into<PathBuf>,
@@ -39,6 +47,7 @@ impl ExternalAgentCommand {
         timeout: Duration,
     ) -> Self {
         Self {
+            invocation: ExternalAgentInvocation::CodexSupervisor,
             program: program.into(),
             cwd: cwd.into(),
             prompt: prompt.into(),
@@ -48,6 +57,52 @@ impl ExternalAgentCommand {
             timeout,
             env_allowlist: default_env_allowlist(),
             sandbox_mode: "danger-full-access".to_string(),
+            approval_mode: None,
+        }
+    }
+
+    pub fn codex_read_only_consultant(
+        program: impl Into<PathBuf>,
+        cwd: impl Into<PathBuf>,
+        prompt: impl Into<PathBuf>,
+        json_log: impl Into<PathBuf>,
+        output_last_message: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            invocation: ExternalAgentInvocation::CodexConsultant,
+            program: program.into(),
+            cwd: cwd.into(),
+            prompt: prompt.into(),
+            json_log: json_log.into(),
+            output_last_message: output_last_message.into(),
+            output_schema: None,
+            timeout,
+            env_allowlist: default_env_allowlist(),
+            sandbox_mode: "read-only".to_string(),
+            approval_mode: None,
+        }
+    }
+
+    pub fn claude_consultant(
+        program: impl Into<PathBuf>,
+        cwd: impl Into<PathBuf>,
+        prompt: impl Into<PathBuf>,
+        json_log: impl Into<PathBuf>,
+        output_last_message: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            invocation: ExternalAgentInvocation::ClaudeConsultant,
+            program: program.into(),
+            cwd: cwd.into(),
+            prompt: prompt.into(),
+            json_log: json_log.into(),
+            output_last_message: output_last_message.into(),
+            output_schema: None,
+            timeout,
+            env_allowlist: default_env_allowlist(),
+            sandbox_mode: "read-only".to_string(),
             approval_mode: None,
         }
     }
@@ -89,7 +144,7 @@ pub fn default_env_allowlist() -> Vec<String> {
 
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
     let started = Instant::now();
-    let argv = codex_argv(spec);
+    let argv = command_argv(spec);
     let mut command = Command::new(&spec.program);
     configure_timeout_process_control(&mut command);
     command
@@ -187,7 +242,15 @@ pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
     report
 }
 
-fn codex_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+fn command_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+    match spec.invocation {
+        ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec),
+        ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec),
+        ExternalAgentInvocation::ClaudeConsultant => claude_consultant_argv(),
+    }
+}
+
+fn codex_supervisor_argv(spec: &ExternalAgentCommand) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
         "--cd".to_string(),
@@ -214,6 +277,27 @@ fn codex_argv(spec: &ExternalAgentCommand) -> Vec<String> {
     }
     argv.push("-".to_string());
     argv
+}
+
+fn codex_consultant_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+    vec![
+        "exec".to_string(),
+        "--sandbox".to_string(),
+        spec.sandbox_mode.clone(),
+        "--cd".to_string(),
+        spec.cwd.display().to_string(),
+        "--output-last-message".to_string(),
+        spec.output_last_message.display().to_string(),
+        "-".to_string(),
+    ]
+}
+
+fn claude_consultant_argv() -> Vec<String> {
+    vec![
+        "-p".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+    ]
 }
 
 enum PromptWriter {
