@@ -2462,6 +2462,7 @@ fn review_feedback_from_value(value: &Value) -> GithubReviewFeedbackSummary {
 
 fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<InboxRefusal>> {
     let mut refusals = Vec::new();
+    let target_paths = non_runtime_paths(target_paths);
     let dirty_paths = dirty_primary_paths(repo)?;
     if !dirty_paths.is_empty() {
         refusals.push(InboxRefusal {
@@ -2475,7 +2476,8 @@ fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<Inbox
     let sync_claims = SyncStore::open(repo)?.snapshot()?;
     let mut sync_details = Vec::new();
     for claim in &sync_claims {
-        for path in planning::any_path_overlaps(target_paths, &claim.paths) {
+        let claim_paths = non_runtime_paths(&claim.paths);
+        for path in planning::any_path_overlaps(&target_paths, &claim_paths) {
             sync_details.push(InboxLockRefusalDetail {
                 path,
                 owner: Some(claim.agent_id.clone()),
@@ -2504,7 +2506,8 @@ fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<Inbox
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        for path in planning::any_path_overlaps(target_paths, &related_paths) {
+        let related_paths = non_runtime_paths(&related_paths);
+        for path in planning::any_path_overlaps(&target_paths, &related_paths) {
             semantic_details.push(InboxLockRefusalDetail {
                 path,
                 owner: Some(intent.agent_id.clone()),
@@ -2526,7 +2529,8 @@ fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<Inbox
     let live = live_claim::status(repo, &LiveClock::now())?;
     let mut live_details = Vec::new();
     for claim in live.claims.into_iter().filter(|claim| claim.is_lock) {
-        for path in planning::any_path_overlaps(target_paths, &claim.owned_files) {
+        let owned_files = non_runtime_paths(&claim.owned_files);
+        for path in planning::any_path_overlaps(&target_paths, &owned_files) {
             live_details.push(InboxLockRefusalDetail {
                 path,
                 owner: claim.owner.clone(),
@@ -2546,6 +2550,14 @@ fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<Inbox
     }
 
     Ok(refusals)
+}
+
+fn non_runtime_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| !is_ignored_runtime_path(path))
+        .cloned()
+        .collect()
 }
 
 fn inbox_detail_paths(details: &[InboxLockRefusalDetail]) -> Vec<PathBuf> {
@@ -2724,7 +2736,7 @@ fn privacy_reasons(
     policy: &InboxPrivacyPolicy,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
-    if redacted.summary.total_replacements > 0 {
+    if redacted.summary.total_replacements > 0 || contains_token_like_word(text) {
         reasons.push("secret_like_content_redacted".to_string());
     }
     if contains_private_key_material(text) {
@@ -3214,15 +3226,33 @@ fn redact_token_like_words(text: &str) -> String {
     output
 }
 
+fn contains_token_like_word(text: &str) -> bool {
+    let mut token = String::new();
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+            token.push(character);
+        } else {
+            if is_token_like_word(&token) {
+                return true;
+            }
+            token.clear();
+        }
+    }
+    is_token_like_word(&token)
+}
+
 fn push_redacted_token(output: &mut String, token: &str) {
-    if token.len() >= 32
-        && token.chars().any(|c| c.is_ascii_alphabetic())
-        && token.chars().any(|c| c.is_ascii_digit())
-    {
+    if is_token_like_word(token) {
         output.push_str("<redacted:token>");
     } else {
         output.push_str(token);
     }
+}
+
+fn is_token_like_word(token: &str) -> bool {
+    token.len() >= 32
+        && token.chars().any(|c| c.is_ascii_alphabetic())
+        && token.chars().any(|c| c.is_ascii_digit())
 }
 
 fn default_true() -> bool {
@@ -3271,48 +3301,491 @@ fn default_blocked_terms() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::WorktreeManager;
+    use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn assigned_paths_for_issue_falls_back_to_config_default() {
         let config = InboxConfig::default();
-        let item = InboxItem {
-            item_id: "issue-1".to_string(),
-            source_key: "github_issue:1".to_string(),
+        let item = make_issue_item(1, "No candidate paths", Vec::new());
+
+        let paths = assigned_paths_for_item(&item, &config).expect("assigned paths");
+
+        assert_eq!(paths, vec![PathBuf::from("README.md")]);
+    }
+
+    #[test]
+    fn summarize_text_bounds_body_summary_by_chars() {
+        let bounded = summarize_text("abcdef", 3);
+
+        assert_eq!(bounded.text, "abc");
+        assert!(bounded.truncated);
+
+        let exact = summarize_text("abc", 3);
+
+        assert_eq!(exact.text, "abc");
+        assert!(!exact.truncated);
+    }
+
+    #[test]
+    fn privacy_scan_redacts_token_like_values_and_refuses_body() {
+        let token = "abc123456789012345678901234567890xyz";
+        let policy = InboxPrivacyPolicy {
+            max_body_chars: 512,
+            ..InboxPrivacyPolicy::default()
+        };
+
+        let scan = privacy_scan(&format!("observed value {token}"), &policy);
+
+        assert!(!scan.safe);
+        assert!(scan
+            .reasons
+            .contains(&"secret_like_content_redacted".to_string()));
+        assert!(scan.body_summary.contains("<redacted:token>"));
+        assert!(!scan.body_summary.contains(token));
+    }
+
+    #[test]
+    fn private_key_material_is_replaced_with_refusal_marker() {
+        let body = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----";
+
+        let scan = privacy_scan(body, &InboxPrivacyPolicy::default());
+
+        assert!(!scan.safe);
+        assert!(scan.reasons.contains(&"private_key_material".to_string()));
+        assert_eq!(scan.body_summary, "<redacted:private-key-material>");
+    }
+
+    #[test]
+    fn local_absolute_paths_are_detected_and_redacted() {
+        let body = r"Paths: /mnt/d/home/project, /home/example/repo, C:\Users\Example\secret.txt";
+
+        let scan = privacy_scan(body, &InboxPrivacyPolicy::default());
+
+        assert!(!scan.safe);
+        assert!(scan.reasons.contains(&"local_absolute_path".to_string()));
+        assert_eq!(
+            scan.body_summary.matches("<redacted:local-path>").count(),
+            3
+        );
+        assert!(!scan.body_summary.contains("/mnt/d/home"));
+        assert!(!scan.body_summary.contains("/home/example"));
+        assert!(!scan.body_summary.contains(r"C:\Users"));
+    }
+
+    #[test]
+    fn blocked_terms_in_titles_extend_privacy_reasons() {
+        let mut privacy = privacy_scan("safe body", &InboxPrivacyPolicy::default());
+
+        extend_privacy_reasons(
+            &mut privacy,
+            "title",
+            "Regression exposes api key handling",
+            &InboxPrivacyPolicy::default(),
+        );
+
+        assert!(!privacy.safe);
+        assert!(privacy
+            .reasons
+            .contains(&"title_blocked_term:api key".to_string()));
+    }
+
+    #[test]
+    fn sanitize_public_text_rewrites_repo_paths_without_leaking_absolutes() {
+        let repo = Path::new("/mnt/d/home/project/repo");
+
+        let sanitized = sanitize_public_text(
+            repo,
+            "repo path /mnt/d/home/project/repo/src/inbox.rs parent /mnt/d/home/project",
+            512,
+        );
+
+        assert_eq!(
+            sanitized.text,
+            "repo path ./src/inbox.rs parent <repo-parent>"
+        );
+        assert!(!sanitized.text.contains("/mnt/d/home/project"));
+    }
+
+    #[test]
+    fn permission_mode_parse_normalizes_hyphen_aliases() {
+        assert_eq!(
+            InboxPermissionMode::parse("github-read").expect("github-read"),
+            InboxPermissionMode::GithubRead
+        );
+        assert_eq!(
+            InboxPermissionMode::parse("github_read").expect("github_read"),
+            InboxPermissionMode::GithubRead
+        );
+        assert_eq!(
+            InboxPermissionMode::parse("github-full").expect("github-full"),
+            InboxPermissionMode::GithubFull
+        );
+    }
+
+    #[test]
+    fn permission_mode_parse_accepts_legacy_github_alias_and_rejects_unknown() {
+        assert_eq!(
+            InboxPermissionMode::parse("github").expect("github alias"),
+            InboxPermissionMode::GithubFull
+        );
+
+        let error = InboxPermissionMode::parse("github-write").expect_err("unknown mode");
+
+        assert!(error.contains("expected one of"));
+    }
+
+    #[test]
+    fn permission_mode_deserializes_hyphen_aliases() {
+        let mode: InboxPermissionMode =
+            serde_json::from_str(r#""github-local""#).expect("deserialize alias");
+
+        assert_eq!(mode, InboxPermissionMode::GithubLocal);
+    }
+
+    #[test]
+    fn legacy_github_flag_and_action_policy_promote_to_full_permission() {
+        let config = InboxConfig::default();
+
+        assert_eq!(
+            effective_permission_mode(&config, true, None),
+            InboxPermissionMode::GithubFull
+        );
+
+        let config = InboxConfig {
+            action_policy: InboxActionPolicy::Github,
+            ..InboxConfig::default()
+        };
+
+        assert_eq!(
+            effective_permission_mode(&config, false, None),
+            InboxPermissionMode::GithubFull
+        );
+    }
+
+    #[test]
+    fn effective_action_policy_preserves_dry_run_and_maps_github_intake() {
+        assert_eq!(
+            effective_action_policy(InboxActionPolicy::DryRun, InboxPermissionMode::GithubFull),
+            InboxActionPolicy::DryRun
+        );
+        assert_eq!(
+            effective_action_policy(InboxActionPolicy::Fake, InboxPermissionMode::GithubRead),
+            InboxActionPolicy::Github
+        );
+        assert_eq!(
+            effective_action_policy(InboxActionPolicy::Github, InboxPermissionMode::Fake),
+            InboxActionPolicy::Fake
+        );
+    }
+
+    #[test]
+    fn apply_scan_decisions_enforces_max_items() {
+        let mut items = vec![
+            make_issue_item(1, "first", vec![PathBuf::from("README.md")]),
+            make_issue_item(2, "second", vec![PathBuf::from("src/lib.rs")]),
+            make_issue_item(3, "third", vec![PathBuf::from("docs/guide.md")]),
+        ];
+
+        apply_scan_decisions(&mut items, 2);
+
+        assert!(items[0].selected);
+        assert!(items[1].selected);
+        assert!(!items[2].selected);
+        assert_eq!(items[2].skip_reason.as_deref(), Some("selection_limit"));
+    }
+
+    #[test]
+    fn apply_scan_decisions_marks_duplicates_within_current_scan() {
+        let mut duplicate = make_issue_item(1, "duplicate", vec![PathBuf::from("README.md")]);
+        duplicate.item_id = "issue-1-copy".to_string();
+        let mut items = vec![
+            make_issue_item(1, "first", vec![PathBuf::from("README.md")]),
+            duplicate,
+        ];
+
+        apply_scan_decisions(&mut items, 4);
+
+        assert!(items[0].selected);
+        assert!(!items[1].selected);
+        assert!(items[1].duplicate.duplicate);
+        assert_eq!(items[1].skip_reason.as_deref(), Some("duplicate"));
+        assert_eq!(
+            items[1].duplicate.reason.as_deref(),
+            Some("duplicate inbox candidate in current scan")
+        );
+    }
+
+    #[test]
+    fn label_overrides_are_trimmed_sorted_and_used_by_fake_candidates() {
+        let (temp, repo) = temp_repo();
+        let loaded = load_config_with_config_overrides(
+            &repo,
+            InboxConfigOverrides {
+                labels: Some(vec![
+                    "needs-work".to_string(),
+                    " bug ".to_string(),
+                    "needs-work".to_string(),
+                    String::new(),
+                ]),
+                ..InboxConfigOverrides::default()
+            },
+        )
+        .expect("load config");
+
+        assert_eq!(
+            loaded.config.selection.labels,
+            vec!["bug".to_string(), "needs-work".to_string()]
+        );
+        assert_eq!(
+            fake_issue_candidates(&loaded.config)[0].labels,
+            loaded.config.selection.labels
+        );
+        drop(temp);
+    }
+
+    #[test]
+    fn selected_target_paths_include_only_selected_items() {
+        let config = InboxConfig::default();
+        let mut skipped = make_issue_item(2, "skipped", vec![PathBuf::from("src/lib.rs")]);
+        skipped.selected = false;
+        let items = vec![
+            make_issue_item(1, "selected", vec![PathBuf::from("README.md")]),
+            skipped,
+        ];
+
+        let paths = selected_target_paths(&items, &config).expect("target paths");
+
+        assert_eq!(paths, vec![PathBuf::from("README.md")]);
+    }
+
+    #[test]
+    fn preflight_ignores_dirty_runtime_artifacts() {
+        let (_temp, repo) = temp_repo();
+        fs::create_dir_all(repo.join(".maco/inbox/runs/run-1")).expect("create .maco");
+        fs::write(
+            repo.join(".maco/inbox/runs/run-1/final-report.json"),
+            "{}\n",
+        )
+        .expect("write .maco artifact");
+        fs::create_dir_all(repo.join(".maco-cache")).expect("create cache");
+        fs::write(repo.join(".maco-cache/state.json"), "{}\n").expect("write cache artifact");
+
+        let refusals =
+            preflight_refusals(&repo, &[PathBuf::from("src/inbox.rs")]).expect("preflight");
+
+        assert!(refusals.is_empty());
+    }
+
+    #[test]
+    fn preflight_refuses_only_overlapping_sync_claims() {
+        let (_temp, repo) = temp_repo();
+        SyncStore::open(&repo)
+            .expect("open store")
+            .claim_paths("agent-a", ["docs"])
+            .expect("claim docs");
+
+        let unrelated =
+            preflight_refusals(&repo, &[PathBuf::from("src/inbox.rs")]).expect("preflight");
+
+        assert!(unrelated.is_empty());
+
+        let overlapping =
+            preflight_refusals(&repo, &[PathBuf::from("docs/guide.md")]).expect("preflight");
+
+        assert_eq!(overlapping.len(), 1);
+        assert_eq!(overlapping[0].kind, "active_sync_claims");
+        assert_eq!(overlapping[0].paths, vec![PathBuf::from("docs")]);
+    }
+
+    #[test]
+    fn preflight_ignores_runtime_artifact_sync_claims() {
+        let (_temp, repo) = temp_repo();
+        SyncStore::open(&repo)
+            .expect("open store")
+            .claim_paths("agent-a", [".maco/inbox/runs/run-1"])
+            .expect("claim runtime path");
+
+        let refusals = preflight_refusals(
+            &repo,
+            &[PathBuf::from(".maco/inbox/runs/run-1/final-report.json")],
+        )
+        .expect("preflight");
+
+        assert!(refusals.is_empty());
+    }
+
+    #[test]
+    fn scan_report_public_json_uses_placeholder_repo_and_omits_absolute_paths() {
+        let (temp, repo) = temp_repo();
+
+        let report = scan_inbox(InboxScanOptions {
+            repo: repo.clone(),
+            github: false,
+            permission_mode: None,
+            max_items: Some(1),
+            action_policy_override: None,
+        })
+        .expect("scan inbox");
+        let public_json = serde_json::to_string(&report).expect("serialize report");
+
+        assert_eq!(report.repo, PathBuf::from("."));
+        assert!(!public_json.contains(repo.to_str().expect("utf8 repo path")));
+        assert!(!public_json.contains(temp.path().to_str().expect("utf8 temp path")));
+    }
+
+    #[test]
+    fn issue_task_body_and_title_include_public_issue_context() {
+        let config = InboxConfig::default();
+        let mut item = make_issue_item(7, "Repair inbox summaries", vec![PathBuf::from("src")]);
+        let issue = item.issue.as_mut().expect("issue");
+        issue.url = Some("https://github.example/repo/issues/7".to_string());
+        issue.body_summary = "Summary with <redacted:token>".to_string();
+
+        let plan =
+            autopilot_plan_for_item(&item, &config, InboxPermissionMode::GithubPr).expect("plan");
+
+        assert_eq!(plan.task.title, "Inbox issue: Repair inbox summaries");
+        assert!(plan
+            .task
+            .body
+            .contains("React to GitHub issue #7.\nURL: https://github.example/repo/issues/7"));
+        assert!(plan.task.body.contains("Summary with <redacted:token>"));
+        assert_eq!(plan.assigned_paths, vec![PathBuf::from("src")]);
+        assert_eq!(plan.forge_mode, AutopilotForgeMode::Github);
+    }
+
+    #[test]
+    fn pr_task_body_includes_paths_checks_reviews_and_validation_expectation() {
+        let item = make_pr_item(
+            42,
+            "Fix failing inbox CI",
+            vec![PathBuf::from("src/inbox.rs")],
+        );
+
+        let body = task_body_for_item(&item);
+
+        assert!(body.contains("React to GitHub PR #42."));
+        assert!(body.contains("Changed files:\n- src/inbox.rs"));
+        assert!(body.contains("- ci status=completed conclusion=failure summary=ci failed"));
+        assert!(body.contains("requested change summary"));
+        assert!(body.contains("address failing check context: ci"));
+    }
+
+    #[test]
+    fn raw_pr_candidate_parsing_deduplicates_labels_files_and_failed_checks() {
+        let value = json!({
+            "number": 9,
+            "title": "PR title",
+            "body": "body",
+            "labels": [{"name": "z"}, {"name": "a"}, {"name": "a"}],
+            "files": [{"path": "src/../src/inbox.rs"}, {"path": "src/inbox.rs"}, {"path": "/tmp/outside"}],
+            "statusCheckRollup": [
+                {"name": "ci", "status": "completed", "conclusion": "failure", "detailsUrl": "fake://ci"}
+            ],
+            "reviewDecision": "CHANGES_REQUESTED",
+            "latestReviews": [
+                {"state": "CHANGES_REQUESTED", "author": {"login": "reviewer"}, "body": "please adjust"}
+            ]
+        });
+
+        let raw = raw_pr_from_value(&value, &InboxConfig::default()).expect("raw pr");
+
+        assert_eq!(raw.labels, vec!["a".to_string(), "z".to_string()]);
+        assert_eq!(raw.changed_files, vec![PathBuf::from("src/inbox.rs")]);
+        assert!(raw.review_feedback.requested_changes);
+        assert!(check_failed(
+            raw.checks[0].conclusion.as_deref(),
+            raw.checks[0].status.as_deref()
+        ));
+    }
+
+    fn temp_repo() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").expect("init repo");
+        (temp, repo)
+    }
+
+    fn make_issue_item(number: u64, title: &str, assigned_paths: Vec<PathBuf>) -> InboxItem {
+        let source_key = format!("github_issue:{number}");
+        InboxItem {
+            item_id: format!("issue-{number}"),
+            source_key: source_key.clone(),
             kind: InboxItemKind::Issue,
-            title: "No candidate paths".to_string(),
+            title: title.to_string(),
             url: None,
             issue: Some(GithubIssueCandidate {
-                number: 1,
-                title: "No candidate paths".to_string(),
+                number,
+                title: title.to_string(),
                 url: None,
                 author: None,
                 labels: Vec::new(),
                 updated_at: None,
                 body_summary: String::new(),
                 body_truncated: false,
-                assigned_paths: Vec::new(),
+                assigned_paths,
                 path_proposal: planning::TaskPathProposalDiagnostics::default(),
             }),
             pull_request: None,
-            privacy: PrivacyScanResult {
-                safe: true,
-                reasons: Vec::new(),
-                redactions: RedactionSummary::default(),
-                body_summary: String::new(),
-                body_truncated: false,
-            },
-            duplicate: DuplicateDetectionResult {
-                duplicate: false,
-                key: "github_issue:1".to_string(),
-                matched_run_id: None,
-                reason: None,
-            },
+            privacy: safe_privacy(),
+            duplicate: duplicate_result(&source_key, &BTreeMap::new()),
             selected: true,
             skip_reason: None,
-        };
+        }
+    }
 
-        let paths = assigned_paths_for_item(&item, &config).expect("assigned paths");
+    fn make_pr_item(number: u64, title: &str, changed_files: Vec<PathBuf>) -> InboxItem {
+        let source_key = format!("github_pr:{number}");
+        InboxItem {
+            item_id: format!("pr-{number}"),
+            source_key: source_key.clone(),
+            kind: InboxItemKind::PullRequest,
+            title: title.to_string(),
+            url: Some(format!("https://github.example/repo/pull/{number}")),
+            issue: None,
+            pull_request: Some(GithubPrCandidate {
+                number,
+                title: title.to_string(),
+                url: Some(format!("https://github.example/repo/pull/{number}")),
+                author: Some("author".to_string()),
+                labels: vec!["needs-work".to_string()],
+                updated_at: Some("2026-07-08T00:00:00Z".to_string()),
+                head_ref: Some("feature/inbox".to_string()),
+                base_ref: Some("main".to_string()),
+                changed_files,
+                checks: vec![GithubCheckSummary {
+                    name: "ci".to_string(),
+                    status: Some("completed".to_string()),
+                    conclusion: Some("failure".to_string()),
+                    details_url: None,
+                    summary: "ci failed".to_string(),
+                }],
+                review_feedback: GithubReviewFeedbackSummary {
+                    review_decision: Some("CHANGES_REQUESTED".to_string()),
+                    requested_changes: true,
+                    unresolved_thread_count: Some(1),
+                    reviewer_logins: vec!["reviewer".to_string()],
+                    summaries: vec!["requested change summary".to_string()],
+                },
+                body_summary: "PR body summary".to_string(),
+                body_truncated: false,
+            }),
+            privacy: safe_privacy(),
+            duplicate: duplicate_result(&source_key, &BTreeMap::new()),
+            selected: true,
+            skip_reason: None,
+        }
+    }
 
-        assert_eq!(paths, vec![PathBuf::from("README.md")]);
+    fn safe_privacy() -> PrivacyScanResult {
+        PrivacyScanResult {
+            safe: true,
+            reasons: Vec::new(),
+            redactions: RedactionSummary::default(),
+            body_summary: String::new(),
+            body_truncated: false,
+        }
     }
 }
