@@ -59,6 +59,11 @@ pub struct AutopilotPlan {
     pub task: AutopilotTask,
     #[serde(default)]
     pub assigned_paths: Vec<PathBuf>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::planning::TaskPathProposalDiagnostics::is_empty"
+    )]
+    pub path_proposal: planning::TaskPathProposalDiagnostics,
     #[serde(default)]
     pub semantic_symbols: Vec<String>,
     #[serde(default)]
@@ -203,6 +208,11 @@ pub struct AutopilotReportsCreated {
 pub struct AutopilotPlanSummary {
     pub title: String,
     pub assigned_paths: Vec<PathBuf>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::planning::TaskPathProposalDiagnostics::is_empty"
+    )]
+    pub path_proposal: planning::TaskPathProposalDiagnostics,
     pub semantic_symbols: Vec<String>,
     pub semantic_modules: Vec<String>,
     pub forge_mode: AutopilotForgeMode,
@@ -369,6 +379,7 @@ pub fn autopilot_plan_from_task_file(
                 body: contents,
             },
             assigned_paths: Vec::new(),
+            path_proposal: planning::TaskPathProposalDiagnostics::default(),
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
             validation_commands: Vec::new(),
@@ -635,11 +646,19 @@ fn validate_autopilot_plan(repo: &Path, mut plan: AutopilotPlan) -> Result<Autop
         plan.task.body = plan.task.title.clone();
     }
     if plan.assigned_paths.is_empty() {
-        plan.assigned_paths = planning::propose_task_paths(repo, &plan.task.title, &plan.task.body)
-            .context("failed to propose autopilot assigned paths")?;
+        let proposal =
+            planning::propose_task_path_proposal(repo, &plan.task.title, &plan.task.body)
+                .context("failed to propose autopilot assigned paths")?;
+        plan.path_proposal = proposal.diagnostics;
+        plan.assigned_paths = proposal.paths;
     }
     plan.assigned_paths = normalize_paths(std::mem::take(&mut plan.assigned_paths))
         .context("autopilot assigned paths are invalid")?;
+    if plan.assigned_paths.is_empty() {
+        bail!(
+            "autopilot assigned paths are empty; provide assigned_paths or mention a concrete repository path or symbol"
+        );
+    }
     plan.semantic_symbols = sorted_unique_strings(std::mem::take(&mut plan.semantic_symbols));
     plan.semantic_modules = sorted_unique_strings(std::mem::take(&mut plan.semantic_modules));
     for (index, command) in plan.validation_commands.iter_mut().enumerate() {
@@ -1374,6 +1393,7 @@ fn plan_summary(plan: &AutopilotPlan) -> AutopilotPlanSummary {
     AutopilotPlanSummary {
         title: plan.task.title.clone(),
         assigned_paths: plan.assigned_paths.clone(),
+        path_proposal: plan.path_proposal.clone(),
         semantic_symbols: plan.semantic_symbols.clone(),
         semantic_modules: plan.semantic_modules.clone(),
         forge_mode: plan.forge_mode,
@@ -1663,5 +1683,43 @@ fn finding_severity_label(severity: FindingSeverity) -> &'static str {
         FindingSeverity::Info => "info",
         FindingSeverity::Warning => "warning",
         FindingSeverity::Error => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_autopilot_plan_refuses_empty_path_proposal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::write(repo.join("src/lib.rs"), "pub fn unrelated() {}\n").expect("write src");
+
+        let result = validate_autopilot_plan(
+            repo,
+            AutopilotPlan {
+                version: AUTOPILOT_SCHEMA_VERSION,
+                task: AutopilotTask {
+                    title: "Unmatched task".to_string(),
+                    body: "No concrete path or symbol appears here.".to_string(),
+                },
+                assigned_paths: Vec::new(),
+                path_proposal: planning::TaskPathProposalDiagnostics::default(),
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                validation_commands: Vec::new(),
+                max_repair_attempts: default_max_repair_attempts(),
+                forge_mode: AutopilotForgeMode::Fake,
+                reviewer: ReviewerConfig::default(),
+                publish_mode: AutopilotPublishMode::DraftOnly,
+                auto_merge: false,
+            },
+        );
+
+        let error = result.expect_err("empty proposal must be refused");
+        assert!(error.to_string().contains("assigned paths are empty"));
     }
 }

@@ -397,6 +397,11 @@ pub struct GithubIssueCandidate {
     pub body_summary: String,
     pub body_truncated: bool,
     pub assigned_paths: Vec<PathBuf>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::planning::TaskPathProposalDiagnostics::is_empty"
+    )]
+    pub path_proposal: planning::TaskPathProposalDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -690,6 +695,7 @@ struct RawIssueCandidate {
     labels: Vec<String>,
     updated_at: Option<String>,
     assigned_paths: Vec<PathBuf>,
+    path_proposal: planning::TaskPathProposalDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -1814,6 +1820,11 @@ fn autopilot_plan_for_item(
     permission_mode: InboxPermissionMode,
 ) -> Result<AutopilotPlan> {
     let assigned_paths = assigned_paths_for_item(item, config)?;
+    let path_proposal = item
+        .issue
+        .as_ref()
+        .map(|issue| issue.path_proposal.clone())
+        .unwrap_or_default();
     let mut validation_commands = config.default_validation_commands.clone();
     for command in &mut validation_commands {
         if command.timeout_seconds.is_none() {
@@ -1827,6 +1838,7 @@ fn autopilot_plan_for_item(
             body: task_body_for_item(item),
         },
         assigned_paths,
+        path_proposal,
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
         validation_commands,
@@ -2065,6 +2077,7 @@ fn issue_item(
             body_summary: privacy.body_summary.clone(),
             body_truncated: privacy.body_truncated,
             assigned_paths: normalize_or_default(raw.assigned_paths, config)?,
+            path_proposal: raw.path_proposal,
         }),
         pull_request: None,
         privacy,
@@ -2177,6 +2190,7 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             labels: config.selection.labels.clone(),
             updated_at: Some("1970-01-01T00:00:00Z".to_string()),
             assigned_paths: config.default_assigned_paths.clone(),
+            path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
         RawIssueCandidate {
             number: 101,
@@ -2188,6 +2202,7 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             labels: config.selection.labels.clone(),
             updated_at: Some("1970-01-01T00:00:00Z".to_string()),
             assigned_paths: config.default_assigned_paths.clone(),
+            path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
         RawIssueCandidate {
             number: 303,
@@ -2199,6 +2214,7 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             labels: config.selection.labels.clone(),
             updated_at: Some("1970-01-01T00:00:00Z".to_string()),
             assigned_paths: config.default_assigned_paths.clone(),
+            path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
     ]
 }
@@ -2254,7 +2270,7 @@ fn github_issue_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawI
     };
     Ok(values
         .iter()
-        .filter_map(|value| raw_issue_from_value(value, config))
+        .filter_map(|value| raw_issue_from_value(repo, value, config))
         .collect())
 }
 
@@ -2286,20 +2302,56 @@ fn github_pr_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawPrCa
         .collect())
 }
 
-fn raw_issue_from_value(value: &Value, config: &InboxConfig) -> Option<RawIssueCandidate> {
+fn raw_issue_from_value(
+    repo: &Path,
+    value: &Value,
+    config: &InboxConfig,
+) -> Option<RawIssueCandidate> {
+    let title = value["title"]
+        .as_str()
+        .unwrap_or("untitled issue")
+        .to_string();
+    let body = value["body"].as_str().unwrap_or("").to_string();
+    let (assigned_paths, path_proposal) = issue_path_proposal(repo, &title, &body, config);
     Some(RawIssueCandidate {
         number: value["number"].as_u64()?,
-        title: value["title"]
-            .as_str()
-            .unwrap_or("untitled issue")
-            .to_string(),
-        body: value["body"].as_str().unwrap_or("").to_string(),
+        title,
+        body,
         url: value["url"].as_str().map(ToOwned::to_owned),
         author: value["author"]["login"].as_str().map(ToOwned::to_owned),
         labels: labels_from_value(&value["labels"]),
         updated_at: value["updatedAt"].as_str().map(ToOwned::to_owned),
-        assigned_paths: config.default_assigned_paths.clone(),
+        assigned_paths,
+        path_proposal,
     })
+}
+
+fn issue_path_proposal(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    config: &InboxConfig,
+) -> (Vec<PathBuf>, planning::TaskPathProposalDiagnostics) {
+    match planning::propose_task_path_proposal(repo, title, body) {
+        Ok(proposal) => {
+            let paths = if proposal.paths.is_empty() {
+                config.default_assigned_paths.clone()
+            } else {
+                proposal.paths
+            };
+            (paths, proposal.diagnostics)
+        }
+        Err(_) => {
+            let mut diagnostics = planning::TaskPathProposalDiagnostics {
+                degraded: true,
+                notes: Vec::new(),
+            };
+            diagnostics
+                .notes
+                .push("task path proposal failed; used inbox default paths".to_string());
+            (config.default_assigned_paths.clone(), diagnostics)
+        }
+    }
 }
 
 fn raw_pr_from_value(value: &Value, _config: &InboxConfig) -> Option<RawPrCandidate> {
@@ -3214,4 +3266,53 @@ fn default_blocked_terms() -> Vec<String> {
     .into_iter()
     .map(ToOwned::to_owned)
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assigned_paths_for_issue_falls_back_to_config_default() {
+        let config = InboxConfig::default();
+        let item = InboxItem {
+            item_id: "issue-1".to_string(),
+            source_key: "github_issue:1".to_string(),
+            kind: InboxItemKind::Issue,
+            title: "No candidate paths".to_string(),
+            url: None,
+            issue: Some(GithubIssueCandidate {
+                number: 1,
+                title: "No candidate paths".to_string(),
+                url: None,
+                author: None,
+                labels: Vec::new(),
+                updated_at: None,
+                body_summary: String::new(),
+                body_truncated: false,
+                assigned_paths: Vec::new(),
+                path_proposal: planning::TaskPathProposalDiagnostics::default(),
+            }),
+            pull_request: None,
+            privacy: PrivacyScanResult {
+                safe: true,
+                reasons: Vec::new(),
+                redactions: RedactionSummary::default(),
+                body_summary: String::new(),
+                body_truncated: false,
+            },
+            duplicate: DuplicateDetectionResult {
+                duplicate: false,
+                key: "github_issue:1".to_string(),
+                matched_run_id: None,
+                reason: None,
+            },
+            selected: true,
+            skip_reason: None,
+        };
+
+        let paths = assigned_paths_for_item(&item, &config).expect("assigned paths");
+
+        assert_eq!(paths, vec![PathBuf::from("README.md")]);
+    }
 }

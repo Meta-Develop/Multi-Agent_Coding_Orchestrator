@@ -548,3 +548,71 @@ pub fn normalize_changed_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<
 pub fn repo_path_for_review(repo: impl AsRef<Path>) -> PathBuf {
     repo.as_ref().to_path_buf()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fake_review_constructs_passed_report_with_deterministic_identity() {
+        let report = fake_review(ReviewPrOptions {
+            repo: PathBuf::from("."),
+            target: "#42".to_string(),
+            reviewer: ReviewerConfig::default(),
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("src/review.rs")],
+            diff_summary: Some("changed src/review.rs".to_string()),
+        });
+
+        assert_eq!(report.status, ReviewReportStatus::Passed);
+        assert!(report.success);
+        assert_eq!(report.target, "#42");
+        assert_eq!(report.reviewer.mode, ReviewerMode::Fake);
+        assert_eq!(report.reviewer.reviewer_id, "autopilot-fake-reviewer");
+        assert_eq!(report.reviewer.model, "deterministic-local-reviewer");
+        assert_eq!(report.findings, Vec::<ReviewFinding>::new());
+        assert_eq!(report.blocking_finding_count, 0);
+        assert_eq!(report.diff_source, "sanitized_merge_candidate_summary");
+        assert!(!report.ci_reaction_supported);
+        assert_eq!(report.ci_reaction, "unsupported");
+    }
+
+    #[test]
+    fn fake_review_constructs_blocking_template_finding() {
+        let report = fake_review(ReviewPrOptions {
+            repo: PathBuf::from("."),
+            target: "#43".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::Fake,
+                blocking_attempts: 1,
+                finding: Some(FakeReviewFindingTemplate {
+                    severity: "warning".to_string(),
+                    path: None,
+                    summary: "deterministic template finding".to_string(),
+                    suggested_fix: "apply the deterministic fix".to_string(),
+                }),
+                command: None,
+                timeout_seconds: None,
+            },
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("src/review.rs")],
+            diff_summary: None,
+        });
+
+        assert_eq!(report.status, ReviewReportStatus::Blocked);
+        assert!(!report.success);
+        assert_eq!(report.blocking_finding_count, 1);
+        assert_eq!(report.diff_source, "pr_target_only");
+        assert_eq!(
+            report.findings,
+            vec![ReviewFinding {
+                severity: "warning".to_string(),
+                path: Some(PathBuf::from("src/review.rs")),
+                summary: "deterministic template finding".to_string(),
+                suggested_fix: "apply the deterministic fix".to_string(),
+                blocking: true,
+            }]
+        );
+        assert!(!report.ci_reaction_supported);
+    }
+}
