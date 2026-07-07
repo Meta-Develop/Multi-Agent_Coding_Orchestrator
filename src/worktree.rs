@@ -5,7 +5,7 @@ use git2::{
 };
 use serde::Serialize;
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -117,21 +117,52 @@ impl WorktreeManager {
     ) -> Result<WorktreeRecord> {
         let repo = self.open_repository()?;
         let name = normalize_agent_id(agent_id)?;
-        let worktree = repo
-            .find_worktree(&name)
+        let metadata = read_registered_worktree_metadata(&repo, &name)?;
+        let worktree = match repo.find_worktree(&name) {
+            Ok(worktree) => Some(worktree),
+            Err(error) if error.code() == ErrorCode::NotFound => {
+                bail!("worktree '{name}' is not registered");
+            }
+            Err(_) if force && metadata.is_some() => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect worktree '{name}'"));
+            }
+        };
+        let path = worktree
+            .as_ref()
+            .map(|worktree| worktree.path().to_path_buf())
+            .or_else(|| metadata.as_ref().map(|metadata| metadata.path.clone()))
             .with_context(|| format!("worktree '{name}' is not registered"))?;
-        let path = worktree.path().to_path_buf();
-        let branch = read_worktree_branch(&path).unwrap_or_else(|| default_branch_name(&name));
+        let branch = read_worktree_branch(&path)
+            .or_else(|| {
+                metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.branch.clone())
+            })
+            .unwrap_or_else(|| default_branch_name(&name));
 
         if path.exists() && !force {
             ensure_clean_worktree(&path)?;
         }
 
-        let mut prune_options = WorktreePruneOptions::new();
-        prune_options.valid(true).working_tree(true).locked(force);
-        worktree
-            .prune(Some(&mut prune_options))
-            .with_context(|| format!("failed to prune worktree '{name}'"))?;
+        if let Some(worktree) = worktree {
+            let mut prune_options = WorktreePruneOptions::new();
+            prune_options.valid(true).working_tree(true).locked(force);
+            if let Err(error) = worktree.prune(Some(&mut prune_options)) {
+                if !force {
+                    return Err(error)
+                        .with_context(|| format!("failed to prune worktree '{name}'"));
+                }
+                remove_registered_worktree_fallback(&repo, &name, &path, &error)?;
+            }
+        } else if force {
+            remove_registered_worktree_fallback(
+                &repo,
+                &name,
+                &path,
+                &git2::Error::from_str("registered worktree metadata could not be opened"),
+            )?;
+        }
 
         if delete_branch {
             delete_local_branch(&repo, &branch)?;
@@ -237,6 +268,65 @@ fn read_worktree_branch(path: &Path) -> Option<String> {
     head.shorthand().map(ToOwned::to_owned)
 }
 
+#[derive(Debug, Clone)]
+struct RegisteredWorktreeMetadata {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn read_registered_worktree_metadata(
+    repo: &Repository,
+    name: &str,
+) -> Result<Option<RegisteredWorktreeMetadata>> {
+    let metadata_dir = worktree_metadata_dir(repo, name);
+    if !metadata_dir.exists() {
+        return Ok(None);
+    }
+
+    let gitdir_file = metadata_dir.join("gitdir");
+    let gitdir = fs::read_to_string(&gitdir_file)
+        .with_context(|| format!("failed to read worktree gitdir {}", gitdir_file.display()))?;
+    let gitdir = gitdir.trim();
+    if gitdir.is_empty() {
+        bail!("registered worktree '{name}' has empty gitdir metadata");
+    }
+    let gitdir_path = resolve_metadata_path(&metadata_dir, Path::new(gitdir));
+    let path = gitdir_path
+        .parent()
+        .with_context(|| format!("registered worktree '{name}' gitdir has no parent"))?
+        .to_path_buf();
+    let branch = read_worktree_metadata_branch(&metadata_dir)?;
+
+    Ok(Some(RegisteredWorktreeMetadata { path, branch }))
+}
+
+fn resolve_metadata_path(metadata_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        metadata_dir.join(path)
+    }
+}
+
+fn read_worktree_metadata_branch(metadata_dir: &Path) -> Result<Option<String>> {
+    let head_file = metadata_dir.join("HEAD");
+    let head = match fs::read_to_string(&head_file) {
+        Ok(head) => head,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read worktree HEAD {}", head_file.display()));
+        }
+    };
+    let Some(reference) = head.trim().strip_prefix("ref: refs/heads/") else {
+        return Ok(None);
+    };
+    if reference.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(reference.trim().to_string()))
+}
+
 fn sanitize_path_segment(input: &str) -> String {
     input
         .chars()
@@ -333,6 +423,97 @@ fn delete_local_branch(repo: &Repository, branch_name: &str) -> Result<()> {
         Err(error) if error.code() == ErrorCode::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to open branch '{branch_name}'")),
     }
+}
+
+fn remove_registered_worktree_fallback(
+    repo: &Repository,
+    name: &str,
+    path: &Path,
+    prune_error: &git2::Error,
+) -> Result<()> {
+    ensure_safe_registered_worktree_path(repo, name, path)?;
+
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to remove worktree directory {} after git2 prune failed: {prune_error}",
+                    path.display()
+                )
+            });
+        }
+    }
+
+    prune_or_remove_worktree_metadata(repo, name)
+        .with_context(|| format!("failed to prune worktree metadata for '{name}'"))?;
+    Ok(())
+}
+
+fn ensure_safe_registered_worktree_path(repo: &Repository, name: &str, path: &Path) -> Result<()> {
+    ensure_registered_worktree_name(repo, name)?;
+
+    let primary = repo
+        .workdir()
+        .with_context(|| "worktree removal requires a repository with a primary worktree")?;
+    if path.exists() {
+        let worktree_path = fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve worktree path {}", path.display()))?;
+        let primary_path = fs::canonicalize(primary)
+            .with_context(|| format!("failed to resolve primary worktree {}", primary.display()))?;
+        if worktree_path == primary_path {
+            bail!(
+                "refusing to remove registered worktree '{name}' because it resolves to the primary worktree"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_registered_worktree_name(repo: &Repository, name: &str) -> Result<()> {
+    let is_listed = repo
+        .worktrees()
+        .with_context(|| "failed to list registered worktrees")?
+        .iter()
+        .flatten()
+        .any(|registered| registered == name);
+    if !is_listed && !worktree_metadata_dir(repo, name).is_dir() {
+        bail!("worktree '{name}' is not a registered linked worktree of this repo");
+    }
+
+    Ok(())
+}
+
+fn prune_or_remove_worktree_metadata(repo: &Repository, name: &str) -> Result<()> {
+    match repo.find_worktree(name) {
+        Ok(worktree) => {
+            let mut prune_options = WorktreePruneOptions::new();
+            prune_options.locked(true);
+            if worktree.prune(Some(&mut prune_options)).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+
+    let metadata_dir = worktree_metadata_dir(repo, name);
+    match fs::remove_dir_all(&metadata_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove worktree metadata directory {}",
+                metadata_dir.display()
+            )
+        }),
+    }
+}
+
+fn worktree_metadata_dir(repo: &Repository, name: &str) -> PathBuf {
+    repo.commondir().join("worktrees").join(name)
 }
 
 #[cfg(test)]
@@ -486,6 +667,73 @@ mod tests {
         assert!(repo
             .find_branch("maco/agent-force", BranchType::Local)
             .is_err());
+    }
+
+    #[test]
+    fn force_removes_worktree_with_untracked_nested_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+
+        let manager = WorktreeManager::new(&repo_path);
+        let created = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-residue".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+        let residue = created.path.join("target/debug/deps");
+        fs::create_dir_all(&residue).expect("create residue directory");
+        fs::write(residue.join("artifact.d"), "ignored build output\n").expect("write residue");
+
+        let removed = manager
+            .remove("agent-residue", true, true)
+            .expect("force remove worktree with residue");
+
+        assert_eq!(removed.name, "agent-residue");
+        assert!(!removed.path.exists());
+        assert!(repo
+            .find_branch("maco/agent-residue", BranchType::Local)
+            .is_err());
+    }
+
+    #[test]
+    fn repeated_force_remove_reports_clean_not_registered_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+
+        let manager = WorktreeManager::new(&repo_path);
+        let created = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-repeat".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+        fs::create_dir_all(created.path.join("target/debug/deps"))
+            .expect("create residue directory");
+        fs::remove_file(created.path.join(".git")).expect("remove worktree git file");
+
+        manager
+            .remove("agent-repeat", true, true)
+            .expect("force remove partially deleted worktree");
+        let error = manager
+            .remove("agent-repeat", true, true)
+            .expect_err("second remove should report not registered");
+        let message = error.to_string();
+
+        assert!(message.contains("worktree 'agent-repeat' is not registered"));
+        assert!(!message.contains("shallow"));
     }
 
     #[test]

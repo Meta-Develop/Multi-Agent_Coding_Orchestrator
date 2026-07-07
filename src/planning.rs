@@ -1,5 +1,6 @@
 use crate::{repo_semantic, sync::normalize_repo_relative_path};
 use anyhow::{Context, Result};
+use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -282,13 +283,19 @@ fn normalize_text(text: &str) -> String {
 
 fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    collect_repo_files_from(repo, repo, &mut files)?;
+    let git_repo = Repository::open(repo).ok();
+    collect_repo_files_from(repo, repo, git_repo.as_ref(), &mut files)?;
     files.sort();
     files.dedup();
     Ok(files)
 }
 
-fn collect_repo_files_from(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_repo_files_from(
+    root: &Path,
+    directory: &Path,
+    git_repo: Option<&Repository>,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
     let entries = fs::read_dir(directory)
         .with_context(|| format!("failed to read directory {}", directory.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -297,25 +304,34 @@ fn collect_repo_files_from(root: &Path, directory: &Path, files: &mut Vec<PathBu
     for entry in entries {
         let path = entry.path();
         let name = entry.file_name();
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("failed to relativize {}", path.display()))?;
+        let relative = normalize_repo_relative_path(relative)?;
         if path.is_dir() {
             if should_skip_dir(&name.to_string_lossy()) {
                 continue;
             }
-            collect_repo_files_from(root, &path, files)?;
+            if is_ignored_path(git_repo, &relative) {
+                continue;
+            }
+            collect_repo_files_from(root, &path, git_repo, files)?;
             continue;
         }
         if !path.is_file() {
             continue;
         }
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("failed to relativize {}", path.display()))?;
-        let relative = normalize_repo_relative_path(relative)?;
-        if !is_runtime_path(&relative) {
+        if !is_runtime_path(&relative) && !is_ignored_path(git_repo, &relative) {
             files.push(relative);
         }
     }
     Ok(())
+}
+
+fn is_ignored_path(git_repo: Option<&Repository>, relative: &Path) -> bool {
+    git_repo
+        .and_then(|repo| repo.status_should_ignore(relative).ok())
+        .unwrap_or(false)
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -500,6 +516,22 @@ mod tests {
         assert!(!files.iter().any(|path| path.starts_with(".agents/temp")));
         assert!(!files.iter().any(|path| path.starts_with(".agents/storage")));
         assert!(!files.iter().any(|path| path.starts_with(".agents/live")));
+    }
+
+    #[test]
+    fn collect_repo_files_excludes_git_ignored_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, ".gitignore", "ignored/\n");
+        write_file(repo, "ignored/generated.rs", "pub fn ignored() {}\n");
+        write_file(repo, "src/lib.rs", "pub fn kept() {}\n");
+
+        let files = collect_repo_files(repo).expect("collect repo files");
+
+        assert!(files.contains(&PathBuf::from(".gitignore")));
+        assert!(files.contains(&PathBuf::from("src/lib.rs")));
+        assert!(!files.iter().any(|path| path.starts_with("ignored")));
     }
 
     fn write_file(repo: &Path, relative: &str, contents: &str) {
