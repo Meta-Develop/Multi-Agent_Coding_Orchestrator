@@ -508,6 +508,7 @@ Run an opt-in supervisor-of-orchestrators plan:
   "task": "coordinate README and Rust follow-up work",
   "max_depth": 2,
   "max_child_assignments": 2,
+  "max_child_retries": 0,
   "child_timeout_seconds": 600,
   "assignments": [
     {
@@ -593,14 +594,24 @@ subprocess and requires an accepted AuditorReport with `role=auditor`,
 worker ids. A child-side review auditor is advisory unless the parent MACO/O2
 acceptance gate collects and accepts it. The accepted parent-launched
 AuditorReport is appended to the child `audit_reports` field.
+If a child declares worker assignments but returns zero `worker_reports`, the
+child report is rejected as structurally incomplete. If a child has no worker
+assignments but leaves a non-empty child worktree diff, `maco supervise run`
+still launches the parent read-only `REVIEW_AUDITOR` and requires it to cover
+the child orchestrator id and changed paths.
 `maco supervise run` does not apply worker changes to the primary worktree
 automatically. Child orchestrator execution is currently serial: the supervisor
 starts and waits for one child process at a time.
 `max_child_assignments` bounds the number of child assignments in the plan, and
 therefore the allowed fan-out, but it is not a parallel execution limit yet.
+`max_child_retries` defaults to `0` and may be set up to `2`; retries are only
+used for child report-shape failures such as missing or invalid report JSON or
+the wrong report id/role, and the retry prompt includes corrective feedback.
 `max_child_processes` is accepted only as a legacy JSON alias and normalized out
 of reports. The command refuses to start when the primary worktree is dirty; use
-`--allow-dirty-primary` only when the operator has reviewed that state. Tests use
+`--allow-dirty-primary` only when the operator has reviewed that state. The
+primary worktree dirty-path set is rechecked after each child process and any
+newly dirty primary paths fail that child assignment. Tests use
 fake subprocesses by default and do not require network access, provider
 credentials, or a real Codex login.
 

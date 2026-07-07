@@ -7,9 +7,9 @@ use crate::{
     sync_store::SyncStore,
     worktree::{WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use git2::{Delta, DiffFindOptions, DiffOptions, Oid, Repository, StatusOptions};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,7 +21,10 @@ use std::{
 
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_MAX_CHILD_ASSIGNMENTS: usize = 4;
+const DEFAULT_MAX_CHILD_RETRIES: u8 = 0;
+const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
+const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 
 #[derive(Debug, Clone)]
 pub struct SupervisorRunOptions {
@@ -47,6 +50,8 @@ pub struct SupervisorPlan {
         alias = "max_child_processes"
     )]
     pub max_child_assignments: usize,
+    #[serde(default = "default_max_child_retries")]
+    pub max_child_retries: u8,
     #[serde(default = "default_child_timeout_seconds")]
     pub child_timeout_seconds: u64,
     #[serde(default)]
@@ -339,6 +344,7 @@ pub fn supervisor_plan_from_task_file(
         task_file: Some(path_relative_to(&repo, task_file)),
         max_depth: default_max_depth(),
         max_child_assignments: DEFAULT_MAX_CHILD_ASSIGNMENTS,
+        max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         assignments: Vec::new(),
@@ -767,13 +773,13 @@ Evidence to review:
 - Child report path: {child_report_path}
 - Parent auditor report path: {auditor_report_path}
 - Auditor report schema path: {schema_path}
-- Assigned worker ids: {worker_ids}
+- Assigned worker/review subject ids: {worker_ids}
 - Assigned paths: {assigned_paths}
 - Child-reported and supervisor-inspected changed paths: {changed_paths}
 
 Review requirements:
 - Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
-- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence.
+- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
 - Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
 - Set role="auditor", no_further_delegation=true, read_only=true.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
@@ -790,17 +796,57 @@ Child report JSON:
         child_report_path = child_report_path.display(),
         auditor_report_path = auditor_report_path.display(),
         schema_path = schema_path.display(),
-        worker_ids = display_strings(
-            &assignment
-                .worker_assignments
-                .iter()
-                .map(|worker| worker.id.clone())
-                .collect::<Vec<_>>()
-        ),
+        worker_ids = display_strings(&required_auditor_prompt_subject_ids(
+            assignment,
+            child_report,
+        )),
         assigned_paths = display_paths(&assignment.assigned_paths),
         changed_paths = display_paths(&child_report.files_changed),
         child_report_json = child_report_json,
     ))
+}
+
+#[derive(Debug, Clone)]
+struct ChildAttemptArtifacts {
+    prompt_path: PathBuf,
+    report_path: PathBuf,
+    log_path: PathBuf,
+}
+
+fn child_attempt_artifacts(
+    dirs: &RunDirs,
+    assignment_id: &str,
+    attempt: usize,
+    attempt_numbered: bool,
+) -> ChildAttemptArtifacts {
+    let stem = if attempt_numbered {
+        format!("{assignment_id}.attempt-{attempt}")
+    } else {
+        assignment_id.to_string()
+    };
+    ChildAttemptArtifacts {
+        prompt_path: dirs.assignments.join(format!("{stem}.prompt.md")),
+        report_path: dirs.reports.join(format!("{stem}.json")),
+        log_path: dirs.logs.join(format!("{stem}.jsonl")),
+    }
+}
+
+fn prompt_with_corrective_feedback(prompt: &str, problems: &[String]) -> String {
+    let problem_list = problems
+        .iter()
+        .map(|problem| format!("- {problem}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"{prompt}
+
+CORRECTIVE FEEDBACK:
+Your previous attempt had structural OrchestratorReviewReport problems:
+{problem_list}
+
+Return only a compliant OrchestratorReviewReport JSON final response matching the schema. Do not include Markdown fences, prose, or any non-JSON wrapper.
+"#
+    )
 }
 
 fn run_supervisor_plan(
@@ -852,9 +898,16 @@ fn run_supervisor_plan(
                 })?,
             };
 
-            let claim = sync_store
+            let claim = match sync_store
                 .claim_paths(&assignment.id, assignment.assigned_paths.iter())
-                .with_context(|| format!("failed to claim paths for '{}'", assignment.id))?;
+            {
+                Ok(claim) => claim,
+                Err(error) => {
+                    findings.push(claim_failure_finding(&sync_store, assignment, &error));
+                    return Err(error)
+                        .with_context(|| format!("failed to claim paths for '{}'", assignment.id));
+                }
+            };
             acquired_claim_tokens.push(claim.token);
 
             let semantic_token = coordinate_semantic_assignment(
@@ -866,11 +919,10 @@ fn run_supervisor_plan(
                 &mut findings,
             )?;
 
-            let report_path = dirs.reports.join(format!("{}.json", assignment.id));
-            let prompt_path = dirs
+            let final_report_path = dirs.reports.join(format!("{}.json", assignment.id));
+            let final_prompt_path = dirs
                 .assignments
                 .join(format!("{}.prompt.md", assignment.id));
-            let log_path = dirs.logs.join(format!("{}.jsonl", assignment.id));
             let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
             let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
             let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
@@ -879,7 +931,7 @@ fn run_supervisor_plan(
                 assignment,
                 run_dir: &run_dir,
                 worktree: &worktree,
-                report_path: &report_path,
+                report_path: &final_report_path,
                 schema_path: &schema_path,
                 worker_schema_path: &worker_schema_path,
                 auditor_schema_path: &auditor_schema_path,
@@ -888,30 +940,86 @@ fn run_supervisor_plan(
                     semantic_intent_token: semantic_token,
                 },
             })?;
-            fs::write(&prompt_path, prompt)
-                .with_context(|| format!("failed to write prompt {}", prompt_path.display()))?;
+            fs::write(&final_prompt_path, &prompt).with_context(|| {
+                format!("failed to write prompt {}", final_prompt_path.display())
+            })?;
 
-            let mut command = ExternalAgentCommand::codex(
-                &options.codex_bin,
-                &worktree.path,
-                &prompt_path,
-                &log_path,
-                &report_path,
-                Duration::from_secs(plan.child_timeout_seconds),
-            );
-            command.output_schema = Some(schema_path);
+            let mut child_report = None;
+            let mut retry_feedback: Option<Vec<String>> = None;
+            let max_attempts = usize::from(plan.max_child_retries).saturating_add(1);
+            for attempt in 1..=max_attempts {
+                let attempt_artifacts =
+                    child_attempt_artifacts(&dirs, &assignment.id, attempt, max_attempts > 1);
+                let attempt_prompt = match &retry_feedback {
+                    Some(problems) => prompt_with_corrective_feedback(&prompt, problems),
+                    None => prompt.clone(),
+                };
+                fs::write(&attempt_artifacts.prompt_path, attempt_prompt).with_context(|| {
+                    format!(
+                        "failed to write prompt {}",
+                        attempt_artifacts.prompt_path.display()
+                    )
+                })?;
 
-            let external_run = run_external_agent(&command);
-            command_records.push(command_record_from_external(&external_run));
-            let mut child_report = collect_child_report(
-                assignment,
-                &report_path,
-                &external_run,
-                &worktree.path,
-                &primary_head,
-            );
-            if !assignment.worker_assignments.is_empty() && !child_report.worker_reports.is_empty()
-            {
+                let primary_before = dirty_primary_paths(&repo)?;
+                let mut command = ExternalAgentCommand::codex(
+                    &options.codex_bin,
+                    &worktree.path,
+                    &attempt_artifacts.prompt_path,
+                    &attempt_artifacts.log_path,
+                    &attempt_artifacts.report_path,
+                    Duration::from_secs(plan.child_timeout_seconds),
+                );
+                command.output_schema = Some(schema_path.clone());
+
+                let external_run = run_external_agent(&command);
+                command_records.push(command_record_from_external(&external_run));
+                let primary_after = dirty_primary_paths(&repo)?;
+                let primary_newly_dirty = newly_dirty_paths(&primary_before, &primary_after);
+                let (mut attempt_report, report_shape_problems) = collect_child_report(
+                    assignment,
+                    &attempt_artifacts.report_path,
+                    &external_run,
+                    &worktree.path,
+                    &primary_head,
+                );
+                if !primary_newly_dirty.is_empty() {
+                    mark_primary_integrity_violation(
+                        assignment,
+                        &primary_newly_dirty,
+                        &mut attempt_report,
+                    );
+                }
+                if should_retry_child_report(
+                    &attempt_report,
+                    &report_shape_problems,
+                    attempt,
+                    plan.max_child_retries,
+                ) {
+                    retry_feedback = Some(report_shape_problems);
+                    continue;
+                }
+                if attempt > 1 {
+                    attempt_report.findings.push(Finding {
+                        severity: FindingSeverity::Warning,
+                        message: format!(
+                            "child report accepted after corrective retry attempt {attempt}"
+                        ),
+                        paths: vec![attempt_artifacts.report_path.clone()],
+                    });
+                }
+                child_report = Some(attempt_report);
+                break;
+            }
+
+            let mut child_report = child_report.with_context(|| {
+                format!(
+                    "child orchestrator '{}' did not produce a collected report after retries",
+                    assignment.id
+                )
+            })?;
+
+            if parent_auditor_required(assignment, &child_report) {
                 let auditor_id = parent_auditor_id(assignment);
                 let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
                 let auditor_report_path = dirs.reports.join(format!("{auditor_id}.json"));
@@ -923,7 +1031,7 @@ fn run_supervisor_plan(
                         assignment,
                         run_dir: &run_dir,
                         worktree_path: &worktree.path,
-                        child_report_path: &report_path,
+                        child_report_path: &final_report_path,
                         auditor_report_path: &auditor_report_path,
                         schema_path: &auditor_schema_path,
                         child_report: &child_report,
@@ -954,13 +1062,13 @@ fn run_supervisor_plan(
                     collect_parent_auditor_report(assignment, &auditor_report_path, &auditor_run);
                 child_report.audit_reports.push(auditor_report);
             }
-            validate_auditor_reports(assignment, &report_path, &mut child_report);
-            write_child_report(&report_path, &child_report)?;
+            validate_auditor_reports(assignment, &final_report_path, &mut child_report);
+            write_child_report(&final_report_path, &child_report)?;
             if child_report.status != ReviewStatus::Succeeded {
                 findings.push(Finding {
                     severity: FindingSeverity::Error,
                     message: format!("child orchestrator '{}' failed", assignment.id),
-                    paths: vec![report_path.clone()],
+                    paths: vec![final_report_path.clone()],
                 });
             }
             if child_report.audit_reports.iter().any(report_failed) {
@@ -970,7 +1078,7 @@ fn run_supervisor_plan(
                         "child orchestrator '{}' failed enforced parent review auditor gate",
                         assignment.id
                     ),
-                    paths: vec![report_path.clone()],
+                    paths: vec![final_report_path.clone()],
                 });
             }
             if child_report.worker_reports.iter().any(report_failed) {
@@ -1092,6 +1200,12 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
     }
     if plan.max_child_assignments == 0 {
         bail!("max_child_assignments must be at least 1 (legacy max_child_processes is accepted as an alias)");
+    }
+    if plan.max_child_retries > MAX_CHILD_RETRIES_LIMIT {
+        bail!(
+            "max_child_retries must be at most {}",
+            MAX_CHILD_RETRIES_LIMIT
+        );
     }
     if plan.child_timeout_seconds == 0 {
         bail!("child_timeout_seconds must be greater than zero");
@@ -1278,29 +1392,42 @@ fn collect_child_report(
     external_run: &ExternalAgentRun,
     worktree_path: &Path,
     primary_head: &Oid,
-) -> OrchestratorReviewReport {
+) -> (OrchestratorReviewReport, Vec<String>) {
+    let mut report_shape_problems = Vec::new();
     let mut report = match read_child_report(report_path) {
-        Ok(mut report) => {
+        Ok(parsed) => {
+            let mut report = parsed.report;
+            if parsed.recovered {
+                report.findings.push(Finding {
+                    severity: FindingSeverity::Warning,
+                    message: LENIENT_JSON_EXTRACTION_WARNING.to_string(),
+                    paths: vec![report_path.to_path_buf()],
+                });
+            }
             if report.id != assignment.id {
+                let message = format!(
+                    "report id '{}' does not match assignment '{}'",
+                    report.id, assignment.id
+                );
+                report_shape_problems.push(message.clone());
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
                 report.rejected = true;
                 report.findings.push(Finding {
                     severity: FindingSeverity::Error,
-                    message: format!(
-                        "report id '{}' does not match assignment '{}'",
-                        report.id, assignment.id
-                    ),
+                    message,
                     paths: vec![report_path.to_path_buf()],
                 });
             }
             if report.role != AgentRole::ChildOrchestrator {
+                let message = "orchestrator report role must be child_orchestrator".to_string();
+                report_shape_problems.push(message.clone());
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
                 report.rejected = true;
                 report.findings.push(Finding {
                     severity: FindingSeverity::Error,
-                    message: "orchestrator report role must be child_orchestrator".to_string(),
+                    message,
                     paths: vec![report_path.to_path_buf()],
                 });
             }
@@ -1317,12 +1444,14 @@ fn collect_child_report(
             report
         }
         Err(error) => {
+            let message = format!("required child report is missing or invalid: {error}");
+            report_shape_problems.push(message);
             missing_child_report(assignment, report_path, external_run, error.to_string())
         }
     };
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     verify_child_report_paths(assignment, worktree_path, primary_head, &mut report);
-    report
+    (report, report_shape_problems)
 }
 
 fn collect_parent_auditor_report(
@@ -1332,7 +1461,15 @@ fn collect_parent_auditor_report(
 ) -> AuditorReport {
     let expected_id = parent_auditor_id(assignment);
     let mut report = match read_auditor_report(report_path) {
-        Ok(mut report) => {
+        Ok(parsed) => {
+            let mut report = parsed.report;
+            if parsed.recovered {
+                report.findings.push(Finding {
+                    severity: FindingSeverity::Warning,
+                    message: LENIENT_JSON_EXTRACTION_WARNING.to_string(),
+                    paths: vec![report_path.to_path_buf()],
+                });
+            }
             if report.id != expected_id {
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
@@ -1372,18 +1509,14 @@ fn validate_auditor_reports(
     report_path: &Path,
     report: &mut OrchestratorReviewReport,
 ) {
-    if assignment.worker_assignments.is_empty() || report.worker_reports.is_empty() {
+    let required_review_subject_ids = required_auditor_review_subject_ids(assignment, report);
+    if required_review_subject_ids.is_empty() {
         return;
     }
 
-    let required_worker_ids = assignment
-        .worker_assignments
-        .iter()
-        .map(|worker| worker.id.as_str())
-        .collect::<BTreeSet<_>>();
     let required_parent_auditor_id = parent_auditor_id(assignment);
     let required_reviewed_paths = required_auditor_review_paths(assignment, report);
-    let mut covered_worker_ids = BTreeSet::new();
+    let mut covered_review_subject_ids = BTreeSet::<String>::new();
     let mut parent_auditor_accepted = false;
     let mut invalid_auditors = Vec::new();
 
@@ -1461,12 +1594,12 @@ fn validate_auditor_reports(
             if audit_report.id == required_parent_auditor_id {
                 parent_auditor_accepted = true;
             }
-            covered_worker_ids.extend(
+            covered_review_subject_ids.extend(
                 audit_report
                     .reviewed_worker_ids
                     .iter()
-                    .filter(|id| required_worker_ids.contains(id.as_str()))
-                    .map(String::as_str),
+                    .filter(|id| required_review_subject_ids.contains(id.as_str()))
+                    .cloned(),
             );
             continue;
         }
@@ -1484,18 +1617,39 @@ fn validate_auditor_reports(
         invalid_auditors.push(audit_report.id.clone());
     }
 
-    let missing_worker_ids = required_worker_ids
-        .difference(&covered_worker_ids)
+    let missing_review_subject_ids = required_review_subject_ids
+        .difference(&covered_review_subject_ids)
         .map(|id| (*id).to_string())
         .collect::<Vec<_>>();
 
-    if invalid_auditors.is_empty() && missing_worker_ids.is_empty() && parent_auditor_accepted {
+    if invalid_auditors.is_empty()
+        && missing_review_subject_ids.is_empty()
+        && parent_auditor_accepted
+    {
         return;
     }
 
     report.status = ReviewStatus::Failed;
     report.accepted = false;
     report.rejected = true;
+
+    if !assignment.worker_assignments.is_empty() && report.worker_reports.is_empty() {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' contained zero worker_reports despite assigned worker IDs: {}",
+                report.id,
+                display_strings(
+                    &assignment
+                        .worker_assignments
+                        .iter()
+                        .map(|worker| worker.id.clone())
+                        .collect::<Vec<_>>()
+                )
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
 
     if report.audit_reports.is_empty() {
         report.findings.push(Finding {
@@ -1506,13 +1660,13 @@ fn validate_auditor_reports(
             ),
             paths: vec![report_path.to_path_buf()],
         });
-    } else if !missing_worker_ids.is_empty() {
+    } else if !missing_review_subject_ids.is_empty() {
         report.findings.push(Finding {
             severity: FindingSeverity::Error,
             message: format!(
-                "child orchestrator '{}' omitted accepted review auditor coverage for worker IDs: {}",
+                "child orchestrator '{}' omitted accepted review auditor coverage for review subject IDs: {}",
                 report.id,
-                missing_worker_ids.join(", ")
+                missing_review_subject_ids.join(", ")
             ),
             paths: vec![report_path.to_path_buf()],
         });
@@ -1545,6 +1699,42 @@ fn validate_auditor_reports(
         "required terminal review-auditor evidence is missing or invalid".to_string();
     report.next_safe_action =
         "rerun the child scope with a read-only review auditor before finalizing".to_string();
+}
+
+fn parent_auditor_required(
+    assignment: &OrchestratorAssignment,
+    report: &OrchestratorReviewReport,
+) -> bool {
+    (!assignment.worker_assignments.is_empty() && !report.worker_reports.is_empty())
+        || (assignment.worker_assignments.is_empty() && !report.files_changed.is_empty())
+}
+
+fn required_auditor_review_subject_ids(
+    assignment: &OrchestratorAssignment,
+    report: &OrchestratorReviewReport,
+) -> BTreeSet<String> {
+    if assignment.worker_assignments.is_empty() {
+        if report.files_changed.is_empty() {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([report.id.clone()])
+        }
+    } else {
+        assignment
+            .worker_assignments
+            .iter()
+            .map(|worker| worker.id.clone())
+            .collect()
+    }
+}
+
+fn required_auditor_prompt_subject_ids(
+    assignment: &OrchestratorAssignment,
+    report: &OrchestratorReviewReport,
+) -> Vec<String> {
+    required_auditor_review_subject_ids(assignment, report)
+        .into_iter()
+        .collect()
 }
 
 fn required_auditor_review_paths(
@@ -1734,10 +1924,149 @@ fn verify_child_report_paths(
             .to_string();
 }
 
-fn read_child_report(path: &Path) -> Result<OrchestratorReviewReport> {
+fn should_retry_child_report(
+    report: &OrchestratorReviewReport,
+    report_shape_problems: &[String],
+    attempt: usize,
+    max_child_retries: u8,
+) -> bool {
+    if report_shape_problems.is_empty() || attempt > usize::from(max_child_retries) {
+        return false;
+    }
+    if report.worker_reports.iter().any(report_failed)
+        || report.validation_results.iter().any(validation_failed)
+    {
+        return false;
+    }
+    !report.findings.iter().any(|finding| {
+        finding.severity == FindingSeverity::Error
+            && !report_shape_problems
+                .iter()
+                .any(|problem| finding.message.contains(problem))
+            && !retryable_cascaded_shape_message(&finding.message)
+    })
+}
+
+fn retryable_cascaded_shape_message(message: &str) -> bool {
+    message.contains("omitted required worker reports for assignment worker IDs")
+        || message.contains("contained zero worker_reports despite assigned worker IDs")
+}
+
+fn validation_failed(result: &ValidationResult) -> bool {
+    result.status != ReviewStatus::Succeeded
+}
+
+fn mark_primary_integrity_violation(
+    assignment: &OrchestratorAssignment,
+    newly_dirty_paths: &[PathBuf],
+    report: &mut OrchestratorReviewReport,
+) {
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: format!(
+            "primary worktree became dirty during child orchestrator '{}' run: {}",
+            assignment.id,
+            display_paths(newly_dirty_paths)
+        ),
+        paths: newly_dirty_paths.to_vec(),
+    });
+    report.remaining_risk =
+        "child run mutated the primary worktree or left new primary dirty paths".to_string();
+    report.next_safe_action =
+        "inspect and clean the primary worktree before rerunning supervise".to_string();
+}
+
+fn dirty_primary_paths(repo: &Path) -> Result<Vec<PathBuf>> {
+    let repo = Repository::open(repo)
+        .with_context(|| format!("failed to open repository {}", repo.display()))?;
+    repository_dirty_paths(&repo, "failed to inspect primary worktree status")
+}
+
+fn newly_dirty_paths(before: &[PathBuf], after: &[PathBuf]) -> Vec<PathBuf> {
+    let before = before.iter().collect::<BTreeSet<_>>();
+    after
+        .iter()
+        .filter(|path| !before.contains(path))
+        .cloned()
+        .collect()
+}
+
+fn claim_failure_finding(
+    sync_store: &SyncStore,
+    assignment: &OrchestratorAssignment,
+    error: &anyhow::Error,
+) -> Finding {
+    let conflicts = claim_conflict_details(sync_store, &assignment.assigned_paths);
+    let paths = conflicts
+        .iter()
+        .map(|conflict| conflict.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let detail = if conflicts.is_empty() {
+        error.to_string()
+    } else {
+        conflicts
+            .iter()
+            .map(|conflict| {
+                format!(
+                    "{} currently claimed by {}",
+                    conflict.path.display(),
+                    conflict.owner
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    Finding {
+        severity: FindingSeverity::Error,
+        message: format!("failed to claim paths for '{}': {}", assignment.id, detail),
+        paths,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClaimConflictDetail {
+    path: PathBuf,
+    owner: String,
+}
+
+fn claim_conflict_details(
+    sync_store: &SyncStore,
+    requested_paths: &[PathBuf],
+) -> Vec<ClaimConflictDetail> {
+    match sync_store.snapshot() {
+        Ok(claims) => claims
+            .iter()
+            .flat_map(|claim| {
+                claim.paths.iter().filter_map(|claimed| {
+                    requested_paths
+                        .iter()
+                        .find(|requested| paths_overlap(claimed, requested))
+                        .map(|requested| ClaimConflictDetail {
+                            path: requested.clone(),
+                            owner: format!("{} (token {})", claim.agent_id, claim.token.get()),
+                        })
+                })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedReport<T> {
+    report: T,
+    recovered: bool,
+}
+
+fn read_child_report(path: &Path) -> Result<ParsedReport<OrchestratorReviewReport>> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read child report {}", path.display()))?;
-    serde_json::from_str(&contents)
+    parse_report_json(&contents)
         .with_context(|| format!("failed to parse child report {}", path.display()))
 }
 
@@ -1750,11 +2079,118 @@ fn write_child_report(path: &Path, report: &OrchestratorReviewReport) -> Result<
         .with_context(|| format!("failed to finish updated child report {}", path.display()))
 }
 
-fn read_auditor_report(path: &Path) -> Result<AuditorReport> {
+fn read_auditor_report(path: &Path) -> Result<ParsedReport<AuditorReport>> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read auditor report {}", path.display()))?;
-    serde_json::from_str(&contents)
+    parse_report_json(&contents)
         .with_context(|| format!("failed to parse auditor report {}", path.display()))
+}
+
+fn parse_report_json<T>(contents: &str) -> Result<ParsedReport<T>>
+where
+    T: DeserializeOwned,
+{
+    if let Ok(report) = serde_json::from_str(contents) {
+        return Ok(ParsedReport {
+            report,
+            recovered: false,
+        });
+    }
+
+    if let Some(stripped) = strip_surrounding_markdown_fence(contents) {
+        if let Ok(report) = serde_json::from_str(stripped) {
+            return Ok(ParsedReport {
+                report,
+                recovered: true,
+            });
+        }
+    }
+
+    if let Some(object) = last_top_level_json_object(contents) {
+        if let Ok(report) = serde_json::from_str(object) {
+            return Ok(ParsedReport {
+                report,
+                recovered: true,
+            });
+        }
+    }
+
+    if let Some(stripped) = strip_surrounding_markdown_fence(contents) {
+        if let Some(object) = last_top_level_json_object(stripped) {
+            if let Ok(report) = serde_json::from_str(object) {
+                return Ok(ParsedReport {
+                    report,
+                    recovered: true,
+                });
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "report is not valid JSON and lenient JSON extraction failed"
+    ))
+}
+
+fn strip_surrounding_markdown_fence(contents: &str) -> Option<&str> {
+    let trimmed = contents.trim();
+    if !trimmed.starts_with("```") || !trimmed.ends_with("```") {
+        return None;
+    }
+
+    let first_newline = trimmed.find('\n')?;
+    let (opening, body_with_closing) = trimmed.split_at(first_newline);
+    let info = opening.trim_start_matches("```").trim();
+    if !info.is_empty() && info != "json" {
+        return None;
+    }
+    let body_with_closing = body_with_closing.trim_start_matches('\n');
+    let closing_start = body_with_closing.rfind("```")?;
+    Some(body_with_closing[..closing_start].trim())
+}
+
+fn last_top_level_json_object(contents: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut last_object = None;
+
+    for (index, character) in contents.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match character {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth = depth.saturating_add(1);
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(object_start) = start.take() {
+                        let object_end = index + character.len_utf8();
+                        last_object = contents.get(object_start..object_end);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    last_object
 }
 
 fn missing_child_report(
@@ -1970,10 +2406,31 @@ fn ensure_reusable_child_worktree(record: &WorktreeRecord, primary_head: &Oid) -
 }
 
 fn repository_is_dirty(repo: &Repository, context: &'static str) -> Result<bool> {
+    Ok(!repository_dirty_paths(repo, context)?.is_empty())
+}
+
+fn repository_dirty_paths(repo: &Repository, context: &'static str) -> Result<Vec<PathBuf>> {
     let mut options = StatusOptions::new();
     options.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = repo.statuses(Some(&mut options)).context(context)?;
-    Ok(!statuses.is_empty())
+    let mut paths = BTreeSet::new();
+    for entry in statuses.iter() {
+        if let Some(path) = entry.path().filter(|path| !is_local_runtime_path(path)) {
+            paths.insert(PathBuf::from(path));
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn is_local_runtime_path(path: &str) -> bool {
+    path == ".maco"
+        || path.starts_with(".maco/")
+        || path == ".agents/temp"
+        || path.starts_with(".agents/temp/")
+        || path == ".agents/storage"
+        || path.starts_with(".agents/storage/")
+        || path == ".agents/live"
+        || path.starts_with(".agents/live/")
 }
 
 fn current_head_oid(repo_path: &Path) -> Result<Oid> {
@@ -2434,6 +2891,10 @@ fn default_max_child_assignments() -> usize {
     DEFAULT_MAX_CHILD_ASSIGNMENTS
 }
 
+fn default_max_child_retries() -> u8 {
+    DEFAULT_MAX_CHILD_RETRIES
+}
+
 fn default_child_timeout_seconds() -> u64 {
     DEFAULT_CHILD_TIMEOUT_SECONDS
 }
@@ -2465,6 +2926,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_clean_child_report_json_without_recovery() {
+        let parsed: ParsedReport<OrchestratorReviewReport> =
+            parse_report_json(&sample_child_report_json("child-a"))
+                .expect("clean child report should parse");
+        assert_eq!(parsed.report.id, "child-a");
+        assert!(!parsed.recovered);
+    }
+
+    #[test]
+    fn parses_fenced_auditor_report_json_with_recovery() {
+        let contents = format!("```json\n{}\n```", sample_auditor_report_json("auditor-a"));
+        let parsed: ParsedReport<AuditorReport> =
+            parse_report_json(&contents).expect("fenced auditor report should parse");
+        assert_eq!(parsed.report.id, "auditor-a");
+        assert!(parsed.recovered);
+    }
+
+    #[test]
+    fn extracts_last_top_level_child_report_json_with_recovery() {
+        let contents = format!(
+            "summary before\n{{\"ignored\": true}}\n{}\ntrailing notes",
+            sample_child_report_json("child-prose")
+        );
+        let parsed: ParsedReport<OrchestratorReviewReport> =
+            parse_report_json(&contents).expect("prose-wrapped child report should parse");
+        assert_eq!(parsed.report.id, "child-prose");
+        assert!(parsed.recovered);
+    }
+
+    #[test]
+    fn rejects_report_garbage_beyond_recovery() {
+        let error = parse_report_json::<OrchestratorReviewReport>(
+            "not json\n```text\nstill not json\n```\n{broken",
+        )
+        .expect_err("garbage should not parse");
+        assert!(error.to_string().contains("lenient JSON extraction failed"));
+    }
+
+    #[test]
     fn supervise_role_prefixes_match_runtime_contract() {
         assert_eq!(
             supervise_role_prefix(SupervisePromptRole::O2TopSupervisor, "supervisor", None),
@@ -2492,5 +2992,51 @@ mod tests {
         assert!(runtime_labeled_worker.starts_with("ROLE: TERMINAL_WORKER\n"));
         assert!(runtime_labeled_worker.contains("AGENT_LABEL: expert-coder\n"));
         assert!(!runtime_labeled_worker.contains("ROLE: expert-coder"));
+    }
+
+    fn sample_child_report_json(id: &str) -> String {
+        format!(
+            r#"{{
+  "id": "{id}",
+  "role": "child_orchestrator",
+  "assigned_paths": ["README.md"],
+  "semantic_symbols": [],
+  "semantic_modules": [],
+  "claim_token": null,
+  "semantic_intent_token": null,
+  "commands_run": [],
+  "files_changed": [],
+  "validation_results": [],
+  "findings": [],
+  "worker_reports": [],
+  "audit_reports": [],
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded",
+  "remaining_risk": "none",
+  "next_safe_action": "review"
+}}"#
+        )
+    }
+
+    fn sample_auditor_report_json(id: &str) -> String {
+        format!(
+            r#"{{
+  "id": "{id}",
+  "role": "auditor",
+  "reviewed_worker_ids": ["child-a"],
+  "reviewed_paths": ["README.md"],
+  "commands_run": [],
+  "validation_results": [],
+  "findings": [],
+  "no_further_delegation": true,
+  "read_only": true,
+  "accepted": true,
+  "rejected": false,
+  "status": "succeeded",
+  "remaining_risk": "none",
+  "next_safe_action": "review"
+}}"#
+        )
     }
 }

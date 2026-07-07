@@ -800,6 +800,7 @@ fn supervisor_plan_for_attempt(
         task_file: None,
         max_depth: 2,
         max_child_assignments: 1,
+        max_child_retries: 0,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         assignments: vec![OrchestratorAssignment {

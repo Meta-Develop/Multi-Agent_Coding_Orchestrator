@@ -791,12 +791,16 @@ fn supervise_run_rejects_missing_worker_reports_for_assigned_workers() -> Result
     );
     assert_json_findings_contain_message(
         &child_report["findings"],
+        "contained zero worker_reports despite assigned worker IDs: worker-omitted",
+    )?;
+    assert_json_findings_contain_message(
+        &child_report["findings"],
         "omitted required worker reports for assignment worker IDs: worker-omitted",
     )?;
     assert!(child_report["remaining_risk"]
         .as_str()
         .context("child risk")?
-        .contains("missing terminal no-delegation attestations"));
+        .contains("terminal review-auditor evidence"));
 
     Ok(())
 }
@@ -1366,10 +1370,18 @@ fn supervise_run_passes_when_child_only_edits_assigned_paths() -> Result<()> {
 
     assert_eq!(report["success"], true);
     assert_eq!(report["orchestrator_reports"][0]["status"], "succeeded");
+    assert_eq!(
+        report["commands_run"].as_array().context("commands")?.len(),
+        2
+    );
     assert_json_array_contains(
         &report["orchestrator_reports"][0]["files_changed"],
         "README.md",
     )?;
+    assert_eq!(
+        report["orchestrator_reports"][0]["audit_reports"][0]["reviewed_worker_ids"][0],
+        "child-assigned-only"
+    );
     assert_eq!(
         report["orchestrator_reports"][0]["findings"]
             .as_array()
@@ -1377,6 +1389,278 @@ fn supervise_run_passes_when_child_only_edits_assigned_paths() -> Result<()> {
             .len(),
         0
     );
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_fails_when_child_mutates_primary_worktree() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "catch primary mutation",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-mutation", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-primary-mutation",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "primary worktree became dirty during child orchestrator 'child-primary-mutation' run",
+        "README.md",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_retries_report_shape_failure_once_with_corrective_feedback() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "retry malformed report",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "max_child_retries": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-retry-shape", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_success_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-retry-shape",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_eq!(
+        report["commands_run"].as_array().context("commands")?.len(),
+        3
+    );
+    assert!(repo_path
+        .join(".maco/o2/runs/supervise-retry-shape/logs/child-retry-shape.attempt-1.jsonl")
+        .exists());
+    assert!(repo_path
+        .join(".maco/o2/runs/supervise-retry-shape/logs/child-retry-shape.attempt-2.jsonl")
+        .exists());
+    assert!(repo_path
+        .join(".maco/o2/runs/supervise-retry-shape/reports/child-retry-shape.attempt-1.json")
+        .exists());
+    assert!(repo_path
+        .join(".maco/o2/runs/supervise-retry-shape/reports/child-retry-shape.attempt-2.json")
+        .exists());
+    let retry_prompt = fs::read_to_string(repo_path.join(
+        ".maco/o2/runs/supervise-retry-shape/assignments/child-retry-shape.attempt-2.prompt.md",
+    ))
+    .context("read retry prompt")?;
+    assert!(retry_prompt.contains("CORRECTIVE FEEDBACK"));
+    assert!(retry_prompt.contains("required child report is missing or invalid"));
+    assert_json_findings_contain_message(
+        &report["orchestrator_reports"][0]["findings"],
+        "corrective retry attempt 2",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_retries_malformed_first_attempt_that_left_assigned_diff() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "retry malformed report with assigned diff",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "max_child_retries": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-retry-shape-diff", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_success_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-retry-shape-diff",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_json_array_contains(
+        &report["orchestrator_reports"][0]["files_changed"],
+        "README.md",
+    )?;
+    assert!(repo_path
+        .join(
+            ".maco/o2/runs/supervise-retry-shape-diff/logs/child-retry-shape-diff.attempt-1.jsonl"
+        )
+        .exists());
+    assert!(repo_path
+        .join(
+            ".maco/o2/runs/supervise-retry-shape-diff/logs/child-retry-shape-diff.attempt-2.jsonl"
+        )
+        .exists());
+    assert_json_findings_contain_message(
+        &report["orchestrator_reports"][0]["findings"],
+        "corrective retry attempt 2",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_does_not_retry_malformed_first_attempt_with_path_violation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "do not retry malformed report with path violation",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "max_child_retries": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-retry-shape-unauthorized", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-retry-shape-unauthorized",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert!(repo_path
+        .join(".maco/o2/runs/supervise-retry-shape-unauthorized/logs/child-retry-shape-unauthorized.attempt-1.jsonl")
+        .exists());
+    assert!(!repo_path
+        .join(".maco/o2/runs/supervise-retry-shape-unauthorized/logs/child-retry-shape-unauthorized.attempt-2.jsonl")
+        .exists());
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "outside its assigned paths",
+        "src/lib.rs",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "claim conflict diagnostics",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-claim-conflict", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let preclaim = run_success_json_args(&[
+        "sync",
+        "claim",
+        "stale-agent",
+        "README.md",
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--json",
+    ])?;
+    assert_eq!(preclaim["agent_id"], "stale-agent");
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-claim-conflict",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["findings"],
+        "error",
+        "README.md currently claimed by stale-agent (token",
+        "README.md",
+    )?;
 
     Ok(())
 }
@@ -1498,6 +1782,20 @@ fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
           ]
         }"#,
     )?;
+    let bad_retries = temp.path().join("bad-retries.json");
+    write_plan(
+        &bad_retries,
+        r#"{
+          "version": 1,
+          "task": "bad retries",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "max_child_retries": 3,
+          "assignments": [
+            {"id": "child-a", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
 
     let depth_output = run_failure_output(&[
         "supervise",
@@ -1526,6 +1824,20 @@ fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
         "--json",
     ])?;
     assert!(String::from_utf8_lossy(&budget_output.stderr).contains("max_child_assignments"));
+
+    let retries_output = run_failure_output(&[
+        "supervise",
+        "run",
+        bad_retries.to_str().context("bad retries path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-bad-retries",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+    assert!(String::from_utf8_lossy(&retries_output.stderr).contains("max_child_retries"));
 
     Ok(())
 }
@@ -1567,6 +1879,7 @@ fn supervise_plan_json_output_is_stable() -> Result<()> {
     assert_eq!(plan["version"], 1);
     assert_eq!(plan["max_depth"], 2);
     assert_eq!(plan["max_child_assignments"], 1);
+    assert_eq!(plan["max_child_retries"], 0);
     assert_eq!(plan.get("max_child_processes"), None);
     assert_eq!(plan["semantic_coordination"], "off");
     assert_eq!(plan["assignments"][0]["role"], "child_orchestrator");
@@ -2137,9 +2450,15 @@ case "$prompt_body" in
     ;;
 esac
 name="$(basename "$report" .json)"
+logical_name="$name"
+case "$logical_name" in
+  *.attempt-*)
+    logical_name="${logical_name%%.attempt-*}"
+    ;;
+esac
 expected_o1_prefix="ROLE: O1_CHILD_ORCHESTRATOR
 AGENT_KIND: child_orchestrator
-AGENT_LABEL: $name
+AGENT_LABEL: $logical_name
 PARENT_THREAD_ID: none
 THREAD_DEPTH: 1
 NO_FURTHER_DELEGATION: false"
@@ -2209,6 +2528,38 @@ if [ "$auditor_role_prefix" = "true" ]; then
       path="README.md"
       worker="worker-omitted"
       ;;
+    child-unauthorized)
+      path="README.md"
+      worker="child-unauthorized"
+      ;;
+    child-omits-assigned)
+      path="README.md"
+      worker="child-omits-assigned"
+      ;;
+    child-assigned-only)
+      path="README.md"
+      worker="child-assigned-only"
+      ;;
+    child-generated)
+      path="README.md"
+      worker="child-generated"
+      ;;
+    child-primary-mutation)
+      path="README.md"
+      worker="child-primary-mutation"
+      ;;
+    child-retry-shape)
+      path="README.md"
+      worker="child-retry-shape"
+      ;;
+    child-retry-shape-diff)
+      path="README.md"
+      worker="child-retry-shape-diff"
+      ;;
+    child-retry-shape-unauthorized)
+      path="README.md"
+      worker="child-retry-shape-unauthorized"
+      ;;
     *)
       path="README.md"
       worker="worker-a"
@@ -2276,7 +2627,7 @@ JSON
 JSON
   exit 0
 fi
-case "$name" in
+case "$logical_name" in
   child-b)
     path="src/lib.rs"
     edit_path="src/lib.rs"
@@ -2335,6 +2686,26 @@ case "$name" in
     edit_path="README.md"
     worker="worker-assigned-only"
     ;;
+  child-primary-mutation)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-primary-mutation"
+    ;;
+  child-retry-shape)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-retry-shape"
+    ;;
+  child-retry-shape-diff)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-retry-shape-diff"
+    ;;
+  child-retry-shape-unauthorized)
+    path="README.md"
+    edit_path="src/lib.rs"
+    worker="worker-retry-shape-unauthorized"
+    ;;
   child-clean)
     path="README.md"
     edit_path="README.md"
@@ -2348,9 +2719,23 @@ case "$name" in
     worker="worker-a"
     ;;
 esac
-if [ "$name" = "child-missing" ]; then
+if [ "$logical_name" = "child-missing" ]; then
   exit 0
 fi
+case "$logical_name" in
+  child-retry-shape|child-retry-shape-diff|child-retry-shape-unauthorized)
+  case "$name" in
+    *.attempt-1)
+      if [ "$logical_name" != "child-retry-shape" ]; then
+        mkdir -p "$(dirname "$worktree/$edit_path")"
+        printf '\nfirst malformed attempt change from %s\n' "$name" >> "$worktree/$edit_path"
+      fi
+      printf 'not a usable report from first attempt\n{broken\n' > "$report"
+      exit 0
+      ;;
+  esac
+  ;;
+esac
 if [ -z "$files_changed_json" ]; then
   files_changed_json='["'"$path"'"]'
 fi
@@ -2358,7 +2743,11 @@ if [ "$edit" = "true" ]; then
   mkdir -p "$(dirname "$worktree/$edit_path")"
   printf '\nfake change from %s\n' "$name" >> "$worktree/$edit_path"
 fi
-if [ "$name" = "child-fail" ]; then
+if [ "$logical_name" = "child-primary-mutation" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  printf '\nprimary mutation from %s\n' "$name" >> "$primary/README.md"
+fi
+if [ "$logical_name" = "child-fail" ]; then
   status="failed"
   accepted="false"
   rejected="true"
@@ -2402,7 +2791,7 @@ if [ -z "$audit_reports_json" ]; then
 fi
 cat > "$report" <<JSON
 {
-  "id": "$name",
+  "id": "$logical_name",
   "role": "child_orchestrator",
   "assigned_paths": ["$path"],
   "semantic_symbols": [],
