@@ -204,12 +204,7 @@ where
         provider,
     });
 
-    let keep_claims = options.keep_claims
-        && result
-            .as_ref()
-            .map(|report| report.success)
-            .unwrap_or(false);
-    let (released_claims, release_errors) = if keep_claims {
+    let (released_claims, release_errors) = if options.keep_claims {
         (Vec::new(), Vec::new())
     } else {
         match store.release(claim_token) {
@@ -380,6 +375,7 @@ where
             validations,
         },
         forces: MergeForceOptions::default(),
+        require_validation: false,
     })?;
 
     let boundary_error = if candidate.unclaimed_changed_paths.is_empty() {
@@ -1252,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn allowed_provider_command_timeout_fails_and_releases_claim() -> Result<()> {
+    fn allowed_provider_command_timeout_with_keep_claims_leaves_claim_active() -> Result<()> {
         let temp = TempDir::new().context("tempdir")?;
         let repo_path = create_committed_repo(temp.path())?;
         let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
@@ -1287,7 +1283,12 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("timed out"));
-        assert!(SyncStore::open(&repo_path)?.snapshot()?.is_empty());
+        let active_claims = SyncStore::open(&repo_path)?.snapshot()?;
+        assert_eq!(active_claims.len(), 1);
+        assert_eq!(active_claims[0].agent_id, "agent-a");
+        assert_eq!(active_claims[0].paths, vec![PathBuf::from("README.md")]);
+        assert!(report.released_claims.is_empty());
+        assert!(report.release_errors.is_empty());
 
         Ok(())
     }

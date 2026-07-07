@@ -34,18 +34,78 @@ The current implementation covers a local-first command-line slice:
 - `maco sync release-agent <agent-id>` releases all claims for an agent.
 - `maco sync owner <path>` reports the owner of a path, if one exists.
 - `maco sync status` lists active durable claims.
-- `maco repo map` prints a read-only repository file map with coarse file categories and Git status.
+- `maco repo map` prints a read-only repository file map with coarse file
+  categories and Git status while excluding runtime-only `.maco` output and
+  local `.agents/temp`, `.agents/storage`, and `.agents/live` coordination data.
 - `maco repo map --semantic` builds a parser-backed Rust semantic map for modules, symbols, impls, imports, public re-exports, module declarations, import dependencies, and parse errors.
 - `maco repo query symbol <name>` and `maco repo query path <path>` search the semantic Rust map.
 - `maco repo query risk --path <path> --json` reports touched symbols, dependency impacts, and impacted files for changed Rust paths.
+- `maco coord preview/claim/status/release/release-agent` provides standalone
+  repo-local semantic intent coordination for paths, modules, and symbols
+  without automatic task planning.
 - `maco orchestrate validate <plan-file>` validates a local JSON orchestration plan.
 - `maco orchestrate run <plan-file>` creates or reuses agent worktrees, claims paths, runs configured local shell commands, runs per-agent validation commands in agent worktrees, enforces path-claim boundaries, optionally writes patches and checkpoints, releases claims, and emits a run summary.
 - `maco orchestrate resume <checkpoint-file>` validates the checkpoint, repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims before skipping completed agents and running only pending work.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
-- `maco merge preview` and `maco merge apply` collect agent output and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report`.
+- `maco merge preview` and `maco merge apply` collect agent output and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report` and can require passed validation evidence with `--require-validation`.
+- `maco merge apply --validation-command <command>` validates a temporary merged
+  candidate before mutating the primary worktree. A command failure blocks the
+  apply and leaves the primary worktree unchanged.
+- `maco pr preview` checks whether an agent worktree is ready to publish without mutating the primary worktree or contacting a forge.
+- `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when needed, then either emits a deterministic fake PR URL or, with explicit `--forge github`, shells out to `git push` and `gh pr create`. PR preview and publish also accept `--require-validation`.
+- `maco issue preview` redacts issue bodies without creating anything.
+- `maco issue create --forge fake|github` creates a deterministic fake issue URL locally or, with explicit `--forge github`, shells out to `gh issue create`.
+- `maco live status`, `maco live validate`, `maco live heartbeat`, and
+  `maco live override-release` expose repo-local Markdown claim liveness for
+  active, blocked, handoff, and done work.
 - `maco llm providers` and `maco llm prompt-preview` expose the provider-neutral prompt boundary without network calls.
 - `maco agent run` runs a local fake-provider-backed proposal in an isolated worktree with durable claims, boundary checks, validation, merge-preview reporting, and no real network providers by default.
+- `maco supervise plan` normalizes an opt-in supervisor task or JSON plan for
+  Codex CLI subprocess orchestration.
+- `maco supervise run` serially launches opt-in O1 child orchestrators through
+  the Codex CLI in isolated child worktrees under an O2 supervisor. Each child
+  is instructed to read `AGENTS.md` and project-local `.agents` guidance before
+  acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
+  worker/researcher assignments when available, preserve the O1/O2 subprocess
+  launch boundary of `--sandbox danger-full-access`, `--enable goals`, and
+  `--enable multi_agent`, leave O1/O2 hierarchy and enforced audit gates to
+  MACO/Codex CLI subprocess workflows, report peer-O2 escalation candidates
+  instead of taking them over, and preserve structured reporting without
+  applying worker changes to the primary worktree
+  automatically.
+- `maco supervise status` reports durable supervisor run artifact state without
+  launching workers or applying changes.
+- `maco supervise collect` reads the structured supervisor final report and
+  preserves the same no-automatic-primary-apply boundary.
+- `maco supervise artifacts list/latest/prune` inspects or prunes durable
+  supervisor run artifacts.
+- `maco consult ask` asks a terminal read-only cross-runtime consultant for
+  advisory help, using deterministic fake mode by default or an explicit
+  Codex/Claude-compatible executable when selected. Consultant runs write local
+  artifacts under `.maco/consult/runs/<run-id>/`.
+- `maco consult artifacts list/latest/prune` inspects or prunes durable
+  consultant run artifacts.
+- `.agents/scripts/o2-autopilot` runs bounded autonomous O2 supervisors under
+  a separate human/user-directed root O2. The root O2 is out-of-band and is not
+  counted against autonomous depth; autonomous O2-to-O2 follow-up uses
+  `NEXT_O2_TASKS.tsv` durable queue state and run ledgers such as `STATE.tsv`,
+  `HEARTBEAT.tsv`, task prompts, captured outputs, and `SUMMARY.md`.
+- `maco autopilot plan/run/status/collect` provides the first local-first
+  autopilot workflow: normalize a task or plan, run a supervised child worker in
+  fake/local mode by default, publish through the PR safety gates, run an
+  independent reviewer, and write public-safe reports under
+  `.maco/autopilot/runs/<run-id>/`.
+- `maco autopilot artifacts list/latest/prune` inspects or prunes durable
+  autopilot run artifacts.
+- `maco review pr <number|url>` emits an independent fake structured review
+  report by default, with `ci_reaction_supported=false`.
+- `maco inbox scan/run/status/collect/watch` provides a fake-first reaction
+  loop for issue intake, pull request review feedback, and failing CI checks,
+  converting safe inbox items into autopilot repair plans without network access
+  or automatic merge by default.
+- `maco inbox artifacts list/latest/prune` inspects or prunes durable inbox run
+  artifacts.
 
 ## Roadmap
 
@@ -60,16 +120,31 @@ Implemented local foundations:
 4. Provider-neutral LLM adapter boundaries with deterministic fake-provider
    tests and local fake-provider-backed `maco agent run` execution.
 
-Remaining release-readiness work:
+Known limitations and roadmap for 0.3.0:
 
-1. Add richer merge conflict classification. Current apply uses Git apply
-   safety checks and reports structured blockers, but does not classify
-   conflicts by symbol or dependency impact.
-2. Add semantic task planning that proposes path claims and orchestration plans.
-3. Add opt-in real LLM providers only after explicit approval and additional
-   invariant tests.
-4. Add semantic-map caching and broader language adapters after the Rust path is
-   stable.
+1. Richer merge conflict classification is a known limitation. Current apply
+   uses Git apply safety checks and reports structured blockers, but does not
+   classify conflicts by symbol or dependency impact.
+2. Semantic task planning, including automatic path-claim and orchestration-plan
+   proposal, is post-0.3.0 roadmap work. Current task-to-path proposals are
+   conservative helpers for autopilot and inbox defaults; claim gates remain
+   authoritative.
+3. PR and issue publication are intentionally narrow. The fake forge is
+   deterministic and local-only. GitHub publication is opt-in with explicit
+   `--forge github` and shells out to local `git` and `gh`; tests cover the
+   fake adapter without network access. Autopilot keeps the same boundary:
+   GitHub publication is selected only by a plan's explicit
+   `forge_mode: "github"`. Inbox intake keeps deterministic fake data as the default;
+   GitHub inbox scanning is selected only with an explicit GitHub source.
+   Issue triage metadata remains minimal.
+4. Real LLM providers remain post-0.3.0 roadmap work and must be opt-in,
+   explicitly approved, and covered by additional invariant tests.
+5. Semantic-map caching and broader language adapters are post-0.3.0 roadmap
+   work after the Rust path is stable.
+6. Automatic merge remains intentionally absent. Autopilot can record
+   `auto_merge=true` as a request, but always reports
+   `auto_merge_performed=false` and leaves human review and merge as the next
+   action.
 
 Network-facing LLM behavior should remain optional. The default development and
 test workflow should continue to run without provider credentials.
@@ -78,8 +153,111 @@ Durable sync state is stored under the Git common metadata directory at
 `$(git rev-parse --git-common-dir)/maco/state/claims.json`, so the primary
 worktree and linked agent worktrees share the same claim state.
 
+## Semantic coordination
+
+Semantic coordination adds a typed blackboard of structured intents, not
+free-form agent chat. Durable semantic state is repo-local under the Git common
+metadata directory at
+`$(git rev-parse --git-common-dir)/maco/state/semantic_intents.json`, so the
+primary worktree and linked agent worktrees see the same planning state.
+
+Hard path claims remain the write boundary. Semantic intents sit earlier in the
+workflow as a planning and coordination layer: blocking conflicts can prevent an
+intent from being claimed, while advisory conflicts can warn about likely
+overlap without reserving files. MVP semantic analysis is Rust-only.
+
+```bash
+maco coord preview agent-a --path src/lib.rs --symbol WorktreeManager --repo . --json
+maco coord claim agent-a --path src/lib.rs --module crate::worktree --repo . --json
+maco coord status --repo . --json
+maco coord release <token> --repo . --json
+maco coord release-agent agent-a --repo . --json
+```
+
+Orchestration opts in with `--semantic-coordination off|warn|block`; the
+default is `off`.
+
+Orchestration commands, validation commands, and opt-in provider-proposed shell
+commands are trusted local shell commands. `maco` isolates work with Git
+worktrees and path-claim checks, but it is not an OS or filesystem sandbox.
+Path claims enforce Git-visible repository changes; they do not prevent a
+trusted command from reading or writing arbitrary local filesystem paths.
+
 Default linked worktrees are created outside the repository at
 `../.maco/worktrees/<repo-name>/<agent-id>`.
+
+## Local Artifact Boundaries
+
+Runtime artifacts are local operator evidence, not source files. Autopilot,
+inbox, and supervisor runs write under `.maco/.../runs/<run-id>/`; generated run
+ids are collision checked, and an explicit `--run-id` is refused when that run
+directory already exists. Use each command family's nested artifact helpers to
+inspect or prune only that family's run directories:
+
+```bash
+cargo run -- autopilot artifacts list --repo . --json
+cargo run -- autopilot artifacts latest --repo . --json
+cargo run -- autopilot artifacts prune --repo . --keep 10 --dry-run --json
+cargo run -- inbox artifacts list --repo . --json
+cargo run -- supervise artifacts latest --repo . --json
+cargo run -- consult artifacts list --repo . --json
+```
+
+`prune` orders runs newest first, keeps the requested number, and supports
+`--dry-run` before deletion. It is scoped to the selected family root, such as
+`.maco/autopilot/runs`, `.maco/consult/runs`, `.maco/inbox/runs`, or
+`.maco/o2/runs`.
+
+## Cross-runtime consultant
+
+`maco consult ask` is a read-only second-opinion path for stuck agents. It does
+not create worktrees, claim paths, apply patches, or mutate repository files.
+The fake runtime is the default and needs no network or external binaries:
+
+```bash
+cargo run -- consult ask \
+  --repo . \
+  --question "Why is this validation failing after the worker change?" \
+  --context-path README.md \
+  --json
+```
+
+Real runtime adapters are explicit and local-process only. Codex consultant
+mode uses a read-only sandbox and does not enable goals or multi-agent worker
+delegation:
+
+```bash
+cargo run -- consult ask \
+  --repo . \
+  --runtime codex \
+  --consultant-bin codex \
+  --question-file consult-question.md \
+  --context-path src/supervise.rs \
+  --json
+```
+
+Claude consultant mode expects a Claude-compatible executable that supports
+`claude -p --output-format json` and returns the answer in the JSON envelope's
+`result` field:
+
+```bash
+cargo run -- consult ask \
+  --repo . \
+  --runtime claude \
+  --consultant-bin claude \
+  --question "What narrow fix should I inspect next?" \
+  --context-path tests/supervise_cli.rs \
+  --json
+```
+
+Consultant advice is advisory evidence only. It does not override project
+rules, assigned ownership, validation requirements, review gates, or merge
+gates.
+
+Durable project guidance under `.agents/docs`, `.agents/skills`, and
+`.agents/workflows` may appear in repository maps. Local-only agent scratch
+state under `.agents/temp`, `.agents/storage`, and `.agents/live` is excluded
+from repository maps, semantic maps, and task-path proposal helpers.
 
 ## Development
 
@@ -228,10 +406,10 @@ untracked, or actively claimed worktrees.
 
 Run summaries include command status, duration, timeout state, changed paths,
 unclaimed changed paths, captured stdout/stderr summaries, and optional patch
-paths. `--patch-dir` writes per-agent `git diff --binary HEAD` patches for
-changed worktrees. Repo-level validation commands currently run in the primary
-worktree after agent commands complete; use agent validation commands for checks
-that must see unmerged agent worktree changes.
+paths. `--patch-dir` writes per-agent binary patches against the run base, the
+primary HEAD captured for that run. Repo-level validation commands currently
+run in the primary worktree after agent commands complete; use agent validation
+commands for checks that must see unmerged agent worktree changes.
 
 `maco orchestrate resume <checkpoint-file>` only resumes checkpoints whose run
 id matches the checkpoint filename, whose recorded repository matches the
@@ -248,7 +426,9 @@ cargo run -- worktree diff agent-a --repo . --claim src --full-diff --json
 cargo run -- orchestrate collect summary.json --repo . --json
 cargo run -- merge preview agent-a --repo . --claim src --json
 cargo run -- merge preview agent-a --repo . --claim src --validation-report validation.json --json
+cargo run -- merge preview agent-a --repo . --claim src --require-validation --validation-report validation.json --json
 cargo run -- merge apply agent-a --repo . --claim src --validation-report validation.json
+cargo run -- merge apply agent-a --repo . --claim src --require-validation --validation-command "cargo test" --json
 cargo run -- merge apply agent-a --repo . --claim src --force-dirty-primary --force-stale-base --force-unclaimed-edits
 ```
 
@@ -260,9 +440,75 @@ failures are considered when validation reports are supplied from collected run
 summaries or from direct `--validation-report` JSON files. External validation
 JSON may be a single report, an array, an object with `validation`,
 `validations`, or `reports`, or an orchestration summary with per-agent
-validation. With `--json`, a blocked apply emits a machine-readable report with
-readiness blockers, blocker details, and related paths before exiting with an
-error.
+validation. `--require-validation` blocks when validation evidence is missing,
+only `not_run`, only `skipped`, or failed without a passed validation report;
+JSON readiness details distinguish `validation_missing`,
+`validation_not_run`, `validation_skipped`, and `validation_failed`, include
+related paths when available, and report the next safe operation.
+
+`merge apply --validation-command <command>` creates a temporary candidate
+worktree, applies the agent diff there, and runs the command against that
+merged candidate before applying anything to the primary worktree. Candidate
+validation failure is a blocker and leaves the primary worktree unchanged. This
+is different from automatic post-apply validation: `merge apply` still does not
+run project checks after a successful primary apply, so release managers should
+run final verification after accepting changes. With `--json`, a blocked apply
+emits a machine-readable report with readiness blockers, blocker details, and
+related paths before exiting with an error.
+
+Preview and publish agent worktree changes as a pull request:
+
+```bash
+cargo run -- pr preview agent-a --repo . --claim README.md --json
+cargo run -- pr preview agent-a --repo . --claim README.md --require-validation --validation-report validation.json --json
+cargo run -- pr publish agent-a --repo . --claim README.md --forge fake --json
+cargo run -- pr publish agent-a --repo . --claim README.md --forge fake --require-validation --validation-report validation.json --json
+cargo run -- pr publish agent-a --repo . --claim README.md --forge github --ready --json
+```
+
+`maco pr preview` uses the same merge-preview gates as `merge apply` and never
+pushes or creates a pull request. `maco pr publish --forge fake|github` refuses
+dirty-primary, stale-base, unclaimed-edit, validation, and apply-check blockers.
+With `--require-validation`, PR preview and publish require at least one passed
+validation report and report missing evidence as a publishability blocker.
+When the agent worktree has safe uncommitted changes, publish commits those
+changes in the agent worktree only; it does not mutate the primary worktree. The
+fake forge returns deterministic `fake://pr/...` URLs and never uses the
+network. GitHub publication runs only when `--forge github` is passed and shells
+out to `git push` and `gh pr create`.
+
+Preview and create issues:
+
+```bash
+cargo run -- issue preview --title "Bug title" --body "API_TOKEN=secret" --json
+cargo run -- issue preview --title "Bug title" --body-file issue.md --forge github --json
+cargo run -- issue create --title "Bug title" --body-file issue.md --label bug --forge fake --json
+cargo run -- issue create --title "Bug title" --body-file issue.md --label bug --forge github --json
+```
+
+`maco issue preview` redacts secret-looking body assignments and reports
+`created=false`. `maco issue create --forge fake|github` uses the deterministic
+local-only fake forge or, with explicit `--forge github`, shells out to
+`gh issue create`. Issue triage is intentionally minimal: title, body, and
+labels.
+
+Inspect and refresh live work claims:
+
+```bash
+cargo run -- live status --repo . --json
+cargo run -- live validate --repo . --json
+cargo run -- live heartbeat claim-id --repo . --by owner-id --json
+cargo run -- live override-release claim-id --repo . --by project-owner --reason "stale claim owner unavailable" --json
+```
+
+`maco live status` reports each claim's owner, status, owned files, lock state,
+and liveness. `active` and `blocked` claims are treated as locks. A claim is
+stale when its heartbeat, updated timestamp, or date fallback is older than its
+configured stale-after window. `maco live validate` reports missing or malformed
+claim fields. `heartbeat` refreshes the heartbeat and updated timestamp and
+adds an audit entry. `override-release` requires both `--by` and `--reason`,
+moves the claim to `handoff`, and records the previous status and reason.
+`--now` is available on live subcommands for deterministic test runs.
 
 Preview the local LLM boundary without credentials or network access:
 
@@ -293,12 +539,333 @@ cargo run -- agent run task.md --agent-id agent-a --path README.md --fake-propos
 ```
 
 `maco agent run` currently accepts only the local `fake` provider. It renders
-the same provider-neutral prompt boundary used by `llm prompt-preview`, applies
-fake-provider proposed patches and commands inside the agent worktree, runs
-provider-proposed and CLI-supplied validation commands, collects a merge
-candidate and preview, reports path-boundary violations, and releases durable
-claims unless `--keep-claims` is supplied. Real network providers remain
-unconfigured by default.
+the same provider-neutral prompt boundary used by `llm prompt-preview`.
+Provider-proposed shell commands are disabled by default: the command above
+reports a refusal for the proposed `printf` command and tells you to rerun with
+`--allow-provider-commands` if you trust the proposal. Patch-only fake proposals
+can run without that opt-in. When command execution is explicitly allowed,
+`maco agent run` applies fake-provider proposed patches and commands inside the
+agent worktree, runs provider-proposed and CLI-supplied validation commands,
+collects a merge candidate and preview, reports path-boundary violations, and
+releases durable claims unless `--keep-claims` is supplied. Real network
+providers remain unconfigured by default.
+
+```bash
+cargo run -- agent run task.md --agent-id agent-a --path README.md --fake-proposal proposal.json --allow-provider-commands --validation "cargo test" --repo . --json
+```
+
+Run an opt-in supervisor-of-orchestrators plan:
+
+```json
+{
+  "version": 1,
+  "task": "coordinate README and Rust follow-up work",
+  "max_depth": 2,
+  "max_child_assignments": 2,
+  "max_child_retries": 0,
+  "child_timeout_seconds": 600,
+  "assignments": [
+    {
+      "id": "docs-child",
+      "assigned_paths": ["README.md"],
+      "worker_assignments": [
+        {
+          "id": "docs-worker",
+          "assigned_paths": ["README.md"]
+        }
+      ]
+    },
+    {
+      "id": "rust-child",
+      "assigned_paths": ["src/lib.rs"],
+      "semantic_symbols": ["WorktreeManager"],
+      "worker_assignments": [
+        {
+          "id": "rust-worker",
+          "assigned_paths": ["src/lib.rs"],
+          "semantic_symbols": ["WorktreeManager"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+```bash
+cargo run -- supervise plan supervisor-plan.json --repo . --json
+cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --json
+cargo run -- supervise status supervise-demo --repo . --json
+cargo run -- supervise collect supervise-demo --repo . --json
+cargo run -- supervise artifacts latest --repo . --json
+```
+
+`maco supervise run` is opt-in process-level orchestration. It shells out to the
+configured Codex-compatible executable, creates isolated child worktrees, claims
+each assignment's paths, records semantic coordination metadata when the plan
+requests it, and writes structured logs and reports under the run directory.
+Each Codex CLI child orchestrator is instructed to read `AGENTS.md` and
+project-local `.agents` guidance before acting. The generated prompt contract is
+user-directed root O2 -> autonomous O2 supervisor -> O1 child orchestrator ->
+terminal worker/researcher/review-auditor. Human-invoked agents are treated as
+the user-directed root O2: they are out-of-band supervisors, can launch several
+bounded autonomous O2 supervisors, and are not counted against autonomous
+`task_depth`. Workers, researchers, and review auditors are terminal. Workers
+must attest `no_further_delegation=true` in their WorkerReport, and review
+auditors must attest it in their AuditorReport. Embedded worker prompt
+templates begin with `ROLE: TERMINAL_WORKER`; embedded review auditor prompt
+templates begin with `ROLE: REVIEW_AUDITOR`; both must be passed to terminal
+sessions without preamble. Native SubAgent/delegated-worker use is limited to
+lightweight terminal worker and researcher roles; O1 child orchestrators must
+not bind O1 or O2 roles to native SubAgent sessions. Durable roles use canonical
+role names only; runtime labels belong in the runtime bridge and `AGENT_LABEL`,
+never in `ROLE`. O1 child orchestrators must not spawn peer O2 supervisors;
+when they discover newly large cross-cutting problems, they report peer-O2
+escalation candidates upward in their structured report instead of taking those
+scopes over. The user-root O2 or an autonomous O2 durable queue may then launch
+bounded peer O2 supervisors as separate MACO/Codex CLI subprocess scopes.
+
+Long-running O2 supervision is durable run state, not one expanding LLM context.
+Autonomous O2 runs carry context through `STATE.tsv`, `HEARTBEAT.tsv`,
+`queue.tsv`, `NEXT_O2_TASKS.tsv`, task prompts, captured final messages,
+event streams, and `SUMMARY.md` under `.maco/o2-autopilot/runs/<run-id>/`.
+
+O1/O2 subprocess orchestration uses a Codex CLI launch boundary of
+`--sandbox danger-full-access`, `--enable goals`, and `--enable multi_agent`.
+Nested O2/O1 subprocess chains must preserve that boundary for orchestrator
+roles. Do not use `workspace-write` for O2/O1 subprocess chains because nested
+Codex state DB access can collide, corrupt, or fail under workspace-write style
+restrictions.
+
+For worker assignments, child orchestrators should use Codex native
+SubAgent/delegated-worker mechanisms when available only for terminal worker or
+researcher execution so the project manager/worker boundary is preserved. If no
+delegated-worker mechanism is available, the child should stop before mutation
+and report the exact blocked worker task. For child assignments with workers,
+`maco supervise run` requires structured terminal audit evidence before
+accepting the child report: the parent launches a read-only `REVIEW_AUDITOR`
+subprocess and requires an accepted AuditorReport with `role=auditor`,
+`no_further_delegation=true`, `read_only=true`, and coverage for all assigned
+worker ids. A child-side review auditor is advisory unless the parent MACO/O2
+acceptance gate collects and accepts it. The accepted parent-launched
+AuditorReport is appended to the child `audit_reports` field.
+If a child declares worker assignments but returns zero `worker_reports`, the
+child report is rejected as structurally incomplete. If a child has no worker
+assignments but leaves a non-empty child worktree diff, `maco supervise run`
+still launches the parent read-only `REVIEW_AUDITOR` and requires it to cover
+the child orchestrator id and changed paths.
+`maco supervise run` does not apply worker changes to the primary worktree
+automatically. Child orchestrator execution is currently serial: the supervisor
+starts and waits for one child process at a time.
+`max_child_assignments` bounds the number of child assignments in the plan, and
+therefore the allowed fan-out, but it is not a parallel execution limit yet.
+`max_child_retries` defaults to `0` and may be set up to `2`; retries are only
+used for child report-shape failures such as missing or invalid report JSON or
+the wrong report id/role, and the retry prompt includes corrective feedback.
+`max_child_processes` is accepted only as a legacy JSON alias and normalized out
+of reports. The command refuses to start when the primary worktree is dirty; use
+`--allow-dirty-primary` only when the operator has reviewed that state. The
+primary worktree dirty-path set is rechecked after each child process and any
+newly dirty primary paths fail that child assignment. Tests use
+fake subprocesses by default and do not require network access, provider
+credentials, or a real Codex login.
+
+Run the fake-first autopilot workflow:
+
+```json
+{
+  "version": 1,
+  "task": {
+    "title": "Update README",
+    "body": "Make the README clearer without touching Rust code."
+  },
+  "assigned_paths": ["README.md"],
+  "semantic_symbols": [],
+  "semantic_modules": [],
+  "validation_commands": ["cargo test"],
+  "max_repair_attempts": 1,
+  "forge_mode": "fake",
+  "reviewer": {
+    "mode": "fake"
+  },
+  "publish_mode": "draft_only",
+  "auto_merge": false
+}
+```
+
+```bash
+cargo run -- autopilot plan autopilot-plan.json --repo . --json
+cargo run -- autopilot run autopilot-plan.json --repo . --run-id readme-demo --json
+cargo run -- autopilot status readme-demo --repo . --json
+cargo run -- autopilot collect readme-demo --repo . --json
+cargo run -- autopilot artifacts latest --repo . --json
+cargo run -- review pr 123 --repo . --json
+```
+
+Plain task files are accepted too; the first non-empty line becomes the title.
+When a plan omits `assigned_paths`, autopilot uses a conservative task-to-path
+proposal helper that looks at repository paths, Rust semantic names, and common
+task wording instead of defaulting only to `README.md`. The helper is only a
+starting point: hard sync claims, semantic coordination, live locks, and PR
+safety gates remain authoritative, and ambiguous tasks are kept conservative.
+Autopilot stores
+`plan.json`, `supervisor-report.json`, `pr-report.json`, `review-report.json`,
+and `final-report.json` under `.maco/autopilot/runs/<run-id>/`. These reports
+use repo-relative paths and omit nested merge-preview paths and full diffs.
+
+By default, autopilot creates a deterministic fake child subprocess locally, uses
+the fake forge, and runs the fake reviewer. It does not require network access,
+credentials, or a real Codex binary. Passing `--codex-bin` opts into an external
+Codex-compatible executable. Setting `forge_mode` to `github` in the plan opts
+into `git push` and `gh pr create`; fake remains the default. Passing
+`--reviewer-command` opts into an external reviewer command. The independent
+review report uses a separate reviewer identity from the child worker, includes
+structured findings with `blocking`, and currently reports
+`ci_reaction_supported=false`.
+
+Autopilot refuses to launch when the primary worktree is dirty unless
+`--allow-dirty-primary` is supplied, when active sync claims overlap its target
+paths, when active semantic intents overlap those paths, or when active/blocked
+live claim locks overlap those paths. Refusal JSON includes the refusal kind,
+paths, and lock details such as owner, sync or semantic token, or live claim id
+when available. It also relies on the existing supervise and PR safety gates for
+stale/dirty child worktree reuse and unclaimed edits. Blocking review findings
+or failed validation trigger repair attempts up to `max_repair_attempts`.
+Autopilot never auto-merges: `auto_merge=true` is accepted and reported as
+requested, but `auto_merge_performed` is always `false`.
+
+Run the fake-first inbox reaction loop:
+
+```json
+{
+  "permission_mode": "fake",
+  "selection": {"max_items": 2},
+  "max_repair_attempts": 1,
+  "default_validation_commands": [
+    {"name": "smoke", "command": "cargo test", "timeout_seconds": 60}
+  ],
+  "default_assigned_paths": ["README.md"],
+  "privacy": {"allow_private_bodies": false}
+}
+```
+
+```bash
+cargo run -- inbox scan --repo . --json
+cargo run -- inbox run --repo . --run-id inbox-demo --json
+cargo run -- inbox run --repo . --run-id inbox-codex --permission github_local --codex-bin codex --json
+cargo run -- inbox status inbox-demo --repo . --json
+cargo run -- inbox collect inbox-demo --repo . --json
+cargo run -- inbox watch --repo . --poll-seconds 60 --once --json
+cargo run -- inbox artifacts list --repo . --json
+```
+
+`maco-inbox.json` is optional. Without it, `maco inbox scan` uses deterministic
+fake local data: one safe issue candidate, one PR candidate with requested review
+changes and failing CI context, one unsafe item that is skipped, and duplicate
+skipping evidence. Public JSON uses the typed schema fields `version`, `repo`,
+`action_policy`, `github_enabled`, `success`, `refused`, `refusals`,
+`candidate_count`, `selected_count`, `items`, and `next_action`; `repo` is the
+public `"."` placeholder rather than a local absolute path. Item bodies are
+bounded summaries with token-like values redacted, private key material refused,
+and local absolute paths such as `/mnt/...`, `/home/...`, or `C:\Users\...`
+rejected.
+
+`maco inbox run` processes selected candidates through the same fake-first
+autopilot flow unless config `action_policy` or CLI `--dry-run` selects dry-run
+mode. `--max-items` overrides config selection for a scan, run, or watch command.
+`--codex-bin` on `run` or `watch`, or `codex_bin` in `maco-inbox.json`, passes a
+Codex-compatible executable through to autopilot; omitted keeps deterministic
+fake child execution. `timeout_seconds` is honored for validation commands that
+do not return.
+
+Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
+including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
+`item-<n>-autopilot-report.json`, `item-<n>-github-report.json`, and
+`final-report.json`. Reports use repository-relative paths and do not include
+full diffs, raw secret values, credentials, or local absolute paths.
+
+GitHub inbox intake is explicit opt-in. `--permission fake` is the default and
+does not require network access or credentials. `github_read` reads live issues
+and PRs through `gh` but only writes plans and reports. `github_local` reads live
+GitHub and runs local repair with fake PR publication and no source comments.
+`github_pr` reads live GitHub, runs repair, and publishes a draft PR through the
+GitHub forge without commenting on the source item. `github_full` also comments
+on the source issue or PR after success. `github_git` reads live GitHub issue/PR
+items through `gh`, runs repair, pushes the branch through real Git, and does
+not create a GitHub PR or comment on the source item. Hyphen aliases such as
+`github-read` are accepted. Legacy `--github` and `action_policy: "github"` keep
+the old full behavior unless `permission_mode` explicitly overrides them. Fake
+PR review and failing CI context are converted into autopilot repair plans with
+assigned paths, reasons, and validation expectations. Inbox also preserves the
+same path-scoped safety boundary as autopilot: it refuses dirty primary worktree
+files, active local locks, active sync claims, active semantic intents, and
+active/blocked live claim locks only when they overlap selected target paths,
+while ignoring its own `.maco/**` and `.maco-cache/**` runtime artifacts.
+Refusal JSON includes paths and lock details. Inbox never performs automatic
+merge; human review remains the next action after a successful reaction.
+
+Run the cross-repository inbox workspace supervisor:
+
+```json
+{
+  "version": 1,
+  "default_permission_mode": "github_read",
+  "default_max_items_per_repo": 2,
+  "strict": false,
+  "repositories": [
+    {
+      "id": "orchestrator",
+      "path": "../Multi-Agent_Coding_Orchestrator",
+      "enabled": true,
+      "permission_mode": "github_local",
+      "max_items": 1,
+      "labels": ["bug"],
+      "include_pull_requests": true,
+      "include_issues": true
+    },
+    {
+      "id": "docs",
+      "path": "../project-docs",
+      "enabled": false,
+      "include_pull_requests": true,
+      "include_issues": true
+    }
+  ],
+  "safety": {
+    "require_clean_primary": true,
+    "require_validation_for_publication": true,
+    "allow_auto_approval": false,
+    "allow_auto_merge": false
+  }
+}
+```
+
+```bash
+cargo run -- inbox workspace scan --config workspace-inbox.json --json
+cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-demo --json
+cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-dry --dry-run --json
+cargo run -- inbox workspace watch --config workspace-inbox.json --poll-seconds 60 --once --json
+```
+
+Workspace inbox supervises the same inbox flow across multiple configured local
+repositories. The aggregate JSON reports `version`, a public-safe `config_path`,
+`strict`, repo counts, and one entry per repository with `id`, `enabled`,
+`permission_mode`, `status`, `success`, `refused`, optional `message`, and an
+embedded `scan_report` or `run_report`. Workspace run artifacts are written
+under `.maco/inbox-workspace/runs/<run-id>/`, while per-repo repair artifacts
+remain under each repository's `.maco/inbox/runs/<run-id>/` tree. Public reports
+must not expose local temp paths, credentials, raw secrets, or private bodies.
+
+`strict: false` keeps scanning or running later repositories when one repository
+is disabled, empty, dirty, or refused; the per-repo entry records the failure.
+`strict: true` turns a repository refusal or failure into an aggregate command
+failure. Permission modes inherit from `default_permission_mode` and can be
+overridden per repository. `github_read` only scans and plans through `gh`,
+`github_local` can run local repair without source comments, `github_git` can
+plan or perform Git branch publication without GitHub PR creation, and
+`github_pr`/`github_full` are used only when explicitly configured. Workspace
+inbox is cross-repository supervision, not approval or merge automation:
+automatic approval and automatic merge are unsupported, and reports keep
+`auto_approval_performed=false` and `auto_merge_performed=false`.
 
 Cleanup examples:
 

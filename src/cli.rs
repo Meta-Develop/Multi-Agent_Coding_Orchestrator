@@ -3,17 +3,36 @@ use crate::{
         self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
         ProviderCommandPolicy,
     },
+    artifacts::{self, ResolvedRunId, RunArtifactFamily},
+    autopilot::{self, AutopilotRunOptions},
+    consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
+    inbox::{
+        self, InboxPermissionMode, InboxRunOptions, InboxScanOptions, InboxWatchOptions,
+        InboxWorkspaceRunOptions, InboxWorkspaceScanOptions, InboxWorkspaceWatchOptions,
+    },
+    live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
-        self, MergeApplyOptions, MergeApplyPreview, MergeApplyReport, MergeCandidate,
-        MergeCollectOptions, MergeForceOptions, MergePreviewOptions, ValidationReport,
+        self, CandidateValidationCommand, MergeApplyOptions, MergeApplyPreview, MergeApplyReport,
+        MergeCandidate, MergeCollectOptions, MergeForceOptions, MergePreviewOptions,
+        ValidationReport,
     },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
-        OrchestrationRunOptions, OrchestrationSummary, RunId, WorktreeReusePolicy,
+        OrchestrationRunOptions, OrchestrationSummary, RunId, SemanticCoordinationMode,
+        WorktreeReusePolicy,
+    },
+    publication::{
+        self, ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
+        PrPublicationStatus,
     },
     repo_map::{self, RepoEntryKind, RepoMap},
     repo_semantic::{self, SemanticRepoMap},
+    review::{self, ReviewPrOptions, ReviewerConfig, ReviewerMode},
+    semantic_coord::{
+        SemanticCoordinationReport, SemanticIntentRequest, SemanticIntentStore, SemanticIntentToken,
+    },
+    supervise::{self, SupervisorRunOptions},
     sync::ClaimToken,
     sync_store::{OwnerReport, SyncStore},
     worktree::{RepositoryInfo, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
@@ -48,8 +67,17 @@ impl Cli {
             Command::Repo(command) => command.run(),
             Command::Worktree(command) => command.run(),
             Command::Merge(command) => command.run(),
+            Command::Live(command) => command.run(),
+            Command::Pr(command) => command.run(),
+            Command::Issue(command) => command.run(),
             Command::Sync(command) => command.run(),
+            Command::Coord(command) => command.run(),
             Command::Orchestrate(command) => command.run(),
+            Command::Supervise(command) => command.run(),
+            Command::Consult(command) => command.run(),
+            Command::Inbox(command) => command.run(),
+            Command::Autopilot(command) => command.run(),
+            Command::Review(command) => command.run(),
             Command::Agent(command) => command.run(),
             Command::Llm(command) => command.run(),
         }
@@ -66,10 +94,28 @@ enum Command {
     Worktree(WorktreeCommand),
     /// Collect and apply merge candidates from agent worktrees.
     Merge(MergeCommand),
+    /// Inspect and update human-readable live claim files.
+    Live(LiveCommand),
+    /// Preview and publish agent pull requests through an explicit forge.
+    Pr(PrCommand),
+    /// Preview and create issues through an explicit forge.
+    Issue(IssueCommand),
     /// Manage repository-local sync path claims.
     Sync(SyncCommand),
+    /// Manage repository-local semantic coordination intents.
+    Coord(CoordCommand),
     /// Run local orchestration plans.
     Orchestrate(OrchestrateCommand),
+    /// Run opt-in Codex CLI supervisor-of-orchestrators plans.
+    Supervise(SuperviseCommand),
+    /// Ask a read-only cross-runtime consultant for advice.
+    Consult(ConsultCommand),
+    /// Scan and react to safe GitHub issue and pull request inbox items.
+    Inbox(InboxCommand),
+    /// Run local-first autopilot workflow phases.
+    Autopilot(AutopilotCommand),
+    /// Run independent review adapters.
+    Review(ReviewCommand),
     /// Run a provider-backed agent in an isolated worktree.
     Agent(AgentCommand),
     /// Inspect local LLM adapter boundaries without network calls.
@@ -230,6 +276,7 @@ impl OrchestrateCommand {
                         run_id: args.run_id.map(RunId::new).transpose()?,
                         checkpoint_dir: args.checkpoint_dir,
                         worktree_reuse_policy: args.reuse,
+                        semantic_coordination: args.semantic_coordination,
                     },
                 )?;
                 print_orchestration_summary(&summary, args.json)?;
@@ -330,6 +377,9 @@ struct RunOrchestrateArgs {
     /// Directory where run checkpoints should be written.
     #[arg(long)]
     checkpoint_dir: Option<PathBuf>,
+    /// Semantic coordination mode for this run.
+    #[arg(long, default_value = "off", value_parser = parse_semantic_coordination_mode)]
+    semantic_coordination: SemanticCoordinationMode,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -372,6 +422,787 @@ struct CollectOrchestrateArgs {
 struct ValidateOrchestrateArgs {
     /// JSON plan file to validate.
     plan_file: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SuperviseCommand {
+    #[command(subcommand)]
+    command: SuperviseSubcommand,
+}
+
+impl SuperviseCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            SuperviseSubcommand::Plan(args) => {
+                let plan =
+                    supervise::supervisor_plan_document_from_task_file(args.repo, args.task_file)?;
+                print_query_report(&plan, args.json)
+            }
+            SuperviseSubcommand::Run(args) => {
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Supervise,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
+                let report = supervise::run_supervisor_plan_file(SupervisorRunOptions {
+                    repo: resolved.repo,
+                    plan_file: args.supervisor_plan,
+                    run_id: resolved.run_id,
+                    codex_bin: args.codex_bin,
+                    allow_dirty_primary: args.allow_dirty_primary,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("supervise run failed");
+                }
+                Ok(())
+            }
+            SuperviseSubcommand::Status(args) => {
+                let report = supervise::supervisor_status(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)
+            }
+            SuperviseSubcommand::Collect(args) => {
+                let report =
+                    supervise::collect_supervisor_run(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("supervise run failed");
+                }
+                Ok(())
+            }
+            SuperviseSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Supervise),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SuperviseSubcommand {
+    /// Convert a task file or JSON supervisor plan into a normalized supervisor plan.
+    Plan(PlanSuperviseArgs),
+    /// Run a supervisor plan with child Codex CLI orchestrators.
+    Run(RunSuperviseArgs),
+    /// Report durable run artifact status.
+    Status(StatusSuperviseArgs),
+    /// Collect the durable supervisor final report.
+    Collect(CollectSuperviseArgs),
+    /// List, inspect, or prune durable run artifacts.
+    Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct PlanSuperviseArgs {
+    /// Task file or JSON supervisor plan file.
+    task_file: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunSuperviseArgs {
+    /// JSON supervisor plan file to run.
+    supervisor_plan: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/o2/runs/<run-id>` artifacts. Omit to generate one.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Codex-compatible executable to invoke. Tests should pass a fake executable.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+    /// Allow supervise to run when the primary worktree is dirty.
+    #[arg(long)]
+    allow_dirty_primary: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusSuperviseArgs {
+    /// Run id to inspect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectSuperviseArgs {
+    /// Run id to collect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConsultCommand {
+    #[command(subcommand)]
+    command: ConsultSubcommand,
+}
+
+impl ConsultCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            ConsultSubcommand::Ask(args) => {
+                let question = consult_question(&args)?;
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Consult,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
+                let report = consult::ask_consultant(ConsultAskOptions {
+                    repo: resolved.repo,
+                    run_id: resolved.run_id,
+                    runtime: args.runtime,
+                    consultant_bin: args.consultant_bin,
+                    question,
+                    context_paths: args.context_path,
+                    timeout_seconds: args.timeout_seconds,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("consult ask failed");
+                }
+                Ok(())
+            }
+            ConsultSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Consult),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ConsultSubcommand {
+    /// Ask a read-only terminal consultant for advice.
+    Ask(AskConsultArgs),
+    /// List, inspect, or prune durable consult run artifacts.
+    Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct AskConsultArgs {
+    /// Question text to send to the consultant after redaction.
+    #[arg(long)]
+    question: Option<String>,
+    /// File containing the question text.
+    #[arg(long)]
+    question_file: Option<PathBuf>,
+    /// Consultant runtime to use. Real runtimes require --consultant-bin.
+    #[arg(long, default_value = "fake")]
+    runtime: ConsultantRuntime,
+    /// Codex- or Claude-compatible executable for real consultant runtimes.
+    #[arg(long)]
+    consultant_bin: Option<PathBuf>,
+    /// Repo-relative existing path to mention as context. Contents are not inlined.
+    #[arg(long = "context-path")]
+    context_path: Vec<PathBuf>,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/consult/runs/<run-id>` artifacts. Omit to generate one.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Seconds before a real consultant subprocess is terminated.
+    #[arg(long, default_value_t = DEFAULT_CONSULT_TIMEOUT_SECONDS)]
+    timeout_seconds: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn consult_question(args: &AskConsultArgs) -> Result<String> {
+    match (&args.question, &args.question_file) {
+        (Some(_), Some(_)) => bail!("use only one of --question or --question-file"),
+        (Some(question), None) => Ok(question.clone()),
+        (None, Some(path)) => fs::read_to_string(path)
+            .with_context(|| format!("failed to read question file {}", path.display())),
+        (None, None) => bail!("one of --question or --question-file is required"),
+    }
+}
+
+#[derive(Debug, Args)]
+struct InboxCommand {
+    #[command(subcommand)]
+    command: InboxSubcommand,
+}
+
+impl InboxCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            InboxSubcommand::Scan(args) => {
+                let report = inbox::scan_inbox(InboxScanOptions {
+                    repo: args.repo,
+                    github: args.github,
+                    permission_mode: args.permission,
+                    max_items: args.max_items,
+                    action_policy_override: None,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox scan refused");
+                }
+                Ok(())
+            }
+            InboxSubcommand::Run(args) => {
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Inbox,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
+                let report = inbox::run_inbox(InboxRunOptions {
+                    repo: resolved.repo,
+                    run_id: resolved.run_id,
+                    github: args.github,
+                    permission_mode: args.permission,
+                    dry_run: args.dry_run,
+                    max_items: args.max_items,
+                    codex_bin: args.codex_bin,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox run failed");
+                }
+                Ok(())
+            }
+            InboxSubcommand::Status(args) => {
+                let report = inbox::inbox_status(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)
+            }
+            InboxSubcommand::Collect(args) => {
+                let report = inbox::collect_inbox_run(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)?;
+                if report
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|success| !success)
+                {
+                    bail!("inbox run failed");
+                }
+                Ok(())
+            }
+            InboxSubcommand::Watch(args) => {
+                let report = inbox::watch_inbox(InboxWatchOptions {
+                    repo: args.repo,
+                    poll_seconds: args.poll_seconds,
+                    once: args.once,
+                    github: args.github,
+                    permission_mode: args.permission,
+                    dry_run: args.dry_run,
+                    max_items: args.max_items,
+                    codex_bin: args.codex_bin,
+                })?;
+                print_query_report(&report, args.json)?;
+                if report.runs.iter().any(|run| !run.success) {
+                    bail!("inbox watch observed a failed run");
+                }
+                Ok(())
+            }
+            InboxSubcommand::Workspace(command) => command.run(),
+            InboxSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Inbox),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum InboxSubcommand {
+    /// Scan safe issue and pull request candidates without launching work.
+    Scan(ScanInboxArgs),
+    /// Scan and process selected inbox items under a stable run id.
+    Run(RunInboxArgs),
+    /// Report durable inbox run artifact state.
+    Status(StatusInboxArgs),
+    /// Collect the durable inbox final report.
+    Collect(CollectInboxArgs),
+    /// Poll for inbox items and react according to policy.
+    Watch(WatchInboxArgs),
+    /// Scan or run inbox supervision across multiple repositories.
+    Workspace(WorkspaceInboxCommand),
+    /// List, inspect, or prune durable run artifacts.
+    Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceInboxCommand {
+    #[command(subcommand)]
+    command: WorkspaceInboxSubcommand,
+}
+
+impl WorkspaceInboxCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            WorkspaceInboxSubcommand::Scan(args) => {
+                let report = inbox::scan_workspace_inbox(InboxWorkspaceScanOptions {
+                    config: args.config,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox workspace scan failed");
+                }
+                Ok(())
+            }
+            WorkspaceInboxSubcommand::Run(args) => {
+                let report = inbox::run_workspace_inbox(InboxWorkspaceRunOptions {
+                    config: args.config,
+                    run_id: RunId::new(&args.run_id)?,
+                    dry_run: args.dry_run,
+                    codex_bin: args.codex_bin,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox workspace run failed");
+                }
+                Ok(())
+            }
+            WorkspaceInboxSubcommand::Watch(args) => {
+                let report = inbox::watch_workspace_inbox(InboxWorkspaceWatchOptions {
+                    config: args.config,
+                    poll_seconds: args.poll_seconds,
+                    once: args.once,
+                    dry_run: args.dry_run,
+                    codex_bin: args.codex_bin,
+                })?;
+                print_query_report(&report, args.json)?;
+                if report.runs.iter().any(|run| !run.success) {
+                    bail!("inbox workspace watch observed a failed run");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceInboxSubcommand {
+    /// Scan configured repositories without launching work.
+    Scan(ScanWorkspaceInboxArgs),
+    /// Run configured repositories under a workspace run id.
+    Run(RunWorkspaceInboxArgs),
+    /// Poll configured repositories and run workspace inbox supervision.
+    Watch(WatchWorkspaceInboxArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScanWorkspaceInboxArgs {
+    /// Workspace inbox JSON config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunWorkspaceInboxArgs {
+    /// Workspace inbox JSON config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Stable workspace run id for `.maco/inbox-workspace/runs/<run-id>` artifacts.
+    #[arg(long)]
+    run_id: String,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Codex-compatible executable to pass through to per-repository inbox runs.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchWorkspaceInboxArgs {
+    /// Workspace inbox JSON config path.
+    #[arg(long)]
+    config: PathBuf,
+    /// Seconds between poll iterations.
+    #[arg(long, default_value_t = 60)]
+    poll_seconds: u64,
+    /// Run one poll iteration and return.
+    #[arg(long)]
+    once: bool,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Codex-compatible executable to pass through to per-repository inbox runs.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ScanInboxArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Maximum number of safe items selected for work.
+    #[arg(long)]
+    max_items: Option<usize>,
+    /// Enable real GitHub API reads through the local gh CLI.
+    #[arg(long)]
+    github: bool,
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    #[arg(long, value_parser = parse_inbox_permission_mode)]
+    permission: Option<InboxPermissionMode>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunInboxArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/inbox/runs/<run-id>` artifacts. Omit to generate one.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Maximum number of safe items selected for work.
+    #[arg(long)]
+    max_items: Option<usize>,
+    /// Enable real GitHub API reads/comments and GitHub publication through gh.
+    #[arg(long)]
+    github: bool,
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    #[arg(long, value_parser = parse_inbox_permission_mode)]
+    permission: Option<InboxPermissionMode>,
+    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusInboxArgs {
+    /// Run id to inspect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectInboxArgs {
+    /// Run id to collect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchInboxArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Seconds between poll iterations.
+    #[arg(long, default_value_t = 60)]
+    poll_seconds: u64,
+    /// Run one poll iteration and return.
+    #[arg(long)]
+    once: bool,
+    /// Plan item work and reports without launching autopilot.
+    #[arg(long)]
+    dry_run: bool,
+    /// Maximum number of safe items selected for work.
+    #[arg(long)]
+    max_items: Option<usize>,
+    /// Enable real GitHub API reads/comments and GitHub publication through gh.
+    #[arg(long)]
+    github: bool,
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    #[arg(long, value_parser = parse_inbox_permission_mode)]
+    permission: Option<InboxPermissionMode>,
+    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AutopilotCommand {
+    #[command(subcommand)]
+    command: AutopilotSubcommand,
+}
+
+impl AutopilotCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            AutopilotSubcommand::Plan(args) => {
+                let plan = autopilot::autopilot_plan_from_task_file(args.repo, args.task_file)?;
+                print_query_report(&plan, args.json)
+            }
+            AutopilotSubcommand::Run(args) => {
+                let resolved = resolve_run_id_for_run(
+                    &args.repo,
+                    RunArtifactFamily::Autopilot,
+                    args.run_id.as_deref(),
+                    args.json,
+                )?;
+                let report = autopilot::run_autopilot_plan_file(AutopilotRunOptions {
+                    repo: resolved.repo,
+                    plan_file: args.task_file,
+                    run_id: resolved.run_id,
+                    codex_bin: args.codex_bin,
+                    reviewer_command: args.reviewer_command,
+                    allow_dirty_primary: args.allow_dirty_primary,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("autopilot run failed");
+                }
+                Ok(())
+            }
+            AutopilotSubcommand::Status(args) => {
+                let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)
+            }
+            AutopilotSubcommand::Collect(args) => {
+                let report =
+                    autopilot::collect_autopilot_run(args.repo, RunId::new(&args.run_id)?)?;
+                print_query_report(&report, args.json)?;
+                if report
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|success| !success)
+                {
+                    bail!("autopilot run failed");
+                }
+                Ok(())
+            }
+            AutopilotSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Autopilot),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AutopilotSubcommand {
+    /// Normalize a task file or JSON autopilot plan without running it.
+    Plan(PlanAutopilotArgs),
+    /// Run the fake-first autopilot workflow.
+    Run(RunAutopilotArgs),
+    /// Report durable autopilot run artifact state.
+    Status(StatusAutopilotArgs),
+    /// Collect the durable autopilot final report.
+    Collect(CollectAutopilotArgs),
+    /// List, inspect, or prune durable run artifacts.
+    Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct PlanAutopilotArgs {
+    /// Task file or JSON autopilot plan file.
+    task_file: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunAutopilotArgs {
+    /// Task file or JSON autopilot plan file.
+    task_file: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts. Omit to generate one.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
+    /// External reviewer shell command. Omit for deterministic fake review mode.
+    #[arg(long)]
+    reviewer_command: Option<String>,
+    /// Allow autopilot to run when the primary worktree is dirty.
+    #[arg(long)]
+    allow_dirty_primary: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusAutopilotArgs {
+    /// Run id to inspect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectAutopilotArgs {
+    /// Run id to collect.
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ArtifactsCommand {
+    #[command(subcommand)]
+    command: ArtifactsSubcommand,
+}
+
+impl ArtifactsCommand {
+    fn run(self, family: RunArtifactFamily) -> Result<()> {
+        match self.command {
+            ArtifactsSubcommand::List(args) => {
+                let report = artifacts::list_runs(args.repo, family)?;
+                print_query_report(&report, args.json)
+            }
+            ArtifactsSubcommand::Latest(args) => {
+                let report = artifacts::latest_run(args.repo, family)?;
+                print_query_report(&report, args.json)
+            }
+            ArtifactsSubcommand::Prune(args) => {
+                let report = artifacts::prune_runs(args.repo, family, args.keep, args.dry_run)?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ArtifactsSubcommand {
+    /// List run artifact directories newest first.
+    List(ListArtifactsArgs),
+    /// Show the latest run artifact directory.
+    Latest(ListArtifactsArgs),
+    /// Delete old run artifact directories under this command family's run root.
+    Prune(PruneArtifactsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ListArtifactsArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PruneArtifactsArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Keep the latest N run directories.
+    #[arg(long, default_value_t = 10)]
+    keep: usize,
+    /// Report deletions without deleting.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReviewCommand {
+    #[command(subcommand)]
+    command: ReviewSubcommand,
+}
+
+impl ReviewCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            ReviewSubcommand::Pr(args) => {
+                let target = review::target_from_pr_arg(&args.target)?;
+                let reviewer = if let Some(command) = args.reviewer_command {
+                    ReviewerConfig {
+                        mode: ReviewerMode::ExternalCommand,
+                        command: Some(command),
+                        timeout_seconds: args.timeout_seconds,
+                        ..ReviewerConfig::default()
+                    }
+                } else {
+                    ReviewerConfig {
+                        timeout_seconds: args.timeout_seconds,
+                        ..ReviewerConfig::default()
+                    }
+                };
+                let report = review::review_pr(ReviewPrOptions {
+                    repo: review::repo_path_for_review(args.repo),
+                    target,
+                    reviewer,
+                    attempt: 1,
+                    changed_paths: Vec::new(),
+                    diff_summary: None,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("review pr failed");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ReviewSubcommand {
+    /// Review a pull request target with a fake or explicit external reviewer.
+    Pr(ReviewPrArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReviewPrArgs {
+    /// Pull request number or URL.
+    target: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// External reviewer shell command. Omit for deterministic fake review mode.
+    #[arg(long)]
+    reviewer_command: Option<String>,
+    /// Timeout for the external reviewer command.
+    #[arg(long)]
+    timeout_seconds: Option<u64>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -685,6 +1516,257 @@ struct StatusSyncArgs {
 }
 
 #[derive(Debug, Args)]
+struct LiveCommand {
+    #[command(subcommand)]
+    command: LiveSubcommand,
+}
+
+impl LiveCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            LiveSubcommand::Status(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::status(args.repo, &now)?;
+                print_query_report(&report, args.json)
+            }
+            LiveSubcommand::Validate(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::validate(args.repo, &now)?;
+                print_query_report(&report, args.json)
+            }
+            LiveSubcommand::Heartbeat(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::heartbeat(args.repo, &args.claim_id, &args.by, &now)?;
+                print_query_report(&report, args.json)
+            }
+            LiveSubcommand::OverrideRelease(args) => {
+                let now = live_clock(args.now.as_deref())?;
+                let report = live_claim::override_release(
+                    args.repo,
+                    &args.claim_id,
+                    &args.by,
+                    &args.reason,
+                    &now,
+                )?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum LiveSubcommand {
+    /// List live claims and liveness state.
+    Status(LiveStatusArgs),
+    /// Validate live claim file fields.
+    Validate(LiveValidateArgs),
+    /// Refresh a claim heartbeat timestamp.
+    Heartbeat(LiveHeartbeatArgs),
+    /// Move a stale active claim to handoff by explicit override.
+    OverrideRelease(LiveOverrideReleaseArgs),
+}
+
+#[derive(Debug, Args)]
+struct LiveStatusArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveValidateArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveHeartbeatArgs {
+    /// Claim id to refresh.
+    claim_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Actor refreshing the claim.
+    #[arg(long)]
+    by: String,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveOverrideReleaseArgs {
+    /// Claim id to move to handoff.
+    claim_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Actor performing the override.
+    #[arg(long)]
+    by: String,
+    /// Reason recorded in the audit log.
+    #[arg(long)]
+    reason: String,
+    /// Deterministic current timestamp for tests.
+    #[arg(long)]
+    now: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CoordCommand {
+    #[command(subcommand)]
+    command: CoordSubcommand,
+}
+
+impl CoordCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            CoordSubcommand::Preview(args) => {
+                let json = args.json;
+                let store = SemanticIntentStore::open(&args.repo)?;
+                let report = store.preview(args.into_request())?;
+                print_semantic_coordination_report(&report, json)
+            }
+            CoordSubcommand::Claim(args) => {
+                let json = args.json;
+                let store = SemanticIntentStore::open(&args.repo)?;
+                let report = store.claim(args.into_request())?;
+                print_semantic_coordination_report(&report, json)?;
+                if report.has_blocking_conflicts {
+                    bail!(
+                        "semantic claim refused with {} blocking conflict(s)",
+                        report.blocking_conflict_count
+                    );
+                }
+                Ok(())
+            }
+            CoordSubcommand::Release(args) => {
+                let store = SemanticIntentStore::open(args.repo)?;
+                let released = store.release(SemanticIntentToken::from_u64(args.token))?;
+                print_query_report(&released, args.json)
+            }
+            CoordSubcommand::ReleaseAgent(args) => {
+                let store = SemanticIntentStore::open(args.repo)?;
+                let released = store.release_by_agent(&args.agent_id)?;
+                print_query_report(&released, args.json)
+            }
+            CoordSubcommand::Status(args) => {
+                let store = SemanticIntentStore::open(args.repo)?;
+                let intents = store.status()?;
+                print_query_report(&intents, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum CoordSubcommand {
+    /// Preview semantic conflicts without persisting an intent.
+    Preview(CoordIntentArgs),
+    /// Claim a semantic intent if it has no blocking conflicts.
+    Claim(CoordIntentArgs),
+    /// Release one semantic intent by token.
+    Release(ReleaseCoordArgs),
+    /// Release every semantic intent owned by an agent.
+    ReleaseAgent(ReleaseAgentCoordArgs),
+    /// List active semantic intents.
+    Status(StatusCoordArgs),
+}
+
+#[derive(Debug, Args)]
+struct CoordIntentArgs {
+    /// Stable agent id. Allowed characters: ASCII letters, digits, '.', '_' and '-'.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Repository-relative path included in the semantic intent.
+    #[arg(long = "path")]
+    paths: Vec<PathBuf>,
+    /// Rust symbol name, qualified path, or symbol id. Repeat for multiple symbols.
+    #[arg(long = "symbol")]
+    symbols: Vec<String>,
+    /// Rust module path. Repeat for multiple modules.
+    #[arg(long = "module")]
+    modules: Vec<String>,
+    /// Repository-relative task file summarized with the intent.
+    #[arg(long = "task")]
+    task_file: Option<PathBuf>,
+    /// Note attached to the intent. Repeat for multiple notes.
+    #[arg(long = "note")]
+    notes: Vec<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+impl CoordIntentArgs {
+    fn into_request(self) -> SemanticIntentRequest {
+        SemanticIntentRequest {
+            agent_id: self.agent_id,
+            paths: self.paths,
+            symbols: self.symbols,
+            modules: self.modules,
+            task_file: self.task_file,
+            notes: self.notes,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct ReleaseCoordArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Semantic intent token to release.
+    token: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReleaseAgentCoordArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Stable agent id whose semantic intents should be released.
+    agent_id: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusCoordArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct LlmCommand {
     #[command(subcommand)]
     command: LlmSubcommand,
@@ -874,12 +1956,14 @@ fn preview_merge_from_args(
     explicit_claims: Vec<PathBuf>,
     validation_report_paths: Vec<PathBuf>,
     forces: MergeForceOptions,
+    require_validation: bool,
 ) -> Result<MergeApplyPreview> {
     let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
     let validations = load_validation_reports(&validation_report_paths, &agent_id)?;
     merge::preview_merge_apply(MergePreviewOptions {
         collect: collect_options_from_claims(&repo, &agent_id, claims, true, validations),
         forces,
+        require_validation,
     })
 }
 
@@ -899,12 +1983,18 @@ impl MergeCommand {
                     args.claim,
                     args.validation_report,
                     args.forces.into_force_options(),
+                    args.require_validation,
                 )?;
                 print_merge_preview(&preview, args.json)
             }
             MergeSubcommand::Apply(args) => {
                 let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
                 let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+                let candidate_validation_commands = args
+                    .validation_command
+                    .into_iter()
+                    .map(|command| CandidateValidationCommand { command })
+                    .collect::<Vec<_>>();
                 let preview_options = MergePreviewOptions {
                     collect: collect_options_from_claims(
                         &args.repo,
@@ -914,11 +2004,14 @@ impl MergeCommand {
                         validations,
                     ),
                     forces: args.forces.into_force_options(),
+                    require_validation: args.require_validation,
                 };
                 let report = if args.json {
-                    let preview = merge::preview_merge_apply(preview_options)?;
-                    if preview.safety.readiness.status == merge::ApplyReadinessStatus::Blocked {
-                        let report = merge::blocked_merge_apply_report(preview);
+                    let report = merge::merge_apply_report(MergeApplyOptions {
+                        preview: preview_options,
+                        candidate_validation_commands,
+                    })?;
+                    if report.status == merge::MergeApplyReportStatus::Blocked {
                         print_merge_apply_report(&report, true)?;
                         let message = report
                             .error
@@ -926,10 +2019,11 @@ impl MergeCommand {
                             .unwrap_or_else(|| "merge apply refused".to_string());
                         bail!("{message}");
                     }
-                    merge::apply_prechecked_merge(preview)?
+                    report
                 } else {
                     merge::apply_merge_result(MergeApplyOptions {
                         preview: preview_options,
+                        candidate_validation_commands,
                     })?
                 };
                 print_merge_apply_report(&report, args.json)
@@ -959,6 +2053,9 @@ struct MergePreviewArgs {
     /// JSON validation report file. Repeat to supply multiple reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report before preview is considered safe.
+    #[arg(long)]
+    require_validation: bool,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
@@ -979,6 +2076,12 @@ struct MergeApplyArgs {
     /// JSON validation report file. Repeat to supply multiple reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report or candidate validation command.
+    #[arg(long)]
+    require_validation: bool,
+    /// Shell command to validate the temporary merged candidate before applying to primary.
+    #[arg(long = "validation-command")]
+    validation_command: Vec<String>,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
@@ -1015,6 +2118,246 @@ impl MergeForceArgs {
             allow_apply_conflicts: self.force_apply_conflicts,
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct PrCommand {
+    #[command(subcommand)]
+    command: PrSubcommand,
+}
+
+impl PrCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            PrSubcommand::Preview(args) => {
+                let json = args.json;
+                let require_validation = args.require_validation;
+                let report = publication::preview_pr_with_validation_requirement(
+                    pr_options_from_preview_args(args)?,
+                    require_validation,
+                )?;
+                print_pr_publication_report(&report, json)
+            }
+            PrSubcommand::Publish(args) => {
+                let json = args.json;
+                let require_validation = args.require_validation;
+                let report = publication::publish_pr_with_validation_requirement(
+                    pr_options_from_publish_args(args)?,
+                    require_validation,
+                )?;
+                print_pr_publication_report(&report, json)?;
+                if report.status == PrPublicationStatus::Blocked {
+                    bail!("pr publish refused: merge-preview blockers remain");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum PrSubcommand {
+    /// Preview whether an agent worktree is ready to publish as a pull request.
+    Preview(PrPreviewArgs),
+    /// Publish an agent worktree through an explicit forge.
+    Publish(PrPublishArgs),
+}
+
+#[derive(Debug, Args)]
+struct PrPreviewArgs {
+    /// Stable agent id used when the worktree was created.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claimed path. Repeat to provide multiple claims.
+    #[arg(long, required = true)]
+    claim: Vec<PathBuf>,
+    /// JSON validation report file. Repeat to supply multiple reports.
+    #[arg(long)]
+    validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report before PR preview is publishable.
+    #[arg(long)]
+    require_validation: bool,
+    /// Forge label recorded in the preview report.
+    #[arg(long, default_value = "fake", value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Mark the eventual pull request ready for review instead of draft.
+    #[arg(long)]
+    ready: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PrPublishArgs {
+    /// Stable agent id used when the worktree was created.
+    agent_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claimed path. Repeat to provide multiple claims.
+    #[arg(long, required = true)]
+    claim: Vec<PathBuf>,
+    /// JSON validation report file. Repeat to supply multiple reports.
+    #[arg(long)]
+    validation_report: Vec<PathBuf>,
+    /// Require at least one passed validation report before PR publication.
+    #[arg(long)]
+    require_validation: bool,
+    /// Forge adapter. `fake` is deterministic and local-only; `github` shells out explicitly.
+    #[arg(long, value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Mark the pull request ready for review instead of draft.
+    #[arg(long)]
+    ready: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct IssueCommand {
+    #[command(subcommand)]
+    command: IssueSubcommand,
+}
+
+impl IssueCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            IssueSubcommand::Preview(args) => {
+                let json = args.json;
+                let report = publication::preview_issue(issue_options_from_args(
+                    args.repo,
+                    args.title,
+                    args.body,
+                    args.body_file,
+                    args.label,
+                    args.forge,
+                )?)?;
+                print_query_report(&report, json)
+            }
+            IssueSubcommand::Create(args) => {
+                let json = args.json;
+                let report = publication::create_issue(issue_options_from_args(
+                    args.repo,
+                    args.title,
+                    args.body,
+                    args.body_file,
+                    args.label,
+                    args.forge,
+                )?)?;
+                print_query_report(&report, json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum IssueSubcommand {
+    /// Preview issue content after redaction.
+    Preview(IssuePreviewArgs),
+    /// Create an issue through an explicit forge.
+    Create(IssueCreateArgs),
+}
+
+#[derive(Debug, Args)]
+struct IssuePreviewArgs {
+    /// Issue title.
+    #[arg(long)]
+    title: String,
+    /// Issue body text.
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    /// File containing issue body text.
+    #[arg(long, conflicts_with = "body")]
+    body_file: Option<PathBuf>,
+    /// Issue label. Repeat for multiple labels.
+    #[arg(long = "label")]
+    label: Vec<String>,
+    /// Repository path used only by forge adapters that need repository context.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Forge label recorded in the preview report. Preview never creates remote issues.
+    #[arg(long, default_value = "fake", value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct IssueCreateArgs {
+    /// Issue title.
+    #[arg(long)]
+    title: String,
+    /// Issue body text.
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    /// File containing issue body text.
+    #[arg(long, conflicts_with = "body")]
+    body_file: Option<PathBuf>,
+    /// Issue label. Repeat for multiple labels.
+    #[arg(long = "label")]
+    label: Vec<String>,
+    /// Repository path used only by forge adapters that need repository context.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Forge adapter. `fake` is deterministic and local-only; `github` shells out explicitly.
+    #[arg(long, value_parser = parse_forge_kind)]
+    forge: ForgeKind,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn pr_options_from_preview_args(args: PrPreviewArgs) -> Result<PrPublicationOptions> {
+    let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+    Ok(PrPublicationOptions {
+        repo: args.repo,
+        agent_id: args.agent_id,
+        claimed_paths: args.claim,
+        validations,
+        forge: args.forge,
+        draft: !args.ready,
+    })
+}
+
+fn pr_options_from_publish_args(args: PrPublishArgs) -> Result<PrPublicationOptions> {
+    let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+    Ok(PrPublicationOptions {
+        repo: args.repo,
+        agent_id: args.agent_id,
+        claimed_paths: args.claim,
+        validations,
+        forge: args.forge,
+        draft: !args.ready,
+    })
+}
+
+fn issue_options_from_args(
+    repo: PathBuf,
+    title: String,
+    body: Option<String>,
+    body_file: Option<PathBuf>,
+    labels: Vec<String>,
+    forge: ForgeKind,
+) -> Result<IssuePublicationOptions> {
+    let body = match (body, body_file) {
+        (Some(body), None) => body,
+        (None, Some(path)) => fs::read_to_string(&path)
+            .with_context(|| format!("failed to read issue body file {}", path.display()))?,
+        (None, None) => String::new(),
+        (Some(_), Some(_)) => bail!("use either --body or --body-file, not both"),
+    };
+    Ok(IssuePublicationOptions {
+        repo,
+        title,
+        body,
+        labels,
+        forge,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1391,6 +2734,32 @@ fn parse_worktree_reuse_policy(value: &str) -> std::result::Result<WorktreeReuse
     }
 }
 
+fn parse_semantic_coordination_mode(
+    value: &str,
+) -> std::result::Result<SemanticCoordinationMode, String> {
+    match value {
+        "off" => Ok(SemanticCoordinationMode::Off),
+        "warn" => Ok(SemanticCoordinationMode::Warn),
+        "block" => Ok(SemanticCoordinationMode::Block),
+        _ => Err("expected one of: off, warn, block".to_string()),
+    }
+}
+
+fn parse_forge_kind(value: &str) -> std::result::Result<ForgeKind, String> {
+    ForgeKind::parse(value)
+}
+
+fn parse_inbox_permission_mode(value: &str) -> std::result::Result<InboxPermissionMode, String> {
+    InboxPermissionMode::parse(value)
+}
+
+fn live_clock(value: Option<&str>) -> Result<LiveClock> {
+    match value {
+        Some(value) => LiveClock::parse(value),
+        None => Ok(LiveClock::now()),
+    }
+}
+
 fn print_repository_info(info: &RepositoryInfo, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(info)?);
@@ -1462,6 +2831,91 @@ fn print_query_report<T: Serialize + std::fmt::Debug>(report: &T, json: bool) ->
     Ok(())
 }
 
+fn resolve_run_id_for_run(
+    repo: &Path,
+    family: RunArtifactFamily,
+    explicit: Option<&str>,
+    json: bool,
+) -> Result<ResolvedRunId> {
+    match artifacts::resolve_run_id(repo, family, explicit) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) => {
+            if json {
+                let report = RunArtifactRefusalReport::new(repo, family, explicit, &error);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RunArtifactRefusalReport {
+    family: RunArtifactFamily,
+    success: bool,
+    status: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_dir: Option<PathBuf>,
+    error_kind: &'static str,
+    message: String,
+    next_action: &'static str,
+}
+
+impl RunArtifactRefusalReport {
+    fn new(
+        repo: &Path,
+        family: RunArtifactFamily,
+        explicit: Option<&str>,
+        error: &anyhow::Error,
+    ) -> Self {
+        let run_id = explicit.map(ToOwned::to_owned);
+        let run_dir = explicit
+            .and_then(|value| RunId::new(value).ok())
+            .and_then(|run_id| {
+                artifacts::discover_repo_root(repo)
+                    .ok()
+                    .map(|repo| (repo, run_id))
+            })
+            .map(|(_, run_id)| family.run_root().join(run_id.as_str()));
+        Self {
+            family,
+            success: false,
+            status: "refused",
+            run_id,
+            run_dir,
+            error_kind: "run_artifact_refused",
+            message: error.to_string(),
+            next_action: "choose a new --run-id or prune old artifacts first",
+        }
+    }
+}
+
+fn print_semantic_coordination_report(
+    report: &SemanticCoordinationReport,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("Semantic intent: {}", report.intent.token.get());
+        println!("Agent: {}", report.intent.agent_id);
+        println!("Persisted: {}", report.persisted);
+        println!(
+            "Conflicts: blocking={} advisory={}",
+            report.blocking_conflict_count, report.advisory_conflict_count
+        );
+        for conflict in &report.conflicts {
+            println!(
+                "  {:?}\t{:?}\t{}",
+                conflict.severity, conflict.kind, conflict.message
+            );
+        }
+    }
+    Ok(())
+}
+
 fn print_merge_candidate(candidate: &MergeCandidate, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(candidate)?);
@@ -1514,6 +2968,26 @@ fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()>
             }
         );
         println!("Readiness: {:?}", report.preview.safety.readiness.status);
+    }
+    Ok(())
+}
+
+fn print_pr_publication_report(report: &PrPublicationReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("PR publication: {:?}", report.status);
+        println!("Agent: {}", report.agent_id);
+        println!("Branch: {}", report.branch);
+        println!("Base: {}", report.base);
+        println!("Readiness: {:?}", report.readiness);
+        if !report.blockers.is_empty() {
+            println!("Blockers: {:?}", report.blockers);
+        }
+        if let Some(url) = &report.pr_url {
+            println!("URL: {url}");
+        }
+        println!("Next: {}", report.next_action);
     }
     Ok(())
 }
