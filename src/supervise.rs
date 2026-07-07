@@ -103,6 +103,8 @@ pub struct OrchestratorAssignment {
     pub semantic_symbols: Vec<String>,
     #[serde(default)]
     pub semantic_modules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     #[serde(default)]
     pub worker_assignments: Vec<WorkerAssignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -608,6 +610,7 @@ pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) ->
         .collect::<Result<Vec<_>>>()?
         .join("\n\n--- worker prompt contract ---\n\n");
     let auditor_prompt = review_auditor_prompt(plan, assignment, run_dir, auditor_schema_path)?;
+    let task = assignment_task(plan, assignment);
     let role_prefix = supervise_role_prefix(
         SupervisePromptRole::O1ChildOrchestrator,
         &assignment.id,
@@ -703,7 +706,7 @@ Review auditor prompt template:
         schema_path = schema_path.display(),
         worker_schema_path = worker_schema_path.display(),
         auditor_schema_path = auditor_schema_path.display(),
-        task = plan.task,
+        task = task,
         assignment_json = assignment_json,
         worker_prompts = worker_prompts,
         auditor_prompt = auditor_prompt,
@@ -740,6 +743,7 @@ pub fn worker_prompt(
     let worker_json =
         serde_json::to_string_pretty(worker).context("failed to serialize worker assignment")?;
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
+    let task = worker_task(plan, orchestrator, worker);
     Ok(format!(
         r#"{role_prefix}You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
@@ -784,7 +788,7 @@ Worker assignment JSON:
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<none>".to_string()),
         schema_path = schema_path.display(),
-        task = worker.task.as_deref().unwrap_or(&plan.task),
+        task = task,
         worker_json = worker_json,
     ))
 }
@@ -803,6 +807,7 @@ pub fn review_auditor_prompt(
         .join(", ");
     let auditor_id = format!("{}-review-auditor", orchestrator.id);
     let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
+    let task = assignment_task(plan, orchestrator);
     Ok(format!(
         r#"{role_prefix}You are a terminal read-only review auditor in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
@@ -842,7 +847,7 @@ Supervisor task:
         semantic_modules = orchestrator.semantic_modules.join(", "),
         run_dir = run_dir.display(),
         schema_path = schema_path.display(),
-        task = plan.task,
+        task = task,
     ))
 }
 
@@ -872,6 +877,7 @@ fn parent_review_auditor_prompt(context: ParentReviewAuditorPromptContext<'_>) -
     let role_prefix = supervise_role_prefix(SupervisePromptRole::ReviewAuditor, &auditor_id, None);
     let child_report_json = serde_json::to_string_pretty(child_report)
         .context("failed to serialize child report for auditor prompt")?;
+    let task = assignment_task(plan, assignment);
     Ok(format!(
         r#"{role_prefix}You are the parent-launched read-only review auditor in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher, plus this parent-enforced terminal REVIEW_AUDITOR gate.
@@ -907,7 +913,7 @@ Child report JSON:
 {child_report_json}
 "#,
         role_prefix = role_prefix,
-        task = plan.task,
+        task = task,
         assignment_id = assignment.id,
         worktree_path = worktree_path.display(),
         run_dir = run_dir.display(),
@@ -924,11 +930,38 @@ Child report JSON:
     ))
 }
 
+fn assignment_task<'a>(
+    plan: &'a SupervisorPlan,
+    assignment: &'a OrchestratorAssignment,
+) -> &'a str {
+    assignment.task.as_deref().unwrap_or(&plan.task)
+}
+
+fn worker_task<'a>(
+    plan: &'a SupervisorPlan,
+    assignment: &'a OrchestratorAssignment,
+    worker: &'a WorkerAssignment,
+) -> &'a str {
+    worker
+        .task
+        .as_deref()
+        .or(assignment.task.as_deref())
+        .unwrap_or(&plan.task)
+}
+
 #[derive(Debug, Clone)]
 struct ChildAttemptArtifacts {
     prompt_path: PathBuf,
     report_path: PathBuf,
     log_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ChildAttemptHistory {
+    attempt: usize,
+    report_path: PathBuf,
+    structural_problems: Vec<String>,
+    corrective_retry_used: bool,
 }
 
 fn child_attempt_artifacts(
@@ -967,6 +1000,30 @@ Return only a compliant OrchestratorReviewReport JSON final response matching th
     )
 }
 
+fn append_child_attempt_history(
+    report: &mut OrchestratorReviewReport,
+    histories: &[ChildAttemptHistory],
+) {
+    if histories.is_empty() {
+        return;
+    }
+    for history in histories {
+        let structural_problems = if history.structural_problems.is_empty() {
+            "<none>".to_string()
+        } else {
+            history.structural_problems.join("; ")
+        };
+        report.findings.push(Finding {
+            severity: FindingSeverity::Info,
+            message: format!(
+                "child attempt {} history: structural_problems={}; corrective_retry_used={}",
+                history.attempt, structural_problems, history.corrective_retry_used
+            ),
+            paths: vec![history.report_path.clone()],
+        });
+    }
+}
+
 fn run_supervisor_plan(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
@@ -976,7 +1033,6 @@ fn run_supervisor_plan(
     if !options.allow_dirty_primary {
         ensure_clean_primary(&repo)?;
     }
-    let primary_head = current_head_oid(&repo)?;
 
     let run_dir = run_dir(&repo, &options.run_id);
     artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Supervise, &options.run_id)?;
@@ -1008,9 +1064,10 @@ fn run_supervisor_plan(
             .collect::<BTreeMap<_, _>>();
 
         for assignment in &plan.assignments {
+            let current_primary_head = current_head_oid(&repo)?;
             let worktree = match existing.get(&assignment.id) {
                 Some(record) => {
-                    ensure_reusable_child_worktree(record, &primary_head)?;
+                    ensure_reusable_child_worktree(record, &current_primary_head)?;
                     record.clone()
                 }
                 None => manager.create(WorktreeCreateOptions {
@@ -1020,6 +1077,13 @@ fn run_supervisor_plan(
                     worktree_root: None,
                 })?,
             };
+            let child_base_head = current_head_oid(&worktree.path).with_context(|| {
+                format!(
+                    "failed to capture base HEAD for child worktree '{}' at {}",
+                    assignment.id,
+                    worktree.path.display()
+                )
+            })?;
 
             let claim = match sync_store
                 .claim_paths(&assignment.id, assignment.assigned_paths.iter())
@@ -1070,10 +1134,12 @@ fn run_supervisor_plan(
 
             let mut child_report = None;
             let mut retry_feedback: Option<Vec<String>> = None;
+            let mut attempt_history = Vec::new();
             let max_attempts = usize::from(plan.max_child_retries).saturating_add(1);
             for attempt in 1..=max_attempts {
                 let attempt_artifacts =
                     child_attempt_artifacts(&dirs, &assignment.id, attempt, max_attempts > 1);
+                let corrective_retry_used = retry_feedback.is_some();
                 let attempt_prompt = match &retry_feedback {
                     Some(problems) => prompt_with_corrective_feedback(&prompt, problems),
                     None => prompt.clone(),
@@ -1105,7 +1171,7 @@ fn run_supervisor_plan(
                     &attempt_artifacts.report_path,
                     &external_run,
                     &worktree.path,
-                    &primary_head,
+                    &child_base_head,
                 );
                 if !primary_newly_dirty.is_empty() {
                     mark_primary_integrity_violation(
@@ -1114,12 +1180,19 @@ fn run_supervisor_plan(
                         &mut attempt_report,
                     );
                 }
-                if should_retry_child_report(
+                let retry_used = should_retry_child_report(
                     &attempt_report,
                     &report_shape_problems,
                     attempt,
                     plan.max_child_retries,
-                ) {
+                );
+                attempt_history.push(ChildAttemptHistory {
+                    attempt,
+                    report_path: attempt_artifacts.report_path.clone(),
+                    structural_problems: report_shape_problems.clone(),
+                    corrective_retry_used,
+                });
+                if retry_used {
                     retry_feedback = Some(report_shape_problems);
                     continue;
                 }
@@ -1142,6 +1215,11 @@ fn run_supervisor_plan(
                     assignment.id
                 )
             })?;
+
+            if plan.max_child_retries > 0 {
+                append_child_attempt_history(&mut child_report, &attempt_history);
+            }
+            write_child_report(&final_report_path, &child_report)?;
 
             if parent_auditor_required(assignment, &child_report) {
                 let auditor_id = parent_auditor_id(assignment);
@@ -1525,7 +1603,7 @@ fn collect_child_report(
     report_path: &Path,
     external_run: &ExternalAgentRun,
     worktree_path: &Path,
-    primary_head: &Oid,
+    child_base_head: &Oid,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     let mut report_shape_problems = Vec::new();
     let mut report = match read_child_report(report_path) {
@@ -1584,7 +1662,8 @@ fn collect_child_report(
         }
     };
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
-    verify_child_report_paths(assignment, worktree_path, primary_head, &mut report);
+    verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
+    validate_worker_report_evidence(assignment, report_path, &mut report);
     (report, report_shape_problems)
 }
 
@@ -1987,11 +2066,11 @@ fn validate_worker_report_delegation_attestations(
 fn verify_child_report_paths(
     assignment: &OrchestratorAssignment,
     worktree_path: &Path,
-    primary_head: &Oid,
+    child_base_head: &Oid,
     report: &mut OrchestratorReviewReport,
 ) {
     let reported_paths = normalize_paths(report.files_changed.clone());
-    let actual_paths = match collect_paths_changed_since_base(worktree_path, primary_head) {
+    let actual_paths = match collect_paths_changed_since_base(worktree_path, child_base_head) {
         Ok(paths) => paths,
         Err(error) => {
             report.status = ReviewStatus::Failed;
@@ -2056,6 +2135,171 @@ fn verify_child_report_paths(
     report.next_safe_action =
         "inspect the unauthorized child worktree changes before rerunning or collecting"
             .to_string();
+}
+
+fn validate_worker_report_evidence(
+    assignment: &OrchestratorAssignment,
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    if report.worker_reports.is_empty() {
+        return;
+    }
+
+    let workers_by_id = assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| (worker.id.as_str(), worker))
+        .collect::<BTreeMap<_, _>>();
+    let actual_paths = report.files_changed.clone();
+    let actual_set = actual_paths.iter().cloned().collect::<BTreeSet<_>>();
+    let mut reported_union = BTreeSet::<PathBuf>::new();
+    let mut blocking_messages = Vec::new();
+
+    for worker_report in &mut report.worker_reports {
+        let normalized_files_changed = match normalize_paths(worker_report.files_changed.clone()) {
+            Ok(paths) => {
+                worker_report.files_changed = paths.clone();
+                paths
+            }
+            Err(error) => {
+                let message = format!(
+                    "worker '{}' reported invalid files_changed paths: {error}",
+                    worker_report.id
+                );
+                mark_worker_report_structural_inconsistency(
+                    worker_report,
+                    message.clone(),
+                    vec![report_path.to_path_buf()],
+                );
+                blocking_messages.push((message, vec![report_path.to_path_buf()]));
+                Vec::new()
+            }
+        };
+        reported_union.extend(normalized_files_changed.iter().cloned());
+
+        let allowed_paths = if let Some(worker) = workers_by_id.get(worker_report.id.as_str()) {
+            worker.assigned_paths.clone()
+        } else {
+            let message = format!(
+                "worker '{}' is not declared in assignment '{}' worker_assignments",
+                worker_report.id, assignment.id
+            );
+            let paths = if normalized_files_changed.is_empty() {
+                vec![report_path.to_path_buf()]
+            } else {
+                normalized_files_changed.clone()
+            };
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                paths.clone(),
+            );
+            blocking_messages.push((message, paths));
+            Vec::new()
+        };
+        let unauthorized_paths = normalized_files_changed
+            .iter()
+            .filter(|path| {
+                !allowed_paths
+                    .iter()
+                    .any(|assigned| path_is_covered_by_claim(path, assigned))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unauthorized_paths.is_empty() {
+            let message = format!(
+                "worker '{}' reported files_changed outside its assigned_paths: {}",
+                worker_report.id,
+                display_paths(&unauthorized_paths)
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                unauthorized_paths.clone(),
+            );
+            blocking_messages.push((message, unauthorized_paths));
+        }
+
+        if worker_report.accepted
+            && worker_report.status == ReviewStatus::Succeeded
+            && worker_report
+                .validation_results
+                .iter()
+                .any(validation_failed)
+        {
+            let failed_validation_paths = if normalized_files_changed.is_empty() {
+                vec![report_path.to_path_buf()]
+            } else {
+                normalized_files_changed.clone()
+            };
+            let message = format!(
+                "worker '{}' reports failed validation while accepted=true and status=succeeded",
+                worker_report.id
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                failed_validation_paths.clone(),
+            );
+            blocking_messages.push((message, failed_validation_paths));
+        }
+    }
+
+    let reported_but_not_observed = reported_union
+        .difference(&actual_set)
+        .cloned()
+        .collect::<Vec<_>>();
+    let observed_but_not_reported = actual_set
+        .difference(&reported_union)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !reported_but_not_observed.is_empty() || !observed_but_not_reported.is_empty() {
+        let paths = union_paths(&reported_but_not_observed, &observed_but_not_reported);
+        report.findings.push(Finding {
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "worker files_changed union differs from actual child worktree Git changes; reported-but-not-observed: {}; observed-but-not-reported: {}",
+                display_paths(&reported_but_not_observed),
+                display_paths(&observed_but_not_reported)
+            ),
+            paths,
+        });
+    }
+
+    if blocking_messages.is_empty() {
+        return;
+    }
+
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    for (message, paths) in blocking_messages {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message,
+            paths,
+        });
+    }
+    report.remaining_risk =
+        "one or more worker reports have structural evidence inconsistencies".to_string();
+    report.next_safe_action =
+        "inspect worker reports and rerun the child scope with corrected evidence".to_string();
+}
+
+fn mark_worker_report_structural_inconsistency(
+    worker_report: &mut WorkerReport,
+    message: String,
+    paths: Vec<PathBuf>,
+) {
+    worker_report.status = ReviewStatus::Failed;
+    worker_report.accepted = false;
+    worker_report.rejected = true;
+    worker_report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message,
+        paths,
+    });
 }
 
 fn should_retry_child_report(
@@ -2588,10 +2832,10 @@ fn collect_paths_changed_since_base(worktree_path: &Path, base_oid: &Oid) -> Res
         .with_context(|| format!("failed to open child worktree {}", worktree_path.display()))?;
     let base_commit = repo
         .find_commit(*base_oid)
-        .with_context(|| format!("failed to find primary base commit {base_oid}"))?;
+        .with_context(|| format!("failed to find child base commit {base_oid}"))?;
     let base_tree = base_commit
         .tree()
-        .with_context(|| format!("failed to read tree for primary base commit {base_oid}"))?;
+        .with_context(|| format!("failed to read tree for child base commit {base_oid}"))?;
     let mut options = DiffOptions::new();
     options
         .include_untracked(true)
@@ -2599,7 +2843,7 @@ fn collect_paths_changed_since_base(worktree_path: &Path, base_oid: &Oid) -> Res
         .include_typechange(true);
     let mut diff = repo
         .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
-        .context("failed to diff child worktree against primary base commit")?;
+        .context("failed to diff child worktree against child base commit")?;
     let mut find_options = DiffFindOptions::new();
     find_options.renames(true);
     diff.find_similar(Some(&mut find_options))

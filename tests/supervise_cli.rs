@@ -1498,6 +1498,25 @@ fn supervise_run_retries_report_shape_failure_once_with_corrective_feedback() ->
         &report["orchestrator_reports"][0]["findings"],
         "corrective retry attempt 2",
     )?;
+    let canonical_report_path =
+        repo_path.join(".maco/o2/runs/supervise-retry-shape/reports/child-retry-shape.json");
+    assert!(canonical_report_path.exists());
+    let canonical_report: Value = serde_json::from_str(
+        &fs::read_to_string(&canonical_report_path).context("read canonical child report")?,
+    )
+    .context("parse canonical child report")?;
+    assert_json_findings_contain_message(
+        &canonical_report["findings"],
+        "child attempt 1 history: structural_problems=",
+    )?;
+    assert_json_findings_contain_message(
+        &canonical_report["findings"],
+        "corrective_retry_used=false",
+    )?;
+    assert_json_findings_contain_message(
+        &canonical_report["findings"],
+        "child attempt 2 history: structural_problems=<none>; corrective_retry_used=true",
+    )?;
 
     Ok(())
 }
@@ -1605,6 +1624,279 @@ fn supervise_run_does_not_retry_malformed_first_attempt_with_path_violation() ->
         "error",
         "outside its assigned paths",
         "src/lib.rs",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_worker_report_files_changed_outside_worker_assignment() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "catch worker report path violation",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-worker-outside",
+              "assigned_paths": ["README.md", "src/lib.rs"],
+              "worker_assignments": [
+                {"id": "worker-worker-outside", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-worker-outside",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worker 'worker-worker-outside' reported files_changed outside its assigned_paths",
+        "src/lib.rs",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_unassigned_worker_report_that_self_authorizes_diff() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "catch extra unassigned worker self authorization",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-worker-extra-self-authorized",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-extra-assigned", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-worker-extra-self-authorized",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worker 'worker-extra-self-authorized' is not declared in assignment 'child-worker-extra-self-authorized' worker_assignments",
+        "README.md",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_warns_when_worker_report_union_differs_from_git_diff() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "warn about worker evidence mismatch",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-worker-union-mismatch",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-worker-union-mismatch", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_success_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-worker-union-mismatch",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "warning",
+        "worker files_changed union differs from actual child worktree Git changes",
+        "README.md",
+    )?;
+    assert_json_findings_contain_message(
+        &report["orchestrator_reports"][0]["findings"],
+        "reported-but-not-observed: <none>; observed-but-not-reported: README.md",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_worker_with_failed_validation_but_accepted_success() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "catch inconsistent worker validation",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-worker-failed-accepted",
+              "assigned_paths": ["README.md"],
+              "worker_assignments": [
+                {"id": "worker-worker-failed-accepted", "assigned_paths": ["README.md"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-worker-failed-accepted",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worker 'worker-worker-failed-accepted' reports failed validation while accepted=true and status=succeeded",
+        "README.md",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_uses_recorded_child_base_when_primary_advances_mid_run() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "primary may advance while child runs",
+          "max_depth": 2,
+          "max_child_processes": 2,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-mid-commit", "assigned_paths": ["README.md"]},
+            {
+              "id": "child-b",
+              "assigned_paths": ["src/lib.rs"],
+              "worker_assignments": [
+                {"id": "worker-b", "assigned_paths": ["src/lib.rs"]}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_success_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-primary-mid-commit",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_json_array_contains(
+        &report["orchestrator_reports"][0]["files_changed"],
+        "README.md",
+    )?;
+    assert_json_array_not_contains(
+        &report["orchestrator_reports"][0]["files_changed"],
+        "src/inbox.rs",
+    )?;
+    assert_no_finding_message_contains(
+        &report["orchestrator_reports"][0]["findings"],
+        "outside its assigned paths",
+    )?;
+    assert_json_array_contains(
+        &report["orchestrator_reports"][1]["files_changed"],
+        "src/lib.rs",
+    )?;
+    assert_json_array_not_contains(
+        &report["orchestrator_reports"][1]["files_changed"],
+        "src/inbox.rs",
+    )?;
+    assert_no_finding_message_contains(
+        &report["orchestrator_reports"][1]["findings"],
+        "outside its assigned paths",
     )?;
 
     Ok(())
@@ -1952,6 +2244,62 @@ fn supervise_plan_accepts_new_child_assignment_name_and_legacy_alias() -> Result
 }
 
 #[test]
+fn supervise_run_assignment_task_overrides_child_prompt_and_worker_fallback() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan-task-override.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "plan fallback task",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {
+              "id": "child-a",
+              "assigned_paths": ["README.md", "src/lib.rs"],
+              "task": "assignment scoped task",
+              "worker_assignments": [
+                {"id": "worker-a", "assigned_paths": ["README.md"]},
+                {"id": "worker-b", "assigned_paths": ["src/lib.rs"], "task": "worker specific task"}
+              ]
+            }
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-task-override",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+    assert_eq!(report["success"], false);
+
+    let child_prompt = fs::read_to_string(
+        repo_path.join(".maco/o2/runs/supervise-task-override/assignments/child-a.prompt.md"),
+    )
+    .context("read child prompt")?;
+    assert!(child_prompt.contains("Supervisor task:\nassignment scoped task"));
+    assert!(!child_prompt.contains("Supervisor task:\nplan fallback task"));
+    let worker_a_section = prompt_section_after(&child_prompt, "- Worker id: worker-a")?;
+    assert!(worker_a_section.contains("Supervisor task:\nassignment scoped task"));
+    let worker_b_section = prompt_section_after(&child_prompt, "- Worker id: worker-b")?;
+    assert!(worker_b_section.contains("Supervisor task:\nworker specific task"));
+
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_with_consultant_adds_child_prompt_consultation_section() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2074,6 +2422,14 @@ fn assert_json_array_contains(value: &Value, expected: &str) -> Result<()> {
     Ok(())
 }
 
+fn assert_json_array_not_contains(value: &Value, unexpected: &str) -> Result<()> {
+    let values = value.as_array().context("json array")?;
+    if values.iter().any(|value| value == unexpected) {
+        anyhow::bail!("expected JSON array not to contain {unexpected}: {values:?}");
+    }
+    Ok(())
+}
+
 fn assert_json_findings_contain_message(value: &Value, expected: &str) -> Result<()> {
     let findings = value.as_array().context("findings array")?;
     if findings.iter().any(|finding| {
@@ -2084,6 +2440,18 @@ fn assert_json_findings_contain_message(value: &Value, expected: &str) -> Result
         return Ok(());
     }
     anyhow::bail!("expected finding containing '{expected}': {findings:?}");
+}
+
+fn assert_no_finding_message_contains(value: &Value, unexpected: &str) -> Result<()> {
+    let findings = value.as_array().context("findings array")?;
+    if findings.iter().any(|finding| {
+        finding["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(unexpected))
+    }) {
+        anyhow::bail!("unexpected finding containing '{unexpected}': {findings:?}");
+    }
+    Ok(())
 }
 
 fn command_contains_sequence(command: &[Value], expected: &[&str]) -> bool {
@@ -2101,6 +2469,13 @@ fn assert_prompt_starts_with_prefix(prompt: &str, expected_prefix: &str) -> Resu
     }
     let actual = prompt.lines().take(6).collect::<Vec<_>>();
     anyhow::bail!("prompt did not start with expected role prefix; first six lines: {actual:?}");
+}
+
+fn prompt_section_after<'a>(prompt: &'a str, marker: &str) -> Result<&'a str> {
+    prompt
+        .split(marker)
+        .nth(1)
+        .with_context(|| format!("prompt missing marker {marker:?}"))
 }
 
 fn assert_report_array_item_schemas(schema: &Value, label: &str) -> Result<()> {
@@ -2555,7 +2930,38 @@ mkdir -p "$(dirname "$report")"
 printf '{"event":"fake-start","worktree":"%s","prompt_from_stdin":%s,"goals":%s,"multi_agent":%s,"o1_role_prefix":%s,"auditor_role_prefix":%s,"sandbox":"%s"}\n' "$worktree" "$prompt_from_stdin" "$goals_seen" "$multi_agent_seen" "$o1_role_prefix" "$auditor_role_prefix" "$sandbox_mode"
 edit=true
 files_changed_json=
+worker_files_changed_json=
+worker_validation_status=
+worker_status=
+worker_accepted=
+worker_rejected=
+worker_risk=
+worker_next=
 if [ "$auditor_role_prefix" = "true" ]; then
+  child_report_path="$(printf '%s\n' "$prompt_body" | sed -n 's/^- Child report path: //p' | head -n 1)"
+  if [ -n "$child_report_path" ] && [ ! -f "$child_report_path" ]; then
+    cat > "$report" <<JSON
+{
+  "id": "$name",
+  "role": "auditor",
+  "reviewed_worker_ids": [],
+  "reviewed_paths": [],
+  "commands_run": [],
+  "validation_results": [],
+  "findings": [
+    {"severity": "error", "message": "canonical child report was missing before parent audit", "paths": ["$child_report_path"]}
+  ],
+  "no_further_delegation": true,
+  "read_only": true,
+  "accepted": false,
+  "rejected": true,
+  "status": "failed",
+  "remaining_risk": "canonical child report missing",
+  "next_safe_action": "write canonical report before launching parent auditor"
+}
+JSON
+    exit 0
+  fi
   child_name="$name"
   case "$child_name" in
     *-review-auditor)
@@ -2627,11 +3033,35 @@ if [ "$auditor_role_prefix" = "true" ]; then
       path="README.md"
       worker="child-retry-shape-unauthorized"
       ;;
+    child-worker-outside)
+      path="README.md"
+      worker="worker-worker-outside"
+      reviewed_paths_json='["README.md", "src/lib.rs"]'
+      ;;
+    child-worker-extra-self-authorized)
+      path="README.md"
+      worker="worker-extra-assigned"
+      ;;
+    child-worker-union-mismatch)
+      path="README.md"
+      worker="worker-worker-union-mismatch"
+      ;;
+    child-worker-failed-accepted)
+      path="README.md"
+      worker="worker-worker-failed-accepted"
+      ;;
+    child-primary-mid-commit)
+      path="README.md"
+      worker="child-primary-mid-commit"
+      ;;
     *)
       path="README.md"
       worker="worker-a"
       ;;
   esac
+  if [ -z "${reviewed_paths_json:-}" ]; then
+    reviewed_paths_json='["'"$path"'"]'
+  fi
   if [ "$name" = "child-auditor-missing-review-auditor" ]; then
     exit 0
   fi
@@ -2659,7 +3089,7 @@ JSON
   "id": "$name",
   "role": "auditor",
   "reviewed_worker_ids": ["$worker"],
-  "reviewed_paths": ["$path"],
+  "reviewed_paths": $reviewed_paths_json,
   "findings": [],
   "no_further_delegation": true,
   "read_only": true,
@@ -2677,7 +3107,7 @@ JSON
   "id": "$name",
   "role": "auditor",
   "reviewed_worker_ids": ["$worker"],
-  "reviewed_paths": ["$path"],
+  "reviewed_paths": $reviewed_paths_json,
   "commands_run": [],
   "validation_results": [
     {"name": "fake parent auditor validation", "status": "succeeded", "command": [], "message": null}
@@ -2709,6 +3139,7 @@ case "$logical_name" in
     path="README.md"
     edit_path="src/lib.rs"
     worker="worker-unauthorized"
+    worker_reports_json='[]'
     ;;
   child-delegated)
     path="README.md"
@@ -2742,36 +3173,85 @@ case "$logical_name" in
     edit_path="README.md"
     worker="worker-auditor-evidence-missing"
     ;;
+  child-generated)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-generated"
+    worker_reports_json='[]'
+    ;;
   child-omits-assigned)
     path="README.md"
     edit_path="README.md"
     worker="worker-omits-assigned"
     files_changed_json='[]'
+    worker_reports_json='[]'
     ;;
   child-assigned-only)
     path="README.md"
     edit_path="README.md"
     worker="worker-assigned-only"
+    worker_reports_json='[]'
     ;;
   child-primary-mutation)
     path="README.md"
     edit_path="README.md"
     worker="worker-primary-mutation"
+    worker_reports_json='[]'
     ;;
   child-retry-shape)
     path="README.md"
     edit_path="README.md"
     worker="worker-retry-shape"
+    worker_reports_json='[]'
     ;;
   child-retry-shape-diff)
     path="README.md"
     edit_path="README.md"
     worker="worker-retry-shape-diff"
+    worker_reports_json='[]'
     ;;
   child-retry-shape-unauthorized)
     path="README.md"
     edit_path="src/lib.rs"
     worker="worker-retry-shape-unauthorized"
+    worker_reports_json='[]'
+    ;;
+  child-worker-outside)
+    path="README.md"
+    edit_path="src/lib.rs"
+    worker="worker-worker-outside"
+    files_changed_json='["src/lib.rs"]'
+    worker_files_changed_json='["src/lib.rs"]'
+    ;;
+  child-worker-extra-self-authorized)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-extra-assigned"
+    files_changed_json='["README.md"]'
+    ;;
+  child-worker-union-mismatch)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-worker-union-mismatch"
+    files_changed_json='["README.md"]'
+    worker_files_changed_json='[]'
+    ;;
+  child-worker-failed-accepted)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-worker-failed-accepted"
+    worker_validation_status="failed"
+    worker_status="succeeded"
+    worker_accepted="true"
+    worker_rejected="false"
+    worker_risk="worker validation failed despite accepted success"
+    worker_next="fix worker validation evidence"
+    ;;
+  child-primary-mid-commit)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-primary-mid-commit"
+    worker_reports_json='[]'
     ;;
   child-clean)
     path="README.md"
@@ -2779,6 +3259,7 @@ case "$logical_name" in
     worker="worker-clean"
     edit=false
     files_changed_json='[]'
+    worker_reports_json='[]'
     ;;
   *)
     path="README.md"
@@ -2814,6 +3295,12 @@ if [ "$logical_name" = "child-primary-mutation" ]; then
   primary="${report%%/.maco/o2/runs/*}"
   printf '\nprimary mutation from %s\n' "$name" >> "$primary/README.md"
 fi
+if [ "$logical_name" = "child-primary-mid-commit" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  printf 'pub fn inbox_mid_run() -> bool { true }\n' > "$primary/src/inbox.rs"
+  git -C "$primary" add src/inbox.rs
+  git -C "$primary" -c user.name="maco test" -c user.email="maco-test@example.invalid" commit -m "primary mid-run unrelated commit"
+fi
 if [ "$logical_name" = "child-fail" ]; then
   status="failed"
   accepted="false"
@@ -2827,6 +3314,72 @@ else
   risk="none"
   next="review diff"
 fi
+if [ -z "$worker_files_changed_json" ]; then
+  worker_files_changed_json="$files_changed_json"
+fi
+if [ -z "$worker_status" ]; then
+  worker_status="$status"
+fi
+if [ -z "$worker_validation_status" ]; then
+  worker_validation_status="$worker_status"
+fi
+if [ -z "$worker_accepted" ]; then
+  worker_accepted="$accepted"
+fi
+if [ -z "$worker_rejected" ]; then
+  worker_rejected="$rejected"
+fi
+if [ -z "$worker_risk" ]; then
+  worker_risk="$risk"
+fi
+if [ -z "$worker_next" ]; then
+  worker_next="$next"
+fi
+if [ "$logical_name" = "child-worker-extra-self-authorized" ]; then
+  worker_reports_json=$(cat <<JSON
+[
+    {
+      "id": "worker-extra-assigned",
+      "role": "worker",
+      "assigned_paths": ["README.md"],
+      "semantic_symbols": [],
+      "semantic_modules": [],
+      "commands_run": [],
+      "files_changed": [],
+      "validation_results": [
+        {"name": "fake worker validation", "status": "succeeded", "command": [], "message": null}
+      ],
+      "findings": [],
+      "no_further_delegation": true,
+      "accepted": true,
+      "rejected": false,
+      "status": "succeeded",
+      "remaining_risk": "none",
+      "next_safe_action": "review diff"
+    },
+    {
+      "id": "worker-extra-self-authorized",
+      "role": "worker",
+      "assigned_paths": ["README.md"],
+      "semantic_symbols": [],
+      "semantic_modules": [],
+      "commands_run": [],
+      "files_changed": ["README.md"],
+      "validation_results": [
+        {"name": "fake worker validation", "status": "succeeded", "command": [], "message": null}
+      ],
+      "findings": [],
+      "no_further_delegation": true,
+      "accepted": true,
+      "rejected": false,
+      "status": "succeeded",
+      "remaining_risk": "none",
+      "next_safe_action": "review diff"
+    }
+  ]
+JSON
+)
+fi
 if [ -z "$worker_reports_json" ]; then
   worker_reports_json=$(cat <<JSON
 [
@@ -2837,17 +3390,17 @@ if [ -z "$worker_reports_json" ]; then
       "semantic_symbols": [],
       "semantic_modules": [],
       "commands_run": [],
-      "files_changed": $files_changed_json,
+      "files_changed": $worker_files_changed_json,
       "validation_results": [
-        {"name": "fake worker validation", "status": "$status", "command": [], "message": null}
+        {"name": "fake worker validation", "status": "$worker_validation_status", "command": [], "message": null}
       ],
       "findings": [],
       "no_further_delegation": $no_further_delegation,
-      "accepted": $accepted,
-      "rejected": $rejected,
-      "status": "$status",
-      "remaining_risk": "$risk",
-      "next_safe_action": "$next"
+      "accepted": $worker_accepted,
+      "rejected": $worker_rejected,
+      "status": "$worker_status",
+      "remaining_risk": "$worker_risk",
+      "next_safe_action": "$worker_next"
     }
   ]
 JSON
