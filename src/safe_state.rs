@@ -872,6 +872,12 @@ pub struct KernelStateLock {
     root_identity: FileIdentity,
 }
 
+pub(crate) enum ExistingExclusiveLock {
+    Missing,
+    Busy,
+    Acquired(KernelStateLock),
+}
+
 #[derive(Debug, Clone, Copy)]
 enum KernelLockOperation {
     Shared,
@@ -918,6 +924,62 @@ impl KernelStateLock {
         };
         lock.verify_direct_binding(root)?;
         Ok(lock)
+    }
+
+    /// Acquires an already-existing stable lock without creating a pathname.
+    /// Offline verification paths use this to remain strictly non-mutating.
+    pub(crate) fn acquire_existing_direct(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+    ) -> Result<Self> {
+        let file_name = file_name.as_ref();
+        validate_single_component(file_name)?;
+        root.verify()?;
+        let path = root.direct_child(file_name)?;
+        let file = open_existing_stable_private_file_at(root, file_name)?.with_context(|| {
+            format!("required kernel state lock is missing: {}", path.display())
+        })?;
+        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
+        lock_file(&file, &path, LOCK_ACQUIRE_TIMEOUT)?;
+        run_kernel_lock_after_flock_hook(&path);
+        let lock = Self {
+            file,
+            path,
+            file_name: file_name.to_os_string(),
+            identity,
+            root_identity: root.identity().clone(),
+        };
+        lock.verify_direct_binding(root)?;
+        Ok(lock)
+    }
+
+    /// Attempts an exclusive lock only when the exact pathname already
+    /// exists. Missing paths return `None`; no cleanup candidate is created.
+    pub(crate) fn try_acquire_existing_exclusive_direct(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+    ) -> Result<ExistingExclusiveLock> {
+        let file_name = file_name.as_ref();
+        validate_single_component(file_name)?;
+        root.verify()?;
+        let path = root.direct_child(file_name)?;
+        let Some(file) = open_existing_stable_private_file_at(root, file_name)? else {
+            return Ok(ExistingExclusiveLock::Missing);
+        };
+        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
+        if !try_lock_file_if_idle(&file, &path)? {
+            return Ok(ExistingExclusiveLock::Busy);
+        }
+        run_kernel_lock_after_flock_hook(&path);
+        let lock = Self {
+            file,
+            path,
+            file_name: file_name.to_os_string(),
+            identity,
+            root_identity: root.identity().clone(),
+        };
+        lock.verify_direct_binding(root)?;
+        Ok(ExistingExclusiveLock::Acquired(lock))
     }
 
     pub(crate) fn try_acquire_shared_direct(
@@ -994,6 +1056,41 @@ impl KernelStateLock {
             );
         }
         Ok(())
+    }
+
+    /// Unlinks the exact pathname named by this exclusively held descriptor
+    /// and durably records the parent-directory change. A rebound pathname is
+    /// refused before unlink and the opened inode remains locked until return.
+    pub(crate) fn unlink_exact_direct(self, root: &SafeRoot) -> Result<()> {
+        self.verify_direct_binding(root)?;
+        #[cfg(unix)]
+        {
+            let name = c_string(&self.file_name)?;
+            if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to unlink inactive state lock {}",
+                        self.path.display()
+                    )
+                });
+            }
+            sync_directory(root)?;
+            let descriptor = fstat(self.file.as_raw_fd())?;
+            if descriptor.st_mode & libc::S_IFMT != libc::S_IFREG
+                || descriptor.st_uid != unsafe { libc::geteuid() }
+                || descriptor.st_nlink != 0
+                || identity_from_stat(&descriptor) != self.identity
+            {
+                bail!("unlinked state lock descriptor changed unexpectedly");
+            }
+            root.verify()?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        bail!(
+            "identity-bound state lock unlink is unsupported on this platform: {}",
+            self.path.display()
+        )
     }
 }
 
@@ -2115,10 +2212,60 @@ fn open_stable_private_file_at(root: &SafeRoot, file_name: &OsStr) -> Result<Fil
     Ok(file)
 }
 
+#[cfg(unix)]
+fn open_existing_stable_private_file_at(
+    root: &SafeRoot,
+    file_name: &OsStr,
+) -> Result<Option<File>> {
+    let name = c_string(file_name)?;
+    let fd = unsafe {
+        libc::openat(
+            root.directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to open existing stable lock file {}",
+                root.path().join(file_name).display()
+            )
+        });
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    ensure_regular_single_link_metadata(&root.path().join(file_name), &metadata)?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        bail!(
+            "existing stable lock file is not owner-private mode 0600: {}",
+            root.path().join(file_name).display()
+        );
+    }
+    Ok(Some(file))
+}
+
 #[cfg(not(unix))]
 fn open_stable_private_file_at(root: &SafeRoot, file_name: &OsStr) -> Result<File> {
     bail!(
         "handle-relative stable lock files are unsupported on this platform: {}",
+        root.path().join(file_name).display()
+    )
+}
+
+#[cfg(not(unix))]
+fn open_existing_stable_private_file_at(
+    root: &SafeRoot,
+    file_name: &OsStr,
+) -> Result<Option<File>> {
+    bail!(
+        "handle-relative existing lock files are unsupported on this platform: {}",
         root.path().join(file_name).display()
     )
 }
@@ -2164,10 +2311,30 @@ fn try_lock_file(file: &File, path: &Path, operation: KernelLockOperation) -> Re
     Err(error).with_context(|| format!("failed to acquire kernel state lock {}", path.display()))
 }
 
+#[cfg(unix)]
+fn try_lock_file_if_idle(file: &File, path: &Path) -> Result<bool> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(error).with_context(|| format!("failed to acquire kernel state lock {}", path.display()))
+}
+
 #[cfg(not(unix))]
 fn try_lock_file(_file: &File, path: &Path, _operation: KernelLockOperation) -> Result<()> {
     bail!(
         "shared/exclusive cooperative kernel locks are unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(not(unix))]
+fn try_lock_file_if_idle(_file: &File, path: &Path) -> Result<bool> {
+    bail!(
+        "exclusive cooperative kernel lock probing is unsupported on this platform: {}",
         path.display()
     )
 }

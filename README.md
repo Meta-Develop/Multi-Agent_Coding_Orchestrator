@@ -187,17 +187,26 @@ then activates the tombstone and removes the sidecar. Crashes before the
 tombstone leave only the old state; crashes after it recover forward from the
 signed sidecar, while old writers always reject version 3. Migration dry-run
 and repeated apply verify the original signed manifest entry, active tombstone,
-and exact authenticated snapshot locator without adopting a tombstone on
-first use.
+exact authenticated snapshot locator, every held legacy consumer lock, and the
+identity-bound transaction root before and after producing a result, without
+adopting a tombstone on first use.
 
 The typed authenticated-state foundation uses immutable HMAC-chained journals,
 signed atomic heads, and full-lifecycle instance locks. Snapshot stores add a
 signed stable locator containing the active journal identity, absolute
 generation and token, and retained prior terminal anchors. Rollover publishes a
-fully signed replacement generation before atomically switching that locator;
-old journals remain present and are verified on open. A missing locator, a
-substituted or deleted retained journal, or locator replay beyond the single
-record crash window fails closed. Effect WALs likewise publish a durable
+signed prepared intent before its candidate journal can exist, publishes and
+authenticates the replacement generation, then atomically switches that
+locator. A bounded physical-journal inventory rejects a signed old-locator
+replay that leaves newer evidence present; a prepared pre-switch crash either
+recovers forward from the bound candidate or leaves the old locator
+authoritative. Old journals remain present and are verified on open. A missing
+locator, a substituted or deleted retained journal, an unbound physical
+journal, or locator replay beyond the single-record crash window fails closed.
+Managed-worktree snapshots retain only active incarnations. Retired nonce lease
+files are queued with signed inode identities and scavenged only after an
+exclusive lock proves them inactive; active, foreign, or rebound lease paths
+are never unlinked. Effect WALs likewise publish a durable
 `planned` record before returning to a caller and require the ordered
 `planned -> started -> observed -> completed` reconciliation sequence.
 
@@ -206,8 +215,10 @@ registry before it can be created. The entire sensitive state root must also be
 masked from every untrusted child process; authentication does not compensate
 for exposing its key. Local HMAC evidence detects partial mutation and rollback
 relative to retained current evidence, but no local design without an external
-monotonic anchor can detect a coherent restoration of an older key, epoch,
-locator, journals, heads, and migration evidence as one whole snapshot.
+monotonic anchor can detect a coherent restoration of every artifact needed to
+form an older mutually consistent namespace (its locator, tombstone, journals,
+heads, and transaction evidence), or restoration of an older key/epoch and all
+state authenticated by it as one whole snapshot.
 
 ## Semantic coordination
 

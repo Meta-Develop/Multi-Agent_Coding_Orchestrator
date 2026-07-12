@@ -15,12 +15,19 @@ use crate::{
         random_identifier, sha256_hex, AuthenticationDomain, AuthenticationTag, BoundStateLock,
         RepositoryAuthenticator,
     },
-    safe_state::{AtomicStateWriter, BoundedRegularReader, SafeRoot},
+    safe_state::{
+        remove_direct_child_tree, AtomicStateWriter, BoundedRegularReader, FileIdentity, SafeRoot,
+        TreeLinkPolicy,
+    },
     state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec},
 };
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{fs, fs::File, marker::PhantomData};
+use serde_json::Value;
+use std::{collections::BTreeMap, fs, fs::File, marker::PhantomData};
+
+const MAX_SNAPSHOT_ROOT_ENTRIES: usize = 512;
+const MAX_PHYSICAL_SNAPSHOT_INSTANCES: usize = 130;
 
 pub(crate) trait SnapshotSpec: JournalSpec {
     const SNAPSHOT_FORMAT_VERSION: u32;
@@ -70,6 +77,37 @@ struct SnapshotInitIntent {
     logical_id: String,
     attempt: u32,
     physical_id: String,
+    mac: AuthenticationTag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SnapshotRolloverPhase {
+    Prepared,
+    Ready,
+}
+
+/// Durable publication intent for a physical-journal rollover. `Prepared` is
+/// published before the candidate directory can exist, closing the otherwise
+/// ambiguous create-before-intent crash gap. Once the candidate's single
+/// snapshot record is durable, `Ready` binds its complete identity and tail.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotRolloverIntent {
+    version: u32,
+    logical_id: String,
+    phase: SnapshotRolloverPhase,
+    previous_identity: JournalIdentity,
+    previous_start_generation: u64,
+    previous_generation: u64,
+    previous_token: u64,
+    previous_terminal_mac: AuthenticationTag,
+    candidate_run_id: String,
+    expected_snapshot: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_identity: Option<JournalIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_terminal_mac: Option<AuthenticationTag>,
     mac: AuthenticationTag,
 }
 
@@ -131,6 +169,11 @@ where
         if &locator.active_identity != identity || locator.generation != generation {
             bail!("active authenticated snapshot locator does not match its retirement tombstone");
         }
+        if root.direct_child_exists(snapshot_rollover_name(logical_id))? {
+            let _ = read_rollover_intent::<S>(authenticator, &root, logical_id)?;
+            bail!("authenticated snapshot rollover must be recovered before offline inspection");
+        }
+        verify_physical_inventory::<S>(&root, &locator)?;
         root.verify()?;
         authenticator.verify_epoch()
     }
@@ -217,6 +260,7 @@ where
             bail!("injected authenticated snapshot initialization fault after locator publication");
         }
         remove_init_intent::<S>(journal.authenticator(), &store_root, &store_lock, &intent)?;
+        verify_physical_inventory::<S>(&store_root, &locator)?;
         Ok(Self {
             journal,
             store_root,
@@ -245,17 +289,22 @@ where
             BoundStateLock::try_acquire_exclusive(&store_root, &snapshot_lock_name(logical_id))
                 .context("authenticated snapshot store is active elsewhere")?;
         let mut locator = read_locator::<S>(&authenticator, &store_root, logical_id)?;
+        let authenticator =
+            recover_rollover::<S, T>(authenticator, &store_root, &store_lock, &mut locator)?;
+        verify_physical_inventory::<S>(&store_root, &locator)?;
         recover_init_after_locator::<S>(&authenticator, &store_root, &store_lock, &locator)?;
         let authenticator = verify_retained_instances::<S, T>(authenticator, &locator)?;
         let journal =
             AuthenticatedStateJournal::<S>::open(authenticator, &locator.active_identity)?;
-        Self::from_journal(
+        let store = Self::from_journal(
             journal,
             store_root,
             store_lock,
             logical_id.to_string(),
             &mut locator,
-        )
+        )?;
+        verify_physical_inventory::<S>(&store.store_root, &store.locator)?;
+        Ok(store)
     }
 
     fn from_journal(
@@ -394,8 +443,9 @@ where
     }
 
     /// Starts a compacted physical journal while preserving a signed anchor to
-    /// the old terminal MAC. Publication order is new generation first,
-    /// atomic locator switch second, and old-instance retention last.
+    /// the old terminal MAC. A signed prepared intent is durable before the
+    /// candidate directory can exist; the candidate is authenticated before a
+    /// ready intent and the atomic locator switch are published.
     pub(crate) fn rollover(
         self,
         authenticator: RepositoryAuthenticator,
@@ -405,6 +455,9 @@ where
         if token <= self.current.token {
             bail!("authenticated snapshot rollover token must increase monotonically");
         }
+        if self.locator.retained_instances.len() >= 128 {
+            bail!("authenticated snapshot retained-instance bound is exhausted");
+        }
         authenticator.verify_repository_binding(&self.locator.active_identity.repository)?;
         let generation = self
             .current
@@ -412,16 +465,44 @@ where
             .checked_add(1)
             .context("authenticated snapshot rollover generation overflowed")?;
         let physical_id = random_identifier()?;
-        let mut journal = AuthenticatedStateJournal::<S>::create(authenticator, &physical_id)?;
-        if journal.root().identity() != self.store_root.identity() {
-            bail!("authenticated snapshot rollover changed its journal root identity");
-        }
         let current = AuthenticatedSnapshot {
             version: S::SNAPSHOT_FORMAT_VERSION,
             generation,
             token,
             value,
         };
+        let mut intent = SnapshotRolloverIntent {
+            version: S::SNAPSHOT_FORMAT_VERSION,
+            logical_id: self.logical_id.clone(),
+            phase: SnapshotRolloverPhase::Prepared,
+            previous_identity: self.locator.active_identity.clone(),
+            previous_start_generation: self.locator.active_start_generation,
+            previous_generation: self.current.generation,
+            previous_token: self.current.token,
+            previous_terminal_mac: self.locator.terminal_mac.clone(),
+            candidate_run_id: physical_id.clone(),
+            expected_snapshot: serde_json::to_value(&current)
+                .context("failed to encode prepared rollover snapshot")?,
+            next_identity: None,
+            next_terminal_mac: None,
+            mac: AuthenticationTag::zero(),
+        };
+        write_rollover_intent::<S>(
+            self.journal.authenticator(),
+            &self.store_root,
+            &self.store_lock,
+            &mut intent,
+        )?;
+        if take_snapshot_fault(SnapshotFaultPoint::AfterRolloverIntent) {
+            bail!("injected authenticated snapshot rollover fault after prepared intent");
+        }
+        let mut journal = AuthenticatedStateJournal::<S>::create(authenticator, &physical_id)?;
+        if journal.root().identity() != self.store_root.identity() {
+            bail!("authenticated snapshot rollover changed its journal root identity");
+        }
+        if take_snapshot_fault(SnapshotFaultPoint::AfterRolloverDirectory) {
+            bail!("injected authenticated snapshot rollover fault after candidate reservation");
+        }
         journal
             .append(S::SNAPSHOT_PHASE, None, &current)
             .context("failed to publish compacted authenticated snapshot")?;
@@ -430,6 +511,15 @@ where
             .last()
             .map(|record| record.mac.clone())
             .context("authenticated snapshot rollover lost its terminal MAC")?;
+        intent.phase = SnapshotRolloverPhase::Ready;
+        intent.next_identity = Some(journal.identity().clone());
+        intent.next_terminal_mac = Some(terminal_mac.clone());
+        write_rollover_intent::<S>(
+            journal.authenticator(),
+            &self.store_root,
+            &self.store_lock,
+            &mut intent,
+        )?;
         if take_snapshot_fault(SnapshotFaultPoint::BeforeRollover) {
             bail!("injected authenticated snapshot rollover fault before atomic locator switch");
         }
@@ -463,6 +553,13 @@ where
             &self.store_lock,
             &mut locator,
         )?;
+        remove_rollover_intent::<S>(
+            journal.authenticator(),
+            &self.store_root,
+            &self.store_lock,
+            &intent,
+        )?;
+        verify_physical_inventory::<S>(&self.store_root, &locator)?;
         Ok(Self {
             journal,
             store_root: self.store_root,
@@ -496,6 +593,7 @@ fn begin_snapshot_initialization<S: SnapshotSpec>(
         let store_lock = BoundStateLock::try_acquire_exclusive(&root, &store_lock_name)
             .context("authenticated snapshot initialization is active elsewhere")?;
         let mut intent = read_init_intent::<S>(authenticator, &root, logical_id)?;
+        remove_abandoned_initialization_candidate::<S>(&root, &root_lock, &store_lock, &intent)?;
         intent.attempt = intent
             .attempt
             .checked_add(1)
@@ -530,6 +628,35 @@ fn begin_snapshot_initialization<S: SnapshotSpec>(
     store_lock.verify(&root)?;
     drop(root_lock);
     Ok((root, store_lock, intent))
+}
+
+fn remove_abandoned_initialization_candidate<S: SnapshotSpec>(
+    root: &SafeRoot,
+    root_lock: &BoundStateLock,
+    store_lock: &BoundStateLock,
+    intent: &SnapshotInitIntent,
+) -> Result<()> {
+    if !root.direct_child_exists(&intent.physical_id)? {
+        return Ok(());
+    }
+    root_lock.verify(root)?;
+    store_lock.verify(root)?;
+    let candidate = root
+        .bind_existing_direct_child_directory(&intent.physical_id)
+        .context("signed initialization candidate is missing or unsafe")?;
+    let candidate_root = SafeRoot::open_existing(candidate.path())?;
+    let instance_lock =
+        BoundStateLock::try_acquire_exclusive(&candidate_root, S::INSTANCE_LOCK_NAME)
+            .context("signed initialization candidate is still active")?;
+    instance_lock.verify(&candidate_root)?;
+    remove_direct_child_tree(
+        root,
+        &intent.physical_id,
+        Some(candidate.identity()),
+        TreeLinkPolicy::RejectLinksAndSpecialFiles,
+    )?;
+    root_lock.verify(root)?;
+    store_lock.verify(root)
 }
 
 fn validate_logical_id<S: SnapshotSpec>(logical_id: &str) -> Result<()> {
@@ -661,6 +788,367 @@ fn snapshot_locator_name(logical_id: &str) -> String {
 
 fn snapshot_lock_name(logical_id: &str) -> String {
     format!(".snapshot-store-{}.lock", sha256_hex(logical_id.as_bytes()))
+}
+
+fn snapshot_rollover_name(logical_id: &str) -> String {
+    format!(
+        ".snapshot-rollover-{}.json",
+        sha256_hex(logical_id.as_bytes())
+    )
+}
+
+fn rollover_intent_mac_payload(intent: &SnapshotRolloverIntent) -> Result<Vec<u8>> {
+    serde_json::to_vec(&(
+        "snapshot_rollover",
+        intent.version,
+        &intent.logical_id,
+        intent.phase,
+        &intent.previous_identity,
+        intent.previous_start_generation,
+        intent.previous_generation,
+        intent.previous_token,
+        &intent.previous_terminal_mac,
+        &intent.candidate_run_id,
+        &intent.expected_snapshot,
+        &intent.next_identity,
+        &intent.next_terminal_mac,
+    ))
+    .context("failed to encode authenticated snapshot rollover intent")
+}
+
+fn validate_rollover_intent<S: SnapshotSpec>(
+    intent: &SnapshotRolloverIntent,
+    logical_id: &str,
+) -> Result<()> {
+    validate_logical_id::<S>(logical_id)?;
+    intent.mac.validate()?;
+    intent.previous_terminal_mac.validate()?;
+    if intent.version != S::SNAPSHOT_FORMAT_VERSION
+        || intent.logical_id != logical_id
+        || intent.previous_generation < intent.previous_start_generation
+        || intent.previous_generation == 0
+        || intent.previous_token == 0
+        || intent.candidate_run_id.len() != 64
+        || !intent
+            .candidate_run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("authenticated snapshot rollover intent is malformed");
+    }
+    match intent.phase {
+        SnapshotRolloverPhase::Prepared
+            if intent.next_identity.is_none() && intent.next_terminal_mac.is_none() => {}
+        SnapshotRolloverPhase::Ready => {
+            let identity = intent
+                .next_identity
+                .as_ref()
+                .context("ready rollover intent has no next identity")?;
+            let terminal = intent
+                .next_terminal_mac
+                .as_ref()
+                .context("ready rollover intent has no next terminal MAC")?;
+            terminal.validate()?;
+            if identity.run_id != intent.candidate_run_id
+                || identity.repository != intent.previous_identity.repository
+            {
+                bail!("ready rollover intent has a mismatched candidate identity");
+            }
+        }
+        _ => bail!("authenticated snapshot rollover phase is inconsistent"),
+    }
+    Ok(())
+}
+
+fn rollover_intent_limit<S: SnapshotSpec>() -> u64 {
+    S::MAX_RECORD_BYTES.saturating_mul(2)
+}
+
+fn read_rollover_intent<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    root: &SafeRoot,
+    logical_id: &str,
+) -> Result<SnapshotRolloverIntent> {
+    let bytes = BoundedRegularReader::read_direct(
+        root,
+        snapshot_rollover_name(logical_id),
+        rollover_intent_limit::<S>(),
+    )?;
+    let intent: SnapshotRolloverIntent = serde_json::from_slice(&bytes)
+        .context("authenticated snapshot rollover intent is malformed")?;
+    validate_rollover_intent::<S>(&intent, logical_id)?;
+    authenticator.verify_repository_binding(&intent.previous_identity.repository)?;
+    authenticator.verify_tag(
+        S::LOCATOR_DOMAIN,
+        &rollover_intent_mac_payload(&intent)?,
+        &intent.mac,
+    )?;
+    Ok(intent)
+}
+
+fn write_rollover_intent<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    root: &SafeRoot,
+    lock: &BoundStateLock,
+    intent: &mut SnapshotRolloverIntent,
+) -> Result<()> {
+    validate_rollover_intent::<S>(intent, &intent.logical_id)?;
+    authenticator.verify_repository_binding(&intent.previous_identity.repository)?;
+    intent.mac = authenticator.sign(S::LOCATOR_DOMAIN, &rollover_intent_mac_payload(intent)?)?;
+    let mut bytes = serde_json::to_vec(intent)?;
+    bytes.push(b'\n');
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > rollover_intent_limit::<S>() {
+        bail!("authenticated snapshot rollover intent exceeds its byte bound");
+    }
+    let name = snapshot_rollover_name(&intent.logical_id);
+    AtomicStateWriter::scavenge_direct_temps(root, &name)?;
+    AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || lock.verify(root))
+}
+
+fn remove_rollover_intent<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    root: &SafeRoot,
+    lock: &BoundStateLock,
+    expected: &SnapshotRolloverIntent,
+) -> Result<()> {
+    let observed = read_rollover_intent::<S>(authenticator, root, &expected.logical_id)?;
+    if &observed != expected {
+        bail!("authenticated snapshot rollover intent changed before cleanup");
+    }
+    lock.verify(root)?;
+    fs::remove_file(root.direct_child(snapshot_rollover_name(&expected.logical_id))?)?;
+    File::open(root.path())?.sync_all()?;
+    lock.verify(root)
+}
+
+fn locator_matches_rollover_previous(
+    locator: &SnapshotLocator,
+    intent: &SnapshotRolloverIntent,
+) -> bool {
+    locator.active_identity == intent.previous_identity
+        && locator.active_start_generation == intent.previous_start_generation
+        && locator.generation == intent.previous_generation
+        && locator.token == intent.previous_token
+        && locator.terminal_mac == intent.previous_terminal_mac
+}
+
+fn locator_matches_rollover_next(
+    locator: &SnapshotLocator,
+    intent: &SnapshotRolloverIntent,
+) -> bool {
+    intent.phase == SnapshotRolloverPhase::Ready
+        && intent
+            .next_identity
+            .as_ref()
+            .is_some_and(|identity| &locator.active_identity == identity)
+        && locator.active_start_generation == intent.previous_generation.saturating_add(1)
+        && locator.generation == intent.previous_generation.saturating_add(1)
+        && intent.next_terminal_mac.as_ref() == Some(&locator.terminal_mac)
+}
+
+fn validate_rollover_candidate<S, T>(
+    journal: &AuthenticatedStateJournal<S>,
+    intent: &SnapshotRolloverIntent,
+) -> Result<AuthenticatedSnapshot<T>>
+where
+    S: SnapshotSpec,
+    T: DeserializeOwned,
+{
+    if journal.instance_id() != intent.candidate_run_id || journal.records().len() != 1 {
+        bail!("authenticated snapshot rollover candidate has an unexpected physical journal");
+    }
+    let record = &journal.records()[0];
+    if record.phase != S::SNAPSHOT_PHASE
+        || record.subject.is_some()
+        || record.payload != intent.expected_snapshot
+    {
+        bail!("authenticated snapshot rollover candidate does not match its signed intent");
+    }
+    let snapshot: AuthenticatedSnapshot<T> = serde_json::from_value(record.payload.clone())
+        .context("authenticated snapshot rollover payload is malformed")?;
+    if snapshot.version != S::SNAPSHOT_FORMAT_VERSION
+        || snapshot.generation != intent.previous_generation.saturating_add(1)
+        || snapshot.token <= intent.previous_token
+    {
+        bail!("authenticated snapshot rollover generation or token is inconsistent");
+    }
+    Ok(snapshot)
+}
+
+fn recover_rollover<S, T>(
+    authenticator: RepositoryAuthenticator,
+    root: &SafeRoot,
+    lock: &BoundStateLock,
+    locator: &mut SnapshotLocator,
+) -> Result<RepositoryAuthenticator>
+where
+    S: SnapshotSpec,
+    T: Serialize + DeserializeOwned,
+{
+    let name = snapshot_rollover_name(&locator.logical_id);
+    if !root.direct_child_exists(&name)? {
+        return Ok(authenticator);
+    }
+    let mut intent = read_rollover_intent::<S>(&authenticator, root, &locator.logical_id)?;
+    let locator_is_previous = locator_matches_rollover_previous(locator, &intent);
+    let locator_is_next = locator_matches_rollover_next(locator, &intent);
+    if !locator_is_previous && !locator_is_next {
+        bail!("signed rollover intent does not continue the active snapshot locator");
+    }
+
+    let candidate_exists = root.direct_child_exists(&intent.candidate_run_id)?;
+    if !candidate_exists {
+        if locator_is_previous && intent.phase == SnapshotRolloverPhase::Prepared {
+            remove_rollover_intent::<S>(&authenticator, root, lock, &intent)?;
+            return Ok(authenticator);
+        }
+        bail!("signed rollover intent refers to a missing physical journal");
+    }
+
+    let candidate = root.bind_existing_direct_child_directory(&intent.candidate_run_id)?;
+    let candidate_root = SafeRoot::open_existing(candidate.path())?;
+    const FIRST_RECORD: &str = "00000000000000000001.json";
+    if !candidate_root.direct_child_exists(FIRST_RECORD)? {
+        if locator_is_previous && intent.phase == SnapshotRolloverPhase::Prepared {
+            let instance_lock =
+                BoundStateLock::try_acquire_exclusive(&candidate_root, S::INSTANCE_LOCK_NAME)
+                    .context("prepared rollover candidate is still active")?;
+            instance_lock.verify(&candidate_root)?;
+            remove_direct_child_tree(
+                root,
+                &intent.candidate_run_id,
+                Some(candidate.identity()),
+                TreeLinkPolicy::RejectLinksAndSpecialFiles,
+            )?;
+            remove_rollover_intent::<S>(&authenticator, root, lock, &intent)?;
+            return Ok(authenticator);
+        }
+        bail!("ready rollover candidate has no durable snapshot record");
+    }
+
+    let journal =
+        AuthenticatedStateJournal::<S>::open_instance(authenticator, &intent.candidate_run_id)?;
+    let snapshot = validate_rollover_candidate::<S, T>(&journal, &intent)?;
+    let terminal_mac = journal
+        .records()
+        .last()
+        .map(|record| record.mac.clone())
+        .context("rollover candidate lost its terminal MAC")?;
+    if intent.phase == SnapshotRolloverPhase::Prepared {
+        intent.phase = SnapshotRolloverPhase::Ready;
+        intent.next_identity = Some(journal.identity().clone());
+        intent.next_terminal_mac = Some(terminal_mac.clone());
+        write_rollover_intent::<S>(journal.authenticator(), root, lock, &mut intent)?;
+    } else if intent.next_identity.as_ref() != Some(journal.identity())
+        || intent.next_terminal_mac.as_ref() != Some(&terminal_mac)
+    {
+        bail!("ready rollover intent does not match its physical journal");
+    }
+
+    if locator_is_previous {
+        let mut retained_instances = locator.retained_instances.clone();
+        retained_instances.push(RetainedSnapshotAnchor {
+            identity: locator.active_identity.clone(),
+            start_generation: locator.active_start_generation,
+            end_generation: locator.generation,
+            terminal_token: locator.token,
+            terminal_mac: locator.terminal_mac.clone(),
+        });
+        if retained_instances.len() > 128 {
+            bail!("authenticated snapshot retained-instance bound is exhausted");
+        }
+        *locator = SnapshotLocator {
+            version: S::SNAPSHOT_FORMAT_VERSION,
+            logical_id: locator.logical_id.clone(),
+            active_identity: journal.identity().clone(),
+            active_start_generation: snapshot.generation,
+            generation: snapshot.generation,
+            token: snapshot.token,
+            prior_token: intent.previous_token,
+            prior_terminal_mac: intent.previous_terminal_mac.clone(),
+            terminal_mac,
+            retained_instances,
+            mac: AuthenticationTag::zero(),
+        };
+        write_locator::<S>(journal.authenticator(), root, lock, locator)?;
+    }
+    remove_rollover_intent::<S>(journal.authenticator(), root, lock, &intent)?;
+    journal.into_authenticator()
+}
+
+fn verify_physical_inventory<S: SnapshotSpec>(
+    root: &SafeRoot,
+    locator: &SnapshotLocator,
+) -> Result<()> {
+    let mut expected = BTreeMap::<String, FileIdentity>::new();
+    for identity in locator
+        .retained_instances
+        .iter()
+        .map(|anchor| &anchor.identity)
+        .chain(std::iter::once(&locator.active_identity))
+    {
+        if expected
+            .insert(
+                identity.run_id.clone(),
+                identity.run_directory_identity.clone(),
+            )
+            .is_some()
+        {
+            bail!("authenticated snapshot locator repeats a physical journal");
+        }
+    }
+    if expected.len() > MAX_PHYSICAL_SNAPSHOT_INSTANCES {
+        bail!("authenticated snapshot physical journal inventory exceeds its bound");
+    }
+
+    root.verify()?;
+    let mut entries = 0_usize;
+    let mut observed = BTreeMap::<String, FileIdentity>::new();
+    for entry in fs::read_dir(root.path()).context("failed to enumerate snapshot journal root")? {
+        entries = entries
+            .checked_add(1)
+            .context("snapshot root entry count overflowed")?;
+        if entries > MAX_SNAPSHOT_ROOT_ENTRIES {
+            bail!("authenticated snapshot root exceeds its bounded entry count");
+        }
+        let entry = entry.context("failed to inspect snapshot root entry")?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let entry_name = entry.file_name();
+        let canonical_physical_name = entry_name.to_str().is_some_and(|name| {
+            name.len() == 64
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        });
+        if !metadata.file_type().is_dir() {
+            if canonical_physical_name {
+                bail!("authenticated snapshot physical journal entry is not a directory");
+            }
+            continue;
+        }
+        let run_id = entry_name
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("snapshot physical journal name is not UTF-8"))?;
+        if run_id.len() != 64
+            || !run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            bail!("unexpected directory in authenticated snapshot journal root");
+        }
+        let bound = root.bind_existing_direct_child_directory(&run_id)?;
+        if observed.insert(run_id, bound.identity().clone()).is_some() {
+            bail!("authenticated snapshot root contains a duplicate physical journal");
+        }
+        if observed.len() > MAX_PHYSICAL_SNAPSHOT_INSTANCES {
+            bail!("authenticated snapshot physical journal inventory exceeds its bound");
+        }
+    }
+    root.verify()?;
+    if observed != expected {
+        bail!("authenticated snapshot physical journal inventory is not fully anchored");
+    }
+    Ok(())
 }
 
 fn locator_mac_payload(locator: &SnapshotLocator) -> Result<Vec<u8>> {
@@ -843,6 +1331,8 @@ fn write_locator<S: SnapshotSpec>(
 enum SnapshotFaultPoint {
     BeforeInitial,
     AfterInitial,
+    AfterRolloverIntent,
+    AfterRolloverDirectory,
     BeforeRollover,
 }
 
@@ -1006,7 +1496,37 @@ mod tests {
     }
 
     #[test]
-    fn rollover_fault_before_locator_switch_leaves_old_store_authoritative() {
+    fn rollover_faults_recover_only_candidates_bound_by_a_prepared_intent() {
+        for fault in [
+            SnapshotFaultPoint::AfterRolloverIntent,
+            SnapshotFaultPoint::AfterRolloverDirectory,
+        ] {
+            let (_temp, path) = repository();
+            let store = AuthenticatedSnapshotStore::<TestSnapshotSpec, String>::create(
+                authenticator(&path),
+                "rollover-prepared-crash",
+                1,
+                "old".to_string(),
+            )
+            .expect("create");
+            set_snapshot_fault(fault);
+            store
+                .rollover(authenticator(&path), 2, "new".to_string())
+                .err()
+                .expect("injected prepared rollover crash");
+
+            let reopened = AuthenticatedSnapshotStore::<TestSnapshotSpec, String>::open_instance(
+                authenticator(&path),
+                "rollover-prepared-crash",
+            )
+            .expect("prepared candidate recovers to old authority");
+            assert_eq!(reopened.current().generation, 1);
+            assert_eq!(reopened.current().value, "old");
+        }
+    }
+
+    #[test]
+    fn ready_rollover_fault_before_locator_switch_recovers_forward() {
         let (_temp, path) = repository();
         let store = AuthenticatedSnapshotStore::<TestSnapshotSpec, String>::create(
             authenticator(&path),
@@ -1025,9 +1545,43 @@ mod tests {
             authenticator(&path),
             "rollover-crash",
         )
-        .expect("old locator remains authoritative");
-        assert_eq!(reopened.current().generation, 1);
-        assert_eq!(reopened.current().value, "old");
+        .expect("ready rollover recovers forward");
+        assert_eq!(reopened.current().generation, 2);
+        assert_eq!(reopened.current().value, "new");
+    }
+
+    #[test]
+    fn replayed_old_locator_cannot_hide_a_retained_newer_physical_journal() {
+        let (_temp, path) = repository();
+        let store = AuthenticatedSnapshotStore::<TestSnapshotSpec, String>::create(
+            authenticator(&path),
+            "rollover-replay",
+            1,
+            "old".to_string(),
+        )
+        .expect("create");
+        let locator_path = store
+            .store_root
+            .path()
+            .join(snapshot_locator_name("rollover-replay"));
+        let old_locator = fs::read(&locator_path).expect("old signed locator");
+        let store = store
+            .rollover(authenticator(&path), 2, "new".to_string())
+            .expect("rollover");
+        drop(store);
+        fs::write(&locator_path, old_locator).expect("replay old signed locator");
+
+        let error = AuthenticatedSnapshotStore::<TestSnapshotSpec, String>::open_instance(
+            authenticator(&path),
+            "rollover-replay",
+        )
+        .err()
+        .expect("unanchored newer physical journal must be detected");
+        let message = error.to_string();
+        assert!(
+            message.contains("physical journal inventory")
+                || message.contains("unexpected directory")
+        );
     }
 
     #[test]
@@ -1192,7 +1746,7 @@ mod tests {
         )
         .err()
         .expect("retained deletion must fail");
-        assert!(error.to_string().contains("retained journal"));
+        assert!(error.to_string().contains("physical journal inventory"));
     }
 
     #[cfg(unix)]
@@ -1225,6 +1779,10 @@ mod tests {
         )
         .err()
         .expect("retained substitution must fail");
-        assert!(error.to_string().contains("retained journal"));
+        let message = error.to_string();
+        assert!(
+            message.contains("physical journal inventory")
+                || message.contains("unexpected directory")
+        );
     }
 }

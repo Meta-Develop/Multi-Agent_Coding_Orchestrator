@@ -765,6 +765,34 @@ mod tests {
         assert!(!state_root.join(ClaimsSnapshotSpec::ROOT_NAME).exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unauthenticated_version_three_tombstone_cannot_bootstrap_authentication_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let state_root = repo_path.join(".git/maco/state");
+        fs::create_dir_all(&state_root).expect("state root");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).expect("state mode");
+        fs::write(state_root.join("claims.json"), b"{\"version\":3}\n")
+            .expect("forged version-three marker");
+        fs::set_permissions(
+            state_root.join("claims.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("marker mode");
+
+        let error = SyncStore::open(&repo_path).expect_err("unsigned marker must fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("key") || chain.contains("authentication"),
+            "unexpected error: {chain}"
+        );
+        assert!(!state_root.join(authentication_key_file_name()).exists());
+        assert!(!state_root.join("repository_auth_epoch_v1").exists());
+        assert!(!state_root.join(ClaimsSnapshotSpec::ROOT_NAME).exists());
+    }
+
     #[test]
     fn active_retirement_rejects_generation_and_identity_rollback() {
         let temp = TempDir::new().expect("tempdir");

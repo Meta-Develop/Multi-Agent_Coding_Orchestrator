@@ -22,7 +22,7 @@ use crate::{
         KernelStateLock, SafeRoot,
     },
     semantic_coord::{SemanticIntent, SemanticSnapshotSpec},
-    state_journal::{JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
+    state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
     sync::PathClaim,
     sync_store::ClaimsSnapshotSpec,
     worktree::ManagedSnapshotSpec,
@@ -270,21 +270,33 @@ pub(crate) fn prepare_legacy_retirement<S: SnapshotSpec>(
             .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
             == Some(3)
         {
-            let writer = repository_auth_writer(repo_path)?;
+            // A version marker is attacker-controlled until its MAC has been
+            // checked with an already-established repository key. Never let
+            // this recovery branch bootstrap a key, epoch, or consumer root.
+            let existing_authenticator = repository_authenticator_key_only(repo_path)?;
             let tombstone = verify_retirement_tombstone(
-                writer.authenticator(),
+                &existing_authenticator,
                 consumer,
                 file_name,
                 domain,
                 &bytes,
             )?;
+            existing_authenticator.verify_epoch()?;
             if tombstone.phase != LegacyRetirementPhase::Pending
                 || tombstone.snapshot_identity.is_some()
                 || tombstone.snapshot_generation.is_some()
             {
                 bail!("legacy retirement is already active but no authenticated snapshot locator was found");
             }
-            let consumer_root = open_consumer_retirement_root::<S>(writer.authenticator())?;
+            let writer = repository_auth_writer(repo_path)?;
+            if writer.authenticator().binding() != existing_authenticator.binding() {
+                bail!(
+                    "legacy retirement authentication binding changed after tombstone verification"
+                );
+            }
+            let consumer_root =
+                AuthenticatedStateJournal::<S>::existing_root(writer.authenticator())
+                    .context("pending legacy retirement consumer root is missing")?;
             let root_lock = BoundStateLock::acquire(&consumer_root, S::ROOT_LOCK_NAME)?;
             let intent = read_and_verify_retirement_intent(
                 writer.authenticator(),
@@ -827,6 +839,12 @@ struct MigrationReceipt {
     entries: Vec<LegacyStateEntry>,
 }
 
+#[derive(Debug, Clone)]
+struct LoadedMigrationTransaction {
+    value: MigrationTransaction,
+    root_identity: FileIdentity,
+}
+
 #[derive(Debug)]
 struct LegacyPreflight {
     common_dir: PathBuf,
@@ -836,6 +854,7 @@ struct LegacyPreflight {
     original_file_modes: BTreeMap<String, u32>,
     entries: Vec<LegacyStateEntry>,
     retired_tombstones: BTreeMap<String, (FileIdentity, String)>,
+    root_entries: BTreeMap<String, FileIdentity>,
     existing_lock_names: Vec<String>,
     expected_bindings: ExpectedLegacyBindings,
 }
@@ -872,11 +891,13 @@ pub(crate) fn migrate_repository_state(
     let mut locks = acquire_existing_locks(&preflight)?;
     let transaction = load_transaction_if_present(&preflight)?;
     if let Some(transaction) = &transaction {
-        validate_transaction(transaction, &preflight)?;
+        validate_transaction(&transaction.value, &preflight)?;
     }
+    run_migration_after_preflight_hook();
 
     if manifest_exists(&preflight.state_root)? {
-        let report = verify_existing_manifest(repo_path, apply, &preflight, transaction.as_ref())?;
+        let report =
+            verify_existing_manifest(repo_path, apply, &preflight, &locks, transaction.as_ref())?;
         return Ok(report);
     }
 
@@ -886,7 +907,7 @@ pub(crate) fn migrate_repository_state(
             mode: StateMigrationMode::DryRun,
             status: StateMigrationStatus::Ready,
             legacy_state_root: ".git/maco/state".to_string(),
-            transaction_phase: transaction.as_ref().map(|value| value.phase),
+            transaction_phase: transaction.as_ref().map(|loaded| loaded.value.phase),
             entries: preflight.entries.clone(),
             hardened: state_is_hardened(&preflight)?,
             manifest_generation: None,
@@ -895,6 +916,12 @@ pub(crate) fn migrate_repository_state(
 
     let transaction_root = SafeRoot::open_or_create(common_dir.join(TRANSACTION_ROOT_NAME))
         .context("failed to open owner-private state migration transaction root")?;
+    if transaction
+        .as_ref()
+        .is_some_and(|loaded| loaded.root_identity != *transaction_root.identity())
+    {
+        bail!("migration transaction root identity changed after preflight");
+    }
     let transaction_lock = KernelStateLock::acquire_direct(&transaction_root, TRANSACTION_LOCK)?;
     transaction_lock.verify_direct_binding(&transaction_root)?;
 
@@ -905,7 +932,7 @@ pub(crate) fn migrate_repository_state(
         repo_path,
         &preflight,
         &transaction_root,
-        transaction,
+        transaction.map(|loaded| loaded.value),
         locks,
         transaction_lock,
     )
@@ -918,6 +945,28 @@ fn migration_mode(apply: bool) -> StateMigrationMode {
         StateMigrationMode::DryRun
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_AFTER_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_migration_after_preflight_hook(hook: impl FnOnce() + 'static) {
+    MIGRATION_AFTER_PREFLIGHT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_migration_after_preflight_hook() {
+    let hook = MIGRATION_AFTER_PREFLIGHT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_migration_after_preflight_hook() {}
 
 fn preflight_legacy_state(
     repo_path: &Path,
@@ -934,6 +983,7 @@ fn preflight_legacy_state(
     let mut original_file_modes = BTreeMap::new();
     let mut existing_lock_names = Vec::new();
     let mut observed_files = BTreeSet::new();
+    let mut root_entries = BTreeMap::new();
     let mut count = 0_usize;
     for entry in fs::read_dir(state_root.path()).context("failed to enumerate legacy state root")? {
         let entry = entry.context("failed to inspect legacy state entry")?;
@@ -949,6 +999,10 @@ fn preflight_legacy_state(
             .map_err(|_| anyhow::anyhow!("legacy state entry name is not UTF-8"))?;
         let path = state_root.direct_child(&name)?;
         let metadata = fs::symlink_metadata(&path)?;
+        let identity = identity_for_path(&path)?;
+        if root_entries.insert(name.clone(), identity).is_some() {
+            bail!("legacy state root contains a duplicate entry name");
+        }
         if metadata.file_type().is_dir() {
             if !is_known_authenticated_directory(&name) {
                 bail!("unexpected directory in legacy state root: {name}");
@@ -1044,6 +1098,7 @@ fn preflight_legacy_state(
         original_file_modes,
         entries,
         retired_tombstones,
+        root_entries,
         existing_lock_names,
         expected_bindings,
     })
@@ -1062,6 +1117,30 @@ fn retired_manifest_entry(
     file_name: &str,
     bytes: &[u8],
 ) -> Result<LegacyStateEntry> {
+    let manifest_authenticator = repository_authenticator_key_only(repo_path)?;
+    let manifest_store = AuthenticatedSnapshotStore::<
+        StateMigrationManifestSpec,
+        StateMigrationManifest,
+    >::open_instance(manifest_authenticator, MANIFEST_INSTANCE_ID)?;
+    let entry = manifest_store
+        .current()
+        .value
+        .entries
+        .iter()
+        .find(|entry| entry.store == store_name && entry.file == file_name)
+        .cloned()
+        .context("signed migration manifest has no retired consumer entry")?;
+    verify_retired_tombstone_binding(repo_path, store_name, file_name, bytes, &entry)?;
+    Ok(entry)
+}
+
+fn verify_retired_tombstone_binding(
+    repo_path: &Path,
+    store_name: &str,
+    file_name: &str,
+    bytes: &[u8],
+    entry: &LegacyStateEntry,
+) -> Result<()> {
     let authenticator = repository_authenticator_key_only(repo_path)?;
     let tombstone = verify_retirement_tombstone(
         &authenticator,
@@ -1101,20 +1180,6 @@ fn retired_manifest_entry(
         )?,
         _ => bail!("unknown legacy retirement consumer"),
     }
-
-    let manifest_authenticator = repository_authenticator_key_only(repo_path)?;
-    let manifest_store = AuthenticatedSnapshotStore::<
-        StateMigrationManifestSpec,
-        StateMigrationManifest,
-    >::open_instance(manifest_authenticator, MANIFEST_INSTANCE_ID)?;
-    let entry = manifest_store
-        .current()
-        .value
-        .entries
-        .iter()
-        .find(|entry| entry.store == store_name && entry.file == file_name)
-        .cloned()
-        .context("signed migration manifest has no retired consumer entry")?;
     if entry.present {
         if !tombstone.descriptor.original_present
             || tombstone.descriptor.original_identity != entry.file_identity
@@ -1132,7 +1197,7 @@ fn retired_manifest_entry(
     {
         bail!("active retirement tombstone does not match the signed missing migration entry");
     }
-    Ok(entry)
+    Ok(())
 }
 
 fn missing_manifest_entry(store: &str, file: &str) -> LegacyStateEntry {
@@ -2010,7 +2075,7 @@ fn manifest_exists(state_root: &SafeRoot) -> Result<bool> {
 
 fn load_transaction_if_present(
     preflight: &LegacyPreflight,
-) -> Result<Option<MigrationTransaction>> {
+) -> Result<Option<LoadedMigrationTransaction>> {
     let root_path = preflight.common_dir.join(TRANSACTION_ROOT_NAME);
     let metadata = match fs::symlink_metadata(&root_path) {
         Ok(metadata) => metadata,
@@ -2041,7 +2106,11 @@ fn load_transaction_if_present(
     if transaction.checksum != expected {
         bail!("migration transaction checksum mismatch");
     }
-    Ok(Some(transaction))
+    root.verify()?;
+    Ok(Some(LoadedMigrationTransaction {
+        value: transaction,
+        root_identity: root.identity().clone(),
+    }))
 }
 
 fn validate_transaction(
@@ -2246,8 +2315,29 @@ fn verify_existing_manifest(
     repo_path: &Path,
     apply: bool,
     preflight: &LegacyPreflight,
-    transaction: Option<&MigrationTransaction>,
+    locks: &[MigrationHeldLock],
+    transaction: Option<&LoadedMigrationTransaction>,
 ) -> Result<StateMigrationReport> {
+    let transaction =
+        transaction.context("signed migration manifest is missing its durable transaction")?;
+    verify_all_legacy_locks(preflight, locks)?;
+    let transaction_root =
+        SafeRoot::open_existing(preflight.common_dir.join(TRANSACTION_ROOT_NAME))?;
+    if transaction.root_identity != *transaction_root.identity() {
+        bail!("migration transaction root identity changed after preflight");
+    }
+    let transaction_lock =
+        KernelStateLock::acquire_existing_direct(&transaction_root, TRANSACTION_LOCK)?;
+    verify_existing_manifest_boundaries(
+        repo_path,
+        preflight,
+        locks,
+        &transaction_root,
+        &transaction_lock,
+        transaction,
+        None,
+    )?;
+
     let authenticator = repository_authenticator_key_only(repo_path)?;
     authenticator.verify_epoch()?;
     let store = AuthenticatedSnapshotStore::<StateMigrationManifestSpec, StateMigrationManifest>::open_instance(
@@ -2264,25 +2354,65 @@ fn verify_existing_manifest(
         bail!("signed state migration manifest does not match the current legacy state");
     }
 
-    let mut phase = transaction.map(|value| value.phase);
+    let mut durable_transaction = transaction.value.clone();
+    let mut phase = Some(durable_transaction.phase);
     if apply && phase != Some(MigrationPhase::Completed) {
-        let mut transaction = transaction
-            .cloned()
-            .context("signed migration manifest is missing its durable transaction")?;
-        let transaction_root =
-            SafeRoot::open_existing(preflight.common_dir.join(TRANSACTION_ROOT_NAME))?;
-        let lock = KernelStateLock::acquire_direct(&transaction_root, TRANSACTION_LOCK)?;
+        verify_existing_manifest_boundaries(
+            repo_path,
+            preflight,
+            locks,
+            &transaction_root,
+            &transaction_lock,
+            transaction,
+            Some(&snapshot.value),
+        )?;
         write_receipt(
             &transaction_root,
-            &lock,
+            &transaction_lock,
             &snapshot.value,
             snapshot.generation,
             snapshot.token,
         )?;
-        transaction.phase = MigrationPhase::Completed;
-        write_transaction(&transaction_root, &lock, &mut transaction)?;
+        durable_transaction.phase = MigrationPhase::Completed;
+        write_transaction(
+            &transaction_root,
+            &transaction_lock,
+            &mut durable_transaction,
+        )?;
         phase = Some(MigrationPhase::Completed);
     }
+
+    let expected_transaction = LoadedMigrationTransaction {
+        value: durable_transaction,
+        root_identity: transaction.root_identity.clone(),
+    };
+    verify_existing_manifest_boundaries(
+        repo_path,
+        preflight,
+        locks,
+        &transaction_root,
+        &transaction_lock,
+        &expected_transaction,
+        Some(&snapshot.value),
+    )?;
+    if phase == Some(MigrationPhase::Completed) {
+        verify_migration_receipt(
+            &transaction_root,
+            &snapshot.value,
+            snapshot.generation,
+            snapshot.token,
+        )?;
+    }
+    let hardened = state_is_hardened(preflight)?;
+    verify_existing_manifest_boundaries(
+        repo_path,
+        preflight,
+        locks,
+        &transaction_root,
+        &transaction_lock,
+        &expected_transaction,
+        Some(&snapshot.value),
+    )?;
 
     Ok(StateMigrationReport {
         version: MIGRATION_VERSION,
@@ -2291,9 +2421,128 @@ fn verify_existing_manifest(
         legacy_state_root: ".git/maco/state".to_string(),
         transaction_phase: phase,
         entries: preflight.entries.clone(),
-        hardened: state_is_hardened(preflight)?,
+        hardened,
         manifest_generation: Some(snapshot.generation),
     })
+}
+
+fn verify_all_legacy_locks(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Result<()> {
+    let held = locks
+        .iter()
+        .map(|lock| lock.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if !LEGACY_LOCKS.iter().all(|name| held.contains(name)) {
+        bail!("signed migration verification does not hold every legacy consumer lock");
+    }
+    for lock in locks {
+        lock.verify(&preflight.state_root)?;
+    }
+    Ok(())
+}
+
+fn verify_existing_manifest_boundaries(
+    repo_path: &Path,
+    preflight: &LegacyPreflight,
+    locks: &[MigrationHeldLock],
+    transaction_root: &SafeRoot,
+    transaction_lock: &KernelStateLock,
+    expected_transaction: &LoadedMigrationTransaction,
+    manifest: Option<&StateMigrationManifest>,
+) -> Result<()> {
+    let common_root = SafeRoot::open_existing(&preflight.common_dir)?;
+    if common_root.identity() != &preflight.common_dir_identity
+        || transaction_root.identity() != &expected_transaction.root_identity
+    {
+        bail!("migration repository or transaction root identity changed");
+    }
+    verify_all_legacy_locks(preflight, locks)?;
+    transaction_lock.verify_direct_binding(transaction_root)?;
+    revalidate_exact_state_root_inventory(preflight)?;
+    revalidate_preflight(preflight)?;
+    revalidate_retired_tombstones(repo_path, preflight, manifest)?;
+    let observed = load_transaction_if_present(preflight)?
+        .context("migration transaction disappeared while its lock was held")?;
+    if observed.root_identity != expected_transaction.root_identity
+        || observed.value != expected_transaction.value
+    {
+        bail!("migration transaction changed while its lock was held");
+    }
+    transaction_lock.verify_direct_binding(transaction_root)?;
+    common_root.verify()?;
+    preflight.state_root.verify()?;
+    transaction_root.verify()
+}
+
+fn revalidate_exact_state_root_inventory(preflight: &LegacyPreflight) -> Result<()> {
+    let mut observed = BTreeMap::new();
+    let mut count = 0_usize;
+    for entry in fs::read_dir(preflight.state_root.path())
+        .context("failed to re-enumerate migration state root")?
+    {
+        let entry = entry.context("failed to inspect migration state entry")?;
+        count = count
+            .checked_add(1)
+            .context("migration state entry count overflowed")?;
+        if count > MAX_STATE_ENTRIES {
+            bail!("migration state root exceeds its bounded entry count");
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("migration state entry name is not UTF-8"))?;
+        let path = preflight.state_root.direct_child(&name)?;
+        if observed.insert(name, identity_for_path(path)?).is_some() {
+            bail!("migration state root contains a duplicate entry name");
+        }
+    }
+    preflight.state_root.verify()?;
+    if observed != preflight.root_entries {
+        bail!("migration state root inventory changed after preflight");
+    }
+    Ok(())
+}
+
+fn revalidate_retired_tombstones(
+    repo_path: &Path,
+    preflight: &LegacyPreflight,
+    manifest: Option<&StateMigrationManifest>,
+) -> Result<()> {
+    for entry in &preflight.entries {
+        if !preflight.retired_tombstones.contains_key(&entry.file) {
+            continue;
+        }
+        if manifest.is_some_and(|manifest| !manifest.entries.contains(entry)) {
+            bail!("signed migration manifest lost a retired legacy entry");
+        }
+        let bytes = BoundedRegularReader::read_direct(
+            &preflight.state_root,
+            &entry.file,
+            MAX_LEGACY_STATE_BYTES,
+        )?;
+        verify_retired_tombstone_binding(repo_path, &entry.store, &entry.file, &bytes, entry)?;
+    }
+    Ok(())
+}
+
+fn verify_migration_receipt(
+    root: &SafeRoot,
+    manifest: &StateMigrationManifest,
+    generation: u64,
+    token: u64,
+) -> Result<()> {
+    let bytes = BoundedRegularReader::read_direct(root, RECEIPT_FILE, MAX_TRANSACTION_BYTES)?;
+    let receipt: MigrationReceipt =
+        serde_json::from_slice(&bytes).context("migration receipt is malformed")?;
+    let manifest_bytes = serde_json::to_vec(manifest)?;
+    if receipt.version != MIGRATION_VERSION
+        || receipt.manifest_generation != generation
+        || receipt.manifest_token != token
+        || receipt.manifest_sha256 != sha256_hex(&manifest_bytes)
+        || receipt.entries != manifest.entries
+    {
+        bail!("migration receipt does not bind the signed manifest");
+    }
+    root.verify()
 }
 
 fn write_receipt(
@@ -2651,6 +2900,116 @@ mod tests {
         let repeated = migrate_repository_state(&path, true).expect("post-adoption apply");
         assert_eq!(repeated.status, StateMigrationStatus::AlreadyApplied);
         assert_eq!(repeated.transaction_phase, Some(MigrationPhase::Completed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_manifest_refuses_transaction_root_replacement_after_preflight() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        migrate_repository_state(&path, true).expect("publish signed migration manifest");
+        let repo = Repository::open(&path).expect("repo");
+        let transaction_root = repo.commondir().join(TRANSACTION_ROOT_NAME);
+        let original_root = repo.commondir().join("maco-state-migration-v1.original");
+        set_migration_after_preflight_hook({
+            let transaction_root = transaction_root.clone();
+            let original_root = original_root.clone();
+            move || {
+                fs::rename(&transaction_root, &original_root).expect("move transaction root");
+                fs::create_dir(&transaction_root).expect("replacement transaction root");
+                fs::set_permissions(&transaction_root, fs::Permissions::from_mode(0o700))
+                    .expect("replacement root mode");
+                for name in [TRANSACTION_FILE, RECEIPT_FILE, TRANSACTION_LOCK] {
+                    fs::copy(original_root.join(name), transaction_root.join(name))
+                        .expect("copy transaction evidence");
+                    fs::set_permissions(
+                        transaction_root.join(name),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .expect("replacement evidence mode");
+                }
+            }
+        });
+
+        let error = migrate_repository_state(&path, false)
+            .expect_err("transaction root replacement must fail closed");
+        assert!(error.to_string().contains("identity changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_manifest_refuses_legacy_lock_rebind_without_advancing_transaction() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        set_migration_fault(
+            MigrationFaultPoint::AfterManifest,
+            MigrationFaultAction::Crash,
+        );
+        migrate_repository_state(&path, true).expect_err("crash after manifest publication");
+        let repo = Repository::open(&path).expect("repo");
+        let transaction_root = repo.commondir().join(TRANSACTION_ROOT_NAME);
+        assert!(!transaction_root.join(RECEIPT_FILE).exists());
+        let lock_path = state.join("claims.lock");
+        let original_lock = state.join("claims.lock.preflight-original");
+        set_migration_after_preflight_hook({
+            let lock_path = lock_path.clone();
+            let original_lock = original_lock.clone();
+            move || {
+                fs::rename(&lock_path, &original_lock).expect("move held legacy lock");
+                fs::write(&lock_path, b"").expect("replacement legacy lock");
+                fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                    .expect("replacement lock mode");
+            }
+        });
+
+        let error = migrate_repository_state(&path, true)
+            .expect_err("legacy lock rebind must fence manifest completion");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("rebound") || chain.contains("opened descriptor"),
+            "unexpected error: {chain}"
+        );
+        assert!(!transaction_root.join(RECEIPT_FILE).exists());
+        let transaction: MigrationTransaction = serde_json::from_slice(
+            &fs::read(transaction_root.join(TRANSACTION_FILE)).expect("transaction"),
+        )
+        .expect("transaction JSON");
+        assert_eq!(transaction.phase, MigrationPhase::ManifestPublished);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_manifest_refuses_tombstone_change_after_preflight_without_rewriting_evidence() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        migrate_repository_state(&path, true).expect("publish manifest");
+        drop(SyncStore::open(&path).expect("adopt claims"));
+        let repo = Repository::open(&path).expect("repo");
+        let transaction_root = repo.commondir().join(TRANSACTION_ROOT_NAME);
+        let transaction_before =
+            fs::read(transaction_root.join(TRANSACTION_FILE)).expect("transaction before");
+        let receipt_before = fs::read(transaction_root.join(RECEIPT_FILE)).expect("receipt before");
+        let tombstone_path = state.join("claims.json");
+        set_migration_after_preflight_hook({
+            let tombstone_path = tombstone_path.clone();
+            move || {
+                let mut bytes = fs::read(&tombstone_path).expect("active tombstone");
+                bytes.push(b'\n');
+                fs::write(&tombstone_path, bytes).expect("change tombstone bytes");
+            }
+        });
+
+        let error = migrate_repository_state(&path, false)
+            .expect_err("post-preflight tombstone change must fail closed");
+        assert!(error.to_string().contains("tombstone changed"));
+        assert_eq!(
+            fs::read(transaction_root.join(TRANSACTION_FILE)).expect("transaction after"),
+            transaction_before
+        );
+        assert_eq!(
+            fs::read(transaction_root.join(RECEIPT_FILE)).expect("receipt after"),
+            receipt_before
+        );
     }
 
     #[cfg(unix)]

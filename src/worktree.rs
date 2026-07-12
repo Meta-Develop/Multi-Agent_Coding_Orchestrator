@@ -14,8 +14,8 @@ use crate::{
         identity_for_path, quarantine_direct_child_directory, remove_direct_child_tree,
         remove_quarantined_direct_child_tree, replace_reserved_directory_from,
         scavenge_private_random_directories_until, stable_checksum, AtomicStateWriter,
-        BoundedRegularReader, FileIdentity, KernelStateLock, PrivateDirectoryScavengeLimits,
-        SafeRoot, TreeLinkPolicy,
+        BoundedRegularReader, ExistingExclusiveLock, FileIdentity, KernelStateLock,
+        PrivateDirectoryScavengeLimits, SafeRoot, TreeLinkPolicy,
     },
     state_journal::JournalSpec,
     state_migration::{
@@ -256,6 +256,8 @@ struct AuthenticatedManagedState {
     repository: RepositoryAuthBinding,
     registry: ManagedWorktreeRegistry,
     incarnations: BTreeMap<String, ManagedIncarnation>,
+    #[serde(default)]
+    retired_leases: BTreeMap<String, FileIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1173,7 +1175,9 @@ impl ManagedWorktreeRegistryStore {
             normalize_managed_registry(registry, &self.repository)?;
             let mut store = self.ensure_authenticated_state(lock)?;
             let mut incarnations = store.current().value.incarnations.clone();
-            reconcile_managed_incarnations(&mut incarnations, registry)?;
+            let retired_incarnations = reconcile_managed_incarnations(&mut incarnations, registry)?;
+            let mut retired_leases = store.current().value.retired_leases.clone();
+            self.queue_retired_leases(&retired_incarnations, &incarnations, &mut retired_leases)?;
             let revision = store
                 .current()
                 .value
@@ -1186,6 +1190,7 @@ impl ManagedWorktreeRegistryStore {
                 repository: store.current().value.repository.clone(),
                 registry: registry.clone(),
                 incarnations,
+                retired_leases,
             };
             self.verify_lock(lock)?;
             if revision % 4_096 == 0 {
@@ -1194,6 +1199,7 @@ impl ManagedWorktreeRegistryStore {
             } else {
                 store.commit(revision, value)?;
             }
+            store = self.scavenge_retired_leases(store, lock)?;
             self.validate_authenticated_state(&store)?;
             self.finalize_legacy_retirement(&store, lock)?;
             self.verify_lock(lock)
@@ -1240,6 +1246,7 @@ impl ManagedWorktreeRegistryStore {
                     authenticator,
                     MANAGED_LOGICAL_ID,
                 )?;
+                let store = self.scavenge_retired_leases(store, lock)?;
                 self.validate_authenticated_state(&store)?;
                 self.finalize_legacy_retirement(&store, lock)?;
                 self.verify_lock(lock)?;
@@ -1273,13 +1280,17 @@ impl ManagedWorktreeRegistryStore {
         };
         normalize_managed_registry(&mut registry, &self.repository)?;
         let mut incarnations = BTreeMap::new();
-        reconcile_managed_incarnations(&mut incarnations, &registry)?;
+        let retired = reconcile_managed_incarnations(&mut incarnations, &registry)?;
+        if !retired.is_empty() {
+            bail!("new authenticated managed state unexpectedly retired an incarnation");
+        }
         let initial = AuthenticatedManagedState {
             version: 1,
             snapshot_revision: 1,
             repository: writer.authenticator().binding().clone(),
             registry,
             incarnations,
+            retired_leases: BTreeMap::new(),
         };
         let store = AuthenticatedSnapshotStore::create(
             writer.into_authenticator()?,
@@ -1300,6 +1311,7 @@ impl ManagedWorktreeRegistryStore {
         self.verify_lock(lock)?;
         let authenticator = repository_authenticator_key_only(&self.repo_path)?;
         let store = AuthenticatedSnapshotStore::open_instance(authenticator, MANAGED_LOGICAL_ID)?;
+        let store = self.scavenge_retired_leases(store, lock)?;
         self.validate_authenticated_state(&store)?;
         self.finalize_legacy_retirement(&store, lock)?;
         self.verify_lock(lock)?;
@@ -1326,7 +1338,11 @@ impl ManagedWorktreeRegistryStore {
             bail!("authenticated managed registry repository/checksum binding is inconsistent");
         }
         validate_registry_bounds(&snapshot.value.registry)?;
-        validate_managed_incarnations(&snapshot.value.incarnations, &snapshot.value.registry)
+        validate_managed_incarnations(&snapshot.value.incarnations, &snapshot.value.registry)?;
+        validate_retired_managed_leases(
+            &snapshot.value.retired_leases,
+            &snapshot.value.incarnations,
+        )
     }
 
     fn finalize_legacy_retirement(
@@ -1389,6 +1405,92 @@ impl ManagedWorktreeRegistryStore {
             bail!("managed worktree removal lease belongs to a stale incarnation");
         }
         Ok(())
+    }
+
+    fn queue_retired_leases(
+        &self,
+        retired: &[(String, ManagedIncarnation)],
+        active: &BTreeMap<String, ManagedIncarnation>,
+        queue: &mut BTreeMap<String, FileIdentity>,
+    ) -> Result<()> {
+        for (name, incarnation) in retired {
+            let lease_name = managed_worktree_lease_name(name, incarnation)?;
+            let lease_name = lease_name
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("managed worktree lease name is not UTF-8"))?;
+            if active.iter().any(|(active_name, active_incarnation)| {
+                managed_worktree_lease_name(active_name, active_incarnation)
+                    .ok()
+                    .is_some_and(|candidate| candidate == OsStr::new(&lease_name))
+            }) {
+                bail!("retired managed lease collides with an active incarnation");
+            }
+            let path = self.state_root.direct_child(&lease_name)?;
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let identity = identity_for_path(&path)?;
+                    if queue.insert(lease_name, identity).is_some() {
+                        bail!("managed worktree retired lease was queued twice");
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("failed to inspect retired lease file"),
+            }
+        }
+        validate_retired_managed_leases(queue, active)
+    }
+
+    fn scavenge_retired_leases(
+        &self,
+        mut store: AuthenticatedSnapshotStore<ManagedSnapshotSpec, AuthenticatedManagedState>,
+        lock: &ManagedWorktreeRegistryLock,
+    ) -> Result<AuthenticatedSnapshotStore<ManagedSnapshotSpec, AuthenticatedManagedState>> {
+        self.verify_lock(lock)?;
+        let active = store.current().value.incarnations.clone();
+        let mut queue = store.current().value.retired_leases.clone();
+        validate_retired_managed_leases(&queue, &active)?;
+        let mut cleaned = false;
+        for (name, expected_identity) in store.current().value.retired_leases.clone() {
+            let acquired =
+                KernelStateLock::try_acquire_existing_exclusive_direct(&self.state_root, &name)
+                    .context("failed to inspect retired managed lease")?;
+            match acquired {
+                ExistingExclusiveLock::Busy => continue,
+                ExistingExclusiveLock::Missing => {
+                    queue.remove(&name);
+                    cleaned = true;
+                }
+                ExistingExclusiveLock::Acquired(lease) => {
+                    if lease.identity() != &expected_identity {
+                        bail!("retired managed lease path has a foreign or rebound identity");
+                    }
+                    lease.unlink_exact_direct(&self.state_root)?;
+                    queue.remove(&name);
+                    cleaned = true;
+                }
+            }
+        }
+        if !cleaned {
+            return Ok(store);
+        }
+        let revision = store
+            .current()
+            .value
+            .snapshot_revision
+            .checked_add(1)
+            .context("authenticated managed registry revision exhausted")?;
+        let mut value = store.current().value.clone();
+        value.snapshot_revision = revision;
+        value.retired_leases = queue;
+        self.verify_lock(lock)?;
+        if revision % 4_096 == 0 {
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            store = store.rollover(authenticator, revision, value)?;
+        } else {
+            store.commit(revision, value)?;
+        }
+        self.verify_lock(lock)?;
+        Ok(store)
     }
 }
 
@@ -1458,29 +1560,29 @@ fn normalize_managed_registry(
 fn reconcile_managed_incarnations(
     incarnations: &mut BTreeMap<String, ManagedIncarnation>,
     registry: &ManagedWorktreeRegistry,
-) -> Result<()> {
+) -> Result<Vec<(String, ManagedIncarnation)>> {
     let active = registry
         .records
         .keys()
         .chain(registry.operations.keys())
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    for (name, incarnation) in incarnations.iter_mut() {
-        if !active.contains(name) {
-            incarnation.active = false;
-        }
+    let retired_names = incarnations
+        .keys()
+        .filter(|name| !active.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut retired = Vec::with_capacity(retired_names.len());
+    for name in retired_names {
+        let incarnation = incarnations
+            .remove(&name)
+            .context("managed worktree incarnation disappeared during pruning")?;
+        retired.push((name, incarnation));
     }
     for name in active {
         match incarnations.get_mut(&name) {
             Some(incarnation) if incarnation.active => {}
-            Some(incarnation) => {
-                incarnation.generation = incarnation
-                    .generation
-                    .checked_add(1)
-                    .context("managed worktree incarnation generation exhausted")?;
-                incarnation.nonce = random_identifier()?;
-                incarnation.active = true;
-            }
+            Some(_) => bail!("active managed incarnation is marked inactive"),
             None => {
                 incarnations.insert(
                     name,
@@ -1493,7 +1595,8 @@ fn reconcile_managed_incarnations(
             }
         }
     }
-    validate_managed_incarnations(incarnations, registry)
+    validate_managed_incarnations(incarnations, registry)?;
+    Ok(retired)
 }
 
 fn validate_managed_incarnation(incarnation: &ManagedIncarnation) -> Result<()> {
@@ -1523,7 +1626,7 @@ fn validate_managed_incarnations(
         validate_managed_incarnation(incarnation)?;
         let expected_active =
             registry.records.contains_key(name) || registry.operations.contains_key(name);
-        if incarnation.active != expected_active {
+        if !incarnation.active || !expected_active {
             bail!("managed worktree incarnation activity does not match the signed registry");
         }
     }
@@ -1536,6 +1639,55 @@ fn validate_managed_incarnations(
         }
     }
     Ok(())
+}
+
+fn validate_retired_managed_leases(
+    leases: &BTreeMap<String, FileIdentity>,
+    active: &BTreeMap<String, ManagedIncarnation>,
+) -> Result<()> {
+    if leases.len() > MAX_MANAGED_RECORDS.saturating_add(MAX_MANAGED_OPERATIONS) {
+        bail!("retired managed lease cleanup queue exceeds its bound");
+    }
+    let active_names = active
+        .iter()
+        .map(|(name, incarnation)| managed_worktree_lease_name(name, incarnation))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    for (name, identity) in leases {
+        let parsed = parse_managed_worktree_lease_name(name)?;
+        if active_names.contains(OsStr::new(name))
+            || identity.device == 0
+            || identity.file == 0
+            || parsed.0.is_empty()
+        {
+            bail!("retired managed lease cleanup entry is malformed or active");
+        }
+    }
+    Ok(())
+}
+
+fn parse_managed_worktree_lease_name(name: &str) -> Result<(String, ManagedIncarnation)> {
+    let body = name
+        .strip_prefix("managed-worktree-")
+        .and_then(|value| value.strip_suffix(".execution.lock"))
+        .context("retired managed lease name is not canonical")?;
+    let (prefix, nonce) = body
+        .rsplit_once('-')
+        .context("retired managed lease nonce is missing")?;
+    let (agent_id, generation) = prefix
+        .rsplit_once('-')
+        .context("retired managed lease generation is missing")?;
+    let generation = generation
+        .parse::<u64>()
+        .context("retired managed lease generation is malformed")?;
+    let incarnation = ManagedIncarnation {
+        generation,
+        nonce: nonce.to_string(),
+        active: true,
+    };
+    if managed_worktree_lease_name(agent_id, &incarnation)?.to_str() != Some(name) {
+        bail!("retired managed lease name is not canonical");
+    }
+    Ok((agent_id.to_string(), incarnation))
 }
 
 fn managed_registry_checksum(registry: &ManagedWorktreeRegistry) -> Result<String> {
@@ -3955,18 +4107,18 @@ mod tests {
         manager
             .remove("agent-incarnation", true, true)
             .expect("remove first incarnation");
-        let stale_lock = KernelStateLock::try_acquire_exclusive_direct(
-            &store.state_root,
-            managed_worktree_lease_name("agent-incarnation", &first).expect("old lease name"),
-        )
-        .expect("stale incarnation lock");
+        let old_lease_name =
+            managed_worktree_lease_name("agent-incarnation", &first).expect("old lease name");
+        let stale_lock =
+            KernelStateLock::try_acquire_exclusive_direct(&store.state_root, &old_lease_name)
+                .expect("stale incarnation lock");
 
         manager.create(options()).expect("second incarnation");
         let lock = store.lock().expect("registry lock");
         let second = store
             .active_incarnation(&lock, "agent-incarnation")
             .expect("second incarnation evidence");
-        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(second.generation, 1);
         assert_ne!(second.nonce, first.nonce);
         let stale = ManagedWorktreeRemovalLease {
             name: "agent-incarnation".to_string(),
@@ -3978,11 +4130,119 @@ mod tests {
             .verify_removal_lease_current(&lock, &stale)
             .expect_err("stale removal lease must not authorize the new incarnation");
         assert!(error.to_string().contains("stale incarnation"));
+        let authenticated = store
+            .open_authenticated_state(&lock)
+            .expect("authenticated managed state");
+        assert_eq!(authenticated.current().value.incarnations.len(), 1);
+        assert!(authenticated
+            .current()
+            .value
+            .retired_leases
+            .contains_key(old_lease_name.to_str().expect("UTF-8 lease name")));
+        drop(authenticated);
         drop(lock);
 
         let _current = manager
             .acquire_read_execution_lease("agent-incarnation")
             .expect("old-incarnation lock must not block current lease");
+        assert!(store.state_root.path().join(&old_lease_name).exists());
+        drop(stale);
+        manager.list().expect("scavenge released retired lease");
+        assert!(!store.state_root.path().join(&old_lease_name).exists());
+    }
+
+    #[test]
+    fn inactive_incarnation_churn_is_pruned_instead_of_exhausting_the_registry() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let registry = store.empty_registry();
+        let mut incarnations = BTreeMap::new();
+
+        for index in 0..MAX_MANAGED_RECORDS.saturating_mul(4) {
+            let name = format!("retired-{index}");
+            incarnations.insert(
+                name.clone(),
+                ManagedIncarnation {
+                    generation: 1,
+                    nonce: format!("{index:064x}"),
+                    active: true,
+                },
+            );
+            let retired = reconcile_managed_incarnations(&mut incarnations, &registry)
+                .expect("prune inactive incarnation");
+            assert_eq!(retired.len(), 1);
+            assert_eq!(retired[0].0, name);
+            assert!(incarnations.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_lease_scavenger_refuses_rebound_or_foreign_inode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-retired-rebind".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let lock = store.lock().expect("registry lock");
+        let incarnation = store
+            .active_incarnation(&lock, "agent-retired-rebind")
+            .expect("incarnation");
+        drop(lock);
+        manager
+            .remove("agent-retired-rebind", true, true)
+            .expect("remove worktree");
+        let lease_name =
+            managed_worktree_lease_name("agent-retired-rebind", &incarnation).expect("lease name");
+        let lease_path = store.state_root.path().join(&lease_name);
+        let moved_path = store.state_root.path().join("retired-lease-original");
+        crate::safe_state::set_kernel_lock_after_flock_hook({
+            let lease_name = lease_name.clone();
+            let moved_path = moved_path.clone();
+            move |path| {
+                if path.file_name() != Some(lease_name.as_os_str()) {
+                    return false;
+                }
+                fs::rename(path, &moved_path).expect("move expected retired lease");
+                fs::write(path, b"").expect("foreign replacement");
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .expect("replacement mode");
+                true
+            }
+        });
+
+        let error = manager
+            .list()
+            .expect_err("rebound retired lease must fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("does not name its opened descriptor") || chain.contains("rebound"),
+            "unexpected error: {chain}"
+        );
+        assert!(
+            lease_path.exists(),
+            "foreign replacement must not be deleted"
+        );
+        assert!(
+            moved_path.exists(),
+            "expected inode must remain for inspection"
+        );
     }
 
     #[cfg(unix)]
