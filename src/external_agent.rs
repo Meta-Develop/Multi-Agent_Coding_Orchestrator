@@ -209,12 +209,24 @@ impl ExternalAgentRun {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CapturedOutput {
     pub text: String,
     pub truncated: bool,
     #[serde(skip, default)]
     bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for CapturedOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CapturedOutput {{ text: {:?}, truncated: {:?}, bytes: <redacted:{} bytes> }}",
+            self.text,
+            self.truncated,
+            self.bytes.len()
+        )
+    }
 }
 
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
@@ -1434,7 +1446,13 @@ mod tests {
             "failed".to_string(),
         );
         report.output_last_message = Some(b"private descriptor bytes".to_vec());
-        report.stdout.bytes = b"private stdout bytes\0\xff".to_vec();
+        report.stdout.bytes = b"DO_NOT_DEBUG_private_stdout_bytes\0\xff".to_vec();
+        let debug = format!("{report:?}");
+        assert!(!debug.contains("DO_NOT_DEBUG_private_stdout_bytes"));
+        assert!(debug.contains(&format!(
+            "bytes: <redacted:{} bytes>",
+            report.stdout.bytes.len()
+        )));
         let value = serde_json::to_value(&report)?;
         assert!(value.get("output_last_message").is_none());
         assert!(value
