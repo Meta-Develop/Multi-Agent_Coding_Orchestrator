@@ -7,6 +7,7 @@ use crate::{
         ValidationReport,
     },
     process_runner::StdinMode,
+    worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
 use git2::{ObjectType, Oid, Repository};
@@ -321,6 +322,33 @@ pub fn preview_pr_with_validation_evidence(
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<PrPublicationReport> {
     let preview = build_merge_preview(&options, require_validation, validation_evidence)?;
+    publication_report_from_preview(options, preview)
+}
+
+/// Previews publication under an already-held managed-worktree write lease.
+///
+/// Autopilot uses this entrypoint while retaining its mutation authority. The
+/// merge collector validates the lease's durable repository and agent binding
+/// and snapshots directly under it, so no nested shared lease is acquired.
+pub(crate) fn preview_pr_with_validation_evidence_and_write_lease(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<PrPublicationReport> {
+    let preview = build_merge_preview_with_write_lease(
+        &options,
+        require_validation,
+        validation_evidence,
+        write_lease,
+    )?;
+    publication_report_from_preview(options, preview)
+}
+
+fn publication_report_from_preview(
+    options: PrPublicationOptions,
+    preview: MergeApplyPreview,
+) -> Result<PrPublicationReport> {
     let primary_repo = Repository::open(&preview.candidate.metadata.primary_repo_root)
         .context("failed to open primary repository")?;
     let base = current_branch_name(&primary_repo).unwrap_or_else(|| "HEAD".to_string());
@@ -367,7 +395,17 @@ pub fn preview_pr_with_validation_evidence(
 }
 
 pub fn publish_pr(options: PrPublicationOptions) -> Result<PrPublicationReport> {
-    publish_pr_with_validation_requirement(options, false)
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo_root);
+    let write_lease = manager
+        .acquire_write_execution_lease(&options.agent_id)
+        .with_context(|| {
+            format!(
+                "failed to acquire publication write authority for agent '{}'",
+                options.agent_id
+            )
+        })?;
+    publish_pr_with_write_lease(options, &write_lease)
 }
 
 pub fn publish_pr_with_validation_requirement(
@@ -384,11 +422,118 @@ pub fn publish_pr_with_validation_evidence(
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<PrPublicationReport> {
     let repo_root = discover_primary_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo_root);
+    let write_lease = manager
+        .acquire_write_execution_lease(&options.agent_id)
+        .with_context(|| {
+            format!(
+                "failed to acquire publication write authority for agent '{}'",
+                options.agent_id
+            )
+        })?;
+    publish_pr_with_validation_evidence_and_write_lease(
+        options,
+        require_validation,
+        validation_evidence,
+        &write_lease,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn publish_pr_with_validation_evidence_after_lock<F>(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+    after_lock: F,
+) -> Result<PrPublicationReport>
+where
+    F: FnOnce(),
+{
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo_root);
+    let write_lease = manager
+        .acquire_write_execution_lease(&options.agent_id)
+        .with_context(|| {
+            format!(
+                "failed to acquire publication write authority for agent '{}'",
+                options.agent_id
+            )
+        })?;
+    publish_pr_with_validation_evidence_and_write_lease_after_lock(
+        options,
+        require_validation,
+        validation_evidence,
+        &write_lease,
+        after_lock,
+    )
+}
+
+/// Publishes under a borrowed managed-worktree write lease.
+///
+/// Callers such as Autopilot retain the lease across validation, publication,
+/// and subsequent review. This function verifies the lease binding, then
+/// acquires the repository mutation lock without reacquiring either lock. Both
+/// locks use nonblocking acquisition, and standalone publication takes them in
+/// write-lease then repository-lock order to match this borrowed path.
+pub(crate) fn publish_pr_with_validation_evidence_and_write_lease(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<PrPublicationReport> {
+    publish_pr_with_validation_evidence_and_write_lease_after_lock(
+        options,
+        require_validation,
+        validation_evidence,
+        write_lease,
+        || {},
+    )
+}
+
+pub(crate) fn publish_pr_with_write_lease(
+    options: PrPublicationOptions,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<PrPublicationReport> {
+    let evidence = ValidationEvidenceBundle::legacy(options.validations.clone());
+    publish_pr_with_validation_evidence_and_write_lease(options, false, evidence, write_lease)
+}
+
+fn publish_pr_with_validation_evidence_and_write_lease_after_lock<F>(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+    after_lock: F,
+) -> Result<PrPublicationReport>
+where
+    F: FnOnce(),
+{
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo_root);
+    manager.verify_write_execution_lease(&options.agent_id, write_lease)?;
     let _lock = RepoCommonLock::acquire(&repo_root, "pr-publish")?;
-    let mut report = preview_pr_with_validation_evidence(
+    after_lock();
+    publish_pr_with_verified_authority(
+        options,
+        require_validation,
+        validation_evidence,
+        write_lease,
+        repo_root,
+    )
+}
+
+fn publish_pr_with_verified_authority(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+    repo_root: PathBuf,
+) -> Result<PrPublicationReport> {
+    let mut report = preview_pr_with_validation_evidence_and_write_lease(
         options.clone(),
         require_validation,
         validation_evidence.clone(),
+        write_lease,
     )?;
     if report.readiness == ApplyReadinessStatus::Blocked {
         return Ok(report);
@@ -408,10 +553,11 @@ pub fn publish_pr_with_validation_evidence(
     let originally_reviewed = report.preview.candidate.validation_binding.clone();
     let mut local_commit = None;
     if needs_commit {
-        report = preview_pr_with_validation_evidence(
+        report = preview_pr_with_validation_evidence_and_write_lease(
             options.clone(),
             false,
             validation_evidence.clone(),
+            write_lease,
         )?;
         if report.readiness == ApplyReadinessStatus::Blocked {
             return Ok(report);
@@ -425,11 +571,13 @@ pub fn publish_pr_with_validation_evidence(
             )?;
             local_commit = Some(commit_id.to_string());
             if has_uncommitted_changes(&worktree_path)? {
-                let mut changed_during_commit = preview_pr_with_validation_evidence(
-                    options.clone(),
-                    false,
-                    validation_evidence.clone(),
-                )?;
+                let mut changed_during_commit =
+                    preview_pr_with_validation_evidence_and_write_lease(
+                        options.clone(),
+                        false,
+                        validation_evidence.clone(),
+                        write_lease,
+                    )?;
                 changed_during_commit.commit_id = local_commit.clone();
                 changed_during_commit.head_id = changed_during_commit
                     .preview
@@ -447,10 +595,11 @@ pub fn publish_pr_with_validation_evidence(
         }
     }
 
-    let mut after_local = preview_pr_with_validation_evidence(
+    let mut after_local = preview_pr_with_validation_evidence_and_write_lease(
         options.clone(),
         require_validation,
         validation_evidence.clone(),
+        write_lease,
     )?;
     if after_local.readiness == ApplyReadinessStatus::Blocked {
         after_local.commit_id = local_commit.clone();
@@ -482,8 +631,12 @@ pub fn publish_pr_with_validation_evidence(
         ),
     };
 
-    let mut final_report =
-        preview_pr_with_validation_evidence(options, require_validation, validation_evidence)?;
+    let mut final_report = preview_pr_with_validation_evidence_and_write_lease(
+        options,
+        require_validation,
+        validation_evidence,
+        write_lease,
+    )?;
     final_report.commit_id = local_commit;
     final_report.head_id = final_report.preview.candidate.metadata.agent_head.clone();
     final_report.remote = raw_remote_url.as_deref().map(redact_remote_url);
@@ -744,6 +897,30 @@ fn build_merge_preview(
             require_validation,
         },
         validation_evidence,
+    )
+}
+
+fn build_merge_preview_with_write_lease(
+    options: &PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<MergeApplyPreview> {
+    merge::preview_merge_apply_with_evidence_and_write_lease(
+        MergePreviewOptions {
+            collect: MergeCollectOptions {
+                repo: options.repo.clone(),
+                agent_id: options.agent_id.clone(),
+                claimed_paths: options.claimed_paths.clone(),
+                include_full_diff: true,
+                diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                validations: Vec::new(),
+            },
+            forces: MergeForceOptions::default(),
+            require_validation,
+        },
+        validation_evidence,
+        write_lease,
     )
 }
 
@@ -3708,7 +3885,263 @@ fn summarize_text(text: &str, limit: usize) -> OutputSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::worktree::{WorktreeCreateOptions, WorktreeRecord};
     use std::process::Command;
+    #[cfg(target_os = "linux")]
+    use std::{sync::mpsc, time::Duration};
+
+    #[cfg(target_os = "linux")]
+    fn create_publication_lease_fixture(
+        root: &Path,
+    ) -> (PathBuf, WorktreeManager, WorktreeRecord, WorktreeRecord) {
+        let repo_path = root.join("repo");
+        let worktree_root = root.join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        fs::write(repo_path.join("README.md"), "# Publication fixture\n")
+            .expect("write fixture README");
+        let repo = Repository::open(&repo_path).expect("open fixture repository");
+        let mut config = repo.config().expect("open fixture config");
+        config
+            .set_str("user.name", "maco test")
+            .expect("configure test name");
+        config
+            .set_str("user.email", "maco-test@example.invalid")
+            .expect("configure test email");
+        drop(config);
+        let mut index = repo.index().expect("open fixture index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage fixture README");
+        index.write().expect("write fixture index");
+        let tree_id = index.write_tree().expect("write fixture tree");
+        let tree = repo.find_tree(tree_id).expect("find fixture tree");
+        let signature = git2::Signature::now("maco test", "maco-test@example.invalid")
+            .expect("fixture signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        drop(tree);
+        drop(repo);
+
+        let manager = WorktreeManager::new(&repo_path);
+        let agent_a = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root.clone()),
+            })
+            .expect("create agent-a worktree");
+        let agent_b = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-b".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create agent-b worktree");
+        (repo_path, manager, agent_a, agent_b)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_publication_options(repo: &Path, agent_id: &str) -> PrPublicationOptions {
+        PrPublicationOptions {
+            repo: repo.to_path_buf(),
+            agent_id: agent_id.to_string(),
+            claimed_paths: vec![PathBuf::from("README.md")],
+            validations: Vec::new(),
+            forge: ForgeKind::Fake,
+            draft: true,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn borrowed_write_lease_publishes_without_nested_read_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Borrowed authority\n")
+            .expect("edit agent worktree");
+        let write_lease = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("caller-held write lease");
+
+        let report = publish_pr_with_write_lease(
+            fake_publication_options(&repo_path, "agent-a"),
+            &write_lease,
+        )
+        .expect("publish beneath caller-held write lease");
+
+        assert_eq!(report.status, PrPublicationStatus::Published);
+        assert!(report.created);
+        assert_eq!(write_lease.record().name, "agent-a");
+        manager
+            .acquire_read_execution_lease("agent-a")
+            .expect_err("caller retains write authority after publication returns");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_publish_excludes_same_worktree_for_full_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, agent_b) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Lifecycle authority\n")
+            .expect("edit agent worktree");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let publish_repo = repo_path.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_pr_with_validation_evidence_after_lock(
+                fake_publication_options(&publish_repo, "agent-a"),
+                false,
+                ValidationEvidenceBundle::default(),
+                || {
+                    ready_tx.send(()).expect("signal held publication locks");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release publication");
+                },
+            )
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publication acquired lifecycle locks");
+        manager
+            .acquire_read_execution_lease("agent-a")
+            .expect_err("publication writer excludes concurrent reader");
+        manager
+            .acquire_write_execution_lease("agent-a")
+            .expect_err("publication writer excludes concurrent writer");
+        let removal_error = manager
+            .remove("agent-a", true, false)
+            .expect_err("publication writer excludes managed removal");
+        assert!(removal_error
+            .to_string()
+            .contains("active cooperative execution lease"));
+        match RepoCommonLock::acquire(&repo_path, "merge-apply") {
+            Ok(_) => panic!("publication must hold repository mutation lock"),
+            Err(error) => assert!(format!("{error:#}").contains("kernel lock is held")),
+        }
+
+        let unrelated = manager
+            .acquire_write_execution_lease("agent-b")
+            .expect("unrelated worktree remains available");
+        assert_eq!(unrelated.path(), agent_b.path);
+        drop(unrelated);
+
+        release_tx.send(()).expect("release publication lifecycle");
+        let report = publisher
+            .join()
+            .expect("join publisher")
+            .expect("complete fake publication");
+        assert_eq!(report.status, PrPublicationStatus::Published);
+        drop(
+            manager
+                .acquire_read_execution_lease("agent-a")
+                .expect("publication releases worktree lease on return"),
+        );
+        drop(
+            RepoCommonLock::acquire(&repo_path, "merge-apply")
+                .expect("publication releases repository lock on return"),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn borrowed_publication_rejects_agent_and_repository_mismatch() {
+        let first = tempfile::tempdir().expect("first tempdir");
+        let second = tempfile::tempdir().expect("second tempdir");
+        let (first_repo, first_manager, _, _) = create_publication_lease_fixture(first.path());
+        let (second_repo, _, _, _) = create_publication_lease_fixture(second.path());
+        let write_lease = first_manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("first repository write lease");
+
+        let agent_error = preview_pr_with_validation_evidence_and_write_lease(
+            fake_publication_options(&first_repo, "agent-b"),
+            false,
+            ValidationEvidenceBundle::default(),
+            &write_lease,
+        )
+        .expect_err("lease for another agent must be rejected");
+        assert!(agent_error
+            .to_string()
+            .contains("belongs to agent 'agent-a'"));
+
+        let repo_error = publish_pr_with_write_lease(
+            fake_publication_options(&second_repo, "agent-a"),
+            &write_lease,
+        )
+        .expect_err("lease for another repository must be rejected");
+        assert!(repo_error
+            .to_string()
+            .contains("different managed repository"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_publication_error_releases_both_locks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Invalid claim\n")
+            .expect("edit agent worktree");
+        let mut options = fake_publication_options(&repo_path, "agent-a");
+        options.claimed_paths = vec![PathBuf::from("../escape")];
+
+        publish_pr_with_validation_evidence(options, false, ValidationEvidenceBundle::default())
+            .expect_err("invalid claim must fail publication");
+
+        drop(
+            manager
+                .acquire_read_execution_lease("agent-a")
+                .expect("error releases standalone write lease"),
+        );
+        drop(
+            RepoCommonLock::acquire(&repo_path, "merge-apply")
+                .expect("error releases repository mutation lock"),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_preview_coexists_with_reader_and_does_not_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Shared preview\n")
+            .expect("edit agent worktree");
+        let agent_repo = Repository::open(&agent_a.path).expect("open agent repository");
+        let before_head = agent_repo
+            .head()
+            .expect("agent HEAD")
+            .target()
+            .expect("direct agent HEAD");
+        let existing_reader = manager
+            .acquire_read_execution_lease("agent-a")
+            .expect("existing shared reader");
+
+        let report = preview_pr_with_validation_evidence(
+            fake_publication_options(&repo_path, "agent-a"),
+            false,
+            ValidationEvidenceBundle::default(),
+        )
+        .expect("standalone preview shares immutable authority");
+
+        assert_eq!(report.status, PrPublicationStatus::Preview);
+        assert_eq!(
+            agent_repo
+                .head()
+                .expect("agent HEAD after preview")
+                .target()
+                .expect("direct agent HEAD after preview"),
+            before_head
+        );
+        assert!(has_uncommitted_changes(&agent_a.path).expect("dirty preview worktree"));
+        manager
+            .acquire_write_execution_lease("agent-a")
+            .expect_err("existing reader remains held after shared preview");
+        drop(existing_reader);
+    }
 
     fn completed_github_journal(sequence: u64) -> PublicationTransactionJournal {
         PublicationTransactionJournal {

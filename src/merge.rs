@@ -5,7 +5,10 @@ use crate::{
         StdinMode,
     },
     sync::normalize_repo_relative_path,
-    worktree::{normalize_agent_id, ManagedWorktreeReadLease, WorktreeManager, WorktreeRecord},
+    worktree::{
+        normalize_agent_id, ManagedWorktreeReadLease, ManagedWorktreeWriteLease, WorktreeManager,
+        WorktreeRecord,
+    },
 };
 use anyhow::{bail, Context, Result};
 use git2::{ErrorCode, ObjectType, Oid, Repository, Status, StatusOptions};
@@ -591,7 +594,43 @@ where
     let manager = WorktreeManager::new(&repo_root);
     let leased_worktree = find_agent_worktree_read_only(&manager, &options.agent_id)?;
     after_lease();
-    let record = leased_worktree.record();
+    collect_agent_result_from_verified_record(
+        options,
+        validation_evidence,
+        repo_root,
+        leased_worktree.record(),
+    )
+}
+
+/// Collects an immutable candidate while a caller retains exclusive authority
+/// for the managed worktree.
+///
+/// This is the publication/autopilot bridge: it verifies the borrowed lease's
+/// repository and agent binding, then snapshots directly under that authority
+/// instead of trying to nest a shared read lease beneath the caller's write
+/// lease.
+pub(crate) fn collect_agent_result_with_evidence_and_write_lease(
+    options: MergeCollectOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<MergeCandidate> {
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo_root);
+    manager.verify_write_execution_lease(&options.agent_id, write_lease)?;
+    collect_agent_result_from_verified_record(
+        options,
+        validation_evidence,
+        repo_root,
+        write_lease.record(),
+    )
+}
+
+fn collect_agent_result_from_verified_record(
+    options: MergeCollectOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    repo_root: PathBuf,
+    record: &WorktreeRecord,
+) -> Result<MergeCandidate> {
     let primary_repo = Repository::open(&repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
     let agent_repo = Repository::open(&record.path)
@@ -642,6 +681,31 @@ pub fn preview_merge_apply_with_evidence(
     let mut collect = options.collect;
     collect.include_full_diff = true;
     let candidate = collect_agent_result_with_evidence(collect, validation_evidence)?;
+    build_merge_apply_preview(candidate, options.forces, options.require_validation)
+}
+
+/// Builds a merge preview without attempting to acquire a nested shared
+/// worktree lease when the caller already holds verified write authority.
+pub(crate) fn preview_merge_apply_with_evidence_and_write_lease(
+    options: MergePreviewOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<MergeApplyPreview> {
+    let mut collect = options.collect;
+    collect.include_full_diff = true;
+    let candidate = collect_agent_result_with_evidence_and_write_lease(
+        collect,
+        validation_evidence,
+        write_lease,
+    )?;
+    build_merge_apply_preview(candidate, options.forces, options.require_validation)
+}
+
+fn build_merge_apply_preview(
+    candidate: MergeCandidate,
+    forces: MergeForceOptions,
+    require_validation: bool,
+) -> Result<MergeApplyPreview> {
     let patch = candidate.raw_diff.as_slice();
     let candidate_validation_commands = Vec::new();
 
@@ -649,17 +713,17 @@ pub fn preview_merge_apply_with_evidence(
     let dirty_primary = dirty_primary_check(&candidate.metadata.primary_repo_root)?;
     let stale_base = stale_base_check(&candidate.metadata);
     let unclaimed_edits = unclaimed_edits_check(&candidate.unclaimed_changed_paths);
-    let validation = validation_check(&candidate.validations, options.require_validation);
+    let validation = validation_check(&candidate.validations, require_validation);
     let validation_evidence = validation_evidence_check(
         &candidate.validation_evidence,
         &candidate.validation_binding,
-        options.require_validation,
+        require_validation,
         &candidate.changed_paths,
     );
     let (apply_check, apply_mode) = apply_check(
         &candidate.metadata.primary_repo_root,
         patch,
-        options.forces.allow_apply_conflicts,
+        forces.allow_apply_conflicts,
     )?;
     let checks = SafetyChecks {
         primary_state_unchanged: &primary_state_unchanged,
@@ -670,11 +734,11 @@ pub fn preview_merge_apply_with_evidence(
         validation: &validation,
         validation_evidence: &validation_evidence,
         validations: &candidate.validations,
-        require_validation: options.require_validation,
+        require_validation,
         validation_commands: &candidate_validation_commands,
         validation_related_paths: &candidate.changed_paths,
     };
-    let readiness = classify_apply_safety(checks, &options.forces);
+    let readiness = classify_apply_safety(checks, &forces);
 
     Ok(MergeApplyPreview {
         candidate,
@@ -686,9 +750,9 @@ pub fn preview_merge_apply_with_evidence(
             unclaimed_edits,
             validation,
             validation_evidence,
-            validation_required: options.require_validation,
+            validation_required: require_validation,
             candidate_validation_commands,
-            force_options: options.forces,
+            force_options: forces,
             apply_mode,
             readiness,
         },

@@ -121,6 +121,7 @@ pub type ManagedWorktreeExecutionLease = ManagedWorktreeReadLease;
 #[derive(Debug)]
 pub struct ManagedWorktreeWriteLease {
     record: WorktreeRecord,
+    repository: ManagedRepositoryBinding,
     _lock: KernelStateLock,
 }
 
@@ -932,8 +933,50 @@ impl WorktreeManager {
         )?;
         Ok(ManagedWorktreeWriteLease {
             record,
+            repository: registry_store.repository.clone(),
             _lock: lock,
         })
+    }
+
+    /// Verifies that a borrowed write lease grants authority for this manager's
+    /// repository and the requested managed agent binding.
+    ///
+    /// The lease records the create-time repository identity captured while
+    /// the registry lock was held. Re-reading the durable binding here avoids
+    /// treating a matching path alone as proof that a lease from another
+    /// repository authorizes this operation.
+    pub(crate) fn verify_write_execution_lease(
+        &self,
+        agent_id: &str,
+        lease: &ManagedWorktreeWriteLease,
+    ) -> Result<()> {
+        let name = normalize_agent_id(agent_id)?;
+        if lease.record.name != name {
+            bail!(
+                "managed worktree write lease belongs to agent '{}' rather than '{name}'",
+                lease.record.name
+            );
+        }
+
+        let repo = self.open_repository()?;
+        let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
+        if lease.repository != registry_store.repository {
+            bail!("managed worktree write lease belongs to a different managed repository");
+        }
+
+        let registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load(&registry_lock)?;
+        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+        let binding = registry.records.get(&name).with_context(|| {
+            format!("worktree '{name}' has no verified MACO binding; explicit adoption is required")
+        })?;
+        let record = verified_worktree_record(&repo, &registry_store.repository, binding)?;
+        if record != lease.record {
+            bail!(
+                "managed worktree write lease no longer matches the verified binding for '{name}'"
+            );
+        }
+        registry_store.verify_lock(&registry_lock)
     }
 
     fn open_repository(&self) -> Result<Repository> {
