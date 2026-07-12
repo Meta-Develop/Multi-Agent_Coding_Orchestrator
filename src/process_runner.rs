@@ -517,46 +517,49 @@ pub struct TrustedFixedNetworkProfile {
 /// Outer Linux profile for Codex. The parent CLI may reach its provider, while model-generated
 /// commands must additionally use the custom Codex permission profile assembled by
 /// `external_agent`.
+///
+/// This is an opaque capability. External callers cannot construct one directly; the crate's
+/// validated external-Codex launch path is the only authority that may create it.
+///
+/// ```compile_fail
+/// use multi_agent_coding_orchestrator::process_runner::ExternalCodexProfile;
+/// let _profile = ExternalCodexProfile::read_write(".");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCodexProfile {
     config: WorkspaceSandboxConfig,
 }
 
 impl ExternalCodexProfile {
-    pub fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
         }
     }
 
-    pub fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
         }
     }
 
-    pub fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_writable_artifact_root(root);
         self
     }
 
-    pub fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_only_root(root);
         self
     }
 
-    pub fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_only_file(file);
         self
     }
 
-    pub fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_hidden_root(root);
-        self
-    }
-
-    pub fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
-        self.config = self.config.with_resource_limits(limits);
         self
     }
 }

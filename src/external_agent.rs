@@ -291,6 +291,21 @@ fn run_external_agent_runtime(
         None
     };
 
+    // An explicit executable is useful only as a bounded, strict-offline version diagnostic.
+    // Never give it repository-write authority, provider network access, ambient API keys, or a
+    // copied Codex auth file. Nonpublishable evidence is not a substitute for preventing the
+    // side effect in the first place.
+    if runtime == ExternalExecutionRuntime::Verified
+        && program_trust == ExternalProgramTrust::ExplicitCustom
+    {
+        report.duration_ms = duration_millis(started.elapsed());
+        report.error = Some(
+            "explicit custom executables are limited to a strict-offline version diagnostic; the external target was not started"
+                .to_string(),
+        );
+        return report;
+    }
+
     if let Err(error) = ensure_existing_output_parent(&spec.json_log)
         .and_then(|_| ensure_existing_output_parent(&spec.output_last_message))
         .and_then(|_| match &spec.output_schema {
@@ -334,7 +349,9 @@ fn run_external_agent_runtime(
         }
     };
 
-    let codex_auth = if runtime == ExternalExecutionRuntime::Verified {
+    let codex_auth = if runtime == ExternalExecutionRuntime::Verified
+        && program_trust == ExternalProgramTrust::TrustedSystemCodex
+    {
         match ValidatedCodexAuth::load() {
             Ok(auth) => auth,
             Err(error) => {
@@ -347,8 +364,10 @@ fn run_external_agent_runtime(
         None
     };
 
-    let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified {
-        match external_side_effect_profile(spec, &resolved_program) {
+    let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
+        && program_trust == ExternalProgramTrust::TrustedSystemCodex
+    {
+        match external_side_effect_profile(spec, &resolved_program, program_trust) {
             Ok(profile) => Some(profile),
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -394,7 +413,10 @@ fn run_external_agent_runtime(
         &spec.cwd,
         OUTPUT_CAPTURE_LIMIT_BYTES,
     )
-    .with_environment(EnvironmentMode::ClearAndSet(allowed_env(spec.invocation)))
+    .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
+        spec.invocation,
+        program_trust,
+    )))
     .with_stdin(StdinMode::Bytes(prompt))
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
@@ -436,6 +458,7 @@ fn run_external_agent_runtime(
             report.process_tree = Some(output.process_tree);
             report.side_effects = Some(output.side_effects);
             if runtime == ExternalExecutionRuntime::Verified
+                && program_trust == ExternalProgramTrust::TrustedSystemCodex
                 && safety_verified
                 && output.status.is_some_and(|status| status.success())
             {
@@ -780,7 +803,11 @@ fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
 fn external_side_effect_profile(
     spec: &ExternalAgentCommand,
     program: &Path,
+    program_trust: ExternalProgramTrust,
 ) -> Result<SideEffectConfinementProfile> {
+    if program_trust != ExternalProgramTrust::TrustedSystemCodex {
+        bail!("provider-network confinement is reserved for the trusted system Codex executable");
+    }
     let program_parent = program
         .parent()
         .with_context(|| format!("executable has no parent: {}", program.display()))?;
@@ -1146,16 +1173,21 @@ fn claude_consultant_argv() -> Vec<String> {
     ]
 }
 
-fn allowed_env(invocation: ExternalAgentInvocation) -> BTreeMap<String, String> {
+fn allowed_env(
+    invocation: ExternalAgentInvocation,
+    program_trust: ExternalProgramTrust,
+) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::from([
         ("LANG".to_string(), "C.UTF-8".to_string()),
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
         ("TERM".to_string(), "dumb".to_string()),
     ]);
-    if matches!(
-        invocation,
-        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
-    ) {
+    if program_trust == ExternalProgramTrust::TrustedSystemCodex
+        && matches!(
+            invocation,
+            ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+        )
+    {
         for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
             if let Ok(value) = env::var(key) {
                 if !value.is_empty() && !value.contains(['\n', '\r', '\0']) {
@@ -1307,6 +1339,39 @@ mod tests {
         assert!(report.succeeded());
     }
 
+    #[test]
+    fn explicit_custom_environment_never_receives_provider_credentials() {
+        let environment = allowed_env(
+            ExternalAgentInvocation::CodexSupervisor,
+            ExternalProgramTrust::ExplicitCustom,
+        );
+        for name in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            assert!(
+                !environment.contains_key(name),
+                "custom environment exposed {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_custom_cannot_construct_provider_network_profile() {
+        let spec = ExternalAgentCommand::codex(
+            "/tmp/custom-codex",
+            "/tmp",
+            "/tmp/prompt",
+            "/tmp/log",
+            "/tmp/report",
+            Duration::from_secs(1),
+        );
+        let error = external_side_effect_profile(
+            &spec,
+            Path::new("/tmp/custom-codex"),
+            ExternalProgramTrust::ExplicitCustom,
+        )
+        .expect_err("custom program must not receive provider-network authority");
+        assert!(error.to_string().contains("trusted system Codex"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn codex_auth_accepts_only_bounded_private_single_link_regular_file() -> Result<()> {
@@ -1369,6 +1434,50 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("timed out before command start")));
         assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_custom_runs_at_most_version_diagnostic_and_never_target() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let marker = temp.path().join("actual-target-ran");
+        let agent = temp.path().join("custom-codex.sh");
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.142.3\\n'; exit 0; fi\ntouch '{}'\n",
+                marker.display()
+            ),
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "never run custom target\n")?;
+        let spec = ExternalAgentCommand::codex(
+            agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            temp.path().join("last-message.txt"),
+            Duration::from_secs(3),
+        );
+
+        let report = run_external_agent(&spec);
+
+        assert!(!marker.exists());
+        assert!(!report.publishable);
+        assert_eq!(report.program_trust, ExternalProgramTrust::ExplicitCustom);
+        assert_eq!(report.codex_permissions, None);
+        if report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("strict-offline version diagnostic"))
+        {
+            assert_eq!(report.process_tree, None);
+            assert_eq!(report.side_effects, None);
+        }
         Ok(())
     }
 
