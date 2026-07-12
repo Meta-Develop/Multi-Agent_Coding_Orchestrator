@@ -45,6 +45,7 @@ const SNAPSHOT_GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUPERVISOR_PROMPT_BYTES: usize = 1024 * 1024;
+const ARTIFACT_FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
@@ -4958,7 +4959,21 @@ fn read_finalized_supervisor_report(
     run_id: &RunId,
     run_dir: &Path,
 ) -> Result<Option<SupervisorFinalReport>> {
-    match fs::symlink_metadata(run_dir) {
+    let run_metadata = match fs::symlink_metadata(run_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect supervisor run directory {}",
+                    run_dir.display()
+                )
+            })
+        }
+    };
+    validate_active_artifact_run_dir(run_dir, &run_metadata)?;
+    let marker = run_dir.join(ARTIFACT_FINALIZATION_MARKER);
+    match fs::symlink_metadata(&marker) {
         Ok(_) => {
             let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, run_id)
                 .with_context(|| {
@@ -4972,11 +4987,37 @@ fn read_finalized_supervisor_report(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| {
             format!(
-                "failed to inspect supervisor run directory {}",
-                run_dir.display()
+                "failed to inspect supervisor finalization marker {}",
+                marker.display()
             )
         }),
     }
+}
+
+fn validate_active_artifact_run_dir(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "supervisor run path is not a nofollow directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!(
+                "supervisor run directory is not owned by the effective user: {}",
+                path.display()
+            );
+        }
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            bail!(
+                "supervisor run directory is not owner-private: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn write_artifact_json<T: Serialize>(
@@ -5230,6 +5271,189 @@ mod tests {
     }
 
     #[test]
+    fn supervise_writer_discards_reusable_invocation_scratches_and_finalizes_private_evidence() {
+        let (_temp, repo_path) = injected_repository();
+        let run_id = RunId::new("artifact-scratch-finalized").expect("valid run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "supervise-test",
+        )
+        .expect("reserve supervise artifact run");
+        let dirs = RunDirs::for_writer(&writer);
+        let (incoming, capture) =
+            create_invocation_scratches(&mut writer).expect("reserve invocation scratches");
+        let artifacts =
+            child_attempt_artifacts(&dirs, incoming.path(), capture.path(), "child-a", 1, false);
+        let assignment = injected_assignment(false);
+        let child_report = injected_child_report(&assignment);
+        let mut child_bytes =
+            serde_json::to_vec_pretty(&child_report).expect("serialize child report");
+        child_bytes.push(b'\n');
+        fs::write(&artifacts.report_path, &child_bytes).expect("write child scratch output");
+        fs::write(&artifacts.log_path, b"private raw capture\n")
+            .expect("write parent capture scratch");
+        let command = ExternalAgentCommand::codex(
+            "unused-codex",
+            &repo_path,
+            &artifacts.prompt_path,
+            &artifacts.log_path,
+            &artifacts.report_path,
+            Duration::from_secs(1),
+        );
+        let external_run = deterministic_fake_run(&command, child_bytes.clone());
+        import_external_attempt_evidence(
+            &mut writer,
+            &incoming,
+            &capture,
+            &artifacts,
+            &external_run,
+            &command,
+            true,
+            SupervisorRuntime::Fake,
+        )
+        .expect("import held evidence and discard scratches");
+
+        assert!(!dirs.run_dir.join("incoming").exists());
+        assert!(!dirs.run_dir.join("capture").exists());
+        assert!(dirs.run_dir.join("evidence/incoming/child-a.json").exists());
+        assert!(dirs.run_dir.join("logs/child-a.jsonl").exists());
+        assert!(dirs.run_dir.join("logs/child-a.summary.json").exists());
+
+        let final_report = artifact_test_final_report(&run_id);
+        write_final_report(&mut writer, &final_report).expect("write final report");
+        let finalization = writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize supervise artifacts");
+        assert!(!finalization.publishable);
+        assert!(finalization
+            .files
+            .iter()
+            .all(|file| file.disposition == ArtifactFileDisposition::PrivateEvidence));
+        assert!(dirs.run_dir.join(ARTIFACT_FINALIZATION_MARKER).exists());
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized supervise artifacts");
+        let restored = read_supervisor_final_report(&reader).expect("read finalized report");
+        assert_eq!(restored.run_id, run_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_scratch_rebind_is_refused_without_deleting_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, repo_path) = injected_repository();
+        let run_id = RunId::new("artifact-scratch-rebind").expect("valid run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            run_id,
+            "supervise-test",
+        )
+        .expect("reserve supervise artifact run");
+        let (incoming, capture) =
+            create_invocation_scratches(&mut writer).expect("reserve invocation scratches");
+        let moved = writer.run_dir().join("moved-incoming");
+        fs::rename(incoming.path(), &moved).expect("move bound incoming scratch");
+        fs::create_dir(incoming.path()).expect("create replacement incoming scratch");
+        fs::set_permissions(incoming.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure replacement permissions");
+        let sentinel = incoming.path().join("sentinel.txt");
+        fs::write(&sentinel, "preserve\n").expect("write replacement sentinel");
+
+        let error = discard_invocation_scratches(&mut writer, &incoming, &capture)
+            .expect_err("rebound scratch must be refused");
+        assert!(error.to_string().contains("scratch") || error.to_string().contains("identity"));
+        assert_eq!(
+            fs::read_to_string(&sentinel).expect("read replacement sentinel"),
+            "preserve\n"
+        );
+        assert!(!capture.path().exists());
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
+        let (_temp, repo_path) = injected_repository();
+        let absent_id = RunId::new("artifact-status-absent").expect("valid absent id");
+        let absent = supervisor_status(&repo_path, absent_id).expect("status absent run");
+        assert!(!absent.final_report_exists);
+
+        let run_id = RunId::new("artifact-status-lifecycle").expect("valid run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "supervise-test",
+        )
+        .expect("reserve active run");
+        let active = supervisor_status(&repo_path, run_id.clone()).expect("status active run");
+        assert!(!active.final_report_exists);
+
+        let final_report = artifact_test_final_report(&run_id);
+        write_final_report(&mut writer, &final_report).expect("write final report");
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize run");
+        let finalized = supervisor_status(&repo_path, run_id.clone()).expect("status finalized");
+        assert!(finalized.final_report_exists);
+
+        let report_path = repo_path
+            .join(RunArtifactFamily::Supervise.run_root())
+            .join(run_id.as_str())
+            .join(RunArtifactFamily::Supervise.final_report_relative_path());
+        fs::remove_file(&report_path).expect("remove manifested report");
+        let error = supervisor_status(&repo_path, run_id)
+            .expect_err("corrupt finalized run must not appear active");
+        assert!(
+            error.to_string().contains("verified finalized artifact")
+                || error.to_string().contains("missing")
+        );
+    }
+
+    #[test]
+    fn dirty_primary_refusal_is_written_and_finalized_without_launching_a_child() {
+        let (temp, repo_path) = injected_repository();
+        fs::write(repo_path.join("README.md"), "dirty\n").expect("dirty primary");
+        let mut plan = injected_plan(injected_assignment(false), 0);
+        plan.assignments.clear();
+        let mut options = injected_options(&repo_path, temp.path(), "dirty-primary-finalized");
+        options.runtime = SupervisorRuntime::Fake;
+        options.allow_dirty_primary = false;
+        let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+            panic!("dirty-primary refusal must not launch an external child")
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("dirty-primary refusal should remain a finalized report");
+        assert!(!report.success);
+        assert!(!report.publishable);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("dirty primary worktree")));
+        let run_id = RunId::new("dirty-primary-finalized").expect("valid run id");
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized dirty-primary refusal");
+        assert!(!reader.finalization().publishable);
+        let restored = read_supervisor_final_report(&reader).expect("read finalized refusal");
+        assert!(!restored.success);
+    }
+
+    #[test]
     fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let repo = Repository::init(temp.path()).expect("initialize repository");
@@ -5342,7 +5566,7 @@ mod tests {
             next_safe_action: "review".to_string(),
         };
         let mut invocations = Vec::new();
-        let report = {
+        let error = {
             let mut runner = |command: &ExternalAgentCommand| {
                 let report_name = command
                     .output_last_message
@@ -5402,7 +5626,7 @@ mod tests {
                 SupervisorExecutionRuntime::NonpublishableSimulation,
                 &mut runner,
             )
-            .expect("collect failed supervisor report")
+            .expect_err("unverified process quiescence must leave the run unfinalized")
         };
 
         assert_eq!(invocations.len(), 1, "unexpected external follow-up launch");
@@ -5422,12 +5646,25 @@ mod tests {
             0,
             "unverified attempt launched a parent auditor"
         );
+        assert!(error.to_string().contains("outstanding scratch"));
+        let run_root = temp
+            .path()
+            .join(".maco/o2/runs/unverified-containment-stops-followups");
+        assert!(run_root.join("incoming").exists());
+        assert!(run_root.join("capture").exists());
+        assert!(!run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());
+        let report: SupervisorFinalReport = serde_json::from_slice(
+            &fs::read(run_root.join("reports/supervisor-final.json"))
+                .expect("read structured unfinalized supervisor report"),
+        )
+        .expect("parse structured unfinalized supervisor report");
         assert!(!report.success);
+        assert!(!report.publishable);
         assert!(report.remaining_risk.contains("verified-empty containment"));
-        assert!(report.orchestrator_reports[0]
+        assert!(report
             .findings
             .iter()
-            .any(|finding| finding.message.contains("Unverified")));
+            .any(|finding| finding.message.contains("not verified empty")));
     }
 
     #[test]
@@ -5553,13 +5790,16 @@ mod tests {
         for relative in [
             "assignments/child-a.attempt-1.prompt.md",
             "assignments/child-a.attempt-2.prompt.md",
-            "incoming/child-a.attempt-1.json",
-            "incoming/child-a.attempt-2.json",
+            "evidence/incoming/child-a.attempt-1.json",
+            "evidence/incoming/child-a.attempt-2.json",
             "reports/child-a.json",
             "reports/supervisor-final.json",
+            ARTIFACT_FINALIZATION_MARKER,
         ] {
             assert!(run_root.join(relative).exists(), "missing {relative}");
         }
+        assert!(!run_root.join("incoming").exists());
+        assert!(!run_root.join("capture").exists());
         let corrective_prompt =
             fs::read_to_string(run_root.join("assignments/child-a.attempt-2.prompt.md"))
                 .expect("read corrective prompt");
@@ -5569,6 +5809,67 @@ mod tests {
         assert!(history.contains("child attempt 1 history"));
         assert!(history.contains("child attempt 2 history"));
         assert!(history.contains("corrective_retry_used=true"));
+    }
+
+    #[test]
+    fn supervise_holds_exclusive_worktree_lease_through_child_and_parent_auditor() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "injected-write-lease");
+        let competing_manager = WorktreeManager::new(&repo_path);
+        let mut invocation_count = 0usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocation_count = invocation_count.saturating_add(1);
+            let read_error = competing_manager
+                .acquire_read_execution_lease(&assignment.id)
+                .expect_err("supervise write lease must exclude a concurrent reader");
+            assert!(read_error.to_string().contains("shared read lease"));
+            let write_error = competing_manager
+                .acquire_write_execution_lease(&assignment.id)
+                .expect_err("supervise write lease must exclude a concurrent writer");
+            assert!(write_error.to_string().contains("exclusive write lease"));
+            let remove_error = competing_manager
+                .remove(&assignment.id, true, false)
+                .expect_err("supervise write lease must exclude managed removal");
+            assert!(remove_error
+                .to_string()
+                .contains("active cooperative execution lease"));
+
+            let output_name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if output_name.contains("review-auditor") {
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+            } else {
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_child_report(&assignment),
+                );
+            }
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run write-lease regression");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(invocation_count, 2, "child and parent auditor must run");
+        let read_after = competing_manager
+            .acquire_read_execution_lease(&assignment.id)
+            .expect("read lease must be available after supervise lifecycle");
+        assert_eq!(read_after.record().name, assignment.id);
     }
 
     #[test]
@@ -6608,6 +6909,41 @@ mod tests {
             codex_bin: PathBuf::from("unused-injected-codex"),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: true,
+        }
+    }
+
+    fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
+        SupervisorFinalReport {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            run_id: run_id.clone(),
+            role: AgentRole::Supervisor,
+            repo: PathBuf::from("."),
+            plan_file: PathBuf::from("plan.json"),
+            run_dir: RunArtifactFamily::Supervise
+                .run_root()
+                .join(run_id.as_str()),
+            runtime: SupervisorRuntime::Fake,
+            publishable: false,
+            success: true,
+            accepted: false,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            assigned_paths: Vec::new(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_tokens: Vec::new(),
+            semantic_intent_tokens: Vec::new(),
+            commands_run: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            orchestrator_reports: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            remaining_risk: "private test evidence".to_string(),
+            next_safe_action: "none".to_string(),
         }
     }
 
