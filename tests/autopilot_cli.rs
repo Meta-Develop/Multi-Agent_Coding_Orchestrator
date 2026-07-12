@@ -194,11 +194,31 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
     ])?;
     let run_id = report["run_id"].as_str().context("generated run id")?;
     assert!(run_id.starts_with("autopilot-"));
-    assert!(repo_path
-        .join(".maco/autopilot/runs")
-        .join(run_id)
-        .join("final-report.json")
-        .exists());
+    let run_dir = repo_path.join(".maco/autopilot/runs").join(run_id);
+    assert!(run_dir.join("final-report.json").exists());
+    assert!(run_dir.join(".maco-artifact-final.json").exists());
+    assert!(
+        !run_dir.join("runtime").exists(),
+        "fake runtime must not create an executable artifact or chmod surface"
+    );
+    assert!(
+        !run_dir
+            .join("runtime")
+            .join("fake-codex-not-executed")
+            .exists(),
+        "the Fake supervisor path must remain a nonexistent spawn sentinel"
+    );
+    let marker: Value =
+        serde_json::from_slice(&fs::read(run_dir.join(".maco-artifact-final.json"))?)
+            .context("parse Autopilot finalization marker")?;
+    assert!(marker["files"]
+        .as_array()
+        .context("marker files")?
+        .iter()
+        .all(|file| !file["path"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("runtime/")));
 
     let latest = run_success_json(&[
         "autopilot",
@@ -245,8 +265,9 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
         .find(|run| run["run_id"] == "zz-corrupt")
         .context("corrupt run")?;
     assert_eq!(corrupt["final_report_exists"], true);
-    assert_eq!(corrupt["final_report_status"], "malformed");
-    assert_eq!(corrupt["final_report_corrupt"], true);
+    assert_eq!(corrupt["final_report_status"], "active");
+    assert_eq!(corrupt["final_report_readable"], false);
+    assert_eq!(corrupt["final_report_corrupt"], false);
 
     let prune = run_success_json(&[
         "autopilot",
@@ -572,6 +593,11 @@ fn status_and_collect_require_verified_finalization_and_distinguish_active_runs(
     fs::set_permissions(&active_dir, fs::Permissions::from_mode(0o700))
         .context("chmod active run")?;
     write_file(&active_dir.join("plan.json"), "{}\n")?;
+    let active_secret = "autopilot-active-final-report-secret";
+    write_file(
+        &active_dir.join("final-report.json"),
+        &format!("{{malformed:{active_secret}:{}\n", repo_path.display()),
+    )?;
     let active = run_success_json(&[
         "autopilot",
         "status",
@@ -581,8 +607,11 @@ fn status_and_collect_require_verified_finalization_and_distinguish_active_runs(
         "--json",
     ])?;
     assert_eq!(active["artifacts"]["plan"], true);
-    assert_eq!(active["artifacts"]["final_report"], false);
+    assert_eq!(active["artifacts"]["final_report"], true);
     assert!(active["final_report"].is_null());
+    let active_serialized = serde_json::to_string(&active).context("serialize active status")?;
+    assert!(!active_serialized.contains(active_secret));
+    assert!(!active_serialized.contains(&repo_path.display().to_string()));
     let active_collect = run_failure_stderr(&[
         "autopilot",
         "collect",
