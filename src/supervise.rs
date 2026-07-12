@@ -2954,42 +2954,41 @@ fn shared_index_path(repo: &Repository) -> Result<Option<PathBuf>> {
 }
 
 fn sanitized_git_output(workdir: &Path, args: &[&str]) -> Result<std::process::Output> {
-    const AMBIENT_GIT_ENV: &[&str] = &[
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        "GIT_PREFIX",
-        "GIT_INTERNAL_SUPER_PREFIX",
-        "GIT_CONFIG",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_CONFIG_NOSYSTEM",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_EXEC_PATH",
-    ];
+    const SNAPSHOT_ENV_ALLOWLIST: &[&str] = &["PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC"];
     let mut command = Command::new("git");
     command
+        .env_clear()
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", git_null_device())
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("--no-pager")
         .arg("--no-optional-locks")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("core.untrackedCache=false")
         .arg("-C")
         .arg(workdir)
         .args(args);
-    for name in AMBIENT_GIT_ENV {
-        command.env_remove(name);
-    }
-    for (name, _) in env::vars_os() {
-        let name_text = name.to_string_lossy();
-        if name_text.starts_with("GIT_CONFIG_KEY_") || name_text.starts_with("GIT_CONFIG_VALUE_") {
-            command.env_remove(name);
+    for name in SNAPSHOT_ENV_ALLOWLIST {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
         }
     }
-    command.env("LC_ALL", "C").output().map_err(Into::into)
+    command.output().map_err(Into::into)
+}
+
+#[cfg(target_os = "windows")]
+fn git_null_device() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn git_null_device() -> &'static str {
+    "/dev/null"
 }
 
 fn primary_path_state(

@@ -1932,6 +1932,9 @@ fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Resu
     Repository::init(&decoy_path).context("init decoy repository")?;
     let fake_codex = write_fake_codex(temp.path())?;
     let plan_path = temp.path().join("ambient-git-plan.json");
+    let trace_path = temp.path().join("ambient-git-trace.log");
+    let trace2_path = temp.path().join("ambient-git-trace2.json");
+    let redirected_stderr_path = temp.path().join("ambient-git-stderr.log");
     write_plan(
         &plan_path,
         r#"{
@@ -1957,6 +1960,12 @@ fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Resu
         .env("GIT_WORK_TREE", &decoy_path)
         .env("GIT_INDEX_FILE", temp.path().join("ambient-index"))
         .env("GIT_COMMON_DIR", decoy_path.join(".git"))
+        .env("GIT_TRACE", &trace_path)
+        .env("GIT_TRACE2_EVENT", &trace2_path)
+        .env("GIT_REDIRECT_STDERR", &redirected_stderr_path)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", "definitely-not-a-safe-fsmonitor")
         .output()
         .context("run supervise with ambient Git redirects")?;
     if !output.status.success() {
@@ -1967,6 +1976,18 @@ fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Resu
     }
     let report: Value = serde_json::from_slice(&output.stdout).context("parse ambient report")?;
     assert_eq!(report["success"], true);
+    assert!(
+        !trace_path.exists(),
+        "sanitized Git snapshots must not honor GIT_TRACE"
+    );
+    assert!(
+        !trace2_path.exists(),
+        "sanitized Git snapshots must not honor GIT_TRACE2_EVENT"
+    );
+    assert!(
+        !redirected_stderr_path.exists(),
+        "sanitized Git snapshots must not honor GIT_REDIRECT_STDERR"
+    );
     Ok(())
 }
 
