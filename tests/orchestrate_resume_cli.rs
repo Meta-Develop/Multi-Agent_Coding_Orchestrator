@@ -40,6 +40,9 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
 
     let checkpoint_path = checkpoint_dir.join(format!("{run_id}.json"));
     assert!(checkpoint_path.exists());
+    let checkpoint: Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path)?).context("parse written checkpoint")?;
+    assert_eq!(checkpoint["version"], 2);
 
     if !verified_backend_available {
         assert_eq!(run_summary["success"], false);
@@ -59,6 +62,17 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
     }
 
     assert_eq!(run_summary["success"], true);
+    assert_eq!(run_summary["agents"][0]["candidate_binding"]["version"], 1);
+    assert_eq!(
+        run_summary["agents"][0]["candidate_binding"]["changed_paths"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        run_summary["repo_validation_target"]["kind"],
+        "base_no_changes"
+    );
+    assert_eq!(run_summary["repo_validation_target"]["candidate_count"], 1);
+    assert_eq!(run_summary["repo_validation_target"]["patch_count"], 0);
 
     let resume_summary = run_success_json(&[
         "orchestrate",
@@ -81,6 +95,14 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
     );
     assert_eq!(resume_summary["agents"][0]["id"], "agent-a");
     assert_eq!(resume_summary["agents"][0]["status"], "succeeded");
+    assert_eq!(
+        resume_summary["agents"][0]["candidate_binding"],
+        run_summary["agents"][0]["candidate_binding"]
+    );
+    assert_eq!(
+        resume_summary["repo_validation_target"],
+        run_summary["repo_validation_target"]
+    );
 
     let renamed_checkpoint = checkpoint_dir.join("renamed.json");
     fs::copy(&checkpoint_path, &renamed_checkpoint).context("copy checkpoint")?;
