@@ -54,10 +54,11 @@ const REVIEW_SYMLINK_LIMIT_BYTES: usize = 4 * 1024;
 const REVIEW_PREWALK_MAX_DEPTH: usize = 128;
 const REVIEW_PREWALK_TIMEOUT: Duration = Duration::from_secs(5);
 const REVIEW_SCHEMA_VERSION: u32 = 1;
-const REVIEW_SANDBOX_POLICY_VERSION: u32 = 1;
+const REVIEW_SANDBOX_POLICY_VERSION: u32 = 2;
 const EXTERNAL_REVIEWER_BINDING_DOMAIN: &[u8] = b"MACO\0external-reviewer-binding\0v1\0";
 const EXTERNAL_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0external-review-request\0v1\0";
 const FAKE_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0fake-review-request\0v1\0";
+const SANITIZED_REVIEW_VIEW_DOMAIN: &[u8] = b"MACO\0sanitized-review-view\0v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewExecutionRuntime {
@@ -697,10 +698,22 @@ fn external_review_runtime(
     let source_program = BoundReviewerProgram::bind(&repository, program)?;
     if runtime == ReviewExecutionRuntime::Verified {
         validate_verified_reviewer_program(&repository, &source_program, &options.reviewer.args)?;
+        validate_sanitized_changed_paths(&options.changed_paths)?;
     }
     let materialized_program = MaterializedReviewerProgram::create(source_program)?;
     let before = repository.snapshot()?;
+    let sanitized_view = match runtime {
+        ReviewExecutionRuntime::Verified => Some(SanitizedReviewerView::create(&repository)?),
+        #[cfg(test)]
+        ReviewExecutionRuntime::NonpublishableSimulation => None,
+    };
     materialized_program.verify(&repository)?;
+    if let Some(view) = &sanitized_view {
+        view.verify(&repository)?;
+        if repository.snapshot()? != before {
+            bail!("review repository changed while constructing the sanitized view");
+        }
+    }
     let effective_timeout_seconds = options
         .reviewer
         .timeout_seconds
@@ -712,6 +725,7 @@ fn external_review_runtime(
         &before,
         &reviewer_identity,
         &materialized_program.binding,
+        sanitized_view.as_ref().map(SanitizedReviewerView::binding),
         effective_timeout_seconds,
     )?;
     let input = serde_json::to_vec(&ExternalReviewInput {
@@ -731,12 +745,22 @@ fn external_review_runtime(
         );
     }
     let timeout = Some(Duration::from_secs(effective_timeout_seconds));
-    let confinement = repository.confinement_profile()?;
+    let execution_root = sanitized_view
+        .as_ref()
+        .map(SanitizedReviewerView::path)
+        .unwrap_or_else(|| repository.worktree_root.path().to_path_buf());
+    let confinement = sanitized_view
+        .as_ref()
+        .map(|view| {
+            repository
+                .sanitized_confinement_profile(&view.path(), &materialized_program.directory_path())
+        })
+        .transpose()?;
     let mut process_spec = ProcessSpec::direct(
         "external reviewer program",
         &materialized_program.execution_path,
         options.reviewer.args.clone(),
-        repository.worktree_root.path(),
+        &execution_root,
         REVIEW_CAPTURE_LIMIT_BYTES,
     )
     .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
@@ -753,7 +777,7 @@ fn external_review_runtime(
         ReviewExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                confinement,
+                confinement.context("verified reviewer omitted sanitized confinement")?,
             )),
         #[cfg(test)]
         ReviewExecutionRuntime::NonpublishableSimulation => process_spec
@@ -762,6 +786,9 @@ fn external_review_runtime(
     .context("failed to run external reviewer program")?;
     repository.verify()?;
     materialized_program.verify(&repository)?;
+    if let Some(view) = &sanitized_view {
+        view.verify(&repository)?;
+    }
     let after = repository.snapshot()?;
     if let Some(error) = &output.stdin_error {
         bail!(error.clone());
@@ -1028,6 +1055,10 @@ impl MaterializedReviewerProgram {
         }
         Ok(())
     }
+
+    fn directory_path(&self) -> PathBuf {
+        self.root.path().join(&self.directory_name)
+    }
 }
 
 impl Drop for MaterializedReviewerProgram {
@@ -1039,6 +1070,661 @@ impl Drop for MaterializedReviewerProgram {
             TreeLinkPolicy::RejectLinksAndSpecialFiles,
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SanitizedViewOrigin {
+    tracked: bool,
+    untracked: bool,
+    skip_worktree: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SanitizedViewSelection {
+    entries: BTreeMap<PathBuf, SanitizedViewOrigin>,
+}
+
+#[derive(Debug)]
+struct SanitizedReviewerView {
+    root: SafeRoot,
+    directory_name: OsString,
+    directory_identity: FileIdentity,
+    selection: SanitizedViewSelection,
+    source_directories: BTreeMap<PathBuf, BoundReviewDirectory>,
+    source_entries: BTreeMap<PathBuf, SnapshotTreeEntry>,
+    binding: String,
+}
+
+impl SanitizedReviewerView {
+    fn create(repository: &ReviewRepositoryBinding) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let selection = collect_sanitized_view_selection(repository)?;
+            validate_sanitized_view_paths(&selection)?;
+            let reader = ReviewTreeReader::bind(&repository.worktree_root)?;
+            let mut source_entries = BTreeMap::new();
+            let mut regular_contents = BTreeMap::new();
+            let mut total_content_bytes = 0u64;
+            for (path, origin) in &selection.entries {
+                let before = reader.snapshot_entry(path, &mut total_content_bytes)?;
+                if matches!(before, SnapshotTreeEntry::Missing) && origin.skip_worktree {
+                    bail!("sanitized reviewer view refuses sparse-missing tracked entries");
+                }
+                validate_sanitized_view_entry_mode(&before)?;
+                if let SnapshotTreeEntry::Regular { length, sha256, .. } = &before {
+                    let bytes = BoundedRegularReader::read_relative(
+                        repository.worktree_root.path(),
+                        path,
+                        REVIEW_SNAPSHOT_FILE_LIMIT_BYTES,
+                    )
+                    .map_err(|_| anyhow::anyhow!("sanitized reviewer source read was refused"))?;
+                    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != *length
+                        || sha256_bytes(&bytes) != *sha256
+                    {
+                        bail!("sanitized reviewer source changed during bounded copy");
+                    }
+                    let mut verify_total = 0u64;
+                    if reader.snapshot_entry(path, &mut verify_total)? != before {
+                        bail!("sanitized reviewer source changed during bounded copy");
+                    }
+                    regular_contents.insert(path.clone(), bytes);
+                }
+                source_entries.insert(path.clone(), before);
+            }
+            let directory_paths = sanitized_view_parent_directories(&source_entries)?;
+            let mut source_directories = BTreeMap::new();
+            for path in directory_paths {
+                let directory = reader.snapshot_directory(&path)?;
+                if directory.mode & 0o7000 != 0 {
+                    bail!("sanitized reviewer source directory has unsafe special mode bits");
+                }
+                source_directories.insert(path.clone(), directory);
+            }
+            validate_sanitized_view_symlinks(&source_entries, &source_directories)?;
+            reader.verify(&repository.worktree_root)?;
+
+            let runtime_root = trusted_linux_runtime_root()
+                .context("sanitized reviewer view requires an owner-private runtime root")?;
+            let root = SafeRoot::open_existing(runtime_root)
+                .map_err(|_| anyhow::anyhow!("sanitized reviewer runtime root is unsafe"))?;
+            let reserved = root.reserve_random_direct_child_directory("maco-review-view")?;
+            let directory_name = reserved
+                .path()
+                .file_name()
+                .context("sanitized reviewer view has no directory name")?
+                .to_os_string();
+            let directory_identity = reserved.identity().clone();
+            let binding = sanitized_view_binding(&selection, &source_directories, &source_entries)?;
+            let view = Self {
+                root,
+                directory_name,
+                directory_identity,
+                selection,
+                source_directories,
+                source_entries,
+                binding,
+            };
+            let writer = SanitizedViewWriter::open(view.path(), &view.directory_identity)?;
+            for (path, directory) in &view.source_directories {
+                writer.create_directory(path, directory.mode)?;
+            }
+            for (path, entry) in &view.source_entries {
+                match entry {
+                    SnapshotTreeEntry::Missing => {}
+                    SnapshotTreeEntry::Regular { mode, .. } => writer.create_regular(
+                        path,
+                        regular_contents
+                            .get(path)
+                            .context("sanitized reviewer copy omitted regular contents")?,
+                        *mode,
+                    )?,
+                    SnapshotTreeEntry::Symlink { target, .. } => {
+                        writer.create_symlink(path, target)?
+                    }
+                }
+            }
+            for (path, directory) in view.source_directories.iter().rev() {
+                writer.set_directory_mode(path, directory.mode)?;
+            }
+            view.verify(repository)?;
+            Ok(view)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = repository;
+            bail!("sanitized reviewer views are unsupported on this platform")
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.root.path().join(&self.directory_name)
+    }
+
+    fn binding(&self) -> &str {
+        &self.binding
+    }
+
+    fn verify(&self, repository: &ReviewRepositoryBinding) -> Result<()> {
+        self.root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("sanitized reviewer runtime root changed"))?;
+        let reserved = self
+            .root
+            .bind_existing_direct_child_directory(&self.directory_name)?;
+        if reserved.identity() != &self.directory_identity {
+            bail!("sanitized reviewer view directory identity changed");
+        }
+        if collect_sanitized_view_selection(repository)? != self.selection {
+            bail!("sanitized reviewer index or worktree selection changed");
+        }
+        let source = ReviewTreeReader::bind(&repository.worktree_root)?;
+        for (path, expected) in &self.source_directories {
+            if source.snapshot_directory(path)? != *expected {
+                bail!("sanitized reviewer source directory changed");
+            }
+        }
+        let mut source_total = 0u64;
+        for (path, expected) in &self.source_entries {
+            if source.snapshot_entry(path, &mut source_total)? != *expected {
+                bail!("sanitized reviewer source entry changed");
+            }
+        }
+        source.verify(&repository.worktree_root)?;
+
+        let view_root = SafeRoot::open_existing(self.path())
+            .map_err(|_| anyhow::anyhow!("sanitized reviewer view root is unsafe"))?;
+        let observed_paths = collect_sanitized_view_paths(&view_root)?;
+        let expected_paths = self
+            .source_directories
+            .keys()
+            .cloned()
+            .chain(self.source_entries.iter().filter_map(|(path, entry)| {
+                (!matches!(entry, SnapshotTreeEntry::Missing)).then_some(path.clone())
+            }))
+            .collect::<BTreeSet<_>>();
+        if observed_paths != expected_paths {
+            bail!("sanitized reviewer view contained missing or extra paths");
+        }
+        let view = ReviewTreeReader::bind(&view_root)?;
+        for (path, expected) in &self.source_directories {
+            let observed = view.snapshot_directory(path)?;
+            if observed.mode & 0o777 != expected.mode & 0o777 {
+                bail!("sanitized reviewer directory mode changed");
+            }
+        }
+        let mut view_total = 0u64;
+        for (path, expected) in &self.source_entries {
+            if matches!(expected, SnapshotTreeEntry::Missing) {
+                continue;
+            }
+            let observed = view.snapshot_entry(path, &mut view_total)?;
+            if !sanitized_view_content_matches(expected, &observed) {
+                bail!("sanitized reviewer view content or mode changed");
+            }
+        }
+        view.verify(&view_root)?;
+        Ok(())
+    }
+}
+
+impl Drop for SanitizedReviewerView {
+    fn drop(&mut self) {
+        let _ = remove_direct_child_tree(
+            &self.root,
+            &self.directory_name,
+            Some(&self.directory_identity),
+            TreeLinkPolicy::UnlinkLinks,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SanitizedViewWriter {
+    root: File,
+}
+
+#[cfg(target_os = "linux")]
+impl SanitizedViewWriter {
+    fn open(path: PathBuf, expected: &FileIdentity) -> Result<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let root = options
+            .open(path)
+            .context("failed to bind sanitized reviewer view")?;
+        if file_identity_from_metadata(&root.metadata()?) != *expected {
+            bail!("sanitized reviewer view binding changed");
+        }
+        Ok(Self { root })
+    }
+
+    fn create_directory(&self, path: &Path, _mode: u32) -> Result<()> {
+        let (parent, name) = self.open_parent(path)?;
+        let name = c_string(&name)?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create sanitized reviewer directory");
+        }
+        Ok(())
+    }
+
+    fn create_regular(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+        let (parent, name) = self.open_parent(path)?;
+        let name = c_string(&name)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create sanitized reviewer file");
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(bytes)
+            .context("failed to write sanitized reviewer file")?;
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode & 0o777) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to set sanitized reviewer file mode");
+        }
+        file.sync_all()
+            .context("failed to flush sanitized reviewer file")?;
+        Ok(())
+    }
+
+    fn create_symlink(&self, path: &Path, target: &[u8]) -> Result<()> {
+        let (parent, name) = self.open_parent(path)?;
+        let name = c_string(&name)?;
+        let target = std::ffi::CString::new(target)
+            .context("sanitized reviewer symlink target contained NUL")?;
+        if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create sanitized reviewer symlink");
+        }
+        Ok(())
+    }
+
+    fn set_directory_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let directory = self.open_directory(path)?;
+        if unsafe { libc::fchmod(directory.as_raw_fd(), mode & 0o777) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to set sanitized reviewer directory mode");
+        }
+        Ok(())
+    }
+
+    fn open_parent(&self, path: &Path) -> Result<(File, OsString)> {
+        validate_snapshot_relative_path(path)?;
+        let name = path
+            .file_name()
+            .context("sanitized reviewer path has no filename")?
+            .to_os_string();
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        Ok((self.open_directory(parent)?, name))
+    }
+
+    fn open_directory(&self, path: &Path) -> Result<File> {
+        let duplicated = unsafe { libc::dup(self.root.as_raw_fd()) };
+        if duplicated < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to duplicate sanitized reviewer root");
+        }
+        let mut directory = unsafe { File::from_raw_fd(duplicated) };
+        for component in path.components() {
+            let std::path::Component::Normal(component) = component else {
+                bail!("sanitized reviewer directory path is not canonical");
+            };
+            let component = c_string(component)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to traverse sanitized reviewer directory");
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(directory)
+    }
+}
+
+fn collect_sanitized_view_selection(
+    repository: &ReviewRepositoryBinding,
+) -> Result<SanitizedViewSelection> {
+    repository.verify()?;
+    let git = git2::Repository::open(repository.worktree_root.path())
+        .context("failed to enumerate sanitized reviewer selection")?;
+    let index = git
+        .index()
+        .context("failed to read sanitized reviewer index")?;
+    let mut entries = BTreeMap::<PathBuf, SanitizedViewOrigin>::new();
+    for entry in index.iter() {
+        if entry.mode & 0o170000 == 0o160000 {
+            bail!("sanitized reviewer view refuses gitlinks/submodules");
+        }
+        if entry.mode & 0o170000 == 0o040000 || entry.flags & 0x3000 != 0 {
+            bail!("sanitized reviewer view refuses sparse or unmerged index entries");
+        }
+        let path = path_from_git_bytes(&entry.path)?;
+        validate_snapshot_relative_path(&path)?;
+        if sanitized_view_excludes_path(&path) {
+            bail!("sanitized reviewer view refuses tracked .maco runtime paths");
+        }
+        let flags = git2::IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended);
+        let origin = entries.entry(path).or_default();
+        origin.tracked = true;
+        origin.skip_worktree |= flags.is_skip_worktree();
+        if entries.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+            bail!("sanitized reviewer view exceeds its entry limit");
+        }
+    }
+    let mut status_options = git2::StatusOptions::new();
+    status_options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .recurse_ignored_dirs(false);
+    let statuses = git
+        .statuses(Some(&mut status_options))
+        .context("failed to enumerate sanitized reviewer worktree")?;
+    if statuses.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+        bail!("sanitized reviewer status exceeds its entry limit");
+    }
+    for status in statuses.iter() {
+        if !status.status().contains(git2::Status::WT_NEW)
+            || status.status().contains(git2::Status::IGNORED)
+        {
+            continue;
+        }
+        let path = path_from_git_bytes(status.path_bytes())?;
+        validate_snapshot_relative_path(&path)?;
+        if sanitized_view_excludes_path(&path) {
+            continue;
+        }
+        entries.entry(path).or_default().untracked = true;
+        if entries.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+            bail!("sanitized reviewer view exceeds its entry limit");
+        }
+    }
+    repository.verify()?;
+    Ok(SanitizedViewSelection { entries })
+}
+
+fn sanitized_view_excludes_path(path: &Path) -> bool {
+    path.components().next().is_some_and(|component| {
+        matches!(component, std::path::Component::Normal(value) if value == OsStr::new(".maco"))
+    })
+}
+
+fn validate_sanitized_changed_paths(paths: &[PathBuf]) -> Result<()> {
+    if paths.iter().any(|path| sanitized_view_excludes_path(path)) {
+        bail!("verified external review refuses changed .maco runtime paths");
+    }
+    Ok(())
+}
+
+fn validate_sanitized_view_paths(selection: &SanitizedViewSelection) -> Result<()> {
+    let mut folded = BTreeMap::<Vec<u8>, PathBuf>::new();
+    let mut materialized = BTreeSet::<PathBuf>::new();
+    for path in selection.entries.keys() {
+        let depth = path.components().count();
+        if depth == 0 || depth > REVIEW_PREWALK_MAX_DEPTH {
+            bail!("sanitized reviewer path exceeds its depth limit");
+        }
+        materialized.insert(path.clone());
+        let mut parent = path.parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            materialized.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    if materialized.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+        bail!("sanitized reviewer materialization exceeds its entry limit");
+    }
+    for path in &materialized {
+        let key = path_bytes(path)
+            .into_iter()
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if let Some(existing) = folded.insert(key, path.clone()) {
+            if existing != *path {
+                bail!("sanitized reviewer path set contains a case collision");
+            }
+        }
+    }
+    for path in selection.entries.keys() {
+        let mut parent = path.parent();
+        while let Some(candidate) = parent.filter(|value| !value.as_os_str().is_empty()) {
+            if selection.entries.contains_key(candidate) {
+                bail!("sanitized reviewer path set contains a file/directory collision");
+            }
+            parent = candidate.parent();
+        }
+    }
+    Ok(())
+}
+
+fn sanitized_view_parent_directories(
+    entries: &BTreeMap<PathBuf, SnapshotTreeEntry>,
+) -> Result<Vec<PathBuf>> {
+    let mut directories = BTreeSet::new();
+    for (path, entry) in entries {
+        if matches!(entry, SnapshotTreeEntry::Missing) {
+            continue;
+        }
+        let mut parent = path.parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            directories.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    if directories.len().saturating_add(entries.len()) > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+        bail!("sanitized reviewer view exceeds its materialized path limit");
+    }
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|path| path.components().count());
+    Ok(directories)
+}
+
+fn validate_sanitized_view_symlinks(
+    entries: &BTreeMap<PathBuf, SnapshotTreeEntry>,
+    directories: &BTreeMap<PathBuf, BoundReviewDirectory>,
+) -> Result<()> {
+    for (path, entry) in entries {
+        let SnapshotTreeEntry::Symlink { target, .. } = entry else {
+            continue;
+        };
+        let resolved = resolve_internal_symlink_target(path, target)?;
+        if sanitized_view_excludes_path(&resolved) {
+            bail!("sanitized reviewer symlink targets excluded runtime state");
+        }
+        let targets_regular = matches!(
+            entries.get(&resolved),
+            Some(SnapshotTreeEntry::Regular { .. })
+        );
+        if !targets_regular && !directories.contains_key(&resolved) {
+            bail!("sanitized reviewer symlink must target a selected regular file or directory");
+        }
+    }
+    Ok(())
+}
+
+fn sanitized_view_content_matches(
+    expected: &SnapshotTreeEntry,
+    observed: &SnapshotTreeEntry,
+) -> bool {
+    match (expected, observed) {
+        (
+            SnapshotTreeEntry::Regular {
+                mode: expected_mode,
+                length: expected_length,
+                sha256: expected_sha256,
+                ..
+            },
+            SnapshotTreeEntry::Regular {
+                mode: observed_mode,
+                length: observed_length,
+                sha256: observed_sha256,
+                ..
+            },
+        ) => {
+            expected_mode & 0o777 == observed_mode & 0o777
+                && expected_length == observed_length
+                && expected_sha256 == observed_sha256
+        }
+        (
+            SnapshotTreeEntry::Symlink {
+                mode: expected_mode,
+                target: expected_target,
+                ..
+            },
+            SnapshotTreeEntry::Symlink {
+                mode: observed_mode,
+                target: observed_target,
+                ..
+            },
+        ) => expected_mode == observed_mode && expected_target == observed_target,
+        _ => false,
+    }
+}
+
+fn sanitized_view_binding(
+    selection: &SanitizedViewSelection,
+    directories: &BTreeMap<PathBuf, BoundReviewDirectory>,
+    entries: &BTreeMap<PathBuf, SnapshotTreeEntry>,
+) -> Result<String> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        &u64::try_from(selection.entries.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for (path, origin) in &selection.entries {
+        append_snapshot_bytes(&mut bytes, &path_bytes(path))?;
+        bytes.extend_from_slice(&[
+            u8::from(origin.tracked),
+            u8::from(origin.untracked),
+            u8::from(origin.skip_worktree),
+        ]);
+        match entries
+            .get(path)
+            .context("sanitized view binding omitted source entry")?
+        {
+            SnapshotTreeEntry::Missing => bytes.push(0),
+            SnapshotTreeEntry::Regular {
+                mode,
+                length,
+                sha256,
+                ..
+            } => {
+                bytes.push(1);
+                bytes.extend_from_slice(&(mode & 0o777).to_be_bytes());
+                bytes.extend_from_slice(&length.to_be_bytes());
+                bytes.extend_from_slice(sha256);
+            }
+            SnapshotTreeEntry::Symlink { mode, target, .. } => {
+                bytes.push(2);
+                bytes.extend_from_slice(&(mode & 0o777).to_be_bytes());
+                append_snapshot_bytes(&mut bytes, target)?;
+            }
+        }
+    }
+    bytes.extend_from_slice(
+        &u64::try_from(directories.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for (path, directory) in directories {
+        append_snapshot_bytes(&mut bytes, &path_bytes(path))?;
+        bytes.extend_from_slice(&(directory.mode & 0o777).to_be_bytes());
+    }
+    Ok(domain_sha256(SANITIZED_REVIEW_VIEW_DOMAIN, &bytes))
+}
+
+fn validate_sanitized_view_entry_mode(entry: &SnapshotTreeEntry) -> Result<()> {
+    let mode = match entry {
+        SnapshotTreeEntry::Missing => return Ok(()),
+        SnapshotTreeEntry::Regular { mode, .. } | SnapshotTreeEntry::Symlink { mode, .. } => *mode,
+    };
+    if mode & 0o7000 != 0 {
+        bail!("sanitized reviewer source entry has unsafe special mode bits");
+    }
+    Ok(())
+}
+
+fn collect_sanitized_view_paths(root: &SafeRoot) -> Result<BTreeSet<PathBuf>> {
+    let reader = ReviewTreeReader::bind(root)?;
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now()
+            .checked_add(REVIEW_PREWALK_TIMEOUT)
+            .context("sanitized reviewer view deadline overflow")?;
+        let mut paths = BTreeSet::new();
+        collect_sanitized_view_directory(&reader.root, Path::new(""), 0, deadline, &mut paths)?;
+        reader.verify(root)?;
+        Ok(paths)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = reader;
+        bail!("sanitized reviewer view enumeration is unsupported on this platform")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_sanitized_view_directory(
+    directory: &File,
+    relative: &Path,
+    depth: usize,
+    deadline: Instant,
+    paths: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    if depth > REVIEW_PREWALK_MAX_DEPTH || Instant::now() > deadline {
+        bail!("sanitized reviewer view enumeration exceeded its bounds");
+    }
+    for name in review_directory_entries(directory, deadline)? {
+        let path = relative.join(&name);
+        validate_snapshot_relative_path(&path)?;
+        if !paths.insert(path.clone()) || paths.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+            bail!("sanitized reviewer view enumeration exceeded its entry limit");
+        }
+        let name = c_string(&name)?;
+        let stat = stat_at_nofollow(directory, &name)?;
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to bind sanitized reviewer directory");
+                }
+                let child = unsafe { File::from_raw_fd(fd) };
+                collect_sanitized_view_directory(
+                    &child,
+                    &path,
+                    depth.saturating_add(1),
+                    deadline,
+                    paths,
+                )?;
+            }
+            libc::S_IFREG | libc::S_IFLNK => {}
+            _ => bail!("sanitized reviewer view contains a special file"),
+        }
+    }
+    Ok(())
 }
 
 impl BoundReviewerProgram {
@@ -1574,6 +2260,7 @@ impl ReviewRepositoryBinding {
         Ok(())
     }
 
+    #[cfg(test)]
     fn confinement_profile(&self) -> Result<StrictOfflineWorkspaceProfile> {
         self.verify()?;
         let profile = StrictOfflineWorkspaceProfile::read_only(self.worktree_root.path());
@@ -1583,6 +2270,37 @@ impl ReviewRepositoryBinding {
             }
             ReviewStateBinding::MissingMaco | ReviewStateBinding::MissingState { .. } => profile,
         })
+    }
+
+    fn sanitized_confinement_profile(
+        &self,
+        view_root: &Path,
+        materialized_reviewer_root: &Path,
+    ) -> Result<StrictOfflineWorkspaceProfile> {
+        self.verify()?;
+        let mut hidden = BTreeSet::new();
+        for root in [
+            self.worktree_root.path(),
+            self.git_dir_root.path(),
+            self.common_dir_root.path(),
+        ] {
+            hidden.insert(root.to_path_buf());
+            if let Some(parent) = root.parent().filter(|path| *path != Path::new("/")) {
+                hidden.insert(parent.to_path_buf());
+            }
+        }
+        if let ReviewStateBinding::Bound { state_root, .. } = &self.state {
+            hidden.insert(state_root.path().to_path_buf());
+        }
+        let hidden = minimal_sanitized_hidden_roots(hidden);
+        let mut profile = StrictOfflineWorkspaceProfile::read_only(view_root)
+            .with_visible_read_only_root("/nix/store")
+            .with_visible_read_only_root(materialized_reviewer_root)
+            .with_isolated_host_view();
+        for root in hidden {
+            profile = profile.with_hidden_root(root);
+        }
+        Ok(profile)
     }
 
     fn snapshot(&self) -> Result<ReviewRepoSnapshot> {
@@ -1792,6 +2510,24 @@ impl ReviewStateBinding {
     }
 }
 
+fn minimal_sanitized_hidden_roots(roots: BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut minimal = Vec::<PathBuf>::new();
+    for root in roots {
+        if minimal.iter().any(|ancestor| root.starts_with(ancestor)) {
+            continue;
+        }
+        minimal.push(root);
+    }
+    minimal
+}
+
 fn bind_review_state(common_root: &SafeRoot) -> Result<ReviewStateBinding> {
     if !common_root.direct_child_exists("maco")? {
         return Ok(ReviewStateBinding::MissingMaco);
@@ -1844,6 +2580,16 @@ enum SnapshotTreeEntry {
         changed_seconds: i64,
         changed_nanoseconds: i64,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundReviewDirectory {
+    mode: u32,
+    identity: FileIdentity,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 impl SnapshotTreeEntry {
@@ -1977,6 +2723,50 @@ impl ReviewTreeReader {
         }
         #[cfg(not(unix))]
         bail!("exact no-follow review snapshots are unsupported on this platform")
+    }
+
+    fn snapshot_directory(&self, path: &Path) -> Result<BoundReviewDirectory> {
+        validate_snapshot_relative_path(path)?;
+        #[cfg(unix)]
+        {
+            let (parent, name) = self
+                .open_parent(path)?
+                .context("review directory parent is missing or unsafe")?;
+            let name_c = c_string(&name)?;
+            let before =
+                stat_at_nofollow(&parent, &name_c).context("failed to inspect review directory")?;
+            if before.st_uid != unsafe { libc::geteuid() }
+                || before.st_mode & libc::S_IFMT != libc::S_IFDIR
+            {
+                bail!("review directory identity or ownership is unsafe");
+            }
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to bind review directory without following links");
+            }
+            let directory = unsafe { File::from_raw_fd(fd) };
+            let opened = fstat_file(&directory)?;
+            if !same_stat_generation(&before, &opened) {
+                bail!("review directory changed during binding");
+            }
+            Ok(BoundReviewDirectory {
+                mode: opened.st_mode,
+                identity: file_identity_from_stat(&opened),
+                modified_seconds: opened.st_mtime,
+                modified_nanoseconds: stat_modified_nanoseconds(&opened),
+                changed_seconds: opened.st_ctime,
+                changed_nanoseconds: stat_changed_nanoseconds(&opened),
+            })
+        }
+        #[cfg(not(unix))]
+        bail!("exact no-follow review directories are unsupported on this platform")
     }
 
     fn prewalk(&self) -> Result<()> {
@@ -2596,6 +3386,11 @@ fn validate_snapshot_entry_owner_and_links(stat: &libc::stat) -> Result<()> {
 
 #[cfg(unix)]
 fn validate_internal_symlink_target(path: &Path, target: &[u8]) -> Result<()> {
+    resolve_internal_symlink_target(path, target).map(|_| ())
+}
+
+#[cfg(unix)]
+fn resolve_internal_symlink_target(path: &Path, target: &[u8]) -> Result<PathBuf> {
     if target.is_empty() {
         bail!("review worktree symlink target cannot be empty");
     }
@@ -2630,7 +3425,7 @@ fn validate_internal_symlink_target(path: &Path, target: &[u8]) -> Result<()> {
     {
         bail!("review worktree symlink must not enter Git administrative state");
     }
-    Ok(())
+    Ok(resolved.into_iter().collect())
 }
 
 enum ParsedExternalReview {
@@ -3205,6 +4000,8 @@ struct ExternalReviewRequestBindingPayload<'a> {
     reviewer: &'a ReviewerIdentity,
     program: &'a MaterializedReviewerBinding,
     args: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sanitized_view_binding: Option<&'a str>,
     effective_timeout_seconds: u64,
     sandbox_policy_version: u32,
     repository_snapshot: &'a ReviewRepoSnapshot,
@@ -3240,6 +4037,7 @@ fn external_review_request_binding(
     snapshot: &ReviewRepoSnapshot,
     reviewer: &ReviewerIdentity,
     program: &MaterializedReviewerBinding,
+    sanitized_view_binding: Option<&str>,
     effective_timeout_seconds: u64,
 ) -> Result<String> {
     let payload = serde_json::to_vec(&ExternalReviewRequestBindingPayload {
@@ -3251,6 +4049,7 @@ fn external_review_request_binding(
         reviewer,
         program,
         args: &options.reviewer.args,
+        sanitized_view_binding,
         effective_timeout_seconds,
         sandbox_policy_version: REVIEW_SANDBOX_POLICY_VERSION,
         repository_snapshot: snapshot,
@@ -3693,6 +4492,353 @@ mod tests {
             validate_verified_reviewer_program(&repository, &interpreter, &["-".to_string()])
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sanitized_view_contains_only_selected_content_modes_and_internal_symlinks() -> Result<()> {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        std::fs::write(temp.path().join(".gitignore"), "ignored/\n.maco/\n")?;
+        std::fs::create_dir(temp.path().join("docs"))?;
+        std::fs::set_permissions(
+            temp.path().join("docs"),
+            std::fs::Permissions::from_mode(0o750),
+        )?;
+        std::fs::write(temp.path().join("docs/tracked.txt"), "tracked\n")?;
+        std::fs::set_permissions(
+            temp.path().join("docs/tracked.txt"),
+            std::fs::Permissions::from_mode(0o740),
+        )?;
+        symlink("docs/tracked.txt", temp.path().join("tracked-link"))?;
+        let mut index = repository.index()?;
+        for path in [
+            Path::new(".gitignore"),
+            Path::new("docs/tracked.txt"),
+            Path::new("tracked-link"),
+        ] {
+            index.add_path(path)?;
+        }
+        index.write()?;
+        std::fs::write(temp.path().join("untracked.txt"), "untracked\n")?;
+        std::fs::create_dir(temp.path().join("ignored"))?;
+        std::fs::write(temp.path().join("ignored/secret.txt"), "ignored-secret\n")?;
+        std::fs::create_dir(temp.path().join(".maco"))?;
+        std::fs::write(temp.path().join(".maco/auth-key"), "must-not-copy\n")?;
+
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        let view = SanitizedReviewerView::create(&binding)?;
+        let view_path = view.path();
+        assert!(!view_path.starts_with(temp.path()));
+        assert_eq!(
+            std::fs::read_to_string(view_path.join("docs/tracked.txt"))?,
+            "tracked\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view_path.join("untracked.txt"))?,
+            "untracked\n"
+        );
+        assert_eq!(
+            std::fs::read_link(view_path.join("tracked-link"))?,
+            PathBuf::from("docs/tracked.txt")
+        );
+        assert_eq!(
+            std::fs::metadata(view_path.join("docs"))?.mode() & 0o7777,
+            0o750
+        );
+        assert_eq!(
+            std::fs::metadata(view_path.join("docs/tracked.txt"))?.mode() & 0o7777,
+            0o740
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(view_path.join("tracked-link"))?.mode() & libc::S_IFMT,
+            libc::S_IFLNK
+        );
+        assert!(!view_path.join("ignored").exists());
+        assert!(!view_path.join(".git").exists());
+        assert!(!view_path.join(".maco").exists());
+        view.verify(&binding)?;
+        drop(view);
+        assert!(!view_path.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sanitized_view_binding_changes_with_content_mode_and_path() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        std::fs::write(temp.path().join("entry"), "one")?;
+        let mut index = repository.index()?;
+        index.add_path(Path::new("entry"))?;
+        index.write()?;
+        let repository_binding = ReviewRepositoryBinding::bind(temp.path())?;
+
+        let content_binding = {
+            let view = SanitizedReviewerView::create(&repository_binding)?;
+            view.binding().to_string()
+        };
+        std::fs::write(temp.path().join("entry"), "two")?;
+        let changed_content_binding = {
+            let view = SanitizedReviewerView::create(&repository_binding)?;
+            view.binding().to_string()
+        };
+        assert_ne!(content_binding, changed_content_binding);
+
+        std::fs::set_permissions(
+            temp.path().join("entry"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        let changed_mode_binding = {
+            let view = SanitizedReviewerView::create(&repository_binding)?;
+            view.binding().to_string()
+        };
+        assert_ne!(changed_content_binding, changed_mode_binding);
+
+        std::fs::rename(temp.path().join("entry"), temp.path().join("renamed"))?;
+        let mut index = repository.index()?;
+        index.remove_path(Path::new("entry"))?;
+        index.add_path(Path::new("renamed"))?;
+        index.write()?;
+        let changed_path_binding = {
+            let view = SanitizedReviewerView::create(&repository_binding)?;
+            view.binding().to_string()
+        };
+        assert_ne!(changed_mode_binding, changed_path_binding);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sanitized_view_rejects_tracked_or_changed_maco_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        std::fs::create_dir(temp.path().join(".maco"))?;
+        std::fs::write(temp.path().join(".maco/tracked"), "tracked runtime")?;
+        let mut index = repository.index()?;
+        index.add_path(Path::new(".maco/tracked"))?;
+        index.write()?;
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        assert!(SanitizedReviewerView::create(&binding).is_err());
+        assert!(validate_sanitized_changed_paths(&[PathBuf::from(".maco/report.json")]).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sanitized_view_rejects_external_dangling_symlinks_and_hardlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let external = tempfile::tempdir()?;
+        let external_repo = git2::Repository::init(external.path())?;
+        symlink("/etc/passwd", external.path().join("escape"))?;
+        external_repo.index()?.add_path(Path::new("escape"))?;
+        external_repo.index()?.write()?;
+        let binding = ReviewRepositoryBinding::bind(external.path())?;
+        assert!(SanitizedReviewerView::create(&binding).is_err());
+
+        let dangling = tempfile::tempdir()?;
+        let dangling_repo = git2::Repository::init(dangling.path())?;
+        symlink("missing", dangling.path().join("dangling"))?;
+        let mut index = dangling_repo.index()?;
+        index.add_path(Path::new("dangling"))?;
+        index.write()?;
+        let binding = ReviewRepositoryBinding::bind(dangling.path())?;
+        assert!(SanitizedReviewerView::create(&binding).is_err());
+
+        let hardlink_root = tempfile::tempdir()?;
+        let repo_path = hardlink_root.path().join("repo");
+        std::fs::create_dir(&repo_path)?;
+        let hardlink_repo = git2::Repository::init(&repo_path)?;
+        std::fs::write(hardlink_root.path().join("outside"), "hardlinked secret")?;
+        std::fs::hard_link(
+            hardlink_root.path().join("outside"),
+            repo_path.join("hardlink"),
+        )?;
+        let mut index = hardlink_repo.index()?;
+        index.add_path(Path::new("hardlink"))?;
+        index.write()?;
+        let binding = ReviewRepositoryBinding::bind(&repo_path)?;
+        assert!(SanitizedReviewerView::create(&binding).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sanitized_view_detects_source_and_view_races() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        std::fs::write(temp.path().join("tracked"), "before")?;
+        let mut index = repository.index()?;
+        index.add_path(Path::new("tracked"))?;
+        index.write()?;
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        let view = SanitizedReviewerView::create(&binding)?;
+        std::fs::write(temp.path().join("tracked"), "after")?;
+        assert!(view.verify(&binding).is_err());
+        drop(view);
+
+        std::fs::write(temp.path().join("tracked"), "before")?;
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        let view = SanitizedReviewerView::create(&binding)?;
+        std::fs::write(view.path().join("tracked"), "tampered")?;
+        assert!(view.verify(&binding).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sanitized_view_rejects_gitlink_sparse_case_depth_and_aggregate_bounds() -> Result<()> {
+        let gitlink = tempfile::tempdir()?;
+        let repository = git2::Repository::init(gitlink.path())?;
+        let mut index = repository.index()?;
+        index.add(&git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o160000,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: git2::Oid::zero(),
+            flags: 0,
+            flags_extended: 0,
+            path: b"submodule".to_vec(),
+        })?;
+        index.write()?;
+        let binding = ReviewRepositoryBinding::bind(gitlink.path())?;
+        assert!(SanitizedReviewerView::create(&binding).is_err());
+
+        let sparse = tempfile::tempdir()?;
+        let repository = git2::Repository::init(sparse.path())?;
+        std::fs::write(sparse.path().join("sparse"), "sparse")?;
+        let mut index = repository.index()?;
+        index.add_path(Path::new("sparse"))?;
+        let mut sparse_entry = index
+            .get_path(Path::new("sparse"), 0)
+            .context("sparse index entry")?;
+        sparse_entry.flags_extended |= 1 << 14;
+        index.add(&sparse_entry)?;
+        index.write()?;
+        std::fs::remove_file(sparse.path().join("sparse"))?;
+        let binding = ReviewRepositoryBinding::bind(sparse.path())?;
+        assert!(SanitizedReviewerView::create(&binding).is_err());
+
+        let case = SanitizedViewSelection {
+            entries: BTreeMap::from([
+                (PathBuf::from("Case/file"), SanitizedViewOrigin::default()),
+                (PathBuf::from("case/other"), SanitizedViewOrigin::default()),
+            ]),
+        };
+        assert!(validate_sanitized_view_paths(&case).is_err());
+        let deep = SanitizedViewSelection {
+            entries: BTreeMap::from([(
+                (0..=REVIEW_PREWALK_MAX_DEPTH)
+                    .map(|_| "x")
+                    .collect::<PathBuf>(),
+                SanitizedViewOrigin::default(),
+            )]),
+        };
+        assert!(validate_sanitized_view_paths(&deep).is_err());
+
+        let aggregate = tempfile::tempdir()?;
+        git2::Repository::init(aggregate.path())?;
+        std::fs::write(aggregate.path().join("entry"), "x")?;
+        let root = SafeRoot::open_existing(aggregate.path())?;
+        let reader = ReviewTreeReader::bind(&root)?;
+        let mut total = REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES;
+        assert!(reader
+            .snapshot_entry(Path::new("entry"), &mut total)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sanitized_view_rejects_special_modes_and_collapses_hidden_ancestors() {
+        let entry = SnapshotTreeEntry::Regular {
+            mode: libc::S_IFREG | 0o4755,
+            length: 1,
+            sha256: [0; 32],
+            identity: FileIdentity { device: 1, file: 1 },
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+            changed_seconds: 0,
+            changed_nanoseconds: 0,
+        };
+        assert!(validate_sanitized_view_entry_mode(&entry).is_err());
+
+        let requested = BTreeSet::from([
+            PathBuf::from("/data/primary"),
+            PathBuf::from("/data/primary/.git"),
+            PathBuf::from("/data/primary/.git/maco/state"),
+            PathBuf::from("/data/worktrees"),
+            PathBuf::from("/data/worktrees/review"),
+        ]);
+        let hidden = minimal_sanitized_hidden_roots(requested.clone());
+        assert_eq!(
+            hidden,
+            vec![
+                PathBuf::from("/data/primary"),
+                PathBuf::from("/data/worktrees")
+            ]
+        );
+        assert!(requested
+            .iter()
+            .all(|path| hidden.iter().any(|root| path.starts_with(root))));
+        assert!(hidden.iter().enumerate().all(|(index, path)| hidden
+            .iter()
+            .enumerate()
+            .all(|(other, candidate)| index == other
+                || (!path.starts_with(candidate) && !candidate.starts_with(path)))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sanitized_confinement_exposes_only_view_store_and_materialized_reviewer() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        let maco = repository.path().join("maco");
+        let state = maco.join("state");
+        std::fs::create_dir_all(&state)?;
+        std::fs::set_permissions(&maco, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(state.join("auth.key"), "never-read-or-copied")?;
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        let runtime = trusted_linux_runtime_root()?;
+        let view = runtime.join("sanitized-view-fixture");
+        let materialized = runtime.join("materialized-reviewer-fixture");
+        let profile = binding.sanitized_confinement_profile(&view, &materialized)?;
+
+        assert!(profile.isolated_host_view());
+        assert!(profile
+            .visible_read_only_roots()
+            .contains(&PathBuf::from("/nix/store")));
+        assert!(profile.visible_read_only_roots().contains(&materialized));
+        for original in [
+            binding.worktree_root.path(),
+            binding.git_dir_root.path(),
+            binding.common_dir_root.path(),
+            state.as_path(),
+        ] {
+            assert!(profile
+                .hidden_roots()
+                .iter()
+                .any(|root| original.starts_with(root)));
+        }
+        assert!(profile.hidden_roots().iter().all(|root| {
+            !view.starts_with(root)
+                && !materialized.starts_with(root)
+                && !root.starts_with(&view)
+                && !root.starts_with(&materialized)
+        }));
         Ok(())
     }
 
@@ -4157,6 +5303,7 @@ mod tests {
             &baseline,
             &identity,
             &program.binding,
+            None,
             REVIEW_DEFAULT_TIMEOUT_SECONDS,
         )?;
         assert_ne!(
@@ -4166,7 +5313,28 @@ mod tests {
                 &baseline,
                 &identity,
                 &program.binding,
+                None,
                 REVIEW_DEFAULT_TIMEOUT_SECONDS.saturating_add(1)
+            )?
+        );
+        let sanitized_binding = external_review_request_binding(
+            &request,
+            &baseline,
+            &identity,
+            &program.binding,
+            Some("sanitized-view-a"),
+            REVIEW_DEFAULT_TIMEOUT_SECONDS,
+        )?;
+        assert_ne!(baseline_binding, sanitized_binding);
+        assert_ne!(
+            sanitized_binding,
+            external_review_request_binding(
+                &request,
+                &baseline,
+                &identity,
+                &program.binding,
+                Some("sanitized-view-b"),
+                REVIEW_DEFAULT_TIMEOUT_SECONDS,
             )?
         );
         let changed_policy_payload = serde_json::to_vec(&ExternalReviewRequestBindingPayload {
@@ -4178,6 +5346,7 @@ mod tests {
             reviewer: &identity,
             program: &program.binding,
             args: &request.reviewer.args,
+            sanitized_view_binding: None,
             effective_timeout_seconds: REVIEW_DEFAULT_TIMEOUT_SECONDS,
             sandbox_policy_version: REVIEW_SANDBOX_POLICY_VERSION.saturating_add(1),
             repository_snapshot: &baseline,
@@ -4202,6 +5371,7 @@ mod tests {
                 &baseline,
                 &args_identity,
                 &program.binding,
+                None,
                 REVIEW_DEFAULT_TIMEOUT_SECONDS
             )?
         );
@@ -4211,6 +5381,7 @@ mod tests {
                 &baseline,
                 &identity,
                 &program.binding,
+                None,
                 REVIEW_DEFAULT_TIMEOUT_SECONDS
             )?,
             external_review_request_binding(
@@ -4218,6 +5389,7 @@ mod tests {
                 &changed_content,
                 &identity,
                 &program.binding,
+                None,
                 REVIEW_DEFAULT_TIMEOUT_SECONDS
             )?
         );
@@ -4230,6 +5402,7 @@ mod tests {
                 &baseline,
                 &identity,
                 &program.binding,
+                None,
                 REVIEW_DEFAULT_TIMEOUT_SECONDS
             )?,
             external_review_request_binding(
@@ -4237,6 +5410,7 @@ mod tests {
                 &restored_content,
                 &identity,
                 &program.binding,
+                None,
                 REVIEW_DEFAULT_TIMEOUT_SECONDS
             )?
         );

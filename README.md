@@ -1146,7 +1146,8 @@ non-writable, so development and user-local binaries fail closed. Test-only
 nonpublishable simulation remains unpinned and cannot create an authority
 receipt. The parent derives the reviewer identity from the copied bytes and
 bounded argv, and binds each request to the pre-run repository
-snapshot, canonical request, effective timeout, and sandbox-policy version;
+snapshot, canonical request, sanitized-view manifest digest, effective timeout,
+and sandbox-policy version;
 the reviewer must echo that binding. Report strings alone do not grant real
 publication authority: the Review boundary also returns a non-serializable
 in-process receipt bound to the same repository, direct program and argv,
@@ -1156,7 +1157,23 @@ version-1 successful `Passed` report before Git or GitHub publication. Fake
 review, the legacy shell-string input, and a syntactically plausible but
 unreceipted report remain non-authoritative. A bounded descriptor prewalk rejects
 oversized or excessive ignored/untracked trees before Git status construction.
-The snapshot covers
+Verified review separately constructs an owner-private sanitized view outside
+the source repository. Its descriptor-stable manifest contains existing tracked
+entries plus untracked non-ignored entries, their ordinary permission and
+executable bits, and internal relative symlinks only when the lexical target is
+a selected regular file or directory. `.git`, ignored content, and untracked or
+ignored `.maco` runtime data are absent. A tracked `.maco` entry or a requested
+changed path below `.maco` fails closed because an authoritative reviewer may
+not pass content it was not shown. Gitlinks, sparse-missing or unmerged index
+entries, case and file/directory collisions, hard links, special mode bits,
+special files, escaping or dangling links, and bounded path/depth/count/byte
+overflows also fail closed. Files are copied from no-follow source descriptors into
+create-new destination descriptors, and the selected source and view manifests
+are reverified before and after execution. The reviewer runs with this view as
+its working directory; canonical changed paths and the bounded diff summary
+remain parent-supplied JSON input, so Git administrative state is unnecessary.
+
+The complete parent snapshot still covers
 tracked, untracked, and ignored content, modes, link targets, file generations,
 Git HEAD/ref/index/packed-ref state, and linked-worktree identities. Hard links,
 special files, external links, and gitlinks fail closed. Concurrent changes to
@@ -1166,11 +1183,32 @@ invalidate the result; unrelated Git administrative files are not claimed as
 part of this snapshot. Sensitive output is redacted and converted into a
 blocking failed review.
 
-The verified external-review runtime enforces the integrity boundary with a
-read-only workspace and no network access. This is not yet a confidentiality
-boundary: the reviewer still sees the source worktree, including ignored
-files, and host-readable sibling roots may remain visible. A sanitized reviewer
-view and global read isolation remain integration follow-up work.
+The verified external-review runtime enforces both a read-only view and a
+restricted root namespace with no network access. A read-only tmpfs replaces
+the unit root. The configured path and bind sets re-expose the sanitized view,
+the secret-free materialized reviewer program/interpreter directory needed by
+the sealing helper, `/nix/store`, exact root-owned guardian/helper executable
+aliases, and the identity-bound unit runtime. The policy also requests
+systemd-managed private `/proc` and `/dev` views under the existing `Protect*`,
+`ProcSubset`, and `PrivateDevices` checks. The original worktree, Git
+directory and common directory (including MACO state and authentication keys),
+and their parent data roots must have effective `InaccessiblePaths` properties
+and verified systemd inaccessible-placeholder mounts before the start gate is
+released. The authentication key is neither read for view construction nor
+copied into the child namespace. Private `HOME`/`TMPDIR`, the descriptor,
+mount report, and start/owner gates live only in the verified unit runtime.
+Unexpected entries in the configured `BindReadOnlyPaths`, `ReadOnlyPaths`,
+`BindPaths`, `ReadWritePaths`, and `InaccessiblePaths` sets, or a missing or
+mismatched required mount or mask, fail closed. This does not claim a complete
+allow-list inventory of systemd-created API VFS mounts such as `/proc`, `/dev`,
+or `/sys`; their exact runtime layout remains part of strict-runtime validation.
+The configured Nix-store view does not expose a general `/usr` or `/etc`;
+non-Nix loader/library layouts therefore remain unsupported rather than
+widening the host view. The reviewer can still inspect the explicitly visible
+whole `/nix/store`, its own materialized entry images, and the systemd-created
+API VFS surface. Those remain confidentiality boundaries; the source worktree
+and ignored files are instead required to stay behind verified inaccessible
+masks.
 
 Autopilot refuses to launch when the primary worktree is dirty unless
 `--allow-dirty-primary` is supplied, when active sync claims overlap its target

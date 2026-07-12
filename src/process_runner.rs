@@ -107,6 +107,7 @@ const SYSTEMD_SANDBOX_SHOW_PROPERTIES: &[&str] = &[
     "BindReadOnlyPaths",
     "BindPaths",
     "InaccessiblePaths",
+    "TemporaryFileSystem",
 ];
 #[cfg(target_os = "linux")]
 const SYSTEMD_GUARDIAN_SCRIPT: &str = r#"
@@ -174,6 +175,7 @@ exec 3<"$owner_fifo" || fail_guardian "could not open owner-liveness FIFO"
     kill -KILL "$guardian"
 ) &
 : > "$sandbox_report" || fail_guardian "could not create sandbox report"
+[ -c /dev/null ] || fail_guardian "private /dev/null was unavailable"
 cap_inh=missing
 cap_prm=missing
 cap_eff=missing
@@ -201,7 +203,29 @@ while [ "$sandbox_check_count" -gt 0 ]; do
     sandbox_mode=$1
     sandbox_path=$2
     shift 2
-    if [ "$sandbox_mode" = inaccessible ]; then
+    if [ "$sandbox_mode" = isolated-root ]; then
+        isolated_root=$(
+            "$findmnt_program" --raw --noheadings --output SOURCE,FSTYPE,VFS-OPTIONS --mountpoint "$sandbox_path"
+        ) || fail_guardian "could not inspect isolated root mount"
+        isolated_source=${isolated_root%% *}
+        isolated_rest=${isolated_root#* }
+        isolated_fstype=${isolated_rest%% *}
+        isolated_options=${isolated_rest#* }
+        [ "$isolated_source" != "$isolated_root" ] || fail_guardian "isolated root mount report was malformed"
+        [ "$isolated_fstype" != "$isolated_rest" ] || fail_guardian "isolated root mount report was malformed"
+        [ "$isolated_fstype" = tmpfs ] || fail_guardian "isolated root was not backed by tmpfs"
+        isolated_read_only=false
+        for isolated_option_line in $isolated_options; do
+            case ",$isolated_option_line," in
+                *,ro,*) isolated_read_only=true ;;
+            esac
+        done
+        [ "$isolated_read_only" = true ] || fail_guardian "isolated root was not read-only"
+        printf 'isolated-root %s %s %s\n' "$isolated_source" "$isolated_fstype" "$isolated_options" >> "$sandbox_report" || fail_guardian "could not write isolated-root report"
+        sandbox_check_count=$((sandbox_check_count - 1))
+        continue
+    fi
+    if [ "$sandbox_mode" = inaccessible-required ] || [ "$sandbox_mode" = inaccessible-optional ]; then
         if "$stat_program" -L -c '%d %i' -- "$sandbox_path" >/dev/null 2>&1; then
             inaccessible_source=$("$findmnt_program" --raw --noheadings --output SOURCE --mountpoint "$sandbox_path") || fail_guardian "could not inspect inaccessible-path source: $sandbox_path"
             inaccessible_options=$("$findmnt_program" --raw --noheadings --output VFS-OPTIONS --mountpoint "$sandbox_path") || fail_guardian "could not inspect inaccessible-path mount options: $sandbox_path"
@@ -218,8 +242,11 @@ while [ "$sandbox_check_count" -gt 0 ]; do
                 esac
             done
             [ "$inaccessible_read_only" = true ] || fail_guardian "inaccessible path placeholder was not read-only: $sandbox_path"
+            printf 'inaccessible\n' >> "$sandbox_report" || fail_guardian "could not write inaccessible-path report"
+        else
+            [ "$sandbox_mode" = inaccessible-optional ] || fail_guardian "required inaccessible path was not mounted: $sandbox_path"
+            printf 'inaccessible-missing\n' >> "$sandbox_report" || fail_guardian "could not write optional inaccessible-path report"
         fi
-        printf 'inaccessible\n' >> "$sandbox_report" || fail_guardian "could not write inaccessible-path report"
         sandbox_check_count=$((sandbox_check_count - 1))
         continue
     fi
@@ -476,6 +503,7 @@ struct WorkspaceSandboxConfig {
     visible_read_only_files: Vec<PathBuf>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
+    isolated_host_view: bool,
     resource_limits: ProcessResourceLimits,
 }
 
@@ -488,6 +516,7 @@ impl WorkspaceSandboxConfig {
             visible_read_only_files: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
+            isolated_host_view: false,
             resource_limits: ProcessResourceLimits::default(),
         }
     }
@@ -509,6 +538,11 @@ impl WorkspaceSandboxConfig {
 
     fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.hidden_roots.push(root.into());
+        self
+    }
+
+    fn with_isolated_host_view(mut self) -> Self {
+        self.isolated_host_view = true;
         self
     }
 
@@ -552,9 +586,29 @@ impl StrictOfflineWorkspaceProfile {
         self
     }
 
+    pub(crate) fn with_isolated_host_view(mut self) -> Self {
+        self.config = self.config.with_isolated_host_view();
+        self
+    }
+
     pub fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
         self.config = self.config.with_resource_limits(limits);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_only_roots(&self) -> &[PathBuf] {
+        &self.config.visible_read_only_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hidden_roots(&self) -> &[PathBuf] {
+        &self.config.hidden_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn isolated_host_view(&self) -> bool {
+        self.config.isolated_host_view
     }
 }
 
@@ -3558,6 +3612,7 @@ struct ResolvedSystemdSandbox {
     visible_read_only_files: Vec<PathBuf>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
+    isolated_host_view: bool,
     resource_limits: ProcessResourceLimits,
     path_identities: Vec<SandboxPathIdentity>,
     mount_checks: Vec<SandboxMountCheck>,
@@ -3575,7 +3630,9 @@ struct SandboxPathIdentity {
 enum SandboxMountAccess {
     ReadOnly,
     ReadWrite,
+    PrivateRuntime,
     Inaccessible,
+    IsolatedRoot,
 }
 
 #[cfg(target_os = "linux")]
@@ -3584,10 +3641,105 @@ struct SandboxMountCheck {
     device: u64,
     inode: u64,
     access: SandboxMountAccess,
+    optional: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl ResolvedSystemdSandbox {
+    fn add_isolated_runtime_file(&mut self, file: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if !self.isolated_host_view {
+            return Ok(());
+        }
+        validate_systemd_path_syntax(file, "isolated runtime helper")?;
+        let canonical = fs::canonicalize(file)?;
+        if !canonical.starts_with("/nix/store") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "isolated reviewer runtime helper is outside /nix/store",
+            ));
+        }
+        let metadata = fs::metadata(file)?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o111 == 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "isolated reviewer runtime helper is not a trusted executable",
+            ));
+        }
+        if self
+            .hidden_roots
+            .iter()
+            .any(|hidden| file.starts_with(hidden) || hidden.starts_with(file))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "isolated reviewer runtime helper overlaps an inaccessible root",
+            ));
+        }
+        if self.visible_read_only_files.contains(&file.to_path_buf()) {
+            return Ok(());
+        }
+        self.visible_read_only_files.push(file.to_path_buf());
+        self.visible_read_only_files.sort();
+        self.path_identities
+            .push(capture_sandbox_path_identity(&canonical)?);
+        self.mount_checks.push(SandboxMountCheck {
+            path: file.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            access: SandboxMountAccess::ReadOnly,
+            optional: false,
+        });
+        if self.visible_read_only_files.len() > MAX_SANDBOX_PATHS_PER_CLASS
+            || self.mount_checks.len() > MAX_SANDBOX_MOUNT_CHECKS
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "isolated reviewer runtime helper vector exceeds its safety bound",
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_private_runtime_root(&mut self, root: &Path) -> std::io::Result<()> {
+        validate_systemd_path_syntax(root, "private unit runtime root")?;
+        if !root.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private unit runtime root must be absolute",
+            ));
+        }
+        if self
+            .hidden_roots
+            .iter()
+            .any(|hidden| root.starts_with(hidden) || hidden.starts_with(root))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private unit runtime root overlaps an inaccessible sandbox root",
+            ));
+        }
+        self.mount_checks.push(SandboxMountCheck {
+            path: root.to_path_buf(),
+            device: 0,
+            inode: 0,
+            access: SandboxMountAccess::PrivateRuntime,
+            optional: false,
+        });
+        if self.mount_checks.len() > MAX_SANDBOX_MOUNT_CHECKS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sandbox mount-check vector exceeds its safety bound",
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_path_identities(&self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
 
@@ -3854,6 +4006,30 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
             "strict workspace confinement refuses '/' as a hidden root",
         ));
     }
+    if config.isolated_host_view {
+        let nix_store = canonical_sandbox_directory(Path::new("/nix/store"), "Nix store root")?;
+        if !visible_read_only_roots.contains(&nix_store) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "isolated host view requires an explicit read-only /nix/store binding",
+            ));
+        }
+        for hidden in &hidden_roots {
+            for visible in std::iter::once(&workspace_root)
+                .chain(std::iter::once(&current_dir))
+                .chain(visible_read_only_roots.iter())
+                .chain(visible_read_only_files.iter())
+                .chain(writable_artifact_roots.iter())
+            {
+                if visible.starts_with(hidden) || hidden.starts_with(visible) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "isolated host view refuses overlapping visible and inaccessible roots",
+                    ));
+                }
+            }
+        }
+    }
     let mut identity_paths = vec![workspace_root.clone(), current_dir.clone()];
     identity_paths.extend(visible_read_only_roots.iter().cloned());
     identity_paths.extend(visible_read_only_files.iter().cloned());
@@ -3872,6 +4048,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         &visible_read_only_files,
         &writable_artifact_roots,
         &hidden_roots,
+        config.isolated_host_view,
     )?;
     if mount_checks.len() > MAX_SANDBOX_MOUNT_CHECKS {
         return Err(std::io::Error::new(
@@ -3889,6 +4066,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         visible_read_only_files,
         writable_artifact_roots,
         hidden_roots,
+        isolated_host_view: config.isolated_host_view,
         resource_limits: config.resource_limits,
         path_identities,
         mount_checks,
@@ -4026,6 +4204,7 @@ fn build_sandbox_mount_checks(
     visible_read_only_files: &[PathBuf],
     writable_artifact_roots: &[PathBuf],
     hidden_roots: &[PathBuf],
+    isolated_host_view: bool,
 ) -> std::io::Result<Vec<SandboxMountCheck>> {
     use std::os::unix::fs::MetadataExt;
 
@@ -4033,7 +4212,14 @@ fn build_sandbox_mount_checks(
     // ProtectSystem=strict is the foundation that keeps same-filesystem symlink targets outside
     // explicitly writable binds read-only. Verify the unit's actual root mount rather than
     // trusting only the configured property.
-    requested.insert(PathBuf::from("/"), SandboxMountAccess::ReadOnly);
+    requested.insert(
+        PathBuf::from("/"),
+        if isolated_host_view {
+            SandboxMountAccess::IsolatedRoot
+        } else {
+            SandboxMountAccess::ReadOnly
+        },
+    );
     let workspace_mount_access = match workspace_access {
         WorkspaceAccess::ReadOnly => SandboxMountAccess::ReadOnly,
         WorkspaceAccess::ReadWrite => SandboxMountAccess::ReadWrite,
@@ -4073,31 +4259,41 @@ fn build_sandbox_mount_checks(
     let mut checks = requested
         .into_iter()
         .map(|(path, access)| {
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("sandbox mount check path is a symlink: {}", path.display()),
-                ));
-            }
+            let (device, inode) = if access == SandboxMountAccess::IsolatedRoot {
+                (0, 0)
+            } else {
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("sandbox mount check path is a symlink: {}", path.display()),
+                    ));
+                }
+                (metadata.dev(), metadata.ino())
+            };
             Ok(SandboxMountCheck {
                 path,
-                device: metadata.dev(),
-                inode: metadata.ino(),
+                device,
+                inode,
                 access,
+                optional: false,
             })
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mut inaccessible = hidden_roots.to_vec();
-    inaccessible.extend(known_sensitive_socket_paths());
-    inaccessible.sort();
-    inaccessible.dedup();
-    for path in inaccessible {
+    let mut inaccessible = known_sensitive_socket_paths()
+        .into_iter()
+        .map(|path| (path, true))
+        .collect::<BTreeMap<_, _>>();
+    for path in hidden_roots {
+        inaccessible.insert(path.clone(), false);
+    }
+    for (path, optional) in inaccessible {
         checks.push(SandboxMountCheck {
             path,
             device: 0,
             inode: 0,
             access: SandboxMountAccess::Inaccessible,
+            optional,
         });
     }
     Ok(checks)
@@ -4131,6 +4327,9 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         "--property=OOMPolicy=kill",
     ]);
     command.arg("--property=RestrictNamespaces=yes");
+    if sandbox.isolated_host_view {
+        command.arg("--property=TemporaryFileSystem=/:ro");
+    }
     if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
         command.args([
             "--property=PrivateNetwork=yes",
@@ -4260,6 +4459,7 @@ fn verify_systemd_sandbox_properties(
     )?;
 
     verify_systemd_network_properties(sandbox.kind, properties)?;
+    verify_isolated_host_view_property(sandbox, properties)?;
 
     let limits = sandbox.resource_limits;
     for (name, expected) in [
@@ -4367,7 +4567,9 @@ fn verify_systemd_sandbox_properties(
             root,
         )?;
     }
-    if sandbox.kind == SideEffectConfinementProfileKind::TrustedFixedNetwork {
+    if sandbox.kind == SideEffectConfinementProfileKind::TrustedFixedNetwork
+        || sandbox.isolated_host_view
+    {
         let mut inaccessible = sandbox
             .hidden_roots
             .iter()
@@ -4432,6 +4634,37 @@ fn verify_systemd_sandbox_properties(
         )?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_isolated_host_view_property(
+    sandbox: &ResolvedSystemdSandbox,
+    properties: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let value = property_value(properties, "TemporaryFileSystem")?;
+    if !sandbox.isolated_host_view {
+        return if value.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "effective TemporaryFileSystem unexpectedly changed the ordinary sandbox root",
+            ))
+        };
+    }
+    let exact_root = value.split_whitespace().any(|entry| {
+        let mut parts = entry.split(':');
+        parts.next() == Some("/")
+            && parts.any(|option| option.split(',').any(|value| value == "ro"))
+    });
+    if exact_root {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "effective TemporaryFileSystem omitted the isolated read-only root",
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4515,13 +4748,29 @@ fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std
     }
     for (line, check) in lines[1..].iter().copied().zip(checks) {
         if check.access == SandboxMountAccess::Inaccessible {
-            if line != "inaccessible" {
+            let accepted =
+                line == "inaccessible" || (check.optional && line == "inaccessible-missing");
+            if !accepted {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
                         "sandbox path remained visible inside unit mount namespace: {}",
                         check.path.display()
                     ),
+                ));
+            }
+            continue;
+        }
+        if check.access == SandboxMountAccess::IsolatedRoot {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 4
+                || fields[0] != "isolated-root"
+                || fields[2] != "tmpfs"
+                || !fields[3].split(',').any(|option| option == "ro")
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "sandbox root was not an isolated read-only tmpfs",
                 ));
             }
             continue;
@@ -4545,14 +4794,31 @@ fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std
                 format!("invalid mount report inode: {error}"),
             )
         })?;
-        if device != check.device || inode != check.inode {
+        let (expected_device, expected_inode) =
+            if check.access == SandboxMountAccess::PrivateRuntime {
+                let runtime = fs::symlink_metadata(&check.path)?;
+                if runtime.file_type().is_symlink()
+                    || !runtime.is_dir()
+                    || runtime.uid() != effective_uid
+                    || runtime.permissions().mode() & 0o777 != 0o700
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "private unit runtime mount identity or mode was unsafe",
+                    ));
+                }
+                (runtime.dev(), runtime.ino())
+            } else {
+                (check.device, check.inode)
+            };
+        if device != expected_device || inode != expected_inode {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
                     "systemd bound the wrong inode for {}: expected {}:{}, observed {device}:{inode}",
                     check.path.display(),
-                    check.device,
-                    check.inode
+                    expected_device,
+                    expected_inode
                 ),
             ));
         }
@@ -4560,7 +4826,9 @@ fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std
         let expected = match check.access {
             SandboxMountAccess::ReadOnly => "ro",
             SandboxMountAccess::ReadWrite => "rw",
+            SandboxMountAccess::PrivateRuntime => "rw",
             SandboxMountAccess::Inaccessible => continue,
+            SandboxMountAccess::IsolatedRoot => continue,
         };
         if !options.contains(&expected) {
             return Err(std::io::Error::new(
@@ -5263,7 +5531,22 @@ impl SystemdUnit {
         } else {
             target_environment
         });
-        let sandbox = resolve_systemd_sandbox(spec)?;
+        let mut sandbox = resolve_systemd_sandbox(spec)?;
+        if let Some(sandbox) = sandbox.as_mut() {
+            for helper in [
+                &self.env_program,
+                &self.shell,
+                &self.sleep_program,
+                &self.stat_program,
+                &self.findmnt_program,
+            ] {
+                sandbox.add_isolated_runtime_file(helper)?;
+            }
+            if let Some((helper, _)) = &pinned_launch {
+                sandbox.add_isolated_runtime_file(helper)?;
+            }
+            sandbox.add_private_runtime_root(&self.runtime_dir)?;
+        }
         let working_directory = sandbox
             .as_ref()
             .map(|sandbox| sandbox.current_dir.clone())
@@ -5363,7 +5646,12 @@ impl SystemdUnit {
                     .arg(match check.access {
                         SandboxMountAccess::ReadOnly => "ro",
                         SandboxMountAccess::ReadWrite => "rw",
-                        SandboxMountAccess::Inaccessible => "inaccessible",
+                        SandboxMountAccess::PrivateRuntime => "rw",
+                        SandboxMountAccess::Inaccessible if check.optional => {
+                            "inaccessible-optional"
+                        }
+                        SandboxMountAccess::Inaccessible => "inaccessible-required",
+                        SandboxMountAccess::IsolatedRoot => "isolated-root",
                     })
                     .arg(&check.path);
             }
@@ -7556,6 +7844,208 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let view = temp.path().join("view");
+        let materialized = temp.path().join("materialized");
+        let source = temp.path().join("source");
+        let runtime = temp.path().join("runtime");
+        for path in [&view, &materialized, &source, &runtime] {
+            fs::create_dir(path).expect("fixture directory");
+        }
+        let profile = StrictOfflineWorkspaceProfile::read_only(&view)
+            .with_visible_read_only_root("/nix/store")
+            .with_visible_read_only_root(&materialized)
+            .with_hidden_root(&source)
+            .with_isolated_host_view();
+        let spec = ProcessSpec::direct(
+            "isolated reviewer fixture",
+            PathBuf::from("/nix/store/reviewer-fixture"),
+            Vec::<OsString>::new(),
+            &view,
+            128,
+        )
+        .with_side_effect_confinement(
+            SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
+        );
+        let mut sandbox = resolve_systemd_sandbox(&spec)
+            .expect("resolve isolated sandbox")
+            .expect("sandbox config");
+        let env_helper = trusted_system_executable(
+            "env",
+            &["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"],
+        )
+        .expect("trusted env helper");
+        sandbox
+            .add_isolated_runtime_file(&env_helper)
+            .expect("bind exact helper alias");
+        let canonical_env_helper = fs::canonicalize(&env_helper).expect("canonical env helper");
+        sandbox
+            .add_isolated_runtime_file(&canonical_env_helper)
+            .expect("bind helper nested under visible Nix store");
+        sandbox
+            .add_private_runtime_root(&runtime)
+            .expect("bind private runtime");
+        assert!(sandbox.isolated_host_view);
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path == Path::new("/")
+                && check.access == SandboxMountAccess::IsolatedRoot
+                && !check.optional
+        }));
+        assert!(sandbox.visible_read_only_files.contains(&env_helper));
+        assert!(sandbox
+            .visible_read_only_files
+            .contains(&canonical_env_helper));
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path == env_helper && check.access == SandboxMountAccess::ReadOnly
+        }));
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path == runtime && check.access == SandboxMountAccess::PrivateRuntime
+        }));
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path == source
+                && check.access == SandboxMountAccess::Inaccessible
+                && !check.optional
+        }));
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path == materialized
+                && check.access == SandboxMountAccess::ReadOnly
+                && !check.optional
+        }));
+
+        let mut command = Command::new("systemd-run");
+        apply_systemd_sandbox_properties(&mut command, &sandbox);
+        assert!(command
+            .get_args()
+            .any(|arg| arg == OsStr::new("--property=TemporaryFileSystem=/:ro")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
+        let sandbox = ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            workspace_root: PathBuf::from("/view"),
+            current_dir: PathBuf::from("/view"),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            visible_read_only_roots: vec![PathBuf::from("/nix/store")],
+            visible_read_only_files: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: vec![PathBuf::from("/source")],
+            isolated_host_view: true,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        };
+        let mut properties =
+            BTreeMap::from([("TemporaryFileSystem".to_string(), "/:ro".to_string())]);
+        verify_isolated_host_view_property(&sandbox, &properties)
+            .expect("exact isolated root property");
+        properties.insert("TemporaryFileSystem".to_string(), "/tmp:ro".to_string());
+        assert!(verify_isolated_host_view_property(&sandbox, &properties).is_err());
+
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let report = temp.path().join("report");
+        fs::write(
+            &report,
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev\ninaccessible\ninaccessible-missing\n",
+        )
+        .expect("write report");
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).expect("report mode");
+        let checks = vec![
+            SandboxMountCheck {
+                path: PathBuf::from("/"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::IsolatedRoot,
+                optional: false,
+            },
+            SandboxMountCheck {
+                path: PathBuf::from("/source"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::Inaccessible,
+                optional: false,
+            },
+            SandboxMountCheck {
+                path: PathBuf::from("/optional-socket"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::Inaccessible,
+                optional: true,
+            },
+        ];
+        verify_sandbox_mount_report(&report, &checks).expect("isolated mount evidence");
+        fs::write(
+            &report,
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev\ninaccessible-missing\ninaccessible-missing\n",
+        )
+        .expect("replace report");
+        assert!(verify_sandbox_mount_report(&report, &checks).is_err());
+        assert!(SYSTEMD_GUARDIAN_SCRIPT.contains("required inaccessible path was not mounted"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_exact_bindings_are_order_independent_and_alias_mounts_bind_target_identity() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let expected = BTreeSet::from([
+            (PathBuf::from("/nix/store"), PathBuf::from("/nix/store")),
+            (PathBuf::from("/review-view"), PathBuf::from("/review-view")),
+            (PathBuf::from("/usr/bin/env"), PathBuf::from("/usr/bin/env")),
+            (
+                PathBuf::from("/nix/store/helper/bin/maco"),
+                PathBuf::from("/nix/store/helper/bin/maco"),
+            ),
+        ]);
+        verify_exact_property_bindings(
+            "BindReadOnlyPaths",
+            "/usr/bin/env /nix/store/helper/bin/maco /review-view /nix/store",
+            &expected,
+        )
+        .expect("canonical binding set ignores property order");
+        assert!(verify_exact_property_bindings(
+            "BindReadOnlyPaths",
+            "/usr/bin/env /nix/store/helper/bin/maco /review-view /nix/store /unexpected",
+            &expected,
+        )
+        .is_err());
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target");
+        let alias = temp.path().join("alias");
+        fs::write(&target, "helper").expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o500)).expect("target mode");
+        symlink(&target, &alias).expect("alias");
+        let target_metadata = fs::metadata(&alias).expect("follow alias metadata");
+        let report = temp.path().join("report");
+        fs::write(
+            &report,
+            format!(
+                "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nmounted {} {} ro\n",
+                target_metadata.dev(),
+                target_metadata.ino()
+            ),
+        )
+        .expect("report");
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).expect("report mode");
+        verify_sandbox_mount_report(
+            &report,
+            &[SandboxMountCheck {
+                path: alias,
+                device: target_metadata.dev(),
+                inode: target_metadata.ino(),
+                access: SandboxMountAccess::ReadOnly,
+                optional: false,
+            }],
+        )
+        .expect("alias path may become a mounted regular target with the bound identity");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn trusted_network_profile_masks_repo_state_and_seals_private_objects() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -7682,6 +8172,7 @@ mod tests {
             visible_read_only_files: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
+            isolated_host_view: false,
             resource_limits: ProcessResourceLimits::default(),
             path_identities: Vec::new(),
             mount_checks: Vec::new(),
@@ -7721,12 +8212,14 @@ mod tests {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 access: SandboxMountAccess::ReadOnly,
+                optional: false,
             },
             SandboxMountCheck {
                 path: PathBuf::from("/masked"),
                 device: 0,
                 inode: 0,
                 access: SandboxMountAccess::Inaccessible,
+                optional: false,
             },
         ];
 
