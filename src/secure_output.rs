@@ -68,6 +68,34 @@ pub(crate) struct ReservedOutputFile {
 }
 
 impl SecureOutputRoot {
+    /// Creates a new private final directory. Existing final paths are refused even when safe.
+    pub(crate) fn create_new(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let absolute = absolute_normalized(path)?;
+            let directory = create_new_directory_tree(&absolute)?;
+            let metadata = directory.metadata().with_context(|| {
+                format!(
+                    "failed to inspect secure output root {}",
+                    absolute.display()
+                )
+            })?;
+            validate_private_directory(&metadata, &absolute)?;
+            use std::os::unix::fs::MetadataExt;
+            return Ok(Self {
+                path: absolute,
+                directory,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            bail!("secure output capabilities are not implemented on this host")
+        }
+    }
+
     /// Creates the final directory or opens an existing private directory without following any
     /// symlink component. Existing final directories are never chmodded; unsafe permissions fail.
     pub(crate) fn open_or_create(path: &Path) -> Result<Self> {
@@ -243,6 +271,26 @@ impl SecureOutputRoot {
                 "secure output root {} may not overlap child-writable workspace {}",
                 root.display(),
                 workspace.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuses identical or ancestor/descendant output roots, both by path and held inode.
+    pub(crate) fn reject_overlap(&self, other: &Self) -> Result<()> {
+        self.verify_path_identity()?;
+        other.verify_path_identity()?;
+        #[cfg(unix)]
+        if self.device == other.device && self.inode == other.inode {
+            bail!("secure output roots resolve to the same inode");
+        }
+        let left = std::fs::canonicalize(&self.path)?;
+        let right = std::fs::canonicalize(&other.path)?;
+        if left.starts_with(&right) || right.starts_with(&left) {
+            bail!(
+                "secure output roots overlap: {} and {}",
+                left.display(),
+                right.display()
             );
         }
         Ok(())
@@ -592,16 +640,29 @@ fn absolute_normalized(path: &Path) -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn open_or_create_directory_tree(path: &Path) -> Result<File> {
-    walk_directory_tree(path, true)
+    walk_directory_tree(path, DirectoryCreateMode::Missing)
+}
+
+#[cfg(unix)]
+fn create_new_directory_tree(path: &Path) -> Result<File> {
+    walk_directory_tree(path, DirectoryCreateMode::NewFinal)
 }
 
 #[cfg(unix)]
 fn open_existing_directory_tree(path: &Path) -> Result<File> {
-    walk_directory_tree(path, false)
+    walk_directory_tree(path, DirectoryCreateMode::Never)
 }
 
 #[cfg(unix)]
-fn walk_directory_tree(path: &Path, create_final: bool) -> Result<File> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryCreateMode {
+    Never,
+    Missing,
+    NewFinal,
+}
+
+#[cfg(unix)]
+fn walk_directory_tree(path: &Path, create_mode: DirectoryCreateMode) -> Result<File> {
     let absolute = absolute_normalized(path)?;
     // SAFETY: constant is NUL-terminated; the returned descriptor is owned on success.
     let root_fd = unsafe {
@@ -622,11 +683,18 @@ fn walk_directory_tree(path: &Path, create_final: bool) -> Result<File> {
             _ => None,
         })
         .collect::<Vec<_>>();
-    for component in components {
+    for (index, component) in components.iter().enumerate() {
         let name = leaf_cstring(component)?;
+        let final_component = index + 1 == components.len();
         match openat_directory(current.as_raw_fd(), &name) {
+            Ok(_) if create_mode == DirectoryCreateMode::NewFinal && final_component => {
+                bail!("secure output root must be new: {}", absolute.display())
+            }
             Ok(next) => current = next,
-            Err(error) if create_final && error.raw_os_error() == Some(libc::ENOENT) => {
+            Err(error)
+                if create_mode != DirectoryCreateMode::Never
+                    && error.raw_os_error() == Some(libc::ENOENT) =>
+            {
                 // SAFETY: descriptor and name are valid for this call.
                 if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
                     return Err(std::io::Error::last_os_error()).with_context(|| {
@@ -852,6 +920,16 @@ mod tests {
             std::fs::metadata(&root)?.permissions().mode() & 0o777,
             0o755
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_new_refuses_existing_private_root() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("root");
+        let root = SecureOutputRoot::create_new(&path)?;
+        assert!(SecureOutputRoot::create_new(root.path()).is_err());
         Ok(())
     }
 
