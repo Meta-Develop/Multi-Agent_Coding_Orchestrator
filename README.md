@@ -586,6 +586,22 @@ closed on Darwin rather than silently using process-group compatibility. These
 controls prevent a completed command from leaving a delayed child. They do not
 make a trusted validation command an adversarial filesystem sandbox while it is
 running.
+
+Safety-sensitive crate-internal direct launches can additionally bind the
+entry executable before the systemd start gate opens. That opt-in path records
+the source device, inode, mode, length, and SHA-256 digest; authenticates the
+bounded launch descriptor against the digest fixed in the transient unit's
+argument vector; copies the verified image into a sealed Linux memory file; and
+executes the sealed descriptor instead of reopening the source pathname. Script
+launches pin and seal both the script and its native shebang interpreter.
+Dispatcher shebangs such as `env`/`env -S`, native loader hooks, and common
+shell/language startup hooks are refused. Bootstrap requires the currently running
+`maco` executable and every path ancestor to be root-owned and non-writable to
+the invoking user, so `cargo run`, development outputs, and user-local installs
+fail closed for this authority. Ordinary shell and direct commands do not opt in
+and retain their existing behavior. This pins the entry images, not their
+dynamic-library or language-module dependency closure.
+
 Candidate validation additionally starts from a cleared environment with a fixed
 root-owned system `PATH`, private `HOME`, `TMP*`, and XDG directories, and an
 empty private global Git config. Shell startup hooks, provider credentials,

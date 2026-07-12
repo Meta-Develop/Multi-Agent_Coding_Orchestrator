@@ -4,7 +4,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
@@ -16,6 +16,10 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
+
+use crate::pinned_exec::{
+    self, PinnedDirectExecutable, HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME,
+};
 
 const PIPE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const PIPE_CHANNEL_CAPACITY: usize = 8;
@@ -128,6 +132,10 @@ stat_program=$1
 shift
 findmnt_program=$1
 shift
+env_program=$1
+shift
+target_environment_mode=$1
+shift
 sandbox_check_count=$1
 shift
 
@@ -145,6 +153,11 @@ fail_guardian() {
     printf 'maco containment guardian: %s\n' "$1" >&2
     exit 125
 }
+
+case "$target_environment_mode" in
+    source|descriptor) ;;
+    *) fail_guardian "invalid target environment mode" ;;
+esac
 
 guardian=$$
 umask 077
@@ -220,6 +233,13 @@ IFS= read -r environment_token < "$environment_fifo" || exit 125
 [ "$environment_token" = environment ] || exit 125
 
 target_launcher() {
+    if [ "$target_environment_mode" = descriptor ]; then
+        : > "$2" || exit 125
+        IFS= read -r start_token < "$3" || exit 125
+        [ "$start_token" = start ] || exit 125
+        shift 3
+        exec "$env_program" -i "$@" || exit 125
+    fi
     set -a
     . "$1" || exit 125
     set +a
@@ -749,6 +769,7 @@ pub struct ProcessSpec {
     pub private_runtime_codex_home: bool,
     #[cfg(target_os = "linux")]
     private_runtime_files: Vec<PrivateRuntimeFile>,
+    pinned_direct: Option<PinnedDirectCommand>,
     /// Total operation deadline starting at [`run_process`] entry. It covers containment-slot
     /// acquisition, pre-start setup, start-gate release, and command execution. Bounded cleanup may
     /// extend the return past this deadline to prove that no owned process remains. On strict Linux
@@ -756,6 +777,48 @@ pub struct ProcessSpec {
     pub timeout: Option<Duration>,
     pub stdout: StreamCapture,
     pub stderr: StreamCapture,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PinnedDirectCommand {
+    executable: PinnedDirectExecutable,
+    program: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+impl fmt::Debug for PinnedDirectCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedDirectCommand")
+            .field("executable", &"<redacted capability>")
+            .field("program", &"<redacted>")
+            .field(
+                "arguments",
+                &format_args!("<redacted:{} entries>", self.arguments.len()),
+            )
+            .finish()
+    }
+}
+
+impl PinnedDirectCommand {
+    fn validate_command(&self, command: &ProcessCommand) -> io::Result<()> {
+        let ProcessCommand::Direct { program, args } = command else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned executable capability requires a direct command",
+            ));
+        };
+        if program != &self.program
+            || args != &self.arguments
+            || !self.executable.matches_program(program)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "direct command changed after executable identity was pinned",
+            ));
+        }
+        pinned_exec::validated_current_helper_path().map(|_| ())
+    }
 }
 
 impl ProcessSpec {
@@ -785,6 +848,7 @@ impl ProcessSpec {
             private_runtime_codex_home: false,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
+            pinned_direct: None,
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
@@ -817,6 +881,7 @@ impl ProcessSpec {
             private_runtime_codex_home: false,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
+            pinned_direct: None,
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
@@ -826,6 +891,43 @@ impl ProcessSpec {
     pub fn with_environment(mut self, environment: EnvironmentMode) -> Self {
         self.environment = environment;
         self
+    }
+
+    // This capability is intentionally crate-internal and is consumed only by callers that opt
+    // into pathname-identity pinning.
+    #[allow(dead_code)]
+    pub(crate) fn with_pinned_direct_executable(
+        mut self,
+        executable: PinnedDirectExecutable,
+    ) -> io::Result<Self> {
+        let ProcessCommand::Direct { program, args } = &self.command else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned executable capability requires a direct command",
+            ));
+        };
+        if !executable.matches_program(program)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned executable capability did not match the direct command",
+            ));
+        }
+        self.pinned_direct = Some(PinnedDirectCommand {
+            executable,
+            program: program.clone(),
+            arguments: args.clone(),
+        });
+        Ok(self)
+    }
+
+    fn command_display(&self) -> String {
+        match &self.pinned_direct {
+            Some(pinned) => format!(
+                "<pinned direct executable; {} arguments redacted>",
+                pinned.arguments.len()
+            ),
+            None => self.command.display(),
+        }
     }
 
     pub fn with_containment(mut self, containment: ContainmentPolicy) -> Self {
@@ -1068,7 +1170,7 @@ pub enum ProcessRunError {
 
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
-    let command_display = spec.command.display();
+    let command_display = spec.command_display();
     validate_process_spec_bounds(&spec).map_err(|source| ProcessRunError::Spawn {
         label: spec.label.clone(),
         command: command_display.clone(),
@@ -1440,6 +1542,38 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
             std::io::ErrorKind::InvalidInput,
             "direct command argument vector exceeds its safety bound",
         ));
+    }
+    if let Some(pinned) = &spec.pinned_direct {
+        if spec.containment != ContainmentPolicy::Required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned executable capability requires strict process containment",
+            ));
+        }
+        if !matches!(spec.environment, EnvironmentMode::ClearAndSet(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned executable capability requires an explicit clear-and-set environment",
+            ));
+        }
+        pinned.validate_command(&spec.command)?;
+        let ProcessCommand::Direct { args, .. } = &spec.command else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned executable capability requires a direct command",
+            ));
+        };
+        let EnvironmentMode::ClearAndSet(environment) = &spec.environment else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned executable capability requires an explicit clear-and-set environment",
+            ));
+        };
+        let environment = environment
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect::<Vec<_>>();
+        pinned.executable.encode_descriptor(args, &environment)?;
     }
     validate_environment_bounds(&spec.environment)?;
     for capture in [&spec.stdout, &spec.stderr] {
@@ -5089,20 +5223,46 @@ impl SystemdUnit {
     }
 
     fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
-        validate_private_runtime_files(&spec.private_runtime_files)?;
-        self.pending_runtime_files = spec.private_runtime_files.clone();
-        self.pending_environment = Some(
-            if spec.private_runtime_home || spec.private_runtime_codex_home {
-                environment_with_private_runtime_home(
-                    &spec.environment,
-                    &self.runtime_dir,
-                    spec.private_runtime_home,
-                    spec.private_runtime_codex_home,
-                )?
-            } else {
-                spec.environment.clone()
-            },
-        );
+        let target_environment = if spec.private_runtime_home || spec.private_runtime_codex_home {
+            environment_with_private_runtime_home(
+                &spec.environment,
+                &self.runtime_dir,
+                spec.private_runtime_home,
+                spec.private_runtime_codex_home,
+            )?
+        } else {
+            spec.environment.clone()
+        };
+        let mut private_runtime_files = spec.private_runtime_files.clone();
+        let pinned_launch = if let Some(pinned) = &spec.pinned_direct {
+            pinned.validate_command(&spec.command)?;
+            let ProcessCommand::Direct { args, .. } = &spec.command else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pinned executable capability requires a direct command",
+                ));
+            };
+            let helper = pinned_exec::validated_current_helper_path()?;
+            let environment = effective_environment(&target_environment)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let descriptor = pinned.executable.encode_descriptor(args, &environment)?;
+            let (bytes, digest) = descriptor.into_parts();
+            private_runtime_files.push(PrivateRuntimeFile {
+                name: PINNED_EXEC_DESCRIPTOR_NAME.to_string(),
+                bytes,
+            });
+            Some((helper, digest))
+        } else {
+            None
+        };
+        validate_private_runtime_files(&private_runtime_files)?;
+        self.pending_runtime_files = private_runtime_files;
+        self.pending_environment = Some(if pinned_launch.is_some() {
+            EnvironmentMode::ClearAndSet(BTreeMap::new())
+        } else {
+            target_environment
+        });
         let sandbox = resolve_systemd_sandbox(spec)?;
         let working_directory = sandbox
             .as_ref()
@@ -5185,6 +5345,12 @@ impl SystemdUnit {
             .arg(&self.sandbox_report_path)
             .arg(&self.stat_program)
             .arg(&self.findmnt_program)
+            .arg(&self.env_program)
+            .arg(if pinned_launch.is_some() {
+                "descriptor"
+            } else {
+                "source"
+            })
             .arg(
                 self.sandbox
                     .as_ref()
@@ -5202,23 +5368,31 @@ impl SystemdUnit {
                     .arg(&check.path);
             }
         }
-        match &spec.command {
-            ProcessCommand::Shell {
-                shell,
-                command: text,
-            } => match shell {
-                Shell::UnixSh => {
-                    command.arg(&self.shell).arg("-c").arg(text);
+        if let Some((helper, digest)) = pinned_launch {
+            command
+                .arg(helper)
+                .arg(HIDDEN_PINNED_EXEC_ARGUMENT)
+                .arg(self.runtime_dir.join(PINNED_EXEC_DESCRIPTOR_NAME))
+                .arg(digest);
+        } else {
+            match &spec.command {
+                ProcessCommand::Shell {
+                    shell,
+                    command: text,
+                } => match shell {
+                    Shell::UnixSh => {
+                        command.arg(&self.shell).arg("-c").arg(text);
+                    }
+                    Shell::WindowsCmd => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Windows cmd shell cannot run through Linux systemd containment",
+                        ));
+                    }
+                },
+                ProcessCommand::Direct { program, args } => {
+                    command.arg(program).args(args);
                 }
-                Shell::WindowsCmd => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Windows cmd shell cannot run through Linux systemd containment",
-                    ));
-                }
-            },
-            ProcessCommand::Direct { program, args } => {
-                command.arg(program).args(args);
             }
         }
         Ok(command)
@@ -9742,6 +9916,120 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                 args: vec![OsString::from("one"), OsString::from("two")],
             }
         );
+        assert!(spec.pinned_direct.is_none());
+    }
+
+    #[test]
+    fn shell_constructor_preserves_general_unpinned_behavior() {
+        let spec = ProcessSpec::shell(
+            "shell",
+            Shell::for_current_platform(),
+            "echo unchanged",
+            PathBuf::from("."),
+            128,
+        );
+        assert!(matches!(spec.command, ProcessCommand::Shell { .. }));
+        assert!(spec.pinned_direct.is_none());
+        assert!(spec.command_display().contains("echo unchanged"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_guardian_bootstraps_helper_with_an_empty_environment() {
+        assert!(SYSTEMD_GUARDIAN_SCRIPT
+            .contains("if [ \"$target_environment_mode\" = descriptor ]; then"));
+        assert!(SYSTEMD_GUARDIAN_SCRIPT.contains("exec \"$env_program\" -i \"$@\" || exit 125"));
+        let descriptor_branch = SYSTEMD_GUARDIAN_SCRIPT
+            .split("if [ \"$target_environment_mode\" = descriptor ]; then")
+            .nth(1)
+            .and_then(|text| text.split("fi").next())
+            .expect("descriptor guardian branch");
+        assert!(!descriptor_branch.contains(". \"$1\""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_direct_capability_is_direct_only_and_detects_command_drift() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let program = temp.path().join("program");
+        fs::write(&program, b"native executable fixture").expect("write program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("chmod program");
+        let capability = PinnedDirectExecutable::capture_for_test(&program).expect("capture");
+
+        let spec = ProcessSpec::direct("pinned", &program, ["--fixed"], temp.path(), 128)
+            .with_pinned_direct_executable(capability.clone())
+            .expect("attach capability");
+        assert!(spec.pinned_direct.is_some());
+        assert!(spec.command_display().contains("arguments redacted"));
+        assert!(!spec.command_display().contains("--fixed"));
+
+        let mut drifted = spec.clone();
+        let ProcessCommand::Direct { args, .. } = &mut drifted.command else {
+            panic!("direct command");
+        };
+        args.push(OsString::from("--drifted"));
+        let error = drifted
+            .pinned_direct
+            .as_ref()
+            .expect("pinned binding")
+            .validate_command(&drifted.command)
+            .expect_err("argv drift must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let shell_error = ProcessSpec::shell("shell", Shell::UnixSh, ":", temp.path(), 128)
+            .with_pinned_direct_executable(capability)
+            .expect_err("shell pinning must fail");
+        assert_eq!(shell_error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_pinned_capability_refuses_untrusted_development_helper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if pinned_exec::validated_current_helper_path().is_ok() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let program = temp.path().join("program");
+        fs::write(&program, b"native executable fixture").expect("write program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("chmod program");
+        let error = PinnedDirectExecutable::capture(&program)
+            .expect_err("development helper must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a root-owned installed maco helper and trusted user-systemd runtime"]
+    fn pinned_direct_strict_runtime_executes_only_after_helper_bootstrap() {
+        let program = trusted_system_executable(
+            "true",
+            &[
+                "/usr/bin/true",
+                "/bin/true",
+                "/run/current-system/sw/bin/true",
+            ],
+        )
+        .expect("trusted true");
+        let capability = PinnedDirectExecutable::capture(&program).expect("capture true");
+        let output = run_process(
+            ProcessSpec::direct(
+                "pinned true",
+                &program,
+                Vec::<OsString>::new(),
+                Path::new("/"),
+                128,
+            )
+            .with_pinned_direct_executable(capability)
+            .expect("pin true")
+            .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+            .with_stdin(StdinMode::Null),
+        )
+        .expect("run pinned true");
+        assert!(output.safety_sensitive_succeeded());
     }
 
     #[cfg(unix)]

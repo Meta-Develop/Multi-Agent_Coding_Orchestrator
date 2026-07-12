@@ -10,6 +10,7 @@ pub mod live_claim;
 pub mod llm;
 pub mod merge;
 pub mod orchestrator;
+pub(crate) mod pinned_exec;
 pub mod planning;
 pub mod process_runner;
 pub mod publication;
@@ -24,3 +25,12 @@ pub mod supervise;
 pub mod sync;
 pub mod sync_store;
 pub mod worktree;
+
+/// Reserved package-internal bootstrap used by the sealed executable guardian.
+///
+/// Normal callers receive `Ok(false)`. Package binaries call this before tracing, Tokio, or Clap
+/// initialization so the helper path has no ambient CLI/runtime side effects.
+#[doc(hidden)]
+pub fn maybe_run_pinned_helper_from_args() -> std::io::Result<bool> {
+    pinned_exec::maybe_run_helper_from_args()
+}
