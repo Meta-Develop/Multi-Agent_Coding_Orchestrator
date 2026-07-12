@@ -2,7 +2,8 @@ use crate::{
     orchestrator::RunId,
     safe_state::{
         identity_for_path, remove_direct_child_tree, stable_checksum, AtomicStateWriter,
-        BoundedRegularReader, FileIdentity, KernelStateLock, SafeRoot, TreeLinkPolicy,
+        BoundedRegularReader, FileIdentity, KernelStateLock, ReservedDirectory, SafeRoot,
+        TreeLinkPolicy,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -49,6 +50,8 @@ const MAX_ARTIFACT_FILES: usize = 4_096;
 const MAX_ARTIFACT_PATH_BYTES: usize = 4_096;
 const MAX_ARTIFACT_PATH_COMPONENTS: usize = 64;
 const MAX_PRODUCER_BYTES: usize = 128;
+const MAX_ARTIFACT_SCRATCH_DIRECTORIES: usize = 64;
+const MAX_ARTIFACT_SCRATCH_NAME_BYTES: usize = 128;
 static RESERVATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -277,8 +280,37 @@ pub struct ArtifactRunWriter {
     provenance: ArtifactProvenance,
     writer_evidence: ArtifactWriterEvidence,
     files: BTreeMap<PathBuf, ArtifactFileRecord>,
+    outstanding_scratches: BTreeMap<PathBuf, FileIdentity>,
     total_bytes: u64,
     run_lock: BoundArtifactLock,
+}
+
+/// An identity-bound capability for a child-writable directory reserved inside
+/// one artifact run. The directory must be discarded through the writer after
+/// every process that could mutate it has stopped. Dropping this capability
+/// does not delete the directory; the writer will refuse finalization while the
+/// corresponding reservation remains outstanding.
+#[derive(Debug)]
+#[must_use = "artifact scratch directories must be discarded before finalization"]
+pub struct ArtifactScratchDirectory {
+    path: PathBuf,
+    name: PathBuf,
+    identity: FileIdentity,
+    run_identity: FileIdentity,
+    writer_reservation_id: String,
+    reservation: ReservedDirectory,
+}
+
+impl ArtifactScratchDirectory {
+    /// Path to pass to the confined child process as its writable output root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stable filesystem identity captured by the open reservation handle.
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
 }
 
 pub struct ArtifactRunReader {
@@ -526,6 +558,7 @@ impl ArtifactRunWriter {
                 provenance,
                 writer_evidence,
                 files: BTreeMap::new(),
+                outstanding_scratches: BTreeMap::new(),
                 total_bytes: 0,
                 run_lock,
             })
@@ -537,6 +570,113 @@ impl ArtifactRunWriter {
         self.run.path()
     }
 
+    /// Reserves one owner-private, child-writable scratch directory directly
+    /// beneath this run. Only a canonical single-component name is accepted so
+    /// cleanup can remain handle-relative and identity-bound. A launcher must
+    /// expose only this scratch directory as writable to the child; the run
+    /// parent remains parent-owned and must be read-only or hidden in the
+    /// child's mount namespace.
+    pub fn create_scratch_dir(
+        &mut self,
+        name: impl AsRef<Path>,
+    ) -> Result<ArtifactScratchDirectory> {
+        self.run_lock.verify(&self.run)?;
+        let result = (|| -> Result<ArtifactScratchDirectory> {
+            let name = validate_artifact_scratch_name(name.as_ref())?;
+            if self.outstanding_scratches.contains_key(&name) {
+                bail!(
+                    "artifact scratch directory is already outstanding: {}",
+                    name.display()
+                );
+            }
+            if self.outstanding_scratches.len() >= MAX_ARTIFACT_SCRATCH_DIRECTORIES {
+                bail!(
+                    "artifact run exceeds its {} outstanding scratch-directory limit",
+                    MAX_ARTIFACT_SCRATCH_DIRECTORIES
+                );
+            }
+            if self
+                .files
+                .keys()
+                .any(|path| artifact_path_starts_with(path, &name))
+            {
+                bail!(
+                    "artifact scratch directory overlaps an already manifested artifact path: {}",
+                    name.display()
+                );
+            }
+
+            let reservation = self.run.reserve_direct_child_directory(name.as_os_str())?;
+            reservation.verify(&self.run)?;
+            let identity = reservation.identity().clone();
+            self.outstanding_scratches
+                .insert(name.clone(), identity.clone());
+            Ok(ArtifactScratchDirectory {
+                path: reservation.path().to_path_buf(),
+                name,
+                identity,
+                run_identity: self.run.identity().clone(),
+                writer_reservation_id: self.writer_evidence.reservation_id.clone(),
+                reservation,
+            })
+        })();
+        finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
+    }
+
+    /// Safely discards a previously reserved scratch tree. The caller must
+    /// first stop every child process that could still mutate the tree. Links
+    /// and special files inside the child-writable tree are unlinked as entries
+    /// and never followed; filesystem-boundary and tree-budget violations fail
+    /// closed and leave the reservation outstanding.
+    pub fn discard_scratch(&mut self, scratch: &ArtifactScratchDirectory) -> Result<()> {
+        self.run_lock.verify(&self.run)?;
+        let result = (|| -> Result<()> {
+            self.verify_scratch_capability(scratch)?;
+            if self.run.direct_child_exists(scratch.name.as_os_str())? {
+                scratch.reservation.verify(&self.run)?;
+            }
+            remove_artifact_scratch_tree(&self.run, scratch.name.as_os_str(), &scratch.identity)
+                .with_context(|| {
+                    format!(
+                        "failed to safely discard artifact scratch directory {}",
+                        scratch.name.display()
+                    )
+                })?;
+            if self.run.direct_child_exists(scratch.name.as_os_str())? {
+                bail!(
+                    "artifact scratch source name reappeared after cleanup: {}",
+                    scratch.name.display()
+                );
+            }
+            let removed = self
+                .outstanding_scratches
+                .remove(&scratch.name)
+                .context("artifact scratch tracking disappeared during cleanup")?;
+            if removed != scratch.identity {
+                bail!("artifact scratch tracking identity changed during cleanup");
+            }
+            Ok(())
+        })();
+        finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
+    }
+
+    fn verify_scratch_capability(&self, scratch: &ArtifactScratchDirectory) -> Result<()> {
+        if scratch.run_identity != *self.run.identity()
+            || scratch.writer_reservation_id != self.writer_evidence.reservation_id
+            || scratch.path != self.run.path().join(&scratch.name)
+        {
+            bail!("artifact scratch capability belongs to a different run reservation");
+        }
+        let tracked = self
+            .outstanding_scratches
+            .get(&scratch.name)
+            .context("artifact scratch capability is no longer outstanding")?;
+        if tracked != &scratch.identity || scratch.reservation.identity() != &scratch.identity {
+            bail!("artifact scratch capability identity does not match the tracked reservation");
+        }
+        Ok(())
+    }
+
     pub fn write_bytes(
         &mut self,
         relative: impl AsRef<Path>,
@@ -546,6 +686,17 @@ impl ArtifactRunWriter {
         self.run_lock.verify(&self.run)?;
         let result = (|| -> Result<ArtifactFileRecord> {
             let relative = validate_artifact_relative_path(relative.as_ref())?;
+            if let Some(scratch) = self
+                .outstanding_scratches
+                .keys()
+                .find(|scratch| artifact_path_starts_with(&relative, scratch))
+            {
+                bail!(
+                    "artifact path overlaps outstanding scratch directory {}: {}",
+                    scratch.display(),
+                    relative.display()
+                );
+            }
             if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_ARTIFACT_FILE_BYTES {
                 bail!(
                     "artifact file exceeds its {} byte limit: {}",
@@ -636,6 +787,18 @@ impl ArtifactRunWriter {
         final_report: &Path,
         publish_requested: bool,
     ) -> Result<ArtifactFinalization> {
+        if !self.outstanding_scratches.is_empty() {
+            let noun = if self.outstanding_scratches.len() == 1 {
+                "directory"
+            } else {
+                "directories"
+            };
+            bail!(
+                "artifact run has {} outstanding scratch {}; discard every scratch tree before finalization",
+                self.outstanding_scratches.len(),
+                noun
+            );
+        }
         let final_report = validate_artifact_relative_path(final_report)?;
         if final_report != self.family.final_report_relative_path() {
             bail!(
@@ -1774,6 +1937,72 @@ fn validate_artifact_relative_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+fn validate_artifact_scratch_name(path: &Path) -> Result<PathBuf> {
+    let mut components = path.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        bail!(
+            "artifact scratch name must be one canonical relative component: {}",
+            path.display()
+        );
+    };
+    if components.next().is_some() {
+        bail!(
+            "artifact scratch name must be one canonical relative component: {}",
+            path.display()
+        );
+    }
+    let name = name
+        .to_str()
+        .context("artifact scratch names must be valid UTF-8")?;
+    if path.as_os_str() != std::ffi::OsStr::new(name) {
+        bail!(
+            "artifact scratch name must be canonical without separators or redundant components: {}",
+            path.display()
+        );
+    }
+    let mut bytes = name.bytes();
+    if name.len() > MAX_ARTIFACT_SCRATCH_NAME_BYTES
+        || !bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!(
+            "artifact scratch name must contain 1 to {} ASCII letters, digits, '.', '_' or '-', beginning with a letter or digit",
+            MAX_ARTIFACT_SCRATCH_NAME_BYTES
+        );
+    }
+    Ok(PathBuf::from(name))
+}
+
+fn artifact_path_starts_with(path: &Path, scratch_name: &Path) -> bool {
+    path.starts_with(scratch_name)
+}
+
+fn remove_artifact_scratch_tree(
+    run: &SafeRoot,
+    name: &std::ffi::OsStr,
+    expected: &FileIdentity,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        remove_direct_child_tree(run, name, Some(expected), TreeLinkPolicy::UnlinkLinks)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (run, name, expected);
+        unsupported_artifact_scratch_cleanup()
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn unsupported_artifact_scratch_cleanup() -> Result<()> {
+    bail!(
+        "secure artifact scratch cleanup is unsupported on this platform; refusing recursive deletion"
+    )
+}
+
 fn artifact_parent_and_name<'a>(
     run: &SafeRoot,
     relative: &'a Path,
@@ -2524,6 +2753,332 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_scratch_blocks_marker_and_discarded_scratch_finalizes_marker_last() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = committed_repo();
+        let blocked_run_id = RunId::new("scratch-live-blocked").expect("run id");
+        let mut blocked = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Autopilot,
+            blocked_run_id.clone(),
+            "autopilot",
+        )
+        .expect("reserve blocked writer");
+        blocked
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write blocked report");
+        let blocked_scratch = blocked
+            .create_scratch_dir("incoming")
+            .expect("reserve live scratch");
+        fs::write(blocked_scratch.path().join("pending"), b"pending\n")
+            .expect("write pending child output");
+        let blocked_error = blocked
+            .finalize("final-report.json", false)
+            .expect_err("live scratch must block finalization");
+        assert!(blocked_error.to_string().contains("outstanding scratch"));
+        assert!(
+            !run_dir(&repo, RunArtifactFamily::Autopilot, &blocked_run_id)
+                .join(FINALIZATION_MARKER)
+                .exists()
+        );
+
+        let run_id = RunId::new("scratch-discarded").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Autopilot,
+            run_id.clone(),
+            "autopilot",
+        )
+        .expect("reserve writer");
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write report");
+        let scratch = writer
+            .create_scratch_dir("incoming")
+            .expect("reserve scratch");
+        assert_eq!(mode(scratch.path()), 0o700);
+        assert_eq!(
+            identity_for_path(scratch.path()).expect("scratch identity"),
+            *scratch.identity()
+        );
+
+        let sentinel = temp.path().join("external-sentinel");
+        fs::write(&sentinel, b"keep\n").expect("write external sentinel");
+        symlink(&sentinel, scratch.path().join("sentinel-link")).expect("scratch symlink");
+        fs::hard_link(&sentinel, scratch.path().join("sentinel-hardlink"))
+            .expect("scratch hardlink");
+        let fifo = CString::new(scratch.path().join("child-fifo").as_os_str().as_bytes())
+            .expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let run = writer.run_dir().to_path_buf();
+        writer
+            .discard_scratch(&scratch)
+            .expect("discard hostile child tree without following links");
+        assert!(!scratch.path().exists());
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"keep\n");
+        assert!(!run.join(FINALIZATION_MARKER).exists());
+        let finalization = writer
+            .finalize("final-report.json", false)
+            .expect("finalize after scratch discard");
+        assert!(run.join(FINALIZATION_MARKER).exists());
+        assert_eq!(finalization.files.len(), 1);
+        assert_eq!(finalization.files[0].path, Path::new("final-report.json"));
+        ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .expect("final marker authenticates the exact post-discard manifest");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_names_manifest_overlap_and_count_are_bounded() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("scratch-validation").expect("run id");
+        let mut writer =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Inbox, run_id, "inbox")
+                .expect("reserve writer");
+        let invalid = [
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("./incoming"),
+            PathBuf::from("incoming/"),
+            PathBuf::from("../incoming"),
+            PathBuf::from("nested/incoming"),
+            PathBuf::from("/absolute"),
+            PathBuf::from(".artifact.lock"),
+            PathBuf::from("contains space"),
+            PathBuf::from("contains/slash"),
+            PathBuf::from("x".repeat(MAX_ARTIFACT_SCRATCH_NAME_BYTES + 1)),
+            PathBuf::from(std::ffi::OsString::from_vec(vec![0xff])),
+        ];
+        for name in invalid {
+            assert!(
+                writer.create_scratch_dir(&name).is_err(),
+                "invalid scratch name was accepted: {}",
+                name.display()
+            );
+        }
+        assert!(writer.outstanding_scratches.is_empty());
+
+        writer
+            .write_bytes(
+                "manifested/first.txt",
+                b"first\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write nested manifested artifact");
+        assert!(writer.create_scratch_dir("manifested").is_err());
+        writer
+            .write_bytes(
+                "exact-name",
+                b"manifested\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write exact manifested artifact");
+        assert!(writer.create_scratch_dir("exact-name").is_err());
+
+        let scratch = writer
+            .create_scratch_dir("incoming")
+            .expect("create valid scratch");
+        assert!(writer
+            .write_bytes(
+                "incoming",
+                b"overlap\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .is_err());
+        assert!(writer
+            .write_bytes(
+                "incoming/nested.txt",
+                b"overlap\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .is_err());
+        writer.discard_scratch(&scratch).expect("discard scratch");
+
+        let mut scratches = Vec::new();
+        for index in 0..MAX_ARTIFACT_SCRATCH_DIRECTORIES {
+            scratches.push(
+                writer
+                    .create_scratch_dir(format!("scratch-{index}"))
+                    .expect("scratch within limit"),
+            );
+        }
+        let limit_error = writer
+            .create_scratch_dir("one-too-many")
+            .expect_err("scratch count must be bounded");
+        assert!(limit_error.to_string().contains("scratch-directory limit"));
+        for scratch in &scratches {
+            writer
+                .discard_scratch(scratch)
+                .expect("discard bounded scratch");
+        }
+        assert!(writer.outstanding_scratches.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_capability_is_run_bound_and_rebinding_fails_closed() {
+        let (_temp, repo) = committed_repo();
+        let run_a = RunId::new("scratch-capability-a").expect("run id");
+        let run_b = RunId::new("scratch-capability-b").expect("run id");
+        let mut writer_a =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Consult, run_a, "consult")
+                .expect("reserve writer A");
+        let mut writer_b =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Consult, run_b, "consult")
+                .expect("reserve writer B");
+        let scratch = writer_a
+            .create_scratch_dir("incoming")
+            .expect("reserve scratch A");
+
+        let cross_error = writer_b
+            .discard_scratch(&scratch)
+            .expect_err("writer B must reject writer A capability");
+        assert!(cross_error
+            .to_string()
+            .contains("different run reservation"));
+        assert!(scratch.path().exists());
+
+        let moved = writer_a.run_dir().join("moved-original");
+        fs::rename(scratch.path(), &moved).expect("move original scratch inode");
+        fs::create_dir(scratch.path()).expect("create substitute scratch");
+        fs::write(scratch.path().join("substitute-sentinel"), b"keep\n")
+            .expect("write substitute sentinel");
+        let rebind_error = writer_a
+            .discard_scratch(&scratch)
+            .expect_err("rebound scratch name must fail closed");
+        assert!(
+            rebind_error.to_string().contains("no longer identifies")
+                || rebind_error.to_string().contains("identity")
+        );
+        assert!(scratch.path().join("substitute-sentinel").exists());
+        assert!(moved.exists());
+        assert_eq!(writer_a.outstanding_scratches.len(), 1);
+
+        fs::remove_dir_all(scratch.path()).expect("remove substitute");
+        fs::rename(&moved, scratch.path()).expect("restore original binding");
+        writer_a
+            .discard_scratch(&scratch)
+            .expect("discard restored original scratch");
+        assert!(writer_a.outstanding_scratches.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_cleanup_depth_budget_failure_remains_tracked_and_resumes() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("scratch-depth-budget").expect("run id");
+        let mut writer =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Supervise, run_id, "supervise")
+                .expect("reserve writer");
+        writer
+            .write_json(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write final report");
+        let scratch = writer
+            .create_scratch_dir("incoming")
+            .expect("reserve scratch");
+        let mut nested = scratch.path().to_path_buf();
+        for _ in 0..130 {
+            nested.push("d");
+            fs::create_dir(&nested).expect("create bounded-depth fixture");
+        }
+
+        let error = writer
+            .discard_scratch(&scratch)
+            .expect_err("over-depth tree must fail closed");
+        assert!(format!("{error:#}").contains("maximum depth"));
+        assert_eq!(writer.outstanding_scratches.len(), 1);
+        assert!(!scratch.path().exists(), "source is durably quarantined");
+        assert!(!writer.run_dir().join(FINALIZATION_MARKER).exists());
+
+        let quarantine = quarantined_scratch_path(writer.run_dir(), scratch.identity())
+            .expect("identity-bound scratch quarantine");
+        fs::remove_dir_all(quarantine.join("d")).expect("shorten hostile tree for retry");
+        writer
+            .discard_scratch(&scratch)
+            .expect("resume identity-bound quarantine cleanup");
+        assert!(writer.outstanding_scratches.is_empty());
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize after resumed cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_cleanup_refuses_mounted_descendant_when_mount_is_available() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("scratch-mount-boundary").expect("run id");
+        let mut writer =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Consult, run_id, "consult")
+                .expect("reserve writer");
+        let scratch = writer
+            .create_scratch_dir("incoming")
+            .expect("reserve scratch");
+        let mount_point = scratch.path().join("mounted-proc");
+        fs::create_dir(&mount_point).expect("mount point");
+        let source = CString::new("/proc").expect("mount source");
+        let target = CString::new(mount_point.as_os_str().as_bytes()).expect("mount target");
+        let mounted = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
+        if mounted != 0 {
+            writer
+                .discard_scratch(&scratch)
+                .expect("discard fixture when mount privilege is unavailable");
+            return;
+        }
+
+        let mut guard = ScratchMountGuard {
+            run: writer.run_dir().to_path_buf(),
+            scratch_identity: scratch.identity().clone(),
+            mount_name: "mounted-proc".to_string(),
+            active: true,
+        };
+        let error = writer
+            .discard_scratch(&scratch)
+            .expect_err("mounted descendant must fail closed");
+        assert!(format!("{error:#}").contains("filesystem boundary"));
+        assert_eq!(writer.outstanding_scratches.len(), 1);
+        guard.unmount().expect("detach test bind mount");
+        writer
+            .discard_scratch(&scratch)
+            .expect("resume cleanup after mounted descendant is detached");
+    }
+
+    #[test]
+    fn scratch_cleanup_unsupported_platform_fallback_is_fail_closed() {
+        let error = unsupported_artifact_scratch_cleanup()
+            .expect_err("unsupported platforms must never use recursive path deletion");
+        assert!(error.to_string().contains("unsupported on this platform"));
+        assert!(error.to_string().contains("refusing recursive deletion"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn writer_finalizes_private_artifacts_and_public_evidence_cannot_forge_mac() {
@@ -3164,6 +3719,65 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(run_dir(&repo, RunArtifactFamily::Autopilot, &run_id).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn quarantined_scratch_path(run: &Path, expected: &FileIdentity) -> Option<PathBuf> {
+        let entries = fs::read_dir(run).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            let metadata = fs::symlink_metadata(entry.path()).ok()?;
+            if metadata.file_type().is_dir()
+                && identity_for_path(entry.path()).ok().as_ref() == Some(expected)
+            {
+                return Some(entry.path());
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ScratchMountGuard {
+        run: PathBuf,
+        scratch_identity: FileIdentity,
+        mount_name: String,
+        active: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ScratchMountGuard {
+        fn unmount(&mut self) -> Result<()> {
+            let scratch = quarantined_scratch_path(&self.run, &self.scratch_identity)
+                .context("mounted scratch directory is no longer identity-bound in its run")?;
+            let mount_point = scratch.join(&self.mount_name);
+            let target = CString::new(mount_point.as_os_str().as_bytes())
+                .context("mounted scratch path contains a NUL byte")?;
+            if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to detach scratch boundary test mount");
+            }
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ScratchMountGuard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let Some(scratch) = quarantined_scratch_path(&self.run, &self.scratch_identity) else {
+                return;
+            };
+            let mount_point = scratch.join(&self.mount_name);
+            let Ok(target) = CString::new(mount_point.as_os_str().as_bytes()) else {
+                return;
+            };
+            unsafe {
+                libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+            }
+        }
     }
 
     fn finalize_private_test_run(
