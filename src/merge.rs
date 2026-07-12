@@ -1,4 +1,5 @@
 use crate::{
+    llm::Redactor,
     process_runner::{
         run_process, ContainmentEvidence, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
         StdinMode,
@@ -37,6 +38,7 @@ const CANDIDATE_VALIDATION_PROCESS_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const VALIDATION_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const GIT_STDIN_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const REPOSITORY_INDEX_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const PRIVATE_RUNTIME_OWNER_VERSION: u32 = 1;
 const PRIVATE_RUNTIME_OWNER_FILE: &str = "maco-runtime-owner.json";
 const PRIVATE_RUNTIME_LOCK_FILE: &str = ".maco-private-runtime.lock";
@@ -1638,6 +1640,24 @@ impl PrivateRuntimeDirectory {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    pub(crate) fn verify_identity(&self) -> Result<()> {
+        let directory_metadata = validate_private_runtime_directory(&self.path)?;
+        if !same_filesystem_identity(&self.directory_metadata, &directory_metadata) {
+            bail!(
+                "managed private runtime {} changed identity while in use",
+                self.path.display()
+            );
+        }
+        let (owner, _) = read_private_runtime_owner(&self.path, self.owner.kind)?;
+        if owner != self.owner {
+            bail!(
+                "managed private runtime {} owner record changed while in use",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PrivateRuntimeDirectory {
@@ -2780,13 +2800,93 @@ fn require_git_success(output: GitCommandOutput, label: &str) -> Result<()> {
 }
 
 fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
-    match fs::read(path) {
-        Ok(bytes) => Oid::hash_object(ObjectType::Blob, &bytes)
-            .context("failed to hash repository state file")
-            .map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    validate_repository_index_metadata(path, &path_metadata)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
     }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let file_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {}", path.display()))?;
+    validate_repository_index_metadata(path, &file_metadata)?;
+    if !same_filesystem_identity(&path_metadata, &file_metadata) {
+        bail!(
+            "repository index {} changed while it was opened",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(REPOSITORY_INDEX_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > REPOSITORY_INDEX_MAX_BYTES || bytes.len() as u64 != file_metadata.len()
+    {
+        bail!(
+            "repository index {} changed size while read",
+            path.display()
+        );
+    }
+    let after = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to recheck {}", path.display()))?;
+    validate_repository_index_metadata(path, &after)?;
+    if !same_filesystem_identity(&file_metadata, &after) || after.len() != file_metadata.len() {
+        bail!(
+            "repository index {} changed after it was read",
+            path.display()
+        );
+    }
+    Oid::hash_object(ObjectType::Blob, &bytes)
+        .context("failed to hash repository state file")
+        .map(Some)
+}
+
+fn validate_repository_index_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(metadata)
+        || !metadata.file_type().is_file()
+        || metadata.len() > REPOSITORY_INDEX_MAX_BYTES
+    {
+        bail!(
+            "repository index {} is not a bounded real regular file",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            bail!(
+                "repository index {} has a foreign owner, multiple links, or unsafe write mode",
+                path.display()
+            );
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.number_of_links() != Some(1) {
+            bail!("repository index {} has multiple links", path.display());
+        }
+    }
+    Ok(())
 }
 
 fn passed_safety_check() -> SafetyCheck {
@@ -3221,13 +3321,20 @@ fn run_candidate_validation_commands(
     let mut reports = Vec::new();
     for (index, command) in commands.iter().enumerate() {
         let sandbox = CandidateValidationSandbox::create(preview)?;
+        let environment_root = sandbox.validation_environment_root();
+        let redactor = validation_diagnostics_redactor(&environment_root);
         let report = run_candidate_validation_command(
             sandbox.path(),
+            &environment_root,
             command,
             index,
             &preview.candidate.changed_paths,
         );
-        reports.push(sandbox.enforce_candidate_integrity(preview, report));
+        let mut report = sandbox.enforce_candidate_integrity(preview, report);
+        if let Some(message) = report.message.as_mut() {
+            *message = redact_validation_diagnostic(&redactor, message);
+        }
+        reports.push(report);
     }
     Ok(reports)
 }
@@ -3389,6 +3496,10 @@ impl CandidateValidationSandbox {
 
     fn path(&self) -> &Path {
         self.runtime_directory.path()
+    }
+
+    fn validation_environment_root(&self) -> PathBuf {
+        self.git_context.directory.join("validation-environment")
     }
 
     fn enforce_candidate_integrity(
@@ -3774,12 +3885,14 @@ fn validation_file_mode(metadata: &fs::Metadata) -> u32 {
 
 fn run_candidate_validation_command(
     worktree_path: &Path,
+    environment_root: &Path,
     validation: &CandidateValidationCommand,
     index: usize,
     changed_paths: &[PathBuf],
 ) -> ValidationReport {
     run_candidate_validation_command_with_timeout(
         worktree_path,
+        environment_root,
         validation,
         index,
         changed_paths,
@@ -3789,11 +3902,24 @@ fn run_candidate_validation_command(
 
 fn run_candidate_validation_command_with_timeout(
     worktree_path: &Path,
+    environment_root: &Path,
     validation: &CandidateValidationCommand,
     index: usize,
     changed_paths: &[PathBuf],
     timeout: Duration,
 ) -> ValidationReport {
+    let redactor = validation_diagnostics_redactor(environment_root);
+    let environment = match validation_command_environment(environment_root) {
+        Ok(environment) => environment,
+        Err(error) => {
+            return failed_candidate_validation_report(
+                index,
+                changed_paths,
+                &redactor,
+                format!("failed to prepare validation environment: {error:#}"),
+            )
+        }
+    };
     let output = run_process(
         ProcessSpec::shell(
             "candidate validation command",
@@ -3802,9 +3928,7 @@ fn run_candidate_validation_command_with_timeout(
             worktree_path,
             VALIDATION_CAPTURE_LIMIT_BYTES,
         )
-        .with_environment(EnvironmentMode::ClearAndSet(
-            validation_command_environment(),
-        ))
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
         .with_stdin(StdinMode::Null)
         .with_timeout(Some(timeout)),
     );
@@ -3824,8 +3948,8 @@ fn run_candidate_validation_command_with_timeout(
                 },
                 message: evidence
                     .err()
-                    .map(|error| error.to_string())
-                    .or_else(|| candidate_validation_message(&output)),
+                    .map(|error| redact_validation_diagnostic(&redactor, &error.to_string()))
+                    .or_else(|| candidate_validation_message(&output, &redactor)),
                 paths: if passed {
                     Vec::new()
                 } else {
@@ -3833,16 +3957,30 @@ fn run_candidate_validation_command_with_timeout(
                 },
             }
         }
-        Err(error) => ValidationReport {
-            name: format!("candidate validation {}", index + 1),
-            status: ValidationStatus::Failed,
-            message: Some(format!("failed to run validation command: {error}")),
-            paths: changed_paths.to_vec(),
-        },
+        Err(error) => failed_candidate_validation_report(
+            index,
+            changed_paths,
+            &redactor,
+            format!("failed to run validation command: {error}"),
+        ),
     }
 }
 
-fn candidate_validation_message(output: &ProcessOutput) -> Option<String> {
+fn failed_candidate_validation_report(
+    index: usize,
+    changed_paths: &[PathBuf],
+    redactor: &Redactor,
+    message: String,
+) -> ValidationReport {
+    ValidationReport {
+        name: format!("candidate validation {}", index + 1),
+        status: ValidationStatus::Failed,
+        message: Some(redact_validation_diagnostic(redactor, &message)),
+        paths: changed_paths.to_vec(),
+    }
+}
+
+fn candidate_validation_message(output: &ProcessOutput, redactor: &Redactor) -> Option<String> {
     if output.status.is_some_and(|status| status.success()) {
         return None;
     }
@@ -3860,7 +3998,12 @@ fn candidate_validation_message(output: &ProcessOutput) -> Option<String> {
         .and_then(|status| status.code())
         .map(|code| format!("exited with status {code}"))
         .unwrap_or_else(|| "terminated without an exit code".to_string());
-    Some(format!("{exit}: {}", summarize_text(text, 1024).text))
+    let text = redact_validation_diagnostic(redactor, text);
+    Some(format!("{exit}: {}", summarize_text(&text, 1024).text))
+}
+
+fn redact_validation_diagnostic(redactor: &Redactor, message: &str) -> String {
+    redactor.redact(message).text
 }
 
 fn append_validation_message(existing: Option<String>, next: &str) -> Option<String> {
@@ -4965,23 +5108,114 @@ fn capture_git_environment(repo_root: &Path) -> Result<BTreeMap<String, String>>
     Ok(environment)
 }
 
-fn validation_command_environment() -> BTreeMap<String, String> {
-    let mut environment = env::vars_os()
-        .filter_map(|(key, value)| {
-            let key = key.into_string().ok()?;
-            let value = value.into_string().ok()?;
-            if is_git_injection_environment_key(&key)
-                || key.starts_with("LD_")
-                || key.starts_with("DYLD_")
-            {
-                None
-            } else {
-                Some((key, value))
-            }
-        })
-        .collect::<BTreeMap<_, _>>();
+fn validation_command_environment(environment_root: &Path) -> Result<BTreeMap<String, String>> {
+    create_private_directory(environment_root)?;
+    let home = environment_root.join("home");
+    let temporary = environment_root.join("tmp");
+    let xdg_config = environment_root.join("xdg-config");
+    let xdg_cache = environment_root.join("xdg-cache");
+    let xdg_state = environment_root.join("xdg-state");
+    for directory in [&home, &temporary, &xdg_config, &xdg_cache, &xdg_state] {
+        create_private_directory(directory)?;
+    }
+    let global_git_config = environment_root.join("gitconfig");
+    write_private_file(&global_git_config, b"")?;
+    let mut environment = explicit_environment(&[
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ]);
+    environment.insert("PATH".to_string(), trusted_path_text()?);
+    environment.insert("HOME".to_string(), path_environment_value(&home)?);
+    environment.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        path_environment_value(&xdg_config)?,
+    );
+    environment.insert(
+        "XDG_CACHE_HOME".to_string(),
+        path_environment_value(&xdg_cache)?,
+    );
+    environment.insert(
+        "XDG_STATE_HOME".to_string(),
+        path_environment_value(&xdg_state)?,
+    );
+    let temporary = path_environment_value(&temporary)?;
+    environment.insert("TMPDIR".to_string(), temporary.clone());
+    environment.insert("TMP".to_string(), temporary.clone());
+    environment.insert("TEMP".to_string(), temporary);
+    environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert(
+        "GIT_CONFIG_GLOBAL".to_string(),
+        path_environment_value(&global_git_config)?,
+    );
+    environment.insert("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string());
     environment.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
-    environment
+    environment.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+    Ok(environment)
+}
+
+fn validation_diagnostics_redactor(environment_root: &Path) -> Redactor {
+    let mut redactor = Redactor::new().with_private_value(
+        "validation-runtime",
+        environment_root.to_string_lossy().into_owned(),
+    );
+    for (key, value) in env::vars() {
+        if validation_private_environment_key(&key) && value.len() >= 4 {
+            redactor = redactor.with_private_value("validation-private-env", value);
+        }
+    }
+    redactor
+}
+
+fn validation_private_environment_key(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    key == "BASH_ENV"
+        || key == "ENV"
+        || key == "SSH_AUTH_SOCK"
+        || key == "ALL_PROXY"
+        || key == "NO_PROXY"
+        || key.ends_with("_PROXY")
+        || matches!(
+            key.as_str(),
+            "SSL_CERT_FILE"
+                | "SSL_CERT_DIR"
+                | "CURL_CA_BUNDLE"
+                | "REQUESTS_CA_BUNDLE"
+                | "NODE_EXTRA_CA_CERTS"
+                | "GIT_SSL_CAINFO"
+                | "GIT_SSL_CAPATH"
+        )
+        || key.contains("SECRET")
+        || key.contains("TOKEN")
+        || key.contains("PASSWORD")
+        || key.contains("PRIVATE_KEY")
+        || key.contains("API_KEY")
+        || key.contains("ACCESS_KEY")
+        || key.contains("CREDENTIAL")
+        || key.contains("COOKIE")
+        || key.contains("SESSION")
+        || key == "AUTH"
+        || key.starts_with("AUTH_")
+        || key.ends_with("_AUTH")
+        || key.contains("_AUTH_")
+        || (key.ends_with("_KEY") && !key.ends_with("_PUBLIC_KEY"))
+        || [
+            "AWS_",
+            "AZURE_",
+            "GOOGLE_",
+            "OPENAI_",
+            "ANTHROPIC_",
+            "GH_",
+            "GITHUB_",
+            "GITLAB_",
+            "HF_",
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
 }
 
 pub(crate) fn minimal_network_environment(
@@ -5082,6 +5316,7 @@ fn require_verified_containment(label: &str, evidence: ContainmentEvidence) -> R
     Ok(())
 }
 
+#[cfg(test)]
 fn is_git_injection_environment_key(key: &str) -> bool {
     matches!(
         key,
@@ -5617,6 +5852,9 @@ mod tests {
     use super::*;
     use git2::Signature;
     use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+
+    static VALIDATION_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn private_runtime_test_root(temp: &tempfile::TempDir) -> PathBuf {
         let root = temp.path().join("runtime");
@@ -5706,6 +5944,7 @@ mod tests {
         let started = std::time::Instant::now();
         let report = run_candidate_validation_command_with_timeout(
             temp.path(),
+            &temp.path().join("validation-environment"),
             &CandidateValidationCommand {
                 command: "sleep 2".to_string(),
             },
@@ -5720,6 +5959,128 @@ mod tests {
             .message
             .as_deref()
             .is_some_and(|message| message.contains("deadline") || message.contains("timed out")));
+    }
+
+    #[test]
+    fn candidate_validation_clears_shell_startup_and_private_network_environment() {
+        let _environment_guard = VALIDATION_ENVIRONMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bash_startup = temp.path().join("bash-startup");
+        let sh_startup = temp.path().join("sh-startup");
+        let marker = temp.path().join("startup-ran");
+        fs::write(
+            &bash_startup,
+            format!("printf injected > '{}'\n", marker.display()),
+        )
+        .expect("write bash startup");
+        fs::write(
+            &sh_startup,
+            format!("printf injected > '{}'\n", marker.display()),
+        )
+        .expect("write sh startup");
+        let old_bash_env = env::var_os("BASH_ENV");
+        let old_env = env::var_os("ENV");
+        let old_token = env::var_os("OPENAI_API_KEY");
+        // SAFETY: these tests restore the process environment before returning and the values are
+        // used only to verify the child allowlist. The test suite does not otherwise rely on them.
+        unsafe {
+            env::set_var("BASH_ENV", &bash_startup);
+            env::set_var("ENV", &sh_startup);
+            env::set_var("OPENAI_API_KEY", "validation-secret-value");
+        }
+        let command = if cfg!(unix) {
+            "bash -c 'test -z \"$OPENAI_API_KEY\" && test -z \"$BASH_ENV\" && test -z \"$ENV\"'"
+        } else {
+            "exit 0"
+        };
+        let report = run_candidate_validation_command_with_timeout(
+            temp.path(),
+            &temp.path().join("validation-environment"),
+            &CandidateValidationCommand {
+                command: command.to_string(),
+            },
+            0,
+            &[],
+            Duration::from_secs(10),
+        );
+        // SAFETY: restore the exact previous process environment values.
+        unsafe {
+            restore_test_environment("BASH_ENV", old_bash_env);
+            restore_test_environment("ENV", old_env);
+            restore_test_environment("OPENAI_API_KEY", old_token);
+        }
+        assert_eq!(report.status, ValidationStatus::Passed, "{report:?}");
+        assert!(!marker.exists(), "shell startup injection must not execute");
+    }
+
+    #[test]
+    fn candidate_validation_redacts_registered_private_output() {
+        let _environment_guard = VALIDATION_ENVIRONMENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_secret = env::var_os("MACO_VALIDATION_TEST_SECRET");
+        let old_openai_key = env::var_os("OPENAI_API_KEY");
+        let old_aws_key = env::var_os("AWS_ACCESS_KEY_ID");
+        // SAFETY: the environment value is scoped to this test and restored below.
+        unsafe {
+            env::set_var(
+                "MACO_VALIDATION_TEST_SECRET",
+                "candidate-validation-super-secret",
+            );
+            env::set_var("OPENAI_API_KEY", "openai-validation-private-key");
+            env::set_var("AWS_ACCESS_KEY_ID", "aws-validation-access-key");
+        }
+        let report = run_candidate_validation_command_with_timeout(
+            temp.path(),
+            &temp.path().join("validation-environment"),
+            &CandidateValidationCommand {
+                command: "printf '%s %s %s\\n' candidate-validation-super-secret openai-validation-private-key aws-validation-access-key >&2; exit 1".to_string(),
+            },
+            0,
+            &[PathBuf::from("README.md")],
+            Duration::from_secs(10),
+        );
+        // SAFETY: restore the exact previous process environment value.
+        unsafe {
+            restore_test_environment("MACO_VALIDATION_TEST_SECRET", old_secret);
+            restore_test_environment("OPENAI_API_KEY", old_openai_key);
+            restore_test_environment("AWS_ACCESS_KEY_ID", old_aws_key);
+        }
+        let message = report.message.expect("failed validation message");
+        assert_eq!(report.status, ValidationStatus::Failed);
+        assert!(!message.contains("candidate-validation-super-secret"));
+        assert!(!message.contains("openai-validation-private-key"));
+        assert!(!message.contains("aws-validation-access-key"));
+        assert!(message.contains("<redacted:validation-private-env>"));
+    }
+
+    #[test]
+    fn repository_index_digest_rejects_oversized_file_before_reading() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index = temp.path().join("index");
+        let file = fs::File::create(&index).expect("create sparse index");
+        file.set_len(REPOSITORY_INDEX_MAX_BYTES + 1)
+            .expect("size sparse index");
+
+        let error = hash_optional_file(&index).expect_err("oversized index must fail closed");
+
+        assert!(error.to_string().contains("bounded real regular file"));
+    }
+
+    unsafe fn restore_test_environment(key: &str, value: Option<OsString>) {
+        match value {
+            Some(value) => {
+                // SAFETY: caller guarantees serialized restoration of the test process environment.
+                unsafe { env::set_var(key, value) }
+            }
+            None => {
+                // SAFETY: caller guarantees serialized restoration of the test process environment.
+                unsafe { env::remove_var(key) }
+            }
+        }
     }
 
     #[test]

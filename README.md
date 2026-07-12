@@ -69,8 +69,9 @@ The current implementation covers a local-first command-line slice:
   is instructed to read `AGENTS.md` and project-local `.agents` guidance before
   acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
   worker/researcher assignments when available, preserve the O1/O2 subprocess
-  launch boundary of `--sandbox danger-full-access`, `--enable goals`, and
-  `--enable multi_agent`, leave O1/O2 hierarchy and enforced audit gates to
+  launch boundary of the `ExternalCodex` custom permission profile with goals
+  and multi-agent support enabled, require outer-launcher verified systemd
+  cgroup ownership evidence, leave O1/O2 hierarchy and enforced audit gates to
   MACO/Codex CLI subprocess workflows, report peer-O2 escalation candidates
   instead of taking them over, and preserve structured reporting without
   applying worker changes to the primary worktree
@@ -488,7 +489,9 @@ marker removal, or checkout deletion. That fallback fails closed if it exceeds
 uses the same entry, total-content, and single-file limits before it writes new
 temporary objects; Git stdin and output are bounded separately and an exceeded
 limit fails closed. The tool does not initialize or fetch submodules during this
-check.
+check. Repository-index fingerprints likewise use a 64 MiB no-follow bounded
+read and require a stable real regular file owned by the current user, with one
+link and no group/world write permission.
 
 The races addressed by the merge and publication boundary are concrete: a
 candidate can change while validation runs, another local process can start a
@@ -544,6 +547,13 @@ closed on Darwin rather than silently using process-group compatibility. These
 controls prevent a completed command from leaving a delayed child. They do not
 make a trusted validation command an adversarial filesystem sandbox while it is
 running.
+Candidate validation additionally starts from a cleared environment with a fixed
+root-owned system `PATH`, private `HOME`, `TMP*`, and XDG directories, and an
+empty private global Git config. Shell startup hooks, provider credentials,
+proxy/custom-CA routing, SSH-agent state, and ambient user configuration are not
+inherited. Captured validation diagnostics are bounded and redact registered
+credential, authentication, cookie/session, proxy/CA, and shell-startup values
+before they enter a validation report.
 
 Merge apply and PR publication share a kernel-managed advisory lock on the
 stable repo-common file `.git/maco/state/repository-mutation.lock`. The file is
@@ -561,13 +571,16 @@ bare context and structurally reads none of the real repository's local,
 worktree, included, global, or system config. The raw origin URL is supplied as
 guarded child-only config data, not an argument, process display, journal field,
 or on-disk temporary config. Proxy, custom CA, askpass, credential-helper, HOME,
-and custom SSH routing variables are absent. SSH origins always use a trusted
-absolute `ssh` with user config disabled, batch mode, `ProxyCommand=none`, and
-local commands disabled; `SSH_AUTH_SOCK` is the only preserved SSH data-auth
-input. HTTPS Git publication therefore requires credentials in unencoded URL
-userinfo or another transport that needs no inherited helper. Query, fragment,
-and percent-encoded credential forms are refused because reliable transport and
-error redaction semantics cannot be guaranteed.
+and custom SSH routing variables are absent. `ssh://`, `git+ssh://`,
+`ssh+git://`, and SCP-style origins with an optional user (including userless
+`host:path` and bracketed IPv6 hosts) are structurally classified as SSH. Every
+such origin uses a trusted absolute `ssh` with user config disabled, batch mode,
+`ProxyCommand=none`, and local commands disabled; ambiguous authorities and
+unsupported URL schemes are refused. `SSH_AUTH_SOCK` is the only preserved SSH
+data-auth input. HTTPS Git publication therefore requires credentials in
+unencoded URL userinfo or another transport that needs no inherited helper.
+Query, fragment, and percent-encoded credential forms are refused because
+reliable transport and error redaction semantics cannot be guaranteed.
 
 GitHub publication observes the remote head and exact base OIDs before PR
 creation, reads the resulting PR with `gh pr view`, and requires matching
@@ -578,7 +591,10 @@ Every `gh pr` and `gh issue create` call receives that explicit `--repo`;
 `gh` receives an empty private config directory and an explicit environment
 allowlist containing only OS/locale essentials plus GitHub token variables.
 HOME, proxy, custom CA, ambient repository, debug, pager, and forced-TTY routing
-are absent. The receipt URL must identify the same repository and PR number.
+are absent. Its current directory is that private config runtime, whose identity,
+owner record, and owner-only mode are rechecked immediately before each spawn;
+the potentially hostile source worktree is never the `gh` current directory.
+The receipt URL must identify the same repository and PR number.
 Publication observes the remote head and base again after that receipt. A
 mismatch is reported as blocked rather than published.
 
@@ -586,7 +602,12 @@ Publication writes versioned, append-only transaction records below the common
 `.git/maco/state/publication-transactions/` directory. Record replacement is
 atomic, the latest 32 records are kept for each transaction, and Unix creates
 the managed directories with mode `0700` and key/journal files with mode
-`0600`. Windows rejects reparse points and verifies file identity, but this
+`0600`. Journal directory entries, retained record count, and individual record
+bytes have strict upper bounds. Loading uses no-follow bounded reads and rejects
+non-regular, symlink/reparse, foreign-owned, exposed, or multiply linked records,
+identity/size changes, non-contiguous retained sequences, receipt field changes,
+and incomplete or contract-invalid GitHub receipts. Windows rejects reparse
+points and verifies file identity, but this
 workflow does not claim to tighten inherited Windows ACLs. A repo-common random
 key derives a one-way binding digest from the remote name and raw URL, so a
 credential or endpoint change cannot reuse an older transaction while the raw
@@ -809,12 +830,13 @@ Autonomous O2 runs carry context through `STATE.tsv`, `HEARTBEAT.tsv`,
 `queue.tsv`, `NEXT_O2_TASKS.tsv`, task prompts, captured final messages,
 event streams, and `SUMMARY.md` under `.maco/o2-autopilot/runs/<run-id>/`.
 
-O1/O2 subprocess orchestration uses a Codex CLI launch boundary of
-`--sandbox danger-full-access`, `--enable goals`, and `--enable multi_agent`.
-Nested O2/O1 subprocess chains must preserve that boundary for orchestrator
-roles. Do not use `workspace-write` for O2/O1 subprocess chains because nested
-Codex state DB access can collide, corrupt, or fail under workspace-write style
-restrictions.
+O1/O2 subprocess orchestration uses the Codex CLI `ExternalCodex` custom
+permission profile with goals and multi-agent support enabled. The outer
+launcher must establish and return verified systemd cgroup ownership evidence
+before MACO accepts a child result, and nested O2/O1 subprocess chains preserve
+that boundary for orchestrator roles. The ordinary workspace-write profile is
+not used for these chains because nested Codex state DB access can collide,
+corrupt, or fail under workspace-scoped restrictions.
 
 For worker assignments, child orchestrators should use Codex native
 SubAgent/delegated-worker mechanisms when available only for terminal worker or

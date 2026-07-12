@@ -27,6 +27,15 @@ const REMOTE_BINDING_SECRET_FILE: &str = "publication-remote-binding.key";
 const REMOTE_BINDING_SECRET_BYTES: usize = 32;
 const GH_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const GH_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
+const PUBLICATION_JOURNAL_MAX_DIRECTORY_ENTRIES: usize = 96;
+const PUBLICATION_JOURNAL_MAX_RECORDS: usize = 64;
+const PUBLICATION_JOURNAL_MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationRemoteTransport {
+    NonSsh,
+    Ssh,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,7 +203,7 @@ struct PublicationGitContext {
 }
 
 struct GhCommandContext {
-    _runtime_directory: merge::PrivateRuntimeDirectory,
+    runtime_directory: merge::PrivateRuntimeDirectory,
     environment: BTreeMap<String, String>,
 }
 
@@ -1001,8 +1010,10 @@ fn github_repository_identity(remote_url: &str) -> Result<GithubRepositoryIdenti
     let identity_end = remote_url.find(['?', '#']).unwrap_or(remote_url.len());
     let identity = remote_url[..identity_end].trim_end_matches('/');
     let (host, path) = if let Some((scheme, remainder)) = identity.split_once("://") {
-        if !matches!(scheme, "https" | "ssh") {
-            bail!("GitHub publication requires an https:// or ssh:// origin URL");
+        if !matches!(scheme, "https" | "ssh" | "git+ssh" | "ssh+git") {
+            bail!(
+                "GitHub publication requires an https://, ssh://, git+ssh://, or ssh+git:// origin URL"
+            );
         }
         let slash = remainder
             .find('/')
@@ -1798,6 +1809,13 @@ impl PublicationTransaction {
         let mut bytes = serde_json::to_vec_pretty(&self.journal)
             .context("failed to encode publication transaction journal")?;
         bytes.push(b'\n');
+        if bytes.len() as u64 > PUBLICATION_JOURNAL_MAX_RECORD_BYTES {
+            self.journal.sequence = self.journal.sequence.saturating_sub(1);
+            bail!(
+                "publication journal record exceeded the {}-byte safety limit",
+                PUBLICATION_JOURNAL_MAX_RECORD_BYTES
+            );
+        }
         let mut published = false;
         let write_result = (|| -> Result<()> {
             let mut options = OpenOptions::new();
@@ -1892,8 +1910,7 @@ fn load_latest_publication_journal(
     let records = publication_journal_records(directory)?;
     let mut latest = None;
     for (sequence, path) in records {
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to read journal record {}", path.display()))?;
+        let bytes = read_publication_journal_record(&path)?;
         let journal: PublicationTransactionJournal = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid journal record {}", path.display()))?;
         if journal.sequence != sequence {
@@ -1925,32 +1942,49 @@ fn prune_publication_journal(directory: &Path, retain: usize) -> Result<()> {
 }
 
 fn publication_journal_records(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
-    let mut records = Vec::new();
+    let directory_metadata = validate_publication_journal_directory(directory)?;
+    let mut paths = Vec::new();
+    let mut entry_count = 0_usize;
     for entry in fs::read_dir(directory)
         .with_context(|| format!("failed to list journal directory {}", directory.display()))?
     {
+        entry_count = entry_count
+            .checked_add(1)
+            .context("publication journal directory entry count overflow")?;
+        if entry_count > PUBLICATION_JOURNAL_MAX_DIRECTORY_ENTRIES {
+            bail!(
+                "publication journal directory exceeded the {}-entry safety limit",
+                PUBLICATION_JOURNAL_MAX_DIRECTORY_ENTRIES
+            );
+        }
         let entry = entry.with_context(|| {
             format!(
                 "failed to read journal directory entry in {}",
                 directory.display()
             )
         })?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
+        paths.push(entry.path());
+    }
+    let listed = validate_publication_journal_directory(directory)?;
+    if !publication_same_filesystem_identity(&directory_metadata, &listed) {
+        bail!("publication journal directory changed identity while it was listed");
+    }
+
+    let mut records = Vec::new();
+    for path in paths {
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to inspect journal record {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            bail!(
-                "publication journal record {} is not a regular file",
-                path.display()
-            );
-        }
+        validate_publication_journal_record_metadata(&path, &metadata)?;
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .context("publication journal JSON filename was not UTF-8")?;
+            .context("publication journal filename was not UTF-8")?;
+        if is_publication_journal_temp_name(name) {
+            bail!(
+                "publication journal contains incomplete temporary record {}",
+                path.display()
+            );
+        }
         let sequence = name
             .strip_suffix(".json")
             .filter(|sequence| {
@@ -1960,12 +1994,192 @@ fn publication_journal_records(directory: &Path) -> Result<Vec<(u64, PathBuf)>> 
             .parse::<u64>()
             .context("publication journal sequence was invalid")?;
         records.push((sequence, path));
+        if records.len() > PUBLICATION_JOURNAL_MAX_RECORDS {
+            bail!(
+                "publication journal exceeded the {}-record safety limit",
+                PUBLICATION_JOURNAL_MAX_RECORDS
+            );
+        }
     }
     records.sort_by_key(|(sequence, _)| *sequence);
+    let after = validate_publication_journal_directory(directory)?;
+    if !publication_same_filesystem_identity(&directory_metadata, &after) {
+        bail!("publication journal directory changed identity while records were inspected");
+    }
     Ok(records)
 }
 
+fn is_publication_journal_temp_name(name: &str) -> bool {
+    let Some(remainder) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(remainder) = remainder.strip_suffix(".tmp") else {
+        return false;
+    };
+    let mut fields = remainder.split('-');
+    fields.next().is_some_and(|sequence| {
+        sequence.len() == 20 && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    }) && fields
+        .next()
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        && fields.next().is_some_and(|nanos| {
+            !nanos.is_empty() && nanos.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && fields.next().is_none()
+}
+
+fn validate_publication_journal_directory(directory: &Path) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(directory).with_context(|| {
+        format!(
+            "failed to inspect publication journal directory {}",
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || publication_metadata_is_windows_reparse_point(&metadata)
+        || !metadata.file_type().is_dir()
+    {
+        bail!(
+            "publication journal directory {} is not a real directory",
+            directory.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "publication journal directory {} has a foreign owner or unsafe mode",
+                directory.display()
+            );
+        }
+    }
+    Ok(metadata)
+}
+
+fn validate_publication_journal_record_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    if metadata.file_type().is_symlink()
+        || publication_metadata_is_windows_reparse_point(metadata)
+        || !metadata.file_type().is_file()
+    {
+        bail!(
+            "publication journal record {} is not a real regular file",
+            path.display()
+        );
+    }
+    if metadata.len() == 0 || metadata.len() > PUBLICATION_JOURNAL_MAX_RECORD_BYTES {
+        bail!(
+            "publication journal record {} has an invalid size",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.nlink() != 1
+        {
+            bail!(
+                "publication journal record {} has a foreign owner, unsafe mode, or multiple links",
+                path.display()
+            );
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.number_of_links() != Some(1) {
+            bail!(
+                "publication journal record {} has multiple links",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect journal record {}", path.display()))?;
+    validate_publication_journal_record_metadata(path, &path_metadata)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open journal record {}", path.display()))?;
+    let file_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened journal record {}", path.display()))?;
+    validate_publication_journal_record_metadata(path, &file_metadata)?;
+    if !publication_same_filesystem_identity(&path_metadata, &file_metadata) {
+        bail!(
+            "publication journal record {} changed while it was opened",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(PUBLICATION_JOURNAL_MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read journal record {}", path.display()))?;
+    if bytes.is_empty()
+        || bytes.len() as u64 > PUBLICATION_JOURNAL_MAX_RECORD_BYTES
+        || bytes.len() as u64 != file_metadata.len()
+    {
+        bail!(
+            "publication journal record {} changed size while it was read",
+            path.display()
+        );
+    }
+    let after = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to recheck journal record {}", path.display()))?;
+    validate_publication_journal_record_metadata(path, &after)?;
+    if !publication_same_filesystem_identity(&file_metadata, &after)
+        || after.len() != file_metadata.len()
+    {
+        bail!(
+            "publication journal record {} changed after it was read",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+fn publication_same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        left.volume_serial_number() == right.volume_serial_number()
+            && left.file_index() == right.file_index()
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
 fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Result<()> {
+    if journal.version != PUBLICATION_JOURNAL_VERSION || journal.sequence == 0 {
+        bail!("publication journal version or sequence was invalid");
+    }
     Oid::from_str(&journal.expected_oid).context("publication journal expected OID was invalid")?;
     if let Some(oid) = journal.expected_base_oid.as_deref() {
         Oid::from_str(oid).context("publication journal expected base OID was invalid")?;
@@ -1983,15 +2197,83 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
     {
         bail!("publication journal push phase did not contain the expected observed OID");
     }
-    if journal.forge == ForgeKind::Github
-        && journal.phase >= PublicationTransactionPhase::PrObserved
-        && (journal.pr_url.is_none()
-            || journal.pr_head_oid.is_none()
-            || journal.pr_base.is_none()
-            || journal.pr_state.is_none()
-            || journal.pr_is_draft.is_none())
+    if journal.phase < PublicationTransactionPhase::PushObserved
+        && journal.push_observed_oid.is_some()
     {
-        bail!("publication journal PR phase did not contain a complete GitHub receipt");
+        bail!("publication journal recorded a push receipt before the push phase");
+    }
+    if journal.forge == ForgeKind::Github {
+        if journal.expected_base_oid.is_none() {
+            bail!("GitHub publication journal omitted the exact reviewed base OID");
+        }
+        if journal.phase >= PublicationTransactionPhase::PrObserved {
+            if journal.created_by_transaction == journal.observed_existing_pr {
+                bail!(
+                    "publication journal PR phase did not contain exactly one receipt provenance"
+                );
+            }
+            let repository = journal
+                .github_repository
+                .as_ref()
+                .context("GitHub publication journal omitted its bound repository")?;
+            let url = journal
+                .pr_url
+                .as_deref()
+                .context("publication journal PR phase omitted its URL")?;
+            let head = journal
+                .pr_head_oid
+                .as_deref()
+                .context("publication journal PR phase omitted its head OID")?;
+            let base = journal
+                .pr_base
+                .as_deref()
+                .context("publication journal PR phase omitted its base branch")?;
+            let state = journal
+                .pr_state
+                .as_deref()
+                .context("publication journal PR phase omitted its state")?;
+            let is_draft = journal
+                .pr_is_draft
+                .context("publication journal PR phase omitted its draft state")?;
+            let number = journal
+                .pr_number
+                .filter(|number| *number > 0)
+                .context("publication journal PR phase omitted its number")?;
+            if head != journal.expected_oid {
+                bail!("publication journal PR head did not match the expected OID");
+            }
+            if base != journal.base {
+                bail!("publication journal PR base did not match the requested base");
+            }
+            if state != "OPEN" {
+                bail!("publication journal PR state was not OPEN");
+            }
+            if is_draft != journal.draft {
+                bail!("publication journal PR draft state changed from the request");
+            }
+            validate_github_receipt_url(url, repository, number)?;
+        } else if journal.pr_url.is_some()
+            || journal.pr_head_oid.is_some()
+            || journal.pr_base.is_some()
+            || journal.pr_state.is_some()
+            || journal.pr_is_draft.is_some()
+            || journal.pr_number.is_some()
+            || journal.created_by_transaction
+            || journal.observed_existing_pr
+        {
+            bail!("publication journal recorded PR receipt fields before the PR phase");
+        }
+    } else if journal.pr_url.is_some()
+        || journal.pr_head_oid.is_some()
+        || journal.pr_base.is_some()
+        || journal.pr_state.is_some()
+        || journal.pr_is_draft.is_some()
+        || journal.pr_number.is_some()
+        || journal.create_attempted
+        || journal.created_by_transaction
+        || journal.observed_existing_pr
+    {
+        bail!("non-GitHub publication journal contained GitHub PR state");
     }
     if (journal.forge == ForgeKind::Github) != journal.github_repository.is_some() {
         bail!("publication journal forge repository binding was inconsistent");
@@ -2009,6 +2291,14 @@ fn validate_publication_journal_transition(
     previous: &PublicationTransactionJournal,
     current: &PublicationTransactionJournal,
 ) -> Result<()> {
+    if current.sequence
+        != previous
+            .sequence
+            .checked_add(1)
+            .context("publication journal sequence overflow while validating retained records")?
+    {
+        bail!("publication journal retained sequence was not contiguous");
+    }
     if previous.version != current.version
         || previous.transaction_id != current.transaction_id
         || previous.agent_id != current.agent_id
@@ -2028,6 +2318,20 @@ fn validate_publication_journal_transition(
     }
     if current.phase < previous.phase {
         bail!("publication journal phase regressed between records");
+    }
+    if previous.push_observed_oid.is_some()
+        && previous.push_observed_oid != current.push_observed_oid
+    {
+        bail!("publication journal push receipt changed between records");
+    }
+    if (previous.pr_url.is_some() && previous.pr_url != current.pr_url)
+        || (previous.pr_head_oid.is_some() && previous.pr_head_oid != current.pr_head_oid)
+        || (previous.pr_base.is_some() && previous.pr_base != current.pr_base)
+        || (previous.pr_state.is_some() && previous.pr_state != current.pr_state)
+        || (previous.pr_is_draft.is_some() && previous.pr_is_draft != current.pr_is_draft)
+        || (previous.pr_number.is_some() && previous.pr_number != current.pr_number)
+    {
+        bail!("publication journal immutable PR receipt changed between records");
     }
     if (previous.create_attempted && !current.create_attempted)
         || (previous.created_by_transaction && !current.created_by_transaction)
@@ -2118,7 +2422,8 @@ impl PublicationGitContext {
             config
                 .set_str("protocol.ext.allow", "never")
                 .context("failed to disable external publication protocol")?;
-            let uses_ssh = publication_remote_uses_ssh(remote_url);
+            let uses_ssh =
+                publication_remote_transport(remote_url)? == PublicationRemoteTransport::Ssh;
             if uses_ssh {
                 config
                     .set_str("core.sshcommand", &fixed_trusted_ssh_command()?)
@@ -2212,15 +2517,179 @@ fn validate_publication_remote_url(remote_url: &str) -> Result<()> {
             "percent-encoded publication URL credentials are unsupported because safe error redaction cannot be guaranteed"
         );
     }
+    publication_remote_transport(remote_url)?;
     Ok(())
 }
 
-fn publication_remote_uses_ssh(remote_url: &str) -> bool {
-    remote_url.starts_with("ssh://")
-        || (!remote_url.contains("://")
+fn publication_remote_transport(remote_url: &str) -> Result<PublicationRemoteTransport> {
+    if let Some((scheme, remainder)) = remote_url.split_once("://") {
+        if scheme != scheme.to_ascii_lowercase() {
+            bail!("publication remote URL scheme must be lowercase");
+        }
+        return match scheme.to_ascii_lowercase().as_str() {
+            "ssh" | "git+ssh" | "ssh+git" => {
+                validate_ssh_url_remote(remainder)?;
+                Ok(PublicationRemoteTransport::Ssh)
+            }
+            "https" | "http" | "git" => {
+                validate_non_ssh_network_remote(remainder)?;
+                Ok(PublicationRemoteTransport::NonSsh)
+            }
+            "file" => {
+                if remainder.is_empty() {
+                    bail!("file publication remote omitted a path");
+                }
+                Ok(PublicationRemoteTransport::NonSsh)
+            }
+            _ => bail!("publication remote uses an unsupported URL scheme"),
+        };
+    }
+
+    if publication_remote_is_local_path(remote_url) {
+        return Ok(PublicationRemoteTransport::NonSsh);
+    }
+    if remote_url.contains(':') {
+        validate_scp_style_remote(remote_url)?;
+        return Ok(PublicationRemoteTransport::Ssh);
+    }
+    Ok(PublicationRemoteTransport::NonSsh)
+}
+
+fn publication_remote_is_local_path(remote_url: &str) -> bool {
+    remote_url.starts_with('/')
+        || remote_url.starts_with('\\')
+        || remote_url.starts_with("./")
+        || remote_url.starts_with("../")
+        || remote_url.starts_with("~/")
+        || remote_url.as_bytes().get(1) == Some(&b':')
             && remote_url
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+            && remote_url
+                .as_bytes()
+                .get(2)
+                .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+}
+
+fn validate_non_ssh_network_remote(remainder: &str) -> Result<()> {
+    let (authority, path) = remainder
+        .split_once('/')
+        .context("publication remote URL omitted a repository path")?;
+    if authority.is_empty() || path.is_empty() {
+        bail!("publication remote URL omitted an authority or repository path");
+    }
+    Ok(())
+}
+
+fn validate_ssh_url_remote(remainder: &str) -> Result<()> {
+    let (authority, path) = remainder
+        .split_once('/')
+        .context("SSH publication remote omitted a repository path")?;
+    if path.is_empty() {
+        bail!("SSH publication remote omitted a repository path");
+    }
+    validate_ssh_authority(authority, true)
+}
+
+fn validate_scp_style_remote(remote_url: &str) -> Result<()> {
+    let delimiter = if let Some(bracket_start) = remote_url.find('[') {
+        let bracket_end = remote_url[bracket_start + 1..]
+            .find(']')
+            .map(|offset| bracket_start + 1 + offset)
+            .context("SCP-style publication remote contained an unterminated IPv6 host")?;
+        if remote_url[bracket_end + 1..].starts_with(':') {
+            bracket_end + 1
+        } else {
+            bail!("SCP-style publication remote omitted ':' after its IPv6 host");
+        }
+    } else {
+        remote_url
+            .find(':')
+            .context("SCP-style publication remote omitted ':'")?
+    };
+    let authority = &remote_url[..delimiter];
+    let path = &remote_url[delimiter + 1..];
+    if path.is_empty() || path.starts_with(':') {
+        bail!("SCP-style publication remote omitted a repository path");
+    }
+    validate_ssh_authority(authority, false)
+}
+
+fn validate_ssh_authority(authority: &str, allow_port: bool) -> Result<()> {
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\'))
+    {
+        bail!("SSH publication remote authority is invalid");
+    }
+    let mut user_and_host = authority.split('@');
+    let first = user_and_host
+        .next()
+        .context("SSH publication remote authority was empty")?;
+    let (user, host_and_port) = match user_and_host.next() {
+        Some(host) => (Some(first), host),
+        None => (None, first),
+    };
+    if user_and_host.next().is_some()
+        || user.is_some_and(|user| {
+            user.is_empty()
+                || !user.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+                })
+        })
+    {
+        bail!("SSH publication remote user is invalid");
+    }
+
+    if let Some(host) = host_and_port.strip_prefix('[') {
+        let close = host
+            .find(']')
+            .context("SSH publication remote contained an unterminated IPv6 host")?;
+        let address = &host[..close];
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            bail!("SSH publication remote IPv6 host is invalid");
+        }
+        let suffix = &host[close + 1..];
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        if !allow_port {
+            bail!("SCP-style publication remote IPv6 authority contained unexpected data");
+        }
+        validate_ssh_port(suffix)
+    } else {
+        let (host, port) = if allow_port {
+            host_and_port
                 .split_once(':')
-                .is_some_and(|(authority, _)| authority.contains('@')))
+                .map_or((host_and_port, None), |(host, port)| (host, Some(port)))
+        } else {
+            (host_and_port, None)
+        };
+        if host.is_empty()
+            || host.contains(':')
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            bail!("SSH publication remote host is invalid");
+        }
+        if let Some(port) = port {
+            validate_ssh_port(&format!(":{port}"))?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_ssh_port(suffix: &str) -> Result<()> {
+    let port = suffix
+        .strip_prefix(':')
+        .context("SSH publication remote port separator was invalid")?;
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("SSH publication remote port is invalid");
+    }
+    Ok(())
 }
 
 fn fixed_trusted_ssh_command() -> Result<String> {
@@ -2665,7 +3134,7 @@ impl GhCommandContext {
         })();
         match result {
             Ok(environment) => Ok(Self {
-                _runtime_directory: runtime_directory,
+                runtime_directory,
                 environment,
             }),
             Err(error) => Err(error),
@@ -2674,16 +3143,18 @@ impl GhCommandContext {
 
     fn run(
         &self,
-        worktree_path: &Path,
         label: &str,
         args: Vec<OsString>,
         stdin: StdinMode,
     ) -> Result<merge::RequiredCommandOutput> {
+        self.runtime_directory
+            .verify_identity()
+            .context("private gh runtime changed before command execution")?;
         merge::run_required_direct(
             label,
             merge::resolve_trusted_executable("gh")?,
             args,
-            worktree_path,
+            self.runtime_directory.path(),
             self.environment.clone(),
             stdin,
             merge::NETWORK_PROCESS_TIMEOUT,
@@ -2706,7 +3177,6 @@ fn cli_github_pr_list(
 ) -> Result<Vec<GithubPrResult>> {
     let context = GhCommandContext::create(worktree_path)?;
     let output = context.run(
-        worktree_path,
         "gh pr list",
         [
             "pr",
@@ -2743,7 +3213,6 @@ fn cli_github_pr_view(
 ) -> Result<GithubPrResult> {
     let context = GhCommandContext::create(worktree_path)?;
     let output = context.run(
-        worktree_path,
         "gh pr view",
         [
             "pr",
@@ -2843,7 +3312,6 @@ fn cli_github_pr_create(
         args.push(OsString::from("--draft"));
     }
     let output = context.run(
-        worktree_path,
         "gh pr create",
         args,
         StdinMode::Bytes(body.as_bytes().to_vec()),
@@ -2884,7 +3352,6 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
         args.push(OsString::from(label));
     }
     let output = context.run(
-        repo,
         "gh issue create",
         args,
         StdinMode::Bytes(body.as_bytes().to_vec()),
@@ -3029,6 +3496,53 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    fn completed_github_journal(sequence: u64) -> PublicationTransactionJournal {
+        PublicationTransactionJournal {
+            version: PUBLICATION_JOURNAL_VERSION,
+            transaction_id: "completed-test-transaction".to_string(),
+            sequence,
+            agent_id: "agent-a".to_string(),
+            forge: ForgeKind::Github,
+            expected_oid: "1111111111111111111111111111111111111111".to_string(),
+            expected_base_oid: Some("3333333333333333333333333333333333333333".to_string()),
+            remote_name: "origin".to_string(),
+            remote_binding_digest: "2222222222222222222222222222222222222222".to_string(),
+            remote_display: "https://example.invalid/owner/repo.git".to_string(),
+            remote_ref: "refs/heads/maco/review/agent-a/test".to_string(),
+            remote_branch: "maco/review/agent-a/test".to_string(),
+            github_repository: Some(GithubRepositoryIdentity {
+                host: "example.invalid".to_string(),
+                owner: "owner".to_string(),
+                name: "repo".to_string(),
+            }),
+            base: "main".to_string(),
+            draft: true,
+            phase: PublicationTransactionPhase::Completed,
+            push_observed_oid: Some("1111111111111111111111111111111111111111".to_string()),
+            pr_url: Some("https://example.invalid/owner/repo/pull/7".to_string()),
+            pr_head_oid: Some("1111111111111111111111111111111111111111".to_string()),
+            pr_base: Some("main".to_string()),
+            pr_state: Some("OPEN".to_string()),
+            pr_is_draft: Some(true),
+            pr_number: Some(7),
+            create_attempted: true,
+            created_by_transaction: true,
+            observed_existing_pr: false,
+            last_error: None,
+            updated_unix_seconds: sequence,
+        }
+    }
+
+    fn write_test_journal_record(directory: &Path, journal: &PublicationTransactionJournal) {
+        let mut bytes = serde_json::to_vec(journal).expect("serialize test journal");
+        bytes.push(b'\n');
+        merge::write_private_file(
+            &directory.join(format!("{:020}.json", journal.sequence)),
+            &bytes,
+        )
+        .expect("write private test journal");
+    }
+
     struct LostResponseGithubApi {
         list_calls: usize,
         create_calls: usize,
@@ -3084,10 +3598,12 @@ mod tests {
     #[test]
     fn publication_journal_retains_only_latest_32_of_100_retries() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let journal_directory = temp.path().join("journal");
+        merge::create_private_directory(&journal_directory).expect("private journal directory");
         let remote_display = "https://example.invalid/repo";
         let remote_binding_digest = "2222222222222222222222222222222222222222".to_string();
         let mut transaction = PublicationTransaction {
-            directory: temp.path().to_path_buf(),
+            directory: journal_directory.clone(),
             journal: PublicationTransactionJournal {
                 version: PUBLICATION_JOURNAL_VERSION,
                 transaction_id: "test-transaction".to_string(),
@@ -3131,13 +3647,13 @@ mod tests {
             transaction.persist().expect("persist retry");
         }
 
-        let records = fs::read_dir(temp.path())
+        let records = fs::read_dir(&journal_directory)
             .expect("read journal dir")
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 32);
-        let latest = load_latest_publication_journal(temp.path())
+        let latest = load_latest_publication_journal(&journal_directory)
             .expect("load latest")
             .expect("journal exists");
         assert_eq!(latest.sequence, 100);
@@ -3173,13 +3689,165 @@ mod tests {
     #[test]
     fn publication_journal_rejects_every_noncanonical_json_record() {
         let temp = tempfile::tempdir().expect("tempdir");
-        fs::write(temp.path().join("unexpected.json"), b"{}\n")
-            .expect("write unexpected JSON record");
+        let journal_directory = temp.path().join("journal");
+        merge::create_private_directory(&journal_directory).expect("private journal directory");
+        merge::write_private_file(&journal_directory.join("unexpected.json"), b"{}\n")
+            .expect("write private unexpected JSON record");
 
-        assert!(load_latest_publication_journal(temp.path())
+        assert!(load_latest_publication_journal(&journal_directory)
             .expect_err("noncanonical JSON record must fail")
             .to_string()
             .contains("canonical sequence"));
+    }
+
+    #[test]
+    fn publication_journal_rejects_oversized_hardlinked_and_excess_records() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let oversized_directory = temp.path().join("oversized");
+        merge::create_private_directory(&oversized_directory)
+            .expect("private oversized journal directory");
+        let oversized_path = oversized_directory.join("00000000000000000001.json");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let oversized = options
+            .open(&oversized_path)
+            .expect("create oversized journal");
+        oversized
+            .set_len(PUBLICATION_JOURNAL_MAX_RECORD_BYTES + 1)
+            .expect("size oversized journal");
+        assert!(load_latest_publication_journal(&oversized_directory)
+            .expect_err("oversized journal must fail")
+            .to_string()
+            .contains("invalid size"));
+
+        let linked_directory = temp.path().join("linked");
+        merge::create_private_directory(&linked_directory)
+            .expect("private linked journal directory");
+        let linked_path = linked_directory.join("00000000000000000001.json");
+        merge::write_private_file(&linked_path, b"{}\n").expect("write linked journal source");
+        fs::hard_link(&linked_path, temp.path().join("journal-hardlink"))
+            .expect("link journal record");
+        assert!(load_latest_publication_journal(&linked_directory)
+            .expect_err("hardlinked journal must fail")
+            .to_string()
+            .contains("multiple links"));
+
+        let excess_directory = temp.path().join("excess");
+        merge::create_private_directory(&excess_directory)
+            .expect("private excess journal directory");
+        for sequence in 1..=(PUBLICATION_JOURNAL_MAX_RECORDS as u64 + 1) {
+            write_test_journal_record(&excess_directory, &completed_github_journal(sequence));
+        }
+        assert!(load_latest_publication_journal(&excess_directory)
+            .expect_err("excess journal records must fail")
+            .to_string()
+            .contains("record safety limit"));
+
+        let entry_directory = temp.path().join("entries");
+        merge::create_private_directory(&entry_directory)
+            .expect("private entry-bound journal directory");
+        for entry in 0..=PUBLICATION_JOURNAL_MAX_DIRECTORY_ENTRIES {
+            merge::write_private_file(&entry_directory.join(format!("entry-{entry}")), b"x")
+                .expect("write bounded journal directory entry");
+        }
+        assert!(load_latest_publication_journal(&entry_directory)
+            .expect_err("excess journal directory entries must fail")
+            .to_string()
+            .contains("entry safety limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_journal_rejects_symlinked_and_exposed_records() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let symlink_directory = temp.path().join("symlink");
+        merge::create_private_directory(&symlink_directory)
+            .expect("private symlink journal directory");
+        let target = temp.path().join("target.json");
+        merge::write_private_file(&target, b"{}\n").expect("write journal target");
+        symlink(&target, symlink_directory.join("00000000000000000001.json"))
+            .expect("symlink journal record");
+        assert!(load_latest_publication_journal(&symlink_directory)
+            .expect_err("symlinked journal must fail")
+            .to_string()
+            .contains("real regular file"));
+
+        let exposed_directory = temp.path().join("exposed");
+        merge::create_private_directory(&exposed_directory)
+            .expect("private exposed journal directory");
+        let exposed = exposed_directory.join("00000000000000000001.json");
+        merge::write_private_file(&exposed, b"{}\n").expect("write exposed journal");
+        fs::set_permissions(&exposed, fs::Permissions::from_mode(0o644))
+            .expect("expose journal mode");
+        assert!(load_latest_publication_journal(&exposed_directory)
+            .expect_err("exposed journal must fail")
+            .to_string()
+            .contains("unsafe mode"));
+    }
+
+    #[test]
+    fn publication_journal_rejects_sequence_gaps_and_receipt_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_directory = temp.path().join("journal");
+        merge::create_private_directory(&journal_directory).expect("private journal directory");
+        write_test_journal_record(&journal_directory, &completed_github_journal(1));
+        write_test_journal_record(&journal_directory, &completed_github_journal(3));
+        assert!(load_latest_publication_journal(&journal_directory)
+            .expect_err("retained journal gap must fail")
+            .to_string()
+            .contains("not contiguous"));
+
+        let previous = completed_github_journal(1);
+        let mut changed = completed_github_journal(2);
+        changed.pr_url = Some("https://example.invalid/owner/repo/pull/8".to_string());
+        changed.pr_number = Some(8);
+        validate_publication_journal(&changed).expect("changed receipt is independently valid");
+        assert!(validate_publication_journal_transition(&previous, &changed)
+            .expect_err("receipt identity change must fail")
+            .to_string()
+            .contains("immutable PR receipt"));
+    }
+
+    #[test]
+    fn publication_journal_enforces_completed_github_receipt_contract() {
+        let valid = completed_github_journal(1);
+        validate_publication_journal(&valid).expect("valid completed receipt");
+
+        let mut wrong_head = valid.clone();
+        wrong_head.pr_head_oid = Some("4444444444444444444444444444444444444444".to_string());
+        assert!(validate_publication_journal(&wrong_head)
+            .expect_err("wrong persisted head must fail")
+            .to_string()
+            .contains("PR head"));
+
+        let mut wrong_base = valid.clone();
+        wrong_base.pr_base = Some("release".to_string());
+        assert!(validate_publication_journal(&wrong_base)
+            .expect_err("wrong persisted base must fail")
+            .to_string()
+            .contains("PR base"));
+
+        let mut missing_number = valid.clone();
+        missing_number.pr_number = None;
+        assert!(validate_publication_journal(&missing_number)
+            .expect_err("missing persisted PR number must fail")
+            .to_string()
+            .contains("number"));
+
+        let mut wrong_draft = valid;
+        wrong_draft.pr_is_draft = Some(false);
+        assert!(validate_publication_journal(&wrong_draft)
+            .expect_err("changed persisted draft state must fail")
+            .to_string()
+            .contains("draft state"));
     }
 
     #[test]
@@ -3296,9 +3964,12 @@ mod tests {
         .expect("parse HTTPS origin");
         let ssh = github_repository_identity("ssh://git@github.example/Owner/repo.git")
             .expect("parse SSH origin");
+        let git_ssh = github_repository_identity("git+ssh://github.example/Owner/repo.git")
+            .expect("parse git+ssh origin");
         let scp = github_repository_identity("git@github.example:Owner/repo.git")
             .expect("parse SCP origin");
         assert_eq!(https, ssh);
+        assert_eq!(https, git_ssh);
         assert_eq!(https, scp);
         assert_eq!(https.selector(), "github.example/Owner/repo");
         assert!(github_repository_identity("/tmp/local-origin.git").is_err());
@@ -3374,7 +4045,7 @@ mod tests {
         );
 
         let journal_directory = temp.path().join("journal");
-        fs::create_dir(&journal_directory).expect("journal directory");
+        merge::create_private_directory(&journal_directory).expect("private journal directory");
         let repository = GithubRepositoryIdentity {
             host: "github.example".to_string(),
             owner: "owner".to_string(),
@@ -3519,7 +4190,7 @@ mod tests {
         let remote_branch = format!("maco/review/agent-a/{expected}");
         let remote_ref = format!("refs/heads/{remote_branch}");
         let journal_directory = temp.path().join("journal");
-        fs::create_dir(&journal_directory).expect("journal directory");
+        merge::create_private_directory(&journal_directory).expect("private journal directory");
         let mut transaction = PublicationTransaction {
             directory: journal_directory,
             journal: PublicationTransactionJournal {
@@ -3636,7 +4307,7 @@ mod tests {
         );
 
         let journal_directory = temp.path().join("journal");
-        fs::create_dir(&journal_directory).expect("journal directory");
+        merge::create_private_directory(&journal_directory).expect("private journal directory");
         let mut transaction = PublicationTransaction {
             directory: journal_directory.clone(),
             journal: PublicationTransactionJournal {
@@ -3817,7 +4488,7 @@ mod tests {
         );
         assert_eq!(
             context.environment.get("GH_CONFIG_DIR").map(String::as_str),
-            context._runtime_directory.path().to_str()
+            context.runtime_directory.path().to_str()
         );
     }
 
@@ -3867,6 +4538,102 @@ mod tests {
             validate_publication_remote_url("https://user:abc%64ef@example.invalid/repo.git")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn publication_remote_structurally_classifies_every_supported_ssh_form() {
+        for remote in [
+            "ssh://github.example/owner/repo.git",
+            "ssh://git@github.example:2222/owner/repo.git",
+            "git+ssh://github.example/owner/repo.git",
+            "ssh+git://git@github.example/owner/repo.git",
+            "github.example:owner/repo.git",
+            "git@github.example:owner/repo.git",
+            "[2001:db8::1]:owner/repo.git",
+            "git@[2001:db8::1]:owner/repo.git",
+        ] {
+            assert_eq!(
+                publication_remote_transport(remote).expect("classify supported SSH remote"),
+                PublicationRemoteTransport::Ssh,
+                "{remote}"
+            );
+        }
+        for remote in [
+            "https://github.example/owner/repo.git",
+            "file:///tmp/repo.git",
+            "/tmp/repo.git",
+            "../repo.git",
+            r"C:\\repo.git",
+        ] {
+            assert_eq!(
+                publication_remote_transport(remote).expect("classify supported non-SSH remote"),
+                PublicationRemoteTransport::NonSsh,
+                "{remote}"
+            );
+        }
+        for remote in [
+            "ext://host/repo",
+            "SSH://host/repo",
+            "host::remote-helper",
+            "ssh://user@@host/repo",
+            "ssh://[2001:db8::1/repo",
+            "host:",
+        ] {
+            assert!(
+                publication_remote_transport(remote).is_err(),
+                "ambiguous remote must fail: {remote}"
+            );
+        }
+    }
+
+    #[test]
+    fn userless_scp_remote_is_bound_to_fixed_trusted_ssh_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let context = PublicationGitContext::create(&repo_path, "github.example:owner/repo.git")
+            .expect("create userless SCP publication context");
+        let config = git2::Config::open(&context.directory.join("config"))
+            .expect("open private publication config");
+        let command = config
+            .get_string("core.sshcommand")
+            .expect("fixed SSH command must be configured");
+        assert!(command.contains(" -F /dev/null "));
+        assert!(command.contains("ProxyCommand=none"));
+        assert_eq!(
+            context.environment.get("SSH_AUTH_SOCK"),
+            env::var("SSH_AUTH_SOCK").ok().as_ref()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_command_refuses_changed_private_runtime_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let context = GhCommandContext::create(temp.path()).expect("create gh context");
+        assert_ne!(context.runtime_directory.path(), temp.path());
+        fs::set_permissions(
+            context.runtime_directory.path(),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("weaken gh runtime mode");
+        let result = context.run(
+            "gh identity test",
+            vec![OsString::from("--version")],
+            StdinMode::Null,
+        );
+        fs::set_permissions(
+            context.runtime_directory.path(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore gh runtime mode for cleanup");
+        let error = match result {
+            Ok(_) => panic!("changed gh runtime must fail before command execution"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("private gh runtime changed"));
     }
 
     #[cfg(unix)]
