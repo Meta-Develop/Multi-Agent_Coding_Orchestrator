@@ -11,16 +11,21 @@
 use crate::{
     artifacts::{
         repository_auth_writer, repository_authenticator_key_only,
-        state_auth::{sha256_hex, AuthenticationDomain, RepositoryAuthBinding},
+        state_auth::{
+            sha256_hex, AuthenticationDomain, AuthenticationTag, BoundStateLock,
+            RepositoryAuthBinding, RepositoryAuthWriter,
+        },
     },
     authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
     safe_state::{
         identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity,
         KernelStateLock, SafeRoot,
     },
-    semantic_coord::SemanticIntent,
-    state_journal::{JournalSpec, JOURNAL_ROOT_NAME},
+    semantic_coord::{SemanticIntent, SemanticSnapshotSpec},
+    state_journal::{JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
     sync::PathClaim,
+    sync_store::ClaimsSnapshotSpec,
+    worktree::ManagedSnapshotSpec,
 };
 use anyhow::{bail, Context, Result};
 use git2::Repository;
@@ -138,6 +143,657 @@ pub(crate) struct StateMigrationReport {
     pub manifest_generation: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum LegacyAdoption {
+    Missing,
+    Present(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyRetirementPhase {
+    Pending,
+    Active,
+}
+
+const RETIREMENT_INTENT_FILE: &str = ".legacy-retirement.intent.json";
+const RETIREMENT_SIDECAR_FILE: &str = ".legacy-retirement.sidecar";
+pub(crate) const LEGACY_RETIREMENT_DOMAIN: AuthenticationDomain =
+    AuthenticationDomain::new(b"MACO\0legacy-state-retirement\0v1\0");
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyRetirementFaultPoint {
+    Sidecar,
+    Intent,
+    PendingTombstone,
+    ActiveTombstone,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_RETIREMENT_FAULT: std::cell::Cell<Option<LegacyRetirementFaultPoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_legacy_retirement_fault(point: LegacyRetirementFaultPoint) {
+    LEGACY_RETIREMENT_FAULT.with(|slot| slot.set(Some(point)));
+}
+
+#[cfg(test)]
+fn run_legacy_retirement_fault(point: LegacyRetirementFaultPoint) -> Result<()> {
+    let triggered = LEGACY_RETIREMENT_FAULT.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if triggered {
+        bail!("injected legacy retirement fault after {point:?}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRetirementDescriptor {
+    original_present: bool,
+    original_identity: Option<FileIdentity>,
+    original_sha256: Option<String>,
+    sidecar_file: String,
+    sidecar_identity: FileIdentity,
+    sidecar_size: u64,
+    sidecar_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRetirementIntent {
+    version: u32,
+    consumer: String,
+    file: String,
+    repository: RepositoryAuthBinding,
+    descriptor: LegacyRetirementDescriptor,
+    mac: AuthenticationTag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRetirementTombstone {
+    version: u32,
+    phase: LegacyRetirementPhase,
+    consumer: String,
+    file: String,
+    repository: RepositoryAuthBinding,
+    descriptor: LegacyRetirementDescriptor,
+    snapshot_identity: Option<JournalIdentity>,
+    snapshot_generation: Option<u64>,
+    mac: AuthenticationTag,
+}
+
+pub(crate) struct LegacyRetirementPreparation {
+    adoption: LegacyAdoption,
+    writer: RepositoryAuthWriter,
+}
+
+impl LegacyRetirementPreparation {
+    pub(crate) fn into_parts(self) -> (LegacyAdoption, RepositoryAuthWriter) {
+        (self.adoption, self.writer)
+    }
+}
+
+/// Starts or resumes the legacy-retirement transaction before a consumer
+/// publishes its first authenticated snapshot. The trusted legacy bytes are
+/// copied into the consumer root and bound by a signed intent before the
+/// legacy filename becomes a version-3 pending tombstone. Consequently a
+/// crash leaves either the untouched legacy state, or a state that old
+/// version-2 writers reject and new code can recover from the signed sidecar.
+pub(crate) fn prepare_legacy_retirement<S: SnapshotSpec>(
+    repo_path: &Path,
+    consumer: &str,
+    file_name: &str,
+    domain: AuthenticationDomain,
+    legacy_fence: &impl Fn() -> Result<()>,
+) -> Result<LegacyRetirementPreparation> {
+    legacy_fence()?;
+    let repository = Repository::discover(repo_path)?;
+    let common_root = SafeRoot::open_existing(repository.commondir())?;
+    let state_root = SafeRoot::open_existing(common_root.path().join("maco/state"))?;
+    if state_root.direct_child_exists(file_name)? {
+        let bytes =
+            BoundedRegularReader::read_direct(&state_root, file_name, MAX_LEGACY_STATE_BYTES)?;
+        if serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+            == Some(3)
+        {
+            let writer = repository_auth_writer(repo_path)?;
+            let tombstone = verify_retirement_tombstone(
+                writer.authenticator(),
+                consumer,
+                file_name,
+                domain,
+                &bytes,
+            )?;
+            if tombstone.phase != LegacyRetirementPhase::Pending
+                || tombstone.snapshot_identity.is_some()
+                || tombstone.snapshot_generation.is_some()
+            {
+                bail!("legacy retirement is already active but no authenticated snapshot locator was found");
+            }
+            let consumer_root = open_consumer_retirement_root::<S>(writer.authenticator())?;
+            let root_lock = BoundStateLock::acquire(&consumer_root, S::ROOT_LOCK_NAME)?;
+            let intent = read_and_verify_retirement_intent(
+                writer.authenticator(),
+                &consumer_root,
+                consumer,
+                file_name,
+                domain,
+            )?;
+            if intent.descriptor != tombstone.descriptor {
+                bail!("legacy retirement pending tombstone does not match its signed intent");
+            }
+            let adoption = read_retirement_sidecar(&consumer_root, &intent.descriptor)?;
+            root_lock.verify(&consumer_root)?;
+            legacy_fence()?;
+            return Ok(LegacyRetirementPreparation { adoption, writer });
+        }
+    }
+    // This manifest preflight deliberately precedes the first auth writer so
+    // untrusted legacy state cannot cause a key, epoch, or consumer root.
+    let adoption = authenticated_legacy_adoption(repo_path, consumer, file_name)?;
+    let original_identity = match &adoption {
+        LegacyAdoption::Missing => None,
+        LegacyAdoption::Present(_) => Some(identity_for_path(state_root.direct_child(file_name)?)?),
+    };
+    let writer = repository_auth_writer(repo_path)?;
+    let consumer_root = open_consumer_retirement_root::<S>(writer.authenticator())?;
+    let root_lock = BoundStateLock::acquire(&consumer_root, S::ROOT_LOCK_NAME)?;
+    if consumer_root.direct_child_exists(RETIREMENT_INTENT_FILE)? {
+        let intent = read_and_verify_retirement_intent(
+            writer.authenticator(),
+            &consumer_root,
+            consumer,
+            file_name,
+            domain,
+        )?;
+        validate_retirement_descriptor_against_adoption(
+            &intent.descriptor,
+            &adoption,
+            original_identity.as_ref(),
+        )?;
+        let recovered = read_retirement_sidecar(&consumer_root, &intent.descriptor)?;
+        let tombstone = pending_retirement_tombstone(
+            writer.authenticator(),
+            consumer,
+            file_name,
+            domain,
+            intent.descriptor,
+        )?;
+        write_pretty_fenced(&state_root, file_name, &tombstone, || {
+            legacy_fence()?;
+            root_lock.verify(&consumer_root)
+        })?;
+        #[cfg(test)]
+        run_legacy_retirement_fault(LegacyRetirementFaultPoint::PendingTombstone)?;
+        root_lock.verify(&consumer_root)?;
+        legacy_fence()?;
+        return Ok(LegacyRetirementPreparation {
+            adoption: recovered,
+            writer,
+        });
+    }
+    if consumer_root.direct_child_exists(RETIREMENT_SIDECAR_FILE)? {
+        let bytes = BoundedRegularReader::read_direct(
+            &consumer_root,
+            RETIREMENT_SIDECAR_FILE,
+            MAX_LEGACY_STATE_BYTES,
+        )?;
+        let expected = match &adoption {
+            LegacyAdoption::Missing => &[][..],
+            LegacyAdoption::Present(bytes) => bytes.as_slice(),
+        };
+        if bytes != expected {
+            bail!("unsigned legacy retirement sidecar does not match current trusted legacy state");
+        }
+        fs::remove_file(consumer_root.direct_child(RETIREMENT_SIDECAR_FILE)?)?;
+        File::open(consumer_root.path())?.sync_all()?;
+        legacy_fence()?;
+    }
+    let sidecar_bytes = match &adoption {
+        LegacyAdoption::Missing => Vec::new(),
+        LegacyAdoption::Present(bytes) => bytes.clone(),
+    };
+    AtomicStateWriter::scavenge_direct_temps(&consumer_root, RETIREMENT_SIDECAR_FILE)?;
+    AtomicStateWriter::write_direct_fenced(
+        &consumer_root,
+        RETIREMENT_SIDECAR_FILE,
+        &sidecar_bytes,
+        || {
+            legacy_fence()?;
+            root_lock.verify(&consumer_root)
+        },
+    )?;
+    #[cfg(test)]
+    run_legacy_retirement_fault(LegacyRetirementFaultPoint::Sidecar)?;
+    let descriptor = LegacyRetirementDescriptor {
+        original_present: matches!(adoption, LegacyAdoption::Present(_)),
+        original_identity,
+        original_sha256: match &adoption {
+            LegacyAdoption::Missing => None,
+            LegacyAdoption::Present(bytes) => Some(sha256_hex(bytes)),
+        },
+        sidecar_file: RETIREMENT_SIDECAR_FILE.to_string(),
+        sidecar_identity: identity_for_path(consumer_root.direct_child(RETIREMENT_SIDECAR_FILE)?)?,
+        sidecar_size: u64::try_from(sidecar_bytes.len()).unwrap_or(u64::MAX),
+        sidecar_sha256: sha256_hex(&sidecar_bytes),
+    };
+    let mut intent = LegacyRetirementIntent {
+        version: 1,
+        consumer: consumer.to_string(),
+        file: file_name.to_string(),
+        repository: writer.authenticator().binding().clone(),
+        descriptor: descriptor.clone(),
+        mac: AuthenticationTag::zero(),
+    };
+    intent.mac = writer
+        .authenticator()
+        .sign(domain, &legacy_retirement_intent_payload(&intent)?)?;
+    write_pretty_fenced(&consumer_root, RETIREMENT_INTENT_FILE, &intent, || {
+        legacy_fence()?;
+        root_lock.verify(&consumer_root)
+    })?;
+    #[cfg(test)]
+    run_legacy_retirement_fault(LegacyRetirementFaultPoint::Intent)?;
+    let tombstone = pending_retirement_tombstone(
+        writer.authenticator(),
+        consumer,
+        file_name,
+        domain,
+        descriptor,
+    )?;
+    write_pretty_fenced(&state_root, file_name, &tombstone, || {
+        legacy_fence()?;
+        root_lock.verify(&consumer_root)
+    })?;
+    #[cfg(test)]
+    run_legacy_retirement_fault(LegacyRetirementFaultPoint::PendingTombstone)?;
+    root_lock.verify(&consumer_root)?;
+    legacy_fence()?;
+    Ok(LegacyRetirementPreparation { adoption, writer })
+}
+
+pub(crate) fn finalize_legacy_retirement<S: SnapshotSpec>(
+    repo_path: &Path,
+    consumer: &str,
+    file_name: &str,
+    domain: AuthenticationDomain,
+    snapshot_identity: &JournalIdentity,
+    snapshot_generation: u64,
+    legacy_fence: &impl Fn() -> Result<()>,
+) -> Result<()> {
+    legacy_fence()?;
+    let repository = Repository::discover(repo_path)?;
+    let common_root = SafeRoot::open_existing(repository.commondir())?;
+    let state_root = SafeRoot::open_existing(common_root.path().join("maco/state"))?;
+    let bytes = BoundedRegularReader::read_direct(&state_root, file_name, MAX_LEGACY_STATE_BYTES)?;
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    authenticator.verify_repository_binding(&snapshot_identity.repository)?;
+    let prior = verify_retirement_tombstone(&authenticator, consumer, file_name, domain, &bytes)?;
+    if prior.phase == LegacyRetirementPhase::Active {
+        if prior.snapshot_identity.as_ref() == Some(snapshot_identity)
+            && prior.snapshot_generation == Some(snapshot_generation)
+        {
+            cleanup_retirement_sidecar::<S>(
+                &authenticator,
+                consumer,
+                file_name,
+                domain,
+                &prior.descriptor,
+                legacy_fence,
+            )?;
+            return Ok(());
+        }
+        let prior_generation = prior
+            .snapshot_generation
+            .context("active legacy retirement tombstone has no generation")?;
+        if snapshot_generation < prior_generation {
+            bail!("authenticated snapshot generation rolled back behind its legacy tombstone");
+        }
+        if snapshot_generation == prior_generation
+            && prior.snapshot_identity.as_ref() != Some(snapshot_identity)
+        {
+            bail!("authenticated snapshot identity changed without increasing its generation");
+        }
+    } else {
+        let consumer_root = open_consumer_retirement_root::<S>(&authenticator)?;
+        let intent = read_and_verify_retirement_intent(
+            &authenticator,
+            &consumer_root,
+            consumer,
+            file_name,
+            domain,
+        )?;
+        if intent.descriptor != prior.descriptor {
+            bail!("legacy retirement pending tombstone does not match its signed intent");
+        }
+        let _ = read_retirement_sidecar(&consumer_root, &intent.descriptor)?;
+    }
+    let mut tombstone = LegacyRetirementTombstone {
+        phase: LegacyRetirementPhase::Active,
+        snapshot_identity: Some(snapshot_identity.clone()),
+        snapshot_generation: Some(snapshot_generation),
+        mac: AuthenticationTag::zero(),
+        ..prior
+    };
+    tombstone.mac = authenticator.sign(domain, &legacy_retirement_payload(&tombstone)?)?;
+    write_pretty_fenced(&state_root, file_name, &tombstone, || {
+        legacy_fence()?;
+        authenticator.verify_epoch()
+    })?;
+    #[cfg(test)]
+    run_legacy_retirement_fault(LegacyRetirementFaultPoint::ActiveTombstone)?;
+    cleanup_retirement_sidecar::<S>(
+        &authenticator,
+        consumer,
+        file_name,
+        domain,
+        &tombstone.descriptor,
+        legacy_fence,
+    )
+}
+
+fn pending_retirement_tombstone(
+    authenticator: &crate::artifacts::state_auth::RepositoryAuthenticator,
+    consumer: &str,
+    file_name: &str,
+    domain: AuthenticationDomain,
+    descriptor: LegacyRetirementDescriptor,
+) -> Result<LegacyRetirementTombstone> {
+    let mut tombstone = LegacyRetirementTombstone {
+        version: 3,
+        phase: LegacyRetirementPhase::Pending,
+        consumer: consumer.to_string(),
+        file: file_name.to_string(),
+        repository: authenticator.binding().clone(),
+        descriptor,
+        snapshot_identity: None,
+        snapshot_generation: None,
+        mac: AuthenticationTag::zero(),
+    };
+    tombstone.mac = authenticator.sign(domain, &legacy_retirement_payload(&tombstone)?)?;
+    Ok(tombstone)
+}
+
+fn validate_retirement_descriptor_against_adoption(
+    descriptor: &LegacyRetirementDescriptor,
+    adoption: &LegacyAdoption,
+    identity: Option<&FileIdentity>,
+) -> Result<()> {
+    match adoption {
+        LegacyAdoption::Missing => {
+            if descriptor.original_present
+                || descriptor.original_identity.is_some()
+                || descriptor.original_sha256.is_some()
+            {
+                bail!("signed retirement intent does not match missing legacy state");
+            }
+        }
+        LegacyAdoption::Present(bytes) => {
+            let digest = sha256_hex(bytes);
+            if !descriptor.original_present
+                || descriptor.original_identity.as_ref() != identity
+                || descriptor.original_sha256.as_deref() != Some(digest.as_str())
+            {
+                bail!("signed retirement intent no longer matches trusted legacy state");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_retirement_tombstone(
+    authenticator: &crate::artifacts::state_auth::RepositoryAuthenticator,
+    consumer: &str,
+    file_name: &str,
+    domain: AuthenticationDomain,
+    bytes: &[u8],
+) -> Result<LegacyRetirementTombstone> {
+    let tombstone: LegacyRetirementTombstone =
+        serde_json::from_slice(bytes).context("legacy retirement tombstone is malformed")?;
+    if tombstone.version != 3 || tombstone.consumer != consumer || tombstone.file != file_name {
+        bail!("legacy retirement tombstone belongs to a different consumer");
+    }
+    authenticator.verify_repository_binding(&tombstone.repository)?;
+    authenticator.verify_tag(
+        domain,
+        &legacy_retirement_payload(&tombstone)?,
+        &tombstone.mac,
+    )?;
+    match tombstone.phase {
+        LegacyRetirementPhase::Pending
+            if tombstone.snapshot_identity.is_none() && tombstone.snapshot_generation.is_none() => {
+        }
+        LegacyRetirementPhase::Active
+            if tombstone.snapshot_identity.is_some() && tombstone.snapshot_generation.is_some() => {
+        }
+        _ => bail!("legacy retirement tombstone phase fields are inconsistent"),
+    }
+    Ok(tombstone)
+}
+
+fn legacy_retirement_payload(tombstone: &LegacyRetirementTombstone) -> Result<Vec<u8>> {
+    serde_json::to_vec(&(
+        tombstone.version,
+        &tombstone.phase,
+        &tombstone.consumer,
+        &tombstone.file,
+        &tombstone.repository,
+        &tombstone.descriptor,
+        &tombstone.snapshot_identity,
+        &tombstone.snapshot_generation,
+    ))
+    .context("failed to encode legacy retirement tombstone")
+}
+
+fn legacy_retirement_intent_payload(intent: &LegacyRetirementIntent) -> Result<Vec<u8>> {
+    serde_json::to_vec(&(
+        intent.version,
+        &intent.consumer,
+        &intent.file,
+        &intent.repository,
+        &intent.descriptor,
+    ))
+    .context("failed to encode legacy retirement intent")
+}
+
+fn open_consumer_retirement_root<S: SnapshotSpec>(
+    authenticator: &crate::artifacts::state_auth::RepositoryAuthenticator,
+) -> Result<SafeRoot> {
+    authenticator.verify_epoch()?;
+    SafeRoot::open_or_create(authenticator.state_root().path().join(S::ROOT_NAME))
+        .context("failed to open authenticated consumer retirement root")
+}
+
+fn read_and_verify_retirement_intent(
+    authenticator: &crate::artifacts::state_auth::RepositoryAuthenticator,
+    root: &SafeRoot,
+    consumer: &str,
+    file_name: &str,
+    domain: AuthenticationDomain,
+) -> Result<LegacyRetirementIntent> {
+    let bytes =
+        BoundedRegularReader::read_direct(root, RETIREMENT_INTENT_FILE, MAX_LEGACY_STATE_BYTES)?;
+    let intent: LegacyRetirementIntent =
+        serde_json::from_slice(&bytes).context("legacy retirement intent is malformed")?;
+    if intent.version != 1 || intent.consumer != consumer || intent.file != file_name {
+        bail!("legacy retirement intent belongs to a different consumer");
+    }
+    authenticator.verify_repository_binding(&intent.repository)?;
+    authenticator.verify_tag(
+        domain,
+        &legacy_retirement_intent_payload(&intent)?,
+        &intent.mac,
+    )?;
+    Ok(intent)
+}
+
+fn read_retirement_sidecar(
+    root: &SafeRoot,
+    descriptor: &LegacyRetirementDescriptor,
+) -> Result<LegacyAdoption> {
+    if descriptor.sidecar_file != RETIREMENT_SIDECAR_FILE {
+        bail!("legacy retirement sidecar name is not canonical");
+    }
+    let identity = identity_for_path(root.direct_child(RETIREMENT_SIDECAR_FILE)?)?;
+    let bytes =
+        BoundedRegularReader::read_direct(root, RETIREMENT_SIDECAR_FILE, MAX_LEGACY_STATE_BYTES)?;
+    if identity != descriptor.sidecar_identity
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != descriptor.sidecar_size
+        || sha256_hex(&bytes) != descriptor.sidecar_sha256
+    {
+        bail!("legacy retirement sidecar no longer matches its signed descriptor");
+    }
+    if descriptor.original_present {
+        let digest = sha256_hex(&bytes);
+        if descriptor.original_sha256.as_deref() != Some(digest.as_str()) {
+            bail!("legacy retirement sidecar does not match the original digest");
+        }
+        Ok(LegacyAdoption::Present(bytes))
+    } else if !bytes.is_empty()
+        || descriptor.original_identity.is_some()
+        || descriptor.original_sha256.is_some()
+    {
+        bail!("signed missing legacy retirement descriptor is inconsistent");
+    } else {
+        Ok(LegacyAdoption::Missing)
+    }
+}
+
+fn cleanup_retirement_sidecar<S: SnapshotSpec>(
+    authenticator: &crate::artifacts::state_auth::RepositoryAuthenticator,
+    consumer: &str,
+    file_name: &str,
+    domain: AuthenticationDomain,
+    descriptor: &LegacyRetirementDescriptor,
+    legacy_fence: &impl Fn() -> Result<()>,
+) -> Result<()> {
+    legacy_fence()?;
+    let root = open_consumer_retirement_root::<S>(authenticator)?;
+    let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+    let intent_identity = if root.direct_child_exists(RETIREMENT_INTENT_FILE)? {
+        let before = identity_for_path(root.direct_child(RETIREMENT_INTENT_FILE)?)?;
+        let intent =
+            read_and_verify_retirement_intent(authenticator, &root, consumer, file_name, domain)?;
+        if &intent.descriptor != descriptor {
+            bail!("legacy retirement cleanup intent does not match the active tombstone");
+        }
+        let after = identity_for_path(root.direct_child(RETIREMENT_INTENT_FILE)?)?;
+        if before != after {
+            bail!("legacy retirement cleanup intent identity changed during verification");
+        }
+        Some(before)
+    } else {
+        None
+    };
+    for (name, expected) in [
+        (RETIREMENT_SIDECAR_FILE, Some(&descriptor.sidecar_identity)),
+        (RETIREMENT_INTENT_FILE, intent_identity.as_ref()),
+    ] {
+        if root.direct_child_exists(name)? {
+            if let Some(expected) = expected {
+                if identity_for_path(root.direct_child(name)?)? != *expected {
+                    bail!("legacy retirement cleanup file identity changed");
+                }
+            }
+            fs::remove_file(root.direct_child(name)?)?;
+            File::open(root.path())?.sync_all()?;
+            legacy_fence()?;
+        }
+    }
+    root_lock.verify(&root)?;
+    legacy_fence()
+}
+
+fn write_pretty_fenced<T: Serialize>(
+    root: &SafeRoot,
+    name: &str,
+    value: &T,
+    verify: impl Fn() -> Result<()>,
+) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    AtomicStateWriter::scavenge_direct_temps(root, name)?;
+    AtomicStateWriter::write_direct_fenced(root, name, &bytes, verify)
+}
+
+/// Returns legacy bytes only when the signed migration manifest binds the
+/// exact repository, inode, size, digest, store name, and file name. A legacy
+/// file without that evidence is never treated as trusted first-use state.
+pub(crate) fn authenticated_legacy_adoption(
+    repo_path: &Path,
+    store_name: &str,
+    file_name: &str,
+) -> Result<LegacyAdoption> {
+    let repository = Repository::discover(repo_path)?;
+    let common_root = SafeRoot::open_existing(repository.commondir())?;
+    let state_path = common_root.path().join("maco/state");
+    let state_root = match SafeRoot::open_existing(&state_path) {
+        Ok(root) => root,
+        Err(error) if fs::symlink_metadata(&state_path).is_err() => {
+            let _ = error;
+            return Ok(LegacyAdoption::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    let legacy_exists = state_root.direct_child_exists(file_name)?;
+    if !state_root.direct_child_exists(MANIFEST_ROOT_NAME)? {
+        if legacy_exists {
+            bail!(
+                "legacy {file_name} has no signed migration manifest; run `maco state migrate --repo <repo> --apply` offline before retrying"
+            );
+        }
+        return Ok(LegacyAdoption::Missing);
+    }
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    authenticator.verify_epoch()?;
+    let manifest_store = AuthenticatedSnapshotStore::<
+        StateMigrationManifestSpec,
+        StateMigrationManifest,
+    >::open_instance(authenticator, MANIFEST_INSTANCE_ID)?;
+    let manifest = &manifest_store.current().value;
+    if manifest.repository != manifest_store.identity().repository {
+        bail!("signed migration manifest repository binding is inconsistent");
+    }
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.store == store_name && entry.file == file_name)
+        .context("signed migration manifest has no entry for this state consumer")?;
+    if !entry.present {
+        if legacy_exists {
+            bail!("legacy state exists despite a signed missing migration entry");
+        }
+        return Ok(LegacyAdoption::Missing);
+    }
+    if !legacy_exists {
+        bail!("signed migration entry refers to a missing legacy state file");
+    }
+    let bytes = BoundedRegularReader::read_direct(&state_root, file_name, MAX_LEGACY_STATE_BYTES)?;
+    let identity = identity_for_path(state_root.direct_child(file_name)?)?;
+    let digest = sha256_hex(&bytes);
+    if entry.file_identity.as_ref() != Some(&identity)
+        || entry.size != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        || entry.sha256.as_deref() != Some(digest.as_str())
+    {
+        bail!("legacy state no longer matches its signed migration manifest entry");
+    }
+    Ok(LegacyAdoption::Present(bytes))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MigrationPhase {
@@ -179,6 +835,7 @@ struct LegacyPreflight {
     original_state_mode: u32,
     original_file_modes: BTreeMap<String, u32>,
     entries: Vec<LegacyStateEntry>,
+    retired_tombstones: BTreeMap<String, (FileIdentity, String)>,
     existing_lock_names: Vec<String>,
     expected_bindings: ExpectedLegacyBindings,
 }
@@ -211,7 +868,7 @@ pub(crate) fn migrate_repository_state(
         });
     }
 
-    let preflight = preflight_legacy_state(&common_dir, &state_path)?;
+    let preflight = preflight_legacy_state(repo_path, &common_dir, &state_path)?;
     let mut locks = acquire_existing_locks(&preflight)?;
     let transaction = load_transaction_if_present(&preflight)?;
     if let Some(transaction) = &transaction {
@@ -262,7 +919,11 @@ fn migration_mode(apply: bool) -> StateMigrationMode {
     }
 }
 
-fn preflight_legacy_state(common_dir: &Path, state_path: &Path) -> Result<LegacyPreflight> {
+fn preflight_legacy_state(
+    repo_path: &Path,
+    common_dir: &Path,
+    state_path: &Path,
+) -> Result<LegacyPreflight> {
     let common_root = SafeRoot::open_existing(common_dir)
         .context("Git common directory is unsafe for state migration")?;
     let state_root = SafeRoot::open_existing(state_path)
@@ -339,10 +1000,26 @@ fn preflight_legacy_state(common_dir: &Path, state_path: &Path) -> Result<Legacy
     };
 
     let mut entries = Vec::with_capacity(LEGACY_STORES.len());
+    let mut retired_tombstones = BTreeMap::new();
     for (store, file_name) in LEGACY_STORES {
         if observed_files.contains(file_name) {
             let bytes =
                 BoundedRegularReader::read_direct(&state_root, file_name, MAX_LEGACY_STATE_BYTES)?;
+            if serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+                == Some(3)
+            {
+                retired_tombstones.insert(
+                    file_name.to_string(),
+                    (
+                        identity_for_path(state_root.direct_child(file_name)?)?,
+                        sha256_hex(&bytes),
+                    ),
+                );
+                entries.push(retired_manifest_entry(repo_path, store, file_name, &bytes)?);
+                continue;
+            }
             let checksum = validate_legacy_checksum(file_name, &bytes, &expected_bindings)?;
             entries.push(LegacyStateEntry {
                 store: store.to_string(),
@@ -366,6 +1043,7 @@ fn preflight_legacy_state(common_dir: &Path, state_path: &Path) -> Result<Legacy
         original_state_mode: file_mode(&state_metadata),
         original_file_modes,
         entries,
+        retired_tombstones,
         existing_lock_names,
         expected_bindings,
     })
@@ -376,6 +1054,85 @@ fn missing_manifest_entries() -> Vec<LegacyStateEntry> {
         .iter()
         .map(|(store, file)| missing_manifest_entry(store, file))
         .collect()
+}
+
+fn retired_manifest_entry(
+    repo_path: &Path,
+    store_name: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<LegacyStateEntry> {
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    let tombstone = verify_retirement_tombstone(
+        &authenticator,
+        store_name,
+        file_name,
+        LEGACY_RETIREMENT_DOMAIN,
+        bytes,
+    )?;
+    if tombstone.phase != LegacyRetirementPhase::Active {
+        bail!("state migration inspection found a pending legacy retirement; reopen the owning consumer to recover it first");
+    }
+    let identity = tombstone
+        .snapshot_identity
+        .as_ref()
+        .context("active retirement tombstone has no snapshot identity")?;
+    let generation = tombstone
+        .snapshot_generation
+        .context("active retirement tombstone has no snapshot generation")?;
+    match store_name {
+        "claims" => AuthenticatedSnapshotStore::<ClaimsSnapshotSpec, serde_json::Value>::verify_locator_anchor(
+            &authenticator,
+            "claims",
+            identity,
+            generation,
+        )?,
+        "semantic_intents" => AuthenticatedSnapshotStore::<
+            SemanticSnapshotSpec,
+            serde_json::Value,
+        >::verify_locator_anchor(
+            &authenticator, "semantic-intents", identity, generation
+        )?,
+        "managed_worktrees" => AuthenticatedSnapshotStore::<
+            ManagedSnapshotSpec,
+            serde_json::Value,
+        >::verify_locator_anchor(
+            &authenticator, "managed-worktrees", identity, generation
+        )?,
+        _ => bail!("unknown legacy retirement consumer"),
+    }
+
+    let manifest_authenticator = repository_authenticator_key_only(repo_path)?;
+    let manifest_store = AuthenticatedSnapshotStore::<
+        StateMigrationManifestSpec,
+        StateMigrationManifest,
+    >::open_instance(manifest_authenticator, MANIFEST_INSTANCE_ID)?;
+    let entry = manifest_store
+        .current()
+        .value
+        .entries
+        .iter()
+        .find(|entry| entry.store == store_name && entry.file == file_name)
+        .cloned()
+        .context("signed migration manifest has no retired consumer entry")?;
+    if entry.present {
+        if !tombstone.descriptor.original_present
+            || tombstone.descriptor.original_identity != entry.file_identity
+            || tombstone.descriptor.original_sha256 != entry.sha256
+            || tombstone.descriptor.sidecar_size != entry.size
+            || tombstone.descriptor.sidecar_sha256 != entry.sha256.clone().unwrap_or_default()
+        {
+            bail!("active retirement tombstone does not match the original signed migration entry");
+        }
+    } else if tombstone.descriptor.original_present
+        || tombstone.descriptor.original_identity.is_some()
+        || tombstone.descriptor.original_sha256.is_some()
+        || tombstone.descriptor.sidecar_size != 0
+        || tombstone.descriptor.sidecar_sha256 != sha256_hex(&[])
+    {
+        bail!("active retirement tombstone does not match the signed missing migration entry");
+    }
+    Ok(entry)
 }
 
 fn missing_manifest_entry(store: &str, file: &str) -> LegacyStateEntry {
@@ -393,7 +1150,12 @@ fn missing_manifest_entry(store: &str, file: &str) -> LegacyStateEntry {
 fn is_known_authenticated_directory(name: &str) -> bool {
     matches!(
         name,
-        MANIFEST_ROOT_NAME | JOURNAL_ROOT_NAME | "authenticated-effect-wals-v1"
+        MANIFEST_ROOT_NAME
+            | JOURNAL_ROOT_NAME
+            | "authenticated-effect-wals-v1"
+            | "authenticated-claims-state-v1"
+            | "authenticated-semantic-state-v1"
+            | "authenticated-managed-worktrees-v1"
     )
 }
 
@@ -412,6 +1174,9 @@ fn is_known_lock_name(name: &str) -> bool {
                 | ".journals.lock"
                 | ".effect-wals.lock"
                 | ".state-migrations.lock"
+                | ".authenticated-claims.lock"
+                | ".authenticated-semantic.lock"
+                | ".authenticated-managed-worktrees.lock"
         )
         || name
             .strip_prefix("managed-worktree-")
@@ -421,7 +1186,7 @@ fn is_known_lock_name(name: &str) -> bool {
 
 fn is_canonical_lock_component(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
+        && value.len() <= 256
         && !matches!(value, "." | "..")
         && value
             .bytes()
@@ -740,6 +1505,11 @@ fn validate_managed_worktree_checksum(
     validate_managed_repository(&registry.repository)?;
     if registry.records.len() > 4_096 || registry.operations.len() > 4_096 {
         bail!("managed worktree registry exceeds its bounded record count");
+    }
+    if !registry.operations.is_empty() {
+        bail!(
+            "legacy managed worktree registry contains unauthenticated pending operations; refuse migration and complete or manually recover them with the originating trusted binary before retrying"
+        );
     }
     for (name, binding) in &registry.records {
         if name != &binding.name || !is_canonical_lock_component(name) {
@@ -1193,6 +1963,20 @@ fn revalidate_preflight(preflight: &LegacyPreflight) -> Result<()> {
     preflight.state_root.verify()?;
     for entry in &preflight.entries {
         let path = preflight.state_root.direct_child(&entry.file)?;
+        if let Some((identity, digest)) = preflight.retired_tombstones.get(&entry.file) {
+            let bytes = BoundedRegularReader::read_direct(
+                &preflight.state_root,
+                &entry.file,
+                MAX_LEGACY_STATE_BYTES,
+            )?;
+            if &identity_for_path(path)? != identity || &sha256_hex(&bytes) != digest {
+                bail!(
+                    "retired legacy tombstone changed during migration preflight: {}",
+                    entry.file
+                );
+            }
+            continue;
+        }
         if !entry.present {
             if fs::symlink_metadata(path).is_ok() {
                 bail!(
@@ -1715,7 +2499,7 @@ fn take_migration_fault(_point: MigrationFaultPoint) -> Option<MigrationFaultAct
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync_store::SyncStore;
+    use crate::{sync::ClaimToken, sync_store::SyncStore};
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -1725,11 +2509,36 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("repo");
         let repository = Repository::init(&path).expect("repository");
-        SyncStore::open(&path)
-            .expect("sync store")
-            .claim_paths("migration-test", [Path::new("src")])
-            .expect("claim");
         let state = repository.commondir().join("maco/state");
+        let state_root = SafeRoot::open_or_create(&state).expect("state root");
+        let binding = expected_bindings_for(&path).repository_state;
+        let mut claims = LegacyClaimsState {
+            version: 2,
+            checksum: String::new(),
+            repository: binding,
+            next_token: 2,
+            claims: vec![PathClaim {
+                token: ClaimToken::from_u64(1),
+                agent_id: "migration-test".to_string(),
+                paths: vec![PathBuf::from("src")],
+            }],
+        };
+        claims.checksum = stable_checksum(
+            &serde_json::to_vec(&(
+                claims.version,
+                &claims.repository,
+                claims.next_token,
+                &claims.claims,
+            ))
+            .expect("claims checksum payload"),
+        );
+        AtomicStateWriter::write_direct(
+            &state_root,
+            "claims.json",
+            &serde_json::to_vec_pretty(&claims).expect("claims JSON"),
+        )
+        .expect("claims state");
+        KernelStateLock::acquire_direct(&state_root, "claims.lock").expect("claims lock");
         (temp, path, state)
     }
 
@@ -1817,6 +2626,70 @@ mod tests {
         let repeated = migrate_repository_state(&path, true).expect("idempotent apply");
         assert_eq!(repeated.status, StateMigrationStatus::AlreadyApplied);
         assert_eq!(repeated.transaction_phase, Some(MigrationPhase::Completed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_adoption_dry_run_and_apply_verify_original_manifest_and_active_tombstone() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        migrate_repository_state(&path, true).expect("publish signed migration manifest");
+
+        let store = SyncStore::open(&path).expect("adopt signed legacy claims");
+        let claims = store.snapshot().expect("authenticated claims");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].agent_id, "migration-test");
+        let tombstone: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.join("claims.json")).expect("active tombstone"))
+                .expect("tombstone JSON");
+        assert_eq!(tombstone["version"], 3);
+        assert_eq!(tombstone["phase"], "active");
+
+        let dry = migrate_repository_state(&path, false).expect("post-adoption dry run");
+        assert_eq!(dry.status, StateMigrationStatus::AlreadyApplied);
+        assert_eq!(dry.transaction_phase, Some(MigrationPhase::Completed));
+        let repeated = migrate_repository_state(&path, true).expect("post-adoption apply");
+        assert_eq!(repeated.status, StateMigrationStatus::AlreadyApplied);
+        assert_eq!(repeated.transaction_phase, Some(MigrationPhase::Completed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_nonempty_claims_forward_recover_at_every_retirement_fault() {
+        for fault in [
+            LegacyRetirementFaultPoint::Sidecar,
+            LegacyRetirementFaultPoint::Intent,
+            LegacyRetirementFaultPoint::PendingTombstone,
+            LegacyRetirementFaultPoint::ActiveTombstone,
+        ] {
+            let (_temp, path, state) = repository_with_claims();
+            make_legacy_permissions(&state);
+            migrate_repository_state(&path, true).expect("signed migration manifest");
+            set_legacy_retirement_fault(fault);
+            let error = SyncStore::open(&path).expect_err("retirement fault");
+            assert!(error
+                .to_string()
+                .contains("injected legacy retirement fault"));
+
+            let bytes = fs::read(state.join("claims.json")).expect("legacy filename");
+            let value: serde_json::Value = serde_json::from_slice(&bytes).expect("state JSON");
+            if matches!(
+                fault,
+                LegacyRetirementFaultPoint::PendingTombstone
+                    | LegacyRetirementFaultPoint::ActiveTombstone
+            ) {
+                assert_eq!(value["version"], 3);
+                assert!(serde_json::from_slice::<LegacyClaimsState>(&bytes).is_err());
+            } else {
+                assert_eq!(value["version"], 2);
+            }
+
+            let store = SyncStore::open(&path).expect("forward recover signed claims");
+            let claims = store.snapshot().expect("recovered claims");
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].agent_id, "migration-test");
+            assert_eq!(claims[0].paths, vec![PathBuf::from("src")]);
+        }
     }
 
     #[cfg(unix)]

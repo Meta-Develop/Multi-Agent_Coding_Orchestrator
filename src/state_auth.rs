@@ -38,6 +38,18 @@ const AUTHENTICATED_STATE_CONSUMERS: &[(&str, &str)] = &[
     ),
     ("authenticated-effect-wals-v1", "authenticated effect WALs"),
     (
+        "authenticated-claims-state-v1",
+        "authenticated claims state",
+    ),
+    (
+        "authenticated-semantic-state-v1",
+        "authenticated semantic coordination state",
+    ),
+    (
+        "authenticated-managed-worktrees-v1",
+        "authenticated managed worktree state",
+    ),
+    (
         "state-migration-manifests-v1",
         "authenticated state migration manifests",
     ),

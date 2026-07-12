@@ -91,6 +91,74 @@ where
     S: SnapshotSpec,
     T: Serialize + DeserializeOwned,
 {
+    pub(crate) fn initialized(
+        authenticator: &RepositoryAuthenticator,
+        logical_id: &str,
+    ) -> Result<bool> {
+        validate_logical_id::<S>(logical_id)?;
+        if !authenticator
+            .state_root()
+            .direct_child_exists(S::ROOT_NAME)?
+        {
+            return Ok(false);
+        }
+        let root = AuthenticatedStateJournal::<S>::existing_root(authenticator)?;
+        let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+        let initialized = root.direct_child_exists(snapshot_locator_name(logical_id))?;
+        if initialized {
+            let _ = read_locator::<S>(authenticator, &root, logical_id)?;
+        } else if root.direct_child_exists(snapshot_init_name(logical_id))? {
+            let _ = read_init_intent::<S>(authenticator, &root, logical_id)?;
+        }
+        root_lock.verify(&root)?;
+        Ok(initialized)
+    }
+
+    /// Read-only verification used by offline migration inspection. The
+    /// signed locator must name the exact active journal and generation bound
+    /// by a retirement tombstone; this function never performs journal or
+    /// locator recovery.
+    pub(crate) fn verify_locator_anchor(
+        authenticator: &RepositoryAuthenticator,
+        logical_id: &str,
+        identity: &JournalIdentity,
+        generation: u64,
+    ) -> Result<()> {
+        validate_logical_id::<S>(logical_id)?;
+        let root = AuthenticatedStateJournal::<S>::existing_root(authenticator)?;
+        root.verify()?;
+        let locator = read_locator::<S>(authenticator, &root, logical_id)?;
+        if &locator.active_identity != identity || locator.generation != generation {
+            bail!("active authenticated snapshot locator does not match its retirement tombstone");
+        }
+        root.verify()?;
+        authenticator.verify_epoch()
+    }
+
+    pub(crate) fn initialization_pending(
+        authenticator: &RepositoryAuthenticator,
+        logical_id: &str,
+    ) -> Result<bool> {
+        validate_logical_id::<S>(logical_id)?;
+        if !authenticator
+            .state_root()
+            .direct_child_exists(S::ROOT_NAME)?
+        {
+            return Ok(false);
+        }
+        let root = AuthenticatedStateJournal::<S>::existing_root(authenticator)?;
+        let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+        if root.direct_child_exists(snapshot_locator_name(logical_id))? {
+            return Ok(false);
+        }
+        if !root.direct_child_exists(snapshot_init_name(logical_id))? {
+            return Ok(false);
+        }
+        read_init_intent::<S>(authenticator, &root, logical_id)?;
+        root_lock.verify(&root)?;
+        Ok(true)
+    }
+
     pub(crate) fn create(
         authenticator: RepositoryAuthenticator,
         logical_id: &str,

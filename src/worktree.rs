@@ -1,6 +1,11 @@
 #[cfg(test)]
 use crate::safe_state::scavenge_private_random_directories;
 use crate::{
+    artifacts::{
+        repository_authenticator_key_only,
+        state_auth::{random_identifier, AuthenticationDomain, RepositoryAuthBinding},
+    },
+    authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
     process_runner::{
         run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessSpec,
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
@@ -11,6 +16,11 @@ use crate::{
         scavenge_private_random_directories_until, stable_checksum, AtomicStateWriter,
         BoundedRegularReader, FileIdentity, KernelStateLock, PrivateDirectoryScavengeLimits,
         SafeRoot, TreeLinkPolicy,
+    },
+    state_journal::JournalSpec,
+    state_migration::{
+        finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
+        LEGACY_RETIREMENT_DOMAIN,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -62,6 +72,34 @@ const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 // repositories from spuriously exhausting the shared runtime-lock budget.
 const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
+const MANAGED_LOGICAL_ID: &str = "managed-worktrees";
+
+pub(crate) enum ManagedSnapshotSpec {}
+
+impl JournalSpec for ManagedSnapshotSpec {
+    const FORMAT_VERSION: u32 = 1;
+    const NAMESPACE: &'static str = "authenticated_managed_worktrees";
+    const ROOT_NAME: &'static str = "authenticated-managed-worktrees-v1";
+    const ROOT_LOCK_NAME: &'static str = ".authenticated-managed-worktrees.lock";
+    const INSTANCE_LOCK_NAME: &'static str = ".managed-snapshot.lock";
+    const HEAD_FILE_NAME: &'static str = ".head.json";
+    const RECORD_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-managed-record\0v1\0");
+    const HEAD_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-managed-head\0v1\0");
+    const MAX_RECORDS: usize = 4_096;
+    const MAX_RECORD_BYTES: u64 = MAX_MANAGED_REGISTRY_BYTES;
+    const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+    const MAX_PHASE_BYTES: usize = 32;
+    const MAX_SUBJECT_BYTES: usize = 64;
+    const MAX_INSTANCE_ID_BYTES: usize = 128;
+}
+
+impl SnapshotSpec for ManagedSnapshotSpec {
+    const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+    const LOCATOR_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-managed-locator\0v1\0");
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RepositoryInfo {
@@ -140,6 +178,8 @@ impl ManagedWorktreeWriteLease {
 #[derive(Debug)]
 struct ManagedWorktreeRemovalLease {
     name: String,
+    incarnation_generation: u64,
+    incarnation_nonce: String,
     _lock: KernelStateLock,
 }
 
@@ -198,6 +238,24 @@ struct ManagedWorktreeRegistry {
     repository: ManagedRepositoryBinding,
     records: BTreeMap<String, ManagedWorktreeBinding>,
     operations: BTreeMap<String, ManagedWorktreeOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedIncarnation {
+    generation: u64,
+    nonce: String,
+    active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedManagedState {
+    version: u32,
+    snapshot_revision: u64,
+    repository: RepositoryAuthBinding,
+    registry: ManagedWorktreeRegistry,
+    incarnations: BTreeMap<String, ManagedIncarnation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -452,6 +510,7 @@ mod persisted_optional_path {
 }
 
 struct ManagedWorktreeRegistryStore {
+    repo_path: PathBuf,
     state_root: SafeRoot,
     repository: ManagedRepositoryBinding,
 }
@@ -748,7 +807,7 @@ impl WorktreeManager {
             delete_branch,
         )?;
         let _removal_lease = registry_store
-            .try_acquire_worktree_removal_lease(&name)
+            .try_acquire_worktree_removal_lease(&registry_lock, &name)
             .with_context(|| {
                 format!(
                     "managed worktree '{name}' has an active cooperative execution lease; stop its MACO child before removal"
@@ -884,7 +943,7 @@ impl WorktreeManager {
         let record = verified_worktree_record(&repo, &registry_store.repository, binding)?;
         let lock = finish_with_registry_lock_verification(
             registry_store
-                .try_acquire_shared_worktree_read_lock(&name)
+                .try_acquire_shared_worktree_read_lock(&registry_lock, &name)
                 .with_context(|| {
                     format!("failed to acquire shared read lease for managed worktree '{name}'")
                 }),
@@ -925,7 +984,7 @@ impl WorktreeManager {
         let record = verified_worktree_record(&repo, &registry_store.repository, binding)?;
         let lock = finish_with_registry_lock_verification(
             registry_store
-                .try_acquire_exclusive_worktree_write_lock(&name)
+                .try_acquire_exclusive_worktree_write_lock(&registry_lock, &name)
                 .with_context(|| {
                     format!("failed to acquire exclusive write lease for managed worktree '{name}'")
                 }),
@@ -1035,6 +1094,7 @@ impl ManagedWorktreeRegistryStore {
         let repository = managed_repository_binding(repo)?;
         let state_root = repository.common_dir.join("maco").join("state");
         Ok(Self {
+            repo_path: repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf(),
             state_root: SafeRoot::open_or_create(state_root)?,
             repository,
         })
@@ -1051,97 +1111,53 @@ impl ManagedWorktreeRegistryStore {
         Ok(bound)
     }
 
-    fn try_acquire_shared_worktree_read_lock(&self, name: &str) -> Result<KernelStateLock> {
+    fn try_acquire_shared_worktree_read_lock(
+        &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<KernelStateLock> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
         KernelStateLock::try_acquire_shared_direct(
             &self.state_root,
-            managed_worktree_lease_name(name)?,
+            managed_worktree_lease_name(name, &incarnation)?,
         )
     }
 
-    fn try_acquire_exclusive_worktree_write_lock(&self, name: &str) -> Result<KernelStateLock> {
+    fn try_acquire_exclusive_worktree_write_lock(
+        &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<KernelStateLock> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
         KernelStateLock::try_acquire_exclusive_direct(
             &self.state_root,
-            managed_worktree_lease_name(name)?,
+            managed_worktree_lease_name(name, &incarnation)?,
         )
     }
 
     fn try_acquire_worktree_removal_lease(
         &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
         name: &str,
     ) -> Result<ManagedWorktreeRemovalLease> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
         let lock = KernelStateLock::try_acquire_exclusive_direct(
             &self.state_root,
-            managed_worktree_lease_name(name)?,
+            managed_worktree_lease_name(name, &incarnation)?,
         )?;
         Ok(ManagedWorktreeRemovalLease {
             name: name.to_string(),
+            incarnation_generation: incarnation.generation,
+            incarnation_nonce: incarnation.nonce,
             _lock: lock,
         })
     }
 
     fn load(&self, lock: &ManagedWorktreeRegistryLock) -> Result<ManagedWorktreeRegistry> {
         self.verify_lock(lock)?;
-        let result = (|| -> Result<ManagedWorktreeRegistry> {
-            if !self
-                .state_root
-                .direct_child_exists("managed_worktrees.json")?
-            {
-                return Ok(self.empty_registry());
-            }
-            let contents = BoundedRegularReader::read_direct(
-                &self.state_root,
-                "managed_worktrees.json",
-                MAX_MANAGED_REGISTRY_BYTES,
-            )?;
-            let value: serde_json::Value =
-                serde_json::from_slice(&contents).with_context(|| {
-                    format!(
-                        "failed to parse managed worktree registry {}",
-                        self.state_root
-                            .path()
-                            .join("managed_worktrees.json")
-                            .display()
-                    )
-                })?;
-            let version = value
-                .get("version")
-                .and_then(serde_json::Value::as_u64)
-                .context("managed worktree registry has no valid version")?;
-            if version != u64::from(MANAGED_WORKTREE_REGISTRY_VERSION) {
-                bail!(
-                    "unsupported managed worktree registry version {} in {}",
-                    version,
-                    self.state_root
-                        .path()
-                        .join("managed_worktrees.json")
-                        .display()
-                );
-            }
-            let registry: ManagedWorktreeRegistry =
-                serde_json::from_value(value).with_context(|| {
-                    format!(
-                        "failed to decode managed worktree registry {}",
-                        self.state_root
-                            .path()
-                            .join("managed_worktrees.json")
-                            .display()
-                    )
-                })?;
-            if registry.repository != self.repository {
-                bail!(
-                    "managed worktree registry repository binding does not match this repository"
-                );
-            }
-            validate_registry_bounds(&registry)?;
-            let expected_checksum = managed_registry_checksum(&registry)?;
-            if registry.checksum != expected_checksum {
-                bail!(
-                    "managed worktree registry checksum mismatch in {}; refusing destructive operations",
-                    self.state_root.path().join("managed_worktrees.json").display()
-                );
-            }
-            Ok(registry)
-        })();
+        let result = self
+            .ensure_authenticated_state(lock)
+            .map(|store| store.current().value.registry.clone());
         finish_with_registry_lock_verification(result, self.verify_lock(lock))
     }
 
@@ -1153,36 +1169,33 @@ impl ManagedWorktreeRegistryStore {
         self.verify_lock(lock)?;
         run_managed_registry_after_precheck_hook();
         let result = (|| -> Result<()> {
-            registry.version = MANAGED_WORKTREE_REGISTRY_VERSION;
-            registry.repository = self.repository.clone();
-            validate_registry_bounds(registry)?;
-            registry.checksum = managed_registry_checksum(registry)?;
-            let mut contents = serde_json::to_vec_pretty(registry)
-                .context("failed to serialize managed worktree registry")?;
-            contents.push(b'\n');
-            if contents.len() as u64 > MAX_MANAGED_REGISTRY_BYTES {
-                bail!(
-                    "managed worktree registry exceeds its serialized size limit of {MAX_MANAGED_REGISTRY_BYTES} bytes"
-                );
+            self.verify_lock(lock)?;
+            normalize_managed_registry(registry, &self.repository)?;
+            let mut store = self.ensure_authenticated_state(lock)?;
+            let mut incarnations = store.current().value.incarnations.clone();
+            reconcile_managed_incarnations(&mut incarnations, registry)?;
+            let revision = store
+                .current()
+                .value
+                .snapshot_revision
+                .checked_add(1)
+                .context("authenticated managed registry revision exhausted")?;
+            let value = AuthenticatedManagedState {
+                version: 1,
+                snapshot_revision: revision,
+                repository: store.current().value.repository.clone(),
+                registry: registry.clone(),
+                incarnations,
+            };
+            self.verify_lock(lock)?;
+            if revision % 4_096 == 0 {
+                let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+                store = store.rollover(authenticator, revision, value)?;
+            } else {
+                store.commit(revision, value)?;
             }
-            self.verify_lock(lock)?;
-            AtomicStateWriter::scavenge_direct_temps(&self.state_root, "managed_worktrees.json")?;
-            self.verify_lock(lock)?;
-            AtomicStateWriter::write_direct_fenced(
-                &self.state_root,
-                "managed_worktrees.json",
-                &contents,
-                || self.verify_lock(lock),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to save managed worktree registry {}",
-                    self.state_root
-                        .path()
-                        .join("managed_worktrees.json")
-                        .display()
-                )
-            })?;
+            self.validate_authenticated_state(&store)?;
+            self.finalize_legacy_retirement(&store, lock)?;
             self.verify_lock(lock)
         })();
         finish_with_registry_lock_verification(result, self.verify_lock(lock))
@@ -1207,6 +1220,175 @@ impl ManagedWorktreeRegistryStore {
             records: BTreeMap::new(),
             operations: BTreeMap::new(),
         }
+    }
+
+    fn ensure_authenticated_state(
+        &self,
+        lock: &ManagedWorktreeRegistryLock,
+    ) -> Result<AuthenticatedSnapshotStore<ManagedSnapshotSpec, AuthenticatedManagedState>> {
+        self.verify_lock(lock)?;
+        if self
+            .state_root
+            .direct_child_exists(ManagedSnapshotSpec::ROOT_NAME)?
+        {
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            if AuthenticatedSnapshotStore::<ManagedSnapshotSpec, AuthenticatedManagedState>::initialized(
+                &authenticator,
+                MANAGED_LOGICAL_ID,
+            )? {
+                let store = AuthenticatedSnapshotStore::open_instance(
+                    authenticator,
+                    MANAGED_LOGICAL_ID,
+                )?;
+                self.validate_authenticated_state(&store)?;
+                self.finalize_legacy_retirement(&store, lock)?;
+                self.verify_lock(lock)?;
+                return Ok(store);
+            }
+        }
+        let preparation = prepare_legacy_retirement::<ManagedSnapshotSpec>(
+            &self.repo_path,
+            "managed_worktrees",
+            "managed_worktrees.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            &|| self.verify_lock(lock),
+        )?;
+        let (adoption, writer) = preparation.into_parts();
+        let mut registry = match adoption {
+            LegacyAdoption::Missing => self.empty_registry(),
+            LegacyAdoption::Present(bytes) => {
+                let registry: ManagedWorktreeRegistry = serde_json::from_slice(&bytes)
+                    .context("signed legacy managed worktree registry is malformed")?;
+                if registry.version != MANAGED_WORKTREE_REGISTRY_VERSION
+                    || registry.repository != self.repository
+                    || registry.checksum != managed_registry_checksum(&registry)?
+                {
+                    bail!("signed legacy managed registry failed repository/checksum validation");
+                }
+                if !registry.operations.is_empty() {
+                    bail!("legacy managed registry contains in-flight operations; complete or recover them with the old binary before authenticated adoption");
+                }
+                registry
+            }
+        };
+        normalize_managed_registry(&mut registry, &self.repository)?;
+        let mut incarnations = BTreeMap::new();
+        reconcile_managed_incarnations(&mut incarnations, &registry)?;
+        let initial = AuthenticatedManagedState {
+            version: 1,
+            snapshot_revision: 1,
+            repository: writer.authenticator().binding().clone(),
+            registry,
+            incarnations,
+        };
+        let store = AuthenticatedSnapshotStore::create(
+            writer.into_authenticator()?,
+            MANAGED_LOGICAL_ID,
+            1,
+            initial,
+        )?;
+        self.validate_authenticated_state(&store)?;
+        self.finalize_legacy_retirement(&store, lock)?;
+        self.verify_lock(lock)?;
+        Ok(store)
+    }
+
+    fn open_authenticated_state(
+        &self,
+        lock: &ManagedWorktreeRegistryLock,
+    ) -> Result<AuthenticatedSnapshotStore<ManagedSnapshotSpec, AuthenticatedManagedState>> {
+        self.verify_lock(lock)?;
+        let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+        let store = AuthenticatedSnapshotStore::open_instance(authenticator, MANAGED_LOGICAL_ID)?;
+        self.validate_authenticated_state(&store)?;
+        self.finalize_legacy_retirement(&store, lock)?;
+        self.verify_lock(lock)?;
+        Ok(store)
+    }
+
+    fn validate_authenticated_state(
+        &self,
+        store: &AuthenticatedSnapshotStore<ManagedSnapshotSpec, AuthenticatedManagedState>,
+    ) -> Result<()> {
+        let snapshot = store.current();
+        if snapshot.value.version != 1
+            || snapshot.value.snapshot_revision != snapshot.generation
+            || snapshot.value.snapshot_revision != snapshot.token
+            || snapshot.value.repository != store.identity().repository
+        {
+            bail!("authenticated managed registry binding or revision is inconsistent");
+        }
+        if snapshot.value.registry.repository != self.repository
+            || snapshot.value.registry.version != MANAGED_WORKTREE_REGISTRY_VERSION
+            || snapshot.value.registry.checksum
+                != managed_registry_checksum(&snapshot.value.registry)?
+        {
+            bail!("authenticated managed registry repository/checksum binding is inconsistent");
+        }
+        validate_registry_bounds(&snapshot.value.registry)?;
+        validate_managed_incarnations(&snapshot.value.incarnations, &snapshot.value.registry)
+    }
+
+    fn finalize_legacy_retirement(
+        &self,
+        store: &AuthenticatedSnapshotStore<ManagedSnapshotSpec, AuthenticatedManagedState>,
+        lock: &ManagedWorktreeRegistryLock,
+    ) -> Result<()> {
+        finalize_legacy_retirement::<ManagedSnapshotSpec>(
+            &self.repo_path,
+            "managed_worktrees",
+            "managed_worktrees.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            store.identity(),
+            store.current().generation,
+            &|| self.verify_lock(lock),
+        )
+    }
+
+    fn active_incarnation(
+        &self,
+        lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<ManagedIncarnation> {
+        let store = self.open_authenticated_state(lock)?;
+        let incarnation = store
+            .current()
+            .value
+            .incarnations
+            .get(name)
+            .filter(|incarnation| incarnation.active)
+            .cloned()
+            .with_context(|| {
+                format!("managed worktree '{name}' has no active signed incarnation")
+            })?;
+        Ok(incarnation)
+    }
+
+    fn verify_authenticated_registry(
+        &self,
+        lock: &ManagedWorktreeRegistryLock,
+        registry: &ManagedWorktreeRegistry,
+    ) -> Result<()> {
+        self.verify_lock(lock)?;
+        let store = self.open_authenticated_state(lock)?;
+        if &store.current().value.registry != registry {
+            bail!("managed worktree registry changed since its authenticated destructive precheck");
+        }
+        self.verify_lock(lock)
+    }
+
+    fn verify_removal_lease_current(
+        &self,
+        lock: &ManagedWorktreeRegistryLock,
+        lease: &ManagedWorktreeRemovalLease,
+    ) -> Result<()> {
+        let incarnation = self.active_incarnation(lock, &lease.name)?;
+        if incarnation.generation != lease.incarnation_generation
+            || incarnation.nonce != lease.incarnation_nonce
+        {
+            bail!("managed worktree removal lease belongs to a stale incarnation");
+        }
+        Ok(())
     }
 }
 
@@ -1246,14 +1428,114 @@ fn run_managed_registry_after_precheck_hook() {
 #[cfg(not(test))]
 fn run_managed_registry_after_precheck_hook() {}
 
-fn managed_worktree_lease_name(name: &str) -> Result<OsString> {
+fn managed_worktree_lease_name(name: &str, incarnation: &ManagedIncarnation) -> Result<OsString> {
     let normalized = normalize_agent_id(name)?;
     if normalized != name {
         bail!("managed worktree lease name is not canonical");
     }
+    validate_managed_incarnation(incarnation)?;
     Ok(OsString::from(format!(
-        "managed-worktree-{name}.execution.lock"
+        "managed-worktree-{name}-{}-{}.execution.lock",
+        incarnation.generation, incarnation.nonce
     )))
+}
+
+fn normalize_managed_registry(
+    registry: &mut ManagedWorktreeRegistry,
+    repository: &ManagedRepositoryBinding,
+) -> Result<()> {
+    registry.version = MANAGED_WORKTREE_REGISTRY_VERSION;
+    registry.repository = repository.clone();
+    validate_registry_bounds(registry)?;
+    registry.checksum = managed_registry_checksum(registry)?;
+    let bytes = serde_json::to_vec(registry)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANAGED_REGISTRY_BYTES {
+        bail!("managed worktree registry exceeds its serialized size limit");
+    }
+    Ok(())
+}
+
+fn reconcile_managed_incarnations(
+    incarnations: &mut BTreeMap<String, ManagedIncarnation>,
+    registry: &ManagedWorktreeRegistry,
+) -> Result<()> {
+    let active = registry
+        .records
+        .keys()
+        .chain(registry.operations.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (name, incarnation) in incarnations.iter_mut() {
+        if !active.contains(name) {
+            incarnation.active = false;
+        }
+    }
+    for name in active {
+        match incarnations.get_mut(&name) {
+            Some(incarnation) if incarnation.active => {}
+            Some(incarnation) => {
+                incarnation.generation = incarnation
+                    .generation
+                    .checked_add(1)
+                    .context("managed worktree incarnation generation exhausted")?;
+                incarnation.nonce = random_identifier()?;
+                incarnation.active = true;
+            }
+            None => {
+                incarnations.insert(
+                    name,
+                    ManagedIncarnation {
+                        generation: 1,
+                        nonce: random_identifier()?,
+                        active: true,
+                    },
+                );
+            }
+        }
+    }
+    validate_managed_incarnations(incarnations, registry)
+}
+
+fn validate_managed_incarnation(incarnation: &ManagedIncarnation) -> Result<()> {
+    if incarnation.generation == 0
+        || incarnation.nonce.len() != 64
+        || !incarnation
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("managed worktree incarnation is malformed");
+    }
+    Ok(())
+}
+
+fn validate_managed_incarnations(
+    incarnations: &BTreeMap<String, ManagedIncarnation>,
+    registry: &ManagedWorktreeRegistry,
+) -> Result<()> {
+    if incarnations.len() > MAX_MANAGED_RECORDS.saturating_add(MAX_MANAGED_OPERATIONS) {
+        bail!("managed worktree incarnation registry exceeds its bound");
+    }
+    for (name, incarnation) in incarnations {
+        if normalize_agent_id(name)? != *name {
+            bail!("managed worktree incarnation key is not canonical");
+        }
+        validate_managed_incarnation(incarnation)?;
+        let expected_active =
+            registry.records.contains_key(name) || registry.operations.contains_key(name);
+        if incarnation.active != expected_active {
+            bail!("managed worktree incarnation activity does not match the signed registry");
+        }
+    }
+    for name in registry.records.keys().chain(registry.operations.keys()) {
+        if !incarnations
+            .get(name)
+            .is_some_and(|incarnation| incarnation.active)
+        {
+            bail!("signed managed registry entry has no active incarnation");
+        }
+    }
+    Ok(())
 }
 
 fn managed_registry_checksum(registry: &ManagedWorktreeRegistry) -> Result<String> {
@@ -1313,6 +1595,7 @@ fn recover_pending_operations_with_held_removal_lease(
 ) -> Result<()> {
     let names = registry.operations.keys().cloned().collect::<Vec<_>>();
     for name in names {
+        store.verify_authenticated_registry(lock, registry)?;
         let operation = registry
             .operations
             .get(&name)
@@ -1326,14 +1609,15 @@ fn recover_pending_operations_with_held_removal_lease(
                 recover_create_operation(repo, store, lock, registry, operation)?
             }
             ManagedWorktreeOperationKind::Remove => {
-                let _lease = if held_removal_lease
-                    .is_some_and(|lease| lease.name.as_str() == name.as_str())
+                let _lease = if let Some(lease) =
+                    held_removal_lease.filter(|lease| lease.name.as_str() == name.as_str())
                 {
+                    store.verify_removal_lease_current(lock, lease)?;
                     None
                 } else {
                     Some(
                         store
-                            .try_acquire_worktree_removal_lease(&name)
+                            .try_acquire_worktree_removal_lease(lock, &name)
                             .with_context(|| {
                                 format!(
                                     "managed worktree '{name}' has an active cooperative execution lease; pending removal remains durable"
@@ -1356,6 +1640,7 @@ fn recover_create_operation(
     mut operation: ManagedWorktreeOperation,
 ) -> Result<()> {
     if operation.phase == ManagedWorktreeOperationPhase::CreateIntent {
+        store.verify_authenticated_registry(lock, registry)?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity
             || root.direct_child(&operation.name)? != operation.path
@@ -1459,6 +1744,7 @@ fn recover_create_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreatePrepared {
+        store.verify_authenticated_registry(lock, registry)?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity {
             bail!(
@@ -1565,6 +1851,7 @@ fn recover_create_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreateStaged {
+        store.verify_authenticated_registry(lock, registry)?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity {
             bail!(
@@ -1686,6 +1973,7 @@ fn recover_create_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreateObserved {
+        store.verify_authenticated_registry(lock, registry)?;
         ensure_creation_worktree_locked(repo, &operation.name)?;
         let _branch_guard = lock_branch_reference(repo, &operation.branch)?;
         let expected_branch_oid = verify_create_branch_exact(repo, &operation)?;
@@ -2041,6 +2329,7 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::RemovePrepared {
+        store.verify_authenticated_registry(lock, registry)?;
         let worktree_quarantine = operation_worktree_quarantine_path(&operation)?;
         let path_exists = path_entry_exists(&binding.path)?;
         let quarantine_exists = path_entry_exists(&worktree_quarantine)?;
@@ -2093,6 +2382,7 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::WorktreeQuarantined {
+        store.verify_authenticated_registry(lock, registry)?;
         let worktree_quarantine = operation_worktree_quarantine_path(&operation)?;
         let worktree_quarantine_identity = operation
             .worktree_quarantine_identity
@@ -2136,6 +2426,7 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::MetadataQuarantined {
+        store.verify_authenticated_registry(lock, registry)?;
         ensure_original_binding_absent(&binding.path, "worktree")?;
         ensure_original_binding_absent(&binding.metadata_dir, "metadata")?;
         let worktree_quarantine = operation_worktree_quarantine_path(&operation)?;
@@ -2156,6 +2447,7 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::WorktreeDeleted {
+        store.verify_authenticated_registry(lock, registry)?;
         ensure_original_binding_absent(&binding.path, "worktree")?;
         ensure_original_binding_absent(&binding.metadata_dir, "metadata")?;
         let metadata_quarantine = operation_metadata_quarantine_path(&operation)?;
@@ -2176,6 +2468,7 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::MetadataDeleted {
+        store.verify_authenticated_registry(lock, registry)?;
         ensure_original_binding_absent(&binding.path, "worktree")?;
         ensure_original_binding_absent(&binding.metadata_dir, "metadata")?;
         if operation.delete_branch {
@@ -2201,6 +2494,7 @@ fn recover_remove_operation(
             operation.phase
         );
     }
+    store.verify_authenticated_registry(lock, registry)?;
     registry.records.remove(&operation.name);
     registry.operations.remove(&operation.name);
     store.save(lock, registry)
@@ -3635,6 +3929,62 @@ mod tests {
         assert_ne!(write_a.path(), write_b.path());
     }
 
+    #[test]
+    fn recreated_worktree_uses_new_incarnation_and_rejects_stale_removal_lease() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let options = || WorktreeCreateOptions {
+            agent_id: "agent-incarnation".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: Some(worktree_root.clone()),
+        };
+        manager.create(options()).expect("first incarnation");
+
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let lock = store.lock().expect("registry lock");
+        let first = store
+            .active_incarnation(&lock, "agent-incarnation")
+            .expect("first incarnation evidence");
+        drop(lock);
+        manager
+            .remove("agent-incarnation", true, true)
+            .expect("remove first incarnation");
+        let stale_lock = KernelStateLock::try_acquire_exclusive_direct(
+            &store.state_root,
+            managed_worktree_lease_name("agent-incarnation", &first).expect("old lease name"),
+        )
+        .expect("stale incarnation lock");
+
+        manager.create(options()).expect("second incarnation");
+        let lock = store.lock().expect("registry lock");
+        let second = store
+            .active_incarnation(&lock, "agent-incarnation")
+            .expect("second incarnation evidence");
+        assert_eq!(second.generation, first.generation + 1);
+        assert_ne!(second.nonce, first.nonce);
+        let stale = ManagedWorktreeRemovalLease {
+            name: "agent-incarnation".to_string(),
+            incarnation_generation: first.generation,
+            incarnation_nonce: first.nonce,
+            _lock: stale_lock,
+        };
+        let error = store
+            .verify_removal_lease_current(&lock, &stale)
+            .expect_err("stale removal lease must not authorize the new incarnation");
+        assert!(error.to_string().contains("stale incarnation"));
+        drop(lock);
+
+        let _current = manager
+            .acquire_read_execution_lease("agent-incarnation")
+            .expect("old-incarnation lock must not block current lease");
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_execution_lease_rejects_lock_path_rebind_after_flock() {
@@ -3656,7 +4006,13 @@ mod tests {
             })
             .expect("create worktree");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
-        let lease_name = managed_worktree_lease_name("agent-write-rebind").expect("lease name");
+        let registry_lock = store.lock().expect("registry lock");
+        let incarnation = store
+            .active_incarnation(&registry_lock, "agent-write-rebind")
+            .expect("active incarnation");
+        drop(registry_lock);
+        let lease_name =
+            managed_worktree_lease_name("agent-write-rebind", &incarnation).expect("lease name");
         let moved_path = store
             .state_root
             .path()

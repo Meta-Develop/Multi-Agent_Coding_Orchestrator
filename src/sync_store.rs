@@ -1,9 +1,18 @@
-use crate::safe_state::{
-    identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity,
-    KernelStateLock, SafeRoot,
-};
 use crate::sync::{
     normalize_repo_relative_path, ClaimToken, PathClaim, SyncCoordinator, SyncSnapshot,
+};
+use crate::{
+    artifacts::{
+        repository_authenticator_key_only,
+        state_auth::{AuthenticationDomain, RepositoryAuthBinding},
+    },
+    authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
+    safe_state::{stable_checksum, FileIdentity, KernelStateLock, SafeRoot},
+    state_journal::JournalSpec,
+    state_migration::{
+        finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
+        LEGACY_RETIREMENT_DOMAIN,
+    },
 };
 use anyhow::{bail, Context, Result};
 use git2::Repository;
@@ -14,13 +23,15 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::{
-    ffi::OsStrExt,
-    fs::{MetadataExt, PermissionsExt},
-};
+use std::os::unix::ffi::OsStrExt;
+
+#[cfg(all(test, unix))]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+#[cfg(test)]
+use crate::safe_state::{identity_for_path, AtomicStateWriter, BoundedRegularReader};
 
 const STATE_VERSION: u32 = 2;
-const LEGACY_STATE_VERSION: u32 = 1;
 const MAX_SYNC_STATE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SYNC_CLAIMS: usize = 4_096;
 const MAX_SYNC_PATHS: usize = 16_384;
@@ -30,7 +41,47 @@ const MAX_STATE_PATH_COMPONENTS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct SyncStore {
+    repo_path: PathBuf,
     state: RepositoryStateRoot,
+}
+
+pub(crate) enum ClaimsSnapshotSpec {}
+
+impl JournalSpec for ClaimsSnapshotSpec {
+    const FORMAT_VERSION: u32 = 1;
+    const NAMESPACE: &'static str = "authenticated_claims";
+    const ROOT_NAME: &'static str = "authenticated-claims-state-v1";
+    const ROOT_LOCK_NAME: &'static str = ".authenticated-claims.lock";
+    const INSTANCE_LOCK_NAME: &'static str = ".claims-snapshot.lock";
+    const HEAD_FILE_NAME: &'static str = ".head.json";
+    const RECORD_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-claims-record\0v1\0");
+    const HEAD_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-claims-head\0v1\0");
+    const MAX_RECORDS: usize = 4_096;
+    const MAX_RECORD_BYTES: u64 = MAX_SYNC_STATE_BYTES;
+    const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_PHASE_BYTES: usize = 32;
+    const MAX_SUBJECT_BYTES: usize = 64;
+    const MAX_INSTANCE_ID_BYTES: usize = 128;
+}
+
+impl SnapshotSpec for ClaimsSnapshotSpec {
+    const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+    const LOCATOR_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-claims-locator\0v1\0");
+}
+
+const CLAIMS_LOGICAL_ID: &str = "claims";
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedClaimsState {
+    version: u32,
+    snapshot_revision: u64,
+    repository: RepositoryAuthBinding,
+    next_token: u64,
+    claims: Vec<PathClaim>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,29 +122,6 @@ struct PersistedSyncState {
     repository: RepositoryStateBinding,
     next_token: u64,
     claims: Vec<PathClaim>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyPersistedSyncState {
-    version: u32,
-    next_token: u64,
-    claims: Vec<PathClaim>,
-}
-
-impl PersistedSyncState {
-    fn from_snapshot(repository: RepositoryStateBinding, snapshot: SyncSnapshot) -> Result<Self> {
-        validate_sync_snapshot(&snapshot)?;
-        let mut state = Self {
-            version: STATE_VERSION,
-            checksum: String::new(),
-            repository,
-            next_token: snapshot.next_token,
-            claims: snapshot.claims,
-        };
-        state.checksum = sync_state_checksum(&state)?;
-        Ok(state)
-    }
 }
 
 impl RepositoryStateRoot {
@@ -141,6 +169,14 @@ impl RepositoryStateRoot {
         &self.binding
     }
 
+    pub(crate) fn root(&self) -> &SafeRoot {
+        &self.root
+    }
+
+    pub(crate) fn verify(&self, lock: &RepositoryStateLock) -> Result<()> {
+        self.verify_lock(lock)
+    }
+
     pub(crate) fn lock(&self) -> Result<RepositoryStateLock> {
         let lock = KernelStateLock::acquire_direct(&self.root, self.lock_file)?;
         let lock_identity = lock.identity().clone();
@@ -152,6 +188,8 @@ impl RepositoryStateRoot {
         })
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn read(
         &self,
         lock: &RepositoryStateLock,
@@ -177,6 +215,8 @@ impl RepositoryStateRoot {
         finish_with_lock_verification(result, self.verify_lock(lock))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn write(
         &self,
         lock: &RepositoryStateLock,
@@ -229,11 +269,13 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn set_repository_state_after_precheck_hook(hook: impl FnOnce() + 'static) {
     REPOSITORY_STATE_AFTER_PRECHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn run_repository_state_after_precheck_hook() {
     let hook = REPOSITORY_STATE_AFTER_PRECHECK_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -241,9 +283,8 @@ fn run_repository_state_after_precheck_hook() {
     }
 }
 
-#[cfg(not(test))]
-fn run_repository_state_after_precheck_hook() {}
-
+#[cfg(test)]
+#[allow(dead_code)]
 fn finish_with_lock_verification<T>(result: Result<T>, verification: Result<()>) -> Result<T> {
     match (result, verification) {
         (Ok(value), Ok(())) => Ok(value),
@@ -263,9 +304,12 @@ impl SyncStore {
                 repo_path.as_ref().display()
             )
         })?;
-        Ok(Self {
+        let store = Self {
+            repo_path: repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf(),
             state: RepositoryStateRoot::open(&repo, "claims.json", "claims.lock")?,
-        })
+        };
+        store.ensure_authenticated_initialized()?;
+        Ok(store)
     }
 
     pub fn state_path(&self) -> &Path {
@@ -313,9 +357,36 @@ impl SyncStore {
         operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
-        let coordinator = self.load_coordinator(&lock)?;
+        let mut store = self.open_authenticated_store(&lock)?;
+        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
+            next_token: store.current().value.next_token,
+            claims: store.current().value.claims.clone(),
+        })?;
         let output = operation(&coordinator)?;
-        self.save_snapshot(&lock, coordinator.to_snapshot()?)?;
+        let snapshot = coordinator.to_snapshot()?;
+        validate_sync_snapshot(&snapshot)?;
+        let revision = store
+            .current()
+            .value
+            .snapshot_revision
+            .checked_add(1)
+            .context("authenticated claims snapshot revision exhausted")?;
+        let value = AuthenticatedClaimsState {
+            version: 1,
+            snapshot_revision: revision,
+            repository: store.current().value.repository.clone(),
+            next_token: snapshot.next_token,
+            claims: snapshot.claims,
+        };
+        if revision % 4_096 == 0 {
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            store = store.rollover(authenticator, revision, value)?;
+        } else {
+            store.commit(revision, value)?;
+        }
+        self.validate_authenticated_store(&store)?;
+        self.ensure_legacy_retirement(&store, &lock)?;
+        self.state.verify_lock(&lock)?;
         Ok(output)
     }
 
@@ -324,82 +395,164 @@ impl SyncStore {
         operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
-        let coordinator = self.load_coordinator(&lock)?;
+        let store = self.open_authenticated_store(&lock)?;
+        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
+            next_token: store.current().value.next_token,
+            claims: store.current().value.claims.clone(),
+        })?;
         operation(&coordinator)
     }
 
-    fn load_coordinator(&self, lock: &RepositoryStateLock) -> Result<SyncCoordinator> {
-        let snapshot = self.load_snapshot(lock)?;
-        SyncCoordinator::from_snapshot(snapshot).map_err(Into::into)
-    }
-
-    fn load_snapshot(&self, lock: &RepositoryStateLock) -> Result<SyncSnapshot> {
-        let Some(contents) = self.state.read(lock, MAX_SYNC_STATE_BYTES)? else {
-            return Ok(SyncSnapshot::default());
-        };
-        let version = serde_json::from_slice::<serde_json::Value>(&contents)
-            .with_context(|| format!("failed to parse sync state {}", self.state_path().display()))?
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .context("sync state is missing an integer version")?;
-        let version = u32::try_from(version).context("sync state version does not fit in u32")?;
-        if version == LEGACY_STATE_VERSION {
-            let legacy: LegacyPersistedSyncState =
-                serde_json::from_slice(&contents).with_context(|| {
-                    format!(
-                        "failed to parse legacy sync state {}",
-                        self.state_path().display()
-                    )
-                })?;
-            if legacy.version != LEGACY_STATE_VERSION {
-                bail!("legacy sync state changed versions while it was being parsed");
+    fn ensure_authenticated_initialized(&self) -> Result<()> {
+        let lock = self.state.lock()?;
+        let root_exists = self
+            .state
+            .root
+            .direct_child_exists(ClaimsSnapshotSpec::ROOT_NAME)?;
+        if root_exists {
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            let initialized = AuthenticatedSnapshotStore::<
+                ClaimsSnapshotSpec,
+                AuthenticatedClaimsState,
+            >::initialized(&authenticator, CLAIMS_LOGICAL_ID)?;
+            if initialized {
+                let store = AuthenticatedSnapshotStore::<
+                    ClaimsSnapshotSpec,
+                    AuthenticatedClaimsState,
+                >::open_instance(authenticator, CLAIMS_LOGICAL_ID)?;
+                self.validate_authenticated_store(&store)?;
+                self.ensure_legacy_retirement(&store, &lock)?;
+                return self.state.verify_lock(&lock);
             }
-            let snapshot = SyncSnapshot {
-                next_token: legacy.next_token,
-                claims: legacy.claims,
-            };
-            validate_sync_snapshot(&snapshot)?;
-            SyncCoordinator::from_snapshot(snapshot.clone())
-                .context("legacy sync state failed structural validation")?;
-            self.save_snapshot(lock, snapshot.clone()).context(
-                "failed to migrate private legacy sync state to repository-bound version 2",
-            )?;
-            return Ok(snapshot);
         }
-        if version != STATE_VERSION {
-            bail!(
-                "unsupported sync state version {} in {}",
-                version,
-                self.state_path().display()
-            );
-        }
-        let state: PersistedSyncState = serde_json::from_slice(&contents).with_context(|| {
-            format!("failed to parse sync state {}", self.state_path().display())
-        })?;
-        if state.repository != *self.state.binding() {
-            bail!("sync state repository/common-directory binding does not match this repository");
-        }
-        let expected_checksum = sync_state_checksum(&state)?;
-        if state.checksum != expected_checksum {
-            bail!(
-                "sync state checksum mismatch in {}; refusing to use corrupted state",
-                self.state_path().display()
-            );
-        }
-        let snapshot = SyncSnapshot {
-            next_token: state.next_token,
-            claims: state.claims,
+        let preparation = prepare_legacy_retirement::<ClaimsSnapshotSpec>(
+            &self.repo_path,
+            "claims",
+            "claims.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            &|| self.state.verify_lock(&lock),
+        )?;
+        let (adoption, writer) = preparation.into_parts();
+        let binding = writer.authenticator().binding().clone();
+        let initial = match adoption {
+            LegacyAdoption::Missing => AuthenticatedClaimsState {
+                version: 1,
+                snapshot_revision: 1,
+                repository: binding,
+                next_token: 1,
+                claims: Vec::new(),
+            },
+            LegacyAdoption::Present(bytes) => {
+                let legacy: PersistedSyncState = serde_json::from_slice(&bytes)
+                    .context("signed legacy claims state is malformed")?;
+                if legacy.version != STATE_VERSION
+                    || legacy.repository != *self.state.binding()
+                    || legacy.checksum != sync_state_checksum(&legacy)?
+                {
+                    bail!("signed legacy claims state failed repository/checksum validation");
+                }
+                let snapshot = SyncSnapshot {
+                    next_token: legacy.next_token,
+                    claims: legacy.claims,
+                };
+                validate_sync_snapshot(&snapshot)?;
+                AuthenticatedClaimsState {
+                    version: 1,
+                    snapshot_revision: 1,
+                    repository: binding,
+                    next_token: snapshot.next_token,
+                    claims: snapshot.claims,
+                }
+            }
         };
-        validate_sync_snapshot(&snapshot)?;
-        Ok(snapshot)
+        let store =
+            AuthenticatedSnapshotStore::<ClaimsSnapshotSpec, AuthenticatedClaimsState>::create(
+                writer.into_authenticator()?,
+                CLAIMS_LOGICAL_ID,
+                1,
+                initial,
+            )?;
+        self.validate_authenticated_store(&store)?;
+        self.ensure_legacy_retirement(&store, &lock)?;
+        self.state.verify_lock(&lock)
     }
 
+    fn open_authenticated_store(
+        &self,
+        lock: &RepositoryStateLock,
+    ) -> Result<AuthenticatedSnapshotStore<ClaimsSnapshotSpec, AuthenticatedClaimsState>> {
+        self.state.verify_lock(lock)?;
+        let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+        let store = AuthenticatedSnapshotStore::open_instance(authenticator, CLAIMS_LOGICAL_ID)?;
+        self.validate_authenticated_store(&store)?;
+        self.ensure_legacy_retirement(&store, lock)?;
+        self.state.verify_lock(lock)?;
+        Ok(store)
+    }
+
+    fn validate_authenticated_store(
+        &self,
+        store: &AuthenticatedSnapshotStore<ClaimsSnapshotSpec, AuthenticatedClaimsState>,
+    ) -> Result<()> {
+        let snapshot = store.current();
+        if snapshot.value.version != 1
+            || snapshot.value.snapshot_revision != snapshot.generation
+            || snapshot.value.snapshot_revision != snapshot.token
+            || snapshot.value.repository != store.identity().repository
+        {
+            bail!("authenticated claims snapshot binding or revision is inconsistent");
+        }
+        validate_sync_snapshot(&SyncSnapshot {
+            next_token: snapshot.value.next_token,
+            claims: snapshot.value.claims.clone(),
+        })
+    }
+
+    fn ensure_legacy_retirement(
+        &self,
+        store: &AuthenticatedSnapshotStore<ClaimsSnapshotSpec, AuthenticatedClaimsState>,
+        lock: &RepositoryStateLock,
+    ) -> Result<()> {
+        finalize_legacy_retirement::<ClaimsSnapshotSpec>(
+            &self.repo_path,
+            "claims",
+            "claims.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            store.identity(),
+            store.current().generation,
+            &|| self.state.verify_lock(lock),
+        )
+    }
+
+    #[cfg(test)]
+    fn load_snapshot(&self, lock: &RepositoryStateLock) -> Result<SyncSnapshot> {
+        let store = self.open_authenticated_store(lock)?;
+        Ok(SyncSnapshot {
+            next_token: store.current().value.next_token,
+            claims: store.current().value.claims.clone(),
+        })
+    }
+
+    #[cfg(test)]
     fn save_snapshot(&self, lock: &RepositoryStateLock, snapshot: SyncSnapshot) -> Result<()> {
-        let state = PersistedSyncState::from_snapshot(self.state.binding().clone(), snapshot)?;
-        let mut contents = serde_json::to_vec_pretty(&state)
-            .context("failed to serialize repository-bound sync state")?;
-        contents.push(b'\n');
-        self.state.write(lock, &contents, MAX_SYNC_STATE_BYTES)
+        self.state.verify_lock(lock)?;
+        validate_sync_snapshot(&snapshot)?;
+        let mut store = self.open_authenticated_store(lock)?;
+        let revision = store
+            .current()
+            .value
+            .snapshot_revision
+            .checked_add(1)
+            .context("authenticated claims test revision exhausted")?;
+        let value = AuthenticatedClaimsState {
+            version: 1,
+            snapshot_revision: revision,
+            repository: store.current().value.repository.clone(),
+            next_token: snapshot.next_token,
+            claims: snapshot.claims,
+        };
+        store.commit(revision, value)?;
+        self.state.verify_lock(lock)
     }
 }
 
@@ -488,7 +641,8 @@ fn filesystem_path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().to_string_lossy().as_bytes().to_vec()
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
+#[allow(dead_code)]
 fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect private state file {}", path.display()))?;
@@ -522,7 +676,8 @@ fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
     identity_for_path(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
+#[allow(dead_code)]
 fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
     bail!(
         "private state-file ownership and ACL validation is unsupported on this platform: {}",
@@ -533,9 +688,171 @@ fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worktree::WorktreeManager;
+    use crate::{
+        artifacts::state_auth::authentication_key_file_name,
+        state_migration::{set_legacy_retirement_fault, LegacyRetirementFaultPoint},
+        worktree::WorktreeManager,
+    };
     use git2::{Oid, Repository, Signature};
     use tempfile::TempDir;
+
+    #[test]
+    fn retirement_faults_recover_without_an_empty_or_split_brain_window() {
+        for fault in [
+            LegacyRetirementFaultPoint::Sidecar,
+            LegacyRetirementFaultPoint::Intent,
+            LegacyRetirementFaultPoint::PendingTombstone,
+            LegacyRetirementFaultPoint::ActiveTombstone,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let repo_path = temp.path().join("repo");
+            WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+            set_legacy_retirement_fault(fault);
+            let error = SyncStore::open(&repo_path).expect_err("fault must interrupt retirement");
+            assert!(error
+                .to_string()
+                .contains("injected legacy retirement fault"));
+
+            let legacy_path = repo_path.join(".git/maco/state/claims.json");
+            if matches!(
+                fault,
+                LegacyRetirementFaultPoint::PendingTombstone
+                    | LegacyRetirementFaultPoint::ActiveTombstone
+            ) {
+                let value: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&legacy_path).expect("pending or active tombstone"),
+                )
+                .expect("tombstone JSON");
+                assert_eq!(
+                    value.get("version").and_then(serde_json::Value::as_u64),
+                    Some(3)
+                );
+                assert!(serde_json::from_value::<PersistedSyncState>(value).is_err());
+            }
+
+            let store = SyncStore::open(&repo_path).expect("forward recover retirement");
+            assert!(store.snapshot().expect("snapshot").is_empty());
+            let consumer_root =
+                repo_path.join(format!(".git/maco/state/{}", ClaimsSnapshotSpec::ROOT_NAME));
+            assert!(!consumer_root.join(".legacy-retirement.sidecar").exists());
+            assert!(!consumer_root
+                .join(".legacy-retirement.intent.json")
+                .exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmanifested_legacy_claims_refuse_before_auth_bootstrap() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let state_root = repo_path.join(".git/maco/state");
+        fs::create_dir_all(&state_root).expect("state root");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).expect("state mode");
+        fs::write(state_root.join("claims.json"), b"{\"version\":2}\n")
+            .expect("unmanifested legacy");
+        fs::set_permissions(
+            state_root.join("claims.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("legacy mode");
+
+        let error = SyncStore::open(&repo_path).expect_err("migration evidence is mandatory");
+        assert!(error.to_string().contains("signed migration manifest"));
+        assert!(!state_root.join(authentication_key_file_name()).exists());
+        assert!(!state_root.join("repository_auth_epoch_v1").exists());
+        assert!(!state_root.join(ClaimsSnapshotSpec::ROOT_NAME).exists());
+    }
+
+    #[test]
+    fn active_retirement_rejects_generation_and_identity_rollback() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        store
+            .claim_paths("agent-a", ["README.md"])
+            .expect("advance snapshot");
+        let lock = store.state.lock().expect("claims lock");
+        let authenticated = store
+            .open_authenticated_store(&lock)
+            .expect("authenticated claims");
+        let generation = authenticated.current().generation;
+        assert!(generation > 1);
+        let mut foreign_identity = authenticated.identity().clone();
+        foreign_identity.journal_id = "0".repeat(64);
+
+        let rollback = finalize_legacy_retirement::<ClaimsSnapshotSpec>(
+            &repo_path,
+            "claims",
+            "claims.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            &foreign_identity,
+            generation - 1,
+            &|| store.state.verify_lock(&lock),
+        )
+        .expect_err("generation rollback must fail regardless of identity");
+        assert!(rollback.to_string().contains("generation rolled back"));
+
+        let identity_swap = finalize_legacy_retirement::<ClaimsSnapshotSpec>(
+            &repo_path,
+            "claims",
+            "claims.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            &foreign_identity,
+            generation,
+            &|| store.state.verify_lock(&lock),
+        )
+        .expect_err("same-generation identity swap must fail");
+        assert!(identity_swap
+            .to_string()
+            .contains("identity changed without increasing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_write_fence_rejects_rebound_legacy_lock_path() {
+        use std::cell::Cell;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("repo");
+        let state =
+            RepositoryStateRoot::open(&repo, "claims.json", "claims.lock").expect("state root");
+        let lock = state.lock().expect("claims lock");
+        let lock_path = lock._lock.path().to_path_buf();
+        let moved = lock_path.with_file_name("claims.lock.retirement-original");
+        let calls = Cell::new(0_u32);
+        let fence = || {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 1 {
+                fs::rename(&lock_path, &moved).expect("move lock pathname");
+                fs::write(&lock_path, b"").expect("replacement lock");
+                fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                    .expect("replacement mode");
+            }
+            state.verify_lock(&lock)
+        };
+        let error = match prepare_legacy_retirement::<ClaimsSnapshotSpec>(
+            &repo_path,
+            "claims",
+            "claims.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            &fence,
+        ) {
+            Ok(_) => panic!("rebound legacy lock must fence retirement publication"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("lock path") || message.contains("opened descriptor"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!state.state_path().exists());
+    }
 
     #[test]
     fn claim_persists_and_blocks_overlapping_paths() {
@@ -715,37 +1032,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn private_legacy_v1_state_is_migrated_and_repository_bound() {
+    fn retired_legacy_filename_is_not_decodable_as_v2_state() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
         let store = SyncStore::open(&repo_path).expect("open store");
-        let legacy = serde_json::json!({
-            "version": LEGACY_STATE_VERSION,
-            "next_token": 2,
-            "claims": [{
-                "token": 1,
-                "agent_id": "agent-a",
-                "paths": ["README.md"]
-            }]
-        });
-        fs::write(
-            store.state_path(),
-            serde_json::to_vec_pretty(&legacy).expect("legacy JSON"),
-        )
-        .expect("write legacy");
-        fs::set_permissions(store.state_path(), fs::Permissions::from_mode(0o600))
-            .expect("private state");
-
-        assert_eq!(store.snapshot().expect("migrate").len(), 1);
-        let migrated = fs::read(store.state_path()).expect("read migrated");
-        let state: PersistedSyncState = serde_json::from_slice(&migrated).expect("parse migrated");
-        assert_eq!(state.version, STATE_VERSION);
-        assert_eq!(state.repository, *store.state.binding());
-        assert_eq!(
-            state.checksum,
-            sync_state_checksum(&state).expect("checksum")
-        );
+        let tombstone = fs::read(store.state_path()).expect("retirement tombstone");
+        let value: serde_json::Value = serde_json::from_slice(&tombstone).expect("tombstone JSON");
+        assert_eq!(value["version"], 3);
+        assert!(serde_json::from_slice::<PersistedSyncState>(&tombstone).is_err());
     }
 
     #[cfg(unix)]
@@ -763,17 +1058,14 @@ mod tests {
         let mut state: serde_json::Value =
             serde_json::from_slice(&fs::read(store.state_path()).expect("state"))
                 .expect("parse state");
-        state["next_token"] = serde_json::json!(999);
+        state["snapshot_generation"] = serde_json::json!(999);
         fs::write(
             store.state_path(),
             serde_json::to_vec_pretty(&state).expect("tampered JSON"),
         )
         .expect("tamper state");
-        assert!(store
-            .snapshot()
-            .expect_err("checksum tamper")
-            .to_string()
-            .contains("checksum mismatch"));
+        let error = store.snapshot().expect_err("HMAC tamper");
+        assert!(format!("{error:#}").contains("authentication tag"));
 
         fs::remove_file(store.state_path()).expect("remove tampered state");
         let external = temp.path().join("external-state");
@@ -827,13 +1119,6 @@ mod tests {
 
         let claims = store.snapshot().expect("snapshot");
         assert_eq!(claims.len(), 16);
-        let state: PersistedSyncState =
-            serde_json::from_slice(&fs::read(store.state_path()).expect("state"))
-                .expect("parse state");
-        assert_eq!(
-            state.checksum,
-            sync_state_checksum(&state).expect("checksum")
-        );
     }
 
     #[test]
@@ -849,23 +1134,13 @@ mod tests {
                 paths: vec![PathBuf::from(format!("path-{index}"))],
             })
             .collect::<Vec<_>>();
-        let mut state = PersistedSyncState {
-            version: STATE_VERSION,
-            checksum: String::new(),
-            repository: store.state.binding().clone(),
+        let snapshot = SyncSnapshot {
             next_token: u64::try_from(MAX_SYNC_CLAIMS).expect("count") + 2,
             claims,
         };
-        state.checksum = sync_state_checksum(&state).expect("checksum");
-        let bytes = serde_json::to_vec(&state).expect("state JSON");
-        assert!(u64::try_from(bytes.len()).expect("length") < MAX_SYNC_STATE_BYTES);
-        fs::write(store.state_path(), bytes).expect("write oversized records");
-        #[cfg(unix)]
-        fs::set_permissions(store.state_path(), fs::Permissions::from_mode(0o600))
-            .expect("private mode");
-
+        let lock = store.state.lock().expect("claims lock");
         assert!(store
-            .snapshot()
+            .save_snapshot(&lock, snapshot)
             .expect_err("record budget")
             .to_string()
             .contains("claim budget"));
@@ -884,13 +1159,17 @@ mod tests {
             .claim_paths("agent-a", ["README.md"])
             .expect("persist claim");
 
-        let bytes = fs::read(store.state_path()).expect("state bytes");
-        let state: PersistedSyncState = serde_json::from_slice(&bytes).expect("state JSON");
-        assert_eq!(state.repository, *store.state.binding());
-        assert!(state
-            .repository
-            .common_dir_path_checksum
-            .starts_with("maco-v1-"));
+        let lock = store.state.lock().expect("claims lock");
+        let authenticated = store
+            .open_authenticated_store(&lock)
+            .expect("authenticated claims");
+        assert_eq!(
+            authenticated.current().value.repository,
+            authenticated.identity().repository
+        );
+        drop(authenticated);
+        drop(lock);
+        assert_eq!(store.snapshot().expect("snapshot").len(), 1);
     }
 
     #[cfg(unix)]
@@ -946,23 +1225,16 @@ mod tests {
             .expect("initial claim");
 
         let stale_lock = store.state.lock().expect("stale lock");
-        let stale_snapshot = store.load_snapshot(&stale_lock).expect("stale snapshot");
-        let nested_store = store.clone();
         let lock_path = stale_lock._lock.path().to_path_buf();
         let moved_lock = lock_path.with_file_name("claims.lock.precheck-original");
-        set_repository_state_after_precheck_hook(move || {
-            fs::rename(&lock_path, &moved_lock).expect("move stale lock inode");
-            fs::write(&lock_path, b"").expect("create replacement lock inode");
-            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
-                .expect("replacement mode");
-            nested_store
-                .claim_paths("agent-b", ["second"])
-                .expect("commit in replacement lock domain");
-        });
-
-        let error = store
-            .save_snapshot(&stale_lock, stale_snapshot)
-            .expect_err("stale writer must fail before destination replacement");
+        fs::rename(&lock_path, &moved_lock).expect("move stale lock inode");
+        fs::write(&lock_path, b"").expect("create replacement lock inode");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+        let error = match store.open_authenticated_store(&stale_lock) {
+            Ok(_) => panic!("stale lock must fail before authenticated state access"),
+            Err(error) => error,
+        };
         assert!(
             error.to_string().contains("lock path")
                 || error.to_string().contains("opened descriptor"),
@@ -970,10 +1242,7 @@ mod tests {
         );
         drop(stale_lock);
 
-        let claims = store.snapshot().expect("final snapshot");
-        assert_eq!(claims.len(), 2);
-        assert!(claims.iter().any(|claim| claim.agent_id == "agent-a"));
-        assert!(claims.iter().any(|claim| claim.agent_id == "agent-b"));
+        assert_eq!(store.snapshot().expect("final snapshot").len(), 1);
     }
 
     fn commit_readme(repo: &Repository) -> Result<Oid> {

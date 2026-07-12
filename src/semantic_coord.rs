@@ -1,6 +1,16 @@
 use crate::{
+    artifacts::{
+        repository_authenticator_key_only,
+        state_auth::{AuthenticationDomain, RepositoryAuthBinding},
+    },
+    authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
     repo_semantic::{self, SemanticRepoMap, SemanticScanError, SemanticSymbol, SemanticSymbolKind},
     safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
+    state_journal::JournalSpec,
+    state_migration::{
+        finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
+        LEGACY_RETIREMENT_DOMAIN,
+    },
     sync::normalize_repo_relative_path,
     sync_store::{
         validate_state_path, RepositoryStateBinding, RepositoryStateLock, RepositoryStateRoot,
@@ -15,7 +25,6 @@ use std::{
 };
 
 const STATE_VERSION: u32 = 2;
-const LEGACY_STATE_VERSION: u32 = 1;
 const MAX_SEMANTIC_STATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SEMANTIC_INTENTS: usize = 4_096;
 const MAX_SEMANTIC_RECORDS: usize = 262_144;
@@ -132,7 +141,47 @@ pub struct SemanticCoordinationReport {
 #[derive(Debug, Clone)]
 pub struct SemanticIntentStore {
     repo_root: PathBuf,
+    repo_path: PathBuf,
     state: RepositoryStateRoot,
+}
+
+pub(crate) enum SemanticSnapshotSpec {}
+
+impl JournalSpec for SemanticSnapshotSpec {
+    const FORMAT_VERSION: u32 = 1;
+    const NAMESPACE: &'static str = "authenticated_semantic";
+    const ROOT_NAME: &'static str = "authenticated-semantic-state-v1";
+    const ROOT_LOCK_NAME: &'static str = ".authenticated-semantic.lock";
+    const INSTANCE_LOCK_NAME: &'static str = ".semantic-snapshot.lock";
+    const HEAD_FILE_NAME: &'static str = ".head.json";
+    const RECORD_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-semantic-record\0v1\0");
+    const HEAD_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-semantic-head\0v1\0");
+    const MAX_RECORDS: usize = 4_096;
+    const MAX_RECORD_BYTES: u64 = MAX_SEMANTIC_STATE_BYTES;
+    const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+    const MAX_PHASE_BYTES: usize = 32;
+    const MAX_SUBJECT_BYTES: usize = 64;
+    const MAX_INSTANCE_ID_BYTES: usize = 128;
+}
+
+impl SnapshotSpec for SemanticSnapshotSpec {
+    const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+    const LOCATOR_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0authenticated-semantic-locator\0v1\0");
+}
+
+const SEMANTIC_LOGICAL_ID: &str = "semantic-intents";
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedSemanticState {
+    version: u32,
+    snapshot_revision: u64,
+    repository: RepositoryAuthBinding,
+    next_token: u64,
+    intents: Vec<SemanticIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -143,26 +192,6 @@ struct PersistedSemanticState {
     repository: RepositoryStateBinding,
     next_token: u64,
     intents: Vec<SemanticIntent>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyPersistedSemanticState {
-    version: u32,
-    next_token: u64,
-    intents: Vec<SemanticIntent>,
-}
-
-impl PersistedSemanticState {
-    fn empty(repository: RepositoryStateBinding) -> Self {
-        Self {
-            version: STATE_VERSION,
-            checksum: String::new(),
-            repository,
-            next_token: 1,
-            intents: Vec::new(),
-        }
-    }
 }
 
 impl SemanticIntentStore {
@@ -181,14 +210,17 @@ impl SemanticIntentStore {
             .context("semantic intent repository root is not safely reachable")?
             .path()
             .to_path_buf();
-        Ok(Self {
+        let store = Self {
             repo_root,
+            repo_path: repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf(),
             state: RepositoryStateRoot::open(
                 &repo,
                 "semantic_intents.json",
                 "semantic_intents.lock",
             )?,
-        })
+        };
+        store.ensure_authenticated_initialized()?;
+        Ok(store)
     }
 
     pub fn state_path(&self) -> &Path {
@@ -300,9 +332,33 @@ impl SemanticIntentStore {
         operation: impl FnOnce(&mut PersistedSemanticState) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
-        let mut state = self.load_state(&lock)?;
+        let mut store = self.open_authenticated_store(&lock)?;
+        let mut state = self.persisted_view(store.current().value.clone())?;
         let output = operation(&mut state)?;
-        self.save_state(&lock, &mut state)?;
+        normalize_state(&mut state);
+        validate_semantic_state(&state)?;
+        let revision = store
+            .current()
+            .value
+            .snapshot_revision
+            .checked_add(1)
+            .context("authenticated semantic snapshot revision exhausted")?;
+        let value = AuthenticatedSemanticState {
+            version: 1,
+            snapshot_revision: revision,
+            repository: store.current().value.repository.clone(),
+            next_token: state.next_token,
+            intents: state.intents,
+        };
+        if revision % 4_096 == 0 {
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            store = store.rollover(authenticator, revision, value)?;
+        } else {
+            store.commit(revision, value)?;
+        }
+        self.validate_authenticated_store(&store)?;
+        self.ensure_legacy_retirement(&store, &lock)?;
+        self.state.verify(&lock)?;
         Ok(output)
     }
 
@@ -311,99 +367,138 @@ impl SemanticIntentStore {
         operation: impl FnOnce(&PersistedSemanticState) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
-        let state = self.load_state(&lock)?;
+        let store = self.open_authenticated_store(&lock)?;
+        let state = self.persisted_view(store.current().value.clone())?;
         operation(&state)
     }
 
-    fn load_state(&self, lock: &RepositoryStateLock) -> Result<PersistedSemanticState> {
-        let Some(contents) = self.state.read(lock, MAX_SEMANTIC_STATE_BYTES)? else {
-            return Ok(PersistedSemanticState::empty(self.state.binding().clone()));
-        };
-        let version = serde_json::from_slice::<serde_json::Value>(&contents)
-            .with_context(|| {
-                format!(
-                    "failed to parse semantic intent state {}",
-                    self.state_path().display()
-                )
-            })?
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .context("semantic intent state is missing an integer version")?;
-        let version =
-            u32::try_from(version).context("semantic intent state version does not fit in u32")?;
-        if version == LEGACY_STATE_VERSION {
-            let legacy: LegacyPersistedSemanticState = serde_json::from_slice(&contents)
-                .with_context(|| {
-                    format!(
-                        "failed to parse legacy semantic intent state {}",
-                        self.state_path().display()
-                    )
-                })?;
-            if legacy.version != LEGACY_STATE_VERSION {
-                bail!("legacy semantic intent state changed versions while parsing");
+    fn ensure_authenticated_initialized(&self) -> Result<()> {
+        let lock = self.state.lock()?;
+        let root_exists = self
+            .state
+            .root()
+            .direct_child_exists(SemanticSnapshotSpec::ROOT_NAME)?;
+        if root_exists {
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            let initialized = AuthenticatedSnapshotStore::<
+                SemanticSnapshotSpec,
+                AuthenticatedSemanticState,
+            >::initialized(&authenticator, SEMANTIC_LOGICAL_ID)?;
+            if initialized {
+                let store = AuthenticatedSnapshotStore::<
+                    SemanticSnapshotSpec,
+                    AuthenticatedSemanticState,
+                >::open_instance(authenticator, SEMANTIC_LOGICAL_ID)?;
+                self.validate_authenticated_store(&store)?;
+                self.ensure_legacy_retirement(&store, &lock)?;
+                return self.state.verify(&lock);
             }
-            let mut state = PersistedSemanticState {
-                version: STATE_VERSION,
-                checksum: String::new(),
-                repository: self.state.binding().clone(),
-                next_token: legacy.next_token,
-                intents: legacy.intents,
-            };
-            validate_semantic_state(&state)?;
-            normalize_state(&mut state);
-            self.save_state(lock, &mut state).context(
-                "failed to migrate private legacy semantic state to repository-bound version 2",
+        }
+        let preparation = prepare_legacy_retirement::<SemanticSnapshotSpec>(
+            &self.repo_path,
+            "semantic_intents",
+            "semantic_intents.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            &|| self.state.verify(&lock),
+        )?;
+        let (adoption, writer) = preparation.into_parts();
+        let binding = writer.authenticator().binding().clone();
+        let initial = match adoption {
+            LegacyAdoption::Missing => AuthenticatedSemanticState {
+                version: 1,
+                snapshot_revision: 1,
+                repository: binding,
+                next_token: 1,
+                intents: Vec::new(),
+            },
+            LegacyAdoption::Present(bytes) => {
+                let legacy: PersistedSemanticState = serde_json::from_slice(&bytes)
+                    .context("signed legacy semantic state is malformed")?;
+                if legacy.version != STATE_VERSION
+                    || legacy.repository != *self.state.binding()
+                    || legacy.checksum != semantic_state_checksum(&legacy)?
+                {
+                    bail!("signed legacy semantic state failed repository/checksum validation");
+                }
+                validate_semantic_state(&legacy)?;
+                AuthenticatedSemanticState {
+                    version: 1,
+                    snapshot_revision: 1,
+                    repository: binding,
+                    next_token: legacy.next_token,
+                    intents: legacy.intents,
+                }
+            }
+        };
+        let store =
+            AuthenticatedSnapshotStore::<SemanticSnapshotSpec, AuthenticatedSemanticState>::create(
+                writer.into_authenticator()?,
+                SEMANTIC_LOGICAL_ID,
+                1,
+                initial,
             )?;
-            return Ok(state);
-        }
-        if version != STATE_VERSION {
-            bail!(
-                "unsupported semantic intent state version {} in {}",
-                version,
-                self.state_path().display()
-            );
-        }
-        let mut state: PersistedSemanticState =
-            serde_json::from_slice(&contents).with_context(|| {
-                format!(
-                    "failed to parse semantic intent state {}",
-                    self.state_path().display()
-                )
-            })?;
-        if state.repository != *self.state.binding() {
-            bail!(
-                "semantic intent state repository/common-directory binding does not match this repository"
-            );
-        }
-        let expected_checksum = semantic_state_checksum(&state)?;
-        if state.checksum != expected_checksum {
-            bail!(
-                "semantic intent state checksum mismatch in {}; refusing corrupted state",
-                self.state_path().display()
-            );
-        }
-        validate_semantic_state(&state)?;
-        let before_normalization = state.clone();
-        normalize_state(&mut state);
-        if state != before_normalization {
-            bail!("semantic intent state is not in its required canonical form");
-        }
-        Ok(state)
+        self.validate_authenticated_store(&store)?;
+        self.ensure_legacy_retirement(&store, &lock)?;
+        self.state.verify(&lock)
     }
 
-    fn save_state(
+    fn open_authenticated_store(
         &self,
         lock: &RepositoryStateLock,
-        state: &mut PersistedSemanticState,
+    ) -> Result<AuthenticatedSnapshotStore<SemanticSnapshotSpec, AuthenticatedSemanticState>> {
+        self.state.verify(lock)?;
+        let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+        let store = AuthenticatedSnapshotStore::open_instance(authenticator, SEMANTIC_LOGICAL_ID)?;
+        self.validate_authenticated_store(&store)?;
+        self.ensure_legacy_retirement(&store, lock)?;
+        self.state.verify(lock)?;
+        Ok(store)
+    }
+
+    fn validate_authenticated_store(
+        &self,
+        store: &AuthenticatedSnapshotStore<SemanticSnapshotSpec, AuthenticatedSemanticState>,
     ) -> Result<()> {
-        normalize_state(state);
-        state.repository = self.state.binding().clone();
-        validate_semantic_state(state)?;
-        state.checksum = semantic_state_checksum(state)?;
-        let mut contents = serde_json::to_vec_pretty(state)
-            .context("failed to serialize repository-bound semantic state")?;
-        contents.push(b'\n');
-        self.state.write(lock, &contents, MAX_SEMANTIC_STATE_BYTES)
+        let snapshot = store.current();
+        if snapshot.value.version != 1
+            || snapshot.value.snapshot_revision != snapshot.generation
+            || snapshot.value.snapshot_revision != snapshot.token
+            || snapshot.value.repository != store.identity().repository
+        {
+            bail!("authenticated semantic snapshot binding or revision is inconsistent");
+        }
+        let state = self.persisted_view(snapshot.value.clone())?;
+        validate_semantic_state(&state)
+    }
+
+    fn ensure_legacy_retirement(
+        &self,
+        store: &AuthenticatedSnapshotStore<SemanticSnapshotSpec, AuthenticatedSemanticState>,
+        lock: &RepositoryStateLock,
+    ) -> Result<()> {
+        finalize_legacy_retirement::<SemanticSnapshotSpec>(
+            &self.repo_path,
+            "semantic_intents",
+            "semantic_intents.json",
+            LEGACY_RETIREMENT_DOMAIN,
+            store.identity(),
+            store.current().generation,
+            &|| self.state.verify(lock),
+        )
+    }
+
+    fn persisted_view(&self, value: AuthenticatedSemanticState) -> Result<PersistedSemanticState> {
+        let mut state = PersistedSemanticState {
+            version: STATE_VERSION,
+            checksum: String::new(),
+            repository: self.state.binding().clone(),
+            next_token: value.next_token,
+            intents: value.intents,
+        };
+        normalize_state(&mut state);
+        validate_semantic_state(&state)?;
+        state.checksum = semantic_state_checksum(&state)?;
+        Ok(state)
     }
 
     fn build_intent(
@@ -1537,42 +1632,25 @@ pub mod api;
         sorted.sort();
         assert_eq!(kinds, sorted);
 
-        let state = fs::read_to_string(store.state_path()).expect("read state");
-        let reparsed: PersistedSemanticState =
-            serde_json::from_str(&state).expect("parse persisted state");
+        let lock = store.state.lock().expect("semantic lock");
+        let authenticated = store
+            .open_authenticated_store(&lock)
+            .expect("authenticated semantic state");
+        let reparsed = store
+            .persisted_view(authenticated.current().value.clone())
+            .expect("persisted view");
         assert_eq!(reparsed.intents, vec![first.intent]);
     }
 
     #[test]
-    fn private_legacy_state_migrates_to_bound_checksummed_v2() {
+    fn retired_legacy_filename_is_not_decodable_as_v2_state() {
         let (_temp, repo) = init_repo();
         write_file(&repo, "src/lib.rs", "pub fn root() {}\n");
         let store = SemanticIntentStore::open(&repo).expect("open store");
-        let claimed = store
-            .claim(request("agent-a").path("src/lib.rs").into())
-            .expect("claim");
-        let legacy = serde_json::json!({
-            "version": LEGACY_STATE_VERSION,
-            "next_token": 2,
-            "intents": [claimed.intent]
-        });
-        fs::write(
-            store.state_path(),
-            serde_json::to_vec_pretty(&legacy).expect("legacy JSON"),
-        )
-        .expect("write legacy");
-
-        let reopened = SemanticIntentStore::open(&repo).expect("reopen");
-        assert_eq!(reopened.status().expect("migrate").len(), 1);
-        let migrated: PersistedSemanticState =
-            serde_json::from_slice(&fs::read(reopened.state_path()).expect("state"))
-                .expect("parse state");
-        assert_eq!(migrated.version, STATE_VERSION);
-        assert_eq!(migrated.repository, *reopened.state.binding());
-        assert_eq!(
-            migrated.checksum,
-            semantic_state_checksum(&migrated).expect("checksum")
-        );
+        let tombstone = fs::read(store.state_path()).expect("retirement tombstone");
+        let value: serde_json::Value = serde_json::from_slice(&tombstone).expect("tombstone JSON");
+        assert_eq!(value["version"], 3);
+        assert!(serde_json::from_slice::<PersistedSemanticState>(&tombstone).is_err());
     }
 
     #[test]
@@ -1583,24 +1661,19 @@ pub mod api;
         store
             .claim(request("agent-a").path("src/lib.rs").into())
             .expect("claim");
+        let template = store.status().expect("status")[0].clone();
         let original = fs::read(store.state_path()).expect("state");
         let mut tampered: serde_json::Value =
             serde_json::from_slice(&original).expect("parse state");
-        tampered["next_token"] = serde_json::json!(999);
+        tampered["snapshot_generation"] = serde_json::json!(999);
         fs::write(
             store.state_path(),
             serde_json::to_vec_pretty(&tampered).expect("tampered JSON"),
         )
         .expect("tamper");
-        assert!(store
-            .status()
-            .expect_err("checksum mismatch")
-            .to_string()
-            .contains("checksum mismatch"));
-
-        let original_state: PersistedSemanticState =
-            serde_json::from_slice(&original).expect("parse original");
-        let template = original_state.intents[0].clone();
+        let error = store.status().expect_err("HMAC mismatch");
+        assert!(format!("{error:#}").contains("authentication tag"));
+        fs::write(store.state_path(), &original).expect("restore tombstone");
         let mut intents = Vec::with_capacity(MAX_SEMANTIC_INTENTS + 1);
         for index in 0..=MAX_SEMANTIC_INTENTS {
             let mut intent = template.clone();
@@ -1608,17 +1681,23 @@ pub mod api;
             intent.paths = vec![PathBuf::from(format!("generated/path-{index}"))];
             intents.push(intent);
         }
-        let mut oversized = PersistedSemanticState {
-            version: STATE_VERSION,
-            checksum: String::new(),
-            repository: store.state.binding().clone(),
+        let lock = store.state.lock().expect("semantic lock");
+        let mut authenticated = store
+            .open_authenticated_store(&lock)
+            .expect("authenticated semantic state");
+        let revision = authenticated.current().value.snapshot_revision + 1;
+        let oversized = AuthenticatedSemanticState {
+            version: 1,
+            snapshot_revision: revision,
+            repository: authenticated.current().value.repository.clone(),
             next_token: u64::try_from(MAX_SEMANTIC_INTENTS).expect("count") + 2,
             intents,
         };
-        oversized.checksum = semantic_state_checksum(&oversized).expect("checksum");
-        let bytes = serde_json::to_vec(&oversized).expect("state JSON");
-        assert!(u64::try_from(bytes.len()).expect("length") < MAX_SEMANTIC_STATE_BYTES);
-        fs::write(store.state_path(), bytes).expect("write record overflow");
+        authenticated
+            .commit(revision, oversized)
+            .expect("publish malformed budget snapshot");
+        drop(authenticated);
+        drop(lock);
         assert!(store
             .status()
             .expect_err("intent budget")
@@ -1647,13 +1726,6 @@ pub mod api;
             assert!(report.persisted);
         }
         assert_eq!(store.status().expect("status").len(), 12);
-        let state: PersistedSemanticState =
-            serde_json::from_slice(&fs::read(store.state_path()).expect("state"))
-                .expect("parse state");
-        assert_eq!(
-            state.checksum,
-            semantic_state_checksum(&state).expect("checksum")
-        );
     }
 
     #[cfg(unix)]

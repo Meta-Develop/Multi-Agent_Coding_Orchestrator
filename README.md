@@ -157,9 +157,10 @@ Known limitations and roadmap for 0.3.0:
 Network-facing LLM behavior should remain optional. The default development and
 test workflow should continue to run without provider credentials.
 
-Durable sync state is stored under the Git common metadata directory at
-`$(git rev-parse --git-common-dir)/maco/state/claims.json`, so the primary
-worktree and linked agent worktrees share the same claim state.
+Durable sync state is shared through the Git common metadata directory. Current
+claims live in the repository-authenticated `authenticated-claims-state-v1`
+snapshot namespace; `claims.json` is retained only as a signed version-3
+retirement tombstone that makes legacy version-2 writers fail closed.
 
 ### Authenticated state migration and foundations
 
@@ -175,6 +176,19 @@ owner-private transaction outside the state root makes a crash between chmod
 and manifest publication forward-recoverable; ordinary pre-publication errors
 restore original modes, and successful apply writes an idempotent audit
 receipt.
+
+The first open of each migrated claims, semantic-intent, or managed-worktree
+consumer performs a recoverable retirement transaction while holding its
+legacy kernel lock. It copies the exact signed-manifest legacy bytes into a
+bounded owner-private sidecar, binds both original and sidecar identities and
+digests in an HMAC intent, atomically replaces the legacy filename with a
+pending version-3 tombstone, publishes the full authenticated snapshot, and
+then activates the tombstone and removes the sidecar. Crashes before the
+tombstone leave only the old state; crashes after it recover forward from the
+signed sidecar, while old writers always reject version 3. Migration dry-run
+and repeated apply verify the original signed manifest entry, active tombstone,
+and exact authenticated snapshot locator without adopting a tombstone on
+first use.
 
 The typed authenticated-state foundation uses immutable HMAC-chained journals,
 signed atomic heads, and full-lifecycle instance locks. Snapshot stores add a
@@ -198,10 +212,11 @@ locator, journals, heads, and migration evidence as one whole snapshot.
 ## Semantic coordination
 
 Semantic coordination adds a typed blackboard of structured intents, not
-free-form agent chat. Durable semantic state is repo-local under the Git common
-metadata directory at
-`$(git rev-parse --git-common-dir)/maco/state/semantic_intents.json`, so the
-primary worktree and linked agent worktrees see the same planning state.
+free-form agent chat. Durable semantic state is repo-local in the Git common
+metadata directory's `authenticated-semantic-state-v1` snapshot namespace, so
+the primary worktree and linked agent worktrees see the same planning state.
+The legacy `semantic_intents.json` pathname is only the signed retirement
+tombstone.
 
 Hard path claims remain the write boundary. Semantic intents sit earlier in the
 workflow as a planning and coordination layer: blocking conflicts can prevent an
