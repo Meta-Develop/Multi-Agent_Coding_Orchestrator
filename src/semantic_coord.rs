@@ -1,21 +1,28 @@
 use crate::{
     repo_semantic::{self, SemanticRepoMap, SemanticScanError, SemanticSymbol, SemanticSymbolKind},
+    safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
     sync::normalize_repo_relative_path,
+    sync_store::{
+        validate_state_path, RepositoryStateBinding, RepositoryStateLock, RepositoryStateRoot,
+    },
 };
 use anyhow::{bail, Context, Result};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
-    io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    process::{self, Command},
-    thread,
-    time::Duration,
 };
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
+const LEGACY_STATE_VERSION: u32 = 1;
+const MAX_SEMANTIC_STATE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SEMANTIC_INTENTS: usize = 4_096;
+const MAX_SEMANTIC_RECORDS: usize = 262_144;
+const MAX_AGENT_ID_BYTES: usize = 128;
+const MAX_SEMANTIC_STRING_BYTES: usize = 16 * 1024;
+const MAX_TASK_EXCERPT_BYTES: usize = 16 * 1024;
+const MAX_TASK_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
@@ -125,20 +132,33 @@ pub struct SemanticCoordinationReport {
 #[derive(Debug, Clone)]
 pub struct SemanticIntentStore {
     repo_root: PathBuf,
-    state_path: PathBuf,
+    state: RepositoryStateRoot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedSemanticState {
+    version: u32,
+    checksum: String,
+    repository: RepositoryStateBinding,
+    next_token: u64,
+    intents: Vec<SemanticIntent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedSemanticState {
     version: u32,
     next_token: u64,
     intents: Vec<SemanticIntent>,
 }
 
-impl Default for PersistedSemanticState {
-    fn default() -> Self {
+impl PersistedSemanticState {
+    fn empty(repository: RepositoryStateBinding) -> Self {
         Self {
             version: STATE_VERSION,
+            checksum: String::new(),
+            repository,
             next_token: 1,
             intents: Vec::new(),
         }
@@ -157,18 +177,22 @@ impl SemanticIntentStore {
             .workdir()
             .context("semantic intent store requires a non-bare repository")?
             .to_path_buf();
+        let repo_root = SafeRoot::open_existing(&repo_root)
+            .context("semantic intent repository root is not safely reachable")?
+            .path()
+            .to_path_buf();
         Ok(Self {
             repo_root,
-            state_path: repo
-                .commondir()
-                .join("maco")
-                .join("state")
-                .join("semantic_intents.json"),
+            state: RepositoryStateRoot::open(
+                &repo,
+                "semantic_intents.json",
+                "semantic_intents.lock",
+            )?,
         })
     }
 
     pub fn state_path(&self) -> &Path {
-        &self.state_path
+        self.state.state_path()
     }
 
     pub fn preview(&self, request: SemanticIntentRequest) -> Result<SemanticCoordinationReport> {
@@ -275,10 +299,10 @@ impl SemanticIntentStore {
         &self,
         operation: impl FnOnce(&mut PersistedSemanticState) -> Result<T>,
     ) -> Result<T> {
-        let _lock = StateLock::acquire(&self.state_path)?;
-        let mut state = self.load_state()?;
+        let lock = self.state.lock()?;
+        let mut state = self.load_state(&lock)?;
         let output = operation(&mut state)?;
-        self.save_state(&mut state)?;
+        self.save_state(&lock, &mut state)?;
         Ok(output)
     }
 
@@ -286,64 +310,100 @@ impl SemanticIntentStore {
         &self,
         operation: impl FnOnce(&PersistedSemanticState) -> Result<T>,
     ) -> Result<T> {
-        let _lock = StateLock::acquire(&self.state_path)?;
-        let state = self.load_state()?;
+        let lock = self.state.lock()?;
+        let state = self.load_state(&lock)?;
         operation(&state)
     }
 
-    fn load_state(&self) -> Result<PersistedSemanticState> {
-        let contents = match fs::read_to_string(&self.state_path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(PersistedSemanticState::default())
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to read semantic intent state {}",
-                        self.state_path.display()
-                    )
-                })
-            }
+    fn load_state(&self, lock: &RepositoryStateLock) -> Result<PersistedSemanticState> {
+        let Some(contents) = self.state.read(lock, MAX_SEMANTIC_STATE_BYTES)? else {
+            return Ok(PersistedSemanticState::empty(self.state.binding().clone()));
         };
-
-        let mut state: PersistedSemanticState =
-            serde_json::from_str(&contents).with_context(|| {
+        let version = serde_json::from_slice::<serde_json::Value>(&contents)
+            .with_context(|| {
                 format!(
                     "failed to parse semantic intent state {}",
-                    self.state_path.display()
+                    self.state_path().display()
                 )
-            })?;
-        if state.version != STATE_VERSION {
+            })?
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .context("semantic intent state is missing an integer version")?;
+        let version =
+            u32::try_from(version).context("semantic intent state version does not fit in u32")?;
+        if version == LEGACY_STATE_VERSION {
+            let legacy: LegacyPersistedSemanticState = serde_json::from_slice(&contents)
+                .with_context(|| {
+                    format!(
+                        "failed to parse legacy semantic intent state {}",
+                        self.state_path().display()
+                    )
+                })?;
+            if legacy.version != LEGACY_STATE_VERSION {
+                bail!("legacy semantic intent state changed versions while parsing");
+            }
+            let mut state = PersistedSemanticState {
+                version: STATE_VERSION,
+                checksum: String::new(),
+                repository: self.state.binding().clone(),
+                next_token: legacy.next_token,
+                intents: legacy.intents,
+            };
+            validate_semantic_state(&state)?;
+            normalize_state(&mut state);
+            self.save_state(lock, &mut state).context(
+                "failed to migrate private legacy semantic state to repository-bound version 2",
+            )?;
+            return Ok(state);
+        }
+        if version != STATE_VERSION {
             bail!(
                 "unsupported semantic intent state version {} in {}",
-                state.version,
-                self.state_path.display()
+                version,
+                self.state_path().display()
             );
         }
+        let mut state: PersistedSemanticState =
+            serde_json::from_slice(&contents).with_context(|| {
+                format!(
+                    "failed to parse semantic intent state {}",
+                    self.state_path().display()
+                )
+            })?;
+        if state.repository != *self.state.binding() {
+            bail!(
+                "semantic intent state repository/common-directory binding does not match this repository"
+            );
+        }
+        let expected_checksum = semantic_state_checksum(&state)?;
+        if state.checksum != expected_checksum {
+            bail!(
+                "semantic intent state checksum mismatch in {}; refusing corrupted state",
+                self.state_path().display()
+            );
+        }
+        validate_semantic_state(&state)?;
+        let before_normalization = state.clone();
         normalize_state(&mut state);
+        if state != before_normalization {
+            bail!("semantic intent state is not in its required canonical form");
+        }
         Ok(state)
     }
 
-    fn save_state(&self, state: &mut PersistedSemanticState) -> Result<()> {
-        let parent = self
-            .state_path
-            .parent()
-            .context("semantic intent state path must have a parent directory")?;
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create semantic intent state directory {}",
-                parent.display()
-            )
-        })?;
-
+    fn save_state(
+        &self,
+        lock: &RepositoryStateLock,
+        state: &mut PersistedSemanticState,
+    ) -> Result<()> {
         normalize_state(state);
-        let temp_path = temp_state_path(&self.state_path);
-        let result = write_state_file(&temp_path, &self.state_path, state);
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        result
+        state.repository = self.state.binding().clone();
+        validate_semantic_state(state)?;
+        state.checksum = semantic_state_checksum(state)?;
+        let mut contents = serde_json::to_vec_pretty(state)
+            .context("failed to serialize repository-bound semantic state")?;
+        contents.push(b'\n');
+        self.state.write(lock, &contents, MAX_SEMANTIC_STATE_BYTES)
     }
 
     fn build_intent(
@@ -403,8 +463,11 @@ impl SemanticIntentStore {
             return Ok((None, None, Vec::new()));
         };
         let task_file = normalize_repo_relative_path(task_file)?;
-        let full_path = self.repo_root.join(&task_file);
-        let contents = match fs::read_to_string(&full_path) {
+        let contents = match BoundedRegularReader::read_relative_utf8(
+            &self.repo_root,
+            &task_file,
+            MAX_TASK_FILE_BYTES,
+        ) {
             Ok(contents) => contents,
             Err(error) => {
                 return Ok((
@@ -1026,36 +1089,137 @@ fn sort_symbols(symbols: &mut [ResolvedSemanticSymbol]) {
     });
 }
 
-fn write_state_file(
-    temp_path: &Path,
-    state_path: &Path,
-    state: &PersistedSemanticState,
-) -> Result<()> {
-    let mut file = File::create(temp_path)
-        .with_context(|| format!("failed to create temporary state {}", temp_path.display()))?;
-    serde_json::to_writer_pretty(&mut file, state)
-        .with_context(|| format!("failed to write temporary state {}", temp_path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish temporary state {}", temp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush temporary state {}", temp_path.display()))?;
-    drop(file);
-
-    fs::rename(temp_path, state_path).with_context(|| {
-        format!(
-            "failed to replace semantic intent state {} with {}",
-            state_path.display(),
-            temp_path.display()
-        )
-    })
+fn semantic_state_checksum(state: &PersistedSemanticState) -> Result<String> {
+    let payload = serde_json::to_vec(&(
+        state.version,
+        &state.repository,
+        state.next_token,
+        &state.intents,
+    ))
+    .context("failed to encode semantic state checksum payload")?;
+    Ok(stable_checksum(&payload))
 }
 
-fn temp_state_path(state_path: &Path) -> PathBuf {
-    let file_name = state_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("semantic_intents.json");
-    state_path.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
+fn validate_semantic_state(state: &PersistedSemanticState) -> Result<()> {
+    if state.next_token == 0 {
+        bail!("semantic intent state next_token must be nonzero");
+    }
+    if state.intents.len() > MAX_SEMANTIC_INTENTS {
+        bail!(
+            "semantic intent state exceeds its intent budget of {}",
+            MAX_SEMANTIC_INTENTS
+        );
+    }
+
+    let mut seen_tokens = BTreeSet::new();
+    let mut record_count = state.intents.len();
+    let mut max_token = 0u64;
+    for intent in &state.intents {
+        if intent.token.get() == 0 {
+            bail!("semantic intent token must be nonzero");
+        }
+        if !seen_tokens.insert(intent.token) {
+            bail!(
+                "semantic intent token appears more than once: {}",
+                intent.token.get()
+            );
+        }
+        max_token = max_token.max(intent.token.get());
+        validate_semantic_string("agent id", &intent.agent_id, MAX_AGENT_ID_BYTES, false)?;
+        if normalize_agent_id(&intent.agent_id)? != intent.agent_id {
+            bail!("persisted semantic intent agent id is not canonical");
+        }
+        add_semantic_records(&mut record_count, intent.paths.len(), "paths")?;
+        add_semantic_records(&mut record_count, intent.symbols.len(), "symbols")?;
+        add_semantic_records(&mut record_count, intent.modules.len(), "modules")?;
+        add_semantic_records(
+            &mut record_count,
+            intent.impacted_files.len(),
+            "impacted files",
+        )?;
+        add_semantic_records(&mut record_count, intent.notes.len(), "notes")?;
+        add_semantic_records(&mut record_count, intent.warnings.len(), "warnings")?;
+
+        for path in intent.paths.iter().chain(&intent.impacted_files) {
+            validate_state_path(path)?;
+        }
+        for symbol in &intent.symbols {
+            validate_semantic_string("symbol id", &symbol.id, MAX_SEMANTIC_STRING_BYTES, false)?;
+            validate_semantic_string(
+                "symbol qualified path",
+                &symbol.qualified_path,
+                MAX_SEMANTIC_STRING_BYTES,
+                false,
+            )?;
+            validate_semantic_string(
+                "symbol name",
+                &symbol.name,
+                MAX_SEMANTIC_STRING_BYTES,
+                false,
+            )?;
+            validate_semantic_string(
+                "symbol kind",
+                &symbol.kind,
+                MAX_SEMANTIC_STRING_BYTES,
+                false,
+            )?;
+            validate_state_path(&symbol.file)?;
+        }
+        for module in &intent.modules {
+            validate_semantic_string("module", module, MAX_SEMANTIC_STRING_BYTES, false)?;
+        }
+        if let Some(digest) = &intent.task_digest {
+            validate_semantic_string("task digest", digest, MAX_SEMANTIC_STRING_BYTES, false)?;
+        }
+        if let Some(excerpt) = &intent.task_excerpt {
+            validate_semantic_string("task excerpt", excerpt, MAX_TASK_EXCERPT_BYTES, true)?;
+        }
+        for note in &intent.notes {
+            validate_semantic_string("note", note, MAX_SEMANTIC_STRING_BYTES, true)?;
+        }
+        for warning in &intent.warnings {
+            validate_semantic_string("warning", warning, MAX_SEMANTIC_STRING_BYTES, true)?;
+        }
+    }
+    if max_token > 0 && state.next_token <= max_token {
+        bail!(
+            "semantic intent next_token {} does not advance past active token {}",
+            state.next_token,
+            max_token
+        );
+    }
+    Ok(())
+}
+
+fn add_semantic_records(total: &mut usize, count: usize, label: &str) -> Result<()> {
+    *total = total
+        .checked_add(count)
+        .with_context(|| format!("semantic intent {label} record count overflow"))?;
+    if *total > MAX_SEMANTIC_RECORDS {
+        bail!(
+            "semantic intent state exceeds its aggregate record budget of {} while counting {}",
+            MAX_SEMANTIC_RECORDS,
+            label
+        );
+    }
+    Ok(())
+}
+
+fn validate_semantic_string(
+    label: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<()> {
+    if (!allow_empty && value.is_empty()) || value.len() > max_bytes {
+        bail!(
+            "semantic intent {} must contain between {} and {} bytes",
+            label,
+            usize::from(!allow_empty),
+            max_bytes
+        );
+    }
+    Ok(())
 }
 
 fn stable_digest(bytes: &[u8]) -> String {
@@ -1072,127 +1236,10 @@ fn excerpt(contents: &str) -> String {
     contents.chars().take(MAX_CHARS).collect()
 }
 
-struct StateLock {
-    path: PathBuf,
-}
-
-impl StateLock {
-    fn acquire(state_path: &Path) -> Result<Self> {
-        let parent = state_path
-            .parent()
-            .context("semantic intent state path must have a parent directory")?;
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create semantic intent state directory {}",
-                parent.display()
-            )
-        })?;
-
-        let path = parent.join("semantic_intents.lock");
-        let mut attempts = 0;
-        let mut file = loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => break file,
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if remove_stale_lock(&path)? {
-                        continue;
-                    }
-                    attempts += 1;
-                    if attempts >= 50 {
-                        bail!(
-                            "semantic intent state is locked at {}; another maco semantic command may be running",
-                            path.display()
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to create semantic intent lock {}", path.display())
-                    })
-                }
-            }
-        };
-
-        let result = (|| -> Result<()> {
-            writeln!(file, "pid={}", process::id()).with_context(|| {
-                format!("failed to write semantic intent lock {}", path.display())
-            })?;
-            file.sync_all().with_context(|| {
-                format!("failed to flush semantic intent lock {}", path.display())
-            })?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&path);
-        }
-        result?;
-
-        Ok(Self { path })
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn remove_stale_lock(path: &Path) -> Result<bool> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to inspect semantic intent lock {}", path.display())
-            })
-        }
-    };
-    let Some(pid) = parse_lock_pid(&contents) else {
-        return Ok(false);
-    };
-    if process_is_running(pid) {
-        return Ok(false);
-    }
-
-    fs::remove_file(path).with_context(|| {
-        format!(
-            "failed to remove stale semantic intent lock {}",
-            path.display()
-        )
-    })?;
-    Ok(true)
-}
-
-fn parse_lock_pid(contents: &str) -> Option<u32> {
-    contents
-        .lines()
-        .find_map(|line| line.strip_prefix("pid="))
-        .and_then(|pid| pid.trim().parse().ok())
-}
-
-#[cfg(target_family = "unix")]
-fn process_is_running(pid: u32) -> bool {
-    if Path::new("/proc").exists() {
-        return Path::new("/proc").join(pid.to_string()).exists();
-    }
-
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
-}
-
-#[cfg(not(target_family = "unix"))]
-fn process_is_running(_pid: u32) -> bool {
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]
@@ -1496,6 +1543,187 @@ pub mod api;
         assert_eq!(reparsed.intents, vec![first.intent]);
     }
 
+    #[test]
+    fn private_legacy_state_migrates_to_bound_checksummed_v2() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn root() {}\n");
+        let store = SemanticIntentStore::open(&repo).expect("open store");
+        let claimed = store
+            .claim(request("agent-a").path("src/lib.rs").into())
+            .expect("claim");
+        let legacy = serde_json::json!({
+            "version": LEGACY_STATE_VERSION,
+            "next_token": 2,
+            "intents": [claimed.intent]
+        });
+        fs::write(
+            store.state_path(),
+            serde_json::to_vec_pretty(&legacy).expect("legacy JSON"),
+        )
+        .expect("write legacy");
+
+        let reopened = SemanticIntentStore::open(&repo).expect("reopen");
+        assert_eq!(reopened.status().expect("migrate").len(), 1);
+        let migrated: PersistedSemanticState =
+            serde_json::from_slice(&fs::read(reopened.state_path()).expect("state"))
+                .expect("parse state");
+        assert_eq!(migrated.version, STATE_VERSION);
+        assert_eq!(migrated.repository, *reopened.state.binding());
+        assert_eq!(
+            migrated.checksum,
+            semantic_state_checksum(&migrated).expect("checksum")
+        );
+    }
+
+    #[test]
+    fn semantic_checksum_and_record_budgets_reject_tampered_state() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn root() {}\n");
+        let store = SemanticIntentStore::open(&repo).expect("open store");
+        store
+            .claim(request("agent-a").path("src/lib.rs").into())
+            .expect("claim");
+        let original = fs::read(store.state_path()).expect("state");
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&original).expect("parse state");
+        tampered["next_token"] = serde_json::json!(999);
+        fs::write(
+            store.state_path(),
+            serde_json::to_vec_pretty(&tampered).expect("tampered JSON"),
+        )
+        .expect("tamper");
+        assert!(store
+            .status()
+            .expect_err("checksum mismatch")
+            .to_string()
+            .contains("checksum mismatch"));
+
+        let original_state: PersistedSemanticState =
+            serde_json::from_slice(&original).expect("parse original");
+        let template = original_state.intents[0].clone();
+        let mut intents = Vec::with_capacity(MAX_SEMANTIC_INTENTS + 1);
+        for index in 0..=MAX_SEMANTIC_INTENTS {
+            let mut intent = template.clone();
+            intent.token = SemanticIntentToken::from_u64(u64::try_from(index).expect("index") + 1);
+            intent.paths = vec![PathBuf::from(format!("generated/path-{index}"))];
+            intents.push(intent);
+        }
+        let mut oversized = PersistedSemanticState {
+            version: STATE_VERSION,
+            checksum: String::new(),
+            repository: store.state.binding().clone(),
+            next_token: u64::try_from(MAX_SEMANTIC_INTENTS).expect("count") + 2,
+            intents,
+        };
+        oversized.checksum = semantic_state_checksum(&oversized).expect("checksum");
+        let bytes = serde_json::to_vec(&oversized).expect("state JSON");
+        assert!(u64::try_from(bytes.len()).expect("length") < MAX_SEMANTIC_STATE_BYTES);
+        fs::write(store.state_path(), bytes).expect("write record overflow");
+        assert!(store
+            .status()
+            .expect_err("intent budget")
+            .to_string()
+            .contains("intent budget"));
+    }
+
+    #[test]
+    fn concurrent_semantic_claims_are_serialized_without_lost_updates() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn root() {}\n");
+        let store = SemanticIntentStore::open(&repo).expect("open store");
+        let mut workers = Vec::new();
+        for index in 0..12usize {
+            let store = store.clone();
+            workers.push(std::thread::spawn(move || {
+                store.claim(
+                    request(&format!("agent-{index}"))
+                        .path(&format!("generated/path-{index}"))
+                        .into(),
+                )
+            }));
+        }
+        for worker in workers {
+            let report = worker.join().expect("worker thread").expect("claim");
+            assert!(report.persisted);
+        }
+        assert_eq!(store.status().expect("status").len(), 12);
+        let state: PersistedSemanticState =
+            serde_json::from_slice(&fs::read(store.state_path()).expect("state"))
+                .expect("parse state");
+        assert_eq!(
+            state.checksum,
+            semantic_state_checksum(&state).expect("checksum")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_summary_rejects_symlink_and_oversized_input_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn root() {}\n");
+        let external = temp.path().join("external-task.txt");
+        fs::write(&external, "secret task\n").expect("external task");
+        symlink(&external, repo.join("task-link.txt")).expect("task symlink");
+        let store = SemanticIntentStore::open(&repo).expect("open store");
+
+        let linked = store
+            .preview(
+                request("agent-a")
+                    .path("src/lib.rs")
+                    .task("task-link.txt")
+                    .into(),
+            )
+            .expect("linked preview");
+        assert!(linked.intent.task_digest.is_none());
+        assert!(linked
+            .intent
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("failed to read task file")));
+
+        let oversized = vec![b'x'; usize::try_from(MAX_TASK_FILE_BYTES).expect("limit") + 1];
+        fs::write(repo.join("large-task.txt"), oversized).expect("large task");
+        let large = store
+            .preview(
+                request("agent-b")
+                    .path("Cargo.toml")
+                    .task("large-task.txt")
+                    .into(),
+            )
+            .expect("large preview");
+        assert!(large.intent.task_digest.is_none());
+        assert!(large
+            .intent
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("bounded read limit")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_state_binding_supports_non_utf8_repository_roots() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join(OsString::from_vec(b"repo-\x80".to_vec()));
+        fs::create_dir_all(repo.join("src")).expect("source directory");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='t'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .expect("Cargo.toml");
+        fs::write(repo.join("src/lib.rs"), "pub fn root() {}\n").expect("source");
+        Repository::init(&repo).expect("init repository");
+        let store = SemanticIntentStore::open(&repo).expect("open store");
+        let report = store
+            .claim(request("agent-a").path("src/lib.rs").into())
+            .expect("persist intent");
+        assert!(report.persisted);
+        assert_eq!(store.status().expect("status").len(), 1);
+    }
+
     fn init_repo() -> (TempDir, PathBuf) {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -1545,6 +1773,11 @@ pub mod api;
 
         fn note(mut self, note: &str) -> Self {
             self.inner.notes.push(note.to_string());
+            self
+        }
+
+        fn task(mut self, path: &str) -> Self {
+            self.inner.task_file = Some(PathBuf::from(path));
             self
         }
     }

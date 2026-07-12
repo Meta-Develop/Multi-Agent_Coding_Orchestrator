@@ -1,16 +1,56 @@
-use crate::orchestrator::RunId;
+use crate::{
+    orchestrator::RunId,
+    safe_state::{
+        identity_for_path, remove_direct_child_tree, stable_checksum, AtomicStateWriter,
+        BoundedRegularReader, FileIdentity, KernelStateLock, SafeRoot, TreeLinkPolicy,
+    },
+};
 use anyhow::{bail, Context, Result};
 use git2::Repository;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::{hash_map::RandomState, BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    hash::{BuildHasher, Hash, Hasher},
+    path::{Component, Path, PathBuf},
     process,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg(unix)]
+use std::{
+    ffi::{CStr, CString, OsStr},
+    fs::{File, OpenOptions},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+    },
+};
+
+const ARTIFACT_FORMAT_VERSION: u32 = 1;
+const FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
+const RUN_LOCK_FILE: &str = ".artifact.lock";
+const ROOT_LOCK_FILE: &str = ".runs.lock";
+const QUARANTINE_DIRECTORY: &str = ".quarantine";
+const MAX_FINALIZATION_BYTES: u64 = 512 * 1024;
+const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARTIFACT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ARTIFACT_FILES: usize = 4_096;
+const MAX_ARTIFACT_PATH_BYTES: usize = 4_096;
+const MAX_ARTIFACT_PATH_COMPONENTS: usize = 64;
+const MAX_PRODUCER_BYTES: usize = 128;
+const MAX_QUARANTINE_ENTRIES: usize = 4_096;
+static RESERVATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+const MAX_RUN_ROOT_ENTRIES: usize = 64;
+#[cfg(not(test))]
+const MAX_RUN_ROOT_ENTRIES: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunArtifactFamily {
     Autopilot,
@@ -93,8 +133,16 @@ pub struct RunArtifactSummary {
     pub final_report_corrupt: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_report_error: Option<String>,
+    pub finalized: bool,
+    pub publishable: bool,
+    pub provenance_valid: bool,
+    pub artifact_digests_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization_error: Option<String>,
     #[serde(skip)]
     modified: SystemTime,
+    #[serde(skip)]
+    identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -125,13 +173,375 @@ pub enum RunArtifactPruneAction {
     WouldDelete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactFileDisposition {
+    Publishable,
+    PrivateEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactProvenance {
+    pub producer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactFileRecord {
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// Content-integrity digest only; it confers no authority. Publishability
+    /// also requires the private reservation and bound writer evidence
+    /// verified by `ArtifactRunReader`.
+    pub sha256: String,
+    pub disposition: ArtifactFileDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactWriterEvidence {
+    pub run_root_identity: FileIdentity,
+    pub run_identity: FileIdentity,
+    pub writer_lock_identity: FileIdentity,
+    pub reservation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactRepositoryBinding {
+    common_dir_path_checksum: String,
+    common_dir_identity: FileIdentity,
+    worktree_path_checksum: String,
+    worktree_identity: FileIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactRepository {
+    binding: ArtifactRepositoryBinding,
+    worktree: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactFinalization {
+    /// The checksum and per-file SHA-256 values detect integrity changes only
+    /// and confer no authority.
+    version: u32,
+    checksum: String,
+    repository: ArtifactRepositoryBinding,
+    pub family: RunArtifactFamily,
+    pub run_id: String,
+    pub provenance: ArtifactProvenance,
+    pub writer_evidence: ArtifactWriterEvidence,
+    pub final_report: PathBuf,
+    pub files: Vec<ArtifactFileRecord>,
+    pub publish_requested: bool,
+    /// True only after the writer has bound the owner-private reservation,
+    /// stable exclusive-writer lock identity, provenance and every file
+    /// disposition into the atomic final marker. Readers revalidate all of
+    /// those facts before exposing this value as trusted state.
+    pub publishable: bool,
+}
+
+pub struct ArtifactRunWriter {
+    repository: ArtifactRepositoryBinding,
+    family: RunArtifactFamily,
+    run_id: RunId,
+    run_root: SafeRoot,
+    run: SafeRoot,
+    provenance: ArtifactProvenance,
+    writer_evidence: ArtifactWriterEvidence,
+    files: BTreeMap<PathBuf, ArtifactFileRecord>,
+    total_bytes: u64,
+    _run_lock: KernelStateLock,
+}
+
+pub struct ArtifactRunReader {
+    run: SafeRoot,
+    finalization: ArtifactFinalization,
+}
+
+impl ArtifactRunWriter {
+    pub fn reserve(
+        repo: impl AsRef<Path>,
+        family: RunArtifactFamily,
+        run_id: RunId,
+        producer: impl Into<String>,
+    ) -> Result<Self> {
+        let producer = producer.into();
+        validate_producer(&producer)?;
+        let repository = discover_artifact_repository(repo.as_ref())?;
+        let run_root = open_or_create_run_root(&repository, family)?;
+        ensure_private_directory(run_root.path()).context(
+            "ArtifactRunWriter requires an owner-private 0700 run root; legacy roots remain readable/nonpublishable but must be inspected and migrated before finalized writes",
+        )?;
+        let root_lock = KernelStateLock::acquire_direct(&run_root, ROOT_LOCK_FILE)?;
+        if run_root.direct_child_exists(run_id.as_str())? {
+            bail!(
+                "{} run id '{}' already exists at {}; choose a new --run-id or prune old artifacts first",
+                family.label(),
+                run_id.as_str(),
+                run_root.path().join(run_id.as_str()).display()
+            );
+        }
+        let reserved = run_root.reserve_direct_child_directory(run_id.as_str())?;
+        let run = SafeRoot::open_or_create(reserved.path())?;
+        let run_lock = KernelStateLock::acquire_direct(&run, RUN_LOCK_FILE)?;
+        let writer_evidence = ArtifactWriterEvidence {
+            run_root_identity: run_root.identity().clone(),
+            run_identity: run.identity().clone(),
+            writer_lock_identity: identity_for_path(run_lock.path())?,
+            reservation_id: reservation_evidence_id(run_id.as_str(), run.identity()),
+        };
+        drop(root_lock);
+
+        let repo_handle = Repository::discover(&repository.worktree).with_context(|| {
+            format!(
+                "failed to reopen artifact repository {}",
+                repository.worktree.display()
+            )
+        })?;
+        let source_revision = repo_handle
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| oid.to_string());
+        let provenance = ArtifactProvenance {
+            producer,
+            source_revision,
+        };
+
+        Ok(Self {
+            repository: repository.binding,
+            family,
+            run_id,
+            run_root,
+            run,
+            provenance,
+            writer_evidence,
+            files: BTreeMap::new(),
+            total_bytes: 0,
+            _run_lock: run_lock,
+        })
+    }
+
+    pub fn run_dir(&self) -> &Path {
+        self.run.path()
+    }
+
+    pub fn write_bytes(
+        &mut self,
+        relative: impl AsRef<Path>,
+        contents: &[u8],
+        disposition: ArtifactFileDisposition,
+    ) -> Result<ArtifactFileRecord> {
+        let relative = validate_artifact_relative_path(relative.as_ref())?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_ARTIFACT_FILE_BYTES {
+            bail!(
+                "artifact file exceeds its {} byte limit: {}",
+                MAX_ARTIFACT_FILE_BYTES,
+                relative.display()
+            );
+        }
+        let previous_bytes = self
+            .files
+            .get(&relative)
+            .map(|record| record.bytes)
+            .unwrap_or(0);
+        let proposed_total = self
+            .total_bytes
+            .checked_sub(previous_bytes)
+            .and_then(|total| total.checked_add(u64::try_from(contents.len()).ok()?))
+            .context("artifact byte accounting overflow")?;
+        if proposed_total > MAX_ARTIFACT_TOTAL_BYTES {
+            bail!(
+                "artifact run exceeds its {} byte aggregate limit",
+                MAX_ARTIFACT_TOTAL_BYTES
+            );
+        }
+        if !self.files.contains_key(&relative) && self.files.len() >= MAX_ARTIFACT_FILES {
+            bail!(
+                "artifact run exceeds its {} file manifest limit",
+                MAX_ARTIFACT_FILES
+            );
+        }
+
+        let (parent, file_name) = artifact_parent_and_name(&self.run, &relative, true)?;
+        AtomicStateWriter::scavenge_direct_temps(&parent, file_name)?;
+        AtomicStateWriter::write_direct(&parent, file_name, contents)
+            .with_context(|| format!("failed to write artifact file {}", relative.display()))?;
+        ensure_private_regular_file(&self.run.path().join(&relative))?;
+        let observed = BoundedRegularReader::read_relative(
+            self.run.path(),
+            &relative,
+            MAX_ARTIFACT_FILE_BYTES,
+        )?;
+        if observed != contents {
+            bail!(
+                "artifact contents changed immediately after atomic write: {}",
+                relative.display()
+            );
+        }
+
+        let record = ArtifactFileRecord {
+            path: relative.clone(),
+            bytes: u64::try_from(contents.len()).context("artifact length overflow")?,
+            sha256: sha256_hex(contents),
+            disposition,
+        };
+        self.files.insert(relative, record.clone());
+        self.total_bytes = proposed_total;
+        Ok(record)
+    }
+
+    pub fn write_json<T: Serialize>(
+        &mut self,
+        relative: impl AsRef<Path>,
+        value: &T,
+        disposition: ArtifactFileDisposition,
+    ) -> Result<ArtifactFileRecord> {
+        let mut contents =
+            serde_json::to_vec_pretty(value).context("failed to serialize artifact JSON")?;
+        contents.push(b'\n');
+        self.write_bytes(relative, &contents, disposition)
+    }
+
+    pub fn finalize(
+        self,
+        final_report: impl AsRef<Path>,
+        publish_requested: bool,
+    ) -> Result<ArtifactFinalization> {
+        let final_report = validate_artifact_relative_path(final_report.as_ref())?;
+        if final_report != self.family.final_report_relative_path() {
+            bail!(
+                "final report path {} does not match the {} artifact contract {}",
+                final_report.display(),
+                self.family.label(),
+                self.family.final_report_relative_path().display()
+            );
+        }
+        if !self.files.contains_key(&final_report) {
+            bail!(
+                "final report was not written through ArtifactRunWriter: {}",
+                final_report.display()
+            );
+        }
+        let audited = audit_artifact_tree(&self.run, true)?;
+        verify_manifest_paths(&self.files, &audited)?;
+        verify_manifest_contents(&self.run, self.files.values())?;
+
+        let files = self.files.into_values().collect::<Vec<_>>();
+        let publishable = publish_requested
+            && self.provenance.source_revision.is_some()
+            && files
+                .iter()
+                .all(|file| file.disposition == ArtifactFileDisposition::Publishable);
+        let mut finalization = ArtifactFinalization {
+            version: ARTIFACT_FORMAT_VERSION,
+            checksum: String::new(),
+            repository: self.repository,
+            family: self.family,
+            run_id: self.run_id.as_str().to_string(),
+            provenance: self.provenance,
+            writer_evidence: self.writer_evidence,
+            final_report,
+            files,
+            publish_requested,
+            publishable,
+        };
+        validate_finalization(&finalization)?;
+        verify_writer_evidence(&finalization.writer_evidence, &self.run_root, &self.run)?;
+        finalization.checksum = finalization_checksum(&finalization)?;
+        let mut marker = serde_json::to_vec_pretty(&finalization)
+            .context("failed to serialize artifact finalization marker")?;
+        marker.push(b'\n');
+        if u64::try_from(marker.len()).unwrap_or(u64::MAX) > MAX_FINALIZATION_BYTES {
+            bail!("artifact finalization marker exceeds its bounded size");
+        }
+        AtomicStateWriter::scavenge_direct_temps(&self.run, FINALIZATION_MARKER)?;
+        AtomicStateWriter::write_direct(&self.run, FINALIZATION_MARKER, &marker)?;
+        ensure_private_regular_file(&self.run.path().join(FINALIZATION_MARKER))?;
+        let post_audit = audit_artifact_tree(&self.run, true)?;
+        verify_manifest_paths_with_marker(&finalization.files, &post_audit)?;
+        self.run.verify()?;
+        self.run_root.verify()?;
+        Ok(finalization)
+    }
+}
+
+impl ArtifactRunReader {
+    pub fn open(repo: impl AsRef<Path>, family: RunArtifactFamily, run_id: &RunId) -> Result<Self> {
+        let repository = discover_artifact_repository(repo.as_ref())?;
+        let run_root = open_existing_run_root(&repository, family)?;
+        ensure_private_directory(run_root.path())?;
+        let reserved = run_root.bind_existing_direct_child_directory(run_id.as_str())?;
+        let run = SafeRoot::open_existing(reserved.path())?;
+        ensure_private_directory(run.path())?;
+        if !run.direct_child_exists(FINALIZATION_MARKER)? {
+            bail!(
+                "artifact run '{}' is unfinalized; marker {} is missing",
+                run_id.as_str(),
+                FINALIZATION_MARKER
+            );
+        }
+        ensure_private_regular_file(&run.path().join(FINALIZATION_MARKER))?;
+        let marker =
+            BoundedRegularReader::read_direct(&run, FINALIZATION_MARKER, MAX_FINALIZATION_BYTES)?;
+        let finalization: ArtifactFinalization = serde_json::from_slice(&marker)
+            .context("failed to parse artifact finalization marker")?;
+        if finalization.version != ARTIFACT_FORMAT_VERSION {
+            bail!(
+                "unsupported artifact finalization version {}",
+                finalization.version
+            );
+        }
+        if finalization.repository != repository.binding {
+            bail!("artifact finalization repository binding does not match this repository");
+        }
+        if finalization.family != family || finalization.run_id != run_id.as_str() {
+            bail!("artifact finalization family/run binding does not match the requested run");
+        }
+        if finalization.checksum != finalization_checksum(&finalization)? {
+            bail!("artifact finalization checksum mismatch");
+        }
+        validate_finalization(&finalization)?;
+        verify_writer_evidence(&finalization.writer_evidence, &run_root, &run)?;
+        let audited = audit_artifact_tree(&run, true)?;
+        verify_manifest_paths_with_marker(&finalization.files, &audited)?;
+        verify_manifest_contents(&run, finalization.files.iter())?;
+        run.verify()?;
+        run_root.verify()?;
+        Ok(Self { run, finalization })
+    }
+
+    pub fn finalization(&self) -> &ArtifactFinalization {
+        &self.finalization
+    }
+
+    pub fn read(&self, relative: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let relative = validate_artifact_relative_path(relative.as_ref())?;
+        let record = self
+            .finalization
+            .files
+            .iter()
+            .find(|record| record.path == relative)
+            .with_context(|| {
+                format!(
+                    "artifact file is not present in the finalized manifest: {}",
+                    relative.display()
+                )
+            })?;
+        let contents = read_and_verify_record(&self.run, record)?;
+        self.run.verify()?;
+        Ok(contents)
+    }
+}
+
 pub fn discover_repo_root(repo_path: impl AsRef<Path>) -> Result<PathBuf> {
-    let repo_path = repo_path.as_ref();
-    let repo = Repository::discover(repo_path)
-        .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
-    repo.workdir()
-        .map(Path::to_path_buf)
-        .context("repository command requires a non-bare repository")
+    Ok(discover_artifact_repository(repo_path.as_ref())?.worktree)
 }
 
 pub fn run_root(repo: &Path, family: RunArtifactFamily) -> PathBuf {
@@ -151,15 +561,19 @@ pub fn ensure_run_dir_available(
     family: RunArtifactFamily,
     run_id: &RunId,
 ) -> Result<()> {
-    let dir = run_dir(repo, family, run_id);
-    if dir.exists() {
+    let repository = discover_artifact_repository(repo)?;
+    let root = open_or_create_run_root(&repository, family)?;
+    let _lock = KernelStateLock::acquire_direct(&root, ROOT_LOCK_FILE)?;
+    if root.direct_child_exists(run_id.as_str())? {
         bail!(
             "{} run id '{}' already exists at {}; choose a new --run-id or prune old artifacts first",
             family.label(),
             run_id.as_str(),
-            dir.display()
+            root.path().join(run_id.as_str()).display()
         );
     }
+    let reserved = root.reserve_direct_child_directory(run_id.as_str())?;
+    reserved.verify(&root)?;
     Ok(())
 }
 
@@ -173,7 +587,7 @@ pub fn resolve_run_id(
         Some(value) => RunId::new(value)?,
         None => generate_run_id(&repo, family)?,
     };
-    ensure_run_dir_available(&repo, family, &run_id)?;
+    check_run_dir_available(&repo, family, &run_id)?;
     let run_dir = run_dir(&repo, family, &run_id);
     Ok(ResolvedRunId {
         repo,
@@ -187,6 +601,8 @@ pub fn generate_run_id(repo: &Path, family: RunArtifactFamily) -> Result<RunId> 
         .duration_since(UNIX_EPOCH)
         .context("system clock is before UNIX epoch")?
         .as_millis();
+    let repository = discover_artifact_repository(repo)?;
+    let root = open_optional_run_root(&repository, family)?;
     for suffix in 0..1000u16 {
         let candidate = RunId::new(format!(
             "{}-{}-{}-{}",
@@ -195,7 +611,11 @@ pub fn generate_run_id(repo: &Path, family: RunArtifactFamily) -> Result<RunId> 
             process::id(),
             suffix
         ))?;
-        if !run_dir(repo, family, &candidate).exists() {
+        let exists = match &root {
+            Some(root) => root.direct_child_exists(candidate.as_str())?,
+            None => false,
+        };
+        if !exists {
             return Ok(candidate);
         }
     }
@@ -210,9 +630,11 @@ pub fn list_runs(
     repo: impl AsRef<Path>,
     family: RunArtifactFamily,
 ) -> Result<RunArtifactListReport> {
-    let repo = discover_repo_root(repo)?;
-    let run_root = run_root(&repo, family);
-    let runs = sorted_run_summaries(&run_root, family)?;
+    let repository = discover_artifact_repository(repo.as_ref())?;
+    let runs = match open_optional_run_root(&repository, family)? {
+        Some(root) => sorted_run_summaries(&repository, &root, family)?,
+        None => Vec::new(),
+    };
     Ok(RunArtifactListReport {
         family,
         run_root: family.run_root(),
@@ -240,9 +662,19 @@ pub fn prune_runs(
     keep: usize,
     dry_run: bool,
 ) -> Result<RunArtifactPruneReport> {
-    let repo = discover_repo_root(repo)?;
-    let absolute_root = run_root(&repo, family);
-    let runs = sorted_run_summaries(&absolute_root, family)?;
+    let repository = discover_artifact_repository(repo.as_ref())?;
+    let Some(root) = open_optional_run_root(&repository, family)? else {
+        return Ok(empty_prune_report(family, keep, dry_run));
+    };
+    let _root_lock = KernelStateLock::acquire_direct(&root, ROOT_LOCK_FILE)?;
+    let runs = sorted_run_summaries(&repository, &root, family)?;
+    let quarantine = if dry_run {
+        None
+    } else {
+        let quarantine = open_or_create_quarantine(&root)?;
+        scavenge_quarantine(&quarantine)?;
+        Some(quarantine)
+    };
     let mut entries = Vec::new();
     let mut kept_count = 0usize;
     let mut deleted_count = 0usize;
@@ -258,26 +690,55 @@ pub fn prune_runs(
             });
             continue;
         }
-
         delete_candidate_count = delete_candidate_count.saturating_add(1);
-        let absolute_run_dir = absolute_root.join(&run.run_id);
-        ensure_child_run_dir(&absolute_root, &absolute_run_dir)?;
         if dry_run {
             entries.push(RunArtifactPruneEntry {
                 run_id: run.run_id,
                 run_dir: run.run_dir,
                 action: RunArtifactPruneAction::WouldDelete,
             });
-        } else {
-            fs::remove_dir_all(&absolute_run_dir)
-                .with_context(|| format!("failed to delete {}", absolute_run_dir.display()))?;
-            deleted_count = deleted_count.saturating_add(1);
-            entries.push(RunArtifactPruneEntry {
-                run_id: run.run_id,
-                run_dir: run.run_dir,
-                action: RunArtifactPruneAction::Delete,
-            });
+            continue;
         }
+
+        let rebound = root.bind_existing_managed_direct_child_directory(&run.run_id)?;
+        if rebound.identity() != &run.identity {
+            bail!(
+                "artifact run identity changed before quarantine: {}",
+                run.run_id
+            );
+        }
+        let rebound_root = SafeRoot::open_existing(rebound.path())?;
+        let _run_lock = KernelStateLock::acquire_direct(&rebound_root, RUN_LOCK_FILE)?;
+        let quarantine = quarantine
+            .as_ref()
+            .context("artifact quarantine was not initialized")?;
+        let quarantine_name = quarantine.random_direct_child_name(&run.run_id)?;
+        rename_bound_directory(
+            &root,
+            run.run_id.as_ref(),
+            &run.identity,
+            quarantine,
+            &quarantine_name,
+        )?;
+        remove_direct_child_tree(
+            quarantine,
+            &quarantine_name,
+            Some(&run.identity),
+            TreeLinkPolicy::RejectLinksAndSpecialFiles,
+        )
+        .with_context(|| {
+            format!(
+                "artifact run '{}' was quarantined but could not be safely deleted; inspect {}",
+                run.run_id,
+                quarantine.path().join(&quarantine_name).display()
+            )
+        })?;
+        deleted_count = deleted_count.saturating_add(1);
+        entries.push(RunArtifactPruneEntry {
+            run_id: run.run_id,
+            run_dir: run.run_dir,
+            action: RunArtifactPruneAction::Delete,
+        });
     }
 
     Ok(RunArtifactPruneReport {
@@ -297,32 +758,132 @@ pub fn artifact_ordering() -> &'static str {
     "newest first by final-report modification time, then run directory modification time, ties by descending run id"
 }
 
+fn check_run_dir_available(repo: &Path, family: RunArtifactFamily, run_id: &RunId) -> Result<()> {
+    let repository = discover_artifact_repository(repo)?;
+    if let Some(root) = open_optional_run_root(&repository, family)? {
+        if root.direct_child_exists(run_id.as_str())? {
+            bail!(
+                "{} run id '{}' already exists at {}; choose a new --run-id or prune old artifacts first",
+                family.label(),
+                run_id.as_str(),
+                root.path().join(run_id.as_str()).display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn discover_artifact_repository(repo_path: &Path) -> Result<ArtifactRepository> {
+    let repo = Repository::discover(repo_path)
+        .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
+    let worktree = repo
+        .workdir()
+        .context("repository command requires a non-bare repository")?;
+    let worktree_root =
+        SafeRoot::open_existing(worktree).context("repository worktree is not safely reachable")?;
+    let common_root = SafeRoot::open_existing(repo.commondir())
+        .context("Git common directory is not safely reachable")?;
+    Ok(ArtifactRepository {
+        binding: ArtifactRepositoryBinding {
+            common_dir_path_checksum: stable_checksum(&filesystem_path_bytes(common_root.path())),
+            common_dir_identity: common_root.identity().clone(),
+            worktree_path_checksum: stable_checksum(&filesystem_path_bytes(worktree_root.path())),
+            worktree_identity: worktree_root.identity().clone(),
+        },
+        worktree: worktree_root.path().to_path_buf(),
+    })
+}
+
+fn open_or_create_run_root(
+    repository: &ArtifactRepository,
+    family: RunArtifactFamily,
+) -> Result<SafeRoot> {
+    let path = repository.worktree.join(family.run_root());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => SafeRoot::open_existing(&path).with_context(|| {
+            format!(
+                "existing {} artifact root is unsafe; independently verify ownership and contents before migration: {}",
+                family.label(),
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SafeRoot::open_or_create(&path)
+            .context("failed to create owner-private artifact run root"),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect artifact run root {}", path.display())),
+    }
+}
+
+fn open_existing_run_root(
+    repository: &ArtifactRepository,
+    family: RunArtifactFamily,
+) -> Result<SafeRoot> {
+    SafeRoot::open_existing(repository.worktree.join(family.run_root()))
+        .context("failed to open artifact run root without following links")
+}
+
+fn open_optional_run_root(
+    repository: &ArtifactRepository,
+    family: RunArtifactFamily,
+) -> Result<Option<SafeRoot>> {
+    let path = repository.worktree.join(family.run_root());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => open_existing_run_root(repository, family).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect artifact root {}", path.display())),
+    }
+}
+
 fn sorted_run_summaries(
-    absolute_root: &Path,
+    repository: &ArtifactRepository,
+    root: &SafeRoot,
     family: RunArtifactFamily,
 ) -> Result<Vec<RunArtifactSummary>> {
-    if !absolute_root.exists() {
-        return Ok(Vec::new());
-    }
+    root.verify()?;
     let mut runs = Vec::new();
-    for entry in fs::read_dir(absolute_root)
-        .with_context(|| format!("failed to read run root {}", absolute_root.display()))?
+    let mut entry_count = 0usize;
+    for entry in fs::read_dir(root.path())
+        .with_context(|| format!("failed to read run root {}", root.path().display()))?
     {
+        entry_count = entry_count
+            .checked_add(1)
+            .context("artifact run-root entry count overflow")?;
+        if entry_count > MAX_RUN_ROOT_ENTRIES {
+            bail!(
+                "artifact run root exceeds its {} entry budget",
+                MAX_RUN_ROOT_ENTRIES
+            );
+        }
         let entry = entry
-            .with_context(|| format!("failed to inspect run root {}", absolute_root.display()))?;
-        let file_type = entry.file_type().with_context(|| {
-            format!(
-                "failed to inspect artifact entry {}",
-                entry.path().display()
-            )
-        })?;
-        if !file_type.is_dir() {
+            .with_context(|| format!("failed to inspect run root {}", root.path().display()))?;
+        let name = entry.file_name();
+        if name == ROOT_LOCK_FILE {
+            ensure_private_regular_file(&entry.path())?;
             continue;
         }
-        let run_id = entry.file_name().to_string_lossy().into_owned();
-        let run_dir = entry.path();
-        runs.push(summarize_run(absolute_root, family, run_id, run_dir)?);
+        if name == QUARANTINE_DIRECTORY {
+            root.bind_existing_direct_child_directory(&name)?;
+            continue;
+        }
+        let run_id = name
+            .to_str()
+            .context("artifact run id is not valid UTF-8")?
+            .to_string();
+        let validated = RunId::new(&run_id)?;
+        if validated.as_str() != run_id {
+            bail!("artifact run id is not canonical: {run_id}");
+        }
+        let binding = root.bind_existing_managed_direct_child_directory(&name)?;
+        runs.push(summarize_run(
+            repository,
+            family,
+            run_id,
+            binding.path().to_path_buf(),
+            binding.identity().clone(),
+        )?);
     }
+    root.verify()?;
     runs.sort_by(|left, right| {
         right
             .modified
@@ -333,72 +894,117 @@ fn sorted_run_summaries(
 }
 
 fn summarize_run(
-    absolute_root: &Path,
+    repository: &ArtifactRepository,
     family: RunArtifactFamily,
     run_id: String,
     absolute_run_dir: PathBuf,
+    identity: FileIdentity,
 ) -> Result<RunArtifactSummary> {
-    ensure_child_run_dir(absolute_root, &absolute_run_dir)?;
-    let final_report_path = absolute_run_dir.join(family.final_report_relative_path());
-    let modified = final_report_path
-        .metadata()
+    let final_relative = family.final_report_relative_path();
+    let final_report_path = absolute_run_dir.join(&final_relative);
+    let modified = fs::symlink_metadata(&final_report_path)
         .and_then(|metadata| metadata.modified())
         .or_else(|_| {
-            absolute_run_dir
-                .metadata()
-                .and_then(|metadata| metadata.modified())
+            fs::symlink_metadata(&absolute_run_dir).and_then(|metadata| metadata.modified())
         })
         .unwrap_or(UNIX_EPOCH);
     let public_run_dir = family.run_root().join(&run_id);
-    let public_final_report_path = public_run_dir.join(family.final_report_relative_path());
+    let public_final_report_path = public_run_dir.join(&final_relative);
+    let run_id_value = RunId::new(&run_id)?;
+    let marker_exists = fs::symlink_metadata(absolute_run_dir.join(FINALIZATION_MARKER)).is_ok();
+    let strict = if marker_exists {
+        ArtifactRunReader::open(&repository.worktree, family, &run_id_value)
+    } else {
+        Err(anyhow::anyhow!(
+            "artifact finalization marker {} is missing",
+            FINALIZATION_MARKER
+        ))
+    };
 
-    if !final_report_path.exists() {
-        return Ok(RunArtifactSummary {
-            run_id,
-            run_dir: public_run_dir,
-            final_report_path: public_final_report_path,
-            final_report_exists: false,
-            final_report_status: "missing".to_string(),
-            final_report_success: None,
-            final_report_readable: false,
-            final_report_corrupt: false,
-            final_report_error: None,
-            modified,
-        });
-    }
-
-    let contents = match fs::read_to_string(&final_report_path) {
-        Ok(contents) => contents,
-        Err(error) => {
-            return Ok(RunArtifactSummary {
+    match strict {
+        Ok(reader) => {
+            let contents = reader.read(&final_relative)?;
+            let (status, success, readable, corrupt, error) = parse_report(&contents);
+            let marker = reader.finalization();
+            Ok(RunArtifactSummary {
                 run_id,
                 run_dir: public_run_dir,
                 final_report_path: public_final_report_path,
                 final_report_exists: true,
-                final_report_status: "read_error".to_string(),
-                final_report_success: None,
-                final_report_readable: false,
-                final_report_corrupt: false,
-                final_report_error: Some(error.to_string()),
+                final_report_status: status,
+                final_report_success: success,
+                final_report_readable: readable,
+                final_report_corrupt: corrupt,
+                final_report_error: error,
+                finalized: true,
+                publishable: marker.publishable,
+                provenance_valid: true,
+                artifact_digests_verified: true,
+                finalization_error: None,
                 modified,
-            });
+                identity,
+            })
         }
-    };
-    let value = match serde_json::from_str::<Value>(&contents) {
+        Err(finalization_error) => {
+            let (exists, status, success, readable, corrupt, error) =
+                read_unfinalized_report(&absolute_run_dir, &final_relative);
+            Ok(RunArtifactSummary {
+                run_id,
+                run_dir: public_run_dir,
+                final_report_path: public_final_report_path,
+                final_report_exists: exists,
+                final_report_status: status,
+                final_report_success: success,
+                final_report_readable: readable,
+                final_report_corrupt: corrupt,
+                final_report_error: error,
+                finalized: false,
+                publishable: false,
+                provenance_valid: false,
+                artifact_digests_verified: false,
+                finalization_error: Some(finalization_error.to_string()),
+                modified,
+                identity,
+            })
+        }
+    }
+}
+
+fn read_unfinalized_report(
+    run_dir: &Path,
+    relative: &Path,
+) -> (bool, String, Option<bool>, bool, bool, Option<String>) {
+    let path = run_dir.join(relative);
+    if fs::symlink_metadata(&path).is_err() {
+        return (false, "missing".to_string(), None, false, false, None);
+    }
+    match BoundedRegularReader::read_relative(run_dir, relative, MAX_ARTIFACT_FILE_BYTES) {
+        Ok(contents) => {
+            let (status, success, readable, corrupt, error) = parse_report(&contents);
+            (true, status, success, readable, corrupt, error)
+        }
+        Err(error) => (
+            true,
+            "read_error".to_string(),
+            None,
+            false,
+            false,
+            Some(error.to_string()),
+        ),
+    }
+}
+
+fn parse_report(contents: &[u8]) -> (String, Option<bool>, bool, bool, Option<String>) {
+    let value = match serde_json::from_slice::<Value>(contents) {
         Ok(value) => value,
         Err(error) => {
-            return Ok(RunArtifactSummary {
-                run_id,
-                run_dir: public_run_dir,
-                final_report_path: public_final_report_path,
-                final_report_exists: true,
-                final_report_status: "malformed".to_string(),
-                final_report_success: None,
-                final_report_readable: false,
-                final_report_corrupt: true,
-                final_report_error: Some(error.to_string()),
-                modified,
-            });
+            return (
+                "malformed".to_string(),
+                None,
+                false,
+                true,
+                Some(error.to_string()),
+            )
         }
     };
     let status = value
@@ -407,27 +1013,1018 @@ fn summarize_run(
         .unwrap_or("readable")
         .to_string();
     let success = value.get("success").and_then(Value::as_bool);
-    Ok(RunArtifactSummary {
-        run_id,
-        run_dir: public_run_dir,
-        final_report_path: public_final_report_path,
-        final_report_exists: true,
-        final_report_status: status,
-        final_report_success: success,
-        final_report_readable: true,
-        final_report_corrupt: false,
-        final_report_error: None,
-        modified,
-    })
+    (status, success, true, false, None)
 }
 
-fn ensure_child_run_dir(root: &Path, run_dir: &Path) -> Result<()> {
-    if run_dir.parent() != Some(root) {
+fn empty_prune_report(
+    family: RunArtifactFamily,
+    keep: usize,
+    dry_run: bool,
+) -> RunArtifactPruneReport {
+    RunArtifactPruneReport {
+        family,
+        run_root: family.run_root(),
+        ordering: artifact_ordering(),
+        keep,
+        dry_run,
+        kept_count: 0,
+        deleted_count: 0,
+        delete_candidate_count: 0,
+        entries: Vec::new(),
+    }
+}
+
+fn open_or_create_quarantine(root: &SafeRoot) -> Result<SafeRoot> {
+    let binding = if root.direct_child_exists(QUARANTINE_DIRECTORY)? {
+        root.bind_existing_direct_child_directory(QUARANTINE_DIRECTORY)?
+    } else {
+        root.reserve_direct_child_directory(QUARANTINE_DIRECTORY)?
+    };
+    SafeRoot::open_or_create(binding.path())
+}
+
+fn scavenge_quarantine(quarantine: &SafeRoot) -> Result<()> {
+    quarantine.verify()?;
+    let mut count = 0usize;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(quarantine.path()).with_context(|| {
+        format!(
+            "failed to inspect artifact quarantine {}",
+            quarantine.path().display()
+        )
+    })? {
+        count = count
+            .checked_add(1)
+            .context("artifact quarantine entry count overflow")?;
+        if count > MAX_QUARANTINE_ENTRIES {
+            bail!(
+                "artifact quarantine exceeds its {} entry budget",
+                MAX_QUARANTINE_ENTRIES
+            );
+        }
+        let entry = entry.context("failed to inspect artifact quarantine entry")?;
+        let binding = quarantine.bind_existing_managed_direct_child_directory(entry.file_name())?;
+        entries.push((entry.file_name(), binding.identity().clone()));
+    }
+    for (name, identity) in entries {
+        let run = SafeRoot::open_existing(quarantine.path().join(&name))?;
+        let _lock = KernelStateLock::acquire_direct(&run, RUN_LOCK_FILE)?;
+        remove_direct_child_tree(
+            quarantine,
+            &name,
+            Some(&identity),
+            TreeLinkPolicy::RejectLinksAndSpecialFiles,
+        )?;
+    }
+    quarantine.verify()
+}
+
+fn validate_artifact_relative_path(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
         bail!(
-            "refusing to operate outside run root {}; candidate was {}",
-            root.display(),
-            run_dir.display()
+            "artifact path must be a non-empty relative path: {}",
+            path.display()
+        );
+    }
+    let mut normalized = PathBuf::new();
+    let mut component_count = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                if name == FINALIZATION_MARKER || name == RUN_LOCK_FILE {
+                    bail!(
+                        "artifact path uses a reserved component: {}",
+                        path.display()
+                    );
+                }
+                component_count = component_count
+                    .checked_add(1)
+                    .context("artifact path component count overflow")?;
+                normalized.push(name);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "artifact path escapes its run directory: {}",
+                    path.display()
+                )
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() || component_count > MAX_ARTIFACT_PATH_COMPONENTS {
+        bail!(
+            "artifact path must contain 1 to {} normal components",
+            MAX_ARTIFACT_PATH_COMPONENTS
+        );
+    }
+    let text = normalized
+        .to_str()
+        .context("artifact paths must be valid UTF-8")?;
+    if text.len() > MAX_ARTIFACT_PATH_BYTES {
+        bail!(
+            "artifact path exceeds its {} byte limit",
+            MAX_ARTIFACT_PATH_BYTES
+        );
+    }
+    Ok(normalized)
+}
+
+fn artifact_parent_and_name<'a>(
+    run: &SafeRoot,
+    relative: &'a Path,
+    create: bool,
+) -> Result<(SafeRoot, &'a OsStr)> {
+    let file_name = relative
+        .file_name()
+        .context("artifact path has no final file name")?;
+    let mut current = run.clone();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let binding = if current.direct_child_exists(name)? {
+                current.bind_existing_direct_child_directory(name)?
+            } else if create {
+                current.reserve_direct_child_directory(name)?
+            } else {
+                bail!("artifact parent directory is missing: {}", parent.display());
+            };
+            current = SafeRoot::open_or_create(binding.path())?;
+        }
+    }
+    Ok((current, file_name))
+}
+
+fn validate_producer(producer: &str) -> Result<()> {
+    if producer.is_empty()
+        || producer.len() > MAX_PRODUCER_BYTES
+        || !producer
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        bail!(
+            "artifact producer must contain 1 to {} ASCII letters, digits, '.', '_' or '-'",
+            MAX_PRODUCER_BYTES
         );
     }
     Ok(())
+}
+
+fn validate_finalization(finalization: &ArtifactFinalization) -> Result<()> {
+    validate_producer(&finalization.provenance.producer)?;
+    validate_writer_evidence(&finalization.writer_evidence)?;
+    let run_id = RunId::new(&finalization.run_id)?;
+    if run_id.as_str() != finalization.run_id {
+        bail!("artifact finalization run id is not canonical");
+    }
+    let final_report = validate_artifact_relative_path(&finalization.final_report)?;
+    if final_report != finalization.family.final_report_relative_path() {
+        bail!("artifact finalization has the wrong final report path");
+    }
+    if let Some(revision) = &finalization.provenance.source_revision {
+        if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("artifact source revision is not a full Git object id");
+        }
+    }
+    if finalization.files.is_empty() || finalization.files.len() > MAX_ARTIFACT_FILES {
+        bail!(
+            "artifact finalization must contain 1 to {} files",
+            MAX_ARTIFACT_FILES
+        );
+    }
+    let mut seen = BTreeSet::new();
+    let mut total = 0u64;
+    for record in &finalization.files {
+        let path = validate_artifact_relative_path(&record.path)?;
+        if path != record.path || !seen.insert(path) {
+            bail!("artifact finalization contains a duplicate or noncanonical path");
+        }
+        if record.bytes > MAX_ARTIFACT_FILE_BYTES {
+            bail!("artifact file record exceeds the per-file byte limit");
+        }
+        total = total
+            .checked_add(record.bytes)
+            .context("artifact manifest byte total overflow")?;
+        if total > MAX_ARTIFACT_TOTAL_BYTES {
+            bail!("artifact manifest exceeds its aggregate byte limit");
+        }
+        if record.sha256.len() != 64 || !record.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("artifact file record has an invalid SHA-256 digest");
+        }
+    }
+    if !seen.contains(&final_report) {
+        bail!("artifact final report is missing from the manifest");
+    }
+    let expected_publishable = finalization.publish_requested
+        && finalization.provenance.source_revision.is_some()
+        && finalization
+            .files
+            .iter()
+            .all(|file| file.disposition == ArtifactFileDisposition::Publishable);
+    if finalization.publishable != expected_publishable {
+        bail!("artifact publishability does not match its provenance/file dispositions");
+    }
+    Ok(())
+}
+
+fn validate_writer_evidence(evidence: &ArtifactWriterEvidence) -> Result<()> {
+    const PREFIX: &str = "maco-reservation-v1-";
+    if evidence.run_root_identity.file == 0
+        || evidence.run_identity.file == 0
+        || evidence.writer_lock_identity.file == 0
+    {
+        bail!("artifact writer evidence contains an invalid zero inode identity");
+    }
+    let suffix = evidence
+        .reservation_id
+        .strip_prefix(PREFIX)
+        .context("artifact reservation evidence has an unsupported format")?;
+    if suffix.len() != 32 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("artifact reservation evidence is malformed");
+    }
+    Ok(())
+}
+
+fn verify_writer_evidence(
+    evidence: &ArtifactWriterEvidence,
+    run_root: &SafeRoot,
+    run: &SafeRoot,
+) -> Result<()> {
+    validate_writer_evidence(evidence)?;
+    run_root.verify()?;
+    run.verify()?;
+    if evidence.run_root_identity != *run_root.identity()
+        || evidence.run_identity != *run.identity()
+    {
+        bail!("artifact writer evidence does not match the reserved run directories");
+    }
+    let observed_lock = ensure_private_regular_file(&run.path().join(RUN_LOCK_FILE))?;
+    if observed_lock != evidence.writer_lock_identity {
+        bail!("artifact writer lock identity does not match finalization evidence");
+    }
+    Ok(())
+}
+
+fn reservation_evidence_id(run_id: &str, run_identity: &FileIdentity) -> String {
+    let counter = RESERVATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut first = RandomState::new().build_hasher();
+    run_id.hash(&mut first);
+    run_identity.device.hash(&mut first);
+    run_identity.file.hash(&mut first);
+    process::id().hash(&mut first);
+    counter.hash(&mut first);
+    now.hash(&mut first);
+    let first = first.finish();
+    let mut second = RandomState::new().build_hasher();
+    first.hash(&mut second);
+    now.rotate_left(31).hash(&mut second);
+    let second = second.finish();
+    format!("maco-reservation-v1-{first:016x}{second:016x}")
+}
+
+fn finalization_checksum(finalization: &ArtifactFinalization) -> Result<String> {
+    let payload = serde_json::to_vec(&(
+        finalization.version,
+        &finalization.repository,
+        finalization.family,
+        &finalization.run_id,
+        &finalization.provenance,
+        &finalization.writer_evidence,
+        &finalization.final_report,
+        &finalization.files,
+        finalization.publish_requested,
+        finalization.publishable,
+    ))
+    .context("failed to encode artifact finalization checksum payload")?;
+    Ok(stable_checksum(&payload))
+}
+
+fn verify_manifest_paths(
+    records: &BTreeMap<PathBuf, ArtifactFileRecord>,
+    audited: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    let expected = records.keys().cloned().collect::<BTreeSet<_>>();
+    if &expected != audited {
+        bail!("artifact tree does not exactly match its in-memory manifest");
+    }
+    Ok(())
+}
+
+fn verify_manifest_paths_with_marker(
+    records: &[ArtifactFileRecord],
+    audited: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    let expected = records
+        .iter()
+        .map(|record| record.path.clone())
+        .collect::<BTreeSet<_>>();
+    if &expected != audited {
+        bail!("artifact tree does not exactly match its finalized manifest");
+    }
+    Ok(())
+}
+
+fn verify_manifest_contents<'a>(
+    run: &SafeRoot,
+    records: impl IntoIterator<Item = &'a ArtifactFileRecord>,
+) -> Result<()> {
+    for record in records {
+        read_and_verify_record(run, record)?;
+    }
+    Ok(())
+}
+
+fn read_and_verify_record(run: &SafeRoot, record: &ArtifactFileRecord) -> Result<Vec<u8>> {
+    let (_parent, _file_name) = artifact_parent_and_name(run, &record.path, false)?;
+    ensure_private_regular_file(&run.path().join(&record.path))?;
+    let contents =
+        BoundedRegularReader::read_relative(run.path(), &record.path, MAX_ARTIFACT_FILE_BYTES)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) != record.bytes
+        || sha256_hex(&contents) != record.sha256
+    {
+        bail!(
+            "artifact file digest/length does not match its manifest: {}",
+            record.path.display()
+        );
+    }
+    Ok(contents)
+}
+
+fn audit_artifact_tree(run: &SafeRoot, require_private: bool) -> Result<BTreeSet<PathBuf>> {
+    run.verify()?;
+    let metadata = fs::symlink_metadata(run.path())?;
+    #[cfg(unix)]
+    let device = metadata.dev();
+    #[cfg(not(unix))]
+    let device = 0u64;
+    let mut entries = 0usize;
+    let mut files = BTreeSet::new();
+    audit_artifact_directory(
+        run.path(),
+        Path::new(""),
+        device,
+        0,
+        &mut entries,
+        require_private,
+        &mut files,
+    )?;
+    run.verify()?;
+    Ok(files)
+}
+
+fn audit_artifact_directory(
+    directory: &Path,
+    relative: &Path,
+    device: u64,
+    depth: usize,
+    entries: &mut usize,
+    require_private: bool,
+    files: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    if depth > MAX_ARTIFACT_PATH_COMPONENTS {
+        bail!("artifact tree exceeds its maximum depth");
+    }
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("failed to audit artifact directory {}", directory.display()))?
+    {
+        *entries = entries
+            .checked_add(1)
+            .context("artifact tree entry count overflow")?;
+        if *entries > MAX_ARTIFACT_FILES.saturating_mul(2).saturating_add(128) {
+            bail!("artifact tree exceeds its global entry budget");
+        }
+        let entry = entry.context("failed to inspect artifact tree entry")?;
+        let name = entry.file_name();
+        let child_relative = relative.join(&name);
+        let metadata = fs::symlink_metadata(entry.path())?;
+        ensure_same_device(&metadata, device, &entry.path())?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "artifact tree contains a symbolic link: {}",
+                child_relative.display()
+            );
+        }
+        if metadata.file_type().is_dir() {
+            if require_private {
+                ensure_private_directory(&entry.path())?;
+            }
+            audit_artifact_directory(
+                &entry.path(),
+                &child_relative,
+                device,
+                depth.saturating_add(1),
+                entries,
+                require_private,
+                files,
+            )?;
+            continue;
+        }
+        if !metadata.file_type().is_file() {
+            bail!(
+                "artifact tree contains a special file: {}",
+                child_relative.display()
+            );
+        }
+        if child_relative == Path::new(RUN_LOCK_FILE)
+            || child_relative == Path::new(FINALIZATION_MARKER)
+        {
+            ensure_private_regular_file(&entry.path())?;
+            continue;
+        }
+        if require_private {
+            ensure_private_regular_file(&entry.path())?;
+        } else {
+            ensure_regular_single_link(&entry.path())?;
+        }
+        validate_artifact_relative_path(&child_relative)?;
+        files.insert(child_relative);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_same_device(metadata: &fs::Metadata, device: u64, path: &Path) -> Result<()> {
+    if metadata.dev() != device {
+        bail!(
+            "artifact tree crosses a filesystem boundary: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_same_device(_metadata: &fs::Metadata, _device: u64, path: &Path) -> Result<()> {
+    bail!(
+        "artifact device-boundary validation is unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(path: &Path) -> Result<FileIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect private directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!(
+            "artifact directory is not a no-follow directory: {}",
+            path.display()
+        );
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "artifact directory is not owned by the current user: {}",
+            path.display()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        bail!(
+            "artifact directory is not owner-private (expected 0700, observed {:04o}): {}",
+            mode,
+            path.display()
+        );
+    }
+    identity_for_path(path)
+}
+
+#[cfg(not(unix))]
+fn ensure_private_directory(path: &Path) -> Result<FileIdentity> {
+    bail!(
+        "artifact directory ACL validation is unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn ensure_regular_single_link(path: &Path) -> Result<FileIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect artifact file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!(
+            "artifact entry is not a regular no-follow file: {}",
+            path.display()
+        );
+    }
+    if metadata.nlink() != 1 {
+        bail!(
+            "artifact file must have exactly one hard link (observed {}): {}",
+            metadata.nlink(),
+            path.display()
+        );
+    }
+    identity_for_path(path)
+}
+
+#[cfg(not(unix))]
+fn ensure_regular_single_link(path: &Path) -> Result<FileIdentity> {
+    bail!(
+        "artifact regular-file validation is unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn ensure_private_regular_file(path: &Path) -> Result<FileIdentity> {
+    let identity = ensure_regular_single_link(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "artifact file is not owned by the current user: {}",
+            path.display()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "artifact file is not owner-private (expected 0600, observed {:04o}): {}",
+            mode,
+            path.display()
+        );
+    }
+    Ok(identity)
+}
+
+#[cfg(not(unix))]
+fn ensure_private_regular_file(path: &Path) -> Result<FileIdentity> {
+    bail!(
+        "artifact file ACL validation is unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn filesystem_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn filesystem_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn rename_bound_directory(
+    source_root: &SafeRoot,
+    source_name: &OsStr,
+    expected: &FileIdentity,
+    destination_root: &SafeRoot,
+    destination_name: &OsStr,
+) -> Result<()> {
+    source_root.verify()?;
+    destination_root.verify()?;
+    let source = open_safe_root_handle(source_root)?;
+    let destination = open_safe_root_handle(destination_root)?;
+    let source_name = CString::new(source_name.as_bytes()).context("source name contains NUL")?;
+    let destination_name =
+        CString::new(destination_name.as_bytes()).context("destination name contains NUL")?;
+    let source_stat = fstatat_no_follow(source.as_raw_fd(), &source_name)?;
+    if source_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || identity_from_stat(&source_stat) != *expected
+    {
+        bail!("artifact source directory identity changed before quarantine");
+    }
+    let mut destination_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            destination.as_raw_fd(),
+            destination_name.as_ptr(),
+            &mut destination_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        bail!("artifact quarantine destination already exists");
+    }
+    let missing = std::io::Error::last_os_error();
+    if missing.kind() != std::io::ErrorKind::NotFound {
+        return Err(missing).context("failed to inspect artifact quarantine destination");
+    }
+    if unsafe {
+        libc::renameat(
+            source.as_raw_fd(),
+            source_name.as_ptr(),
+            destination.as_raw_fd(),
+            destination_name.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to atomically quarantine artifact run");
+    }
+    let rebound = fstatat_no_follow(destination.as_raw_fd(), &destination_name)?;
+    if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR || identity_from_stat(&rebound) != *expected
+    {
+        bail!("artifact quarantine destination does not match the inspected run inode");
+    }
+    source
+        .sync_all()
+        .context("failed to flush artifact run root")?;
+    destination
+        .sync_all()
+        .context("failed to flush artifact quarantine")?;
+    destination_root.verify()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn rename_bound_directory(
+    _source_root: &SafeRoot,
+    _source_name: &std::ffi::OsStr,
+    _expected: &FileIdentity,
+    _destination_root: &SafeRoot,
+    _destination_name: &std::ffi::OsStr,
+) -> Result<()> {
+    bail!("handle-relative artifact quarantine is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn open_safe_root_handle(root: &SafeRoot) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root.path())
+        .with_context(|| format!("failed to open safe root handle {}", root.path().display()))?;
+    let metadata = file.metadata()?;
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    };
+    if identity != *root.identity() {
+        bail!("safe root path changed before handle-relative artifact operation");
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn fstatat_no_follow(fd: i32, name: &CStr) -> Result<libc::stat> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect artifact directory entry without following links");
+    }
+    Ok(stat)
+}
+
+#[cfg(unix)]
+fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
+    FileIdentity {
+        device: stat.st_dev,
+        file: stat.st_ino,
+    }
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    const INITIAL: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+    let mut hash = INITIAL;
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (index, bytes) in chunk.chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = hash;
+        for index in 0..64 {
+            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(sum1)
+                .wrapping_add(choice)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = sum0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        hash[0] = hash[0].wrapping_add(a);
+        hash[1] = hash[1].wrapping_add(b);
+        hash[2] = hash[2].wrapping_add(c);
+        hash[3] = hash[3].wrapping_add(d);
+        hash[4] = hash[4].wrapping_add(e);
+        hash[5] = hash[5].wrapping_add(f);
+        hash[6] = hash[6].wrapping_add(g);
+        hash[7] = hash[7].wrapping_add(h);
+    }
+    hash.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worktree::WorktreeManager;
+    use git2::{Oid, Signature};
+    use tempfile::TempDir;
+
+    #[test]
+    fn sha256_matches_standard_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_finalizes_private_bound_digest_verified_artifacts() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("secure-run").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Autopilot,
+            run_id.clone(),
+            "autopilot",
+        )
+        .expect("reserve writer");
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status": "succeeded", "success": true}),
+                ArtifactFileDisposition::Publishable,
+            )
+            .expect("write report");
+        writer
+            .write_bytes(
+                "details/evidence.txt",
+                b"verified\n",
+                ArtifactFileDisposition::Publishable,
+            )
+            .expect("write evidence");
+        let finalization = writer
+            .finalize("final-report.json", true)
+            .expect("finalize");
+        assert!(finalization.publishable);
+
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .expect("strict reader");
+        assert_eq!(
+            reader.read("details/evidence.txt").expect("read"),
+            b"verified\n"
+        );
+        let summary = latest_run(&repo, RunArtifactFamily::Autopilot)
+            .expect("latest")
+            .run
+            .expect("run");
+        assert!(summary.finalized);
+        assert!(summary.publishable);
+        assert!(summary.provenance_valid);
+        assert!(summary.artifact_digests_verified);
+        assert_eq!(summary.final_report_status, "succeeded");
+
+        let run = run_dir(&repo, RunArtifactFamily::Autopilot, &run_id);
+        assert_eq!(mode(&run), 0o700);
+        assert_eq!(mode(&run.join("final-report.json")), 0o600);
+        assert_eq!(mode(&run.join(FINALIZATION_MARKER)), 0o600);
+
+        let marker_path = run.join(FINALIZATION_MARKER);
+        let original_marker = fs::read(&marker_path).expect("marker");
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&original_marker).expect("marker JSON");
+        tampered["publishable"] = serde_json::json!(false);
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&tampered).expect("tampered marker"),
+        )
+        .expect("tamper marker");
+        let marker_error = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .err()
+            .expect("marker checksum");
+        assert!(marker_error.to_string().contains("checksum mismatch"));
+        fs::write(&marker_path, original_marker).expect("restore marker");
+
+        let lock_path = run.join(RUN_LOCK_FILE);
+        fs::remove_file(&lock_path).expect("remove bound writer lock");
+        fs::write(&lock_path, b"").expect("replacement lock");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .expect("replacement lock mode");
+        let evidence_error = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .err()
+            .expect("writer evidence");
+        assert!(evidence_error.to_string().contains("lock identity"));
+    }
+
+    #[test]
+    fn legacy_direct_writer_is_visible_but_never_finalized_or_publishable() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("legacy-run").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+        fs::write(
+            final_report_path(&repo, RunArtifactFamily::Inbox, &run_id),
+            b"{\"status\":\"succeeded\",\"success\":true}\n",
+        )
+        .expect("legacy report");
+
+        let summary = latest_run(&repo, RunArtifactFamily::Inbox)
+            .expect("latest")
+            .run
+            .expect("run");
+        assert_eq!(summary.final_report_status, "succeeded");
+        assert!(!summary.finalized);
+        assert!(!summary.publishable);
+        assert!(!summary.provenance_valid);
+        assert!(!summary.artifact_digests_verified);
+        assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Inbox, &run_id).is_err());
+    }
+
+    #[test]
+    fn oversized_report_and_run_root_entry_budget_fail_boundedly() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("large-run").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Consult, &run_id).expect("reserve");
+        fs::write(
+            final_report_path(&repo, RunArtifactFamily::Consult, &run_id),
+            vec![b'x'; usize::try_from(MAX_ARTIFACT_FILE_BYTES).expect("limit") + 1],
+        )
+        .expect("oversized report");
+        let summary = latest_run(&repo, RunArtifactFamily::Consult)
+            .expect("latest")
+            .run
+            .expect("run");
+        assert_eq!(summary.final_report_status, "read_error");
+        assert!(!summary.final_report_readable);
+
+        let root = run_root(&repo, RunArtifactFamily::Consult);
+        for index in 0..MAX_RUN_ROOT_ENTRIES {
+            fs::create_dir(root.join(format!("extra-{index}"))).expect("extra run");
+        }
+        assert!(list_runs(&repo, RunArtifactFamily::Consult)
+            .expect_err("entry budget")
+            .to_string()
+            .contains("entry budget"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_quarantines_before_refusing_symlink_hardlink_and_fifo() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["symlink", "hardlink", "fifo"] {
+            let (temp, repo) = committed_repo();
+            let run_id = RunId::new(format!("unsafe-{kind}")).expect("run id");
+            ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+            let run = run_dir(&repo, RunArtifactFamily::Inbox, &run_id);
+            let external = temp.path().join(format!("external-{kind}"));
+            fs::write(&external, b"keep\n").expect("external");
+            match kind {
+                "symlink" => symlink(&external, run.join("unsafe-entry")).expect("symlink"),
+                "hardlink" => fs::hard_link(&external, run.join("unsafe-entry")).expect("hardlink"),
+                "fifo" => {
+                    let path = CString::new(run.join("unsafe-entry").as_os_str().as_bytes())
+                        .expect("FIFO path");
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                _ => unreachable!(),
+            }
+            let error = prune_runs(&repo, RunArtifactFamily::Inbox, 0, false)
+                .expect_err("unsafe tree must not be deleted");
+            assert!(error.to_string().contains("quarantined"));
+            assert!(external.exists());
+            assert!(
+                !run.exists(),
+                "unsafe run must leave the public namespace first"
+            );
+            assert!(run_root(&repo, RunArtifactFamily::Inbox)
+                .join(QUARANTINE_DIRECTORY)
+                .exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_rejects_device_nodes_when_platform_allows_creating_one() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("unsafe-device").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+        let device = run_dir(&repo, RunArtifactFamily::Inbox, &run_id).join("device");
+        let path = CString::new(device.as_os_str().as_bytes()).expect("device path");
+        let result =
+            unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(1, 3)) };
+        if result != 0 {
+            return;
+        }
+        assert!(prune_runs(&repo, RunArtifactFamily::Inbox, 0, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_bound_quarantine_refuses_aba_substitution() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("aba-run").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let root = open_existing_run_root(&repository, RunArtifactFamily::Inbox).expect("root");
+        let original = root
+            .bind_existing_managed_direct_child_directory(run_id.as_str())
+            .expect("binding");
+        let original_identity = original.identity().clone();
+        fs::rename(original.path(), root.path().join("moved-original")).expect("move original");
+        fs::create_dir(root.path().join(run_id.as_str())).expect("substitute");
+        let quarantine = open_or_create_quarantine(&root).expect("quarantine");
+        let error = rename_bound_directory(
+            &root,
+            run_id.as_str().as_ref(),
+            &original_identity,
+            &quarantine,
+            "quarantine-aba".as_ref(),
+        )
+        .expect_err("ABA substitution must fail");
+        assert!(error.to_string().contains("identity changed"));
+        assert!(root.path().join(run_id.as_str()).exists());
+        assert!(root.path().join("moved-original").exists());
+    }
+
+    #[test]
+    fn normal_prune_removes_run_and_leaves_empty_quarantine() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("prune-run").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Autopilot, &run_id).expect("reserve");
+        fs::write(
+            final_report_path(&repo, RunArtifactFamily::Autopilot, &run_id),
+            b"{\"status\":\"done\"}\n",
+        )
+        .expect("report");
+        let report = prune_runs(&repo, RunArtifactFamily::Autopilot, 0, false).expect("prune");
+        assert_eq!(report.deleted_count, 1);
+        assert!(!run_dir(&repo, RunArtifactFamily::Autopilot, &run_id).exists());
+        let quarantine = run_root(&repo, RunArtifactFamily::Autopilot).join(QUARANTINE_DIRECTORY);
+        assert_eq!(fs::read_dir(quarantine).expect("quarantine").count(), 0);
+    }
+
+    fn committed_repo() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let workdir = repo.workdir().expect("workdir");
+        fs::write(workdir.join("README.md"), "# Test\n").expect("README");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("README.md")).expect("add");
+        index.write().expect("index write");
+        let tree_id = index.write_tree().expect("tree id");
+        let tree = repo.find_tree(tree_id).expect("tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        let oid: Oid = repo
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit");
+        assert!(!oid.is_zero());
+        drop(tree);
+        drop(repo);
+        (temp, repo_path)
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
 }

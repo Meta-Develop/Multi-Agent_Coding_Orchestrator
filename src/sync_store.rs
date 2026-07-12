@@ -1,3 +1,7 @@
+use crate::safe_state::{
+    identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity,
+    KernelStateLock, SafeRoot,
+};
 use crate::sync::{
     normalize_repo_relative_path, ClaimToken, PathClaim, SyncCoordinator, SyncSnapshot,
 };
@@ -5,19 +9,28 @@ use anyhow::{bail, Context, Result};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{ErrorKind, Write},
+    fs,
     path::{Path, PathBuf},
-    process::{self, Command},
-    thread,
-    time::Duration,
 };
 
-const STATE_VERSION: u32 = 1;
+#[cfg(unix)]
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, PermissionsExt},
+};
+
+const STATE_VERSION: u32 = 2;
+const LEGACY_STATE_VERSION: u32 = 1;
+const MAX_SYNC_STATE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SYNC_CLAIMS: usize = 4_096;
+const MAX_SYNC_PATHS: usize = 16_384;
+const MAX_AGENT_ID_BYTES: usize = 128;
+const MAX_STATE_PATH_BYTES: usize = 4_096;
+const MAX_STATE_PATH_COMPONENTS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct SyncStore {
-    state_path: PathBuf,
+    state: RepositoryStateRoot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -26,20 +39,165 @@ pub struct OwnerReport {
     pub owner: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RepositoryStateBinding {
+    common_dir_path_checksum: String,
+    common_dir_identity: FileIdentity,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepositoryStateRoot {
+    root: SafeRoot,
+    state_path: PathBuf,
+    state_file: &'static str,
+    lock_file: &'static str,
+    binding: RepositoryStateBinding,
+}
+
+#[derive(Debug)]
+pub(crate) struct RepositoryStateLock {
+    _lock: KernelStateLock,
+    root_identity: FileIdentity,
+    state_file: &'static str,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedSyncState {
+    version: u32,
+    checksum: String,
+    repository: RepositoryStateBinding,
+    next_token: u64,
+    claims: Vec<PathClaim>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedSyncState {
     version: u32,
     next_token: u64,
     claims: Vec<PathClaim>,
 }
 
-impl From<SyncSnapshot> for PersistedSyncState {
-    fn from(snapshot: SyncSnapshot) -> Self {
-        Self {
+impl PersistedSyncState {
+    fn from_snapshot(repository: RepositoryStateBinding, snapshot: SyncSnapshot) -> Result<Self> {
+        validate_sync_snapshot(&snapshot)?;
+        let mut state = Self {
             version: STATE_VERSION,
+            checksum: String::new(),
+            repository,
             next_token: snapshot.next_token,
             claims: snapshot.claims,
+        };
+        state.checksum = sync_state_checksum(&state)?;
+        Ok(state)
+    }
+}
+
+impl RepositoryStateRoot {
+    pub(crate) fn open(
+        repo: &Repository,
+        state_file: &'static str,
+        lock_file: &'static str,
+    ) -> Result<Self> {
+        let common_root = SafeRoot::open_existing(repo.commondir()).with_context(|| {
+            format!(
+                "Git common directory is not a safe current-user-owned directory: {}",
+                repo.commondir().display()
+            )
+        })?;
+        let binding = RepositoryStateBinding {
+            common_dir_path_checksum: stable_checksum(&filesystem_path_bytes(common_root.path())),
+            common_dir_identity: common_root.identity().clone(),
+        };
+        let state_path = common_root.path().join("maco").join("state");
+        let existed = fs::symlink_metadata(&state_path).is_ok();
+        let root = match SafeRoot::open_or_create(&state_path) {
+            Ok(root) => root,
+            Err(error) if existed => {
+                bail!(
+                    "existing MACO state directory is not owner-private: {}. Refusing to change legacy permissions automatically. Independently verify its ownership and contents, then migrate the directory to mode 0700 and each state/lock file to mode 0600 before retrying. Underlying error: {error:#}",
+                    state_path.display()
+                )
+            }
+            Err(error) => return Err(error).context("failed to create owner-private MACO state"),
+        };
+        Ok(Self {
+            state_path: root.direct_child(state_file)?,
+            root,
+            state_file,
+            lock_file,
+            binding,
+        })
+    }
+
+    pub(crate) fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    pub(crate) fn binding(&self) -> &RepositoryStateBinding {
+        &self.binding
+    }
+
+    pub(crate) fn lock(&self) -> Result<RepositoryStateLock> {
+        let lock = KernelStateLock::acquire_direct(&self.root, self.lock_file)?;
+        Ok(RepositoryStateLock {
+            _lock: lock,
+            root_identity: self.root.identity().clone(),
+            state_file: self.state_file,
+        })
+    }
+
+    pub(crate) fn read(
+        &self,
+        lock: &RepositoryStateLock,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.verify_lock(lock)?;
+        if !self.root.direct_child_exists(self.state_file)? {
+            return Ok(None);
         }
+        let before = ensure_private_state_file(&self.state_path)?;
+        let contents = BoundedRegularReader::read_direct(&self.root, self.state_file, max_bytes)?;
+        let after = ensure_private_state_file(&self.state_path)?;
+        if before != after {
+            bail!(
+                "state file identity changed during protected read: {}",
+                self.state_path.display()
+            );
+        }
+        Ok(Some(contents))
+    }
+
+    pub(crate) fn write(
+        &self,
+        lock: &RepositoryStateLock,
+        contents: &[u8],
+        max_bytes: u64,
+    ) -> Result<()> {
+        self.verify_lock(lock)?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+            bail!(
+                "serialized state exceeds its {} byte limit: {}",
+                max_bytes,
+                self.state_path.display()
+            );
+        }
+        if self.root.direct_child_exists(self.state_file)? {
+            ensure_private_state_file(&self.state_path)?;
+        }
+        AtomicStateWriter::scavenge_direct_temps(&self.root, self.state_file)?;
+        AtomicStateWriter::write_direct(&self.root, self.state_file, contents)?;
+        ensure_private_state_file(&self.state_path)?;
+        Ok(())
+    }
+
+    fn verify_lock(&self, lock: &RepositoryStateLock) -> Result<()> {
+        if lock.root_identity != *self.root.identity() || lock.state_file != self.state_file {
+            bail!("repository state lock does not match the protected state file");
+        }
+        self.root.verify()
     }
 }
 
@@ -52,16 +210,12 @@ impl SyncStore {
             )
         })?;
         Ok(Self {
-            state_path: repo
-                .commondir()
-                .join("maco")
-                .join("state")
-                .join("claims.json"),
+            state: RepositoryStateRoot::open(&repo, "claims.json", "claims.lock")?,
         })
     }
 
     pub fn state_path(&self) -> &Path {
-        &self.state_path
+        self.state.state_path()
     }
 
     pub fn claim_paths<I, P>(&self, agent_id: impl AsRef<str>, paths: I) -> Result<PathClaim>
@@ -104,10 +258,10 @@ impl SyncStore {
         &self,
         operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
     ) -> Result<T> {
-        let _lock = StateLock::acquire(&self.state_path)?;
-        let coordinator = self.load_coordinator()?;
+        let lock = self.state.lock()?;
+        let coordinator = self.load_coordinator(&lock)?;
         let output = operation(&coordinator)?;
-        self.save_snapshot(coordinator.to_snapshot()?)?;
+        self.save_snapshot(&lock, coordinator.to_snapshot()?)?;
         Ok(output)
     }
 
@@ -115,195 +269,211 @@ impl SyncStore {
         &self,
         operation: impl FnOnce(&SyncCoordinator) -> Result<T>,
     ) -> Result<T> {
-        let _lock = StateLock::acquire(&self.state_path)?;
-        let coordinator = self.load_coordinator()?;
+        let lock = self.state.lock()?;
+        let coordinator = self.load_coordinator(&lock)?;
         operation(&coordinator)
     }
 
-    fn load_coordinator(&self) -> Result<SyncCoordinator> {
-        let snapshot = self.load_snapshot()?;
+    fn load_coordinator(&self, lock: &RepositoryStateLock) -> Result<SyncCoordinator> {
+        let snapshot = self.load_snapshot(lock)?;
         SyncCoordinator::from_snapshot(snapshot).map_err(Into::into)
     }
 
-    fn load_snapshot(&self) -> Result<SyncSnapshot> {
-        let contents = match fs::read_to_string(&self.state_path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(SyncSnapshot::default()),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read sync state {}", self.state_path.display())
-                })
-            }
+    fn load_snapshot(&self, lock: &RepositoryStateLock) -> Result<SyncSnapshot> {
+        let Some(contents) = self.state.read(lock, MAX_SYNC_STATE_BYTES)? else {
+            return Ok(SyncSnapshot::default());
         };
-
-        let state: PersistedSyncState = serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse sync state {}", self.state_path.display()))?;
-        if state.version != STATE_VERSION {
+        let version = serde_json::from_slice::<serde_json::Value>(&contents)
+            .with_context(|| format!("failed to parse sync state {}", self.state_path().display()))?
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .context("sync state is missing an integer version")?;
+        let version = u32::try_from(version).context("sync state version does not fit in u32")?;
+        if version == LEGACY_STATE_VERSION {
+            let legacy: LegacyPersistedSyncState =
+                serde_json::from_slice(&contents).with_context(|| {
+                    format!(
+                        "failed to parse legacy sync state {}",
+                        self.state_path().display()
+                    )
+                })?;
+            if legacy.version != LEGACY_STATE_VERSION {
+                bail!("legacy sync state changed versions while it was being parsed");
+            }
+            let snapshot = SyncSnapshot {
+                next_token: legacy.next_token,
+                claims: legacy.claims,
+            };
+            validate_sync_snapshot(&snapshot)?;
+            SyncCoordinator::from_snapshot(snapshot.clone())
+                .context("legacy sync state failed structural validation")?;
+            self.save_snapshot(lock, snapshot.clone()).context(
+                "failed to migrate private legacy sync state to repository-bound version 2",
+            )?;
+            return Ok(snapshot);
+        }
+        if version != STATE_VERSION {
             bail!(
                 "unsupported sync state version {} in {}",
-                state.version,
-                self.state_path.display()
+                version,
+                self.state_path().display()
             );
         }
-
-        Ok(SyncSnapshot {
+        let state: PersistedSyncState = serde_json::from_slice(&contents).with_context(|| {
+            format!("failed to parse sync state {}", self.state_path().display())
+        })?;
+        if state.repository != *self.state.binding() {
+            bail!("sync state repository/common-directory binding does not match this repository");
+        }
+        let expected_checksum = sync_state_checksum(&state)?;
+        if state.checksum != expected_checksum {
+            bail!(
+                "sync state checksum mismatch in {}; refusing to use corrupted state",
+                self.state_path().display()
+            );
+        }
+        let snapshot = SyncSnapshot {
             next_token: state.next_token,
             claims: state.claims,
-        })
-    }
-
-    fn save_snapshot(&self, snapshot: SyncSnapshot) -> Result<()> {
-        let parent = self
-            .state_path
-            .parent()
-            .context("sync state path must have a parent directory")?;
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create sync state directory {}", parent.display())
-        })?;
-
-        let state = PersistedSyncState::from(snapshot);
-        let temp_path = temp_state_path(&self.state_path);
-        let result = write_state_file(&temp_path, &self.state_path, &state);
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        result
-    }
-}
-
-fn write_state_file(temp_path: &Path, state_path: &Path, state: &PersistedSyncState) -> Result<()> {
-    let mut file = File::create(temp_path)
-        .with_context(|| format!("failed to create temporary state {}", temp_path.display()))?;
-    serde_json::to_writer_pretty(&mut file, state)
-        .with_context(|| format!("failed to write temporary state {}", temp_path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish temporary state {}", temp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush temporary state {}", temp_path.display()))?;
-    drop(file);
-
-    fs::rename(temp_path, state_path).with_context(|| {
-        format!(
-            "failed to replace sync state {} with {}",
-            state_path.display(),
-            temp_path.display()
-        )
-    })
-}
-
-fn temp_state_path(state_path: &Path) -> PathBuf {
-    let file_name = state_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("claims.json");
-    state_path.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
-}
-
-struct StateLock {
-    path: PathBuf,
-}
-
-impl StateLock {
-    fn acquire(state_path: &Path) -> Result<Self> {
-        let parent = state_path
-            .parent()
-            .context("sync state path must have a parent directory")?;
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create sync state directory {}", parent.display())
-        })?;
-
-        let path = parent.join("claims.lock");
-        let mut attempts = 0;
-        let mut file = loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => break file,
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if remove_stale_lock(&path)? {
-                        continue;
-                    }
-                    attempts += 1;
-                    if attempts >= 50 {
-                        bail!(
-                            "sync state is locked at {}; another maco sync command may be running",
-                            path.display()
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to create sync lock {}", path.display()))
-                }
-            }
         };
+        validate_sync_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
 
-        let result = (|| -> Result<()> {
-            writeln!(file, "pid={}", process::id())
-                .with_context(|| format!("failed to write sync lock {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("failed to flush sync lock {}", path.display()))?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&path);
+    fn save_snapshot(&self, lock: &RepositoryStateLock, snapshot: SyncSnapshot) -> Result<()> {
+        let state = PersistedSyncState::from_snapshot(self.state.binding().clone(), snapshot)?;
+        let mut contents = serde_json::to_vec_pretty(&state)
+            .context("failed to serialize repository-bound sync state")?;
+        contents.push(b'\n');
+        self.state.write(lock, &contents, MAX_SYNC_STATE_BYTES)
+    }
+}
+
+fn sync_state_checksum(state: &PersistedSyncState) -> Result<String> {
+    let payload = serde_json::to_vec(&(
+        state.version,
+        &state.repository,
+        state.next_token,
+        &state.claims,
+    ))
+    .context("failed to encode sync state checksum payload")?;
+    Ok(stable_checksum(&payload))
+}
+
+fn validate_sync_snapshot(snapshot: &SyncSnapshot) -> Result<()> {
+    if snapshot.next_token == 0 {
+        bail!("sync state next_token must be nonzero");
+    }
+    if snapshot.claims.len() > MAX_SYNC_CLAIMS {
+        bail!(
+            "sync state exceeds its claim budget of {} records",
+            MAX_SYNC_CLAIMS
+        );
+    }
+    let mut path_count = 0usize;
+    for claim in &snapshot.claims {
+        if claim.agent_id.len() > MAX_AGENT_ID_BYTES {
+            bail!("sync state agent id exceeds {MAX_AGENT_ID_BYTES} bytes");
         }
-        result?;
-
-        Ok(Self { path })
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn remove_stale_lock(path: &Path) -> Result<bool> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect sync lock {}", path.display()))
+        path_count = path_count
+            .checked_add(claim.paths.len())
+            .context("sync state path count overflow")?;
+        if path_count > MAX_SYNC_PATHS {
+            bail!(
+                "sync state exceeds its aggregate path budget of {}",
+                MAX_SYNC_PATHS
+            );
         }
-    };
-    let Some(pid) = parse_lock_pid(&contents) else {
-        return Ok(false);
-    };
-    if process_is_running(pid) {
-        return Ok(false);
+        for path in &claim.paths {
+            validate_state_path(path)?;
+        }
     }
-
-    fs::remove_file(path)
-        .with_context(|| format!("failed to remove stale sync lock {}", path.display()))?;
-    Ok(true)
+    Ok(())
 }
 
-fn parse_lock_pid(contents: &str) -> Option<u32> {
-    contents
-        .lines()
-        .find_map(|line| line.strip_prefix("pid="))
-        .and_then(|pid| pid.trim().parse().ok())
-}
-
-#[cfg(target_family = "unix")]
-fn process_is_running(pid: u32) -> bool {
-    if Path::new("/proc").exists() {
-        return Path::new("/proc").join(pid.to_string()).exists();
+pub(crate) fn validate_state_path(path: &Path) -> Result<()> {
+    let bytes = path_bytes(path);
+    if bytes == 0 || bytes > MAX_STATE_PATH_BYTES {
+        bail!(
+            "persisted path length must be between 1 and {} bytes",
+            MAX_STATE_PATH_BYTES
+        );
     }
-
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
+    if path.components().count() > MAX_STATE_PATH_COMPONENTS {
+        bail!(
+            "persisted path exceeds its {} component budget",
+            MAX_STATE_PATH_COMPONENTS
+        );
+    }
+    normalize_repo_relative_path(path).with_context(|| {
+        format!(
+            "persisted path is not repository-relative: {}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
-#[cfg(not(target_family = "unix"))]
-fn process_is_running(_pid: u32) -> bool {
-    true
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> usize {
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> usize {
+    path.as_os_str().to_string_lossy().len()
+}
+
+#[cfg(unix)]
+fn filesystem_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn filesystem_path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect private state file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!(
+            "state file is not a regular no-follow file: {}",
+            path.display()
+        );
+    }
+    if metadata.nlink() != 1 {
+        bail!(
+            "state file must have exactly one hard link (observed {}): {}",
+            metadata.nlink(),
+            path.display()
+        );
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "state file is not owned by the current user: {}",
+            path.display()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        bail!(
+            "state file has unsafe mode {:04o}; independently verify ownership and contents, then migrate it to mode 0600: {}",
+            mode,
+            path.display()
+        );
+    }
+    identity_for_path(path)
+}
+
+#[cfg(not(unix))]
+fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
+    bail!(
+        "private state-file ownership and ACL validation is unsupported on this platform: {}",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -432,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_lock_file_is_removed() {
+    fn stable_kernel_lock_is_private_and_keeps_its_inode() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -442,11 +612,231 @@ mod tests {
             .parent()
             .expect("state parent")
             .join("claims.lock");
-        fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("state dir");
-        fs::write(&lock_path, "pid=4294967295\n").expect("write stale lock");
 
         assert_eq!(store.snapshot().expect("snapshot"), Vec::<PathClaim>::new());
-        assert!(!lock_path.exists());
+        let first = identity_for_path(&lock_path).expect("first lock identity");
+        assert_eq!(
+            store.snapshot().expect("second snapshot"),
+            Vec::<PathClaim>::new()
+        );
+        assert_eq!(
+            identity_for_path(&lock_path).expect("second lock identity"),
+            first
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::symlink_metadata(&lock_path)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_public_state_directory_fails_closed_without_chmod() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let state_root = repo_path.join(".git/maco/state");
+        fs::create_dir_all(&state_root).expect("legacy state root");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o755)).expect("legacy mode");
+
+        let error = SyncStore::open(&repo_path).expect_err("legacy mode must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("Independently verify its ownership and contents"));
+        assert!(message.contains("0700"));
+        assert!(message.contains("0600"));
+        assert_eq!(
+            fs::symlink_metadata(&state_root)
+                .expect("state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_legacy_v1_state_is_migrated_and_repository_bound() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let legacy = serde_json::json!({
+            "version": LEGACY_STATE_VERSION,
+            "next_token": 2,
+            "claims": [{
+                "token": 1,
+                "agent_id": "agent-a",
+                "paths": ["README.md"]
+            }]
+        });
+        fs::write(
+            store.state_path(),
+            serde_json::to_vec_pretty(&legacy).expect("legacy JSON"),
+        )
+        .expect("write legacy");
+        fs::set_permissions(store.state_path(), fs::Permissions::from_mode(0o600))
+            .expect("private state");
+
+        assert_eq!(store.snapshot().expect("migrate").len(), 1);
+        let migrated = fs::read(store.state_path()).expect("read migrated");
+        let state: PersistedSyncState = serde_json::from_slice(&migrated).expect("parse migrated");
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.repository, *store.state.binding());
+        assert_eq!(
+            state.checksum,
+            sync_state_checksum(&state).expect("checksum")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checksum_tamper_and_unsafe_file_types_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        store
+            .claim_paths("agent-a", ["README.md"])
+            .expect("initial claim");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.state_path()).expect("state"))
+                .expect("parse state");
+        state["next_token"] = serde_json::json!(999);
+        fs::write(
+            store.state_path(),
+            serde_json::to_vec_pretty(&state).expect("tampered JSON"),
+        )
+        .expect("tamper state");
+        assert!(store
+            .snapshot()
+            .expect_err("checksum tamper")
+            .to_string()
+            .contains("checksum mismatch"));
+
+        fs::remove_file(store.state_path()).expect("remove tampered state");
+        let external = temp.path().join("external-state");
+        fs::write(&external, b"{}\n").expect("external state");
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).expect("mode");
+        symlink(&external, store.state_path()).expect("state symlink");
+        assert!(store
+            .snapshot()
+            .expect_err("symlink state")
+            .to_string()
+            .contains("regular"));
+
+        fs::remove_file(store.state_path()).expect("remove symlink");
+        fs::hard_link(&external, store.state_path()).expect("hardlink state");
+        assert!(store
+            .snapshot()
+            .expect_err("hard-linked state")
+            .to_string()
+            .contains("exactly one hard link"));
+
+        fs::remove_file(store.state_path()).expect("remove hardlink");
+        let path =
+            std::ffi::CString::new(store.state_path().as_os_str().as_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(store
+            .snapshot()
+            .expect_err("FIFO state")
+            .to_string()
+            .contains("regular"));
+    }
+
+    #[test]
+    fn concurrent_claims_are_serialized_without_lost_updates() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let mut workers = Vec::new();
+        for index in 0..16usize {
+            let store = store.clone();
+            workers.push(std::thread::spawn(move || {
+                store.claim_paths(
+                    format!("agent-{index}"),
+                    [format!("generated/path-{index}")],
+                )
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker thread").expect("claim");
+        }
+
+        let claims = store.snapshot().expect("snapshot");
+        assert_eq!(claims.len(), 16);
+        let state: PersistedSyncState =
+            serde_json::from_slice(&fs::read(store.state_path()).expect("state"))
+                .expect("parse state");
+        assert_eq!(
+            state.checksum,
+            sync_state_checksum(&state).expect("checksum")
+        );
+    }
+
+    #[test]
+    fn state_record_budget_is_enforced_before_coordinator_materialization() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let claims = (0..=MAX_SYNC_CLAIMS)
+            .map(|index| PathClaim {
+                token: ClaimToken::from_u64(u64::try_from(index).expect("index") + 1),
+                agent_id: format!("agent-{index}"),
+                paths: vec![PathBuf::from(format!("path-{index}"))],
+            })
+            .collect::<Vec<_>>();
+        let mut state = PersistedSyncState {
+            version: STATE_VERSION,
+            checksum: String::new(),
+            repository: store.state.binding().clone(),
+            next_token: u64::try_from(MAX_SYNC_CLAIMS).expect("count") + 2,
+            claims,
+        };
+        state.checksum = sync_state_checksum(&state).expect("checksum");
+        let bytes = serde_json::to_vec(&state).expect("state JSON");
+        assert!(u64::try_from(bytes.len()).expect("length") < MAX_SYNC_STATE_BYTES);
+        fs::write(store.state_path(), bytes).expect("write oversized records");
+        #[cfg(unix)]
+        fs::set_permissions(store.state_path(), fs::Permissions::from_mode(0o600))
+            .expect("private mode");
+
+        assert!(store
+            .snapshot()
+            .expect_err("record budget")
+            .to_string()
+            .contains("claim budget"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_binding_supports_non_utf8_common_directory_paths() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join(OsString::from_vec(b"repo-\x80".to_vec()));
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        store
+            .claim_paths("agent-a", ["README.md"])
+            .expect("persist claim");
+
+        let bytes = fs::read(store.state_path()).expect("state bytes");
+        let state: PersistedSyncState = serde_json::from_slice(&bytes).expect("state JSON");
+        assert_eq!(state.repository, *store.state.binding());
+        assert!(state
+            .repository
+            .common_dir_path_checksum
+            .starts_with("maco-v1-"));
     }
 
     fn commit_readme(repo: &Repository) -> Result<Oid> {
