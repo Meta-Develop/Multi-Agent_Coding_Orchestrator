@@ -5,6 +5,10 @@
 //! truncated published tail. A single identity-bound kernel lock protects one
 //! run for its full lifecycle.
 
+// Generic discovery helpers are staged for snapshot/effect consumers while
+// checkpoint callers continue to use the compatibility alias.
+#![allow(dead_code)]
+
 use crate::{
     artifacts::state_auth::{
         random_identifier, validate_repository_binding, AuthenticationDomain, AuthenticationTag,
@@ -20,6 +24,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::Write,
+    marker::PhantomData,
     path::Path,
 };
 
@@ -44,6 +49,45 @@ const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PHASE_BYTES: usize = 64;
 const MAX_SUBJECT_BYTES: usize = 256;
 const MAX_RUN_ID_BYTES: usize = 128;
+
+/// Compile-time contract for one authenticated journal namespace. A spec owns
+/// every path, domain, wire-version, and resource bound that can otherwise be
+/// confused across durable-state consumers.
+pub(crate) trait JournalSpec: Send + Sync + 'static {
+    const FORMAT_VERSION: u32;
+    const NAMESPACE: &'static str;
+    const ROOT_NAME: &'static str;
+    const ROOT_LOCK_NAME: &'static str;
+    const INSTANCE_LOCK_NAME: &'static str;
+    const HEAD_FILE_NAME: &'static str;
+    const RECORD_DOMAIN: AuthenticationDomain;
+    const HEAD_DOMAIN: AuthenticationDomain;
+    const MAX_RECORDS: usize;
+    const MAX_RECORD_BYTES: u64;
+    const MAX_TOTAL_BYTES: u64;
+    const MAX_PHASE_BYTES: usize;
+    const MAX_SUBJECT_BYTES: usize;
+    const MAX_INSTANCE_ID_BYTES: usize;
+}
+
+pub(crate) enum CheckpointJournalSpec {}
+
+impl JournalSpec for CheckpointJournalSpec {
+    const FORMAT_VERSION: u32 = JOURNAL_FORMAT_VERSION;
+    const NAMESPACE: &'static str = "orchestration_checkpoint";
+    const ROOT_NAME: &'static str = JOURNAL_ROOT_NAME;
+    const ROOT_LOCK_NAME: &'static str = JOURNAL_ROOT_LOCK;
+    const INSTANCE_LOCK_NAME: &'static str = RUN_LOCK_NAME;
+    const HEAD_FILE_NAME: &'static str = HEAD_FILE_NAME;
+    const RECORD_DOMAIN: AuthenticationDomain = RECORD_DOMAIN;
+    const HEAD_DOMAIN: AuthenticationDomain = HEAD_DOMAIN;
+    const MAX_RECORDS: usize = MAX_JOURNAL_RECORDS;
+    const MAX_RECORD_BYTES: u64 = MAX_RECORD_BYTES;
+    const MAX_TOTAL_BYTES: u64 = MAX_JOURNAL_BYTES;
+    const MAX_PHASE_BYTES: usize = MAX_PHASE_BYTES;
+    const MAX_SUBJECT_BYTES: usize = MAX_SUBJECT_BYTES;
+    const MAX_INSTANCE_ID_BYTES: usize = MAX_RUN_ID_BYTES;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -80,7 +124,7 @@ struct JournalHead {
     mac: AuthenticationTag,
 }
 
-pub(crate) struct StateJournal {
+pub(crate) struct AuthenticatedStateJournal<S: JournalSpec> {
     authenticator: RepositoryAuthenticator,
     journal_root: SafeRoot,
     run_root: SafeRoot,
@@ -88,14 +132,30 @@ pub(crate) struct StateJournal {
     identity: JournalIdentity,
     records: Vec<JournalRecord>,
     record_bytes: u64,
+    spec: PhantomData<S>,
 }
 
-impl StateJournal {
-    pub(crate) fn create(authenticator: RepositoryAuthenticator, run_id: &str) -> Result<Self> {
-        validate_run_id(run_id)?;
+pub(crate) type StateJournal = AuthenticatedStateJournal<CheckpointJournalSpec>;
+
+impl<S: JournalSpec> AuthenticatedStateJournal<S> {
+    pub(crate) fn existing_root(authenticator: &RepositoryAuthenticator) -> Result<SafeRoot> {
+        validate_spec::<S>()?;
         authenticator.verify_epoch()?;
-        let journal_root = open_or_create_journal_root(&authenticator)?;
-        let root_lock = BoundStateLock::acquire(&journal_root, JOURNAL_ROOT_LOCK)?;
+        open_existing_journal_root::<S>(authenticator)
+    }
+
+    pub(crate) fn create_root(authenticator: &RepositoryAuthenticator) -> Result<SafeRoot> {
+        validate_spec::<S>()?;
+        authenticator.verify_epoch()?;
+        open_or_create_journal_root::<S>(authenticator)
+    }
+
+    pub(crate) fn create(authenticator: RepositoryAuthenticator, run_id: &str) -> Result<Self> {
+        validate_spec::<S>()?;
+        validate_instance_id::<S>(run_id)?;
+        authenticator.verify_epoch()?;
+        let journal_root = open_or_create_journal_root::<S>(&authenticator)?;
+        let root_lock = BoundStateLock::acquire(&journal_root, S::ROOT_LOCK_NAME)?;
         root_lock.verify(&journal_root)?;
         let reserved = journal_root
             .reserve_direct_child_directory(run_id)
@@ -106,10 +166,10 @@ impl StateJournal {
             })?;
         reserved.verify(&journal_root)?;
         let run_root = SafeRoot::open_existing(reserved.path())?;
-        let run_lock = BoundStateLock::try_acquire_exclusive(&run_root, RUN_LOCK_NAME)
-            .context("checkpoint run is already active in another process")?;
+        let run_lock = BoundStateLock::try_acquire_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
+            .with_context(|| format!("{} instance is already active", S::NAMESPACE))?;
         let identity = JournalIdentity {
-            version: JOURNAL_FORMAT_VERSION,
+            version: S::FORMAT_VERSION,
             repository: authenticator.binding().clone(),
             run_id: run_id.to_string(),
             journal_id: random_identifier()?,
@@ -124,6 +184,7 @@ impl StateJournal {
             identity,
             records: Vec::new(),
             record_bytes: 0,
+            spec: PhantomData,
         };
         journal.verify_boundaries()?;
         Ok(journal)
@@ -133,10 +194,11 @@ impl StateJournal {
         authenticator: RepositoryAuthenticator,
         expected: &JournalIdentity,
     ) -> Result<Self> {
-        validate_identity(expected)?;
+        validate_spec::<S>()?;
+        validate_identity::<S>(expected)?;
         authenticator.verify_epoch()?;
         authenticator.verify_repository_binding(&expected.repository)?;
-        let journal_root = open_existing_journal_root(&authenticator)?;
+        let journal_root = open_existing_journal_root::<S>(&authenticator)?;
         let reserved = journal_root
             .bind_existing_direct_child_directory(&expected.run_id)
             .context("authenticated checkpoint run directory is missing or unsafe")?;
@@ -144,8 +206,8 @@ impl StateJournal {
         if run_root.identity() != &expected.run_directory_identity {
             bail!("authenticated checkpoint run directory identity changed");
         }
-        let run_lock = BoundStateLock::try_acquire_exclusive(&run_root, RUN_LOCK_NAME)
-            .context("checkpoint run is already active or being resumed elsewhere")?;
+        let run_lock = BoundStateLock::try_acquire_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
+            .with_context(|| format!("{} instance is active elsewhere", S::NAMESPACE))?;
         let mut journal = Self {
             authenticator,
             journal_root,
@@ -154,14 +216,53 @@ impl StateJournal {
             identity: expected.clone(),
             records: Vec::new(),
             record_bytes: 0,
+            spec: PhantomData,
         };
         journal.load_and_recover()?;
         journal.verify_boundaries()?;
         Ok(journal)
     }
 
+    /// Opens a stable instance when its authenticated identity is not stored by
+    /// the caller. The first record is locator material only: its identity is
+    /// structurally bounded, then the normal `open` path authenticates the
+    /// complete chain before any payload becomes authoritative.
+    pub(crate) fn open_instance(
+        authenticator: RepositoryAuthenticator,
+        instance_id: &str,
+    ) -> Result<Self> {
+        validate_spec::<S>()?;
+        validate_instance_id::<S>(instance_id)?;
+        authenticator.verify_epoch()?;
+        let journal_root = open_existing_journal_root::<S>(&authenticator)?;
+        let reserved = journal_root
+            .bind_existing_direct_child_directory(instance_id)
+            .with_context(|| format!("{} instance is missing or unsafe", S::NAMESPACE))?;
+        let run_root = SafeRoot::open_existing(reserved.path())?;
+        let first_name = record_file_name(1);
+        let bytes = BoundedRegularReader::read_direct(&run_root, &first_name, S::MAX_RECORD_BYTES)
+            .with_context(|| format!("{} instance has no durable first record", S::NAMESPACE))?;
+        let locator: JournalRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} first record locator is malformed", S::NAMESPACE))?;
+        validate_identity::<S>(&locator.identity)?;
+        if locator.sequence != 1
+            || locator.identity.run_id != instance_id
+            || locator.identity.run_directory_identity != *run_root.identity()
+        {
+            bail!(
+                "{} first record locator has the wrong instance binding",
+                S::NAMESPACE
+            );
+        }
+        Self::open(authenticator, &locator.identity)
+    }
+
     pub(crate) fn identity(&self) -> &JournalIdentity {
         &self.identity
+    }
+
+    pub(crate) fn root(&self) -> &SafeRoot {
+        &self.journal_root
     }
 
     pub(crate) fn authenticator(&self) -> &RepositoryAuthenticator {
@@ -172,18 +273,22 @@ impl StateJournal {
         &self.records
     }
 
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.identity.run_id
+    }
+
     pub(crate) fn append<T: Serialize>(
         &mut self,
         phase: &str,
         subject: Option<&str>,
         payload: &T,
     ) -> Result<&JournalRecord> {
-        validate_phase(phase)?;
+        validate_phase::<S>(phase)?;
         if let Some(subject) = subject {
-            validate_subject(subject)?;
+            validate_subject::<S>(subject)?;
         }
-        if self.records.len() >= MAX_JOURNAL_RECORDS {
-            bail!("checkpoint journal reached its bounded record count");
+        if self.records.len() >= S::MAX_RECORDS {
+            bail!("{} journal reached its bounded record count", S::NAMESPACE);
         }
         self.verify_boundaries()?;
         let sequence = u64::try_from(self.records.len())
@@ -197,7 +302,7 @@ impl StateJournal {
             .unwrap_or_else(AuthenticationTag::zero);
         let payload = serde_json::to_value(payload).context("failed to encode journal payload")?;
         let mut record = JournalRecord {
-            version: JOURNAL_FORMAT_VERSION,
+            version: S::FORMAT_VERSION,
             identity: self.identity.clone(),
             sequence,
             previous_mac,
@@ -208,13 +313,13 @@ impl StateJournal {
         };
         record.mac = self
             .authenticator
-            .sign(RECORD_DOMAIN, &record_mac_payload(&record)?)?;
+            .sign(S::RECORD_DOMAIN, &record_mac_payload(&record)?)?;
         let mut encoded =
             serde_json::to_vec(&record).context("failed to serialize journal record")?;
         encoded.push(b'\n');
-        validate_record_size(encoded.len(), self.record_bytes)?;
+        validate_record_size::<S>(encoded.len(), self.record_bytes)?;
         let name = record_file_name(sequence);
-        durable_publish_no_replace(&self.run_root, &name, sequence, &encoded, || {
+        durable_publish_no_replace::<S>(&self.run_root, &name, sequence, &encoded, || {
             self.verify_boundaries()
         })?;
         let encoded_len = u64::try_from(encoded.len()).context("record length overflowed")?;
@@ -230,9 +335,14 @@ impl StateJournal {
             .context("journal append lost its record")
     }
 
+    pub(crate) fn into_authenticator(self) -> Result<RepositoryAuthenticator> {
+        self.verify_boundaries()?;
+        Ok(self.authenticator)
+    }
+
     fn load_and_recover(&mut self) -> Result<()> {
         self.verify_boundaries()?;
-        let inventory = inventory_run_directory(&self.run_root)?;
+        let inventory = inventory_run_directory::<S>(&self.run_root)?;
         let mut records = Vec::with_capacity(inventory.records.len());
         let mut total = 0_u64;
         let mut previous = AuthenticationTag::zero();
@@ -244,26 +354,27 @@ impl StateJournal {
             if *sequence != expected_sequence {
                 bail!("checkpoint journal has a missing, reordered, or duplicate sequence");
             }
-            let bytes = BoundedRegularReader::read_direct(&self.run_root, name, MAX_RECORD_BYTES)?;
+            let bytes =
+                BoundedRegularReader::read_direct(&self.run_root, name, S::MAX_RECORD_BYTES)?;
             total = total
                 .checked_add(u64::try_from(bytes.len()).context("record length overflowed")?)
                 .context("journal byte total overflowed")?;
-            if total > MAX_JOURNAL_BYTES {
-                bail!("checkpoint journal exceeds its aggregate byte bound");
+            if total > S::MAX_TOTAL_BYTES {
+                bail!("{} journal exceeds its aggregate byte bound", S::NAMESPACE);
             }
             let record: JournalRecord = serde_json::from_slice(&bytes)
                 .context("checkpoint journal contains a truncated or malformed record")?;
-            validate_record(&record, &self.identity, expected_sequence, &previous)?;
+            validate_record::<S>(&record, &self.identity, expected_sequence, &previous)?;
             self.authenticator.verify_tag(
-                RECORD_DOMAIN,
+                S::RECORD_DOMAIN,
                 &record_mac_payload(&record)?,
                 &record.mac,
             )?;
             previous = record.mac.clone();
             records.push(record);
         }
-        if records.len() > MAX_JOURNAL_RECORDS {
-            bail!("checkpoint journal exceeds its record-count bound");
+        if records.len() > S::MAX_RECORDS {
+            bail!("{} journal exceeds its record-count bound", S::NAMESPACE);
         }
         self.records = records;
         self.record_bytes = total;
@@ -277,15 +388,15 @@ impl StateJournal {
             bail!("checkpoint journal has ambiguous crash residue");
         }
         if let Some(name) = inventory.head_temps.first() {
-            remove_bound_temp(&self.run_root, name)?;
+            remove_bound_temp::<S>(&self.run_root, name)?;
         }
         if let Some((sequence, name)) = inventory.record_temps.first() {
             let last = u64::try_from(self.records.len()).context("checkpoint count overflowed")?;
             if *sequence == last {
                 let final_name = record_file_name(*sequence);
-                remove_published_hardlink_residue(&self.run_root, name, &final_name)?;
+                remove_published_hardlink_residue::<S>(&self.run_root, name, &final_name)?;
             } else if *sequence == last.saturating_add(1) {
-                remove_bound_temp(&self.run_root, name)?;
+                remove_bound_temp::<S>(&self.run_root, name)?;
             } else {
                 bail!("checkpoint journal temp does not belong to the final unpublished tail");
             }
@@ -308,13 +419,16 @@ impl StateJournal {
             }
             return self.write_head();
         }
-        let bytes =
-            BoundedRegularReader::read_direct(&self.run_root, HEAD_FILE_NAME, MAX_RECORD_BYTES)?;
+        let bytes = BoundedRegularReader::read_direct(
+            &self.run_root,
+            S::HEAD_FILE_NAME,
+            S::MAX_RECORD_BYTES,
+        )?;
         let head: JournalHead = serde_json::from_slice(&bytes)
             .context("checkpoint journal head is truncated or malformed")?;
-        validate_head(&head, &self.identity)?;
+        validate_head::<S>(&head, &self.identity)?;
         self.authenticator
-            .verify_tag(HEAD_DOMAIN, &head_mac_payload(&head)?, &head.mac)?;
+            .verify_tag(S::HEAD_DOMAIN, &head_mac_payload(&head)?, &head.mac)?;
         if head.sequence > last_sequence {
             bail!("checkpoint journal published tail was truncated");
         }
@@ -345,7 +459,7 @@ impl StateJournal {
         }
         self.verify_boundaries()?;
         let mut head = JournalHead {
-            version: JOURNAL_FORMAT_VERSION,
+            version: S::FORMAT_VERSION,
             identity: self.identity.clone(),
             sequence: u64::try_from(self.records.len()).context("checkpoint count overflowed")?,
             last_record_mac: self
@@ -358,13 +472,13 @@ impl StateJournal {
         };
         head.mac = self
             .authenticator
-            .sign(HEAD_DOMAIN, &head_mac_payload(&head)?)?;
+            .sign(S::HEAD_DOMAIN, &head_mac_payload(&head)?)?;
         let mut encoded = serde_json::to_vec(&head).context("failed to serialize journal head")?;
         encoded.push(b'\n');
-        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_RECORD_BYTES {
-            bail!("checkpoint journal head exceeds its byte bound");
+        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > S::MAX_RECORD_BYTES {
+            bail!("{} journal head exceeds its byte bound", S::NAMESPACE);
         }
-        durable_replace(&self.run_root, HEAD_FILE_NAME, &encoded, || {
+        durable_replace::<S>(&self.run_root, S::HEAD_FILE_NAME, &encoded, || {
             self.verify_boundaries()
         })?;
         self.verify_boundaries()
@@ -390,12 +504,14 @@ struct RunInventory {
     head_exists: bool,
 }
 
-fn open_or_create_journal_root(authenticator: &RepositoryAuthenticator) -> Result<SafeRoot> {
+fn open_or_create_journal_root<S: JournalSpec>(
+    authenticator: &RepositoryAuthenticator,
+) -> Result<SafeRoot> {
     authenticator.verify()?;
     let state_root = authenticator.state_root();
-    let root_lock = BoundStateLock::acquire(state_root, JOURNAL_ROOT_LOCK)?;
+    let root_lock = BoundStateLock::acquire(state_root, S::ROOT_LOCK_NAME)?;
     root_lock.verify(state_root)?;
-    let path = state_root.path().join(JOURNAL_ROOT_NAME);
+    let path = state_root.path().join(S::ROOT_NAME);
     let root = SafeRoot::open_or_create(&path)
         .context("failed to open owner-private checkpoint journal root")?;
     root_lock.verify(state_root)?;
@@ -403,16 +519,18 @@ fn open_or_create_journal_root(authenticator: &RepositoryAuthenticator) -> Resul
     Ok(root)
 }
 
-fn open_existing_journal_root(authenticator: &RepositoryAuthenticator) -> Result<SafeRoot> {
+fn open_existing_journal_root<S: JournalSpec>(
+    authenticator: &RepositoryAuthenticator,
+) -> Result<SafeRoot> {
     authenticator.verify()?;
-    let path = authenticator.state_root().path().join(JOURNAL_ROOT_NAME);
+    let path = authenticator.state_root().path().join(S::ROOT_NAME);
     let root = SafeRoot::open_existing(&path)
         .context("authenticated checkpoint journal root is missing or unsafe")?;
     root.verify()?;
     Ok(root)
 }
 
-fn inventory_run_directory(root: &SafeRoot) -> Result<RunInventory> {
+fn inventory_run_directory<S: JournalSpec>(root: &SafeRoot) -> Result<RunInventory> {
     root.verify()?;
     let mut inventory = RunInventory {
         records: BTreeMap::new(),
@@ -425,38 +543,38 @@ fn inventory_run_directory(root: &SafeRoot) -> Result<RunInventory> {
         entries = entries
             .checked_add(1)
             .context("journal entry count overflowed")?;
-        if entries > MAX_JOURNAL_RECORDS.saturating_add(8) {
-            bail!("checkpoint journal directory exceeds its entry bound");
+        if entries > S::MAX_RECORDS.saturating_add(8) {
+            bail!("{} journal directory exceeds its entry bound", S::NAMESPACE);
         }
         let entry = entry.context("failed to inspect checkpoint journal entry")?;
         let name = entry.file_name();
         let Some(text) = name.to_str() else {
             bail!("checkpoint journal entry name is not UTF-8");
         };
-        if text == RUN_LOCK_NAME {
+        if text == S::INSTANCE_LOCK_NAME {
             continue;
         }
-        if text == HEAD_FILE_NAME {
+        if text == S::HEAD_FILE_NAME {
             if inventory.head_exists {
                 bail!("checkpoint journal has a duplicate head");
             }
             inventory.head_exists = true;
-            validate_private_state_file(&entry.path(), false)?;
+            validate_private_state_file::<S>(&entry.path(), false)?;
             continue;
         }
         if is_head_temp_name(text) {
-            validate_private_state_file(&entry.path(), false)?;
+            validate_private_state_file::<S>(&entry.path(), false)?;
             inventory.head_temps.push(name);
             continue;
         }
         if let Some(sequence) = parse_record_temp_name(text) {
-            validate_private_state_file(&entry.path(), true)?;
+            validate_private_state_file::<S>(&entry.path(), true)?;
             inventory.record_temps.push((sequence, name));
             continue;
         }
         let sequence = parse_record_file_name(text)
             .with_context(|| format!("unknown checkpoint journal entry '{text}'"))?;
-        validate_private_state_file(&entry.path(), true)?;
+        validate_private_state_file::<S>(&entry.path(), true)?;
         if inventory.records.insert(sequence, name).is_some() {
             bail!("checkpoint journal has a duplicate sequence");
         }
@@ -530,9 +648,9 @@ fn head_mac_payload(head: &JournalHead) -> Result<Vec<u8>> {
     .context("failed to encode checkpoint head MAC payload")
 }
 
-fn validate_identity(identity: &JournalIdentity) -> Result<()> {
+fn validate_identity<S: JournalSpec>(identity: &JournalIdentity) -> Result<()> {
     validate_repository_binding(&identity.repository)?;
-    if identity.version != JOURNAL_FORMAT_VERSION
+    if identity.version != S::FORMAT_VERSION
         || identity.run_directory_identity.file == 0
         || identity.journal_id.len() != 64
         || !identity
@@ -542,47 +660,81 @@ fn validate_identity(identity: &JournalIdentity) -> Result<()> {
     {
         bail!("checkpoint journal identity is malformed or unsupported");
     }
-    validate_run_id(&identity.run_id)
+    validate_instance_id::<S>(&identity.run_id)
+}
+
+fn validate_spec<S: JournalSpec>() -> Result<()> {
+    let canonical_identifier = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+    };
+    let safe_component = |value: &str| {
+        !value.is_empty()
+            && !matches!(value, "." | "..")
+            && !value
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | '\0'))
+    };
+    if S::FORMAT_VERSION == 0
+        || !canonical_identifier(S::NAMESPACE)
+        || !safe_component(S::ROOT_NAME)
+        || !safe_component(S::ROOT_LOCK_NAME)
+        || !safe_component(S::INSTANCE_LOCK_NAME)
+        || !safe_component(S::HEAD_FILE_NAME)
+        || S::ROOT_LOCK_NAME == S::INSTANCE_LOCK_NAME
+        || S::INSTANCE_LOCK_NAME == S::HEAD_FILE_NAME
+        || S::MAX_RECORDS == 0
+        || S::MAX_RECORD_BYTES == 0
+        || S::MAX_TOTAL_BYTES < S::MAX_RECORD_BYTES
+        || S::MAX_PHASE_BYTES == 0
+        || S::MAX_SUBJECT_BYTES == 0
+        || S::MAX_INSTANCE_ID_BYTES == 0
+    {
+        bail!("authenticated journal spec is malformed or internally inconsistent");
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_journal_identity(identity: &JournalIdentity) -> Result<()> {
-    validate_identity(identity)
+    validate_identity::<CheckpointJournalSpec>(identity)
 }
 
-fn validate_record(
+fn validate_record<S: JournalSpec>(
     record: &JournalRecord,
     identity: &JournalIdentity,
     sequence: u64,
     previous: &AuthenticationTag,
 ) -> Result<()> {
-    if record.version != JOURNAL_FORMAT_VERSION
+    if record.version != S::FORMAT_VERSION
         || &record.identity != identity
         || record.sequence != sequence
         || &record.previous_mac != previous
     {
         bail!("checkpoint journal record chain or identity is invalid");
     }
-    validate_phase(&record.phase)?;
+    validate_phase::<S>(&record.phase)?;
     if let Some(subject) = &record.subject {
-        validate_subject(subject)?;
+        validate_subject::<S>(subject)?;
     }
     Ok(())
 }
 
-fn validate_head(head: &JournalHead, identity: &JournalIdentity) -> Result<()> {
-    if head.version != JOURNAL_FORMAT_VERSION
+fn validate_head<S: JournalSpec>(head: &JournalHead, identity: &JournalIdentity) -> Result<()> {
+    if head.version != S::FORMAT_VERSION
         || &head.identity != identity
         || head.sequence == 0
-        || head.record_bytes > MAX_JOURNAL_BYTES
+        || head.record_bytes > S::MAX_TOTAL_BYTES
     {
         bail!("checkpoint journal head is malformed or bound to another run");
     }
     Ok(())
 }
 
-fn validate_run_id(run_id: &str) -> Result<()> {
+fn validate_instance_id<S: JournalSpec>(run_id: &str) -> Result<()> {
     if run_id.is_empty()
-        || run_id.len() > MAX_RUN_ID_BYTES
+        || run_id.len() > S::MAX_INSTANCE_ID_BYTES
         || matches!(run_id, "." | "..")
         || !run_id
             .bytes()
@@ -593,9 +745,9 @@ fn validate_run_id(run_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_phase(phase: &str) -> Result<()> {
+fn validate_phase<S: JournalSpec>(phase: &str) -> Result<()> {
     if phase.is_empty()
-        || phase.len() > MAX_PHASE_BYTES
+        || phase.len() > S::MAX_PHASE_BYTES
         || !phase
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
@@ -605,9 +757,9 @@ fn validate_phase(phase: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_subject(subject: &str) -> Result<()> {
+fn validate_subject<S: JournalSpec>(subject: &str) -> Result<()> {
     if subject.is_empty()
-        || subject.len() > MAX_SUBJECT_BYTES
+        || subject.len() > S::MAX_SUBJECT_BYTES
         || !subject
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
@@ -617,15 +769,15 @@ fn validate_subject(subject: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_record_size(encoded: usize, current_total: u64) -> Result<()> {
+fn validate_record_size<S: JournalSpec>(encoded: usize, current_total: u64) -> Result<()> {
     let encoded = u64::try_from(encoded).context("checkpoint record length overflowed")?;
-    if encoded == 0 || encoded > MAX_RECORD_BYTES {
+    if encoded == 0 || encoded > S::MAX_RECORD_BYTES {
         bail!("checkpoint record exceeds its byte bound");
     }
     if current_total
         .checked_add(encoded)
         .context("checkpoint journal byte total overflowed")?
-        > MAX_JOURNAL_BYTES
+        > S::MAX_TOTAL_BYTES
     {
         bail!("checkpoint journal exceeds its aggregate byte bound");
     }
@@ -686,7 +838,7 @@ fn is_head_temp_name(name: &str) -> bool {
         })
 }
 
-fn durable_publish_no_replace(
+fn durable_publish_no_replace<S: JournalSpec>(
     root: &SafeRoot,
     final_name: &std::ffi::OsStr,
     sequence: u64,
@@ -711,11 +863,11 @@ fn durable_publish_no_replace(
     cleanup_published_temp_if_linked(&temp_path, &final_path)?;
     sync_parent_directory(root.path())?;
     fence()?;
-    validate_private_state_file(&final_path, false)?;
+    validate_private_state_file::<S>(&final_path, false)?;
     Ok(())
 }
 
-fn durable_replace(
+fn durable_replace<S: JournalSpec>(
     root: &SafeRoot,
     final_name: &str,
     contents: &[u8],
@@ -736,7 +888,7 @@ fn durable_replace(
     replace_atomic(&temp_path, &final_path)?;
     sync_parent_directory(root.path())?;
     fence()?;
-    validate_private_state_file(&final_path, false)?;
+    validate_private_state_file::<S>(&final_path, false)?;
     Ok(())
 }
 
@@ -918,10 +1070,10 @@ fn cleanup_published_temp_if_linked(temp: &Path, _final_path: &Path) -> Result<(
     Ok(())
 }
 
-fn remove_bound_temp(root: &SafeRoot, name: &std::ffi::OsStr) -> Result<()> {
+fn remove_bound_temp<S: JournalSpec>(root: &SafeRoot, name: &std::ffi::OsStr) -> Result<()> {
     let path = root.direct_child(name)?;
-    let before = validate_private_state_file(&path, false)?;
-    let after = validate_private_state_file(&path, false)?;
+    let before = validate_private_state_file::<S>(&path, false)?;
+    let after = validate_private_state_file::<S>(&path, false)?;
     if before != after {
         bail!("checkpoint temp identity changed before recovery cleanup");
     }
@@ -930,7 +1082,7 @@ fn remove_bound_temp(root: &SafeRoot, name: &std::ffi::OsStr) -> Result<()> {
     root.verify()
 }
 
-fn remove_published_hardlink_residue(
+fn remove_published_hardlink_residue<S: JournalSpec>(
     root: &SafeRoot,
     temp_name: &std::ffi::OsStr,
     final_name: &std::ffi::OsStr,
@@ -949,7 +1101,7 @@ fn remove_published_hardlink_residue(
             bail!("checkpoint hard-link crash residue is not bound to its published record");
         }
         fs::remove_file(&temp).context("failed to remove checkpoint hard-link crash residue")?;
-        validate_private_state_file(&final_path, false)?;
+        validate_private_state_file::<S>(&final_path, false)?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -957,7 +1109,10 @@ fn remove_published_hardlink_residue(
 }
 
 #[cfg(unix)]
-fn validate_private_state_file(path: &Path, allow_two_links: bool) -> Result<FileIdentity> {
+fn validate_private_state_file<S: JournalSpec>(
+    path: &Path,
+    allow_two_links: bool,
+) -> Result<FileIdentity> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect checkpoint state {}", path.display()))?;
     let links_ok = metadata.nlink() == 1 || (allow_two_links && metadata.nlink() == 2);
@@ -966,7 +1121,7 @@ fn validate_private_state_file(path: &Path, allow_two_links: bool) -> Result<Fil
         || !links_ok
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.len() > MAX_RECORD_BYTES
+        || metadata.len() > S::MAX_RECORD_BYTES
     {
         bail!("checkpoint state file is not a bounded private regular file");
     }
@@ -974,7 +1129,10 @@ fn validate_private_state_file(path: &Path, allow_two_links: bool) -> Result<Fil
 }
 
 #[cfg(not(unix))]
-fn validate_private_state_file(path: &Path, _allow_two_links: bool) -> Result<FileIdentity> {
+fn validate_private_state_file<S: JournalSpec>(
+    path: &Path,
+    _allow_two_links: bool,
+) -> Result<FileIdentity> {
     bail!(
         "checkpoint state ACL validation is unsupported on this platform: {}",
         path.display()

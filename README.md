@@ -161,6 +161,40 @@ Durable sync state is stored under the Git common metadata directory at
 `$(git rev-parse --git-common-dir)/maco/state/claims.json`, so the primary
 worktree and linked agent worktrees share the same claim state.
 
+### Authenticated state migration and foundations
+
+`maco state migrate --repo . --json` is a non-mutating dry-run for legacy
+`maco/state` data. `maco state migrate --repo . --apply --json` is the explicit
+offline apply path. Migration refuses active known kernel locks, unexpected
+entries, links, non-owner files, oversized state, malformed JSON, or invalid
+legacy checksums before changing anything. Apply holds all legacy consumer
+locks, hardens the state root to `0700` and files to `0600`, then records
+claims, semantic intents, and the optional managed-worktree registry (including
+an explicit missing entry) in a signed generation-one manifest. An
+owner-private transaction outside the state root makes a crash between chmod
+and manifest publication forward-recoverable; ordinary pre-publication errors
+restore original modes, and successful apply writes an idempotent audit
+receipt.
+
+The typed authenticated-state foundation uses immutable HMAC-chained journals,
+signed atomic heads, and full-lifecycle instance locks. Snapshot stores add a
+signed stable locator containing the active journal identity, absolute
+generation and token, and retained prior terminal anchors. Rollover publishes a
+fully signed replacement generation before atomically switching that locator;
+old journals remain present and are verified on open. A missing locator, a
+substituted or deleted retained journal, or locator replay beyond the single
+record crash window fails closed. Effect WALs likewise publish a durable
+`planned` record before returning to a caller and require the ordered
+`planned -> started -> observed -> completed` reconciliation sequence.
+
+Every authenticated namespace must be registered in the first-key consumer
+registry before it can be created. The entire sensitive state root must also be
+masked from every untrusted child process; authentication does not compensate
+for exposing its key. Local HMAC evidence detects partial mutation and rollback
+relative to retained current evidence, but no local design without an external
+monotonic anchor can detect a coherent restoration of an older key, epoch,
+locator, journals, heads, and migration evidence as one whole snapshot.
+
 ## Semantic coordination
 
 Semantic coordination adds a typed blackboard of structured intents, not

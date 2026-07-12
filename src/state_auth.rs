@@ -28,6 +28,21 @@ const MAX_AUTH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const AUTH_FRAME_MAGIC: &[u8] = b"MACO\0repository-auth\0hmac-sha256\0v1\0";
 const LEGACY_ARTIFACT_DOMAIN: &[u8] = b"MACO\0artifact-finalization\0hmac-sha256\0v2\0";
 
+/// Direct children that cannot safely survive generation of a replacement
+/// repository authentication key. Keep this registry centralized so every
+/// first-key writer fails closed as new authenticated state consumers arrive.
+const AUTHENTICATED_STATE_CONSUMERS: &[(&str, &str)] = &[
+    (
+        "orchestration-checkpoints-v3",
+        "orchestration checkpoint journals",
+    ),
+    ("authenticated-effect-wals-v1", "authenticated effect WALs"),
+    (
+        "state-migration-manifests-v1",
+        "authenticated state migration manifests",
+    ),
+];
+
 #[cfg(test)]
 pub(crate) fn authentication_key_file_name() -> &'static str {
     AUTH_KEY_FILE
@@ -401,24 +416,32 @@ impl RepositoryAuthWriter {
             // key. This preserves precise diagnostics for existing markers or
             // journals while the epoch sentinel remains the final fail-closed
             // backstop for otherwise unregistered authenticated state.
-            before_first_key(&state_root)?;
             if epoch_exists {
                 bail!(
                     "repository authentication key is missing for an existing authentication epoch; refusing to generate a replacement key"
                 );
             }
-            let mut epoch = SecretKey([0_u8; AUTH_EPOCH_BYTES]);
-            fill_os_random(&mut epoch.0)?;
-            AtomicStateWriter::scavenge_direct_temps(&state_root, AUTH_EPOCH_FILE)?;
-            AtomicStateWriter::write_direct_fenced(&state_root, AUTH_EPOCH_FILE, &epoch.0, || {
-                lock.verify(&state_root)
-            })?;
+            validate_registered_consumers_before_first_key(&state_root)?;
+            before_first_key(&state_root)?;
             let mut key = SecretKey([0_u8; AUTH_KEY_BYTES]);
             fill_os_random(&mut key.0)?;
             AtomicStateWriter::scavenge_direct_temps(&state_root, AUTH_KEY_FILE)?;
             AtomicStateWriter::write_direct_fenced(&state_root, AUTH_KEY_FILE, &key.0, || {
                 lock.verify(&state_root)
             })?;
+            run_key_bootstrap_fault(KeyBootstrapFaultPoint::AfterKey)?;
+
+            // The key is authoritative and must become durable before the
+            // epoch sentinel. A crash between these writes is recoverable by
+            // the key-existing/epoch-missing branch below; the reverse order
+            // could strand an epoch with no recoverable authentication key.
+            let mut epoch = SecretKey([0_u8; AUTH_EPOCH_BYTES]);
+            fill_os_random(&mut epoch.0)?;
+            AtomicStateWriter::scavenge_direct_temps(&state_root, AUTH_EPOCH_FILE)?;
+            AtomicStateWriter::write_direct_fenced(&state_root, AUTH_EPOCH_FILE, &epoch.0, || {
+                lock.verify(&state_root)
+            })?;
+            run_key_bootstrap_fault(KeyBootstrapFaultPoint::AfterEpoch)?;
         } else if !epoch_exists {
             // One-time migration for repositories whose key predates the
             // epoch sentinel. The existing key remains authoritative.
@@ -428,6 +451,7 @@ impl RepositoryAuthWriter {
             AtomicStateWriter::write_direct_fenced(&state_root, AUTH_EPOCH_FILE, &epoch.0, || {
                 lock.verify(&state_root)
             })?;
+            run_key_bootstrap_fault(KeyBootstrapFaultPoint::AfterEpoch)?;
         }
         let authenticator = RepositoryAuthenticator::load(common_root, state_root)?;
         let writer = Self {
@@ -458,6 +482,56 @@ impl RepositoryAuthWriter {
         self.verify()?;
         Ok(self.authenticator)
     }
+}
+
+fn validate_registered_consumers_before_first_key(state_root: &SafeRoot) -> Result<()> {
+    state_root.verify()?;
+    for (root_name, description) in AUTHENTICATED_STATE_CONSUMERS {
+        if state_root.direct_child_exists(root_name)? {
+            bail!(
+                "repository authentication key is missing while {description} exist; refusing to establish a replacement key epoch"
+            );
+        }
+    }
+    state_root.verify()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyBootstrapFaultPoint {
+    AfterKey,
+    AfterEpoch,
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEY_BOOTSTRAP_FAULT: std::cell::Cell<Option<KeyBootstrapFaultPoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_key_bootstrap_fault(point: KeyBootstrapFaultPoint) {
+    KEY_BOOTSTRAP_FAULT.with(|slot| slot.set(Some(point)));
+}
+
+#[cfg(test)]
+fn run_key_bootstrap_fault(point: KeyBootstrapFaultPoint) -> Result<()> {
+    let should_fail = KEY_BOOTSTRAP_FAULT.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if should_fail {
+        bail!("injected repository authentication bootstrap fault after {point:?}");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn run_key_bootstrap_fault(_point: KeyBootstrapFaultPoint) -> Result<()> {
+    Ok(())
 }
 
 fn validate_auth_input(domain: AuthenticationDomain, payload: &[u8]) -> Result<()> {
@@ -784,7 +858,17 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::err_expect)]
     use super::*;
+    use git2::Repository;
+    use tempfile::TempDir;
+
+    fn repository() -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("repo");
+        let repository = Repository::init(&path).expect("repository");
+        (temp, repository.commondir().to_path_buf())
+    }
 
     #[test]
     fn sha256_matches_standard_vector() {
@@ -839,5 +923,58 @@ mod tests {
         }
         assert!(production.contains("std::ptr::write_volatile"));
         assert!(!production.contains(".fill(0)"));
+    }
+
+    #[test]
+    fn key_first_bootstrap_recovers_when_epoch_write_never_started() {
+        let (_temp, common_dir) = repository();
+        set_key_bootstrap_fault(KeyBootstrapFaultPoint::AfterKey);
+        let error = RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .err()
+            .expect("injected fault");
+        assert!(error.to_string().contains("AfterKey"));
+        let state = common_dir.join("maco/state");
+        let key = state.join(AUTH_KEY_FILE);
+        let epoch = state.join(AUTH_EPOCH_FILE);
+        let original_key = fs::read(&key).expect("durable key");
+        assert!(!epoch.exists());
+
+        let writer = RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .expect("recover missing epoch");
+        writer.verify().expect("recovered writer");
+        assert_eq!(fs::read(key).expect("preserved key"), original_key);
+        assert_eq!(fs::read(epoch).expect("epoch").len(), AUTH_EPOCH_BYTES);
+    }
+
+    #[test]
+    fn completed_epoch_write_is_idempotently_reopened_after_fault() {
+        let (_temp, common_dir) = repository();
+        set_key_bootstrap_fault(KeyBootstrapFaultPoint::AfterEpoch);
+        RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .err()
+            .expect("injected fault");
+        let state = common_dir.join("maco/state");
+        let key = fs::read(state.join(AUTH_KEY_FILE)).expect("key");
+        let epoch = fs::read(state.join(AUTH_EPOCH_FILE)).expect("epoch");
+
+        let writer = RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .expect("idempotent reopen");
+        writer.verify().expect("writer");
+        assert_eq!(fs::read(state.join(AUTH_KEY_FILE)).expect("key"), key);
+        assert_eq!(fs::read(state.join(AUTH_EPOCH_FILE)).expect("epoch"), epoch);
+    }
+
+    #[test]
+    fn registered_authenticated_consumer_refuses_first_key() {
+        let (_temp, common_dir) = repository();
+        let state = SafeRoot::open_or_create(common_dir.join("maco/state")).expect("state root");
+        SafeRoot::open_or_create(state.path().join("authenticated-effect-wals-v1"))
+            .expect("consumer root");
+
+        let error = RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .err()
+            .expect("must refuse rekey");
+        assert!(error.to_string().contains("authenticated effect WALs"));
+        assert!(!state.path().join(AUTH_KEY_FILE).exists());
     }
 }

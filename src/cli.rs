@@ -32,6 +32,7 @@ use crate::{
     semantic_coord::{
         SemanticCoordinationReport, SemanticIntentRequest, SemanticIntentStore, SemanticIntentToken,
     },
+    state_migration,
     supervise::{self, SupervisorRunOptions},
     sync::ClaimToken,
     sync_store::{OwnerReport, SyncStore},
@@ -65,6 +66,7 @@ impl Cli {
                 print_repository_info(&info, args.json)
             }
             Command::Repo(command) => command.run(),
+            Command::State(command) => command.run(),
             Command::Worktree(command) => command.run(),
             Command::Merge(command) => command.run(),
             Command::Live(command) => command.run(),
@@ -90,6 +92,8 @@ enum Command {
     Init(InitArgs),
     /// Inspect repository structure.
     Repo(RepoCommand),
+    /// Inspect or explicitly migrate repository-local durable state.
+    State(StateCommand),
     /// Manage linked Git worktrees for sub-agents.
     Worktree(WorktreeCommand),
     /// Collect and apply merge candidates from agent worktrees.
@@ -130,6 +134,42 @@ struct InitArgs {
     /// Initial branch name for a new repository.
     #[arg(long, default_value = "main")]
     initial_branch: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StateCommand {
+    #[command(subcommand)]
+    command: StateSubcommand,
+}
+
+impl StateCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            StateSubcommand::Migrate(args) => {
+                let report = state_migration::migrate_repository_state(args.repo, args.apply)?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum StateSubcommand {
+    /// Validate legacy state, or apply its offline authenticated migration.
+    Migrate(MigrateStateArgs),
+}
+
+#[derive(Debug, Args)]
+struct MigrateStateArgs {
+    /// Repository path. Dry-run is the default and never changes state.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Apply the validated migration; requires every known state lock to be idle.
+    #[arg(long)]
+    apply: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
