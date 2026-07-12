@@ -19,6 +19,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+use std::{io::Read, os::unix::fs::FileTypeExt};
+
 #[cfg(unix)]
 use std::{
     ffi::{CStr, CString, OsStr},
@@ -30,11 +33,15 @@ use std::{
     },
 };
 
-const ARTIFACT_FORMAT_VERSION: u32 = 1;
+const ARTIFACT_FORMAT_VERSION: u32 = 2;
 const FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const RUN_LOCK_FILE: &str = ".artifact.lock";
 const ROOT_LOCK_FILE: &str = ".runs.lock";
 const QUARANTINE_DIRECTORY: &str = ".quarantine";
+const ARTIFACT_MAC_KEY_FILE: &str = "artifact_finalization_hmac_v1.key";
+const ARTIFACT_MAC_KEY_LOCK: &str = "artifact_finalization_hmac_v1.lock";
+const ARTIFACT_MAC_KEY_BYTES: usize = 32;
+const ARTIFACT_MAC_DOMAIN: &[u8] = b"MACO\0artifact-finalization\0hmac-sha256\0v2\0";
 const MAX_FINALIZATION_BYTES: u64 = 512 * 1024;
 const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARTIFACT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -42,7 +49,6 @@ const MAX_ARTIFACT_FILES: usize = 4_096;
 const MAX_ARTIFACT_PATH_BYTES: usize = 4_096;
 const MAX_ARTIFACT_PATH_COMPONENTS: usize = 64;
 const MAX_PRODUCER_BYTES: usize = 128;
-const MAX_QUARANTINE_ENTRIES: usize = 4_096;
 static RESERVATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -154,6 +160,7 @@ pub struct RunArtifactPruneReport {
     pub dry_run: bool,
     pub kept_count: usize,
     pub deleted_count: usize,
+    pub refused_unfinalized_count: usize,
     pub delete_candidate_count: usize,
     pub entries: Vec<RunArtifactPruneEntry>,
 }
@@ -163,6 +170,8 @@ pub struct RunArtifactPruneEntry {
     pub run_id: String,
     pub run_dir: PathBuf,
     pub action: RunArtifactPruneAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -171,6 +180,7 @@ pub enum RunArtifactPruneAction {
     Keep,
     Delete,
     WouldDelete,
+    RefuseUnfinalized,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -221,6 +231,7 @@ struct ArtifactRepositoryBinding {
 #[derive(Debug, Clone)]
 struct ArtifactRepository {
     binding: ArtifactRepositoryBinding,
+    common_dir: PathBuf,
     worktree: PathBuf,
 }
 
@@ -236,6 +247,8 @@ pub struct ArtifactFinalization {
     pub run_id: String,
     pub provenance: ArtifactProvenance,
     pub writer_evidence: ArtifactWriterEvidence,
+    pub mac_key_id: String,
+    pub mac_key_identity: FileIdentity,
     pub final_report: PathBuf,
     pub files: Vec<ArtifactFileRecord>,
     pub publish_requested: bool,
@@ -244,10 +257,11 @@ pub struct ArtifactFinalization {
     /// disposition into the atomic final marker. Readers revalidate all of
     /// those facts before exposing this value as trusted state.
     pub publishable: bool,
+    hmac_sha256: String,
 }
 
 pub struct ArtifactRunWriter {
-    repository: ArtifactRepositoryBinding,
+    repository: ArtifactRepository,
     family: RunArtifactFamily,
     run_id: RunId,
     run_root: SafeRoot,
@@ -256,12 +270,193 @@ pub struct ArtifactRunWriter {
     writer_evidence: ArtifactWriterEvidence,
     files: BTreeMap<PathBuf, ArtifactFileRecord>,
     total_bytes: u64,
-    _run_lock: KernelStateLock,
+    run_lock: BoundArtifactLock,
 }
 
 pub struct ArtifactRunReader {
     run: SafeRoot,
     finalization: ArtifactFinalization,
+}
+
+/// A kernel lock plus the inode that its pathname named at acquisition. MACO
+/// revalidates the path before and after mutations so replacing a live lock
+/// file cannot silently create two independent lock domains. An arbitrary
+/// uncooperative process running as the same OS user remains outside this
+/// cooperative lock boundary and requires an OS sandbox for isolation.
+struct BoundArtifactLock {
+    lock: KernelStateLock,
+    root_identity: FileIdentity,
+    lock_identity: FileIdentity,
+}
+
+struct ArtifactMacKey {
+    root: SafeRoot,
+    bytes: [u8; ARTIFACT_MAC_KEY_BYTES],
+    identity: FileIdentity,
+    key_id: String,
+}
+
+struct ArtifactMacKeyWriter {
+    key: ArtifactMacKey,
+    lock: BoundArtifactLock,
+}
+
+impl BoundArtifactLock {
+    fn acquire(root: &SafeRoot, name: &str) -> Result<Self> {
+        let lock = KernelStateLock::acquire_direct(root, name)?;
+        let lock_identity = ensure_private_regular_file(lock.path())?;
+        let bound = Self {
+            lock,
+            root_identity: root.identity().clone(),
+            lock_identity,
+        };
+        bound.verify(root)?;
+        Ok(bound)
+    }
+
+    fn verify(&self, root: &SafeRoot) -> Result<()> {
+        root.verify()?;
+        if self.root_identity != *root.identity() {
+            bail!("artifact lock was presented with a different root inode");
+        }
+        let name = self
+            .lock
+            .path()
+            .file_name()
+            .context("artifact lock path has no file name")?;
+        let observed = ensure_private_regular_file(&root.path().join(name)).with_context(|| {
+            format!(
+                "artifact lock path no longer names its acquired inode: {}",
+                root.path().join(name).display()
+            )
+        })?;
+        if observed != self.lock_identity {
+            bail!(
+                "artifact lock path was rebound while its original inode remained locked: {}",
+                root.path().join(name).display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn finish_with_artifact_lock_verification<T>(
+    result: Result<T>,
+    verification: Result<()>,
+) -> Result<T> {
+    match (result, verification) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(lock_error)) => Err(lock_error),
+        (Err(error), Err(lock_error)) => Err(error.context(format!(
+            "operation also lost its stable artifact lock-path binding: {lock_error:#}"
+        ))),
+    }
+}
+
+impl ArtifactMacKey {
+    fn open_existing(repository: &ArtifactRepository) -> Result<Self> {
+        let state_path = repository.common_dir.join("maco").join("state");
+        let root = SafeRoot::open_existing(&state_path).with_context(|| {
+            format!(
+                "artifact finalization key state is missing or unsafe: {}",
+                state_path.display()
+            )
+        })?;
+        ensure_private_directory(root.path())?;
+        Self::load(&root)
+    }
+
+    fn load(root: &SafeRoot) -> Result<Self> {
+        if !root.direct_child_exists(ARTIFACT_MAC_KEY_FILE)? {
+            bail!("artifact finalization MAC key is missing");
+        }
+        let identity = ensure_private_regular_file(&root.path().join(ARTIFACT_MAC_KEY_FILE))?;
+        let contents = BoundedRegularReader::read_direct(
+            root,
+            ARTIFACT_MAC_KEY_FILE,
+            ARTIFACT_MAC_KEY_BYTES as u64,
+        )?;
+        let bytes: [u8; ARTIFACT_MAC_KEY_BYTES] =
+            contents.try_into().map_err(|contents: Vec<u8>| {
+                anyhow::anyhow!(
+                    "artifact finalization MAC key has invalid length {} (expected {})",
+                    contents.len(),
+                    ARTIFACT_MAC_KEY_BYTES
+                )
+            })?;
+        let key = Self {
+            root: root.clone(),
+            key_id: sha256_hex(&bytes),
+            bytes,
+            identity,
+        };
+        key.verify()?;
+        Ok(key)
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.root.verify()?;
+        let result = (|| -> Result<()> {
+            let observed =
+                ensure_private_regular_file(&self.root.path().join(ARTIFACT_MAC_KEY_FILE))?;
+            if observed != self.identity {
+                bail!("artifact finalization MAC key inode was replaced");
+            }
+            let contents = BoundedRegularReader::read_direct(
+                &self.root,
+                ARTIFACT_MAC_KEY_FILE,
+                ARTIFACT_MAC_KEY_BYTES as u64,
+            )?;
+            if !constant_time_eq(&contents, &self.bytes) {
+                bail!("artifact finalization MAC key contents changed");
+            }
+            Ok(())
+        })();
+        finish_with_artifact_lock_verification(result, self.root.verify())
+    }
+}
+
+impl ArtifactMacKeyWriter {
+    fn open(repository: &ArtifactRepository) -> Result<Self> {
+        let state_path = repository.common_dir.join("maco").join("state");
+        let existed = fs::symlink_metadata(&state_path).is_ok();
+        let root = match SafeRoot::open_or_create(&state_path) {
+            Ok(root) => root,
+            Err(error) if existed => bail!(
+                "existing artifact-key state root is not owner-private; refusing automatic permission changes: {error:#}"
+            ),
+            Err(error) => return Err(error).context("failed to create artifact-key state root"),
+        };
+        ensure_private_directory(root.path())?;
+        let lock = BoundArtifactLock::acquire(&root, ARTIFACT_MAC_KEY_LOCK)?;
+        lock.verify(&root)?;
+        let result = (|| -> Result<ArtifactMacKey> {
+            if !root.direct_child_exists(ARTIFACT_MAC_KEY_FILE)? {
+                if bounded_existing_finalization_marker(repository)? {
+                    bail!(
+                        "artifact finalization MAC key is missing while an existing final marker is present; refusing to generate a replacement key"
+                    );
+                }
+                let mut bytes = [0u8; ARTIFACT_MAC_KEY_BYTES];
+                fill_os_random(&mut bytes)?;
+                AtomicStateWriter::scavenge_direct_temps(&root, ARTIFACT_MAC_KEY_FILE)?;
+                AtomicStateWriter::write_direct(&root, ARTIFACT_MAC_KEY_FILE, &bytes)?;
+                lock.verify(&root)?;
+            }
+            ArtifactMacKey::load(&root)
+        })();
+        let key = finish_with_artifact_lock_verification(result, lock.verify(&root))?;
+        let writer = Self { key, lock };
+        writer.verify()?;
+        Ok(writer)
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.lock.verify(&self.key.root)?;
+        let result = self.key.verify();
+        finish_with_artifact_lock_verification(result, self.lock.verify(&self.key.root))
+    }
 }
 
 impl ArtifactRunWriter {
@@ -274,30 +469,6 @@ impl ArtifactRunWriter {
         let producer = producer.into();
         validate_producer(&producer)?;
         let repository = discover_artifact_repository(repo.as_ref())?;
-        let run_root = open_or_create_run_root(&repository, family)?;
-        ensure_private_directory(run_root.path()).context(
-            "ArtifactRunWriter requires an owner-private 0700 run root; legacy roots remain readable/nonpublishable but must be inspected and migrated before finalized writes",
-        )?;
-        let root_lock = KernelStateLock::acquire_direct(&run_root, ROOT_LOCK_FILE)?;
-        if run_root.direct_child_exists(run_id.as_str())? {
-            bail!(
-                "{} run id '{}' already exists at {}; choose a new --run-id or prune old artifacts first",
-                family.label(),
-                run_id.as_str(),
-                run_root.path().join(run_id.as_str()).display()
-            );
-        }
-        let reserved = run_root.reserve_direct_child_directory(run_id.as_str())?;
-        let run = SafeRoot::open_or_create(reserved.path())?;
-        let run_lock = KernelStateLock::acquire_direct(&run, RUN_LOCK_FILE)?;
-        let writer_evidence = ArtifactWriterEvidence {
-            run_root_identity: run_root.identity().clone(),
-            run_identity: run.identity().clone(),
-            writer_lock_identity: identity_for_path(run_lock.path())?,
-            reservation_id: reservation_evidence_id(run_id.as_str(), run.identity()),
-        };
-        drop(root_lock);
-
         let repo_handle = Repository::discover(&repository.worktree).with_context(|| {
             format!(
                 "failed to reopen artifact repository {}",
@@ -313,19 +484,46 @@ impl ArtifactRunWriter {
             producer,
             source_revision,
         };
+        let run_root = open_or_create_run_root(&repository, family)?;
+        ensure_private_directory(run_root.path()).context(
+            "ArtifactRunWriter requires an owner-private 0700 run root; legacy roots remain readable/nonpublishable but must be inspected and migrated before finalized writes",
+        )?;
+        let root_lock = BoundArtifactLock::acquire(&run_root, ROOT_LOCK_FILE)?;
+        root_lock.verify(&run_root)?;
+        let result = (|| -> Result<Self> {
+            if run_root.direct_child_exists(run_id.as_str())? {
+                bail!(
+                    "{} run id '{}' already exists at {}; choose a new --run-id or prune old artifacts first",
+                    family.label(),
+                    run_id.as_str(),
+                    run_root.path().join(run_id.as_str()).display()
+                );
+            }
+            let reserved = run_root.reserve_direct_child_directory(run_id.as_str())?;
+            let run = SafeRoot::open_or_create(reserved.path())?;
+            let run_lock = BoundArtifactLock::acquire(&run, RUN_LOCK_FILE)?;
+            let writer_evidence = ArtifactWriterEvidence {
+                run_root_identity: run_root.identity().clone(),
+                run_identity: run.identity().clone(),
+                writer_lock_identity: run_lock.lock_identity.clone(),
+                reservation_id: reservation_evidence_id(run_id.as_str(), run.identity()),
+            };
+            run_lock.verify(&run)?;
 
-        Ok(Self {
-            repository: repository.binding,
-            family,
-            run_id,
-            run_root,
-            run,
-            provenance,
-            writer_evidence,
-            files: BTreeMap::new(),
-            total_bytes: 0,
-            _run_lock: run_lock,
-        })
+            Ok(Self {
+                repository,
+                family,
+                run_id,
+                run_root: run_root.clone(),
+                run,
+                provenance,
+                writer_evidence,
+                files: BTreeMap::new(),
+                total_bytes: 0,
+                run_lock,
+            })
+        })();
+        finish_with_artifact_lock_verification(result, root_lock.verify(&run_root))
     }
 
     pub fn run_dir(&self) -> &Path {
@@ -338,63 +536,67 @@ impl ArtifactRunWriter {
         contents: &[u8],
         disposition: ArtifactFileDisposition,
     ) -> Result<ArtifactFileRecord> {
-        let relative = validate_artifact_relative_path(relative.as_ref())?;
-        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_ARTIFACT_FILE_BYTES {
-            bail!(
-                "artifact file exceeds its {} byte limit: {}",
+        self.run_lock.verify(&self.run)?;
+        let result = (|| -> Result<ArtifactFileRecord> {
+            let relative = validate_artifact_relative_path(relative.as_ref())?;
+            if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_ARTIFACT_FILE_BYTES {
+                bail!(
+                    "artifact file exceeds its {} byte limit: {}",
+                    MAX_ARTIFACT_FILE_BYTES,
+                    relative.display()
+                );
+            }
+            let previous_bytes = self
+                .files
+                .get(&relative)
+                .map(|record| record.bytes)
+                .unwrap_or(0);
+            let proposed_total = self
+                .total_bytes
+                .checked_sub(previous_bytes)
+                .and_then(|total| total.checked_add(u64::try_from(contents.len()).ok()?))
+                .context("artifact byte accounting overflow")?;
+            if proposed_total > MAX_ARTIFACT_TOTAL_BYTES {
+                bail!(
+                    "artifact run exceeds its {} byte aggregate limit",
+                    MAX_ARTIFACT_TOTAL_BYTES
+                );
+            }
+            if !self.files.contains_key(&relative) && self.files.len() >= MAX_ARTIFACT_FILES {
+                bail!(
+                    "artifact run exceeds its {} file manifest limit",
+                    MAX_ARTIFACT_FILES
+                );
+            }
+
+            let (parent, file_name) = artifact_parent_and_name(&self.run, &relative, true)?;
+            AtomicStateWriter::scavenge_direct_temps(&parent, file_name)?;
+            AtomicStateWriter::write_direct(&parent, file_name, contents)
+                .with_context(|| format!("failed to write artifact file {}", relative.display()))?;
+            ensure_private_regular_file(&self.run.path().join(&relative))?;
+            let observed = BoundedRegularReader::read_relative(
+                self.run.path(),
+                &relative,
                 MAX_ARTIFACT_FILE_BYTES,
-                relative.display()
-            );
-        }
-        let previous_bytes = self
-            .files
-            .get(&relative)
-            .map(|record| record.bytes)
-            .unwrap_or(0);
-        let proposed_total = self
-            .total_bytes
-            .checked_sub(previous_bytes)
-            .and_then(|total| total.checked_add(u64::try_from(contents.len()).ok()?))
-            .context("artifact byte accounting overflow")?;
-        if proposed_total > MAX_ARTIFACT_TOTAL_BYTES {
-            bail!(
-                "artifact run exceeds its {} byte aggregate limit",
-                MAX_ARTIFACT_TOTAL_BYTES
-            );
-        }
-        if !self.files.contains_key(&relative) && self.files.len() >= MAX_ARTIFACT_FILES {
-            bail!(
-                "artifact run exceeds its {} file manifest limit",
-                MAX_ARTIFACT_FILES
-            );
-        }
+            )?;
+            if observed != contents {
+                bail!(
+                    "artifact contents changed immediately after atomic write: {}",
+                    relative.display()
+                );
+            }
 
-        let (parent, file_name) = artifact_parent_and_name(&self.run, &relative, true)?;
-        AtomicStateWriter::scavenge_direct_temps(&parent, file_name)?;
-        AtomicStateWriter::write_direct(&parent, file_name, contents)
-            .with_context(|| format!("failed to write artifact file {}", relative.display()))?;
-        ensure_private_regular_file(&self.run.path().join(&relative))?;
-        let observed = BoundedRegularReader::read_relative(
-            self.run.path(),
-            &relative,
-            MAX_ARTIFACT_FILE_BYTES,
-        )?;
-        if observed != contents {
-            bail!(
-                "artifact contents changed immediately after atomic write: {}",
-                relative.display()
-            );
-        }
-
-        let record = ArtifactFileRecord {
-            path: relative.clone(),
-            bytes: u64::try_from(contents.len()).context("artifact length overflow")?,
-            sha256: sha256_hex(contents),
-            disposition,
-        };
-        self.files.insert(relative, record.clone());
-        self.total_bytes = proposed_total;
-        Ok(record)
+            let record = ArtifactFileRecord {
+                path: relative.clone(),
+                bytes: u64::try_from(contents.len()).context("artifact length overflow")?,
+                sha256: sha256_hex(contents),
+                disposition,
+            };
+            self.files.insert(relative, record.clone());
+            self.total_bytes = proposed_total;
+            Ok(record)
+        })();
+        finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
     }
 
     pub fn write_json<T: Serialize>(
@@ -414,7 +616,17 @@ impl ArtifactRunWriter {
         final_report: impl AsRef<Path>,
         publish_requested: bool,
     ) -> Result<ArtifactFinalization> {
-        let final_report = validate_artifact_relative_path(final_report.as_ref())?;
+        self.run_lock.verify(&self.run)?;
+        let result = self.finalize_locked(final_report.as_ref(), publish_requested);
+        finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
+    }
+
+    fn finalize_locked(
+        &self,
+        final_report: &Path,
+        publish_requested: bool,
+    ) -> Result<ArtifactFinalization> {
+        let final_report = validate_artifact_relative_path(final_report)?;
         if final_report != self.family.final_report_relative_path() {
             bail!(
                 "final report path {} does not match the {} artifact contract {}",
@@ -432,43 +644,53 @@ impl ArtifactRunWriter {
         let audited = audit_artifact_tree(&self.run, true)?;
         verify_manifest_paths(&self.files, &audited)?;
         verify_manifest_contents(&self.run, self.files.values())?;
-
-        let files = self.files.into_values().collect::<Vec<_>>();
-        let publishable = publish_requested
-            && self.provenance.source_revision.is_some()
-            && files
-                .iter()
-                .all(|file| file.disposition == ArtifactFileDisposition::Publishable);
-        let mut finalization = ArtifactFinalization {
-            version: ARTIFACT_FORMAT_VERSION,
-            checksum: String::new(),
-            repository: self.repository,
-            family: self.family,
-            run_id: self.run_id.as_str().to_string(),
-            provenance: self.provenance,
-            writer_evidence: self.writer_evidence,
-            final_report,
-            files,
-            publish_requested,
-            publishable,
-        };
-        validate_finalization(&finalization)?;
-        verify_writer_evidence(&finalization.writer_evidence, &self.run_root, &self.run)?;
-        finalization.checksum = finalization_checksum(&finalization)?;
-        let mut marker = serde_json::to_vec_pretty(&finalization)
-            .context("failed to serialize artifact finalization marker")?;
-        marker.push(b'\n');
-        if u64::try_from(marker.len()).unwrap_or(u64::MAX) > MAX_FINALIZATION_BYTES {
-            bail!("artifact finalization marker exceeds its bounded size");
-        }
-        AtomicStateWriter::scavenge_direct_temps(&self.run, FINALIZATION_MARKER)?;
-        AtomicStateWriter::write_direct(&self.run, FINALIZATION_MARKER, &marker)?;
-        ensure_private_regular_file(&self.run.path().join(FINALIZATION_MARKER))?;
-        let post_audit = audit_artifact_tree(&self.run, true)?;
-        verify_manifest_paths_with_marker(&finalization.files, &post_audit)?;
-        self.run.verify()?;
-        self.run_root.verify()?;
-        Ok(finalization)
+        let mac_key = ArtifactMacKeyWriter::open(&self.repository)?;
+        mac_key.verify()?;
+        let result = (|| -> Result<ArtifactFinalization> {
+            let files = self.files.values().cloned().collect::<Vec<_>>();
+            let publishable = publish_requested
+                && self.provenance.source_revision.is_some()
+                && files
+                    .iter()
+                    .all(|file| file.disposition == ArtifactFileDisposition::Publishable);
+            let mut finalization = ArtifactFinalization {
+                version: ARTIFACT_FORMAT_VERSION,
+                checksum: String::new(),
+                repository: self.repository.binding.clone(),
+                family: self.family,
+                run_id: self.run_id.as_str().to_string(),
+                provenance: self.provenance.clone(),
+                writer_evidence: self.writer_evidence.clone(),
+                mac_key_id: mac_key.key.key_id.clone(),
+                mac_key_identity: mac_key.key.identity.clone(),
+                final_report,
+                files,
+                publish_requested,
+                publishable,
+                hmac_sha256: String::new(),
+            };
+            verify_writer_evidence(&finalization.writer_evidence, &self.run_root, &self.run)?;
+            finalization.checksum = finalization_checksum(&finalization)?;
+            finalization.hmac_sha256 = finalization_hmac(&mac_key.key.bytes, &finalization)?;
+            validate_finalization(&finalization)?;
+            mac_key.verify()?;
+            let mut marker = serde_json::to_vec_pretty(&finalization)
+                .context("failed to serialize artifact finalization marker")?;
+            marker.push(b'\n');
+            if u64::try_from(marker.len()).unwrap_or(u64::MAX) > MAX_FINALIZATION_BYTES {
+                bail!("artifact finalization marker exceeds its bounded size");
+            }
+            AtomicStateWriter::scavenge_direct_temps(&self.run, FINALIZATION_MARKER)?;
+            AtomicStateWriter::write_direct(&self.run, FINALIZATION_MARKER, &marker)?;
+            ensure_private_regular_file(&self.run.path().join(FINALIZATION_MARKER))?;
+            let post_audit = audit_artifact_tree(&self.run, true)?;
+            verify_manifest_paths_with_marker(&finalization.files, &post_audit)?;
+            self.run.verify()?;
+            self.run_root.verify()?;
+            self.run_lock.verify(&self.run)?;
+            Ok(finalization)
+        })();
+        finish_with_artifact_lock_verification(result, mac_key.verify())
     }
 }
 
@@ -508,12 +730,24 @@ impl ArtifactRunReader {
             bail!("artifact finalization checksum mismatch");
         }
         validate_finalization(&finalization)?;
+        let mac_key = ArtifactMacKey::open_existing(&repository)?;
+        mac_key.verify()?;
+        if finalization.mac_key_id != mac_key.key_id
+            || finalization.mac_key_identity != mac_key.identity
+        {
+            bail!("artifact finalization MAC key binding does not match repository state");
+        }
+        let expected_mac = finalization_hmac(&mac_key.bytes, &finalization)?;
+        if !constant_time_eq(expected_mac.as_bytes(), finalization.hmac_sha256.as_bytes()) {
+            bail!("artifact finalization HMAC verification failed");
+        }
         verify_writer_evidence(&finalization.writer_evidence, &run_root, &run)?;
         let audited = audit_artifact_tree(&run, true)?;
         verify_manifest_paths_with_marker(&finalization.files, &audited)?;
         verify_manifest_contents(&run, finalization.files.iter())?;
         run.verify()?;
         run_root.verify()?;
+        mac_key.verify()?;
         Ok(Self { run, finalization })
     }
 
@@ -563,18 +797,21 @@ pub fn ensure_run_dir_available(
 ) -> Result<()> {
     let repository = discover_artifact_repository(repo)?;
     let root = open_or_create_run_root(&repository, family)?;
-    let _lock = KernelStateLock::acquire_direct(&root, ROOT_LOCK_FILE)?;
-    if root.direct_child_exists(run_id.as_str())? {
-        bail!(
-            "{} run id '{}' already exists at {}; choose a new --run-id or prune old artifacts first",
-            family.label(),
-            run_id.as_str(),
-            root.path().join(run_id.as_str()).display()
-        );
-    }
-    let reserved = root.reserve_direct_child_directory(run_id.as_str())?;
-    reserved.verify(&root)?;
-    Ok(())
+    let lock = BoundArtifactLock::acquire(&root, ROOT_LOCK_FILE)?;
+    lock.verify(&root)?;
+    let result = (|| -> Result<()> {
+        if root.direct_child_exists(run_id.as_str())? {
+            bail!(
+                "{} run id '{}' already exists at {}; choose a new --run-id or prune old artifacts first",
+                family.label(),
+                run_id.as_str(),
+                root.path().join(run_id.as_str()).display()
+            );
+        }
+        let reserved = root.reserve_direct_child_directory(run_id.as_str())?;
+        reserved.verify(&root)
+    })();
+    finish_with_artifact_lock_verification(result, lock.verify(&root))
 }
 
 pub fn resolve_run_id(
@@ -666,92 +903,142 @@ pub fn prune_runs(
     let Some(root) = open_optional_run_root(&repository, family)? else {
         return Ok(empty_prune_report(family, keep, dry_run));
     };
-    let _root_lock = KernelStateLock::acquire_direct(&root, ROOT_LOCK_FILE)?;
-    let runs = sorted_run_summaries(&repository, &root, family)?;
-    let quarantine = if dry_run {
-        None
-    } else {
-        let quarantine = open_or_create_quarantine(&root)?;
-        scavenge_quarantine(&quarantine)?;
-        Some(quarantine)
-    };
-    let mut entries = Vec::new();
-    let mut kept_count = 0usize;
-    let mut deleted_count = 0usize;
-    let mut delete_candidate_count = 0usize;
+    let root_lock = BoundArtifactLock::acquire(&root, ROOT_LOCK_FILE)?;
+    root_lock.verify(&root)?;
+    let result = (|| -> Result<RunArtifactPruneReport> {
+        let runs = sorted_run_summaries(&repository, &root, family)?;
+        let mut quarantine = None;
+        let mut entries = Vec::new();
+        let mut kept_count = 0usize;
+        let mut deleted_count = 0usize;
+        let mut refused_unfinalized_count = 0usize;
+        let mut delete_candidate_count = 0usize;
 
-    for (index, run) in runs.into_iter().enumerate() {
-        if index < keep {
-            kept_count = kept_count.saturating_add(1);
-            entries.push(RunArtifactPruneEntry {
-                run_id: run.run_id,
-                run_dir: run.run_dir,
-                action: RunArtifactPruneAction::Keep,
-            });
-            continue;
-        }
-        delete_candidate_count = delete_candidate_count.saturating_add(1);
-        if dry_run {
-            entries.push(RunArtifactPruneEntry {
-                run_id: run.run_id,
-                run_dir: run.run_dir,
-                action: RunArtifactPruneAction::WouldDelete,
-            });
-            continue;
-        }
+        for (index, run) in runs.into_iter().enumerate() {
+            if index < keep {
+                kept_count = kept_count.saturating_add(1);
+                entries.push(RunArtifactPruneEntry {
+                    run_id: run.run_id,
+                    run_dir: run.run_dir,
+                    action: RunArtifactPruneAction::Keep,
+                    reason: None,
+                });
+                continue;
+            }
+            delete_candidate_count = delete_candidate_count.saturating_add(1);
+            let run_id = RunId::new(&run.run_id)?;
+            if let Err(error) = ArtifactRunReader::open(&repository.worktree, family, &run_id) {
+                kept_count = kept_count.saturating_add(1);
+                refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                entries.push(RunArtifactPruneEntry {
+                    run_id: run.run_id,
+                    run_dir: run.run_dir,
+                    action: RunArtifactPruneAction::RefuseUnfinalized,
+                    reason: Some(format!(
+                        "refusing to prune artifact run without a valid finalization MAC: {error:#}"
+                    )),
+                });
+                continue;
+            }
+            if dry_run {
+                entries.push(RunArtifactPruneEntry {
+                    run_id: run.run_id,
+                    run_dir: run.run_dir,
+                    action: RunArtifactPruneAction::WouldDelete,
+                    reason: None,
+                });
+                continue;
+            }
 
-        let rebound = root.bind_existing_managed_direct_child_directory(&run.run_id)?;
-        if rebound.identity() != &run.identity {
-            bail!(
-                "artifact run identity changed before quarantine: {}",
-                run.run_id
-            );
-        }
-        let rebound_root = SafeRoot::open_existing(rebound.path())?;
-        let _run_lock = KernelStateLock::acquire_direct(&rebound_root, RUN_LOCK_FILE)?;
-        let quarantine = quarantine
-            .as_ref()
-            .context("artifact quarantine was not initialized")?;
-        let quarantine_name = quarantine.random_direct_child_name(&run.run_id)?;
-        rename_bound_directory(
-            &root,
-            run.run_id.as_ref(),
-            &run.identity,
-            quarantine,
-            &quarantine_name,
-        )?;
-        remove_direct_child_tree(
-            quarantine,
-            &quarantine_name,
-            Some(&run.identity),
-            TreeLinkPolicy::RejectLinksAndSpecialFiles,
-        )
-        .with_context(|| {
-            format!(
-                "artifact run '{}' was quarantined but could not be safely deleted; inspect {}",
-                run.run_id,
-                quarantine.path().join(&quarantine_name).display()
+            root_lock.verify(&root)?;
+            let rebound = root.bind_existing_managed_direct_child_directory(&run.run_id)?;
+            if rebound.identity() != &run.identity {
+                bail!(
+                    "artifact run identity changed before quarantine: {}",
+                    run.run_id
+                );
+            }
+            let rebound_root = SafeRoot::open_existing(rebound.path())?;
+            let run_lock = BoundArtifactLock::acquire(&rebound_root, RUN_LOCK_FILE)?;
+            run_lock.verify(&rebound_root)?;
+            let validation = ArtifactRunReader::open(&repository.worktree, family, &run_id);
+            let validation =
+                finish_with_artifact_lock_verification(validation, run_lock.verify(&rebound_root));
+            if let Err(error) = validation {
+                kept_count = kept_count.saturating_add(1);
+                refused_unfinalized_count = refused_unfinalized_count.saturating_add(1);
+                entries.push(RunArtifactPruneEntry {
+                    run_id: run.run_id,
+                    run_dir: run.run_dir,
+                    action: RunArtifactPruneAction::RefuseUnfinalized,
+                    reason: Some(format!(
+                        "refusing to prune artifact run that lost valid finalization while waiting for its writer lock: {error:#}"
+                    )),
+                });
+                continue;
+            }
+            root_lock.verify(&root)?;
+            if quarantine.is_none() {
+                let created = open_or_create_quarantine(&root)?;
+                ensure_quarantine_empty(&created)?;
+                quarantine = Some(created);
+            }
+            let quarantine = quarantine
+                .as_ref()
+                .context("artifact quarantine unavailable")?;
+            let quarantine_name = quarantine.random_direct_child_name(&run.run_id)?;
+            rename_bound_directory(
+                &root,
+                run.run_id.as_ref(),
+                &run.identity,
+                quarantine,
+                &quarantine_name,
+            )?;
+            let quarantined_run =
+                SafeRoot::open_existing(quarantine.path().join(&quarantine_name))?;
+            run_lock.verify(&quarantined_run)?;
+            // The acquired run-lock inode is deliberately removed with the now
+            // quarantined run. Its pathname identity is therefore revalidated
+            // after the rename and immediately before the bounded tree deletion;
+            // the root lock continues to protect the family namespace afterward.
+            remove_direct_child_tree(
+                quarantine,
+                &quarantine_name,
+                Some(&run.identity),
+                TreeLinkPolicy::RejectLinksAndSpecialFiles,
             )
-        })?;
-        deleted_count = deleted_count.saturating_add(1);
-        entries.push(RunArtifactPruneEntry {
-            run_id: run.run_id,
-            run_dir: run.run_dir,
-            action: RunArtifactPruneAction::Delete,
-        });
-    }
+            .with_context(|| {
+                format!(
+                    "artifact run '{}' was quarantined but could not be safely deleted; inspect {}",
+                    run.run_id,
+                    quarantine.path().join(&quarantine_name).display()
+                )
+            })?;
+            root_lock.verify(&root)?;
+            deleted_count = deleted_count.saturating_add(1);
+            entries.push(RunArtifactPruneEntry {
+                run_id: run.run_id,
+                run_dir: run.run_dir,
+                action: RunArtifactPruneAction::Delete,
+                reason: None,
+            });
+        }
 
-    Ok(RunArtifactPruneReport {
-        family,
-        run_root: family.run_root(),
-        ordering: artifact_ordering(),
-        keep,
-        dry_run,
-        kept_count,
-        deleted_count,
-        delete_candidate_count,
-        entries,
-    })
+        root_lock.verify(&root)?;
+        Ok(RunArtifactPruneReport {
+            family,
+            run_root: family.run_root(),
+            ordering: artifact_ordering(),
+            keep,
+            dry_run,
+            kept_count,
+            deleted_count,
+            refused_unfinalized_count,
+            delete_candidate_count,
+            entries,
+        })
+    })();
+    finish_with_artifact_lock_verification(result, root_lock.verify(&root))
 }
 
 pub fn artifact_ordering() -> &'static str {
@@ -790,8 +1077,132 @@ fn discover_artifact_repository(repo_path: &Path) -> Result<ArtifactRepository> 
             worktree_path_checksum: stable_checksum(&filesystem_path_bytes(worktree_root.path())),
             worktree_identity: worktree_root.identity().clone(),
         },
+        common_dir: common_root.path().to_path_buf(),
         worktree: worktree_root.path().to_path_buf(),
     })
+}
+
+fn bounded_existing_finalization_marker(repository: &ArtifactRepository) -> Result<bool> {
+    let mut entries = 0usize;
+    for family in [
+        RunArtifactFamily::Autopilot,
+        RunArtifactFamily::Consult,
+        RunArtifactFamily::Inbox,
+        RunArtifactFamily::Supervise,
+    ] {
+        let Some(root) = open_optional_run_root(repository, family)? else {
+            continue;
+        };
+        root.verify()?;
+        for entry in fs::read_dir(root.path()).with_context(|| {
+            format!(
+                "failed to scan {} artifacts before MAC-key creation",
+                family.label()
+            )
+        })? {
+            entries = entries
+                .checked_add(1)
+                .context("artifact marker scan entry count overflow")?;
+            if entries > MAX_RUN_ROOT_ENTRIES.saturating_mul(8) {
+                bail!("artifact marker scan exceeded its global entry budget");
+            }
+            let entry = entry.context("failed to inspect artifact marker-scan entry")?;
+            let name = entry.file_name();
+            if name == ROOT_LOCK_FILE {
+                ensure_private_regular_file(&entry.path())?;
+                continue;
+            }
+            if name == QUARANTINE_DIRECTORY {
+                let quarantine = root.bind_existing_direct_child_directory(&name)?;
+                let quarantine = SafeRoot::open_existing(quarantine.path())?;
+                if bounded_marker_in_quarantine(&quarantine, &mut entries)? {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let run = root.bind_existing_managed_direct_child_directory(&name)?;
+            let run = SafeRoot::open_existing(run.path())?;
+            if run.direct_child_exists(FINALIZATION_MARKER)? {
+                return Ok(true);
+            }
+        }
+        root.verify()?;
+    }
+    Ok(false)
+}
+
+fn bounded_marker_in_quarantine(quarantine: &SafeRoot, entries: &mut usize) -> Result<bool> {
+    quarantine.verify()?;
+    for entry in fs::read_dir(quarantine.path()).with_context(|| {
+        format!(
+            "failed to scan artifact quarantine {} for final markers",
+            quarantine.path().display()
+        )
+    })? {
+        *entries = entries
+            .checked_add(1)
+            .context("artifact quarantine marker count overflow")?;
+        if *entries > MAX_RUN_ROOT_ENTRIES.saturating_mul(8) {
+            bail!("artifact marker scan exceeded its global entry budget");
+        }
+        let entry = entry.context("failed to inspect quarantined artifact run")?;
+        let run = quarantine.bind_existing_managed_direct_child_directory(entry.file_name())?;
+        let run = SafeRoot::open_existing(run.path())?;
+        if run.direct_child_exists(FINALIZATION_MARKER)? {
+            return Ok(true);
+        }
+    }
+    quarantine.verify()?;
+    Ok(false)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fill_os_random(bytes: &mut [u8]) -> Result<()> {
+    let mut filled = 0usize;
+    while filled < bytes.len() {
+        let result = unsafe {
+            libc::getrandom(
+                bytes[filled..].as_mut_ptr().cast(),
+                bytes.len().saturating_sub(filled),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("OS getrandom failed for artifact MAC key");
+        }
+        let read = usize::try_from(result).context("OS random byte count overflow")?;
+        if read == 0 {
+            bail!("OS getrandom returned zero bytes for artifact MAC key");
+        }
+        filled = filled
+            .checked_add(read)
+            .context("OS random fill count overflow")?;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn fill_os_random(bytes: &mut [u8]) -> Result<()> {
+    let mut source = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/dev/urandom")
+        .context("failed to open OS random source")?;
+    if !source.metadata()?.file_type().is_char_device() {
+        bail!("OS random source is not a character device");
+    }
+    source
+        .read_exact(bytes)
+        .context("failed to read artifact MAC key from OS random source")
+}
+
+#[cfg(not(unix))]
+fn fill_os_random(_bytes: &mut [u8]) -> Result<()> {
+    bail!("artifact MAC key generation requires a supported OS random source")
 }
 
 fn open_or_create_run_root(
@@ -1029,6 +1440,7 @@ fn empty_prune_report(
         dry_run,
         kept_count: 0,
         deleted_count: 0,
+        refused_unfinalized_count: 0,
         delete_candidate_count: 0,
         entries: Vec::new(),
     }
@@ -1043,38 +1455,21 @@ fn open_or_create_quarantine(root: &SafeRoot) -> Result<SafeRoot> {
     SafeRoot::open_or_create(binding.path())
 }
 
-fn scavenge_quarantine(quarantine: &SafeRoot) -> Result<()> {
+fn ensure_quarantine_empty(quarantine: &SafeRoot) -> Result<()> {
     quarantine.verify()?;
-    let mut count = 0usize;
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(quarantine.path()).with_context(|| {
+    let mut entries = fs::read_dir(quarantine.path()).with_context(|| {
         format!(
             "failed to inspect artifact quarantine {}",
             quarantine.path().display()
         )
-    })? {
-        count = count
-            .checked_add(1)
-            .context("artifact quarantine entry count overflow")?;
-        if count > MAX_QUARANTINE_ENTRIES {
-            bail!(
-                "artifact quarantine exceeds its {} entry budget",
-                MAX_QUARANTINE_ENTRIES
-            );
-        }
+    })?;
+    if let Some(entry) = entries.next() {
         let entry = entry.context("failed to inspect artifact quarantine entry")?;
-        let binding = quarantine.bind_existing_managed_direct_child_directory(entry.file_name())?;
-        entries.push((entry.file_name(), binding.identity().clone()));
-    }
-    for (name, identity) in entries {
-        let run = SafeRoot::open_existing(quarantine.path().join(&name))?;
-        let _lock = KernelStateLock::acquire_direct(&run, RUN_LOCK_FILE)?;
-        remove_direct_child_tree(
-            quarantine,
-            &name,
-            Some(&identity),
-            TreeLinkPolicy::RejectLinksAndSpecialFiles,
-        )?;
+        quarantine.bind_existing_managed_direct_child_directory(entry.file_name())?;
+        bail!(
+            "artifact quarantine contains crash residue; refusing automatic deletion until its finalization marker and contents are inspected: {}",
+            entry.path().display()
+        );
     }
     quarantine.verify()
 }
@@ -1172,8 +1567,19 @@ fn validate_producer(producer: &str) -> Result<()> {
 }
 
 fn validate_finalization(finalization: &ArtifactFinalization) -> Result<()> {
+    if finalization.version != ARTIFACT_FORMAT_VERSION {
+        bail!("artifact finalization format version is unsupported");
+    }
     validate_producer(&finalization.provenance.producer)?;
     validate_writer_evidence(&finalization.writer_evidence)?;
+    if !is_canonical_lower_hex_64(&finalization.mac_key_id)
+        || finalization.mac_key_identity.file == 0
+    {
+        bail!("artifact finalization MAC key evidence is malformed");
+    }
+    if !is_canonical_lower_hex_64(&finalization.hmac_sha256) {
+        bail!("artifact finalization HMAC is malformed");
+    }
     let run_id = RunId::new(&finalization.run_id)?;
     if run_id.as_str() != finalization.run_id {
         bail!("artifact finalization run id is not canonical");
@@ -1209,8 +1615,7 @@ fn validate_finalization(finalization: &ArtifactFinalization) -> Result<()> {
         if total > MAX_ARTIFACT_TOTAL_BYTES {
             bail!("artifact manifest exceeds its aggregate byte limit");
         }
-        if record.sha256.len() != 64 || !record.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
+        if !is_canonical_lower_hex_64(&record.sha256) {
             bail!("artifact file record has an invalid SHA-256 digest");
         }
     }
@@ -1296,6 +1701,8 @@ fn finalization_checksum(finalization: &ArtifactFinalization) -> Result<String> 
         &finalization.run_id,
         &finalization.provenance,
         &finalization.writer_evidence,
+        &finalization.mac_key_id,
+        &finalization.mac_key_identity,
         &finalization.final_report,
         &finalization.files,
         finalization.publish_requested,
@@ -1681,6 +2088,10 @@ fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
 }
 
 fn sha256_hex(input: &[u8]) -> String {
+    hex_encode(&sha256_bytes(input))
+}
+
+fn sha256_bytes(input: &[u8]) -> [u8; 32] {
     const INITIAL: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -1697,7 +2108,9 @@ fn sha256_hex(input: &[u8]) -> String {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
-    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let bit_len = u64::try_from(input.len())
+        .unwrap_or(u64::MAX)
+        .wrapping_mul(8);
     let mut message = input.to_vec();
     message.push(0x80);
     while message.len() % 64 != 56 {
@@ -1752,7 +2165,89 @@ fn sha256_hex(input: &[u8]) -> String {
         hash[6] = hash[6].wrapping_add(g);
         hash[7] = hash[7].wrapping_add(h);
     }
-    hash.iter().map(|word| format!("{word:08x}")).collect()
+    let mut output = [0u8; 32];
+    for (index, word) in hash.iter().enumerate() {
+        let offset = index.saturating_mul(4);
+        output[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    output
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut padded_key = [0u8; 64];
+    if key.len() > padded_key.len() {
+        padded_key[..32].copy_from_slice(&sha256_bytes(key));
+    } else {
+        padded_key[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; 64];
+    let mut outer_pad = [0x5cu8; 64];
+    for index in 0..64 {
+        inner_pad[index] ^= padded_key[index];
+        outer_pad[index] ^= padded_key[index];
+    }
+    let mut inner = Vec::with_capacity(inner_pad.len().saturating_add(message.len()));
+    inner.extend_from_slice(&inner_pad);
+    inner.extend_from_slice(message);
+    let inner_digest = sha256_bytes(&inner);
+    let mut outer = Vec::with_capacity(outer_pad.len().saturating_add(inner_digest.len()));
+    outer.extend_from_slice(&outer_pad);
+    outer.extend_from_slice(&inner_digest);
+    sha256_bytes(&outer)
+}
+
+fn finalization_hmac(
+    key: &[u8; ARTIFACT_MAC_KEY_BYTES],
+    finalization: &ArtifactFinalization,
+) -> Result<String> {
+    let canonical = serde_json::to_vec(&(
+        finalization.version,
+        &finalization.checksum,
+        &finalization.repository,
+        finalization.family,
+        &finalization.run_id,
+        &finalization.provenance,
+        &finalization.writer_evidence,
+        &finalization.mac_key_id,
+        &finalization.mac_key_identity,
+        &finalization.final_report,
+        &finalization.files,
+        finalization.publish_requested,
+        finalization.publishable,
+    ))
+    .context("failed to encode canonical artifact HMAC payload")?;
+    let mut domain_separated =
+        Vec::with_capacity(ARTIFACT_MAC_DOMAIN.len().saturating_add(canonical.len()));
+    domain_separated.extend_from_slice(ARTIFACT_MAC_DOMAIN);
+    domain_separated.extend_from_slice(&canonical);
+    Ok(hex_encode(&hmac_sha256(key, &domain_separated)))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn is_canonical_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -1770,9 +2265,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_case_one() {
+        let key = [0x0bu8; 20];
+        assert_eq!(
+            hex_encode(&hmac_sha256(&key, b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn writer_finalizes_private_bound_digest_verified_artifacts() {
+    fn writer_finalizes_private_artifacts_and_public_evidence_cannot_forge_mac() {
         let (_temp, repo) = committed_repo();
         let run_id = RunId::new("secure-run").expect("run id");
         let mut writer = ArtifactRunWriter::reserve(
@@ -1821,25 +2325,109 @@ mod tests {
         assert_eq!(mode(&run), 0o700);
         assert_eq!(mode(&run.join("final-report.json")), 0o600);
         assert_eq!(mode(&run.join(FINALIZATION_MARKER)), 0o600);
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let key_path = repository
+            .common_dir
+            .join("maco/state")
+            .join(ARTIFACT_MAC_KEY_FILE);
+        let key_lock_path = repository
+            .common_dir
+            .join("maco/state")
+            .join(ARTIFACT_MAC_KEY_LOCK);
+        assert_eq!(mode(&key_path), 0o600);
+        assert_eq!(mode(&key_lock_path), 0o600);
 
         let marker_path = run.join(FINALIZATION_MARKER);
         let original_marker = fs::read(&marker_path).expect("marker");
-        let mut tampered: serde_json::Value =
+        let mut forged: ArtifactFinalization =
             serde_json::from_slice(&original_marker).expect("marker JSON");
-        tampered["publishable"] = serde_json::json!(false);
+        forged.provenance.producer = "legacy-writer".to_string();
+        forged.checksum = finalization_checksum(&forged).expect("public checksum");
+        forged.hmac_sha256 = "00".repeat(32);
         fs::write(
             &marker_path,
-            serde_json::to_vec_pretty(&tampered).expect("tampered marker"),
+            serde_json::to_vec_pretty(&forged).expect("forged marker"),
         )
-        .expect("tamper marker");
+        .expect("write public-evidence forgery");
         let marker_error = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
             .err()
-            .expect("marker checksum");
-        assert!(marker_error.to_string().contains("checksum mismatch"));
+            .expect("forged MAC");
+        assert!(marker_error
+            .to_string()
+            .contains("HMAC verification failed"));
+
+        let mut uppercase: ArtifactFinalization =
+            serde_json::from_slice(&original_marker).expect("marker JSON");
+        uppercase.hmac_sha256.replace_range(..1, "A");
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&uppercase).expect("uppercase marker"),
+        )
+        .expect("write uppercase MAC");
+        let uppercase_error = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .err()
+            .expect("uppercase MAC");
+        assert!(uppercase_error.to_string().contains("HMAC is malformed"));
+
+        let mut oversized: ArtifactFinalization =
+            serde_json::from_slice(&original_marker).expect("marker JSON");
+        oversized.hmac_sha256 = "0".repeat(65);
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&oversized).expect("oversized marker"),
+        )
+        .expect("write oversized MAC");
+        let oversized_error = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .err()
+            .expect("oversized MAC");
+        assert!(oversized_error.to_string().contains("HMAC is malformed"));
         fs::write(&marker_path, original_marker).expect("restore marker");
 
+        let original_key = fs::read(&key_path).expect("MAC key");
+        let moved_key = key_path.with_file_name("artifact-key.original");
+        fs::rename(&key_path, &moved_key).expect("move MAC key");
+        let missing_error = ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .err()
+            .expect("missing key");
+        assert!(missing_error.to_string().contains("MAC key is missing"));
+        assert!(
+            !key_path.exists(),
+            "reader must never recreate a missing key"
+        );
+        let rekey_error = ArtifactMacKeyWriter::open(&repository)
+            .err()
+            .expect("rekey refusal");
+        assert!(rekey_error
+            .to_string()
+            .contains("existing final marker is present"));
+        fs::rename(&moved_key, &key_path).expect("restore MAC key");
+        ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .expect("restored key");
+
+        fs::write(&key_path, [0xa5; ARTIFACT_MAC_KEY_BYTES]).expect("corrupt bound key");
+        let corrupt_key_error =
+            ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+                .err()
+                .expect("corrupt key");
+        assert!(corrupt_key_error.to_string().contains("key binding"));
+        fs::write(&key_path, &original_key).expect("restore bound key contents");
+        ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+            .expect("restored key contents");
+
+        let moved_key = key_path.with_file_name("artifact-key.bound-original");
+        fs::rename(&key_path, &moved_key).expect("move bound key");
+        write_private(&key_path, &original_key);
+        let rebound_key_error =
+            ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
+                .err()
+                .expect("rebound key");
+        assert!(rebound_key_error.to_string().contains("key binding"));
+        fs::remove_file(&key_path).expect("remove replacement key");
+        fs::rename(&moved_key, &key_path).expect("restore bound key");
+
         let lock_path = run.join(RUN_LOCK_FILE);
-        fs::remove_file(&lock_path).expect("remove bound writer lock");
+        let original_lock_path = run.join("artifact-writer-lock.original");
+        fs::rename(&lock_path, &original_lock_path).expect("move bound writer lock");
         fs::write(&lock_path, b"").expect("replacement lock");
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
             .expect("replacement lock mode");
@@ -1870,6 +2458,15 @@ mod tests {
         assert!(!summary.provenance_valid);
         assert!(!summary.artifact_digests_verified);
         assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Inbox, &run_id).is_err());
+        let prune = prune_runs(&repo, RunArtifactFamily::Inbox, 0, false)
+            .expect("legacy prune refusal report");
+        assert_eq!(prune.deleted_count, 0);
+        assert_eq!(prune.refused_unfinalized_count, 1);
+        assert_eq!(
+            prune.entries[0].action,
+            RunArtifactPruneAction::RefuseUnfinalized
+        );
+        assert!(run_dir(&repo, RunArtifactFamily::Inbox, &run_id).exists());
     }
 
     #[test]
@@ -1901,13 +2498,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prune_quarantines_before_refusing_symlink_hardlink_and_fifo() {
+    fn prune_refuses_finalized_runs_tampered_with_symlink_hardlink_and_fifo() {
         use std::os::unix::fs::symlink;
 
         for kind in ["symlink", "hardlink", "fifo"] {
             let (temp, repo) = committed_repo();
             let run_id = RunId::new(format!("unsafe-{kind}")).expect("run id");
-            ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+            let mut writer = ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Inbox,
+                run_id.clone(),
+                "inbox",
+            )
+            .expect("writer");
+            writer
+                .write_json(
+                    "final-report.json",
+                    &serde_json::json!({"status":"done"}),
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .expect("report");
+            writer
+                .finalize("final-report.json", false)
+                .expect("finalize");
             let run = run_dir(&repo, RunArtifactFamily::Inbox, &run_id);
             let external = temp.path().join(format!("external-{kind}"));
             fs::write(&external, b"keep\n").expect("external");
@@ -1921,17 +2534,16 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let error = prune_runs(&repo, RunArtifactFamily::Inbox, 0, false)
-                .expect_err("unsafe tree must not be deleted");
-            assert!(error.to_string().contains("quarantined"));
-            assert!(external.exists());
-            assert!(
-                !run.exists(),
-                "unsafe run must leave the public namespace first"
+            let report = prune_runs(&repo, RunArtifactFamily::Inbox, 0, false)
+                .expect("tampered run refusal");
+            assert_eq!(report.deleted_count, 0);
+            assert_eq!(report.refused_unfinalized_count, 1);
+            assert_eq!(
+                report.entries[0].action,
+                RunArtifactPruneAction::RefuseUnfinalized
             );
-            assert!(run_root(&repo, RunArtifactFamily::Inbox)
-                .join(QUARANTINE_DIRECTORY)
-                .exists());
+            assert!(external.exists());
+            assert!(run.exists(), "tampered run must never be deleted");
         }
     }
 
@@ -1940,7 +2552,19 @@ mod tests {
     fn prune_rejects_device_nodes_when_platform_allows_creating_one() {
         let (_temp, repo) = committed_repo();
         let run_id = RunId::new("unsafe-device").expect("run id");
-        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+        let mut writer =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Inbox, run_id.clone(), "inbox")
+                .expect("writer");
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("report");
+        writer
+            .finalize("final-report.json", false)
+            .expect("finalize");
         let device = run_dir(&repo, RunArtifactFamily::Inbox, &run_id).join("device");
         let path = CString::new(device.as_os_str().as_bytes()).expect("device path");
         let result =
@@ -1948,7 +2572,11 @@ mod tests {
         if result != 0 {
             return;
         }
-        assert!(prune_runs(&repo, RunArtifactFamily::Inbox, 0, false).is_err());
+        let report =
+            prune_runs(&repo, RunArtifactFamily::Inbox, 0, false).expect("device refusal report");
+        assert_eq!(report.deleted_count, 0);
+        assert_eq!(report.refused_unfinalized_count, 1);
+        assert!(device.exists());
     }
 
     #[cfg(unix)]
@@ -1979,18 +2607,136 @@ mod tests {
         assert!(root.path().join("moved-original").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rebound_artifact_root_run_and_key_locks_fail_closed() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("rebound-run-lock").expect("run id");
+        let mut writer =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Autopilot, run_id, "autopilot")
+                .expect("writer");
+        let run_lock_path = writer.run_lock.lock.path().to_path_buf();
+        let old_run_lock = run_lock_path.with_file_name("artifact.lock.original");
+        fs::rename(&run_lock_path, &old_run_lock).expect("move run lock");
+        write_private(&run_lock_path, b"");
+        let replacement_run_lock =
+            BoundArtifactLock::acquire(&writer.run, RUN_LOCK_FILE).expect("replacement run lock");
+        let run_error = writer
+            .write_bytes(
+                "final-report.json",
+                b"{}\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect_err("rebound run lock must fail");
+        assert!(run_error.to_string().contains("lock path was rebound"));
+        assert!(!writer.run.path().join("final-report.json").exists());
+        drop(replacement_run_lock);
+
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let key_writer = ArtifactMacKeyWriter::open(&repository).expect("key writer");
+        let key_lock_path = key_writer.lock.lock.path().to_path_buf();
+        let old_key_lock = key_lock_path.with_file_name("artifact-key.lock.original");
+        fs::rename(&key_lock_path, &old_key_lock).expect("move key lock");
+        write_private(&key_lock_path, b"");
+        let replacement_key_lock =
+            BoundArtifactLock::acquire(&key_writer.key.root, ARTIFACT_MAC_KEY_LOCK)
+                .expect("replacement key lock");
+        let key_error = key_writer.verify().expect_err("rebound key lock must fail");
+        assert!(key_error.to_string().contains("lock path was rebound"));
+        drop(replacement_key_lock);
+
+        let root =
+            open_or_create_run_root(&repository, RunArtifactFamily::Consult).expect("consult root");
+        let root_lock = BoundArtifactLock::acquire(&root, ROOT_LOCK_FILE).expect("root lock");
+        let root_lock_path = root_lock.lock.path().to_path_buf();
+        let old_root_lock = root_lock_path.with_file_name("runs.lock.original");
+        fs::rename(&root_lock_path, &old_root_lock).expect("move root lock");
+        write_private(&root_lock_path, b"");
+        let replacement_root_lock =
+            BoundArtifactLock::acquire(&root, ROOT_LOCK_FILE).expect("replacement root lock");
+        let root_error = root_lock
+            .verify(&root)
+            .expect_err("rebound root lock must fail");
+        assert!(root_error.to_string().contains("lock path was rebound"));
+        drop(replacement_root_lock);
+    }
+
+    #[test]
+    fn finalized_prune_waits_for_active_artifact_writer_lock() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("active-lock-run").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Autopilot,
+            run_id.clone(),
+            "autopilot",
+        )
+        .expect("writer");
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("report");
+        writer
+            .finalize("final-report.json", false)
+            .expect("finalize");
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let root =
+            open_existing_run_root(&repository, RunArtifactFamily::Autopilot).expect("run root");
+        let run = root
+            .bind_existing_direct_child_directory(run_id.as_str())
+            .expect("run binding");
+        let run = SafeRoot::open_existing(run.path()).expect("run");
+        let held = BoundArtifactLock::acquire(&run, RUN_LOCK_FILE).expect("held run lock");
+
+        let (sender, receiver) = mpsc::channel();
+        let prune_repo = repo.clone();
+        let worker = thread::spawn(move || {
+            let result = prune_runs(&prune_repo, RunArtifactFamily::Autopilot, 0, false);
+            sender.send(result).expect("send prune result");
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(held);
+        let report = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("prune completion")
+            .expect("prune report");
+        assert_eq!(report.deleted_count, 1);
+        worker.join().expect("prune worker");
+    }
+
     #[test]
     fn normal_prune_removes_run_and_leaves_empty_quarantine() {
         let (_temp, repo) = committed_repo();
         let run_id = RunId::new("prune-run").expect("run id");
-        ensure_run_dir_available(&repo, RunArtifactFamily::Autopilot, &run_id).expect("reserve");
-        fs::write(
-            final_report_path(&repo, RunArtifactFamily::Autopilot, &run_id),
-            b"{\"status\":\"done\"}\n",
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Autopilot,
+            run_id.clone(),
+            "autopilot",
         )
-        .expect("report");
+        .expect("writer");
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("report");
+        writer
+            .finalize("final-report.json", false)
+            .expect("finalize");
         let report = prune_runs(&repo, RunArtifactFamily::Autopilot, 0, false).expect("prune");
         assert_eq!(report.deleted_count, 1);
+        assert_eq!(report.refused_unfinalized_count, 0);
         assert!(!run_dir(&repo, RunArtifactFamily::Autopilot, &run_id).exists());
         let quarantine = run_root(&repo, RunArtifactFamily::Autopilot).join(QUARANTINE_DIRECTORY);
         assert_eq!(fs::read_dir(quarantine).expect("quarantine").count(), 0);
@@ -2017,6 +2763,12 @@ mod tests {
         drop(tree);
         drop(repo);
         (temp, repo_path)
+    }
+
+    #[cfg(unix)]
+    fn write_private(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).expect("private file");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private mode");
     }
 
     #[cfg(unix)]

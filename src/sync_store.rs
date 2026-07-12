@@ -60,6 +60,7 @@ pub(crate) struct RepositoryStateLock {
     _lock: KernelStateLock,
     root_identity: FileIdentity,
     state_file: &'static str,
+    lock_identity: FileIdentity,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -142,10 +143,12 @@ impl RepositoryStateRoot {
 
     pub(crate) fn lock(&self) -> Result<RepositoryStateLock> {
         let lock = KernelStateLock::acquire_direct(&self.root, self.lock_file)?;
+        let lock_identity = ensure_private_state_file(lock.path())?;
         Ok(RepositoryStateLock {
             _lock: lock,
             root_identity: self.root.identity().clone(),
             state_file: self.state_file,
+            lock_identity,
         })
     }
 
@@ -155,19 +158,23 @@ impl RepositoryStateRoot {
         max_bytes: u64,
     ) -> Result<Option<Vec<u8>>> {
         self.verify_lock(lock)?;
-        if !self.root.direct_child_exists(self.state_file)? {
-            return Ok(None);
-        }
-        let before = ensure_private_state_file(&self.state_path)?;
-        let contents = BoundedRegularReader::read_direct(&self.root, self.state_file, max_bytes)?;
-        let after = ensure_private_state_file(&self.state_path)?;
-        if before != after {
-            bail!(
-                "state file identity changed during protected read: {}",
-                self.state_path.display()
-            );
-        }
-        Ok(Some(contents))
+        let result = (|| -> Result<Option<Vec<u8>>> {
+            if !self.root.direct_child_exists(self.state_file)? {
+                return Ok(None);
+            }
+            let before = ensure_private_state_file(&self.state_path)?;
+            let contents =
+                BoundedRegularReader::read_direct(&self.root, self.state_file, max_bytes)?;
+            let after = ensure_private_state_file(&self.state_path)?;
+            if before != after {
+                bail!(
+                    "state file identity changed during protected read: {}",
+                    self.state_path.display()
+                );
+            }
+            Ok(Some(contents))
+        })();
+        finish_with_lock_verification(result, self.verify_lock(lock))
     }
 
     pub(crate) fn write(
@@ -177,27 +184,49 @@ impl RepositoryStateRoot {
         max_bytes: u64,
     ) -> Result<()> {
         self.verify_lock(lock)?;
-        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
-            bail!(
-                "serialized state exceeds its {} byte limit: {}",
-                max_bytes,
-                self.state_path.display()
-            );
-        }
-        if self.root.direct_child_exists(self.state_file)? {
+        let result = (|| -> Result<()> {
+            if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+                bail!(
+                    "serialized state exceeds its {} byte limit: {}",
+                    max_bytes,
+                    self.state_path.display()
+                );
+            }
+            if self.root.direct_child_exists(self.state_file)? {
+                ensure_private_state_file(&self.state_path)?;
+            }
+            AtomicStateWriter::scavenge_direct_temps(&self.root, self.state_file)?;
+            AtomicStateWriter::write_direct(&self.root, self.state_file, contents)?;
             ensure_private_state_file(&self.state_path)?;
-        }
-        AtomicStateWriter::scavenge_direct_temps(&self.root, self.state_file)?;
-        AtomicStateWriter::write_direct(&self.root, self.state_file, contents)?;
-        ensure_private_state_file(&self.state_path)?;
-        Ok(())
+            Ok(())
+        })();
+        finish_with_lock_verification(result, self.verify_lock(lock))
     }
 
     fn verify_lock(&self, lock: &RepositoryStateLock) -> Result<()> {
         if lock.root_identity != *self.root.identity() || lock.state_file != self.state_file {
             bail!("repository state lock does not match the protected state file");
         }
-        self.root.verify()
+        self.root.verify()?;
+        let observed = ensure_private_state_file(lock._lock.path())?;
+        if observed != lock.lock_identity {
+            bail!(
+                "repository state lock path was rebound while its original inode remained locked: {}",
+                lock._lock.path().display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn finish_with_lock_verification<T>(result: Result<T>, verification: Result<()>) -> Result<T> {
+    match (result, verification) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(lock_error)) => Err(lock_error),
+        (Err(error), Err(lock_error)) => Err(error.context(format!(
+            "operation also lost its stable lock-path binding: {lock_error:#}"
+        ))),
     }
 }
 
@@ -837,6 +866,41 @@ mod tests {
             .repository
             .common_dir_path_checksum
             .starts_with("maco-v1-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebound_lock_path_cannot_commit_a_stale_snapshot_or_lose_newer_update() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        store
+            .claim_paths("agent-a", ["first"])
+            .expect("initial claim");
+
+        let stale_lock = store.state.lock().expect("first lock");
+        let stale_snapshot = store.load_snapshot(&stale_lock).expect("stale snapshot");
+        let lock_path = stale_lock._lock.path().to_path_buf();
+        let moved_lock = lock_path.with_file_name("claims.lock.rebound-original");
+        fs::rename(&lock_path, &moved_lock).expect("move locked inode");
+        fs::write(&lock_path, b"").expect("replacement lock");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+
+        store
+            .claim_paths("agent-b", ["second"])
+            .expect("new lock-domain writer");
+        let error = store
+            .save_snapshot(&stale_lock, stale_snapshot)
+            .expect_err("stale writer must fail closed");
+        assert!(error.to_string().contains("lock path was rebound"));
+        drop(stale_lock);
+
+        let claims = store.snapshot().expect("final snapshot");
+        assert_eq!(claims.len(), 2);
+        assert!(claims.iter().any(|claim| claim.agent_id == "agent-a"));
+        assert!(claims.iter().any(|claim| claim.agent_id == "agent-b"));
     }
 
     fn commit_readme(repo: &Repository) -> Result<Oid> {
