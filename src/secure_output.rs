@@ -273,7 +273,9 @@ impl SecureOutputRoot {
         {
             self.verify_path_identity()?;
             let name_c = leaf_cstring(name)?;
-            let base_flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            // O_NONBLOCK is inert for regular files and prevents a pre-existing FIFO/device from
+            // blocking or triggering device-specific open behavior before fstat rejects it.
+            let base_flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
             let (fd, created) = if allow_existing {
                 // SAFETY: the held directory fd and NUL-terminated leaf name remain valid.
                 let existing = unsafe {
@@ -951,6 +953,32 @@ mod tests {
         assert!(!root.path().join("report.json").exists());
         let slot = root.reserve(OsStr::new("report.json"))?;
         assert!(slot.path().is_file());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn existing_fifo_leaf_fails_immediately_without_replacement() -> Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+        use std::time::{Duration, Instant};
+
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        // SAFETY: the path is NUL-terminated and points into a test-owned private directory.
+        if unsafe {
+            libc::mkfifo(
+                CString::new(root.path().join("state.json").as_os_str().as_bytes())?.as_ptr(),
+                0o600,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error()).context("failed to create test FIFO");
+        }
+        let started = Instant::now();
+        assert!(root.open_or_reserve(OsStr::new("state.json")).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let metadata = std::fs::symlink_metadata(root.path().join("state.json"))?;
+        assert!(metadata.file_type().is_fifo());
         Ok(())
     }
 
