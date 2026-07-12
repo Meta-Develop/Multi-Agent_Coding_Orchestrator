@@ -1430,8 +1430,210 @@ fn supervise_run_fails_when_child_mutates_primary_worktree() -> Result<()> {
     assert_finding(
         &report["orchestrator_reports"][0]["findings"],
         "error",
-        "primary worktree became dirty during child orchestrator 'child-primary-mutation' run",
+        "primary worktree integrity changed during child orchestrator 'child-primary-mutation' run",
         "README.md",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_change_to_preexisting_dirty_primary_path() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::write(
+        repo_path.join("README.md"),
+        "# Smoke\n\npre-existing operator change\n",
+    )
+    .context("create pre-existing dirty primary path")?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "protect already dirty primary content",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-existing-dirty", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-primary-existing-dirty",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--allow-dirty-primary",
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worktree content/type changed for README.md",
+        "README.md",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_change_to_preexisting_untracked_primary_path() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::write(repo_path.join("operator-notes.txt"), "pre-existing notes\n")
+        .context("create pre-existing untracked primary path")?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "protect already untracked primary content",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-existing-untracked", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-primary-existing-untracked",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--allow-dirty-primary",
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worktree content/type changed for operator-notes.txt",
+        "operator-notes.txt",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_allows_unchanged_preexisting_dirty_primary_path() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::write(
+        repo_path.join("README.md"),
+        "# Smoke\n\npre-existing operator change\n",
+    )
+    .context("create pre-existing dirty primary path")?;
+    let before = fs::read(repo_path.join("README.md")).context("read dirty primary before run")?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "leave already dirty primary content unchanged",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-no-mutation", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_success_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-primary-no-mutation",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--allow-dirty-primary",
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], true);
+    assert_eq!(report["orchestrator_reports"][0]["status"], "succeeded");
+    assert_eq!(
+        fs::read(repo_path.join("README.md")).context("read dirty primary after run")?,
+        before
+    );
+    assert!(repo_path
+        .join(".maco-cache/supervise-primary-no-mutation.txt")
+        .exists());
+
+    Ok(())
+}
+
+#[test]
+fn supervise_run_protects_tracked_content_under_runtime_directory() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::create_dir_all(repo_path.join(".maco-cache")).context("create runtime directory")?;
+    fs::write(
+        repo_path.join(".maco-cache/tracked.txt"),
+        "tracked runtime configuration\n",
+    )
+    .context("write tracked runtime configuration")?;
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    commit_all(&repo, "track runtime configuration")?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervisor-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "protect tracked runtime configuration",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-tracked-runtime", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let report = run_failure_json_args(&[
+        "supervise",
+        "run",
+        plan_path.to_str().context("plan path utf8")?,
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--run-id",
+        "supervise-primary-tracked-runtime",
+        "--codex-bin",
+        fake_codex.to_str().context("fake codex path utf8")?,
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "Git status changed for .maco-cache/tracked.txt",
+        ".maco-cache/tracked.txt",
     )?;
 
     Ok(())
@@ -1834,7 +2036,7 @@ fn supervise_run_rejects_worker_with_failed_validation_but_accepted_success() ->
 }
 
 #[test]
-fn supervise_run_uses_recorded_child_base_when_primary_advances_mid_run() -> Result<()> {
+fn supervise_run_rejects_clean_primary_commit_during_child() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let fake_codex = write_fake_codex(temp.path())?;
@@ -1843,24 +2045,17 @@ fn supervise_run_uses_recorded_child_base_when_primary_advances_mid_run() -> Res
         &plan_path,
         r#"{
           "version": 1,
-          "task": "primary may advance while child runs",
+          "task": "reject a clean primary commit during child execution",
           "max_depth": 2,
-          "max_child_processes": 2,
+          "max_child_processes": 1,
           "child_timeout_seconds": 10,
           "assignments": [
-            {"id": "child-primary-mid-commit", "assigned_paths": ["README.md"]},
-            {
-              "id": "child-b",
-              "assigned_paths": ["src/lib.rs"],
-              "worker_assignments": [
-                {"id": "worker-b", "assigned_paths": ["src/lib.rs"]}
-              ]
-            }
+            {"id": "child-primary-mid-commit", "assigned_paths": ["README.md"]}
           ]
         }"#,
     )?;
 
-    let report = run_success_json_args(&[
+    let report = run_failure_json_args(&[
         "supervise",
         "run",
         plan_path.to_str().context("plan path utf8")?,
@@ -1873,7 +2068,13 @@ fn supervise_run_uses_recorded_child_base_when_primary_advances_mid_run() -> Res
         "--json",
     ])?;
 
-    assert_eq!(report["success"], true);
+    assert_eq!(report["success"], false);
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "HEAD/reference changed",
+        "src/inbox.rs",
+    )?;
     assert_json_array_contains(
         &report["orchestrator_reports"][0]["files_changed"],
         "README.md",
@@ -1884,18 +2085,6 @@ fn supervise_run_uses_recorded_child_base_when_primary_advances_mid_run() -> Res
     )?;
     assert_no_finding_message_contains(
         &report["orchestrator_reports"][0]["findings"],
-        "outside its assigned paths",
-    )?;
-    assert_json_array_contains(
-        &report["orchestrator_reports"][1]["files_changed"],
-        "src/lib.rs",
-    )?;
-    assert_json_array_not_contains(
-        &report["orchestrator_reports"][1]["files_changed"],
-        "src/inbox.rs",
-    )?;
-    assert_no_finding_message_contains(
-        &report["orchestrator_reports"][1]["findings"],
         "outside its assigned paths",
     )?;
 
@@ -3198,6 +3387,38 @@ case "$logical_name" in
     worker="worker-primary-mutation"
     worker_reports_json='[]'
     ;;
+  child-primary-existing-dirty)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-primary-existing-dirty"
+    edit=false
+    files_changed_json='[]'
+    worker_reports_json='[]'
+    ;;
+  child-primary-existing-untracked)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-primary-existing-untracked"
+    edit=false
+    files_changed_json='[]'
+    worker_reports_json='[]'
+    ;;
+  child-primary-no-mutation)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-primary-no-mutation"
+    edit=false
+    files_changed_json='[]'
+    worker_reports_json='[]'
+    ;;
+  child-primary-tracked-runtime)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-primary-tracked-runtime"
+    edit=false
+    files_changed_json='[]'
+    worker_reports_json='[]'
+    ;;
   child-retry-shape)
     path="README.md"
     edit_path="README.md"
@@ -3294,6 +3515,23 @@ fi
 if [ "$logical_name" = "child-primary-mutation" ]; then
   primary="${report%%/.maco/o2/runs/*}"
   printf '\nprimary mutation from %s\n' "$name" >> "$primary/README.md"
+fi
+if [ "$logical_name" = "child-primary-existing-dirty" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  printf 'primary mutation from %s\n' "$name" >> "$primary/README.md"
+fi
+if [ "$logical_name" = "child-primary-existing-untracked" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  printf 'primary mutation from %s\n' "$name" >> "$primary/operator-notes.txt"
+fi
+if [ "$logical_name" = "child-primary-no-mutation" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  mkdir -p "$primary/.maco-cache"
+  printf 'runtime artifact from %s\n' "$name" > "$primary/.maco-cache/supervise-primary-no-mutation.txt"
+fi
+if [ "$logical_name" = "child-primary-tracked-runtime" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  printf 'primary mutation from %s\n' "$name" >> "$primary/.maco-cache/tracked.txt"
 fi
 if [ "$logical_name" = "child-primary-mid-commit" ]; then
   primary="${report%%/.maco/o2/runs/*}"

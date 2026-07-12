@@ -8,7 +8,10 @@ use crate::{
     worktree::{WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{anyhow, bail, Context, Result};
-use git2::{Delta, DiffFindOptions, DiffOptions, Oid, Repository, StatusOptions};
+use git2::{
+    Delta, DiffFindOptions, DiffOptions, ErrorCode, ObjectType, Oid, Repository, Status,
+    StatusOptions,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -25,6 +28,13 @@ const DEFAULT_MAX_CHILD_RETRIES: u8 = 0;
 const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
+const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
+    b".maco",
+    b".maco-cache",
+    b".agents/temp",
+    b".agents/storage",
+    b".agents/live",
+];
 
 #[derive(Debug, Clone)]
 pub struct SupervisorRunOptions {
@@ -1151,7 +1161,7 @@ fn run_supervisor_plan(
                     )
                 })?;
 
-                let primary_before = dirty_primary_paths(&repo)?;
+                let primary_before = primary_worktree_snapshot(&repo)?;
                 let mut command = ExternalAgentCommand::codex(
                     &options.codex_bin,
                     &worktree.path,
@@ -1164,8 +1174,8 @@ fn run_supervisor_plan(
 
                 let external_run = run_external_agent(&command);
                 command_records.push(command_record_from_external(&external_run));
-                let primary_after = dirty_primary_paths(&repo)?;
-                let primary_newly_dirty = newly_dirty_paths(&primary_before, &primary_after);
+                let primary_after = primary_worktree_snapshot(&repo)?;
+                let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
                 let (mut attempt_report, report_shape_problems) = collect_child_report(
                     assignment,
                     &attempt_artifacts.report_path,
@@ -1173,10 +1183,10 @@ fn run_supervisor_plan(
                     &worktree.path,
                     &child_base_head,
                 );
-                if !primary_newly_dirty.is_empty() {
+                if !primary_changes.is_empty() {
                     mark_primary_integrity_violation(
                         assignment,
-                        &primary_newly_dirty,
+                        &primary_changes,
                         &mut attempt_report,
                     );
                 }
@@ -2336,7 +2346,7 @@ fn validation_failed(result: &ValidationResult) -> bool {
 
 fn mark_primary_integrity_violation(
     assignment: &OrchestratorAssignment,
-    newly_dirty_paths: &[PathBuf],
+    changes: &PrimaryIntegrityChanges,
     report: &mut OrchestratorReviewReport,
 ) {
     report.status = ReviewStatus::Failed;
@@ -2345,31 +2355,312 @@ fn mark_primary_integrity_violation(
     report.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: format!(
-            "primary worktree became dirty during child orchestrator '{}' run: {}",
+            "primary worktree integrity changed during child orchestrator '{}' run: {}",
             assignment.id,
-            display_paths(newly_dirty_paths)
+            changes.details.join("; ")
         ),
-        paths: newly_dirty_paths.to_vec(),
+        paths: changes.paths.clone(),
     });
     report.remaining_risk =
-        "child run mutated the primary worktree or left new primary dirty paths".to_string();
+        "child run mutated primary HEAD/ref, index, tracked content, or non-runtime untracked content"
+            .to_string();
     report.next_safe_action =
-        "inspect and clean the primary worktree before rerunning supervise".to_string();
+        "inspect and restore the primary worktree before rerunning supervise".to_string();
 }
 
-fn dirty_primary_paths(repo: &Path) -> Result<Vec<PathBuf>> {
-    let repo = Repository::open(repo)
-        .with_context(|| format!("failed to open repository {}", repo.display()))?;
-    repository_dirty_paths(&repo, "failed to inspect primary worktree status")
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryWorktreeSnapshot {
+    head: PrimaryHeadSnapshot,
+    index: BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>,
+    status: BTreeMap<Vec<u8>, Status>,
+    worktree: BTreeMap<Vec<u8>, PrimaryPathState>,
 }
 
-fn newly_dirty_paths(before: &[PathBuf], after: &[PathBuf]) -> Vec<PathBuf> {
-    let before = before.iter().collect::<BTreeSet<_>>();
-    after
-        .iter()
-        .filter(|path| !before.contains(path))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryHeadSnapshot {
+    detached: bool,
+    reference_name: Option<Vec<u8>>,
+    symbolic_target: Option<Vec<u8>>,
+    target: Option<Oid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PrimaryIndexEntryKey {
+    path: Vec<u8>,
+    stage: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryIndexEntryState {
+    id: Oid,
+    mode: u32,
+    flags: u16,
+    flags_extended: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrimaryPathState {
+    Missing,
+    File {
+        id: Oid,
+        mode: u32,
+    },
+    Symlink {
+        target: PathBuf,
+        mode: u32,
+    },
+    Directory {
+        repository_head: Option<Oid>,
+        mode: u32,
+    },
+    Other {
+        mode: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryIntegrityChanges {
+    details: Vec<String>,
+    paths: Vec<PathBuf>,
+}
+
+impl PrimaryIntegrityChanges {
+    fn is_empty(&self) -> bool {
+        self.details.is_empty()
+    }
+}
+
+fn primary_worktree_snapshot(repo_path: &Path) -> Result<PrimaryWorktreeSnapshot> {
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
+    let workdir = repo
+        .workdir()
+        .context("primary integrity snapshot requires a non-bare repository")?;
+    let head = primary_head_snapshot(&repo)?;
+    let index = primary_index_snapshot(&repo)?;
+    let status = repository_status_snapshot(&repo, "failed to inspect primary worktree status")?;
+
+    let mut worktree = BTreeMap::new();
+    for path in status.keys() {
+        let relative_path = repo_relative_path_from_git_bytes(path);
+        let state = primary_path_state(&workdir.join(&relative_path)).with_context(|| {
+            format!(
+                "failed to fingerprint primary worktree path {}",
+                relative_path.display()
+            )
+        })?;
+        worktree.insert(path.clone(), state);
+    }
+
+    Ok(PrimaryWorktreeSnapshot {
+        head,
+        index,
+        status,
+        worktree,
+    })
+}
+
+fn primary_head_snapshot(repo: &Repository) -> Result<PrimaryHeadSnapshot> {
+    let detached = repo.head_detached().unwrap_or(false);
+    match repo.head() {
+        Ok(head) => Ok(PrimaryHeadSnapshot {
+            detached,
+            reference_name: Some(head.name_bytes().to_vec()),
+            symbolic_target: head.symbolic_target_bytes().map(<[u8]>::to_vec),
+            target: head.target(),
+        }),
+        Err(error) if matches!(error.code(), ErrorCode::NotFound | ErrorCode::UnbornBranch) => {
+            Ok(PrimaryHeadSnapshot {
+                detached,
+                reference_name: None,
+                symbolic_target: None,
+                target: None,
+            })
+        }
+        Err(error) => Err(error).context("failed to inspect primary HEAD/reference"),
+    }
+}
+
+fn primary_index_snapshot(
+    repo: &Repository,
+) -> Result<BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>> {
+    let index = repo.index().context("failed to inspect primary index")?;
+    let mut entries = BTreeMap::new();
+    for entry in index.iter() {
+        let key = PrimaryIndexEntryKey {
+            path: entry.path,
+            stage: (entry.flags >> 12) & 0x3,
+        };
+        let state = PrimaryIndexEntryState {
+            id: entry.id,
+            mode: entry.mode,
+            flags: entry.flags,
+            flags_extended: entry.flags_extended,
+        };
+        entries.insert(key, state);
+    }
+    Ok(entries)
+}
+
+fn primary_path_state(path: &Path) -> Result<PrimaryPathState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PrimaryPathState::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mode = primary_path_mode(&metadata);
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Ok(PrimaryPathState::Symlink {
+            target: fs::read_link(path)?,
+            mode,
+        });
+    }
+    if file_type.is_file() {
+        return Ok(PrimaryPathState::File {
+            id: Oid::hash_file(ObjectType::Blob, path)?,
+            mode,
+        });
+    }
+    if file_type.is_dir() {
+        let repository_head = Repository::open(path)
+            .ok()
+            .and_then(|nested| nested.head().ok().and_then(|head| head.target()));
+        return Ok(PrimaryPathState::Directory {
+            repository_head,
+            mode,
+        });
+    }
+    Ok(PrimaryPathState::Other { mode })
+}
+
+#[cfg(unix)]
+fn primary_path_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.mode()
+}
+
+#[cfg(not(unix))]
+fn primary_path_mode(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
+fn primary_integrity_changes(
+    before: &PrimaryWorktreeSnapshot,
+    after: &PrimaryWorktreeSnapshot,
+) -> PrimaryIntegrityChanges {
+    let mut details = Vec::new();
+    let mut paths = BTreeSet::new();
+
+    if before.head != after.head {
+        details.push(format!(
+            "HEAD/reference changed from {} to {}",
+            display_primary_head(&before.head),
+            display_primary_head(&after.head)
+        ));
+        paths.insert(PathBuf::from(".git/HEAD"));
+    }
+
+    let index_paths = changed_index_paths(&before.index, &after.index);
+    if !index_paths.is_empty() {
+        details.push(format!(
+            "index changed for {}",
+            display_git_paths(&index_paths)
+        ));
+        paths.extend(
+            index_paths
+                .iter()
+                .map(|path| repo_relative_path_from_git_bytes(path)),
+        );
+    }
+
+    let status_paths = changed_snapshot_paths(&before.status, &after.status);
+    if !status_paths.is_empty() {
+        details.push(format!(
+            "Git status changed for {}",
+            display_git_paths(&status_paths)
+        ));
+        paths.extend(
+            status_paths
+                .iter()
+                .map(|path| repo_relative_path_from_git_bytes(path)),
+        );
+    }
+
+    let worktree_paths = changed_snapshot_paths(&before.worktree, &after.worktree);
+    if !worktree_paths.is_empty() {
+        details.push(format!(
+            "worktree content/type changed for {}",
+            display_git_paths(&worktree_paths)
+        ));
+        paths.extend(
+            worktree_paths
+                .iter()
+                .map(|path| repo_relative_path_from_git_bytes(path)),
+        );
+    }
+
+    PrimaryIntegrityChanges {
+        details,
+        paths: paths.into_iter().collect(),
+    }
+}
+
+fn changed_index_paths(
+    before: &BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>,
+    after: &BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>,
+) -> BTreeSet<Vec<u8>> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|key| before.get(*key) != after.get(*key))
+        .map(|key| key.path.clone())
+        .collect()
+}
+
+fn changed_snapshot_paths<T: PartialEq>(
+    before: &BTreeMap<Vec<u8>, T>,
+    after: &BTreeMap<Vec<u8>, T>,
+) -> BTreeSet<Vec<u8>> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
         .cloned()
         .collect()
+}
+
+fn display_primary_head(head: &PrimaryHeadSnapshot) -> String {
+    let reference = head
+        .reference_name
+        .as_deref()
+        .map(String::from_utf8_lossy)
+        .map(|name| name.into_owned())
+        .unwrap_or_else(|| "<missing>".to_string());
+    let target = head
+        .target
+        .map(|target| target.to_string())
+        .unwrap_or_else(|| "<missing>".to_string());
+    let mode = if head.detached {
+        "detached"
+    } else {
+        "attached"
+    };
+    format!("{reference}@{target} ({mode})")
+}
+
+fn display_git_paths(paths: &BTreeSet<Vec<u8>>) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            repo_relative_path_from_git_bytes(path)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn claim_failure_finding(
@@ -2788,27 +3079,57 @@ fn repository_is_dirty(repo: &Repository, context: &'static str) -> Result<bool>
 }
 
 fn repository_dirty_paths(repo: &Repository, context: &'static str) -> Result<Vec<PathBuf>> {
+    Ok(repository_status_snapshot(repo, context)?
+        .keys()
+        .map(|path| repo_relative_path_from_git_bytes(path))
+        .collect())
+}
+
+fn repository_status_snapshot(
+    repo: &Repository,
+    context: &'static str,
+) -> Result<BTreeMap<Vec<u8>, Status>> {
     let mut options = StatusOptions::new();
     options.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = repo.statuses(Some(&mut options)).context(context)?;
-    let mut paths = BTreeSet::new();
+    let mut paths = BTreeMap::new();
     for entry in statuses.iter() {
-        if let Some(path) = entry.path().filter(|path| !is_local_runtime_path(path)) {
-            paths.insert(PathBuf::from(path));
+        let path = entry.path_bytes();
+        let status = entry.status();
+        if is_untracked_runtime_artifact(path, status) {
+            continue;
         }
+        paths
+            .entry(path.to_vec())
+            .and_modify(|existing| *existing |= status)
+            .or_insert(status);
     }
-    Ok(paths.into_iter().collect())
+    Ok(paths)
 }
 
-fn is_local_runtime_path(path: &str) -> bool {
-    path == ".maco"
-        || path.starts_with(".maco/")
-        || path == ".agents/temp"
-        || path.starts_with(".agents/temp/")
-        || path == ".agents/storage"
-        || path.starts_with(".agents/storage/")
-        || path == ".agents/live"
-        || path.starts_with(".agents/live/")
+fn is_untracked_runtime_artifact(path: &[u8], status: Status) -> bool {
+    status == Status::WT_NEW
+        && LOCAL_RUNTIME_ROOTS
+            .iter()
+            .any(|root| path_is_at_or_below(path, root))
+}
+
+fn path_is_at_or_below(path: &[u8], root: &[u8]) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.first() == Some(&b'/'))
+}
+
+#[cfg(unix)]
+fn repo_relative_path_from_git_bytes(path: &[u8]) -> PathBuf {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    PathBuf::from(OsString::from_vec(path.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn repo_relative_path_from_git_bytes(path: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(path).into_owned())
 }
 
 fn current_head_oid(repo_path: &Path) -> Result<Oid> {
