@@ -48,12 +48,12 @@ The current implementation covers a local-first command-line slice:
 - `maco orchestrate resume <checkpoint-file>` validates the checkpoint, repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims before skipping completed agents and running only pending work.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
-- `maco merge preview` and `maco merge apply` collect agent output and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report` and can require passed validation evidence with `--require-validation`.
+- `maco merge preview` and `maco merge apply` collect one stable agent snapshot and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, candidate-bound validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report`; `--require-validation` accepts passed reports only when their envelope contains the exact current `candidate.validation_binding` (or a passed `merge apply --validation-command`).
 - `maco merge apply --validation-command <command>` validates a temporary merged
   candidate before mutating the primary worktree. A command failure blocks the
   apply and leaves the primary worktree unchanged.
 - `maco pr preview` checks whether an agent worktree is ready to publish without mutating the primary worktree or contacting a forge.
-- `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when needed, then either emits a deterministic fake PR URL or, with explicit `--forge github`, shells out to `git push` and `gh pr create`. PR preview and publish also accept `--require-validation`.
+- `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when validation is not required, re-previews the resulting clean commit, then either emits a deterministic fake PR URL or, with explicit `--forge github`, pushes that exact reviewed commit and runs `gh pr create`. With `--require-validation`, publication is a two-stage workflow: commit first, preview and validate that exact binding, then publish with the bound envelope.
 - `maco issue preview` redacts issue bodies without creating anything.
 - `maco issue create --forge fake|github` creates a deterministic fake issue URL locally or, with explicit `--forge github`, shells out to `gh issue create`.
 - `maco live status`, `maco live validate`, `maco live heartbeat`, and
@@ -440,21 +440,51 @@ failures are considered when validation reports are supplied from collected run
 summaries or from direct `--validation-report` JSON files. External validation
 JSON may be a single report, an array, an object with `validation`,
 `validations`, or `reports`, or an orchestration summary with per-agent
-validation. `--require-validation` blocks when validation evidence is missing,
-only `not_run`, only `skipped`, or failed without a passed validation report;
-JSON readiness details distinguish `validation_missing`,
+validation. Those legacy forms remain useful as advisory evidence, but they are
+unbound and do **not** satisfy `--require-validation`. Required external
+evidence must use an envelope whose `validation_binding` is copied verbatim
+from the current preview and whose `reports` contains a passed report:
+
+```json
+{
+  "validation_binding": {
+    "version": 1,
+    "agent_id": "agent-a",
+    "primary_head": "<40-character object id or null>",
+    "agent_head": "<40-character object id or null>",
+    "merge_base": "<40-character object id or null>",
+    "diff_oid": "<40-character object id>"
+  },
+  "reports": [
+    { "name": "cargo test", "status": "passed", "paths": ["src"] }
+  ]
+}
+```
+
+For `merge preview`, copy `candidate.validation_binding`; for `pr preview`,
+copy `preview.candidate.validation_binding`. Any candidate, HEAD, base, or diff
+change invalidates that envelope. `--require-validation` also blocks when
+validation evidence is missing, only `not_run`, only `skipped`, or failed
+without a bound passed report. JSON readiness details distinguish `validation_missing`,
 `validation_not_run`, `validation_skipped`, and `validation_failed`, include
 related paths when available, and report the next safe operation.
 
-`merge apply --validation-command <command>` creates a temporary candidate
-worktree, applies the agent diff there, and runs the command against that
-merged candidate before applying anything to the primary worktree. Candidate
-validation failure is a blocker and leaves the primary worktree unchanged. This
+`merge apply --validation-command <command>` creates an independent temporary
+candidate worktree for each command, applies the agent diff there, and runs the
+command against that merged candidate before applying anything to the primary
+worktree. A failed command or any tracked/non-ignored candidate mutation is a
+blocker and leaves the primary worktree unchanged. This
 is different from automatic post-apply validation: `merge apply` still does not
 run project checks after a successful primary apply, so release managers should
 run final verification after accepting changes. With `--json`, a blocked apply
 emits a machine-readable report with readiness blockers, blocker details, and
 related paths before exiting with an error.
+
+Merge apply and PR publication share one repo-common transaction lock at
+`.git/maco/state/repository-mutation.lock`. Its typed owner record identifies
+the operation, PID, nonce, and creation time, so validation/apply cannot overlap
+publication commit/push in the same repository. Live, unknown, and malformed
+owners are refused; only a confirmed-absent PID is reclaimed atomically.
 
 Preview and publish agent worktree changes as a pull request:
 
@@ -469,13 +499,25 @@ cargo run -- pr publish agent-a --repo . --claim README.md --forge github --read
 `maco pr preview` uses the same merge-preview gates as `merge apply` and never
 pushes or creates a pull request. `maco pr publish --forge fake|github` refuses
 dirty-primary, stale-base, unclaimed-edit, validation, and apply-check blockers.
-With `--require-validation`, PR preview and publish require at least one passed
-validation report and report missing evidence as a publishability blocker.
-When the agent worktree has safe uncommitted changes, publish commits those
-changes in the agent worktree only; it does not mutate the primary worktree. The
-fake forge returns deterministic `fake://pr/...` URLs and never uses the
-network. GitHub publication runs only when `--forge github` is passed and shells
-out to `git push` and `gh pr create`.
+
+With `--require-validation`, use this exact two-stage workflow:
+
+1. Commit the candidate in the agent worktree and leave it clean.
+2. Run `maco pr preview ... --json` and validate that exact committed snapshot.
+3. Copy `preview.candidate.validation_binding` verbatim into the envelope shown
+   above and add the passed validation report.
+4. Run `maco pr publish ... --require-validation --validation-report <envelope>`.
+
+Required publication never creates an internal commit, because doing so would
+change the binding after review. A dirty required candidate is blocked with the
+commit -> preview -> validate -> publish recovery sequence. Without
+`--require-validation`, publish may commit safe uncommitted changes in the agent
+worktree only, but it re-previews the clean commit and checks it again immediately
+before external publication. Git and GitHub publication push the explicit
+reviewed commit object, not a branch name that may move concurrently. The fake
+forge returns deterministic `fake://pr/...` URLs and never uses the network.
+GitHub publication runs only when `--forge github` is passed and shells out to
+`git push` and `gh pr create`.
 
 Preview and create issues:
 

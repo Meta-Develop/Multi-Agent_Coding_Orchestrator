@@ -2060,10 +2060,10 @@ struct MergePreviewArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long)]
     claim: Vec<PathBuf>,
-    /// JSON validation report file. Repeat to supply multiple reports.
+    /// Validation JSON. With --require-validation, use an envelope containing the exact current candidate.validation_binding and passed reports; legacy arrays are unbound.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
-    /// Require at least one passed validation report before preview is considered safe.
+    /// Require passed validation evidence bound exactly to the current candidate snapshot.
     #[arg(long)]
     require_validation: bool,
     #[command(flatten)]
@@ -2083,10 +2083,10 @@ struct MergeApplyArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long)]
     claim: Vec<PathBuf>,
-    /// JSON validation report file. Repeat to supply multiple reports.
+    /// Validation JSON. With --require-validation, use an exact candidate-bound envelope; legacy arrays are unbound. Repeat to supply multiple files.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
-    /// Require at least one passed validation report or candidate validation command.
+    /// Require an exact candidate-bound passed report or a passed candidate validation command.
     #[arg(long)]
     require_validation: bool,
     /// Shell command to validate the temporary merged candidate before applying to primary.
@@ -2187,10 +2187,10 @@ struct PrPreviewArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long, required = true)]
     claim: Vec<PathBuf>,
-    /// JSON validation report file. Repeat to supply multiple reports.
+    /// Validation JSON. With --require-validation, copy the exact current preview.candidate.validation_binding into an envelope with passed reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
-    /// Require at least one passed validation report before PR preview is publishable.
+    /// Require passed validation evidence bound exactly to this PR candidate snapshot.
     #[arg(long)]
     require_validation: bool,
     /// Forge label recorded in the preview report.
@@ -2214,10 +2214,10 @@ struct PrPublishArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long, required = true)]
     claim: Vec<PathBuf>,
-    /// JSON validation report file. Repeat to supply multiple reports.
+    /// Candidate-bound validation envelope produced after previewing the clean, committed candidate; legacy report arrays are unbound.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
-    /// Require at least one passed validation report before PR publication.
+    /// Require a clean committed candidate and passed evidence bound exactly to its current preview binding.
     #[arg(long)]
     require_validation: bool,
     /// Forge adapter. `fake` is deterministic and local-only; `github` shells out explicitly.

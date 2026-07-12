@@ -3,13 +3,14 @@ use crate::{
     worktree::{normalize_agent_id, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::{Delta, DiffOptions, ErrorCode, ObjectType, Oid, Repository, Status, StatusOptions};
-use serde::{Deserialize, Serialize};
+use git2::{ErrorCode, ObjectType, Oid, Repository, Status, StatusOptions};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
+    fmt::Write as FmtWrite,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -19,6 +20,9 @@ use std::{
 
 pub const DEFAULT_DIFF_SUMMARY_CHAR_LIMIT: usize = 32 * 1024;
 pub const VALIDATION_BINDING_VERSION: u32 = 1;
+const CANDIDATE_CAPTURE_ATTEMPTS: usize = 3;
+const LOCK_RECORD_VERSION: u32 = 1;
+const REPOSITORY_MUTATION_LOCK_FILE: &str = "repository-mutation.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeCollectOptions {
@@ -60,22 +64,29 @@ pub struct MergeForceOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MergeCandidate {
     pub metadata: WorktreeMergeMetadata,
+    #[serde(serialize_with = "serialize_paths")]
     pub claimed_paths: Vec<PathBuf>,
+    #[serde(serialize_with = "serialize_paths")]
     pub changed_paths: Vec<PathBuf>,
     pub changes: Vec<ChangedPath>,
+    #[serde(serialize_with = "serialize_paths")]
     pub unclaimed_changed_paths: Vec<PathBuf>,
     pub diff: DiffOutput,
     pub validations: Vec<ValidationReport>,
     pub validation_binding: CandidateValidationBinding,
     #[serde(skip_serializing)]
     pub validation_evidence: ValidationEvidenceBundle,
+    #[serde(skip_serializing)]
+    pub(crate) raw_diff: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorktreeMergeMetadata {
     pub agent_id: String,
+    #[serde(serialize_with = "serialize_path")]
     pub worktree_path: PathBuf,
     pub branch: String,
+    #[serde(serialize_with = "serialize_path")]
     pub primary_repo_root: PathBuf,
     pub primary_head: Option<String>,
     pub agent_head: Option<String>,
@@ -85,6 +96,7 @@ pub struct WorktreeMergeMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChangedPath {
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub kind: ChangeKind,
 }
@@ -119,7 +131,7 @@ pub struct ValidationReport {
     pub name: String,
     pub status: ValidationStatus,
     pub message: Option<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -245,6 +257,7 @@ pub struct MergeApplySafety {
 pub struct SafetyCheck {
     pub status: SafetyCheckStatus,
     pub message: Option<String>,
+    #[serde(serialize_with = "serialize_paths")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -300,6 +313,7 @@ pub struct ValidationEvidenceCheck {
     pub status: SafetyCheckStatus,
     pub binding_status: ValidationBindingStatus,
     pub message: Option<String>,
+    #[serde(serialize_with = "serialize_paths")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -318,6 +332,7 @@ pub struct ApplyBlockerDetail {
     pub kind: ApplyBlocker,
     pub disposition: ApplyBlockerDisposition,
     pub check_status: SafetyCheckStatus,
+    #[serde(serialize_with = "serialize_paths")]
     pub paths: Vec<PathBuf>,
     pub message: Option<String>,
     pub validation_reports: Vec<ValidationReport>,
@@ -356,16 +371,65 @@ struct GitCommandOutput {
     stderr: Vec<u8>,
 }
 
-struct MergeApplyLock {
+pub(crate) struct RepoCommonLock {
     path: PathBuf,
-    owner: String,
+    owner_bytes: Vec<u8>,
 }
 
-struct PendingMergeApplyLock {
+struct PendingRepoCommonLock {
     path: PathBuf,
-    owner: String,
+    owner_bytes: Vec<u8>,
     file: Option<fs::File>,
     committed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RepoLockOwner {
+    version: u32,
+    pid: u32,
+    nonce: String,
+    created_unix_seconds: u64,
+    operation: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLiveness {
+    Live,
+    Absent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateBoundaryState {
+    primary_head: Option<Oid>,
+    agent_head: Option<Oid>,
+    index_digest: Option<Oid>,
+    worktree_status: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateRepositorySnapshot {
+    metadata: WorktreeMergeMetadata,
+    index_digest: Option<Oid>,
+    worktree_status: Vec<u8>,
+    snapshot_tree: Oid,
+    changes: Vec<ChangedPath>,
+    raw_diff: Vec<u8>,
+}
+
+struct TemporaryIndex {
+    directory: PathBuf,
+    path: PathBuf,
+    object_directory: PathBuf,
+    alternate_object_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedWorktreeTree {
+    oid: Oid,
+    changes: Vec<ChangedPath>,
+    raw_diff: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,21 +468,23 @@ fn collect_agent_result_with_evidence(
     let agent_repo = Repository::open(&record.path)
         .with_context(|| format!("failed to open agent worktree {}", record.path.display()))?;
 
-    let metadata = collect_metadata(&primary_repo, &agent_repo, &record, repo_root)?;
     let claimed_paths = normalize_claim_paths(options.claimed_paths)?;
-    let diff_base = collection_base_oid(&metadata)?;
-    let changes = collect_changed_paths(&agent_repo, diff_base)?;
+    let snapshot =
+        capture_consistent_candidate_snapshot(&primary_repo, &agent_repo, &record, repo_root)?;
+    let metadata = snapshot.metadata;
+    let changes = snapshot.changes;
     let changed_paths = changes
         .iter()
         .map(|change| change.path.clone())
         .collect::<Vec<_>>();
     let unclaimed_changed_paths = unclaimed_paths(&changed_paths, &claimed_paths);
-    let full_diff = collect_full_diff(&record.path, diff_base)?;
-    let validation_binding = candidate_validation_binding(&metadata, &full_diff)?;
+    let raw_diff = snapshot.raw_diff;
+    let presented_diff = patch_text_for_json(&raw_diff);
+    let validation_binding = candidate_validation_binding(&metadata, &raw_diff)?;
     let validations = validation_evidence.reports();
     let diff = DiffOutput {
-        summary: summarize_text(&full_diff, options.diff_summary_char_limit),
-        full: options.include_full_diff.then_some(full_diff),
+        summary: summarize_text(&presented_diff, options.diff_summary_char_limit),
+        full: options.include_full_diff.then_some(presented_diff),
     };
 
     Ok(MergeCandidate {
@@ -431,6 +497,7 @@ fn collect_agent_result_with_evidence(
         validations,
         validation_binding,
         validation_evidence,
+        raw_diff,
     })
 }
 
@@ -446,7 +513,7 @@ pub fn preview_merge_apply_with_evidence(
     let mut collect = options.collect;
     collect.include_full_diff = true;
     let candidate = collect_agent_result_with_evidence(collect, validation_evidence)?;
-    let patch = candidate.diff.full.as_deref().unwrap_or_default();
+    let patch = candidate.raw_diff.as_slice();
     let candidate_validation_commands = Vec::new();
 
     let primary_state_unchanged = passed_safety_check();
@@ -529,7 +596,7 @@ pub fn merge_apply_report_with_evidence(
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<MergeApplyReport> {
     let repo_root = discover_primary_repo_root(&options.preview.collect.repo)?;
-    let _lock = MergeApplyLock::acquire(&repo_root)?;
+    let _lock = RepoCommonLock::acquire(&repo_root, "merge-apply")?;
     let mut preview_options = options.preview;
     let require_validation_after_candidate = preview_options.require_validation;
     if !options.candidate_validation_commands.is_empty() {
@@ -579,7 +646,7 @@ pub fn apply_prechecked_merge_with_candidate_validation(
     require_validation_after_candidate: bool,
 ) -> Result<MergeApplyReport> {
     let repo_root = preview.candidate.metadata.primary_repo_root.clone();
-    let _lock = MergeApplyLock::acquire(&repo_root)?;
+    let _lock = RepoCommonLock::acquire(&repo_root, "merge-apply")?;
     let expected_primary_state = PrimaryRepositoryState::capture(&repo_root)?;
     apply_prechecked_merge_with_candidate_validation_locked(
         preview,
@@ -602,13 +669,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
         );
     }
 
-    let patch = preview
-        .candidate
-        .diff
-        .full
-        .as_deref()
-        .unwrap_or_default()
-        .to_string();
+    let patch = preview.candidate.raw_diff.clone();
     if patch.is_empty() {
         return Ok(MergeApplyReport {
             preview,
@@ -829,14 +890,129 @@ fn validation_evidence_from_agent_json(agent: &Value) -> Result<ValidationEviden
     }
 }
 
-fn collect_metadata(
+fn capture_consistent_candidate_snapshot(
     primary_repo: &Repository,
     agent_repo: &Repository,
     record: &WorktreeRecord,
     primary_repo_root: PathBuf,
-) -> Result<WorktreeMergeMetadata> {
+) -> Result<CandidateRepositorySnapshot> {
+    capture_two_matching(|| {
+        capture_candidate_snapshot_once(primary_repo, agent_repo, record, primary_repo_root.clone())
+    })
+}
+
+fn capture_two_matching<T, F>(mut capture: F) -> Result<T>
+where
+    T: PartialEq,
+    F: FnMut() -> Result<Option<T>>,
+{
+    for _ in 0..CANDIDATE_CAPTURE_ATTEMPTS {
+        let Some(first) = capture()? else {
+            continue;
+        };
+        let Some(second) = capture()? else {
+            continue;
+        };
+        if first == second {
+            return Ok(second);
+        }
+    }
+    bail!(
+        "candidate repository state changed while it was being captured; retry after concurrent agent worktree activity stops"
+    )
+}
+
+fn capture_candidate_snapshot_once(
+    primary_repo: &Repository,
+    agent_repo: &Repository,
+    record: &WorktreeRecord,
+    primary_repo_root: PathBuf,
+) -> Result<Option<CandidateRepositorySnapshot>> {
+    let before = capture_candidate_boundary(primary_repo, agent_repo, &record.path)?;
+    let metadata = metadata_from_heads(
+        primary_repo,
+        record,
+        primary_repo_root,
+        before.primary_head,
+        before.agent_head,
+    )?;
+    let base_oid = collection_base_oid(&metadata)?;
+    let mut captured = snapshot_worktree_candidate_from_base(
+        agent_repo,
+        &record.path,
+        before.agent_head,
+        base_oid,
+    )?;
+    preserve_untracked_change_kinds(&before.worktree_status, &mut captured.changes)?;
+    let after = capture_candidate_boundary(primary_repo, agent_repo, &record.path)?;
+    if before != after {
+        return Ok(None);
+    }
+
+    Ok(Some(CandidateRepositorySnapshot {
+        metadata,
+        index_digest: after.index_digest,
+        worktree_status: after.worktree_status,
+        snapshot_tree: captured.oid,
+        changes: captured.changes,
+        raw_diff: captured.raw_diff,
+    }))
+}
+
+fn preserve_untracked_change_kinds(porcelain_v2: &[u8], changes: &mut [ChangedPath]) -> Result<()> {
+    let untracked = porcelain_v2
+        .split(|byte| *byte == 0)
+        .filter_map(|record| record.strip_prefix(b"? "))
+        .map(path_buf_from_git_bytes)
+        .collect::<Result<BTreeSet<_>>>()?;
+    for change in changes {
+        if change.kind == ChangeKind::Added && untracked.contains(&change.path) {
+            change.kind = ChangeKind::Untracked;
+        }
+    }
+    Ok(())
+}
+
+fn capture_candidate_boundary(
+    primary_repo: &Repository,
+    agent_repo: &Repository,
+    worktree_path: &Path,
+) -> Result<CandidateBoundaryState> {
     let primary_head = head_oid(primary_repo).context("failed to read primary HEAD")?;
     let agent_head = head_oid(agent_repo).context("failed to read agent HEAD")?;
+    let index_digest = hash_optional_file(&agent_repo.path().join("index"))?;
+    let status = run_git_capture(
+        worktree_path,
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
+    .context("failed to capture agent worktree status")?;
+    if !status.success {
+        bail!(
+            "git status failed while capturing candidate: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        );
+    }
+    Ok(CandidateBoundaryState {
+        primary_head,
+        agent_head,
+        index_digest,
+        worktree_status: status.stdout,
+    })
+}
+
+fn metadata_from_heads(
+    primary_repo: &Repository,
+    record: &WorktreeRecord,
+    primary_repo_root: PathBuf,
+    primary_head: Option<Oid>,
+    agent_head: Option<Oid>,
+) -> Result<WorktreeMergeMetadata> {
     let merge_base = match (primary_head, agent_head) {
         (Some(primary), Some(agent)) => merge_base_oid(primary_repo, primary, agent)?,
         _ => None,
@@ -860,9 +1036,9 @@ fn collect_metadata(
 
 fn candidate_validation_binding(
     metadata: &WorktreeMergeMetadata,
-    full_diff: &str,
+    full_diff: &[u8],
 ) -> Result<CandidateValidationBinding> {
-    let diff_oid = Oid::hash_object(ObjectType::Blob, full_diff.as_bytes())
+    let diff_oid = Oid::hash_object(ObjectType::Blob, full_diff)
         .context("failed to hash merge candidate diff")?;
     CandidateValidationBinding {
         version: VALIDATION_BINDING_VERSION,
@@ -898,11 +1074,7 @@ fn collection_base_oid(metadata: &WorktreeMergeMetadata) -> Result<Option<Oid>> 
         .transpose()
 }
 
-fn collect_changed_paths(repo: &Repository, base_oid: Option<Oid>) -> Result<Vec<ChangedPath>> {
-    if let Some(base_oid) = base_oid {
-        return collect_changed_paths_since_base(repo, base_oid);
-    }
-
+fn collect_changed_paths(repo: &Repository) -> Result<Vec<ChangedPath>> {
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
@@ -915,9 +1087,8 @@ fn collect_changed_paths(repo: &Repository, base_oid: Option<Oid>) -> Result<Vec
     let mut changes = BTreeMap::<PathBuf, ChangeKind>::new();
 
     for entry in statuses.iter() {
-        if let Some(path) = entry.path() {
-            changes.insert(PathBuf::from(path), classify_status(entry.status()));
-        }
+        let path = path_buf_from_git_bytes(entry.path_bytes())?;
+        changes.insert(path, classify_status(entry.status()));
     }
 
     Ok(changes
@@ -926,138 +1097,258 @@ fn collect_changed_paths(repo: &Repository, base_oid: Option<Oid>) -> Result<Vec
         .collect())
 }
 
-fn collect_changed_paths_since_base(repo: &Repository, base_oid: Oid) -> Result<Vec<ChangedPath>> {
-    let base_commit = repo
-        .find_commit(base_oid)
-        .with_context(|| format!("failed to find base commit {base_oid}"))?;
-    let base_tree = base_commit
-        .tree()
-        .with_context(|| format!("failed to read tree for base commit {base_oid}"))?;
-    let mut options = DiffOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_typechange(true);
-    let diff = repo
-        .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
-        .context("failed to diff worktree against base commit")?;
-    let mut changes = BTreeMap::<PathBuf, ChangeKind>::new();
-    diff.foreach(
-        &mut |delta, _| {
-            collect_delta_changes(delta, &mut changes);
-            true
-        },
-        None,
-        None,
-        None,
-    )
-    .context("failed to inspect changed paths")?;
-
-    Ok(changes
-        .into_iter()
-        .map(|(path, kind)| ChangedPath { path, kind })
-        .collect())
+fn snapshot_worktree_candidate(
+    repo: &Repository,
+    worktree_path: &Path,
+    head: Option<Oid>,
+) -> Result<CapturedWorktreeTree> {
+    snapshot_worktree_candidate_from_base(repo, worktree_path, head, head)
 }
 
-fn collect_delta_changes(delta: git2::DiffDelta<'_>, changes: &mut BTreeMap<PathBuf, ChangeKind>) {
-    let kind = classify_delta(delta.status());
-    match delta.status() {
-        Delta::Deleted => {
-            insert_delta_change(delta.old_file().path(), kind, changes);
+fn snapshot_worktree_candidate_from_base(
+    repo: &Repository,
+    worktree_path: &Path,
+    head: Option<Oid>,
+    base_commit: Option<Oid>,
+) -> Result<CapturedWorktreeTree> {
+    let index = TemporaryIndex::create(repo.commondir())?;
+    let mut read_tree = git_command(worktree_path, &["read-tree"]);
+    index.configure_command(&mut read_tree);
+    match head {
+        Some(oid) => {
+            read_tree.arg(oid.to_string());
         }
-        Delta::Renamed | Delta::Copied => {
-            insert_delta_change(delta.old_file().path(), kind, changes);
-            insert_delta_change(delta.new_file().path(), kind, changes);
-        }
-        _ => {
-            insert_delta_change(delta.new_file().path(), kind, changes);
+        None => {
+            read_tree.arg("--empty");
         }
     }
-}
+    run_command_success(read_tree, "initialize candidate snapshot index")?;
 
-fn insert_delta_change(
-    path: Option<&Path>,
-    kind: ChangeKind,
-    changes: &mut BTreeMap<PathBuf, ChangeKind>,
-) {
-    if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
-        changes.insert(path.to_path_buf(), kind);
-    }
-}
+    let mut add = git_command(worktree_path, &["add", "--all", "--", "."]);
+    index.configure_command(&mut add);
+    run_command_success(add, "populate candidate snapshot index")?;
 
-fn collect_full_diff(worktree_path: &Path, base_oid: Option<Oid>) -> Result<String> {
-    let mut args = vec!["diff", "--binary"];
-    let base_arg;
-    if let Some(base_oid) = base_oid {
-        base_arg = base_oid.to_string();
-        args.push(base_arg.as_str());
-    } else {
-        args.push("HEAD");
-    }
-
-    let tracked = run_git_capture(worktree_path, &args).with_context(|| {
-        format!(
-            "failed to collect tracked diff in {}",
-            worktree_path.display()
-        )
-    })?;
-    if !tracked.success {
+    let mut write_tree = git_command(worktree_path, &["write-tree"]);
+    index.configure_command(&mut write_tree);
+    let output = write_tree
+        .output()
+        .context("failed to write candidate snapshot tree")?;
+    if !output.status.success() {
         bail!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&tracked.stderr).trim()
-        );
-    }
-
-    let mut diff = String::from_utf8_lossy(&tracked.stdout).into_owned();
-    for path in collect_untracked_paths(worktree_path)? {
-        let file_diff = run_git_capture_paths(
-            worktree_path,
-            &["diff", "--no-index", "--binary", "--"],
-            &[Path::new("/dev/null"), &path],
-        )
-        .with_context(|| format!("failed to collect untracked diff for {}", path.display()))?;
-        if !file_diff.success && !is_diff_exit(&file_diff) {
-            bail!(
-                "git diff --no-index failed for {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&file_diff.stderr).trim()
-            );
-        }
-        if !diff.is_empty() && !diff.ends_with('\n') {
-            diff.push('\n');
-        }
-        diff.push_str(&String::from_utf8_lossy(&file_diff.stdout));
-    }
-
-    Ok(diff)
-}
-
-fn collect_untracked_paths(worktree_path: &Path) -> Result<Vec<PathBuf>> {
-    let output = run_git_capture(
-        worktree_path,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )
-    .with_context(|| {
-        format!(
-            "failed to list untracked files in {}",
-            worktree_path.display()
-        )
-    })?;
-    if !output.success {
-        bail!(
-            "git ls-files failed: {}",
+            "failed to write candidate snapshot tree: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    let oid =
+        String::from_utf8(output.stdout).context("candidate snapshot tree id was not UTF-8")?;
+    let oid = Oid::from_str(oid.trim()).context("candidate snapshot tree id was invalid")?;
+    let base_tree = temporary_base_tree_oid(repo, worktree_path, base_commit, &index)?;
+    let changes = collect_snapshot_changes(worktree_path, base_tree, oid, &index)?;
+    let raw_diff = collect_snapshot_diff(worktree_path, base_tree, oid, &index)?;
+    Ok(CapturedWorktreeTree {
+        oid,
+        changes,
+        raw_diff,
+    })
+}
 
-    let mut paths = output
-        .stdout
+fn temporary_base_tree_oid(
+    repo: &Repository,
+    worktree_path: &Path,
+    base_commit: Option<Oid>,
+    index: &TemporaryIndex,
+) -> Result<Oid> {
+    if let Some(commit) = base_commit {
+        let tree_id = repo
+            .find_commit(commit)
+            .with_context(|| format!("failed to find base commit {commit}"))?
+            .tree_id();
+        return Ok(tree_id);
+    }
+
+    let mut command = git_command(worktree_path, &["mktree"]);
+    index.configure_command(&mut command);
+    command.stdin(Stdio::null());
+    let output = command
+        .output()
+        .context("failed to create empty base tree")?;
+    if !output.status.success() {
+        bail!(
+            "failed to create empty base tree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let oid = String::from_utf8(output.stdout).context("empty tree id was not UTF-8")?;
+    Oid::from_str(oid.trim()).context("empty tree id was invalid")
+}
+
+fn collect_snapshot_changes(
+    worktree_path: &Path,
+    base_tree: Oid,
+    snapshot_tree: Oid,
+    index: &TemporaryIndex,
+) -> Result<Vec<ChangedPath>> {
+    let base = base_tree.to_string();
+    let snapshot = snapshot_tree.to_string();
+    let mut command = git_command(
+        worktree_path,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            &base,
+            &snapshot,
+            "--",
+        ],
+    );
+    index.configure_command(&mut command);
+    let output = command
+        .output()
+        .context("failed to collect candidate snapshot paths")?;
+    if !output.status.success() {
+        bail!(
+            "failed to collect candidate snapshot paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_name_status_z(&output.stdout)
+}
+
+fn parse_name_status_z(bytes: &[u8]) -> Result<Vec<ChangedPath>> {
+    let mut fields = bytes
         .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
-        .collect::<Vec<_>>();
-    paths.sort();
-    Ok(paths)
+        .filter(|field| !field.is_empty());
+    let mut changes = BTreeMap::new();
+    while let Some(status) = fields.next() {
+        let path = fields
+            .next()
+            .context("git diff --name-status returned a status without a path")?;
+        let kind = match status.first().copied() {
+            Some(b'A') => ChangeKind::Added,
+            Some(b'M') => ChangeKind::Modified,
+            Some(b'D') => ChangeKind::Deleted,
+            Some(b'T') => ChangeKind::Typechange,
+            Some(b'U') => ChangeKind::Conflicted,
+            Some(_) => ChangeKind::Unknown,
+            None => bail!("git diff --name-status returned an empty status"),
+        };
+        changes.insert(path_buf_from_git_bytes(path)?, kind);
+    }
+    Ok(changes
+        .into_iter()
+        .map(|(path, kind)| ChangedPath { path, kind })
+        .collect())
+}
+
+fn collect_snapshot_diff(
+    worktree_path: &Path,
+    base_tree: Oid,
+    snapshot_tree: Oid,
+    index: &TemporaryIndex,
+) -> Result<Vec<u8>> {
+    let base = base_tree.to_string();
+    let snapshot = snapshot_tree.to_string();
+    let mut command = git_command(
+        worktree_path,
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            &base,
+            &snapshot,
+            "--",
+        ],
+    );
+    index.configure_command(&mut command);
+    let output = command
+        .output()
+        .context("failed to collect candidate snapshot diff")?;
+    if !output.status.success() {
+        bail!(
+            "failed to collect candidate snapshot diff: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+impl TemporaryIndex {
+    fn create(common_dir: &Path) -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time before UNIX epoch")?
+            .as_nanos();
+        for attempt in 0..32_u32 {
+            let directory = env::temp_dir().join(format!(
+                "maco-candidate-capture-{}-{nanos}-{attempt}",
+                std::process::id()
+            ));
+            match fs::create_dir(&directory) {
+                Ok(()) => {
+                    let object_directory = directory.join("objects");
+                    if let Err(error) = fs::create_dir(&object_directory) {
+                        let _ = fs::remove_dir_all(&directory);
+                        return Err(error)
+                            .context("failed to create temporary Git object directory");
+                    }
+                    return Ok(Self {
+                        path: directory.join("index"),
+                        object_directory,
+                        alternate_object_directory: common_dir.join("objects"),
+                        directory,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).context("failed to create candidate capture directory")
+                }
+            }
+        }
+        bail!("failed to reserve a unique candidate capture directory")
+    }
+
+    fn configure_command(&self, command: &mut Command) {
+        command
+            .env("GIT_INDEX_FILE", &self.path)
+            .env("GIT_OBJECT_DIRECTORY", &self.object_directory)
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                &self.alternate_object_directory,
+            );
+    }
+}
+
+impl Drop for TemporaryIndex {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn run_command_success(mut command: Command, label: &str) -> Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to {label}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to {label}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
+    match fs::read(path) {
+        Ok(bytes) => Oid::hash_object(ObjectType::Blob, &bytes)
+            .context("failed to hash repository state file")
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
 }
 
 fn passed_safety_check() -> SafetyCheck {
@@ -1138,7 +1429,7 @@ fn validation_evidence_check(
 fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
-    let paths = collect_changed_paths(&repo, None)?
+    let paths = collect_changed_paths(&repo)?
         .into_iter()
         .map(|change| change.path)
         .filter(|path| !is_local_runtime_path(path))
@@ -1259,13 +1550,7 @@ fn refresh_apply_safety(
         validation_required,
         &preview.candidate.changed_paths,
     );
-    let patch = preview
-        .candidate
-        .diff
-        .full
-        .as_deref()
-        .unwrap_or_default()
-        .to_string();
+    let patch = preview.candidate.raw_diff.clone();
     let (apply_check, apply_mode) = apply_check(
         repo_root,
         &patch,
@@ -1413,7 +1698,7 @@ fn failed_validation_paths(validations: &[ValidationReport]) -> Vec<PathBuf> {
 
 fn apply_check(
     repo_root: &Path,
-    patch: &str,
+    patch: &[u8],
     allow_apply_conflicts: bool,
 ) -> Result<(SafetyCheck, ApplyMode)> {
     if patch.is_empty() {
@@ -1495,15 +1780,16 @@ fn run_candidate_validation_commands(
     preview: &MergeApplyPreview,
     commands: &[CandidateValidationCommand],
 ) -> Result<Vec<ValidationReport>> {
-    let sandbox = CandidateValidationSandbox::create(preview)?;
     let mut reports = Vec::new();
     for (index, command) in commands.iter().enumerate() {
-        reports.push(run_candidate_validation_command(
+        let sandbox = CandidateValidationSandbox::create(preview)?;
+        let report = run_candidate_validation_command(
             sandbox.path(),
             command,
             index,
             &preview.candidate.changed_paths,
-        ));
+        );
+        reports.push(sandbox.enforce_candidate_integrity(preview, report));
     }
     Ok(reports)
 }
@@ -1511,6 +1797,7 @@ fn run_candidate_validation_commands(
 struct CandidateValidationSandbox {
     primary_repo_root: PathBuf,
     path: PathBuf,
+    baseline_binding: CandidateValidationBinding,
 }
 
 impl CandidateValidationSandbox {
@@ -1523,31 +1810,30 @@ impl CandidateValidationSandbox {
             .primary_head
             .as_deref()
             .unwrap_or("HEAD");
-        let add_output = Command::new("git")
-            .arg("-C")
-            .arg(&primary_repo_root)
+        let mut add_command = sanitized_git_command(&primary_repo_root);
+        add_command
             .args(["worktree", "add", "--detach", "--force"])
             .arg(&path)
-            .arg(base_revision)
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to create candidate validation worktree {}",
-                    path.display()
-                )
-            })?;
+            .arg(base_revision);
+        let add_output = add_command.output().with_context(|| {
+            format!(
+                "failed to create candidate validation worktree {}",
+                path.display()
+            )
+        })?;
         if !add_output.status.success() {
             bail!(
                 "failed to create candidate validation worktree: {}",
                 String::from_utf8_lossy(&add_output.stderr).trim()
             );
         }
-        let sandbox = Self {
+        let mut sandbox = Self {
             primary_repo_root,
             path,
+            baseline_binding: preview.candidate.validation_binding.clone(),
         };
 
-        let patch = preview.candidate.diff.full.as_deref().unwrap_or_default();
+        let patch = preview.candidate.raw_diff.as_slice();
         let args = match preview.safety.apply_mode {
             ApplyMode::Direct => vec!["apply", "--binary"],
             ApplyMode::ThreeWay => vec!["apply", "--3way", "--binary"],
@@ -1564,19 +1850,61 @@ impl CandidateValidationSandbox {
             }
         }
 
+        sandbox.baseline_binding = sandbox.current_binding(preview)?;
+
         Ok(sandbox)
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn enforce_candidate_integrity(
+        &self,
+        preview: &MergeApplyPreview,
+        mut report: ValidationReport,
+    ) -> ValidationReport {
+        let integrity = self.current_binding(preview);
+        match integrity {
+            Ok(binding) if binding == self.baseline_binding => report,
+            Ok(_) => {
+                report.status = ValidationStatus::Failed;
+                report.message = append_validation_message(
+                    report.message,
+                    "validation command mutated tracked or non-ignored candidate state; its result was rejected",
+                );
+                report.paths = merge_path_sets(&report.paths, &preview.candidate.changed_paths);
+                report
+            }
+            Err(error) => {
+                report.status = ValidationStatus::Failed;
+                report.message = append_validation_message(
+                    report.message,
+                    &format!("failed to verify validation sandbox integrity: {error}"),
+                );
+                report.paths = merge_path_sets(&report.paths, &preview.candidate.changed_paths);
+                report
+            }
+        }
+    }
+
+    fn current_binding(&self, preview: &MergeApplyPreview) -> Result<CandidateValidationBinding> {
+        let repo = Repository::open(&self.path).with_context(|| {
+            format!("failed to open validation sandbox {}", self.path.display())
+        })?;
+        let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
+        let base = collection_base_oid(&preview.candidate.metadata)?;
+        let captured = capture_two_matching(|| {
+            snapshot_worktree_candidate_from_base(&repo, &self.path, head, base).map(Some)
+        })?;
+        candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)
+    }
 }
 
 impl Drop for CandidateValidationSandbox {
     fn drop(&mut self) {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&self.primary_repo_root)
+        let mut command = sanitized_git_command(&self.primary_repo_root);
+        let _ = command
             .args(["worktree", "remove", "--force"])
             .arg(&self.path)
             .output();
@@ -1605,7 +1933,9 @@ fn run_candidate_validation_command(
     index: usize,
     changed_paths: &[PathBuf],
 ) -> ValidationReport {
-    let output = shell_command(&validation.command)
+    let mut command = shell_command(&validation.command);
+    sanitize_git_environment(&mut command);
+    let output = command
         .current_dir(worktree_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1657,6 +1987,13 @@ fn candidate_validation_message(output: &std::process::Output) -> Option<String>
         .map(|code| format!("exited with status {code}"))
         .unwrap_or_else(|| "terminated without an exit code".to_string());
     Some(format!("{exit}: {}", summarize_text(text, 1024).text))
+}
+
+fn append_validation_message(existing: Option<String>, next: &str) -> Option<String> {
+    Some(match existing {
+        Some(existing) => format!("{existing}; {next}"),
+        None => next.to_string(),
+    })
 }
 
 struct SafetyChecks<'a> {
@@ -1968,17 +2305,112 @@ fn classify_status(status: Status) -> ChangeKind {
     }
 }
 
-fn classify_delta(delta: Delta) -> ChangeKind {
-    match delta {
-        Delta::Added => ChangeKind::Added,
-        Delta::Modified => ChangeKind::Modified,
-        Delta::Deleted => ChangeKind::Deleted,
-        Delta::Renamed | Delta::Copied => ChangeKind::Renamed,
-        Delta::Typechange => ChangeKind::Typechange,
-        Delta::Untracked => ChangeKind::Untracked,
-        Delta::Conflicted => ChangeKind::Conflicted,
-        _ => ChangeKind::Unknown,
+fn serialize_path<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&path_json_text(path))
+}
+
+fn serialize_paths<S>(paths: &[PathBuf], serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    paths
+        .iter()
+        .map(|path| path_json_text(path))
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+pub(crate) fn path_json_text(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return path.to_string();
     }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return escape_bytes_ascii(path.as_os_str().as_bytes());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut escaped = String::new();
+        for unit in path.as_os_str().encode_wide() {
+            if matches!(unit, 0x20..=0x7e) && unit != u16::from(b'\\') {
+                escaped.push(char::from_u32(u32::from(unit)).unwrap_or('?'));
+            } else {
+                let _ = write!(&mut escaped, "\\u{unit:04X}");
+            }
+        }
+        return escaped;
+    }
+
+    #[allow(unreachable_code)]
+    "<non-unicode-path>".to_string()
+}
+
+pub(crate) fn raw_path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return path.as_os_str().as_bytes().to_vec();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        return path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+    }
+
+    #[allow(unreachable_code)]
+    path.as_os_str()
+        .to_str()
+        .map(str::as_bytes)
+        .unwrap_or_default()
+        .to_vec()
+}
+
+fn path_buf_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let path = String::from_utf8(bytes.to_vec())
+            .context("Git returned a repository path that is not valid UTF-8 on this platform")?;
+        Ok(PathBuf::from(path))
+    }
+}
+
+fn patch_text_for_json(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap_or_else(|error| escape_bytes_ascii(error.as_bytes()))
+}
+
+fn escape_bytes_ascii(bytes: &[u8]) -> String {
+    let mut escaped = String::new();
+    for byte in bytes {
+        match *byte {
+            b'\n' => escaped.push('\n'),
+            b'\r' => escaped.push('\r'),
+            b'\t' => escaped.push('\t'),
+            0x20..=0x7e if *byte != b'\\' => escaped.push(char::from(*byte)),
+            b'\\' => escaped.push_str("\\\\"),
+            _ => {
+                let _ = write!(&mut escaped, "\\x{byte:02X}");
+            }
+        }
+    }
+    escaped
 }
 
 fn summarize_text(text: &str, limit: usize) -> OutputSummary {
@@ -2015,73 +2447,214 @@ fn discover_primary_repo_root(repo_path: &Path) -> Result<PathBuf> {
         .context("merge operations require a non-bare primary repository")
 }
 
-impl MergeApplyLock {
-    fn acquire(repo_root: &Path) -> Result<Self> {
+impl RepoCommonLock {
+    pub(crate) fn acquire(repo_root: &Path, operation: &str) -> Result<Self> {
+        if operation.is_empty()
+            || !operation
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            bail!("repository lock operation name is invalid");
+        }
         let repo = Repository::open(repo_root).with_context(|| {
             format!(
-                "failed to open repository for merge apply lock {}",
+                "failed to open repository for {operation} lock {}",
                 repo_root.display()
             )
         })?;
         let state_dir = repo.commondir().join("maco").join("state");
         fs::create_dir_all(&state_dir).with_context(|| {
             format!(
-                "failed to create merge apply lock directory {}",
+                "failed to create {operation} lock directory {}",
                 state_dir.display()
             )
         })?;
-        let path = state_dir.join("merge-apply.lock");
-        let nanos = SystemTime::now()
+        let path = state_dir.join(REPOSITORY_MUTATION_LOCK_FILE);
+        let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("system time before UNIX epoch")?
-            .as_nanos();
-        let owner = format!("pid={} nonce={nanos}\n", std::process::id());
-        let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let current_owner =
-                    fs::read_to_string(&path).unwrap_or_else(|_| "owner unavailable".to_string());
-                bail!(
-                    "merge apply lock is already held in the repository common state ({}); wait for the active apply to finish, or after verifying no apply process is running remove the stale lock",
-                    current_owner.trim()
-                );
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to acquire merge apply lock {}", path.display())
-                });
-            }
+            .context("system time before UNIX epoch")?;
+        let owner = RepoLockOwner {
+            version: LOCK_RECORD_VERSION,
+            pid: std::process::id(),
+            nonce: format!("{}-{}", std::process::id(), duration.as_nanos()),
+            created_unix_seconds: duration.as_secs(),
+            operation: operation.to_string(),
         };
-        PendingMergeApplyLock {
-            path,
-            owner,
-            file: Some(file),
-            committed: false,
+        let mut owner_bytes = serde_json::to_vec(&owner).context("failed to encode lock owner")?;
+        owner_bytes.push(b'\n');
+
+        for _ in 0..CANDIDATE_CAPTURE_ATTEMPTS {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return PendingRepoCommonLock {
+                        path,
+                        owner_bytes,
+                        file: Some(file),
+                        committed: false,
+                    }
+                    .commit(operation);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = fs::read(&path).with_context(|| {
+                        format!(
+                            "failed to read existing {operation} lock {}",
+                            path.display()
+                        )
+                    })?;
+                    let current: RepoLockOwner = serde_json::from_slice(&existing).with_context(|| {
+                        format!(
+                            "{operation} lock is malformed and will not be reclaimed automatically ({})",
+                            path.display()
+                        )
+                    })?;
+                    validate_lock_owner(&current, operation)?;
+                    match process_liveness(current.pid) {
+                        ProcessLiveness::Live => bail!(
+                            "{operation} cannot acquire repository mutation lock: it is held for {} by live pid {} (nonce {}, created {})",
+                            current.operation,
+                            current.pid,
+                            current.nonce,
+                            current.created_unix_seconds
+                        ),
+                        ProcessLiveness::Unknown => bail!(
+                            "{operation} cannot acquire repository mutation lock held for {}: owner pid {} could not be checked; refusing unsafe stale-lock recovery",
+                            current.operation,
+                            current.pid,
+                        ),
+                        ProcessLiveness::Absent => {
+                            reclaim_absent_owner_lock(&path, &existing, &owner.nonce, operation)?;
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to acquire {operation} lock {}", path.display())
+                    });
+                }
+            }
         }
-        .commit()
+        bail!("failed to acquire {operation} lock after bounded stale-lock recovery")
     }
 }
 
-impl PendingMergeApplyLock {
-    fn commit(mut self) -> Result<MergeApplyLock> {
+fn validate_lock_owner(owner: &RepoLockOwner, operation: &str) -> Result<()> {
+    if owner.version != LOCK_RECORD_VERSION
+        || owner.pid == 0
+        || owner.nonce.trim().is_empty()
+        || owner.created_unix_seconds == 0
+        || owner.operation.is_empty()
+        || !owner
+            .operation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!(
+            "{operation} repository mutation lock owner record is invalid and will not be reclaimed automatically"
+        );
+    }
+    Ok(())
+}
+
+fn reclaim_absent_owner_lock(
+    path: &Path,
+    expected: &[u8],
+    nonce: &str,
+    operation: &str,
+) -> Result<()> {
+    let quarantine = path.with_file_name(format!(
+        ".{}.reclaim-{}",
+        path.file_name().and_then(OsStr::to_str).unwrap_or("lock"),
+        nonce
+    ));
+    match fs::rename(path, &quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to atomically quarantine stale {operation} lock"))
+        }
+    }
+    let actual = fs::read(&quarantine)
+        .with_context(|| format!("failed to verify quarantined stale {operation} lock"))?;
+    if actual != expected {
+        if !path.exists() {
+            let _ = fs::rename(&quarantine, path);
+        }
+        bail!("{operation} lock changed during stale-lock recovery; refusing to continue");
+    }
+    fs::remove_file(&quarantine)
+        .with_context(|| format!("failed to remove quarantined stale {operation} lock"))
+}
+
+fn process_liveness(pid: u32) -> ProcessLiveness {
+    if pid == std::process::id() {
+        return ProcessLiveness::Live;
+    }
+
+    #[cfg(unix)]
+    {
+        if pid > i32::MAX as u32 {
+            return ProcessLiveness::Unknown;
+        }
+        let output = Command::new("kill").arg("-0").arg(pid.to_string()).output();
+        return match output {
+            Ok(output) if output.status.success() => ProcessLiveness::Live,
+            Ok(output)
+                if String::from_utf8_lossy(&output.stderr)
+                    .to_ascii_lowercase()
+                    .contains("operation not permitted") =>
+            {
+                ProcessLiveness::Live
+            }
+            Ok(_) => ProcessLiveness::Absent,
+            Err(_) => ProcessLiveness::Unknown,
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let filter = format!("PID eq {pid}");
+        return match Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let needle = format!("\"{pid}\"");
+                if String::from_utf8_lossy(&output.stdout).contains(&needle) {
+                    ProcessLiveness::Live
+                } else {
+                    ProcessLiveness::Absent
+                }
+            }
+            _ => ProcessLiveness::Unknown,
+        };
+    }
+
+    #[allow(unreachable_code)]
+    ProcessLiveness::Unknown
+}
+
+impl PendingRepoCommonLock {
+    fn commit(mut self, operation: &str) -> Result<RepoCommonLock> {
         let file = self
             .file
             .as_mut()
-            .context("merge apply lock file was unavailable during acquisition")?;
-        file.write_all(self.owner.as_bytes())
-            .context("failed to record merge apply lock owner")?;
+            .with_context(|| format!("{operation} lock file was unavailable during acquisition"))?;
+        file.write_all(&self.owner_bytes)
+            .with_context(|| format!("failed to record {operation} lock owner"))?;
         file.sync_all()
-            .context("failed to persist merge apply lock owner")?;
+            .with_context(|| format!("failed to persist {operation} lock owner"))?;
         let _ = self.file.take();
         self.committed = true;
-        Ok(MergeApplyLock {
+        Ok(RepoCommonLock {
             path: self.path.clone(),
-            owner: self.owner.clone(),
+            owner_bytes: self.owner_bytes.clone(),
         })
     }
 }
 
-impl Drop for PendingMergeApplyLock {
+impl Drop for PendingRepoCommonLock {
     fn drop(&mut self) {
         let _ = self.file.take();
         if !self.committed {
@@ -2090,9 +2663,9 @@ impl Drop for PendingMergeApplyLock {
     }
 }
 
-impl Drop for MergeApplyLock {
+impl Drop for RepoCommonLock {
     fn drop(&mut self) {
-        if fs::read_to_string(&self.path).ok().as_deref() == Some(self.owner.as_str()) {
+        if fs::read(&self.path).ok().as_deref() == Some(self.owner_bytes.as_slice()) {
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -2115,22 +2688,8 @@ impl PrimaryRepositoryState {
             format!("failed to open primary repository {}", repo_root.display())
         })?;
         let head = head_oid(&repo).context("failed to read primary HEAD for merge transaction")?;
-        let index_path = repo.path().join("index");
-        let index_digest = match fs::read(&index_path) {
-            Ok(bytes) => Some(
-                Oid::hash_object(ObjectType::Blob, &bytes)
-                    .context("failed to hash primary index state")?,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read primary index {}", index_path.display())
-                });
-            }
-        };
-        let worktree_diff = collect_full_diff(repo_root, head)?;
-        let worktree_digest = Oid::hash_object(ObjectType::Blob, worktree_diff.as_bytes())
-            .context("failed to hash primary worktree state")?;
+        let index_digest = hash_optional_file(&repo.path().join("index"))?;
+        let worktree_digest = snapshot_worktree_candidate(&repo, repo_root, head)?.oid;
         Ok(Self {
             head,
             index_digest,
@@ -2163,7 +2722,7 @@ fn run_git_capture_paths(
     })
 }
 
-fn run_git_with_input(repo_root: &Path, args: &[&str], input: &str) -> Result<GitCommandOutput> {
+fn run_git_with_input(repo_root: &Path, args: &[&str], input: &[u8]) -> Result<GitCommandOutput> {
     let mut child = git_command(repo_root, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2176,7 +2735,7 @@ fn run_git_with_input(repo_root: &Path, args: &[&str], input: &str) -> Result<Gi
         .take()
         .context("failed to open git stdin for patch input")?;
     stdin
-        .write_all(input.as_bytes())
+        .write_all(input)
         .context("failed to write patch to git stdin")?;
     drop(stdin);
 
@@ -2191,9 +2750,35 @@ fn run_git_with_input(repo_root: &Path, args: &[&str], input: &str) -> Result<Gi
 }
 
 fn git_command(repo_root: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(repo_root).args(args);
+    let mut command = sanitized_git_command(repo_root);
+    command.args(args);
     command
+}
+
+pub(crate) fn sanitized_git_command(repo_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    sanitize_git_environment(&mut command);
+    command.arg("-C").arg(repo_root);
+    command
+}
+
+pub(crate) fn sanitize_git_environment(command: &mut Command) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(key);
+    }
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_CONFIG_") {
+            command.env_remove(key);
+        }
+    }
+    command.env("GIT_OPTIONAL_LOCKS", "0");
 }
 
 fn shell_command(command_text: &str) -> Command {
@@ -2209,10 +2794,6 @@ fn shell_command(command_text: &str) -> Command {
         command.arg("-c").arg(command_text);
         command
     }
-}
-
-fn is_diff_exit(output: &GitCommandOutput) -> bool {
-    !output.stdout.is_empty()
 }
 
 fn format_blockers(blockers: &[ApplyBlocker]) -> String {
@@ -2436,6 +3017,27 @@ mod tests {
     }
 
     #[test]
+    fn candidate_capture_retries_until_two_complete_snapshots_match() {
+        let mut captures = vec![Some(1_u8), Some(2), Some(3), Some(3)].into_iter();
+
+        let captured = capture_two_matching(|| Ok(captures.next().flatten()))
+            .expect("capture should stabilize");
+
+        assert_eq!(captured, 3);
+    }
+
+    #[test]
+    fn candidate_capture_fails_closed_after_bounded_instability() {
+        let mut captures =
+            vec![Some(1_u8), Some(2), Some(1), Some(2), Some(1), Some(2)].into_iter();
+
+        let error = capture_two_matching(|| Ok(captures.next().flatten()))
+            .expect_err("capture should remain unstable");
+
+        assert!(error.to_string().contains("state changed"));
+    }
+
+    #[test]
     fn safety_classification_blocks_unforced_failures() {
         let failed = SafetyCheck {
             status: SafetyCheckStatus::Failed,
@@ -2570,15 +3172,15 @@ mod tests {
     #[test]
     fn pending_merge_apply_lock_removes_created_file_when_not_committed() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("merge-apply.lock");
+        let path = temp.path().join("repository-mutation.lock");
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .expect("create pending lock");
-        let pending = PendingMergeApplyLock {
+        let pending = PendingRepoCommonLock {
             path: path.clone(),
-            owner: "test-owner".to_string(),
+            owner_bytes: b"test-owner\n".to_vec(),
             file: Some(file),
             committed: false,
         };
@@ -2655,6 +3257,7 @@ mod tests {
                         .to_string(),
                 },
                 validation_evidence: ValidationEvidenceBundle::default(),
+                raw_diff: b"this is not a patch\n".to_vec(),
             },
             safety: MergeApplySafety {
                 primary_state_unchanged: passed.clone(),

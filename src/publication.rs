@@ -1,14 +1,15 @@
 use crate::{
     llm::{RedactionSummary, Redactor},
     merge::{
-        self, ApplyBlocker, ApplyReadinessStatus, MergeApplyPreview, MergeCollectOptions,
-        MergeForceOptions, MergePreviewOptions, OutputSummary, SafetyCheckStatus,
-        ValidationEvidenceBundle, ValidationReport,
+        self, ApplyBlocker, ApplyBlockerDetail, ApplyBlockerDisposition, ApplyReadinessStatus,
+        MergeApplyPreview, MergeCollectOptions, MergeForceOptions, MergePreviewOptions,
+        OutputSummary, RepoCommonLock, SafetyCheckStatus, ValidationEvidenceBundle,
+        ValidationReport,
     },
 };
 use anyhow::{bail, Context, Result};
-use git2::{ErrorCode, Oid, Repository};
-use serde::Serialize;
+use git2::{Oid, Repository};
+use serde::{Serialize, Serializer};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -75,6 +76,7 @@ pub struct PrPublicationReport {
     pub draft: bool,
     pub title: String,
     pub body_summary: OutputSummary,
+    #[serde(serialize_with = "serialize_paths")]
     pub changed_paths: Vec<PathBuf>,
     pub validation_status: SafetyCheckStatus,
     pub validation_required: bool,
@@ -103,7 +105,6 @@ pub struct IssuePublicationReport {
 
 struct GithubPrResult {
     url: String,
-    pushed: bool,
     created: bool,
 }
 
@@ -184,44 +185,122 @@ pub fn publish_pr_with_validation_evidence(
     require_validation: bool,
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<PrPublicationReport> {
-    let mut report =
-        preview_pr_with_validation_evidence(options, require_validation, validation_evidence)?;
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let _lock = RepoCommonLock::acquire(&repo_root, "pr-publish")?;
+    let mut report = preview_pr_with_validation_evidence(
+        options.clone(),
+        require_validation,
+        validation_evidence.clone(),
+    )?;
     if report.readiness == ApplyReadinessStatus::Blocked {
         return Ok(report);
     }
 
-    let primary_repo = Repository::open(&report.preview.candidate.metadata.primary_repo_root)
-        .context("failed to open primary repository")?;
-    match report.forge {
-        ForgeKind::Fake => {}
-        ForgeKind::Git => {
-            report.remote = Some(
-                remote_url(&primary_repo, "origin")
-                    .context("Git publication requires an 'origin' remote")?,
-            );
+    let worktree_path = report.preview.candidate.metadata.worktree_path.clone();
+    let needs_commit = has_uncommitted_changes(&worktree_path)?;
+    if require_validation && needs_commit {
+        return Ok(block_publication(
+            report,
+            ApplyBlocker::ValidationMissing,
+            "candidate-bound publication requires a clean, committed agent candidate",
+            "commit the candidate, rerun pr preview, validate that exact binding, create a bound envelope, then rerun pr publish",
+        ));
+    }
+
+    let originally_reviewed = report.preview.candidate.validation_binding.clone();
+    let mut local_commit = None;
+    if needs_commit {
+        report = preview_pr_with_validation_evidence(
+            options.clone(),
+            false,
+            validation_evidence.clone(),
+        )?;
+        if report.readiness == ApplyReadinessStatus::Blocked {
+            return Ok(report);
         }
-        ForgeKind::Github => {
-            report.remote = Some(
-                remote_url(&primary_repo, "origin")
-                    .context("GitHub PR publication requires an 'origin' remote")?,
-            );
+        if has_uncommitted_changes(&worktree_path)? {
+            let commit_id = commit_agent_changes(
+                &worktree_path,
+                &report.agent_id,
+                &report.changed_paths,
+                &report.preview,
+            )?;
+            local_commit = Some(commit_id.to_string());
+            if has_uncommitted_changes(&worktree_path)? {
+                let mut changed_during_commit = preview_pr_with_validation_evidence(
+                    options.clone(),
+                    false,
+                    validation_evidence.clone(),
+                )?;
+                changed_during_commit.commit_id = local_commit.clone();
+                changed_during_commit.head_id = changed_during_commit
+                    .preview
+                    .candidate
+                    .metadata
+                    .agent_head
+                    .clone();
+                return Ok(block_publication(
+                    changed_during_commit,
+                    ApplyBlocker::StaleBase,
+                    "agent worktree changed while the local publication commit was being created",
+                    "review and commit the remaining worktree changes, then rerun pr preview before publishing",
+                ));
+            }
         }
     }
 
-    let worktree_path = report.preview.candidate.metadata.worktree_path.clone();
-    let needs_commit = has_uncommitted_changes(&worktree_path)?;
-    if needs_commit {
-        let commit_id = commit_agent_changes(
-            &worktree_path,
-            &report.agent_id,
-            &report.changed_paths,
-            &report.preview,
-        )?;
-        report.commit_id = Some(commit_id.to_string());
-        report.head_id = Some(commit_id.to_string());
-    } else {
-        report.head_id = current_head_id(&worktree_path)?;
+    let mut after_local = preview_pr_with_validation_evidence(
+        options.clone(),
+        require_validation,
+        validation_evidence.clone(),
+    )?;
+    if after_local.readiness == ApplyReadinessStatus::Blocked {
+        after_local.commit_id = local_commit.clone();
+        after_local.head_id = after_local.preview.candidate.metadata.agent_head.clone();
+        return Ok(after_local);
     }
+    if !needs_commit && after_local.preview.candidate.validation_binding != originally_reviewed {
+        return Ok(block_publication(
+            after_local,
+            ApplyBlocker::StaleBase,
+            "agent or primary candidate changed after the publication preview",
+            "rerun pr preview and validation for the current committed candidate before publishing",
+        ));
+    }
+    after_local.commit_id = local_commit.clone();
+    after_local.head_id = after_local.preview.candidate.metadata.agent_head.clone();
+    let reviewed_binding = after_local.preview.candidate.validation_binding.clone();
+
+    let primary_repo = Repository::open(&repo_root).context("failed to open primary repository")?;
+    let remote = match after_local.forge {
+        ForgeKind::Fake => None,
+        ForgeKind::Git => Some(
+            remote_url(&primary_repo, "origin")
+                .context("Git publication requires an 'origin' remote")?,
+        ),
+        ForgeKind::Github => Some(
+            remote_url(&primary_repo, "origin")
+                .context("GitHub PR publication requires an 'origin' remote")?,
+        ),
+    };
+
+    let mut final_report =
+        preview_pr_with_validation_evidence(options, require_validation, validation_evidence)?;
+    final_report.commit_id = local_commit;
+    final_report.head_id = final_report.preview.candidate.metadata.agent_head.clone();
+    final_report.remote = remote;
+    if final_report.readiness == ApplyReadinessStatus::Blocked {
+        return Ok(final_report);
+    }
+    if final_report.preview.candidate.validation_binding != reviewed_binding {
+        return Ok(block_publication(
+            final_report,
+            ApplyBlocker::StaleBase,
+            "agent or primary candidate changed before external publication",
+            "rerun pr preview and validation for the current committed candidate before publishing",
+        ));
+    }
+    report = final_report;
 
     match report.forge {
         ForgeKind::Fake => {
@@ -234,7 +313,11 @@ pub fn publish_pr_with_validation_evidence(
             report.next_action = "review the fake pull request report locally".to_string();
         }
         ForgeKind::Git => {
-            push_git_branch(&worktree_path, "origin", &report.branch)?;
+            let expected_head = report
+                .head_id
+                .as_deref()
+                .context("validated publication candidate has no HEAD commit")?;
+            push_git_branch(&worktree_path, "origin", &report.branch, expected_head)?;
             report.pushed = true;
             report.created = false;
             report.pr_url = None;
@@ -242,9 +325,13 @@ pub fn publish_pr_with_validation_evidence(
         }
         ForgeKind::Github => {
             let body = pr_body(&report.preview);
+            let expected_head = report
+                .head_id
+                .as_deref()
+                .context("validated publication candidate has no HEAD commit")?;
+            push_git_branch(&worktree_path, "origin", &report.branch, expected_head)?;
             let github = create_github_pr(
                 &worktree_path,
-                "origin",
                 &report.branch,
                 &report.base,
                 &report.title,
@@ -252,7 +339,7 @@ pub fn publish_pr_with_validation_evidence(
                 report.draft,
             )?;
             report.pr_url = Some(github.url);
-            report.pushed = github.pushed;
+            report.pushed = true;
             report.created = github.created;
             report.next_action = "review the draft pull request on GitHub".to_string();
         }
@@ -260,6 +347,50 @@ pub fn publish_pr_with_validation_evidence(
 
     report.status = PrPublicationStatus::Published;
     Ok(report)
+}
+
+fn block_publication(
+    mut report: PrPublicationReport,
+    blocker: ApplyBlocker,
+    message: &str,
+    next_action: &str,
+) -> PrPublicationReport {
+    let paths = report.preview.candidate.changed_paths.clone();
+    report.preview.safety.readiness.blockers.push(blocker);
+    report.preview.safety.readiness.blockers.sort();
+    report.preview.safety.readiness.blockers.dedup();
+    report
+        .preview
+        .safety
+        .readiness
+        .details
+        .push(ApplyBlockerDetail {
+            kind: blocker,
+            disposition: ApplyBlockerDisposition::Blocked,
+            check_status: SafetyCheckStatus::Failed,
+            paths,
+            message: Some(message.to_string()),
+            validation_reports: report.preview.candidate.validations.clone(),
+            validation_commands: report.preview.safety.candidate_validation_commands.clone(),
+            next_safe_operation: Some(next_action.to_string()),
+        });
+    report.preview.safety.readiness.status = ApplyReadinessStatus::Blocked;
+    report.status = PrPublicationStatus::Blocked;
+    report.readiness = ApplyReadinessStatus::Blocked;
+    report.blockers = report.preview.safety.readiness.blockers.clone();
+    report.pushed = false;
+    report.created = false;
+    report.pr_url = None;
+    report.next_action = next_action.to_string();
+    report
+}
+
+fn discover_primary_repo_root(repo_path: &Path) -> Result<PathBuf> {
+    let repo = Repository::discover(repo_path)
+        .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .context("PR publication requires a non-bare primary repository")
 }
 
 pub fn preview_issue(options: IssuePublicationOptions) -> Result<IssuePublicationReport> {
@@ -328,7 +459,7 @@ fn pr_body(preview: &MergeApplyPreview) -> String {
         .candidate
         .changed_paths
         .iter()
-        .map(|path| format!("- {}", path.display()))
+        .map(|path| format!("- {}", merge::path_json_text(path)))
         .collect::<Vec<_>>()
         .join("\n");
     let changed = if changed.is_empty() {
@@ -411,11 +542,8 @@ fn commit_agent_changes(
 }
 
 fn git_add_all(worktree_path: &Path, changed_paths: &[PathBuf]) -> Result<()> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(worktree_path)
-        .args(["add", "--all", "--"]);
+    let mut command = merge::sanitized_git_command(worktree_path);
+    command.args(["add", "--all", "--"]);
     for path in changed_paths {
         command.arg(path);
     }
@@ -436,29 +564,12 @@ fn commit_message(agent_id: &str, preview: &MergeApplyPreview) -> String {
         .candidate
         .changed_paths
         .iter()
-        .map(|path| format!("- {}", path.display()))
+        .map(|path| format!("- {}", merge::path_json_text(path)))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
         "maco: publish {agent_id} changes\n\nGenerated by maco pr publish after merge-preview gates passed.\n\nChanged paths:\n{paths}\n"
     )
-}
-
-fn current_head_id(worktree_path: &Path) -> Result<Option<String>> {
-    let repo = Repository::open(worktree_path)
-        .with_context(|| format!("failed to open repository {}", worktree_path.display()))?;
-    let head = match repo.head() {
-        Ok(head) => Ok(Some(
-            head.peel_to_commit()
-                .context("failed to peel HEAD to commit")?
-                .id()
-                .to_string(),
-        )),
-        Err(error) if error.code() == ErrorCode::UnbornBranch => Ok(None),
-        Err(error) if error.code() == ErrorCode::NotFound => Ok(None),
-        Err(error) => Err(error).context("failed to read HEAD"),
-    };
-    head
 }
 
 fn current_branch_name(repo: &Repository) -> Option<String> {
@@ -479,16 +590,14 @@ fn remote_url(repo: &Repository, name: &str) -> Result<String> {
 
 fn create_github_pr(
     worktree_path: &Path,
-    remote: &str,
     branch: &str,
     base: &str,
     title: &str,
     body: &str,
     draft: bool,
 ) -> Result<GithubPrResult> {
-    push_git_branch(worktree_path, remote, branch)?;
-
     let mut command = Command::new("gh");
+    merge::sanitize_git_environment(&mut command);
     command
         .current_dir(worktree_path)
         .args(["pr", "create", "--base", base, "--head", branch])
@@ -502,24 +611,25 @@ fn create_github_pr(
     let stdout = run_command(&mut command, "gh pr create")?;
     let url = first_non_empty_line(&stdout)
         .unwrap_or_else(|| format!("https://github.com/pull/{branch}"));
-    Ok(GithubPrResult {
-        url,
-        pushed: true,
-        created: true,
-    })
+    Ok(GithubPrResult { url, created: true })
 }
 
-fn push_git_branch(worktree_path: &Path, remote: &str, branch: &str) -> Result<()> {
-    let mut push = Command::new("git");
-    push.arg("-C")
-        .arg(worktree_path)
-        .args(["push", "-u", remote, branch]);
+fn push_git_branch(
+    worktree_path: &Path,
+    remote: &str,
+    branch: &str,
+    expected_head: &str,
+) -> Result<()> {
+    let mut push = merge::sanitized_git_command(worktree_path);
+    let refspec = format!("{expected_head}:refs/heads/{branch}");
+    push.args(["push", remote, &refspec]);
     run_command(&mut push, "git push")?;
     Ok(())
 }
 
 fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) -> Result<String> {
     let mut command = Command::new("gh");
+    merge::sanitize_git_environment(&mut command);
     command
         .current_dir(repo)
         .args(["issue", "create", "--title"])
@@ -580,18 +690,18 @@ fn normalized_labels(labels: Vec<String>) -> Vec<String> {
 }
 
 fn fake_pr_url(agent_id: &str, branch: &str, changed_paths: &[PathBuf]) -> String {
-    let mut input = String::new();
-    input.push_str(agent_id);
-    input.push('\n');
-    input.push_str(branch);
+    let mut input = Vec::new();
+    input.extend_from_slice(agent_id.as_bytes());
+    input.push(b'\n');
+    input.extend_from_slice(branch.as_bytes());
     for path in changed_paths {
-        input.push('\n');
-        input.push_str(&path.to_string_lossy());
+        input.push(b'\n');
+        input.extend_from_slice(&merge::raw_path_bytes(path));
     }
     format!(
         "fake://pr/{}-{:016x}",
         sanitize_url_segment(agent_id),
-        stable_hash(input.as_bytes())
+        stable_hash(&input)
     )
 }
 
@@ -638,6 +748,17 @@ fn stable_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn serialize_paths<S>(paths: &[PathBuf], serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    paths
+        .iter()
+        .map(|path| merge::path_json_text(path))
+        .collect::<Vec<_>>()
+        .serialize(serializer)
 }
 
 fn summarize_text(text: &str, limit: usize) -> OutputSummary {
