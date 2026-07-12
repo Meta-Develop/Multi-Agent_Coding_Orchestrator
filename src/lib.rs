@@ -15,6 +15,7 @@ pub mod publication;
 pub mod repo_map;
 pub mod repo_semantic;
 pub mod review;
+pub mod safe_state;
 pub mod semantic_coord;
 pub mod supervise;
 pub mod sync;
