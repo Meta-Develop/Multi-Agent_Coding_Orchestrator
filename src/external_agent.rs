@@ -238,14 +238,12 @@ impl ExternalAgentRun {
 
     /// Exact bounded prefix captured from the owned stdout pipe. The bytes are
     /// private held evidence and are deliberately excluded from serialization.
-    #[allow(dead_code)] // Used by artifact producer migrations that may cherry-pick this API first.
     pub(crate) fn stdout_bytes(&self) -> &[u8] {
         &self.stdout.bytes
     }
 
     /// Scratch output may be discarded only when the main target was never
     /// released or its owned process tree is proven empty.
-    #[allow(dead_code)] // Used by artifact producer migrations that may cherry-pick this API first.
     pub(crate) fn scratch_quiescence_verified(&self) -> bool {
         !self.stdout.target_launch_attempted
             || self

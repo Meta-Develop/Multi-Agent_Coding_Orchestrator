@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
 use git2::{Repository, Signature};
+use multi_agent_coding_orchestrator::{
+    artifacts::{ArtifactFileDisposition, ArtifactRunReader, RunArtifactFamily},
+    orchestrator::RunId,
+};
 use serde_json::Value;
 use std::{fs, path::Path, process::Command};
 use tempfile::TempDir;
@@ -49,7 +53,180 @@ fn consult_ask_fake_runtime_writes_report_and_artifacts() -> Result<()> {
     assert!(repo_path
         .join(".maco/consult/runs/consult-fake/trusted/schemas/consultant-report.schema.json")
         .exists());
+    assert!(!repo_path
+        .join(".maco/consult/runs/consult-fake/incoming")
+        .exists());
+    assert!(!repo_path
+        .join(".maco/consult/runs/consult-fake/capture")
+        .exists());
 
+    let run_id = RunId::new("consult-fake")?;
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Consult, &run_id)?;
+    let finalization = reader.finalization();
+    assert!(!finalization.publish_requested);
+    assert!(!finalization.publishable);
+    assert_eq!(finalization.files.len(), 4);
+    assert_eq!(
+        finalization
+            .files
+            .iter()
+            .find(|record| record.path == Path::new("trusted/question.md"))
+            .context("question manifest record")?
+            .disposition,
+        ArtifactFileDisposition::PrivateEvidence
+    );
+    assert_eq!(
+        finalization
+            .files
+            .iter()
+            .find(|record| record.path == Path::new("trusted/raw.log"))
+            .context("raw manifest record")?
+            .disposition,
+        ArtifactFileDisposition::PrivateEvidence
+    );
+    assert_eq!(
+        finalization
+            .files
+            .iter()
+            .find(|record| record.path == Path::new("trusted/consultant-report.json"))
+            .context("final report manifest record")?
+            .disposition,
+        ArtifactFileDisposition::Publishable
+    );
+    let reader_report: Value =
+        serde_json::from_slice(&reader.read("trusted/consultant-report.json")?)?;
+    assert_eq!(reader_report, report);
+
+    Ok(())
+}
+
+#[test]
+fn consult_operational_refusal_is_redacted_and_finalized() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let report = run_failure_json(&[
+        "consult",
+        "ask",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "consult-refused",
+        "--question=-----BEGIN PRIVATE KEY-----\nnever-persist-this\n-----END PRIVATE KEY-----",
+        "--json",
+    ])?;
+
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["question_summary"], "<redacted:refused-question>");
+    let run_dir = repo_path.join(".maco/consult/runs/consult-refused");
+    let question = fs::read(run_dir.join("trusted/question.md"))?;
+    let raw = fs::read(run_dir.join("trusted/raw.log"))?;
+    let final_report = fs::read(run_dir.join("trusted/consultant-report.json"))?;
+    let marker = fs::read(run_dir.join(".maco-artifact-final.json"))?;
+    for artifact in [&question, &raw, &final_report, &marker] {
+        assert!(!String::from_utf8_lossy(artifact).contains("never-persist-this"));
+    }
+    assert_eq!(
+        String::from_utf8(question)?,
+        "ROLE: CONSULTANT\nAGENT_KIND: consultant\nAGENT_LABEL: consult-refused\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\nConsult request refused before a question could be safely persisted.\n"
+    );
+    assert_eq!(raw, b"consult request refused before subprocess launch\n");
+
+    let run_id = RunId::new("consult-refused")?;
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Consult, &run_id)?;
+    assert!(!reader.finalization().publish_requested);
+    assert!(!reader.finalization().publishable);
+    assert!(!run_dir.join("incoming").exists());
+    assert!(!run_dir.join("capture").exists());
+
+    let missing_bin = run_failure_json(&[
+        "consult",
+        "ask",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "consult-missing-bin",
+        "--runtime",
+        "codex",
+        "--question",
+        "Safe question",
+        "--json",
+    ])?;
+    assert_eq!(missing_bin["success"], false);
+    assert!(missing_bin["exit_info"]["error"]
+        .as_str()
+        .context("missing-bin refusal")?
+        .contains("--consultant-bin"));
+    let missing_bin_id = RunId::new("consult-missing-bin")?;
+    ArtifactRunReader::open(&repo_path, RunArtifactFamily::Consult, &missing_bin_id)?;
+    let missing_bin_dir = repo_path.join(".maco/consult/runs/consult-missing-bin");
+    assert!(!missing_bin_dir.join("incoming").exists());
+    assert!(!missing_bin_dir.join("capture").exists());
+    Ok(())
+}
+
+#[test]
+fn consult_artifact_reader_rejects_tampered_final_report() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_success_json(&[
+        "consult",
+        "ask",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "consult-tamper",
+        "--question",
+        "Need a bounded second opinion",
+        "--json",
+    ])?;
+    let run_id = RunId::new("consult-tamper")?;
+    ArtifactRunReader::open(&repo_path, RunArtifactFamily::Consult, &run_id)?;
+    fs::write(
+        repo_path.join(".maco/consult/runs/consult-tamper/trusted/consultant-report.json"),
+        b"{}\n",
+    )?;
+    let error = match ArtifactRunReader::open(&repo_path, RunArtifactFamily::Consult, &run_id) {
+        Ok(_) => anyhow::bail!("tampered finalized report unexpectedly passed verification"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("length changed")
+            || message.contains("digest changed")
+            || message.contains("contents changed")
+            || message.contains("does not match its manifest"),
+        "unexpected tamper error: {message}"
+    );
+
+    run_success_json(&[
+        "consult",
+        "ask",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "consult-marker-tamper",
+        "--question",
+        "Need another bounded second opinion",
+        "--json",
+    ])?;
+    let marker_path =
+        repo_path.join(".maco/consult/runs/consult-marker-tamper/.maco-artifact-final.json");
+    let mut marker: Value = serde_json::from_slice(&fs::read(&marker_path)?)?;
+    marker["hmac_sha256"] = Value::String("0".repeat(64));
+    let mut marker_bytes = serde_json::to_vec_pretty(&marker)?;
+    marker_bytes.push(b'\n');
+    fs::write(&marker_path, marker_bytes)?;
+    let marker_run_id = RunId::new("consult-marker-tamper")?;
+    let marker_error =
+        match ArtifactRunReader::open(&repo_path, RunArtifactFamily::Consult, &marker_run_id) {
+            Ok(_) => anyhow::bail!("tampered HMAC marker unexpectedly passed verification"),
+            Err(error) => error,
+        };
+    assert!(
+        format!("{marker_error:#}").contains("HMAC verification failed"),
+        "unexpected marker tamper error: {marker_error:#}"
+    );
     Ok(())
 }
 
@@ -265,8 +442,15 @@ fn consult_claude_adapter_is_refused_before_launch() -> Result<()> {
     assert!(!command
         .iter()
         .any(|arg| arg.as_str().is_some_and(|text| text.contains("danger"))));
+    assert_eq!(
+        fs::read(repo_path.join(".maco/consult/runs/consult-claude/trusted/raw.log"))?,
+        b""
+    );
     assert!(!repo_path
-        .join(".maco/consult/runs/consult-claude/trusted/raw.log")
+        .join(".maco/consult/runs/consult-claude/incoming")
+        .exists());
+    assert!(!repo_path
+        .join(".maco/consult/runs/consult-claude/capture")
         .exists());
 
     Ok(())
@@ -300,9 +484,12 @@ fn consult_claude_refusal_precedes_result_envelope_parsing() -> Result<()> {
         .as_str()
         .context("external refusal")?
         .contains("no enforceable inner read-only permission contract"));
-    assert!(!repo_path
-        .join(".maco/consult/runs/consult-claude-missing-result/trusted/raw.log")
-        .exists());
+    assert_eq!(
+        fs::read(
+            repo_path.join(".maco/consult/runs/consult-claude-missing-result/trusted/raw.log")
+        )?,
+        b""
+    );
 
     Ok(())
 }
@@ -482,7 +669,13 @@ fn run_failure_json(args: &[&str]) -> Result<Value> {
             String::from_utf8_lossy(&output.stdout)
         );
     }
-    serde_json::from_slice(&output.stdout).context("parse failure json")
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse failure json: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

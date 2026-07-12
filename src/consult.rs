@@ -1,10 +1,12 @@
 use crate::{
-    artifacts::{self, RunArtifactFamily},
+    artifacts::{
+        self, ArtifactFileDisposition, ArtifactRunWriter, ArtifactScratchDirectory,
+        RunArtifactFamily,
+    },
     external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
     llm::Redactor,
     orchestrator::RunId,
     process_runner::resolve_existing_path_without_symlinks,
-    secure_output::{ReservedOutputFile, SecureOutputRoot},
     sync::normalize_repo_relative_path,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,7 +14,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
-    ffi::OsStr,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -26,7 +27,14 @@ const ANSWER_LIMIT: usize = 16 * 1024;
 const REFERENCE_LIMIT: usize = 512;
 const CAVEAT_LIMIT: usize = 1024;
 const CONSULTANT_THREAD_DEPTH: u8 = 2;
-const MAX_CONSULT_ARTIFACT_BYTES: usize = 1024 * 1024;
+const MAX_CONSULT_RAW_BYTES: usize = 8 * 1024 * 1024;
+const CONSULT_PRODUCER: &str = "consult";
+const QUESTION_ARTIFACT: &str = "trusted/question.md";
+const RAW_LOG_ARTIFACT: &str = "trusted/raw.log";
+const SCHEMA_ARTIFACT: &str = "trusted/schemas/consultant-report.schema.json";
+const FINAL_REPORT_ARTIFACT: &str = "trusted/consultant-report.json";
+const EXTERNAL_INCOMING_SCRATCH: &str = "incoming";
+const EXTERNAL_CAPTURE_SCRATCH: &str = "capture";
 
 #[derive(Debug, Clone)]
 pub struct ConsultAskOptions {
@@ -120,18 +128,22 @@ pub struct ConsultantReport {
 }
 
 #[derive(Debug)]
-struct ConsultantArtifacts {
-    run_dir: PathBuf,
-    question_path: PathBuf,
-    incoming_report_path: PathBuf,
-    raw_log_path: PathBuf,
-    schema_path: PathBuf,
-}
-
-#[derive(Debug)]
 struct PreparedQuestion {
     prompt_body: String,
     summary: String,
+}
+
+#[derive(Debug)]
+struct PreparedConsultation {
+    question: PreparedQuestion,
+    context_paths: Vec<PathBuf>,
+    consultant_bin: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct ExternalConsultOutcome {
+    report: ConsultantReport,
+    raw_evidence: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -141,71 +153,99 @@ struct ParsedReport<T> {
 }
 
 pub fn ask_consultant(options: ConsultAskOptions) -> Result<ConsultantReport> {
-    if options.timeout_seconds == 0 {
-        bail!("timeout_seconds must be greater than zero");
-    }
-    let repo = artifacts::discover_repo_root(&options.repo)?;
-    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Consult, &options.run_id)?;
-    let context_paths = validate_context_paths(&repo, &options.context_paths)?;
-    let prepared_question = prepare_question(&options.question)?;
-    let artifacts = consultant_artifacts(&repo, &options.run_id);
-    let run_container = SecureOutputRoot::create_new(&artifacts.run_dir)?;
-    let trusted_root = run_container.create_child(OsStr::new("trusted"))?;
-    let incoming_root = run_container.create_child(OsStr::new("incoming"))?;
-    trusted_root.reject_overlap(&incoming_root)?;
-    let schema_root = trusted_root.create_child(OsStr::new("schemas"))?;
-    let mut schema = schema_root.reserve(OsStr::new("consultant-report.schema.json"))?;
-    let mut question = trusted_root.reserve(OsStr::new("question.md"))?;
-    let mut final_report = trusted_root.reserve(OsStr::new("consultant-report.json"))?;
-    let mut fake_raw_log = match options.runtime {
-        ConsultantRuntime::Fake => Some(trusted_root.reserve(OsStr::new("raw.log"))?),
-        ConsultantRuntime::Codex | ConsultantRuntime::Claude => None,
-    };
-    write_consultant_schema(&mut schema)?;
-    let prompt = consultant_prompt(
-        &options.run_id,
-        &prepared_question.prompt_body,
-        &context_paths,
-        &artifacts.schema_path,
-    )?;
-    question
-        .write_bytes_atomic(prompt.as_bytes(), MAX_CONSULT_ARTIFACT_BYTES)
-        .with_context(|| format!("failed to write {}", question.path().display()))?;
+    ask_consultant_with_runner(options, run_external_agent)
+}
 
-    let report = match options.runtime {
-        ConsultantRuntime::Fake => fake_consultant_report(
-            &options.run_id,
-            prepared_question.summary,
-            &context_paths,
-            fake_raw_log
-                .as_mut()
-                .context("fake consult raw log slot was not reserved")?,
-        )?,
+fn ask_consultant_with_runner<F>(
+    options: ConsultAskOptions,
+    mut external_runner: F,
+) -> Result<ConsultantReport>
+where
+    F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+{
+    let repo = artifacts::discover_repo_root(&options.repo)?;
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Consult,
+        options.run_id.clone(),
+        CONSULT_PRODUCER,
+    )?;
+    write_consultant_schema(&mut writer)?;
+
+    let prepared = prepare_consultation(&options, &repo);
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return finalize_operational_failure(writer, &options, &error);
+        }
+    };
+
+    let schema_prompt_path = RunArtifactFamily::Consult
+        .run_root()
+        .join(options.run_id.as_str())
+        .join(SCHEMA_ARTIFACT);
+    let prompt = match consultant_prompt(
+        &options.run_id,
+        &prepared.question.prompt_body,
+        &prepared.context_paths,
+        &schema_prompt_path,
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            return finalize_operational_failure(writer, &options, &error);
+        }
+    };
+    writer.write_bytes(
+        QUESTION_ARTIFACT,
+        prompt.as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+
+    let (report, raw_evidence) = match options.runtime {
+        ConsultantRuntime::Fake => (
+            fake_consultant_report(
+                &options.run_id,
+                prepared.question.summary,
+                &prepared.context_paths,
+            ),
+            b"fake consultant runtime: no subprocess launched\n".to_vec(),
+        ),
         ConsultantRuntime::Codex => {
-            let consultant_bin = required_consultant_bin(&options)?;
-            run_codex_consultant(
+            let consultant_bin = prepared
+                .consultant_bin
+                .as_deref()
+                .context("prepared Codex consultant executable is missing")?;
+            let outcome = run_codex_consultant(
                 &repo,
                 &options.run_id,
                 consultant_bin,
-                &prepared_question.summary,
-                &artifacts,
+                &prepared.question.summary,
+                &mut writer,
                 Duration::from_secs(options.timeout_seconds),
-            )?
+                &mut external_runner,
+            )?;
+            (outcome.report, outcome.raw_evidence)
         }
         ConsultantRuntime::Claude => {
-            let consultant_bin = required_consultant_bin(&options)?;
-            run_claude_consultant(
+            let consultant_bin = prepared
+                .consultant_bin
+                .as_deref()
+                .context("prepared Claude consultant executable is missing")?;
+            let outcome = run_claude_consultant(
                 &repo,
                 &options.run_id,
                 consultant_bin,
-                &prepared_question.summary,
-                &artifacts,
+                &prepared.question.summary,
+                &mut writer,
                 Duration::from_secs(options.timeout_seconds),
-            )?
+                &mut external_runner,
+            )?;
+            (outcome.report, outcome.raw_evidence)
         }
     };
 
-    write_consultant_final_report(&mut final_report, &report)?;
+    write_raw_evidence(&mut writer, &raw_evidence)?;
+    finalize_consultant_report(writer, &report)?;
     Ok(report)
 }
 
@@ -289,17 +329,36 @@ fn prepare_question(question: &str) -> Result<PreparedQuestion> {
     })
 }
 
+fn prepare_consultation(options: &ConsultAskOptions, repo: &Path) -> Result<PreparedConsultation> {
+    let question = prepare_question(&options.question)?;
+    if options.timeout_seconds == 0 {
+        bail!("timeout_seconds must be greater than zero");
+    }
+    let context_paths = validate_context_paths(repo, &options.context_paths)?;
+    let consultant_bin = match options.runtime {
+        ConsultantRuntime::Fake => None,
+        ConsultantRuntime::Codex | ConsultantRuntime::Claude => {
+            Some(options.consultant_bin.clone().with_context(|| {
+                format!(
+                    "--consultant-bin is required when --runtime {} is selected",
+                    options.runtime.as_str()
+                )
+            })?)
+        }
+    };
+    Ok(PreparedConsultation {
+        question,
+        context_paths,
+        consultant_bin,
+    })
+}
+
 fn fake_consultant_report(
     run_id: &RunId,
     question_summary: String,
     context_paths: &[PathBuf],
-    raw_log: &mut ReservedOutputFile,
-) -> Result<ConsultantReport> {
-    raw_log.write_bytes_atomic(
-        b"fake consultant runtime: no subprocess launched\n",
-        MAX_CONSULT_ARTIFACT_BYTES,
-    )?;
-    Ok(ConsultantReport {
+) -> ConsultantReport {
+    ConsultantReport {
         version: CONSULTANT_REPORT_VERSION,
         run_id: run_id.clone(),
         runtime: ConsultantRuntime::Fake,
@@ -325,83 +384,176 @@ fn fake_consultant_report(
         },
         success: true,
         status: ConsultantStatus::Succeeded,
-    })
-}
-
-fn run_codex_consultant(
-    repo: &Path,
-    run_id: &RunId,
-    consultant_bin: &Path,
-    question_summary: &str,
-    artifacts: &ConsultantArtifacts,
-    timeout: Duration,
-) -> Result<ConsultantReport> {
-    let command = ExternalAgentCommand::codex_read_only_consultant(
-        consultant_bin,
-        repo,
-        &artifacts.question_path,
-        &artifacts.raw_log_path,
-        &artifacts.incoming_report_path,
-        timeout,
-    );
-    let external_run = run_external_agent(&command);
-    let report_text = match external_run.output_last_message() {
-        Some(contents) => String::from_utf8_lossy(contents).into_owned(),
-        None => "failed to capture Codex consultant report from reserved descriptor".to_string(),
-    };
-    Ok(report_from_external_text(
-        ConsultantRuntime::Codex,
-        run_id,
-        question_summary,
-        &external_run,
-        &report_text,
-    ))
-}
-
-fn run_claude_consultant(
-    repo: &Path,
-    run_id: &RunId,
-    consultant_bin: &Path,
-    question_summary: &str,
-    artifacts: &ConsultantArtifacts,
-    timeout: Duration,
-) -> Result<ConsultantReport> {
-    let command = ExternalAgentCommand::claude_consultant(
-        consultant_bin,
-        repo,
-        &artifacts.question_path,
-        &artifacts.raw_log_path,
-        &artifacts.incoming_report_path,
-        timeout,
-    );
-    let external_run = run_external_agent(&command);
-    let raw_log = external_run.stdout.text.clone();
-    match claude_result_text(&raw_log) {
-        Ok(report_text) => Ok(report_from_external_text(
-            ConsultantRuntime::Claude,
-            run_id,
-            question_summary,
-            &external_run,
-            &report_text,
-        )),
-        Err(error) => Ok(failed_report_from_external(
-            ConsultantRuntime::Claude,
-            run_id,
-            question_summary,
-            &external_run,
-            &raw_log,
-            format!("failed to parse Claude JSON envelope: {error}"),
-        )),
     }
 }
 
-fn required_consultant_bin(options: &ConsultAskOptions) -> Result<&Path> {
-    options.consultant_bin.as_deref().with_context(|| {
-        format!(
-            "--consultant-bin is required when --runtime {} is selected",
-            options.runtime.as_str()
-        )
+fn run_codex_consultant<F>(
+    repo: &Path,
+    run_id: &RunId,
+    consultant_bin: &Path,
+    question_summary: &str,
+    writer: &mut ArtifactRunWriter,
+    timeout: Duration,
+    external_runner: &mut F,
+) -> Result<ExternalConsultOutcome>
+where
+    F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+{
+    let (incoming, capture) = create_external_scratches(writer)?;
+    let raw_log_path = capture.path().join("raw.log");
+    let incoming_report_path = incoming.path().join("consultant-report.json");
+    let command = ExternalAgentCommand::codex_read_only_consultant(
+        consultant_bin,
+        repo,
+        writer.run_dir().join(QUESTION_ARTIFACT),
+        &raw_log_path,
+        &incoming_report_path,
+        timeout,
+    );
+    let external_run = external_runner(&command);
+    let report = match external_run.output_last_message() {
+        Some(contents) => match std::str::from_utf8(contents) {
+            Ok(report_text) => report_from_external_text(
+                ConsultantRuntime::Codex,
+                run_id,
+                question_summary,
+                &external_run,
+                report_text,
+            ),
+            Err(error) => failed_report_from_external(
+                ConsultantRuntime::Codex,
+                run_id,
+                question_summary,
+                &external_run,
+                &String::from_utf8_lossy(contents),
+                format!("descriptor-captured Codex report was not valid UTF-8: {error}"),
+            ),
+        },
+        None => failed_report_from_external(
+            ConsultantRuntime::Codex,
+            run_id,
+            question_summary,
+            &external_run,
+            "",
+            "failed to capture Codex consultant report from reserved descriptor".to_string(),
+        ),
+    };
+    let raw_evidence = external_run.stdout_bytes().to_vec();
+    drop(command);
+    if !external_run.scratch_quiescence_verified() {
+        bail!(
+            "external Codex target scratch quiescence was not verified; leaving the run unfinalized for operator inspection"
+        );
+    }
+    let raw_evidence = finish_external_scratches(
+        raw_evidence,
+        writer.discard_scratch(&capture),
+        writer.discard_scratch(&incoming),
+    )?;
+    Ok(ExternalConsultOutcome {
+        report,
+        raw_evidence,
     })
+}
+
+fn run_claude_consultant<F>(
+    repo: &Path,
+    run_id: &RunId,
+    consultant_bin: &Path,
+    question_summary: &str,
+    writer: &mut ArtifactRunWriter,
+    timeout: Duration,
+    external_runner: &mut F,
+) -> Result<ExternalConsultOutcome>
+where
+    F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+{
+    let (incoming, capture) = create_external_scratches(writer)?;
+    let raw_log_path = capture.path().join("raw.log");
+    let incoming_report_path = incoming.path().join("consultant-report.json");
+    let command = ExternalAgentCommand::claude_consultant(
+        consultant_bin,
+        repo,
+        writer.run_dir().join(QUESTION_ARTIFACT),
+        &raw_log_path,
+        &incoming_report_path,
+        timeout,
+    );
+    let external_run = external_runner(&command);
+    let raw_evidence = external_run.stdout_bytes().to_vec();
+    let report = match std::str::from_utf8(&raw_evidence) {
+        Ok(raw_log) => match claude_result_text(raw_log) {
+            Ok(report_text) => report_from_external_text(
+                ConsultantRuntime::Claude,
+                run_id,
+                question_summary,
+                &external_run,
+                &report_text,
+            ),
+            Err(error) => failed_report_from_external(
+                ConsultantRuntime::Claude,
+                run_id,
+                question_summary,
+                &external_run,
+                raw_log,
+                format!("failed to parse Claude JSON envelope: {error}"),
+            ),
+        },
+        Err(error) => failed_report_from_external(
+            ConsultantRuntime::Claude,
+            run_id,
+            question_summary,
+            &external_run,
+            &String::from_utf8_lossy(&raw_evidence),
+            format!("descriptor-captured Claude output was not valid UTF-8: {error}"),
+        ),
+    };
+    drop(command);
+    if !external_run.scratch_quiescence_verified() {
+        bail!(
+            "external Claude target scratch quiescence was not verified; leaving the run unfinalized for operator inspection"
+        );
+    }
+    let raw_evidence = finish_external_scratches(
+        raw_evidence,
+        writer.discard_scratch(&capture),
+        writer.discard_scratch(&incoming),
+    )?;
+    Ok(ExternalConsultOutcome {
+        report,
+        raw_evidence,
+    })
+}
+
+fn create_external_scratches(
+    writer: &mut ArtifactRunWriter,
+) -> Result<(ArtifactScratchDirectory, ArtifactScratchDirectory)> {
+    let incoming = writer.create_scratch_dir(EXTERNAL_INCOMING_SCRATCH)?;
+    match writer.create_scratch_dir(EXTERNAL_CAPTURE_SCRATCH) {
+        Ok(capture) => Ok((incoming, capture)),
+        Err(error) => match writer.discard_scratch(&incoming) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "incoming artifact scratch cleanup also failed: {cleanup_error:#}"
+            ))),
+        },
+    }
+}
+
+fn finish_external_scratches(
+    raw_evidence: Vec<u8>,
+    capture_cleanup: Result<()>,
+    incoming_cleanup: Result<()>,
+) -> Result<Vec<u8>> {
+    let cleanup = match (capture_cleanup, incoming_cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(incoming_error)) => Err(error.context(format!(
+            "incoming artifact scratch cleanup also failed: {incoming_error:#}"
+        ))),
+    };
+    cleanup?;
+    Ok(raw_evidence)
 }
 
 fn report_from_external_text(
@@ -446,6 +598,7 @@ fn normalize_report(
     if !external_run.succeeded() {
         caveats.push("consultant subprocess did not exit successfully".to_string());
     }
+    append_stdout_truncation_caveat(&mut caveats, external_run);
     if report.runtime != runtime {
         caveats.push(format!(
             "consultant reported runtime {}; MACO recorded runtime {}",
@@ -493,6 +646,8 @@ fn failed_report_from_external(
     report_text: &str,
     parse_error: String,
 ) -> ConsultantReport {
+    let mut caveats = vec![sanitize_public_text(&parse_error, CAVEAT_LIMIT).text];
+    append_stdout_truncation_caveat(&mut caveats, external_run);
     ConsultantReport {
         version: CONSULTANT_REPORT_VERSION,
         run_id: run_id.clone(),
@@ -501,13 +656,22 @@ fn failed_report_from_external(
         answer: sanitize_public_text(report_text, ANSWER_LIMIT).text,
         confidence: ConsultantConfidence::Low,
         references: Vec::new(),
-        caveats: vec![sanitize_public_text(&parse_error, CAVEAT_LIMIT).text],
+        caveats,
         no_further_delegation: true,
         read_only: true,
         duration_ms: external_run.duration_ms,
         exit_info: exit_info_from_external(external_run),
         success: false,
         status: ConsultantStatus::Failed,
+    }
+}
+
+fn append_stdout_truncation_caveat(caveats: &mut Vec<String>, external_run: &ExternalAgentRun) {
+    if external_run.stdout.truncated {
+        caveats.push(format!(
+            "stdout capture or public summary reached a configured bound; raw evidence contains {} descriptor-captured bytes",
+            external_run.stdout_bytes().len()
+        ));
     }
 }
 
@@ -642,30 +806,82 @@ fn last_top_level_json_object(contents: &str) -> Option<&str> {
     last_object
 }
 
-fn consultant_artifacts(repo: &Path, run_id: &RunId) -> ConsultantArtifacts {
-    let run_dir = artifacts::run_dir(repo, RunArtifactFamily::Consult, run_id);
-    let trusted_dir = run_dir.join("trusted");
-    ConsultantArtifacts {
-        question_path: trusted_dir.join("question.md"),
-        incoming_report_path: run_dir.join("incoming").join("consultant-report.json"),
-        raw_log_path: trusted_dir.join("raw.log"),
-        schema_path: trusted_dir
-            .join("schemas")
-            .join("consultant-report.schema.json"),
-        run_dir,
-    }
-}
-
-fn write_consultant_final_report(
-    slot: &mut ReservedOutputFile,
+fn finalize_consultant_report(
+    mut writer: ArtifactRunWriter,
     report: &ConsultantReport,
 ) -> Result<()> {
-    slot.write_json_atomic(report, MAX_CONSULT_ARTIFACT_BYTES)
-        .with_context(|| format!("failed to write {}", slot.path().display()))
+    writer.write_json(
+        FINAL_REPORT_ARTIFACT,
+        report,
+        ArtifactFileDisposition::Publishable,
+    )?;
+    let publish_requested = report.success && report.runtime != ConsultantRuntime::Fake;
+    writer.finalize(FINAL_REPORT_ARTIFACT, publish_requested)?;
+    Ok(())
 }
 
-fn write_consultant_schema(slot: &mut ReservedOutputFile) -> Result<()> {
-    slot.write_json_atomic(
+fn write_raw_evidence(writer: &mut ArtifactRunWriter, contents: &[u8]) -> Result<()> {
+    if contents.len() > MAX_CONSULT_RAW_BYTES {
+        bail!(
+            "consult raw evidence exceeds its {} byte limit",
+            MAX_CONSULT_RAW_BYTES
+        );
+    }
+    writer.write_bytes(
+        RAW_LOG_ARTIFACT,
+        contents,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    Ok(())
+}
+
+fn finalize_operational_failure(
+    mut writer: ArtifactRunWriter,
+    options: &ConsultAskOptions,
+    error: &anyhow::Error,
+) -> Result<ConsultantReport> {
+    let refusal_prompt = format!(
+        "{}Consult request refused before a question could be safely persisted.\n",
+        consultant_role_prefix(&options.run_id)
+    );
+    writer.write_bytes(
+        QUESTION_ARTIFACT,
+        refusal_prompt.as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    write_raw_evidence(
+        &mut writer,
+        b"consult request refused before subprocess launch\n",
+    )?;
+    let safe_error = sanitize_public_text(&error.to_string(), CAVEAT_LIMIT).text;
+    let report = ConsultantReport {
+        version: CONSULTANT_REPORT_VERSION,
+        run_id: options.run_id.clone(),
+        runtime: options.runtime,
+        question_summary: "<redacted:refused-question>".to_string(),
+        answer: "Consult request was refused before subprocess launch.".to_string(),
+        confidence: ConsultantConfidence::Low,
+        references: Vec::new(),
+        caveats: vec![safe_error.clone()],
+        no_further_delegation: true,
+        read_only: true,
+        duration_ms: 0,
+        exit_info: ConsultantExitInfo {
+            command: Vec::new(),
+            exit_code: None,
+            timed_out: false,
+            error: Some(safe_error),
+        },
+        success: false,
+        status: ConsultantStatus::Failed,
+    };
+    finalize_consultant_report(writer, &report)?;
+    Ok(report)
+}
+
+fn write_consultant_schema(writer: &mut ArtifactRunWriter) -> Result<()> {
+    writer.write_json(
+        SCHEMA_ARTIFACT,
         &json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "ConsultantReport",
@@ -712,8 +928,9 @@ fn write_consultant_schema(slot: &mut ReservedOutputFile) -> Result<()> {
                 "status": {"type": "string", "enum": ["succeeded", "failed"]}
             }
         }),
-        MAX_CONSULT_ARTIFACT_BYTES,
-    )
+        ArtifactFileDisposition::Publishable,
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -852,6 +1069,11 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::external_agent::{
+        run_external_agent_nonpublishable_simulation, CapturedOutput, ExternalProgramTrust,
+    };
+    use crate::process_runner::{ContainmentBackend, ProcessTreeEvidence};
+    use std::fs;
 
     #[test]
     fn redacts_token_like_values_and_local_paths_in_question_summary() -> Result<()> {
@@ -916,30 +1138,256 @@ mod tests {
 
     #[test]
     fn fake_adapter_report_is_deterministic() -> Result<()> {
-        let temp = tempfile::tempdir()?;
         let run_id = RunId::new("consult-fake")?;
-        let first_root = SecureOutputRoot::create_new(&temp.path().join("first"))?;
-        let second_root = SecureOutputRoot::create_new(&temp.path().join("second"))?;
-        let mut first_log = first_root.reserve(OsStr::new("raw.log"))?;
-        let mut second_log = second_root.reserve(OsStr::new("raw.log"))?;
         let first = fake_consultant_report(
             &run_id,
             "question".to_string(),
             &[PathBuf::from("README.md")],
-            &mut first_log,
-        )?;
+        );
         let second = fake_consultant_report(
             &run_id,
             "question".to_string(),
             &[PathBuf::from("README.md")],
-            &mut second_log,
-        )?;
+        );
         assert_eq!(first, second);
         assert_eq!(first.runtime, ConsultantRuntime::Fake);
         assert_eq!(first.duration_ms, 0);
         assert!(first.no_further_delegation);
         assert!(first.read_only);
         Ok(())
+    }
+
+    #[test]
+    fn failed_report_records_stdout_bound_without_exposing_private_bytes() -> Result<()> {
+        let command = ExternalAgentCommand::codex(
+            "/test-only/codex",
+            ".",
+            "prompt",
+            "capture/raw.log",
+            "incoming/report.json",
+            Duration::from_secs(1),
+        );
+        let mut external = failed_test_external_run(&command, "synthetic failure");
+        external.stdout.truncated = true;
+        let report = failed_report_from_external(
+            ConsultantRuntime::Codex,
+            &RunId::new("consult-truncated")?,
+            "question",
+            &external,
+            "",
+            "missing report".to_string(),
+        );
+        assert!(report
+            .caveats
+            .iter()
+            .any(|caveat| caveat
+                .contains("stdout capture or public summary reached a configured bound")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_failure_imports_exact_parent_capture_and_discards_both_scratches() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = create_test_repo(temp.path())?;
+        let run_id = RunId::new("consult-external-failure")?;
+        let raw_bytes = b"exact descriptor capture\0with binary\xffbytes\n".to_vec();
+        let consultant_bin = write_test_external_program(
+            temp.path(),
+            "printf 'exact descriptor capture\\000with binary\\377bytes\\n'\nexit 7\n",
+        )?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Codex,
+            consultant_bin: Some(consultant_bin),
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+        let report = ask_consultant_with_runner(options, |command| {
+            assert_ne!(
+                command.json_log.parent(),
+                command.output_last_message.parent(),
+                "parent-only capture and child-writable incoming roots must be separate"
+            );
+            assert_eq!(
+                command.json_log.parent().and_then(Path::file_name),
+                Some(std::ffi::OsStr::new(EXTERNAL_CAPTURE_SCRATCH))
+            );
+            assert_eq!(
+                command
+                    .output_last_message
+                    .parent()
+                    .and_then(Path::file_name),
+                Some(std::ffi::OsStr::new(EXTERNAL_INCOMING_SCRATCH))
+            );
+            let mut run = run_external_agent_nonpublishable_simulation(command);
+            run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ));
+            run
+        })?;
+
+        assert!(!report.success);
+        let run_dir = repo.join(".maco/consult/runs").join(run_id.as_str());
+        assert_eq!(fs::read(run_dir.join(RAW_LOG_ARTIFACT))?, raw_bytes);
+        assert!(!run_dir.join(EXTERNAL_CAPTURE_SCRATCH).exists());
+        assert!(!run_dir.join(EXTERNAL_INCOMING_SCRATCH).exists());
+        assert!(run_dir.join(".maco-artifact-final.json").exists());
+        artifacts::ArtifactRunReader::open(&repo, RunArtifactFamily::Consult, &run_id)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attempted_unverified_target_leaves_scratches_unfinalized() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = create_test_repo(temp.path())?;
+        let run_id = RunId::new("consult-unverified-target")?;
+        let consultant_bin = write_test_external_program(
+            temp.path(),
+            "printf 'unverified target output\\n'\nexit 7\n",
+        )?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Codex,
+            consultant_bin: Some(consultant_bin),
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+
+        let error = ask_consultant_with_runner(options, |command| {
+            let mut run = run_external_agent_nonpublishable_simulation(command);
+            run.process_tree = Some(ProcessTreeEvidence::Unverified(
+                ContainmentBackend::SystemdUserService,
+            ));
+            run
+        })
+        .expect_err("attempted target without verified-empty evidence must remain unfinalized");
+        assert!(format!("{error:#}").contains("scratch quiescence was not verified"));
+
+        let run_dir = repo.join(".maco/consult/runs").join(run_id.as_str());
+        assert!(run_dir.join(EXTERNAL_CAPTURE_SCRATCH).exists());
+        assert!(run_dir.join(EXTERNAL_INCOMING_SCRATCH).exists());
+        assert!(!run_dir.join(RAW_LOG_ARTIFACT).exists());
+        assert!(!run_dir.join(".maco-artifact-final.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_refusal_discards_unused_scratches_and_finalizes_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = create_test_repo(temp.path())?;
+        let run_id = RunId::new("consult-preflight-refusal")?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Codex,
+            consultant_bin: Some(PathBuf::from("/test-only/codex")),
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+
+        let report = ask_consultant_with_runner(options, |command| {
+            failed_test_external_run(command, "synthetic preflight refusal")
+        })?;
+
+        assert!(!report.success);
+        let run_dir = repo.join(".maco/consult/runs").join(run_id.as_str());
+        assert!(!run_dir.join(EXTERNAL_CAPTURE_SCRATCH).exists());
+        assert!(!run_dir.join(EXTERNAL_INCOMING_SCRATCH).exists());
+        assert_eq!(fs::read(run_dir.join(RAW_LOG_ARTIFACT))?, b"");
+        artifacts::ArtifactRunReader::open(&repo, RunArtifactFamily::Consult, &run_id)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incoming_scratch_rebind_blocks_finalization_and_preserves_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = create_test_repo(temp.path())?;
+        let run_id = RunId::new("consult-scratch-rebind")?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Codex,
+            consultant_bin: Some(PathBuf::from("/test-only/codex")),
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+        let error = ask_consultant_with_runner(options, |command| {
+            let incoming = command
+                .output_last_message
+                .parent()
+                .expect("incoming parent");
+            let moved = incoming.with_file_name("incoming-moved");
+            fs::rename(incoming, &moved).expect("move original incoming scratch");
+            fs::create_dir(incoming).expect("replace incoming scratch");
+            fs::write(incoming.join("sentinel"), b"replacement survives")
+                .expect("write replacement sentinel");
+            failed_test_external_run(command, "synthetic scratch rebind")
+        })
+        .expect_err("scratch identity replacement must block finalization");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("identity")
+                || message.contains("replaced")
+                || message.contains("opened inode"),
+            "unexpected scratch rebind error: {message}"
+        );
+
+        let run_dir = repo.join(".maco/consult/runs").join(run_id.as_str());
+        assert_eq!(
+            fs::read(run_dir.join(EXTERNAL_INCOMING_SCRATCH).join("sentinel"))?,
+            b"replacement survives"
+        );
+        assert!(run_dir.join("incoming-moved").exists());
+        assert!(!run_dir.join(EXTERNAL_CAPTURE_SCRATCH).exists());
+        assert!(!run_dir.join(".maco-artifact-final.json").exists());
+        Ok(())
+    }
+
+    fn failed_test_external_run(command: &ExternalAgentCommand, error: &str) -> ExternalAgentRun {
+        ExternalAgentRun {
+            command: vec![command.program.display().to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: command.timeout.as_secs(),
+            exit_code: None,
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: None,
+            side_effects: None,
+            publishable: false,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: Some(error.to_string()),
+            output_last_message: None,
+        }
+    }
+
+    fn create_test_repo(root: &Path) -> Result<PathBuf> {
+        let repo = root.join("repo");
+        fs::create_dir(&repo)?;
+        git2::Repository::init(&repo)?;
+        fs::write(repo.join("README.md"), "# Test repository\n")?;
+        Ok(repo)
+    }
+
+    #[cfg(unix)]
+    fn write_test_external_program(root: &Path, body: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = root.join("test-external-agent");
+        fs::write(&program, format!("#!/bin/sh\ncat >/dev/null\n{body}"))?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+        Ok(program)
     }
 
     fn sample_report_json(run_id: &str) -> String {
