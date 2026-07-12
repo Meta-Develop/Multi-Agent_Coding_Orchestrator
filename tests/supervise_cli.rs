@@ -374,6 +374,336 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
 }
 
 #[test]
+fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("generated-id.json");
+    write_simple_plan(&plan_path, "generated-child")?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    let run_id = report["run_id"].as_str().context("generated run id")?;
+    assert!(run_id.starts_with("o2-"));
+    assert!(repo_path
+        .join(".maco/o2/runs")
+        .join(run_id)
+        .join("reports/supervisor-final.json")
+        .exists());
+
+    let listed = run_success_json(&[
+        "supervise",
+        "artifacts",
+        "list",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(listed["runs"][0]["run_id"], run_id);
+    assert_eq!(listed["runs"][0]["final_report_status"], "succeeded");
+    assert_eq!(listed["runs"][0]["final_report_success"], true);
+
+    let reused = run_failure_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        run_id,
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(reused["status"], "refused");
+    assert!(reused["message"]
+        .as_str()
+        .context("reuse message")?
+        .contains("already exists"));
+    Ok(())
+}
+
+#[test]
+fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n")?;
+    let repo = Repository::open(&repo_path)?;
+    commit_all(&repo, "semantic symbol")?;
+    let plan_path = temp.path().join("semantic-warn.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "coordinate semantic overlap",
+            "max_depth": 2,
+            "max_child_assignments": 2,
+            "semantic_coordination": "warn",
+            "assignments": [
+                {
+                    "id": "child-a",
+                    "assigned_paths": ["README.md"],
+                    "semantic_symbols": ["Shared"],
+                    "worker_assignments": []
+                },
+                {
+                    "id": "child-b",
+                    "assigned_paths": ["src/lib.rs"],
+                    "semantic_symbols": ["Shared"],
+                    "worker_assignments": []
+                }
+            ]
+        }))?,
+    )?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "semantic-warn",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert!(report["released_semantic_intents"]
+        .as_array()
+        .context("semantic releases")?
+        .is_empty());
+    assert!(report["findings"]
+        .as_array()
+        .context("findings")?
+        .iter()
+        .any(|finding| finding["severity"] == "warning"
+            && finding["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("warn-mode preview"))
+            && finding["paths"]
+                .as_array()
+                .is_some_and(|paths| paths.iter().any(|path| path == "src/lib.rs"))));
+    Ok(())
+}
+
+#[test]
+fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("claim-conflict.json");
+    write_simple_plan(&plan_path, "child-claim-conflict")?;
+    let claim = run_success_json(&[
+        "sync",
+        "claim",
+        "stale-agent",
+        "README.md",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(claim["agent_id"], "stale-agent");
+
+    let report = run_failure_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "claim-conflict",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], false);
+    assert!(report["findings"]
+        .as_array()
+        .context("findings")?
+        .iter()
+        .any(|finding| finding["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("README.md currently claimed by stale-agent"))
+            && finding["paths"]
+                .as_array()
+                .is_some_and(|paths| paths.iter().any(|path| path == "README.md"))));
+    Ok(())
+}
+
+#[test]
+fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("stale-worktree.json");
+    write_simple_plan(&plan_path, "child-clean")?;
+    let first = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "clean-first",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(first["success"], true);
+    fs::write(repo_path.join("README.md"), "# advanced\n")?;
+    let repo = Repository::open(&repo_path)?;
+    commit_all(&repo, "advance primary")?;
+
+    let report = run_failure_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "clean-stale",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], false);
+    assert!(report["orchestrator_reports"]
+        .as_array()
+        .context("reports")?
+        .is_empty());
+    assert!(report["findings"]
+        .as_array()
+        .context("findings")?
+        .iter()
+        .any(|finding| finding["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("refusing to reuse stale child worktree"))));
+    assert!(!repo_path
+        .join(".maco/o2/runs/clean-stale/incoming/child-clean.json")
+        .exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let cases = [
+        (
+            "bad-depth",
+            serde_json::json!({
+                "version": 1,
+                "task": "bad depth",
+                "max_depth": 3,
+                "max_child_assignments": 1,
+                "assignments": [{"id": "child-a", "assigned_paths": ["README.md"]}]
+            }),
+            "max_depth",
+        ),
+        (
+            "bad-budget",
+            serde_json::json!({
+                "version": 1,
+                "task": "bad budget",
+                "max_depth": 2,
+                "max_child_assignments": 1,
+                "assignments": [
+                    {"id": "child-a", "assigned_paths": ["README.md"]},
+                    {"id": "child-b", "assigned_paths": ["src/lib.rs"]}
+                ]
+            }),
+            "max_child_assignments",
+        ),
+        (
+            "bad-retries",
+            serde_json::json!({
+                "version": 1,
+                "task": "bad retries",
+                "max_depth": 2,
+                "max_child_assignments": 1,
+                "max_child_retries": 3,
+                "assignments": [{"id": "child-a", "assigned_paths": ["README.md"]}]
+            }),
+            "max_child_retries",
+        ),
+    ];
+    for (run_id, plan, expected) in cases {
+        let plan_path = temp.path().join(format!("{run_id}.json"));
+        fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?)?;
+        let output = Command::new(BIN)
+            .args([
+                "supervise",
+                "run",
+                path_str(&plan_path)?,
+                "--repo",
+                path_str(&repo_path)?,
+                "--run-id",
+                run_id,
+                "--runtime",
+                "fake",
+                "--json",
+            ])
+            .output()?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "missing {expected} in {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let decoy_path = temp.path().join("decoy");
+    Repository::init(&decoy_path)?;
+    let plan_path = temp.path().join("ambient-git.json");
+    write_simple_plan(&plan_path, "ambient-child")?;
+    let trace = temp.path().join("git-trace.log");
+    let trace2 = temp.path().join("git-trace2.json");
+    let redirected = temp.path().join("git-stderr.log");
+    let output = Command::new(BIN)
+        .args(["supervise", "run"])
+        .arg(&plan_path)
+        .arg("--repo")
+        .arg(&repo_path)
+        .args(["--run-id", "ambient-git", "--runtime", "fake", "--json"])
+        .env("GIT_DIR", decoy_path.join(".git"))
+        .env("GIT_WORK_TREE", &decoy_path)
+        .env("GIT_INDEX_FILE", temp.path().join("ambient-index"))
+        .env("GIT_COMMON_DIR", decoy_path.join(".git"))
+        .env("GIT_TRACE", &trace)
+        .env("GIT_TRACE2_EVENT", &trace2)
+        .env("GIT_REDIRECT_STDERR", &redirected)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", "unsafe-fsmonitor")
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ambient Git run failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["success"], true);
+    assert!(!trace.exists());
+    assert!(!trace2.exists());
+    assert!(!redirected.exists());
+    Ok(())
+}
+
+#[test]
 fn security_document_describes_deterministic_fake_and_verified_codex_boundary() -> Result<()> {
     let security = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("SECURITY.md"))?;
     assert!(security.contains("Fake supervisor runtime is deterministic"));
