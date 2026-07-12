@@ -1,4 +1,6 @@
 use crate::{
+    artifacts::{repository_auth_writer, state_auth::sha256_hex},
+    effect_wal::{EffectPhase, EffectWal},
     llm::{RedactionSummary, Redactor},
     merge::{
         self, ApplyBlocker, ApplyBlockerDetail, ApplyBlockerDisposition, ApplyReadinessStatus,
@@ -7,6 +9,7 @@ use crate::{
         ValidationEvidenceBundle, ValidationReport,
     },
     process_runner::{StdinMode, TrustedFixedNetworkProfile},
+    safe_state::SafeRoot,
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
@@ -24,7 +27,9 @@ use std::{
 
 const SUMMARY_LIMIT: usize = 12 * 1024;
 const PUBLICATION_JOURNAL_VERSION: u32 = 3;
+#[cfg(test)]
 const REMOTE_BINDING_SECRET_FILE: &str = "publication-remote-binding.key";
+#[cfg(test)]
 const REMOTE_BINDING_SECRET_BYTES: usize = 32;
 const GH_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const GH_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
@@ -42,6 +47,8 @@ const MAX_PUBLICATION_REF_COMPONENTS: usize = 64;
 const MAX_GITHUB_RECEIPT_URL_BYTES: usize = 8 * 1024;
 const MAX_GITHUB_RECEIPT_STRING_BYTES: usize = 1024;
 const MAX_GITHUB_PR_LIST_RECEIPTS: usize = 32;
+const GITHUB_PR_EFFECT_LOOKUP_LIMIT: &str = "33";
+#[cfg(test)]
 const PUBLICATION_PR_MARKER_BYTES: usize = 32;
 const MAX_GITHUB_RECEIPT_BODY_BYTES: usize = 512 * 1024;
 const MAX_PUBLICATION_SOURCE_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -52,6 +59,21 @@ const MAX_PUBLICATION_CLOSURE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_PUBLICATION_TREE_DEPTH: usize = 256;
 const MAX_PUBLICATION_COMMIT_DEPTH: usize = 262_144;
 const GITHUB_PR_RECEIPT_FIELDS: &str = "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft,title,body,headRefName,headRepository,headRepositoryOwner,isCrossRepository,author";
+const GITHUB_ISSUE_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state";
+const GITHUB_PR_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup";
+const GITHUB_ISSUE_EFFECT_FIELDS: &str = "number,url,title,body,labels,author,state";
+const EXTERNAL_EFFECT_VERSION: u32 = 1;
+const EXTERNAL_SOURCE_GUARD_VERSION: u32 = 1;
+const EXTERNAL_EFFECT_MARKER_PREFIX: &str = "maco-external-effect";
+const MAX_EXTERNAL_SOURCE_SERIALIZED_BYTES: usize = 512 * 1024;
+const MAX_EXTERNAL_SOURCE_LABELS: usize = 100;
+const MAX_EXTERNAL_SOURCE_FILES: usize = 512;
+const MAX_EXTERNAL_SOURCE_CHECKS: usize = 512;
+const MAX_EXTERNAL_SOURCE_REVIEWS: usize = 512;
+const MAX_GITHUB_EFFECT_CANDIDATES: usize = 100;
+const GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT: &str = "101";
+const MAX_GITHUB_COMMENT_PAGES: usize = 100;
+const MAX_GITHUB_COMMENT_CANDIDATES: usize = 10_000;
 
 #[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
@@ -84,6 +106,961 @@ impl ForgeKind {
             _ => Err("expected one of: fake, git, github".to_string()),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalSourceObjectKind {
+    Issue,
+    PullRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalSourceGuard {
+    pub version: u32,
+    pub provider: String,
+    pub repository_selector: String,
+    pub repository_identity: String,
+    pub object_kind: ExternalSourceObjectKind,
+    pub number: u64,
+    pub updated_at: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_oid: Option<String>,
+    pub content_digest: String,
+    pub action_revision_digest: String,
+    pub provenance_digest: String,
+}
+
+impl ExternalSourceGuard {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider: impl Into<String>,
+        repository_selector: impl Into<String>,
+        repository_identity: impl Into<String>,
+        object_kind: ExternalSourceObjectKind,
+        number: u64,
+        updated_at: impl Into<String>,
+        state: impl Into<String>,
+        head_oid: Option<String>,
+        base_oid: Option<String>,
+        content_digest: impl Into<String>,
+        action_revision_digest: impl Into<String>,
+    ) -> Result<Self> {
+        let mut guard = Self {
+            version: EXTERNAL_SOURCE_GUARD_VERSION,
+            provider: provider.into(),
+            repository_selector: repository_selector.into(),
+            repository_identity: repository_identity.into(),
+            object_kind,
+            number,
+            updated_at: updated_at.into(),
+            state: state.into(),
+            head_oid,
+            base_oid,
+            content_digest: content_digest.into(),
+            action_revision_digest: action_revision_digest.into(),
+            provenance_digest: String::new(),
+        };
+        guard.provenance_digest = guard.expected_provenance_digest()?;
+        guard.validate()?;
+        Ok(guard)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != EXTERNAL_SOURCE_GUARD_VERSION
+            || self.provider != "github"
+            || self.number == 0
+            || self.repository_selector.is_empty()
+            || self.repository_identity.is_empty()
+            || self.updated_at.is_empty()
+            || self.state.is_empty()
+        {
+            bail!("external source guard is malformed or unsupported");
+        }
+        validate_external_digest(
+            &self.repository_identity,
+            "external source repository identity",
+        )?;
+        validate_external_source_field(
+            &self.repository_selector,
+            "external source repository selector",
+            MAX_PUBLICATION_PATH_BYTES,
+        )?;
+        let (owner, name) = self
+            .repository_selector
+            .split_once('/')
+            .context("external source repository selector omitted owner/name")?;
+        if name.contains('/') {
+            bail!("external source repository selector contained extra components");
+        }
+        validate_github_slug(owner, "external source repository owner")?;
+        validate_github_slug(name, "external source repository name")?;
+        validate_external_source_field(
+            &self.updated_at,
+            "external source updatedAt",
+            MAX_GITHUB_RECEIPT_STRING_BYTES,
+        )?;
+        validate_external_source_field(
+            &self.state,
+            "external source state",
+            MAX_GITHUB_RECEIPT_STRING_BYTES,
+        )?;
+        let valid_state = match self.object_kind {
+            ExternalSourceObjectKind::Issue => matches!(self.state.as_str(), "OPEN" | "CLOSED"),
+            ExternalSourceObjectKind::PullRequest => {
+                matches!(self.state.as_str(), "OPEN" | "CLOSED" | "MERGED")
+            }
+        };
+        if !valid_state {
+            bail!("external source state was not canonical for its object kind");
+        }
+        for digest in [
+            &self.content_digest,
+            &self.action_revision_digest,
+            &self.provenance_digest,
+        ] {
+            validate_external_digest(digest, "external source guard digest")?;
+        }
+        match self.object_kind {
+            ExternalSourceObjectKind::Issue => {
+                if self.head_oid.is_some() || self.base_oid.is_some() {
+                    bail!("external issue source guard contains pull-request revisions");
+                }
+            }
+            ExternalSourceObjectKind::PullRequest => {
+                validate_external_git_oid(
+                    self.head_oid
+                        .as_deref()
+                        .context("external pull-request guard omitted head OID")?,
+                    "external source head OID",
+                )?;
+                validate_external_git_oid(
+                    self.base_oid
+                        .as_deref()
+                        .context("external pull-request guard omitted base OID")?,
+                    "external source base OID",
+                )?;
+            }
+        }
+        if self.provenance_digest != self.expected_provenance_digest()? {
+            bail!("external source guard provenance digest does not match its canonical fields");
+        }
+        Ok(())
+    }
+
+    fn expected_provenance_digest(&self) -> Result<String> {
+        stable_json_digest(&(
+            "maco_external_source_guard_v1",
+            self.version,
+            &self.provider,
+            &self.repository_selector,
+            &self.repository_identity,
+            self.object_kind,
+            self.number,
+            &self.updated_at,
+            &self.state,
+            &self.head_oid,
+            &self.base_oid,
+            &self.content_digest,
+            &self.action_revision_digest,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExternalEffectOperation {
+    GitPush,
+    GithubPullRequest,
+    GithubIssue,
+    GithubIssueComment,
+    GithubPullRequestComment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalEffectRequest {
+    version: u32,
+    provider: String,
+    repository_selector: String,
+    repository_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<ExternalSourceGuard>,
+    operation: ExternalEffectOperation,
+    target: serde_json::Value,
+    payload: serde_json::Value,
+    target_digest: String,
+    payload_digest: String,
+    effect_id: String,
+    logical_id: String,
+    marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalEffectReceipt {
+    version: u32,
+    provider: String,
+    repository_identity: String,
+    repository_selector: String,
+    effect_id: String,
+    operation: ExternalEffectOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_provenance_digest: Option<String>,
+    provider_id: String,
+    url: String,
+    repository: String,
+    marker: String,
+    target: serde_json::Value,
+    payload: serde_json::Value,
+    target_digest: String,
+    payload_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalEffectRecord {
+    version: u32,
+    request: ExternalEffectRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt: Option<ExternalEffectReceipt>,
+}
+
+impl ExternalEffectRequest {
+    fn new(
+        provider: &str,
+        repository_selector: &str,
+        repository_identity: &str,
+        source: Option<ExternalSourceGuard>,
+        operation: ExternalEffectOperation,
+        target: serde_json::Value,
+        payload: serde_json::Value,
+    ) -> Result<Self> {
+        if let Some(source) = &source {
+            source.validate()?;
+        }
+        let target_digest = stable_json_digest(&target)?;
+        let payload_digest = stable_json_digest(&payload)?;
+        let logical_binding = match &source {
+            Some(source) => stable_json_digest(&(
+                "maco_external_effect_logical_v1",
+                provider,
+                repository_selector,
+                repository_identity,
+                &source.repository_selector,
+                &source.repository_identity,
+                source.object_kind,
+                source.number,
+                &source.action_revision_digest,
+            ))?,
+            None => stable_json_digest(&(
+                "maco_external_effect_logical_v1",
+                provider,
+                repository_selector,
+                repository_identity,
+                operation,
+                &target_digest,
+                &payload_digest,
+            ))?,
+        };
+        let effect_binding = match &source {
+            Some(_) => {
+                stable_json_digest(&("maco_external_effect_id_v1", &logical_binding, operation))?
+            }
+            None => stable_json_digest(&(
+                "maco_external_effect_id_v1",
+                &logical_binding,
+                operation,
+                &target_digest,
+                &payload_digest,
+            ))?,
+        };
+        let marker = format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:{effect_binding} -->");
+        let request = Self {
+            version: EXTERNAL_EFFECT_VERSION,
+            provider: provider.to_string(),
+            repository_selector: repository_selector.to_string(),
+            repository_identity: repository_identity.to_string(),
+            source,
+            operation,
+            target,
+            payload,
+            target_digest,
+            payload_digest,
+            effect_id: effect_binding,
+            logical_id: format!("external-{logical_binding}"),
+            marker,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != EXTERNAL_EFFECT_VERSION
+            || self.provider.is_empty()
+            || self.repository_selector.is_empty()
+            || self.repository_identity.is_empty()
+        {
+            bail!("external effect request is malformed or unsupported");
+        }
+        validate_external_digest(&self.effect_id, "external effect id")?;
+        let logical_digest = self
+            .logical_id
+            .strip_prefix("external-")
+            .context("external effect logical id is malformed")?;
+        validate_external_digest(logical_digest, "external effect logical id")?;
+        if self.marker
+            != format!(
+                "<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:{} -->",
+                self.effect_id
+            )
+        {
+            bail!("external effect marker is not derived from its stable identity");
+        }
+        if let Some(source) = &self.source {
+            source.validate()?;
+            if source.provider != self.provider
+                || source.repository_selector != self.repository_selector
+            {
+                bail!("external effect source does not match its provider and repository binding");
+            }
+        }
+        if self.target_digest != stable_json_digest(&self.target)?
+            || self.payload_digest != stable_json_digest(&self.payload)?
+        {
+            bail!(
+                "external effect target or payload digest does not match its exact planned value"
+            );
+        }
+        validate_external_digest(&self.target_digest, "external effect target digest")?;
+        validate_external_digest(&self.payload_digest, "external effect payload digest")
+    }
+}
+
+trait ExternalEffectProvider {
+    fn preflight_before_start(&mut self, request: &ExternalEffectRequest) -> Result<()>;
+    fn lookup(&mut self, request: &ExternalEffectRequest) -> Result<Vec<ExternalEffectReceipt>>;
+    fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt>;
+    fn verify(
+        &mut self,
+        request: &ExternalEffectRequest,
+        receipt: &ExternalEffectReceipt,
+    ) -> Result<ExternalEffectReceipt>;
+}
+
+fn execute_external_effect_exactly_once(
+    repo: &Path,
+    request: ExternalEffectRequest,
+    provider: &mut impl ExternalEffectProvider,
+) -> Result<ExternalEffectReceipt> {
+    request.validate()?;
+    let planned = ExternalEffectRecord {
+        version: EXTERNAL_EFFECT_VERSION,
+        request: request.clone(),
+        receipt: None,
+    };
+    let mut wal = EffectWal::open_or_create_planned(
+        || {
+            repository_auth_writer(repo)?
+                .into_authenticator()
+                .context("failed to bind authenticated external-effect ledger")
+        },
+        &request.logical_id,
+        &request.effect_id,
+        &planned,
+    )?;
+    execute_external_effect_with_wal(&mut wal, request, provider)
+}
+
+fn execute_external_effect_with_wal(
+    wal: &mut EffectWal,
+    request: ExternalEffectRequest,
+    provider: &mut impl ExternalEffectProvider,
+) -> Result<ExternalEffectReceipt> {
+    request.validate()?;
+    if wal.logical_id() != request.logical_id {
+        bail!("external effect was presented to a different authenticated logical ledger");
+    }
+    if wal.phase(&request.effect_id).is_none() {
+        let planned = ExternalEffectRecord {
+            version: EXTERNAL_EFFECT_VERSION,
+            request: request.clone(),
+            receipt: None,
+        };
+        wal.planned(&request.effect_id, &planned)?;
+    }
+    let (phase, current) = latest_external_effect_record(wal, &request.effect_id)?;
+    if !same_external_effect_contract(&current.request, &request) {
+        bail!("existing external effect planned payload does not exactly match this request");
+    }
+    let durable_request = current.request;
+    match phase {
+        EffectPhase::Completed => {
+            let receipt = current
+                .receipt
+                .context("completed external effect omitted its durable receipt")?;
+            provider.verify(&durable_request, &receipt).context(
+                "completed external effect remote receipt changed or disappeared; provider call must not be retried and manual reconciliation is required",
+            )
+        }
+        EffectPhase::Observed => {
+            let receipt = current
+                .receipt
+                .context("observed external effect omitted its durable receipt")?;
+            let verified = provider.verify(&durable_request, &receipt).context(
+                "observed external effect could not be reverified; manual reconciliation required",
+            )?;
+            let completed = ExternalEffectRecord {
+                version: EXTERNAL_EFFECT_VERSION,
+                request: durable_request.clone(),
+                receipt: Some(verified.clone()),
+            };
+            wal.completed(&request.effect_id, &completed)?;
+            Ok(verified)
+        }
+        EffectPhase::Started => {
+            let receipt = reconcile_started_external_effect(provider, &durable_request)?;
+            let observed = ExternalEffectRecord {
+                version: EXTERNAL_EFFECT_VERSION,
+                request: durable_request.clone(),
+                receipt: Some(receipt.clone()),
+            };
+            wal.observed(&request.effect_id, &observed)?;
+            let verified = provider.verify(&durable_request, &receipt).context(
+                "reconciled external effect could not be reverified; manual reconciliation required",
+            )?;
+            let completed = ExternalEffectRecord {
+                version: EXTERNAL_EFFECT_VERSION,
+                request: durable_request.clone(),
+                receipt: Some(verified.clone()),
+            };
+            wal.completed(&request.effect_id, &completed)?;
+            Ok(verified)
+        }
+        EffectPhase::Planned => {
+            provider
+                .preflight_before_start(&durable_request)
+                .context("external effect source changed before start")?;
+            match provider.lookup(&durable_request) {
+                Ok(matches) if matches.is_empty() => {}
+                Ok(_) => bail!(
+                    "planned external effect already has a remote marker match; refusing possible front-run and requiring manual reconciliation"
+                ),
+                Err(error) => bail!(
+                    "planned external effect lookup failed before start; refusing provider call: {error:#}"
+                ),
+            }
+            provider
+                .preflight_before_start(&durable_request)
+                .context("external effect source changed immediately before durable start")?;
+            let started = ExternalEffectRecord {
+                version: EXTERNAL_EFFECT_VERSION,
+                request: durable_request.clone(),
+                receipt: None,
+            };
+            wal.started(&request.effect_id, &started)?;
+            let receipt = match provider.invoke(&durable_request) {
+                Ok(receipt) => provider.verify(&durable_request, &receipt).context(
+                    "provider returned a receipt that could not be verified; manual reconciliation required",
+                )?,
+                Err(invoke_error) => reconcile_started_external_effect(provider, &durable_request)
+                    .with_context(|| {
+                        format!(
+                            "provider call failed or lost its response ({invoke_error:#}); blind retry is forbidden"
+                        )
+                    })?,
+            };
+            let observed = ExternalEffectRecord {
+                version: EXTERNAL_EFFECT_VERSION,
+                request: durable_request.clone(),
+                receipt: Some(receipt.clone()),
+            };
+            wal.observed(&request.effect_id, &observed)?;
+            let verified = provider.verify(&durable_request, &receipt).context(
+                "observed external effect could not be reverified; manual reconciliation required",
+            )?;
+            let completed = ExternalEffectRecord {
+                version: EXTERNAL_EFFECT_VERSION,
+                request: durable_request,
+                receipt: Some(verified.clone()),
+            };
+            wal.completed(&completed.request.effect_id, &completed)?;
+            Ok(verified)
+        }
+    }
+}
+
+fn same_external_effect_contract(
+    stored: &ExternalEffectRequest,
+    current: &ExternalEffectRequest,
+) -> bool {
+    let same_source_action = match (&stored.source, &current.source) {
+        (None, None) => true,
+        (Some(stored), Some(current)) => {
+            stored.provider == current.provider
+                && stored.repository_selector == current.repository_selector
+                && stored.repository_identity == current.repository_identity
+                && stored.object_kind == current.object_kind
+                && stored.number == current.number
+                && stored.action_revision_digest == current.action_revision_digest
+        }
+        _ => false,
+    };
+    same_source_action
+        && stored.version == current.version
+        && stored.provider == current.provider
+        && stored.repository_selector == current.repository_selector
+        && stored.repository_identity == current.repository_identity
+        && stored.operation == current.operation
+        && stored.target == current.target
+        && stored.payload == current.payload
+        && stored.target_digest == current.target_digest
+        && stored.payload_digest == current.payload_digest
+        && stored.effect_id == current.effect_id
+        && stored.logical_id == current.logical_id
+        && stored.marker == current.marker
+}
+
+fn reconcile_started_external_effect(
+    provider: &mut impl ExternalEffectProvider,
+    request: &ExternalEffectRequest,
+) -> Result<ExternalEffectReceipt> {
+    let matches = provider.lookup(request).context(
+        "started external effect lookup failed; provider call must not be retried and manual reconciliation is required",
+    )?;
+    if matches.len() != 1 {
+        bail!(
+            "started external effect lookup found {} exact matches; provider call must not be retried and manual reconciliation is required",
+            matches.len()
+        );
+    }
+    provider.verify(request, &matches[0])
+}
+
+fn latest_external_effect_record(
+    wal: &EffectWal,
+    effect_id: &str,
+) -> Result<(EffectPhase, ExternalEffectRecord)> {
+    let phase = wal
+        .phase(effect_id)
+        .context("authenticated external-effect ledger omitted its claimed effect")?;
+    let event = wal
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.effect_id == effect_id)
+        .context("authenticated external-effect ledger omitted its latest event")?;
+    let record: ExternalEffectRecord = serde_json::from_value(event.data.clone())
+        .context("authenticated external-effect payload is malformed")?;
+    if record.version != EXTERNAL_EFFECT_VERSION || event.phase != phase {
+        bail!("authenticated external-effect phase or payload version is inconsistent");
+    }
+    record.request.validate()?;
+    if let Some(receipt) = &record.receipt {
+        validate_external_effect_receipt(&record.request, receipt)?;
+    }
+    Ok((phase, record))
+}
+
+fn validate_external_effect_receipt(
+    request: &ExternalEffectRequest,
+    receipt: &ExternalEffectReceipt,
+) -> Result<()> {
+    if receipt.version != EXTERNAL_EFFECT_VERSION
+        || receipt.provider != request.provider
+        || receipt.repository_identity != request.repository_identity
+        || receipt.repository_selector != request.repository_selector
+        || receipt.repository != request.repository_selector
+        || receipt.effect_id != request.effect_id
+        || receipt.operation != request.operation
+        || receipt.source_provenance_digest.as_deref()
+            != request
+                .source
+                .as_ref()
+                .map(|source| source.provenance_digest.as_str())
+        || receipt.provider_id.is_empty()
+        || receipt.url.is_empty()
+        || receipt.repository.is_empty()
+        || receipt.marker != request.marker
+        || receipt.target != request.target
+        || receipt.payload != request.payload
+        || receipt.target_digest != request.target_digest
+        || receipt.payload_digest != request.payload_digest
+    {
+        bail!("external effect receipt does not match its exact request binding");
+    }
+    validate_external_digest(&receipt.effect_id, "external effect receipt id")?;
+    if let Some(digest) = &receipt.source_provenance_digest {
+        validate_external_digest(digest, "external effect receipt source provenance")?;
+    }
+    if receipt.url.len() > MAX_GITHUB_RECEIPT_URL_BYTES
+        || receipt.url.as_bytes().contains(&0)
+        || receipt.provider_id.len() > MAX_GITHUB_RECEIPT_STRING_BYTES
+        || receipt.repository_selector.len() > MAX_PUBLICATION_PATH_BYTES
+    {
+        bail!("external effect receipt object identity is malformed or oversized");
+    }
+    Ok(())
+}
+
+fn validate_external_digest(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("{label} is not canonical lowercase SHA-256 hexadecimal");
+    }
+    Ok(())
+}
+
+fn validate_external_git_oid(value: &str, label: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("{label} is not a canonical lowercase 40- or 64-hex Git OID");
+    }
+    Ok(())
+}
+
+fn stable_json_digest(value: &impl Serialize) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(value).context(
+        "failed to encode stable external-effect binding",
+    )?))
+}
+
+pub(crate) fn external_source_repository_identity(device: u64, file: u64) -> String {
+    let mut payload = b"MACO\0external-source-repository\0v2\0".to_vec();
+    payload.extend_from_slice(&device.to_be_bytes());
+    payload.extend_from_slice(&file.to_be_bytes());
+    sha256_hex(&payload)
+}
+
+pub(crate) fn stable_external_digest(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
+}
+
+pub(crate) fn github_source_guard_from_value(
+    repository_selector: &str,
+    repository_identity: &str,
+    kind: ExternalSourceObjectKind,
+    value: &serde_json::Value,
+) -> Result<ExternalSourceGuard> {
+    let serialized =
+        serde_json::to_vec(value).context("failed to bound GitHub source observation")?;
+    if serialized.len() > MAX_EXTERNAL_SOURCE_SERIALIZED_BYTES {
+        bail!("GitHub source observation exceeded its serialized byte limit");
+    }
+    let object = value
+        .as_object()
+        .context("GitHub source observation was not an object")?;
+    let number = object
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|number| *number > 0)
+        .context("GitHub source observation omitted its positive number")?;
+    let updated_at = external_source_string(object, "updatedAt")?;
+    let state = external_source_string(object, "state")?.to_ascii_uppercase();
+    let title = external_source_string(object, "title")?;
+    let body = object
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let url = external_source_string(object, "url")?;
+    let author = object
+        .get("author")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|author| author.get("login"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let label_values = bounded_external_source_array(
+        object.get("labels"),
+        "GitHub source labels",
+        MAX_EXTERNAL_SOURCE_LABELS,
+    )?;
+    let mut labels = Vec::with_capacity(label_values.len());
+    for label in label_values {
+        let name = label
+            .as_object()
+            .and_then(|label| label.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .context("GitHub source label omitted name")?;
+        validate_external_source_field(name, "GitHub source label", MAX_GITHUB_SLUG_BYTES)?;
+        labels.push(name.to_string());
+    }
+    labels.sort();
+    labels.dedup();
+    let (head_oid, base_oid, content_digest, action_revision_digest) = match kind {
+        ExternalSourceObjectKind::Issue => {
+            let action = stable_json_digest(&(
+                "maco_github_issue_action_revision_v1",
+                repository_selector,
+                kind,
+                number,
+                title,
+                body,
+                url,
+                author,
+                &labels,
+                &state,
+            ))?;
+            let full = stable_json_digest(&(
+                "maco_github_issue_content_v1",
+                number,
+                title,
+                body,
+                url,
+                author,
+                &labels,
+                &state,
+                &updated_at,
+            ))?;
+            (None, None, full, action)
+        }
+        ExternalSourceObjectKind::PullRequest => {
+            let head_oid = external_source_string(object, "headRefOid")?.to_string();
+            let base_oid = external_source_string(object, "baseRefOid")?.to_string();
+            validate_external_git_oid(&head_oid, "GitHub source head OID")?;
+            validate_external_git_oid(&base_oid, "GitHub source base OID")?;
+            let head_ref = external_source_string(object, "headRefName")?;
+            let base_ref = external_source_string(object, "baseRefName")?;
+            let is_draft = object
+                .get("isDraft")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let file_values = bounded_external_source_array(
+                object.get("files"),
+                "GitHub source files",
+                MAX_EXTERNAL_SOURCE_FILES,
+            )?;
+            let mut files = Vec::with_capacity(file_values.len());
+            for file in file_values {
+                let path = file
+                    .as_object()
+                    .and_then(|file| file.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("GitHub source file omitted path")?;
+                validate_external_source_field(
+                    path,
+                    "GitHub source file path",
+                    MAX_PUBLICATION_PATH_BYTES,
+                )?;
+                files.push(path.to_string());
+            }
+            files.sort();
+            files.dedup();
+            let checks = canonical_external_source_items(
+                object.get("statusCheckRollup"),
+                "GitHub source checks",
+                MAX_EXTERNAL_SOURCE_CHECKS,
+            )?;
+            let reviews = canonical_external_source_items(
+                object.get("latestReviews"),
+                "GitHub source reviews",
+                MAX_EXTERNAL_SOURCE_REVIEWS,
+            )?;
+            let review_decision = object
+                .get("reviewDecision")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let action = stable_json_digest(&(
+                "maco_github_pull_request_action_revision_v1",
+                repository_selector,
+                kind,
+                number,
+                title,
+                body,
+                url,
+                author,
+                &labels,
+                &state,
+                head_ref,
+                base_ref,
+                &head_oid,
+                &base_oid,
+                is_draft,
+                &files,
+            ))?;
+            let full = stable_json_digest(&(
+                "maco_github_pull_request_content_v1",
+                (
+                    number,
+                    title,
+                    body,
+                    url,
+                    author,
+                    &labels,
+                    &state,
+                    &updated_at,
+                ),
+                (head_ref, base_ref, &head_oid, &base_oid, is_draft, &files),
+                (&checks, &reviews, review_decision),
+            ))?;
+            (Some(head_oid), Some(base_oid), full, action)
+        }
+    };
+    ExternalSourceGuard::new(
+        "github",
+        repository_selector,
+        repository_identity,
+        kind,
+        number,
+        updated_at,
+        state,
+        head_oid,
+        base_oid,
+        content_digest,
+        action_revision_digest,
+    )
+}
+
+fn bounded_external_source_array<'a>(
+    value: Option<&'a serde_json::Value>,
+    label: &str,
+    max: usize,
+) -> Result<&'a [serde_json::Value]> {
+    let values = match value {
+        None | Some(serde_json::Value::Null) => &[][..],
+        Some(value) => value
+            .as_array()
+            .with_context(|| format!("{label} was not an array"))?,
+    };
+    if values.len() > max {
+        bail!("{label} exceeded its entry limit");
+    }
+    Ok(values)
+}
+
+fn canonical_external_source_items(
+    value: Option<&serde_json::Value>,
+    label: &str,
+    max: usize,
+) -> Result<Vec<String>> {
+    let values = bounded_external_source_array(value, label, max)?;
+    let mut canonical = Vec::with_capacity(values.len());
+    for item in values {
+        let bytes =
+            serde_json::to_vec(item).with_context(|| format!("failed to encode {label}"))?;
+        if bytes.len() > MAX_GITHUB_RECEIPT_BODY_BYTES {
+            bail!("{label} entry exceeded its byte limit");
+        }
+        canonical.push(String::from_utf8(bytes).context("canonical JSON was not UTF-8")?);
+    }
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn validate_external_source_field(value: &str, label: &str, max: usize) -> Result<()> {
+    if value.is_empty()
+        || value.len() > max
+        || value.as_bytes().iter().any(|byte| byte.is_ascii_control())
+    {
+        bail!("{label} was empty, malformed, or oversized");
+    }
+    Ok(())
+}
+
+fn external_source_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str> {
+    let value = object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("GitHub source observation omitted {field}"))?;
+    if value.is_empty() || value.len() > MAX_GITHUB_RECEIPT_BODY_BYTES || value.contains('\0') {
+        bail!("GitHub source observation {field} was empty, malformed, or oversized");
+    }
+    Ok(value)
+}
+
+pub(crate) fn revalidate_external_source(
+    repo: &Path,
+    expected: &ExternalSourceGuard,
+) -> Result<()> {
+    revalidate_external_source_with(repo, expected, true)
+}
+
+fn revalidate_external_source_action_revision(
+    repo: &Path,
+    expected: &ExternalSourceGuard,
+) -> Result<()> {
+    revalidate_external_source_with(repo, expected, false)
+}
+
+fn revalidate_external_source_with(
+    repo: &Path,
+    expected: &ExternalSourceGuard,
+    require_full_freshness: bool,
+) -> Result<()> {
+    expected.validate()?;
+    let repository =
+        Repository::discover(repo).context("failed to discover guarded source repo")?;
+    let remote_url = remote_url(&repository, "origin")
+        .context("external source revalidation requires canonical origin")?;
+    let github_repository = github_repository_identity(&remote_url)?;
+    let selector = format!("{}/{}", github_repository.owner, github_repository.name);
+    if !selector.eq_ignore_ascii_case(&expected.repository_selector) {
+        bail!("external source guard repository selector changed");
+    }
+    let common = SafeRoot::open_existing(repository.commondir())
+        .context("failed to bind external source repository common directory")?;
+    if external_source_repository_identity(common.identity().device, common.identity().file)
+        != expected.repository_identity
+    {
+        bail!("external source guard belongs to a different local repository identity");
+    }
+    let value = cli_github_source_view(
+        repo,
+        expected.number,
+        expected.object_kind,
+        &github_repository,
+    )?;
+    let observed = github_source_guard_from_value(
+        &expected.repository_selector,
+        &expected.repository_identity,
+        expected.object_kind,
+        &value,
+    )?;
+    if require_full_freshness {
+        if &observed != expected {
+            bail!("external source changed from its exact freshness snapshot");
+        }
+    } else if observed.provider != expected.provider
+        || observed.repository_selector != expected.repository_selector
+        || observed.repository_identity != expected.repository_identity
+        || observed.object_kind != expected.object_kind
+        || observed.number != expected.number
+        || observed.action_revision_digest != expected.action_revision_digest
+    {
+        bail!("external source action revision changed during effect reconciliation");
+    }
+    common.verify()
+}
+
+#[cfg(test)]
+pub(crate) fn revalidate_external_source_value(
+    expected: &ExternalSourceGuard,
+    value: &serde_json::Value,
+) -> Result<()> {
+    expected.validate()?;
+    let observed = github_source_guard_from_value(
+        &expected.repository_selector,
+        &expected.repository_identity,
+        expected.object_kind,
+        value,
+    )?;
+    if &observed != expected {
+        bail!("external source changed from its exact freshness snapshot");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +1211,8 @@ struct PublicationTransaction {
     directory: PathBuf,
     journal: PublicationTransactionJournal,
     remote_url: String,
+    push_effect_request: Option<ExternalEffectRequest>,
+    pr_effect_request: Option<ExternalEffectRequest>,
 }
 
 struct PublicationGitContext {
@@ -363,8 +1342,10 @@ struct PrivateNetworkToken {
 struct ZeroizingString(String);
 
 #[derive(PartialEq, Eq)]
+#[cfg(test)]
 struct ZeroizingBytes(Vec<u8>);
 
+#[cfg(test)]
 impl ZeroizingBytes {
     fn as_slice(&self) -> &[u8] {
         &self.0
@@ -379,12 +1360,14 @@ impl ZeroizingBytes {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for ZeroizingBytes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("<redacted:zeroizing-bytes>")
     }
 }
 
+#[cfg(test)]
 impl Drop for ZeroizingBytes {
     fn drop(&mut self) {
         zeroize_bytes(&mut self.0);
@@ -990,6 +1973,7 @@ where
         validation_evidence,
         &write_lease,
         after_lock,
+        None,
     )
 }
 
@@ -1012,6 +1996,7 @@ pub(crate) fn publish_pr_with_validation_evidence_and_write_lease(
         validation_evidence,
         write_lease,
         || {},
+        None,
     )
 }
 
@@ -1026,6 +2011,7 @@ pub(crate) fn publish_pr_with_write_lease(
 /// Publishes a previously prepared candidate with mandatory exact validation
 /// evidence. There is intentionally no `require_validation` argument: callers
 /// cannot downgrade this strict bridge to legacy or unbound validation.
+#[cfg(test)]
 pub(crate) fn publish_prepared_pr_with_write_lease(
     options: PrPublicationOptions,
     bound_evidence: &BoundValidationEvidenceBundle,
@@ -1042,12 +2028,32 @@ pub(crate) fn publish_prepared_pr_with_write_lease(
     )
 }
 
+pub(crate) fn publish_prepared_pr_with_source_guard(
+    options: PrPublicationOptions,
+    bound_evidence: &BoundValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+    source_guard: Option<ExternalSourceGuard>,
+) -> Result<PrPublicationReport> {
+    if bound_evidence.binding().agent_id != options.agent_id {
+        bail!("strict publication evidence belongs to a different agent");
+    }
+    publish_pr_with_validation_evidence_and_write_lease_after_lock(
+        options,
+        true,
+        bound_evidence.evidence().clone(),
+        write_lease,
+        || {},
+        source_guard,
+    )
+}
+
 fn publish_pr_with_validation_evidence_and_write_lease_after_lock<F>(
     options: PrPublicationOptions,
     require_validation: bool,
     validation_evidence: ValidationEvidenceBundle,
     write_lease: &ManagedWorktreeWriteLease,
     after_lock: F,
+    source_guard: Option<ExternalSourceGuard>,
 ) -> Result<PrPublicationReport>
 where
     F: FnOnce(),
@@ -1063,6 +2069,7 @@ where
         validation_evidence,
         write_lease,
         repo_root,
+        source_guard,
     )
 }
 
@@ -1072,6 +2079,7 @@ fn publish_pr_with_verified_authority(
     validation_evidence: ValidationEvidenceBundle,
     write_lease: &ManagedWorktreeWriteLease,
     repo_root: PathBuf,
+    source_guard: Option<ExternalSourceGuard>,
 ) -> Result<PrPublicationReport> {
     let mut report = preview_pr_with_validation_evidence_and_write_lease(
         options.clone(),
@@ -1222,6 +2230,7 @@ fn publish_pr_with_verified_authority(
                 "origin",
                 remote_url,
                 &expected_head,
+                source_guard.clone(),
             )?;
             report.publication_receipt = Some(transaction.receipt());
             if let Err(error) = ensure_remote_expected_commit(&worktree_path, &mut transaction) {
@@ -1264,6 +2273,7 @@ fn publish_pr_with_verified_authority(
                 "origin",
                 remote_url,
                 &expected_head,
+                source_guard.clone(),
             )?;
             report.publication_receipt = Some(transaction.receipt());
             if let Err(error) =
@@ -1493,6 +2503,7 @@ fn pr_body(preview: &MergeApplyPreview) -> String {
     )
 }
 
+#[cfg(test)]
 fn generate_publication_pr_marker_nonce() -> Result<String> {
     let mut bytes = ZeroizingBytes(vec![0_u8; PUBLICATION_PR_MARKER_BYTES]);
     fill_os_random(bytes.as_mut_slice())?;
@@ -1503,6 +2514,7 @@ fn generate_publication_pr_marker_nonce() -> Result<String> {
         .collect())
 }
 
+#[cfg(test)]
 fn validate_publication_pr_marker_nonce(value: &str) -> Result<()> {
     if value.len() != PUBLICATION_PR_MARKER_BYTES * 2
         || !value
@@ -1514,6 +2526,7 @@ fn validate_publication_pr_marker_nonce(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn pr_body_with_publication_marker(body: &str, nonce: &str) -> Result<String> {
     validate_publication_pr_marker_nonce(nonce)?;
     if body.len() > MAX_GITHUB_RECEIPT_BODY_BYTES.saturating_sub(128) {
@@ -1865,6 +2878,7 @@ fn validate_github_receipt_url_text(url: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn publication_remote_binding_digest(
     secret: &[u8],
     remote_name: &str,
@@ -1884,6 +2898,7 @@ fn publication_remote_binding_digest(
         .to_string())
 }
 
+#[cfg(test)]
 fn load_or_create_remote_binding_secret(state_directory: &Path) -> Result<ZeroizingBytes> {
     let path = state_directory.join(REMOTE_BINDING_SECRET_FILE);
     match fs::symlink_metadata(&path) {
@@ -1967,12 +2982,13 @@ fn load_or_create_remote_binding_secret(state_directory: &Path) -> Result<Zeroiz
     result
 }
 
+#[cfg(test)]
 enum RemoteBindingSecretPublish {
     Published { temp_is_link: bool },
     Existing,
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn publish_remote_binding_secret_temp(
     temporary_path: &Path,
     final_path: &Path,
@@ -1991,7 +3007,7 @@ fn publish_remote_binding_secret_temp(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(test, target_os = "windows"))]
 fn publish_remote_binding_secret_temp(
     temporary_path: &Path,
     final_path: &Path,
@@ -2039,7 +3055,7 @@ fn publish_remote_binding_secret_temp(
     }
 }
 
-#[cfg(not(any(unix, target_os = "windows")))]
+#[cfg(all(test, not(any(unix, target_os = "windows"))))]
 fn publish_remote_binding_secret_temp(
     _temporary_path: &Path,
     _final_path: &Path,
@@ -2047,6 +3063,7 @@ fn publish_remote_binding_secret_temp(
     bail!("atomic publication remote binding key creation is unsupported on this platform")
 }
 
+#[cfg(test)]
 fn refuse_missing_binding_key_with_existing_transactions(state_directory: &Path) -> Result<()> {
     let transactions = state_directory.join("publication-transactions");
     match fs::symlink_metadata(&transactions) {
@@ -2083,6 +3100,36 @@ fn refuse_missing_binding_key_with_existing_transactions(state_directory: &Path)
     }
 }
 
+fn refuse_legacy_publication_journals(repository: &Repository) -> Result<()> {
+    let legacy_root = repository
+        .commondir()
+        .join("maco")
+        .join("state")
+        .join("publication-transactions");
+    let metadata = match fs::symlink_metadata(&legacy_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).context("failed to inspect legacy publication journal root")
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || publication_metadata_is_windows_reparse_point(&metadata)
+        || !metadata.is_dir()
+    {
+        bail!("legacy publication journal root is unsafe; signed migration is required");
+    }
+    let mut entries = fs::read_dir(&legacy_root)
+        .context("failed to enumerate legacy publication journal root")?;
+    if entries.next().transpose()?.is_some() {
+        bail!(
+            "legacy publication journals require explicit signed migration before authenticated external effects can run"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn read_remote_binding_secret(path: &Path) -> Result<ZeroizingBytes> {
     #[cfg(unix)]
     recover_remote_binding_secret_temp_link(path)?;
@@ -2149,7 +3196,7 @@ fn read_remote_binding_secret(path: &Path) -> Result<ZeroizingBytes> {
     Ok(secret)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(test, target_os = "windows"))]
 fn open_remote_binding_secret_file(path: &Path) -> std::io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -2161,7 +3208,7 @@ fn open_remote_binding_secret_file(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn open_remote_binding_secret_file(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -2172,12 +3219,12 @@ fn open_remote_binding_secret_file(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
-#[cfg(not(any(unix, target_os = "windows")))]
+#[cfg(all(test, not(any(unix, target_os = "windows"))))]
 fn open_remote_binding_secret_file(path: &Path) -> std::io::Result<fs::File> {
     OpenOptions::new().read(true).open(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn recover_remote_binding_secret_temp_link(path: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -2275,6 +3322,7 @@ fn recover_remote_binding_secret_temp_link(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn is_remote_binding_secret_temp_name(name: &str) -> bool {
     let prefix = format!(".{REMOTE_BINDING_SECRET_FILE}-");
     let Some(stem) = name
@@ -2293,6 +3341,7 @@ fn is_remote_binding_secret_temp_name(name: &str) -> bool {
         && nanos.parse::<u128>().is_ok_and(|nanos| nanos > 0)
 }
 
+#[cfg(test)]
 fn validate_remote_binding_secret_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if metadata.file_type().is_symlink()
         || publication_metadata_is_windows_reparse_point(metadata)
@@ -2358,7 +3407,7 @@ fn publication_metadata_is_windows_reparse_point(_metadata: &fs::Metadata) -> bo
     false
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn fill_os_random(destination: &mut [u8]) -> Result<()> {
     fs::File::open("/dev/urandom")
         .context("failed to open operating-system random source")?
@@ -2366,7 +3415,7 @@ fn fill_os_random(destination: &mut [u8]) -> Result<()> {
         .context("failed to read operating-system random source")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(test, target_os = "windows"))]
 fn fill_os_random(destination: &mut [u8]) -> Result<()> {
     use std::ffi::c_void;
 
@@ -2397,7 +3446,7 @@ fn fill_os_random(destination: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(unix, target_os = "windows")))]
+#[cfg(all(test, not(any(unix, target_os = "windows"))))]
 fn fill_os_random(_destination: &mut [u8]) -> Result<()> {
     bail!("publication remote binding keys are unsupported on this platform")
 }
@@ -2409,6 +3458,7 @@ impl PublicationTransaction {
         remote_name: &str,
         remote_url: &str,
         expected_oid: &str,
+        source_guard: Option<ExternalSourceGuard>,
     ) -> Result<Self> {
         let expected =
             Oid::from_str(expected_oid).context("publication expected OID was invalid")?;
@@ -2429,8 +3479,6 @@ impl PublicationTransaction {
         if report.forge == ForgeKind::Github && expected_base_oid.is_none() {
             bail!("GitHub publication requires an exact reviewed base OID");
         }
-        let remote_branch = publication_remote_branch(&report.agent_id, expected_oid);
-        let remote_ref = format!("refs/heads/{remote_branch}");
         let forge = match report.forge {
             ForgeKind::Git => "git",
             ForgeKind::Github => "github",
@@ -2455,83 +3503,81 @@ impl PublicationTransaction {
                 repo_root.display()
             )
         })?;
-        let state = merge::ensure_repo_common_state_directory(&repo)?;
-        let remote_binding_secret = load_or_create_remote_binding_secret(&state)?;
+        refuse_legacy_publication_journals(&repo)?;
+        let auth = repository_auth_writer(repo_root)?
+            .into_authenticator()
+            .context("failed to establish authenticated publication effect ledger")?;
+        let repository_identity = auth.binding().repository_id.clone();
+        let repository_selector = github_repository
+            .as_ref()
+            .map(GithubRepositoryIdentity::selector)
+            .unwrap_or_else(|| redact_remote_url(remote_url));
+        drop(auth);
         let remote_display = redact_remote_url(remote_url);
-        let remote_binding_digest = ZeroizingString(publication_remote_binding_digest(
-            remote_binding_secret.as_slice(),
-            remote_name,
-            remote_url,
-        )?);
-        let identity = ZeroizingString(format!(
-            "{}\n{forge}\n{expected_oid}\n{remote_name}\n{remote_binding_digest}\n{}\n{}",
-            report.agent_id,
-            report.base,
-            report.draft,
-            remote_binding_digest = remote_binding_digest.as_str(),
-        ));
-        let transaction_id = format!(
-            "{}-{expected_oid}-{:016x}",
-            sanitize_url_segment(&report.agent_id),
-            stable_hash(identity.as_bytes())
-        );
-        let remote_binding_digest = remote_binding_digest.as_str().to_string();
-        let publication_transactions =
-            merge::ensure_private_managed_directory(&state, "publication-transactions")?;
-        let directory =
-            merge::ensure_private_managed_directory(&publication_transactions, &transaction_id)?;
-        if let Some(parent) = directory.parent() {
-            sync_journal_directory(parent)?;
-        }
-
-        if let Some(journal) = load_latest_publication_journal(&directory)? {
-            let expected_pr_body = match (&journal.pr_marker_nonce, &unmarked_pr_body) {
-                (Some(nonce), Some(body)) => Some(pr_body_with_publication_marker(body, nonce)?),
-                (None, None) => None,
-                _ => bail!("publication transaction marker did not match its forge"),
-            };
-            if journal.version != PUBLICATION_JOURNAL_VERSION
-                || journal.transaction_id != transaction_id
-                || journal.agent_id != report.agent_id
-                || journal.forge != report.forge
-                || journal.expected_oid != expected_oid
-                || journal.expected_base_oid != expected_base_oid
-                || journal.remote_name != remote_name
-                || journal.remote_binding_digest != remote_binding_digest
-                || journal.remote_display != remote_display
-                || journal.remote_ref != remote_ref
-                || journal.remote_branch != remote_branch
-                || journal.github_repository != github_repository
-                || journal.expected_pr_title != expected_pr_title
-                || journal.expected_pr_body != expected_pr_body
-                || journal.expected_pr_author != expected_pr_author
-                || journal.base != report.base
-                || journal.draft != report.draft
-            {
-                bail!(
-                    "publication transaction journal {} does not match the current reviewed publication",
-                    transaction_id
-                );
-            }
-            return Ok(Self {
-                directory,
-                journal,
-                remote_url: remote_url.to_string(),
-            });
-        }
-
-        let pr_marker_nonce = match report.forge {
-            ForgeKind::Github => Some(generate_publication_pr_marker_nonce()?),
+        let push_effect_request = ExternalEffectRequest::new(
+            forge,
+            &repository_selector,
+            &repository_identity,
+            source_guard.clone(),
+            ExternalEffectOperation::GitPush,
+            serde_json::json!({
+                "version": 1,
+                "repository": repository_selector,
+                "remote_name": remote_name,
+                "remote_url": remote_url,
+                "base": report.base,
+                "expected_base_oid": expected_base_oid,
+            }),
+            serde_json::json!({
+                "version": 1,
+                "expected_oid": expected_oid,
+            }),
+        )?;
+        let remote_branch = format!("maco/effects/{}", &push_effect_request.effect_id[..32]);
+        let remote_ref = format!("refs/heads/{remote_branch}");
+        let pr_effect_request = match report.forge {
+            ForgeKind::Github => Some(ExternalEffectRequest::new(
+                "github",
+                &repository_selector,
+                &repository_identity,
+                source_guard,
+                ExternalEffectOperation::GithubPullRequest,
+                serde_json::json!({
+                    "version": 1,
+                    "repository": repository_selector,
+                    "expected_oid": expected_oid,
+                    "expected_base_oid": expected_base_oid,
+                    "base": report.base,
+                }),
+                serde_json::json!({
+                    "version": 1,
+                    "title": expected_pr_title,
+                    "body": unmarked_pr_body,
+                    "draft": report.draft,
+                    "expected_author": expected_pr_author,
+                }),
+            )?),
             ForgeKind::Git | ForgeKind::Fake => None,
         };
-        let expected_pr_body = match (&pr_marker_nonce, &unmarked_pr_body) {
-            (Some(nonce), Some(body)) => Some(pr_body_with_publication_marker(body, nonce)?),
+        let pr_marker_nonce = pr_effect_request
+            .as_ref()
+            .map(|request| request.effect_id.clone());
+        let expected_pr_body = match (&pr_effect_request, &unmarked_pr_body) {
+            (Some(request), Some(body)) => {
+                Some(external_effect_marked_body(body, &request.marker)?)
+            }
             (None, None) => None,
             _ => bail!("publication transaction marker did not match its forge"),
         };
 
-        let mut transaction = Self {
-            directory,
+        let transaction_id = format!("effect-{}", push_effect_request.effect_id);
+        let remote_binding_digest = stable_json_digest(&(
+            "maco_publication_remote_binding_v1",
+            remote_name,
+            remote_url,
+        ))?;
+        Ok(Self {
+            directory: PathBuf::new(),
             journal: PublicationTransactionJournal {
                 version: PUBLICATION_JOURNAL_VERSION,
                 transaction_id,
@@ -2574,12 +3620,24 @@ impl PublicationTransaction {
                 updated_unix_seconds: 0,
             },
             remote_url: remote_url.to_string(),
-        };
-        transaction.persist()?;
-        Ok(transaction)
+            push_effect_request: Some(push_effect_request),
+            pr_effect_request,
+        })
     }
 
     fn persist(&mut self) -> Result<()> {
+        if self.push_effect_request.is_some() {
+            self.journal.sequence = self
+                .journal
+                .sequence
+                .checked_add(1)
+                .context("publication receipt sequence overflow")?;
+            self.journal.updated_unix_seconds = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system time before UNIX epoch")?
+                .as_secs();
+            return Ok(());
+        }
         self.journal.sequence = self
             .journal
             .sequence
@@ -2696,6 +3754,7 @@ impl PublicationTransaction {
     }
 }
 
+#[cfg(test)]
 fn load_latest_publication_journal(
     directory: &Path,
 ) -> Result<Option<PublicationTransactionJournal>> {
@@ -2898,6 +3957,7 @@ fn validate_publication_journal_record_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
     let path_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect journal record {}", path.display()))?;
@@ -2968,6 +4028,7 @@ fn publication_same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadat
     }
 }
 
+#[cfg(test)]
 fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Result<()> {
     if journal.version != PUBLICATION_JOURNAL_VERSION || journal.sequence == 0 {
         bail!("publication journal version or sequence was invalid");
@@ -2976,8 +4037,16 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
     if let Some(oid) = journal.expected_base_oid.as_deref() {
         Oid::from_str(oid).context("publication journal expected base OID was invalid")?;
     }
-    Oid::from_str(&journal.remote_binding_digest)
-        .context("publication journal remote binding digest was invalid")?;
+    let is_external_effect_receipt = journal.transaction_id.starts_with("effect-");
+    if is_external_effect_receipt {
+        validate_external_digest(
+            &journal.remote_binding_digest,
+            "publication receipt remote binding digest",
+        )?;
+    } else {
+        Oid::from_str(&journal.remote_binding_digest)
+            .context("legacy publication journal remote binding digest was invalid")?;
+    }
     if let Some(oid) = journal.push_observed_oid.as_deref() {
         Oid::from_str(oid).context("publication journal observed push OID was invalid")?;
     }
@@ -3017,13 +4086,15 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
             .context("GitHub publication journal omitted its explicit expected author")?;
         let canonical_author = canonical_github_author_login(expected_author)
             .context("GitHub publication journal expected author was malformed")?;
+        let marker_literal = if is_external_effect_receipt {
+            format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:{marker} -->")
+        } else {
+            format!("<!-- maco-publication-marker:{marker} -->")
+        };
         if expected_title.is_empty()
             || expected_title.len() > MAX_GITHUB_RECEIPT_STRING_BYTES
             || expected_body.len() > MAX_GITHUB_RECEIPT_BODY_BYTES
-            || expected_body
-                .matches(&format!("<!-- maco-publication-marker:{marker} -->"))
-                .count()
-                != 1
+            || expected_body.matches(&marker_literal).count() != 1
             || canonical_author != expected_author
         {
             bail!("GitHub publication journal PR identity fields were invalid");
@@ -3166,6 +4237,7 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_publication_journal_transition(
     previous: &PublicationTransactionJournal,
     current: &PublicationTransactionJournal,
@@ -3252,14 +4324,6 @@ fn sync_journal_directory(directory: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_journal_directory(_directory: &Path) -> Result<()> {
     Ok(())
-}
-
-fn publication_remote_branch(agent_id: &str, expected_oid: &str) -> String {
-    format!(
-        "maco/review/{}/{}",
-        sanitize_url_segment(agent_id),
-        expected_oid
-    )
 }
 
 fn validate_publication_object_store_is_self_contained(
@@ -4485,6 +5549,25 @@ fn ensure_remote_expected_commit(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
 ) -> Result<()> {
+    if let Some(request) = transaction.push_effect_request.clone() {
+        let mut provider = GitPushExternalEffectProvider {
+            worktree_path,
+            remote_url: &transaction.remote_url,
+            remote_ref: &transaction.journal.remote_ref,
+            expected_oid: &transaction.journal.expected_oid,
+            source_guard: request.source.as_ref(),
+        };
+        let receipt =
+            execute_external_effect_exactly_once(worktree_path, request.clone(), &mut provider)?;
+        if receipt.provider_id != transaction.journal.expected_oid {
+            bail!("authenticated push receipt did not contain the expected remote OID");
+        }
+        transaction.journal.push_observed_oid = Some(receipt.provider_id);
+        transaction.advance_phase(PublicationTransactionPhase::PushObserved);
+        transaction.journal.last_error = None;
+        transaction.persist()?;
+        return Ok(());
+    }
     let previous = transaction.journal.clone();
     let before = observe_remote_ref(
         worktree_path,
@@ -4541,6 +5624,101 @@ fn ensure_remote_expected_commit(
             &stderr
         }
     )
+}
+
+struct GitPushExternalEffectProvider<'a> {
+    worktree_path: &'a Path,
+    remote_url: &'a str,
+    remote_ref: &'a str,
+    expected_oid: &'a str,
+    source_guard: Option<&'a ExternalSourceGuard>,
+}
+
+impl GitPushExternalEffectProvider<'_> {
+    fn revalidate_source_full(&self) -> Result<()> {
+        if let Some(source) = self.source_guard {
+            revalidate_external_source(self.worktree_path, source)?;
+        }
+        Ok(())
+    }
+
+    fn revalidate_source_action_revision(&self) -> Result<()> {
+        if let Some(source) = self.source_guard {
+            revalidate_external_source_action_revision(self.worktree_path, source)?;
+        }
+        Ok(())
+    }
+
+    fn exact_receipt(&self, request: &ExternalEffectRequest) -> ExternalEffectReceipt {
+        ExternalEffectReceipt {
+            version: EXTERNAL_EFFECT_VERSION,
+            provider: request.provider.clone(),
+            repository_identity: request.repository_identity.clone(),
+            repository_selector: request.repository_selector.clone(),
+            effect_id: request.effect_id.clone(),
+            operation: request.operation,
+            source_provenance_digest: request
+                .source
+                .as_ref()
+                .map(|source| source.provenance_digest.clone()),
+            provider_id: self.expected_oid.to_string(),
+            url: format!("{}#{}", redact_remote_url(self.remote_url), self.remote_ref),
+            repository: request.repository_selector.clone(),
+            marker: request.marker.clone(),
+            target: request.target.clone(),
+            payload: request.payload.clone(),
+            target_digest: request.target_digest.clone(),
+            payload_digest: request.payload_digest.clone(),
+        }
+    }
+}
+
+impl ExternalEffectProvider for GitPushExternalEffectProvider<'_> {
+    fn preflight_before_start(&mut self, _request: &ExternalEffectRequest) -> Result<()> {
+        self.revalidate_source_full()
+    }
+
+    fn lookup(&mut self, request: &ExternalEffectRequest) -> Result<Vec<ExternalEffectReceipt>> {
+        self.revalidate_source_action_revision()?;
+        match observe_remote_ref(self.worktree_path, self.remote_url, self.remote_ref)? {
+            None => Ok(Vec::new()),
+            Some(observed) if observed == self.expected_oid => {
+                Ok(vec![self.exact_receipt(request)])
+            }
+            Some(_) => bail!("stable external-effect remote ref points to a different OID"),
+        }
+    }
+
+    fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt> {
+        self.revalidate_source_full()?;
+        let output = push_git_commit_create_only(
+            self.worktree_path,
+            self.remote_url,
+            self.remote_ref,
+            self.expected_oid,
+        )?;
+        if !output.success {
+            bail!("git push did not return success");
+        }
+        let matches = self.lookup(request)?;
+        if matches.len() != 1 {
+            bail!("git push response could not be reconciled to its stable remote ref");
+        }
+        Ok(matches[0].clone())
+    }
+
+    fn verify(
+        &mut self,
+        request: &ExternalEffectRequest,
+        receipt: &ExternalEffectReceipt,
+    ) -> Result<ExternalEffectReceipt> {
+        validate_external_effect_receipt(request, receipt)?;
+        let matches = self.lookup(request)?;
+        if matches.as_slice() != [receipt.clone()] {
+            bail!("git push receipt no longer matches the exact remote ref observation");
+        }
+        Ok(receipt.clone())
+    }
 }
 
 fn ensure_github_remote_expected_commit(
@@ -4610,7 +5788,197 @@ fn reconcile_github_pr(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
 ) -> Result<GithubPrResult> {
+    if let Some(request) = transaction.pr_effect_request.clone() {
+        let mut api = CliGithubApi;
+        let mut provider = GithubPrExternalEffectProvider {
+            worktree_path,
+            remote_url: &transaction.remote_url,
+            journal: transaction.journal.clone(),
+            api: &mut api,
+            source_guard: request.source.as_ref(),
+        };
+        let receipt =
+            execute_external_effect_exactly_once(worktree_path, request.clone(), &mut provider)?;
+        let result = provider.view_exact_receipt(&receipt)?;
+        return verify_github_receipt_with_remote_check(
+            worktree_path,
+            transaction,
+            result,
+            true,
+            false,
+            |_, _, _| Ok(()),
+        );
+    }
     reconcile_github_pr_with_api(worktree_path, transaction, &mut CliGithubApi)
+}
+
+struct GithubPrExternalEffectProvider<'a, A: GithubApi> {
+    worktree_path: &'a Path,
+    remote_url: &'a str,
+    journal: PublicationTransactionJournal,
+    api: &'a mut A,
+    source_guard: Option<&'a ExternalSourceGuard>,
+}
+
+impl<A: GithubApi> GithubPrExternalEffectProvider<'_, A> {
+    fn revalidate_bound_inputs(&mut self, require_full_source: bool) -> Result<()> {
+        if let Some(source) = self.source_guard {
+            if require_full_source {
+                revalidate_external_source(self.worktree_path, source)?;
+            } else {
+                revalidate_external_source_action_revision(self.worktree_path, source)?;
+            }
+        }
+        let base_oid = self
+            .journal
+            .expected_base_oid
+            .as_deref()
+            .context("GitHub PR effect omitted exact base OID")?;
+        let base_ref = format!("refs/heads/{}", self.journal.base);
+        if observe_remote_ref(self.worktree_path, self.remote_url, &base_ref)?.as_deref()
+            != Some(base_oid)
+        {
+            bail!("GitHub PR effect base ref changed from its exact reviewed OID");
+        }
+        if observe_remote_ref(
+            self.worktree_path,
+            self.remote_url,
+            &self.journal.remote_ref,
+        )?
+        .as_deref()
+            != Some(self.journal.expected_oid.as_str())
+        {
+            bail!("GitHub PR effect head ref changed from its stable expected OID");
+        }
+        Ok(())
+    }
+
+    fn repository(&self) -> Result<&GithubRepositoryIdentity> {
+        self.journal
+            .github_repository
+            .as_ref()
+            .context("GitHub PR effect omitted repository identity")
+    }
+
+    fn receipt_from_result(
+        &self,
+        request: &ExternalEffectRequest,
+        result: &GithubPrResult,
+    ) -> ExternalEffectReceipt {
+        ExternalEffectReceipt {
+            version: EXTERNAL_EFFECT_VERSION,
+            provider: request.provider.clone(),
+            repository_identity: request.repository_identity.clone(),
+            repository_selector: request.repository_selector.clone(),
+            effect_id: request.effect_id.clone(),
+            operation: request.operation,
+            source_provenance_digest: request
+                .source
+                .as_ref()
+                .map(|source| source.provenance_digest.clone()),
+            provider_id: result.number.to_string(),
+            url: result.url.clone(),
+            repository: request.repository_selector.clone(),
+            marker: request.marker.clone(),
+            target: request.target.clone(),
+            payload: request.payload.clone(),
+            target_digest: request.target_digest.clone(),
+            payload_digest: request.payload_digest.clone(),
+        }
+    }
+
+    fn exact_remote_results(&mut self) -> Result<Vec<GithubPrResult>> {
+        self.revalidate_bound_inputs(false)?;
+        let repository = self.repository()?.clone();
+        let candidates =
+            self.api
+                .list(self.worktree_path, &self.journal.remote_branch, &repository)?;
+        if candidates.len() > MAX_GITHUB_PR_LIST_RECEIPTS {
+            bail!("GitHub PR effect lookup returned too many candidates");
+        }
+        let mut exact = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let viewed = self.api.view(
+                self.worktree_path,
+                &candidate.number.to_string(),
+                &repository,
+            )?;
+            validate_github_receipt_contract(&viewed, &self.journal)?;
+            exact.push(viewed);
+        }
+        exact.sort_by_key(|result| result.number);
+        exact.dedup_by_key(|result| result.number);
+        Ok(exact)
+    }
+
+    fn view_exact_receipt(&mut self, receipt: &ExternalEffectReceipt) -> Result<GithubPrResult> {
+        self.revalidate_bound_inputs(false)?;
+        let repository = self.repository()?.clone();
+        let viewed = self
+            .api
+            .view(self.worktree_path, &receipt.provider_id, &repository)?;
+        validate_github_receipt_contract(&viewed, &self.journal)?;
+        if viewed.url != receipt.url {
+            bail!("GitHub PR exact view URL changed from authenticated receipt");
+        }
+        Ok(viewed)
+    }
+}
+
+impl<A: GithubApi> ExternalEffectProvider for GithubPrExternalEffectProvider<'_, A> {
+    fn preflight_before_start(&mut self, _request: &ExternalEffectRequest) -> Result<()> {
+        self.revalidate_bound_inputs(true)
+    }
+
+    fn lookup(&mut self, request: &ExternalEffectRequest) -> Result<Vec<ExternalEffectReceipt>> {
+        Ok(self
+            .exact_remote_results()?
+            .iter()
+            .map(|result| self.receipt_from_result(request, result))
+            .collect())
+    }
+
+    fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt> {
+        self.revalidate_bound_inputs(true)?;
+        let repository = self.repository()?.clone();
+        let title = self
+            .journal
+            .expected_pr_title
+            .as_deref()
+            .context("GitHub PR effect omitted title")?;
+        let body = self
+            .journal
+            .expected_pr_body
+            .as_deref()
+            .context("GitHub PR effect omitted marker-bound body")?;
+        let output = self.api.create(
+            self.worktree_path,
+            &self.journal.remote_branch,
+            &self.journal.base,
+            title,
+            body,
+            self.journal.draft,
+            &repository,
+        )?;
+        if !output.stderr.is_empty() && output.stdout.is_empty() {
+            bail!("GitHub PR provider returned no usable creation response");
+        }
+        let matches = self.exact_remote_results()?;
+        if matches.len() != 1 {
+            bail!("GitHub PR creation response could not be reconciled exactly");
+        }
+        Ok(self.receipt_from_result(request, &matches[0]))
+    }
+
+    fn verify(
+        &mut self,
+        request: &ExternalEffectRequest,
+        receipt: &ExternalEffectReceipt,
+    ) -> Result<ExternalEffectReceipt> {
+        validate_external_effect_receipt(request, receipt)?;
+        let viewed = self.view_exact_receipt(receipt)?;
+        Ok(self.receipt_from_result(request, &viewed))
+    }
 }
 
 fn reconcile_github_pr_with_api(
@@ -5166,8 +6534,38 @@ fn validate_gh_operation(
     let selector = repository.selector();
     let receipt_fields = GITHUB_PR_RECEIPT_FIELDS;
     match args.as_slice() {
-        ["pr", "list", "--repo", bound, "--head", branch, "--state", "all", "--json", fields]
+        ["issue", "view", number, "--repo", bound, "--json", fields]
             if *bound == selector
+                && *fields == GITHUB_ISSUE_SOURCE_FIELDS
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_gh_positive_number(number, "issue source number")
+        }
+        ["issue", "view", number, "--repo", bound, "--json", fields]
+            if *bound == selector
+                && *fields == GITHUB_ISSUE_EFFECT_FIELDS
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_gh_positive_number(number, "issue effect number")
+        }
+        ["issue", "list", "--repo", bound, "--state", "all", "--search", marker, "--limit", limit, "--json", fields]
+            if *bound == selector
+                && *limit == GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT
+                && *fields == GITHUB_ISSUE_EFFECT_FIELDS
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_external_effect_marker_argument(marker)
+        }
+        ["pr", "view", number, "--repo", bound, "--json", fields]
+            if *bound == selector
+                && *fields == GITHUB_PR_SOURCE_FIELDS
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_gh_positive_number(number, "pull-request source number")
+        }
+        ["pr", "list", "--repo", bound, "--head", branch, "--state", "all", "--limit", limit, "--json", fields]
+            if *bound == selector
+                && *limit == GITHUB_PR_EFFECT_LOOKUP_LIMIT
                 && *fields == receipt_fields
                 && matches!(stdin, StdinMode::Null) =>
         {
@@ -5203,8 +6601,29 @@ fn validate_gh_operation(
             }
             Ok(())
         }
+        [subcommand @ ("issue" | "pr"), "comment", number, "--repo", bound, "--body-file", "-"]
+            if *bound == selector && matches!(stdin, StdinMode::Bytes(_)) =>
+        {
+            let _ = subcommand;
+            validate_gh_positive_number(number, "comment source number")
+        }
+        ["api", "--method", "GET", endpoint] if matches!(stdin, StdinMode::Null) => {
+            validate_github_comment_api_endpoint(endpoint, repository)
+        }
+        ["api", "--method", "GET", "--paginate", "--slurp", endpoint]
+            if matches!(stdin, StdinMode::Null) =>
+        {
+            validate_github_comment_list_api_endpoint(endpoint, repository)
+        }
         _ => bail!("gh command is outside the fixed PR/issue allowlist"),
     }
+}
+
+fn validate_gh_positive_number(value: &str, label: &str) -> Result<()> {
+    if value.len() > 20 || value.parse::<u64>().is_err() || value == "0" {
+        bail!("{label} is not a canonical positive integer");
+    }
+    Ok(())
 }
 
 fn validate_gh_argument_value(value: &str, label: &str) -> Result<()> {
@@ -5218,10 +6637,91 @@ fn validate_gh_argument_value(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_external_effect_marker_argument(value: &str) -> Result<()> {
+    let effect_id = value
+        .strip_prefix(&format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:"))
+        .and_then(|value| value.strip_suffix(" -->"))
+        .context("GitHub effect lookup marker was malformed")?;
+    validate_external_digest(effect_id, "GitHub effect lookup marker id")
+}
+
+fn validate_github_comment_api_endpoint(
+    endpoint: &str,
+    repository: &GithubRepositoryIdentity,
+) -> Result<()> {
+    let prefix = format!(
+        "repos/{}/{}/issues/comments/",
+        repository.owner, repository.name
+    );
+    let id = endpoint
+        .strip_prefix(&prefix)
+        .context("GitHub comment API endpoint did not match the bound repository")?;
+    validate_gh_positive_number(id, "comment API id")?;
+    if endpoint != format!("{prefix}{id}") {
+        bail!("GitHub comment API endpoint was not canonical");
+    }
+    Ok(())
+}
+
+fn validate_github_comment_list_api_endpoint(
+    endpoint: &str,
+    repository: &GithubRepositoryIdentity,
+) -> Result<()> {
+    let prefix = format!("repos/{}/{}/issues/", repository.owner, repository.name);
+    let number = endpoint
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix("/comments?per_page=100"))
+        .context("GitHub comment list API endpoint did not match the bound repository")?;
+    validate_gh_positive_number(number, "comment list source number")?;
+    if endpoint != format!("{prefix}{number}/comments?per_page=100") {
+        bail!("GitHub comment list API endpoint was not canonical");
+    }
+    Ok(())
+}
+
 impl Drop for GhCommandContext {
     fn drop(&mut self) {
         self.environment.clear();
     }
+}
+
+fn cli_github_source_view(
+    worktree_path: &Path,
+    number: u64,
+    kind: ExternalSourceObjectKind,
+    repository: &GithubRepositoryIdentity,
+) -> Result<serde_json::Value> {
+    if number == 0 {
+        bail!("GitHub source number must be positive");
+    }
+    let (subcommand, fields) = match kind {
+        ExternalSourceObjectKind::Issue => ("issue", GITHUB_ISSUE_SOURCE_FIELDS),
+        ExternalSourceObjectKind::PullRequest => ("pr", GITHUB_PR_SOURCE_FIELDS),
+    };
+    let context = GhCommandContext::create(worktree_path, repository)?;
+    let output = context.run(
+        "gh exact source view",
+        [
+            subcommand,
+            "view",
+            &number.to_string(),
+            "--repo",
+            &repository.selector(),
+            "--json",
+            fields,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh exact source view")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).context("gh exact source view did not return valid JSON")?;
+    if serde_json::to_vec(&value)?.len() > MAX_EXTERNAL_SOURCE_SERIALIZED_BYTES {
+        bail!("gh exact source view exceeded its JSON byte limit");
+    }
+    Ok(value)
 }
 
 fn cli_github_pr_list(
@@ -5241,6 +6741,8 @@ fn cli_github_pr_list(
             branch,
             "--state",
             "all",
+            "--limit",
+            GITHUB_PR_EFFECT_LOOKUP_LIMIT,
             "--json",
             GITHUB_PR_RECEIPT_FIELDS,
         ]
@@ -5464,6 +6966,700 @@ fn cli_github_pr_create(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubIssueEffectObserved {
+    number: u64,
+    url: String,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    author: String,
+    state: String,
+}
+
+struct GithubIssueExternalEffectProvider<'a> {
+    worktree_path: &'a Path,
+    repository: &'a GithubRepositoryIdentity,
+    title: &'a str,
+    marked_body: String,
+    labels: &'a [String],
+    expected_author: &'a str,
+}
+
+impl GithubIssueExternalEffectProvider<'_> {
+    fn exact_candidates(
+        &self,
+        request: &ExternalEffectRequest,
+    ) -> Result<Vec<GithubIssueEffectObserved>> {
+        let candidates =
+            cli_github_issue_effect_list(self.worktree_path, &request.marker, self.repository)?;
+        let mut exact = Vec::new();
+        for candidate in candidates {
+            let viewed = cli_github_issue_effect_view(
+                self.worktree_path,
+                candidate.number,
+                self.repository,
+            )?;
+            if self.matches_contract(&viewed)? {
+                exact.push(viewed);
+            }
+        }
+        exact.sort_by_key(|candidate| candidate.number);
+        exact.dedup_by_key(|candidate| candidate.number);
+        Ok(exact)
+    }
+
+    fn matches_contract(&self, observed: &GithubIssueEffectObserved) -> Result<bool> {
+        validate_github_issue_receipt_url(&observed.url, self.repository)?;
+        Ok(observed.title == self.title
+            && observed.body == self.marked_body
+            && observed.labels == self.labels
+            && observed.author == self.expected_author
+            && observed.state == "OPEN")
+    }
+
+    fn receipt(
+        &self,
+        request: &ExternalEffectRequest,
+        observed: &GithubIssueEffectObserved,
+    ) -> ExternalEffectReceipt {
+        ExternalEffectReceipt {
+            version: EXTERNAL_EFFECT_VERSION,
+            provider: request.provider.clone(),
+            repository_identity: request.repository_identity.clone(),
+            repository_selector: request.repository_selector.clone(),
+            effect_id: request.effect_id.clone(),
+            operation: request.operation,
+            source_provenance_digest: request
+                .source
+                .as_ref()
+                .map(|source| source.provenance_digest.clone()),
+            provider_id: observed.number.to_string(),
+            url: observed.url.clone(),
+            repository: request.repository_selector.clone(),
+            marker: request.marker.clone(),
+            target: request.target.clone(),
+            payload: request.payload.clone(),
+            target_digest: request.target_digest.clone(),
+            payload_digest: request.payload_digest.clone(),
+        }
+    }
+}
+
+impl ExternalEffectProvider for GithubIssueExternalEffectProvider<'_> {
+    fn preflight_before_start(&mut self, _request: &ExternalEffectRequest) -> Result<()> {
+        Ok(())
+    }
+
+    fn lookup(&mut self, request: &ExternalEffectRequest) -> Result<Vec<ExternalEffectReceipt>> {
+        Ok(self
+            .exact_candidates(request)?
+            .iter()
+            .map(|observed| self.receipt(request, observed))
+            .collect())
+    }
+
+    fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt> {
+        let context = GhCommandContext::create(self.worktree_path, self.repository)?;
+        let mut args = [
+            "issue",
+            "create",
+            "--repo",
+            &self.repository.selector(),
+            "--title",
+            self.title,
+            "--body-file",
+            "-",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        for label in self.labels {
+            args.push(OsString::from("--label"));
+            args.push(OsString::from(label));
+        }
+        context.run(
+            "gh issue create",
+            args,
+            StdinMode::Bytes(self.marked_body.as_bytes().to_vec()),
+        )?;
+        let matches = self.exact_candidates(request)?;
+        if matches.len() != 1 {
+            bail!("GitHub issue creation response could not be reconciled exactly");
+        }
+        Ok(self.receipt(request, &matches[0]))
+    }
+
+    fn verify(
+        &mut self,
+        request: &ExternalEffectRequest,
+        receipt: &ExternalEffectReceipt,
+    ) -> Result<ExternalEffectReceipt> {
+        validate_external_effect_receipt(request, receipt)?;
+        let number = receipt
+            .provider_id
+            .parse::<u64>()
+            .ok()
+            .filter(|number| *number > 0)
+            .context("GitHub issue effect receipt number was malformed")?;
+        let viewed = cli_github_issue_effect_view(self.worktree_path, number, self.repository)?;
+        if !self.matches_contract(&viewed)? || viewed.url != receipt.url {
+            bail!("GitHub issue effect receipt changed from its exact remote object");
+        }
+        Ok(self.receipt(request, &viewed))
+    }
+}
+
+fn cli_github_issue_effect_list(
+    worktree_path: &Path,
+    marker: &str,
+    repository: &GithubRepositoryIdentity,
+) -> Result<Vec<GithubIssueEffectObserved>> {
+    let context = GhCommandContext::create(worktree_path, repository)?;
+    let output = context.run(
+        "gh issue effect list",
+        [
+            "issue",
+            "list",
+            "--repo",
+            &repository.selector(),
+            "--state",
+            "all",
+            "--search",
+            marker,
+            "--limit",
+            GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT,
+            "--json",
+            GITHUB_ISSUE_EFFECT_FIELDS,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh issue effect list")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).context("gh issue effect list did not return valid JSON")?;
+    github_issue_effect_list_from_json(&value)
+}
+
+fn github_issue_effect_list_from_json(
+    value: &serde_json::Value,
+) -> Result<Vec<GithubIssueEffectObserved>> {
+    let values = value
+        .as_array()
+        .context("gh issue effect list JSON was not an array")?;
+    if values.len() > MAX_GITHUB_EFFECT_CANDIDATES {
+        bail!("gh issue effect list returned too many candidates");
+    }
+    values.iter().map(github_issue_effect_from_json).collect()
+}
+
+fn cli_github_issue_effect_view(
+    worktree_path: &Path,
+    number: u64,
+    repository: &GithubRepositoryIdentity,
+) -> Result<GithubIssueEffectObserved> {
+    if number == 0 {
+        bail!("GitHub issue effect number must be positive");
+    }
+    let context = GhCommandContext::create(worktree_path, repository)?;
+    let output = context.run(
+        "gh issue effect view",
+        [
+            "issue",
+            "view",
+            &number.to_string(),
+            "--repo",
+            &repository.selector(),
+            "--json",
+            GITHUB_ISSUE_EFFECT_FIELDS,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh issue effect view")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).context("gh issue effect view did not return valid JSON")?;
+    github_issue_effect_from_json(&value)
+}
+
+fn github_issue_effect_from_json(value: &serde_json::Value) -> Result<GithubIssueEffectObserved> {
+    let object = value
+        .as_object()
+        .context("GitHub issue effect receipt was not an object")?;
+    let number = object
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|number| *number > 0)
+        .context("GitHub issue effect receipt omitted a positive number")?;
+    let text = |field: &str, limit: usize| -> Result<String> {
+        let value = object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("GitHub issue effect receipt omitted {field}"))?;
+        if value.len() > limit || value.as_bytes().contains(&0) {
+            bail!("GitHub issue effect receipt {field} was malformed or oversized");
+        }
+        Ok(value.to_string())
+    };
+    let url = text("url", MAX_GITHUB_RECEIPT_URL_BYTES)?;
+    let title = text("title", MAX_GITHUB_RECEIPT_STRING_BYTES)?;
+    let body = text("body", MAX_GITHUB_RECEIPT_BODY_BYTES)?;
+    let state = text("state", MAX_GITHUB_RECEIPT_STRING_BYTES)?;
+    let author = object
+        .get("author")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|author| author.get("login"))
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub issue effect receipt omitted author.login")?;
+    let author = canonical_github_author_login(author)?;
+    let label_values = object
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .context("GitHub issue effect receipt omitted labels")?;
+    if label_values.len() > MAX_EXTERNAL_SOURCE_LABELS {
+        bail!("GitHub issue effect receipt returned too many labels");
+    }
+    let mut labels = label_values
+        .iter()
+        .map(|label| {
+            let name = label
+                .as_object()
+                .and_then(|label| label.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .context("GitHub issue effect label omitted name")?;
+            validate_gh_argument_value(name, "GitHub issue effect label")?;
+            Ok(name.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    labels.sort();
+    labels.dedup();
+    Ok(GithubIssueEffectObserved {
+        number,
+        url,
+        title,
+        body,
+        labels,
+        author,
+        state,
+    })
+}
+
+fn external_effect_marked_body(body: &str, marker: &str) -> Result<String> {
+    validate_external_effect_marker_argument(marker)?;
+    if body.contains(EXTERNAL_EFFECT_MARKER_PREFIX) {
+        bail!("external effect body already contains a reserved maco marker");
+    }
+    let marked = if body.is_empty() {
+        marker.to_string()
+    } else {
+        format!("{body}\n\n{marker}")
+    };
+    if marked.len() > GH_STDIN_LIMIT_BYTES || marked.as_bytes().contains(&0) {
+        bail!("external effect body was malformed or oversized");
+    }
+    Ok(marked)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubCommentEffectObserved {
+    id: u64,
+    url: String,
+    body: String,
+    author: String,
+}
+
+struct GithubCommentExternalEffectProvider<'a> {
+    worktree_path: &'a Path,
+    repository: &'a GithubRepositoryIdentity,
+    source: &'a ExternalSourceGuard,
+    marked_body: String,
+    expected_author: &'a str,
+}
+
+impl GithubCommentExternalEffectProvider<'_> {
+    fn revalidate_full(&self) -> Result<()> {
+        revalidate_external_source(self.worktree_path, self.source)
+    }
+
+    fn revalidate_action_revision(&self) -> Result<()> {
+        revalidate_external_source_action_revision(self.worktree_path, self.source)
+    }
+
+    fn exact_candidates(
+        &self,
+        request: &ExternalEffectRequest,
+    ) -> Result<Vec<GithubCommentEffectObserved>> {
+        self.revalidate_action_revision()?;
+        let candidates =
+            cli_github_comment_candidates(self.worktree_path, self.source, self.repository)?;
+        let mut exact = Vec::new();
+        for candidate in candidates
+            .into_iter()
+            .filter(|candidate| candidate.body.contains(&request.marker))
+        {
+            let viewed =
+                cli_github_comment_exact_view(self.worktree_path, candidate.id, self.repository)?;
+            validate_github_comment_contract(
+                &viewed,
+                self.repository,
+                self.source,
+                &self.marked_body,
+                self.expected_author,
+            )?;
+            exact.push(viewed);
+        }
+        exact.sort_by_key(|comment| comment.id);
+        exact.dedup_by_key(|comment| comment.id);
+        Ok(exact)
+    }
+
+    fn receipt(
+        &self,
+        request: &ExternalEffectRequest,
+        comment: &GithubCommentEffectObserved,
+    ) -> ExternalEffectReceipt {
+        ExternalEffectReceipt {
+            version: EXTERNAL_EFFECT_VERSION,
+            provider: request.provider.clone(),
+            repository_identity: request.repository_identity.clone(),
+            repository_selector: request.repository_selector.clone(),
+            effect_id: request.effect_id.clone(),
+            operation: request.operation,
+            source_provenance_digest: request
+                .source
+                .as_ref()
+                .map(|source| source.provenance_digest.clone()),
+            provider_id: comment.id.to_string(),
+            url: comment.url.clone(),
+            repository: request.repository_selector.clone(),
+            marker: request.marker.clone(),
+            target: request.target.clone(),
+            payload: request.payload.clone(),
+            target_digest: request.target_digest.clone(),
+            payload_digest: request.payload_digest.clone(),
+        }
+    }
+}
+
+impl ExternalEffectProvider for GithubCommentExternalEffectProvider<'_> {
+    fn preflight_before_start(&mut self, _request: &ExternalEffectRequest) -> Result<()> {
+        self.revalidate_full()
+    }
+
+    fn lookup(&mut self, request: &ExternalEffectRequest) -> Result<Vec<ExternalEffectReceipt>> {
+        Ok(self
+            .exact_candidates(request)?
+            .iter()
+            .map(|comment| self.receipt(request, comment))
+            .collect())
+    }
+
+    fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt> {
+        self.revalidate_full()?;
+        let subcommand = match self.source.object_kind {
+            ExternalSourceObjectKind::Issue => "issue",
+            ExternalSourceObjectKind::PullRequest => "pr",
+        };
+        let context = GhCommandContext::create(self.worktree_path, self.repository)?;
+        context.run(
+            "gh source comment",
+            [
+                subcommand,
+                "comment",
+                &self.source.number.to_string(),
+                "--repo",
+                &self.repository.selector(),
+                "--body-file",
+                "-",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+            StdinMode::Bytes(self.marked_body.as_bytes().to_vec()),
+        )?;
+        let matches = self.exact_candidates(request)?;
+        if matches.len() != 1 {
+            bail!("GitHub comment creation response could not be reconciled exactly");
+        }
+        Ok(self.receipt(request, &matches[0]))
+    }
+
+    fn verify(
+        &mut self,
+        request: &ExternalEffectRequest,
+        receipt: &ExternalEffectReceipt,
+    ) -> Result<ExternalEffectReceipt> {
+        validate_external_effect_receipt(request, receipt)?;
+        self.revalidate_action_revision()?;
+        let id = receipt
+            .provider_id
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .context("GitHub comment effect receipt id was malformed")?;
+        let viewed = cli_github_comment_exact_view(self.worktree_path, id, self.repository)?;
+        validate_github_comment_contract(
+            &viewed,
+            self.repository,
+            self.source,
+            &self.marked_body,
+            self.expected_author,
+        )?;
+        if viewed.url != receipt.url {
+            bail!("GitHub comment receipt URL changed from its exact remote object");
+        }
+        Ok(self.receipt(request, &viewed))
+    }
+}
+
+pub(crate) fn publish_github_source_comment(
+    repo: &Path,
+    source: ExternalSourceGuard,
+    body: &str,
+) -> Result<String> {
+    source.validate()?;
+    let repository = Repository::discover(repo)
+        .context("failed to discover GitHub comment source repository")?;
+    let remote_url = remote_url(&repository, "origin")
+        .context("GitHub comment publication requires an origin remote")?;
+    let github_repository = github_repository_identity(&remote_url)?;
+    refuse_legacy_publication_journals(&repository)?;
+    let auth = repository_auth_writer(repo)?
+        .into_authenticator()
+        .context("failed to bind authenticated GitHub comment effect ledger")?;
+    let repository_identity = auth.binding().repository_id.clone();
+    drop(auth);
+    let expected_author = select_github_expected_author_with(|key| env::var(key).ok())?;
+    let operation = match source.object_kind {
+        ExternalSourceObjectKind::Issue => ExternalEffectOperation::GithubIssueComment,
+        ExternalSourceObjectKind::PullRequest => ExternalEffectOperation::GithubPullRequestComment,
+    };
+    let request = ExternalEffectRequest::new(
+        "github",
+        &github_repository.selector(),
+        &repository_identity,
+        Some(source.clone()),
+        operation,
+        serde_json::json!({
+            "version": 1,
+            "repository": github_repository.selector(),
+            "source_kind": source.object_kind,
+            "source_number": source.number,
+        }),
+        serde_json::json!({
+            "version": 1,
+            "body": body,
+            "expected_author": expected_author,
+        }),
+    )?;
+    let marked_body = external_effect_marked_body(body, &request.marker)?;
+    let mut provider = GithubCommentExternalEffectProvider {
+        worktree_path: repo,
+        repository: &github_repository,
+        source: &source,
+        marked_body,
+        expected_author: &expected_author,
+    };
+    let receipt = execute_external_effect_exactly_once(repo, request, &mut provider)?;
+    Ok(receipt.url)
+}
+
+fn cli_github_comment_candidates(
+    worktree_path: &Path,
+    source: &ExternalSourceGuard,
+    repository: &GithubRepositoryIdentity,
+) -> Result<Vec<GithubCommentEffectObserved>> {
+    let endpoint = format!(
+        "repos/{}/{}/issues/{}/comments?per_page=100",
+        repository.owner, repository.name, source.number
+    );
+    let context = GhCommandContext::create(worktree_path, repository)?;
+    let output = context.run(
+        "gh source comment candidates",
+        ["api", "--method", "GET", "--paginate", "--slurp", &endpoint]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh source comment candidates")?;
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .context("gh source comment candidates did not return valid JSON")?;
+    github_comment_candidates_from_slurped_json(&value, repository, source)
+}
+
+fn github_comment_candidates_from_slurped_json(
+    value: &serde_json::Value,
+    repository: &GithubRepositoryIdentity,
+    source: &ExternalSourceGuard,
+) -> Result<Vec<GithubCommentEffectObserved>> {
+    let pages = value
+        .as_array()
+        .context("GitHub paginated comment result was not an array of pages")?;
+    if pages.len() > MAX_GITHUB_COMMENT_PAGES {
+        bail!("GitHub comment lookup exceeded its page limit");
+    }
+    let mut comments = Vec::new();
+    for page in pages {
+        let page = page
+            .as_array()
+            .context("GitHub paginated comment page was not an array")?;
+        if page.len() > 100 {
+            bail!("GitHub comment lookup page exceeded its fixed page size");
+        }
+        if comments.len().saturating_add(page.len()) > MAX_GITHUB_COMMENT_CANDIDATES {
+            bail!("GitHub comment lookup exceeded its total candidate limit");
+        }
+        for value in page {
+            let comment = github_comment_from_rest_json(value)?;
+            if github_comment_id_from_url(&comment.url, repository, source)? != comment.id {
+                bail!("GitHub comment REST id did not match its canonical HTML URL fragment");
+            }
+            comments.push(comment);
+        }
+    }
+    Ok(comments)
+}
+
+fn github_comment_from_rest_json(value: &serde_json::Value) -> Result<GithubCommentEffectObserved> {
+    let object = value
+        .as_object()
+        .context("GitHub comment candidate was not an object")?;
+    let id = object
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|id| *id > 0)
+        .context("GitHub comment candidate omitted id")?;
+    let url = object
+        .get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub comment candidate omitted html_url")?;
+    let body = object
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub comment candidate omitted body")?;
+    if body.len() > MAX_GITHUB_RECEIPT_BODY_BYTES || body.as_bytes().contains(&0) {
+        bail!("GitHub comment candidate body was malformed or oversized");
+    }
+    let author = object
+        .get("user")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|user| user.get("login"))
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub comment candidate omitted user.login")?;
+    Ok(GithubCommentEffectObserved {
+        id,
+        url: url.to_string(),
+        body: body.to_string(),
+        author: canonical_github_author_login(author)?,
+    })
+}
+
+fn cli_github_comment_exact_view(
+    worktree_path: &Path,
+    id: u64,
+    repository: &GithubRepositoryIdentity,
+) -> Result<GithubCommentEffectObserved> {
+    if id == 0 {
+        bail!("GitHub comment exact view id must be positive");
+    }
+    let endpoint = format!(
+        "repos/{}/{}/issues/comments/{id}",
+        repository.owner, repository.name
+    );
+    let context = GhCommandContext::create(worktree_path, repository)?;
+    let output = context.run(
+        "gh comment exact view",
+        ["api", "--method", "GET", &endpoint]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh comment exact view")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).context("gh comment exact view did not return valid JSON")?;
+    let observed = github_comment_from_rest_json(&value)?;
+    if observed.id != id {
+        bail!("gh comment exact view returned a different id");
+    }
+    Ok(observed)
+}
+
+fn validate_github_comment_contract(
+    observed: &GithubCommentEffectObserved,
+    repository: &GithubRepositoryIdentity,
+    source: &ExternalSourceGuard,
+    marked_body: &str,
+    expected_author: &str,
+) -> Result<()> {
+    if github_comment_id_from_url(&observed.url, repository, source)? != observed.id
+        || observed.body != marked_body
+        || observed.author != expected_author
+    {
+        bail!("GitHub comment did not match its exact repository, source, body, marker, and author contract");
+    }
+    Ok(())
+}
+
+fn github_comment_id_from_url(
+    url: &str,
+    expected: &GithubRepositoryIdentity,
+    source: &ExternalSourceGuard,
+) -> Result<u64> {
+    if url.len() > MAX_GITHUB_RECEIPT_URL_BYTES
+        || url
+            .as_bytes()
+            .iter()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || url.contains(['?', '%', '\\', '@'])
+    {
+        bail!("GitHub comment URL was malformed or oversized");
+    }
+    let (scheme, remainder) = url
+        .split_once("://")
+        .context("GitHub comment URL was not absolute")?;
+    if scheme != "https" {
+        bail!("GitHub comment URL was not HTTPS");
+    }
+    let (path, fragment) = remainder
+        .split_once('#')
+        .context("GitHub comment URL omitted its exact comment fragment")?;
+    let slash = path
+        .find('/')
+        .context("GitHub comment URL omitted repository path")?;
+    let authority = &path[..slash];
+    if normalize_github_host(authority)? != authority || authority != expected.host {
+        bail!("GitHub comment URL host did not match the repository");
+    }
+    let components = path[slash + 1..].split('/').collect::<Vec<_>>();
+    let expected_kind = match source.object_kind {
+        ExternalSourceObjectKind::Issue => "issues",
+        ExternalSourceObjectKind::PullRequest => "pull",
+    };
+    if components.len() != 4
+        || !components[0].eq_ignore_ascii_case(&expected.owner)
+        || !components[1].eq_ignore_ascii_case(&expected.name)
+        || components[2] != expected_kind
+        || components[3] != source.number.to_string()
+    {
+        bail!("GitHub comment URL did not match its exact repository and source object");
+    }
+    let id = fragment
+        .strip_prefix("issuecomment-")
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| *id > 0)
+        .context("GitHub comment URL fragment did not contain a canonical comment id")?;
+    if fragment != format!("issuecomment-{id}") {
+        bail!("GitHub comment URL comment id was not canonical");
+    }
+    Ok(id)
+}
+
 fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) -> Result<String> {
     let repository = Repository::discover(repo).with_context(|| {
         format!(
@@ -5474,41 +7670,42 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
     let remote_url = remote_url(&repository, "origin")
         .context("GitHub issue creation requires an 'origin' remote")?;
     let github_repository = github_repository_identity(&remote_url)?;
-    let context = GhCommandContext::create(repo, &github_repository)?;
-    let mut args = [
-        "issue",
-        "create",
-        "--repo",
+    refuse_legacy_publication_journals(&repository)?;
+    let auth = repository_auth_writer(repo)?
+        .into_authenticator()
+        .context("failed to bind authenticated GitHub issue effect ledger")?;
+    let repository_identity = auth.binding().repository_id.clone();
+    drop(auth);
+    let expected_author = select_github_expected_author_with(|key| env::var(key).ok())?;
+    let request = ExternalEffectRequest::new(
+        "github",
         &github_repository.selector(),
-        "--title",
-        title,
-        "--body-file",
-        "-",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect::<Vec<_>>();
-    for label in labels {
-        args.push(OsString::from("--label"));
-        args.push(OsString::from(label));
-    }
-    let output = context.run(
-        "gh issue create",
-        args,
-        StdinMode::Bytes(body.as_bytes().to_vec()),
+        &repository_identity,
+        None,
+        ExternalEffectOperation::GithubIssue,
+        serde_json::json!({
+            "version": 1,
+            "repository": github_repository.selector(),
+            "title": title,
+            "labels": labels,
+            "expected_author": expected_author,
+        }),
+        serde_json::json!({
+            "version": 1,
+            "body": body,
+        }),
     )?;
-    let stdout = required_command_stdout(output, "gh issue create")?;
-    let mut receipts = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let receipt = receipts
-        .next()
-        .context("gh issue create returned no issue receipt URL")?;
-    if receipts.next().is_some() {
-        bail!("gh issue create returned multiple receipt lines");
-    }
-    validate_github_issue_receipt_url(receipt, &github_repository)
+    let marked_body = external_effect_marked_body(body, &request.marker)?;
+    let mut provider = GithubIssueExternalEffectProvider {
+        worktree_path: repo,
+        repository: &github_repository,
+        title,
+        marked_body,
+        labels,
+        expected_author: &expected_author,
+    };
+    let receipt = execute_external_effect_exactly_once(repo, request, &mut provider)?;
+    validate_github_issue_receipt_url(&receipt.url, &github_repository)
 }
 
 fn required_command_stdout(output: merge::RequiredCommandOutput, label: &str) -> Result<String> {
@@ -5637,8 +7834,652 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::worktree::{WorktreeCreateOptions, WorktreeRecord};
+    use std::sync::{mpsc, Arc, Mutex};
     #[cfg(target_os = "linux")]
-    use std::{sync::mpsc, time::Duration};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct FakeExternalRemote {
+        receipts: Vec<ExternalEffectReceipt>,
+        invoke_calls: usize,
+    }
+
+    struct FakeExternalProvider {
+        remote: Arc<Mutex<FakeExternalRemote>>,
+        response_loss: bool,
+        lookup_error: bool,
+        block_invoke: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl FakeExternalProvider {
+        fn new(remote: Arc<Mutex<FakeExternalRemote>>) -> Self {
+            Self {
+                remote,
+                response_loss: false,
+                lookup_error: false,
+                block_invoke: None,
+            }
+        }
+
+        fn exact_receipt(request: &ExternalEffectRequest) -> ExternalEffectReceipt {
+            ExternalEffectReceipt {
+                version: EXTERNAL_EFFECT_VERSION,
+                provider: request.provider.clone(),
+                repository_identity: request.repository_identity.clone(),
+                repository_selector: request.repository_selector.clone(),
+                effect_id: request.effect_id.clone(),
+                operation: request.operation,
+                source_provenance_digest: request
+                    .source
+                    .as_ref()
+                    .map(|source| source.provenance_digest.clone()),
+                provider_id: "fake-object-1".to_string(),
+                url: "https://example.invalid/acme/repo/effects/1".to_string(),
+                repository: request.repository_selector.clone(),
+                marker: request.marker.clone(),
+                target: request.target.clone(),
+                payload: request.payload.clone(),
+                target_digest: request.target_digest.clone(),
+                payload_digest: request.payload_digest.clone(),
+            }
+        }
+    }
+
+    impl ExternalEffectProvider for FakeExternalProvider {
+        fn preflight_before_start(&mut self, _request: &ExternalEffectRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn lookup(
+            &mut self,
+            _request: &ExternalEffectRequest,
+        ) -> Result<Vec<ExternalEffectReceipt>> {
+            if self.lookup_error {
+                bail!("injected lookup failure");
+            }
+            Ok(self
+                .remote
+                .lock()
+                .expect("fake remote lock")
+                .receipts
+                .clone())
+        }
+
+        fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt> {
+            let receipt = Self::exact_receipt(request);
+            {
+                let mut remote = self.remote.lock().expect("fake remote lock");
+                remote.invoke_calls += 1;
+                remote.receipts.push(receipt.clone());
+            }
+            if let Some((started, release)) = self.block_invoke.take() {
+                started
+                    .send(())
+                    .expect("signal blocked provider invocation");
+                release.recv().expect("release blocked provider invocation");
+            }
+            if self.response_loss {
+                bail!("injected provider response loss");
+            }
+            Ok(receipt)
+        }
+
+        fn verify(
+            &mut self,
+            request: &ExternalEffectRequest,
+            receipt: &ExternalEffectReceipt,
+        ) -> Result<ExternalEffectReceipt> {
+            validate_external_effect_receipt(request, receipt)?;
+            let remote = self.remote.lock().expect("fake remote lock");
+            if remote.receipts.as_slice() != [receipt.clone()] {
+                bail!("fake remote receipt was missing, duplicated, or mutated");
+            }
+            Ok(receipt.clone())
+        }
+    }
+
+    fn fake_effect_repo() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("effect repo tempdir");
+        WorktreeManager::init_repository(temp.path(), "main").expect("init effect repo");
+        temp
+    }
+
+    fn fake_source_guard(updated_at: &str, content: char, action: char) -> ExternalSourceGuard {
+        ExternalSourceGuard::new(
+            "github",
+            "acme/repo",
+            stable_external_digest(b"fake-source-repository"),
+            ExternalSourceObjectKind::PullRequest,
+            17,
+            updated_at,
+            "OPEN",
+            Some("1".repeat(40)),
+            Some("2".repeat(40)),
+            content.to_string().repeat(64),
+            action.to_string().repeat(64),
+        )
+        .expect("fake source guard")
+    }
+
+    fn fake_effect_request(
+        repo: &Path,
+        source: ExternalSourceGuard,
+        body: &str,
+    ) -> ExternalEffectRequest {
+        let auth = repository_auth_writer(repo)
+            .expect("effect repository auth writer")
+            .into_authenticator()
+            .expect("effect repository authenticator");
+        let repository_identity = auth.binding().repository_id.clone();
+        drop(auth);
+        ExternalEffectRequest::new(
+            "github",
+            "acme/repo",
+            &repository_identity,
+            Some(source),
+            ExternalEffectOperation::GithubPullRequestComment,
+            serde_json::json!({"source": 17, "kind": "pull_request"}),
+            serde_json::json!({"body": body}),
+        )
+        .expect("fake external effect request")
+    }
+
+    fn seed_effect_phase(
+        repo: &Path,
+        request: &ExternalEffectRequest,
+        phase: EffectPhase,
+        receipt: Option<ExternalEffectReceipt>,
+    ) {
+        let auth = repository_auth_writer(repo)
+            .expect("seed auth writer")
+            .into_authenticator()
+            .expect("seed authenticator");
+        let planned = ExternalEffectRecord {
+            version: EXTERNAL_EFFECT_VERSION,
+            request: request.clone(),
+            receipt: None,
+        };
+        let mut wal: EffectWal =
+            EffectWal::create_planned(auth, &request.logical_id, &request.effect_id, &planned)
+                .expect("seed planned effect");
+        if matches!(
+            phase,
+            EffectPhase::Started | EffectPhase::Observed | EffectPhase::Completed
+        ) {
+            wal.started(&request.effect_id, &planned)
+                .expect("seed started effect");
+        }
+        if matches!(phase, EffectPhase::Observed | EffectPhase::Completed) {
+            let observed = ExternalEffectRecord {
+                version: EXTERNAL_EFFECT_VERSION,
+                request: request.clone(),
+                receipt,
+            };
+            wal.observed(&request.effect_id, &observed)
+                .expect("seed observed effect");
+        }
+    }
+
+    #[test]
+    fn external_effect_started_recovery_is_lookup_only_and_ambiguity_fails_closed() {
+        for count in [0_usize, 1, 2] {
+            let repo = fake_effect_repo();
+            let request = fake_effect_request(
+                repo.path(),
+                fake_source_guard("2026-07-13T00:00:00Z", '3', '4'),
+                "comment",
+            );
+            seed_effect_phase(repo.path(), &request, EffectPhase::Started, None);
+            let receipt = FakeExternalProvider::exact_receipt(&request);
+            let remote = Arc::new(Mutex::new(FakeExternalRemote {
+                receipts: vec![receipt.clone(); count],
+                invoke_calls: 0,
+            }));
+            let mut provider = FakeExternalProvider::new(remote.clone());
+            let result =
+                execute_external_effect_exactly_once(repo.path(), request.clone(), &mut provider);
+            if count == 1 {
+                assert_eq!(result.expect("exactly one recovery receipt"), receipt);
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(remote.lock().expect("remote lock").invoke_calls, 0);
+        }
+
+        let repo = fake_effect_repo();
+        let request = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '7', '8'),
+            "lookup error",
+        );
+        seed_effect_phase(repo.path(), &request, EffectPhase::Started, None);
+        let remote = Arc::new(Mutex::new(FakeExternalRemote::default()));
+        let mut provider = FakeExternalProvider::new(remote.clone());
+        provider.lookup_error = true;
+        assert!(execute_external_effect_exactly_once(repo.path(), request, &mut provider).is_err());
+        assert_eq!(remote.lock().expect("remote lock").invoke_calls, 0);
+    }
+
+    #[test]
+    fn external_effect_observed_resume_and_response_loss_never_resend() {
+        let observed_repo = fake_effect_repo();
+        let observed_request = fake_effect_request(
+            observed_repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '3', '4'),
+            "observed",
+        );
+        let observed_receipt = FakeExternalProvider::exact_receipt(&observed_request);
+        seed_effect_phase(
+            observed_repo.path(),
+            &observed_request,
+            EffectPhase::Observed,
+            Some(observed_receipt.clone()),
+        );
+        let observed_remote = Arc::new(Mutex::new(FakeExternalRemote {
+            receipts: vec![observed_receipt.clone()],
+            invoke_calls: 0,
+        }));
+        let mut observed_provider = FakeExternalProvider::new(observed_remote.clone());
+        assert_eq!(
+            execute_external_effect_exactly_once(
+                observed_repo.path(),
+                observed_request,
+                &mut observed_provider,
+            )
+            .expect("observed recovery"),
+            observed_receipt
+        );
+        assert_eq!(
+            observed_remote
+                .lock()
+                .expect("observed remote")
+                .invoke_calls,
+            0
+        );
+
+        let loss_repo = fake_effect_repo();
+        let loss_request = fake_effect_request(
+            loss_repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '5', '6'),
+            "lost response",
+        );
+        let loss_remote = Arc::new(Mutex::new(FakeExternalRemote::default()));
+        let mut loss_provider = FakeExternalProvider::new(loss_remote.clone());
+        loss_provider.response_loss = true;
+        execute_external_effect_exactly_once(loss_repo.path(), loss_request, &mut loss_provider)
+            .expect("response loss reconciled by lookup");
+        let loss_remote = loss_remote.lock().expect("loss remote");
+        assert_eq!(loss_remote.invoke_calls, 1);
+        assert_eq!(loss_remote.receipts.len(), 1);
+    }
+
+    #[test]
+    fn external_effect_completed_reverifies_remote_and_reuses_after_volatile_source_change() {
+        let repo = fake_effect_repo();
+        let first = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '3', '4'),
+            "stable comment",
+        );
+        let remote = Arc::new(Mutex::new(FakeExternalRemote::default()));
+        let mut provider = FakeExternalProvider::new(remote.clone());
+        let receipt =
+            execute_external_effect_exactly_once(repo.path(), first.clone(), &mut provider)
+                .expect("initial effect");
+        assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
+        let repository = Repository::open(repo.path()).expect("open effect repository");
+        assert!(!repository
+            .commondir()
+            .join("maco/state/publication-transactions")
+            .exists());
+
+        let next_run = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:01:00Z", '5', '4'),
+            "stable comment",
+        );
+        assert_eq!(first.effect_id, next_run.effect_id);
+        assert_eq!(first.marker, next_run.marker);
+        assert!(same_external_effect_contract(&first, &next_run));
+        assert_eq!(
+            execute_external_effect_exactly_once(repo.path(), next_run, &mut provider)
+                .expect("completed effect reused after updatedAt-only change"),
+            receipt
+        );
+        assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
+
+        remote.lock().expect("remote").receipts.clear();
+        assert!(
+            execute_external_effect_exactly_once(repo.path(), first.clone(), &mut provider)
+                .is_err()
+        );
+        let mut mutated = receipt;
+        mutated.url.push_str("-mutated");
+        remote.lock().expect("remote").receipts = vec![mutated];
+        assert!(execute_external_effect_exactly_once(repo.path(), first, &mut provider).is_err());
+        assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
+    }
+
+    #[test]
+    fn external_effect_planned_payload_and_stable_source_revision_are_exact() {
+        let repo = fake_effect_repo();
+        let first = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '3', '4'),
+            "first payload",
+        );
+        let same_next_run = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '3', '4'),
+            "first payload",
+        );
+        assert_eq!(first, same_next_run);
+        let marked = external_effect_marked_body("PR body", &first.marker)
+            .expect("stable marker-bound PR body");
+        assert_eq!(marked.matches(&first.marker).count(), 1);
+        assert!(!marked.contains("maco-publication-marker"));
+        let first_ref = format!("refs/heads/maco/effects/{}", &first.effect_id[..32]);
+        let next_ref = format!("refs/heads/maco/effects/{}", &same_next_run.effect_id[..32]);
+        assert_eq!(first_ref, next_ref);
+        let changed_payload = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:01:00Z", '5', '4'),
+            "changed payload",
+        );
+        assert_eq!(first.effect_id, changed_payload.effect_id);
+        assert!(!same_external_effect_contract(&first, &changed_payload));
+        let remote = Arc::new(Mutex::new(FakeExternalRemote::default()));
+        let mut provider = FakeExternalProvider::new(remote.clone());
+        execute_external_effect_exactly_once(repo.path(), first.clone(), &mut provider)
+            .expect("first exact payload");
+        assert!(
+            execute_external_effect_exactly_once(repo.path(), changed_payload, &mut provider)
+                .is_err()
+        );
+        assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
+
+        let changed_action = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:01:00Z", '5', '6'),
+            "first payload",
+        );
+        assert_ne!(first.effect_id, changed_action.effect_id);
+        assert_ne!(first.logical_id, changed_action.logical_id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_external_effect_calls_cannot_double_invoke() {
+        let repo = fake_effect_repo();
+        let request = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '3', '4'),
+            "concurrent",
+        );
+        let remote = Arc::new(Mutex::new(FakeExternalRemote::default()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut first_provider = FakeExternalProvider::new(remote.clone());
+        first_provider.block_invoke = Some((started_tx, release_rx));
+        let first_repo = repo.path().to_path_buf();
+        let first_request = request.clone();
+        let first = std::thread::spawn(move || {
+            execute_external_effect_exactly_once(&first_repo, first_request, &mut first_provider)
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first provider reached invocation");
+        let mut contender = FakeExternalProvider::new(remote.clone());
+        assert!(
+            execute_external_effect_exactly_once(repo.path(), request, &mut contender).is_err()
+        );
+        release_tx.send(()).expect("release first provider");
+        first.join().expect("first thread").expect("first effect");
+        assert_eq!(remote.lock().expect("remote").invoke_calls, 1);
+    }
+
+    #[test]
+    fn external_source_guard_separates_full_freshness_from_action_revision_and_accepts_40_hex_oids()
+    {
+        let identity = external_source_repository_identity(7, 11);
+        assert_eq!(identity.len(), 64);
+        assert_ne!(identity, external_source_repository_identity(7, 12));
+        assert_ne!(identity, external_source_repository_identity(8, 11));
+        assert!(ExternalSourceGuard::new(
+            "github",
+            "acme/repo",
+            "maco-v1-collision-prone-identity",
+            ExternalSourceObjectKind::Issue,
+            1,
+            "2026-07-13T00:00:00Z",
+            "OPEN",
+            None,
+            None,
+            "1".repeat(64),
+            "2".repeat(64),
+        )
+        .is_err());
+        assert!(ExternalSourceGuard::new(
+            "github",
+            "acme/repo/extra",
+            identity.clone(),
+            ExternalSourceObjectKind::Issue,
+            1,
+            "2026-07-13T00:00:00Z",
+            "OPEN",
+            None,
+            None,
+            "1".repeat(64),
+            "2".repeat(64),
+        )
+        .is_err());
+        assert!(ExternalSourceGuard::new(
+            "github",
+            "acme/repo",
+            identity.clone(),
+            ExternalSourceObjectKind::Issue,
+            1,
+            "2026-07-13T00:00:00Z",
+            "MERGED",
+            None,
+            None,
+            "1".repeat(64),
+            "2".repeat(64),
+        )
+        .is_err());
+        let original = serde_json::json!({
+            "number": 7,
+            "title": "stable title",
+            "body": "stable body",
+            "url": "https://github.example/acme/repo/pull/7",
+            "author": {"login": "author"},
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-07-13T00:00:00Z",
+            "state": "OPEN",
+            "headRefName": "feature",
+            "baseRefName": "main",
+            "headRefOid": "1".repeat(40),
+            "baseRefOid": "2".repeat(40),
+            "isDraft": false,
+            "files": [{"path": "src/lib.rs"}],
+            "reviewDecision": "",
+            "latestReviews": [],
+            "statusCheckRollup": []
+        });
+        let expected = github_source_guard_from_value(
+            "acme/repo",
+            &stable_external_digest(b"source-repo"),
+            ExternalSourceObjectKind::PullRequest,
+            &original,
+        )
+        .expect("original guard");
+        let mut volatile = original.clone();
+        volatile["updatedAt"] = serde_json::json!("2026-07-13T00:01:00Z");
+        volatile["statusCheckRollup"] = serde_json::json!([{"name": "maco", "status": "SUCCESS"}]);
+        let volatile_guard = github_source_guard_from_value(
+            "acme/repo",
+            &stable_external_digest(b"source-repo"),
+            ExternalSourceObjectKind::PullRequest,
+            &volatile,
+        )
+        .expect("volatile guard");
+        assert_ne!(expected.provenance_digest, volatile_guard.provenance_digest);
+        assert_eq!(
+            expected.action_revision_digest,
+            volatile_guard.action_revision_digest
+        );
+        assert!(revalidate_external_source_value(&expected, &volatile).is_err());
+
+        let mut changed = volatile;
+        changed["title"] = serde_json::json!("changed title");
+        let changed_guard = github_source_guard_from_value(
+            "acme/repo",
+            &stable_external_digest(b"source-repo"),
+            ExternalSourceObjectKind::PullRequest,
+            &changed,
+        )
+        .expect("changed guard");
+        assert_ne!(
+            expected.action_revision_digest,
+            changed_guard.action_revision_digest
+        );
+    }
+
+    #[test]
+    fn github_issue_effect_contract_rejects_closed_or_mutated_remote() {
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "acme".to_string(),
+            name: "repo".to_string(),
+        };
+        let provider = GithubIssueExternalEffectProvider {
+            worktree_path: Path::new("."),
+            repository: &repository,
+            title: "title",
+            marked_body: "body\n\n<!-- maco-external-effect:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->".to_string(),
+            labels: &["bug".to_string()],
+            expected_author: "publisher",
+        };
+        let exact = GithubIssueEffectObserved {
+            number: 7,
+            url: "https://github.example/acme/repo/issues/7".to_string(),
+            title: "title".to_string(),
+            body: provider.marked_body.clone(),
+            labels: vec!["bug".to_string()],
+            author: "publisher".to_string(),
+            state: "OPEN".to_string(),
+        };
+        assert!(provider.matches_contract(&exact).expect("exact issue"));
+        let mut closed = exact.clone();
+        closed.state = "CLOSED".to_string();
+        assert!(!provider.matches_contract(&closed).expect("closed issue"));
+        let mut mutated = exact;
+        mutated.body.push_str("mutated");
+        assert!(!provider.matches_contract(&mutated).expect("mutated issue"));
+
+        let over_limit = serde_json::Value::Array(
+            std::iter::repeat_n(
+                serde_json::json!({
+                    "number": 7,
+                    "url": "https://github.example/acme/repo/issues/7",
+                    "title": "title",
+                    "body": provider.marked_body,
+                    "labels": [{"name": "bug"}],
+                    "author": {"login": "publisher"},
+                    "state": "OPEN"
+                }),
+                MAX_GITHUB_EFFECT_CANDIDATES + 1,
+            )
+            .collect(),
+        );
+        assert!(github_issue_effect_list_from_json(&over_limit).is_err());
+    }
+
+    #[test]
+    fn github_comment_paginated_parser_finds_candidates_after_first_hundred() {
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "acme".to_string(),
+            name: "repo".to_string(),
+        };
+        let source = ExternalSourceGuard::new(
+            "github",
+            "acme/repo",
+            stable_external_digest(b"paginated-comment-source"),
+            ExternalSourceObjectKind::Issue,
+            7,
+            "2026-07-13T00:00:00Z",
+            "OPEN",
+            None,
+            None,
+            "1".repeat(64),
+            "2".repeat(64),
+        )
+        .expect("comment source guard");
+        let page_one = (1_u64..=100)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "html_url": format!("https://github.example/acme/repo/issues/7#issuecomment-{id}"),
+                    "body": format!("ordinary comment {id}"),
+                    "user": {"login": "publisher"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let marker = "<!-- maco-external-effect:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->";
+        let pages = serde_json::json!([
+            page_one,
+            [{
+                "id": 101,
+                "html_url": "https://github.example/acme/repo/issues/7#issuecomment-101",
+                "body": marker,
+                "user": {"login": "publisher"}
+            }]
+        ]);
+        let comments = github_comment_candidates_from_slurped_json(&pages, &repository, &source)
+            .expect("parse all comment pages");
+        assert_eq!(comments.len(), 101);
+        assert_eq!(comments.last().expect("last comment").body, marker);
+
+        let mismatched_id = serde_json::json!([[{
+            "id": 102,
+            "html_url": "https://github.example/acme/repo/issues/7#issuecomment-103",
+            "body": marker,
+            "user": {"login": "publisher"}
+        }]]);
+        assert!(
+            github_comment_candidates_from_slurped_json(&mismatched_id, &repository, &source)
+                .is_err()
+        );
+
+        let too_many_pages = serde_json::Value::Array(
+            std::iter::repeat_n(serde_json::json!([]), MAX_GITHUB_COMMENT_PAGES + 1).collect(),
+        );
+        assert!(
+            github_comment_candidates_from_slurped_json(&too_many_pages, &repository, &source)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_plaintext_publication_journal_requires_explicit_migration_without_mutation() {
+        let repo = fake_effect_repo();
+        let repository = Repository::open(repo.path()).expect("open legacy test repo");
+        let legacy_root = repository
+            .commondir()
+            .join("maco/state/publication-transactions/legacy");
+        fs::create_dir_all(&legacy_root).expect("create legacy journal directory");
+        let legacy_record = legacy_root.join("00000000000000000001.json");
+        fs::write(&legacy_record, b"legacy plaintext must remain untouched\n")
+            .expect("write legacy record");
+        let error = refuse_legacy_publication_journals(&repository)
+            .expect_err("legacy journal must require migration");
+        assert!(error.to_string().contains("explicit signed migration"));
+        assert_eq!(
+            fs::read(&legacy_record).expect("legacy record remains"),
+            b"legacy plaintext must remain untouched\n"
+        );
+    }
 
     #[test]
     fn prepared_change_kinds_allow_only_untracked_to_added_transition() {
@@ -5985,8 +8826,13 @@ mod tests {
             )
         });
 
+        // Candidate preview performs a bounded status capture with a 60-second
+        // total budget. Under a parallel test load that capture can take more
+        // than five seconds even though the publication locks are behaving
+        // correctly. Keep this coordination assertion above that production
+        // budget so safe bounded work is not mistaken for a lock failure.
         ready_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(65))
             .expect("preparation acquired both locks");
         manager
             .acquire_read_execution_lease("agent-a")
@@ -6309,6 +9155,8 @@ mod tests {
             directory: directory.to_path_buf(),
             journal,
             remote_url: "https://example.invalid/owner/repo.git".to_string(),
+            push_effect_request: None,
+            pr_effect_request: None,
         }
     }
 
@@ -6568,6 +9416,8 @@ mod tests {
                 updated_unix_seconds: 0,
             },
             remote_url: "https://example.invalid/owner/repo.git".to_string(),
+            push_effect_request: None,
+            pr_effect_request: None,
         };
 
         for retry in 0..100 {
@@ -7121,6 +9971,8 @@ mod tests {
                 updated_unix_seconds: 0,
             },
             remote_url: "https://github.example/owner/repo.git".to_string(),
+            push_effect_request: None,
+            pr_effect_request: None,
         };
         let receipt = GithubPrResult {
             url: "https://github.example/owner/repo/pull/7".to_string(),

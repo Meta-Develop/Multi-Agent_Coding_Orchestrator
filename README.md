@@ -707,12 +707,15 @@ handled by the bounded dead-owner scavenger on the next private-runtime entry.
 GitHub publication requires an explicit expected creator login in
 `GH_EXPECTED_AUTHOR` or `GITHUB_EXPECTED_AUTHOR` before token selection; bot
 logins such as `release-bot[bot]` are accepted when named exactly. Each
-transaction generates a persistent unpredictable marker and includes it as a
-hidden comment in the exact PR body. Publication observes the remote head and
-exact base OIDs before PR creation, reads the resulting PR with `gh pr view`,
-and requires exact title, marker-bound body, creator login, `headRefOid`,
-`baseRefOid`, head/base branch, same head-repository owner/name,
-`isCrossRepository=false`, open state, and draft/ready value before persisting
+source-backed external effect derives a stable SHA-256 identity from its
+provider, bound repository, source action revision, and operation; source-less
+effects additionally bind their exact target and payload. The PR branch and
+hidden `maco-external-effect` marker are deterministically derived from that identity;
+run IDs, agent IDs, attempts, and random values do not affect them. Publication
+observes the remote head and exact base OIDs before PR creation, reads the
+resulting PR with `gh pr view`, and requires exact title, marker-bound body,
+creator login, `headRefOid`, `baseRefOid`, head/base branch, same head-repository
+owner/name, `isCrossRepository=false`, open state, and draft/ready value before persisting
 any PR receipt fields or advancing the receipt phase. A PR already present for
 the unique branch before this transaction records a create attempt is treated
 as a front-run and rejected. After a recorded create attempt, crash/lost-response
@@ -731,39 +734,34 @@ repository and PR number.
 Publication observes the remote head and base again after that receipt. A
 mismatch is reported as blocked rather than published.
 
-Publication writes versioned, append-only transaction records below the common
-`.git/maco/state/publication-transactions/` directory. Record replacement is
-atomic, the latest 32 records are kept for each transaction, and Unix creates
-the managed directories with mode `0700` and key/journal files with mode
-`0600`. Journal directory entries, retained record count, and individual record
-bytes have strict upper bounds. Loading uses no-follow bounded reads and rejects
-non-regular, symlink/reparse, foreign-owned, exposed, or multiply linked records,
-identity/size changes, non-contiguous retained sequences, receipt field changes,
-and incomplete or contract-invalid GitHub receipts. Windows rejects reparse
-points and verifies file identity, but this
-workflow does not claim to tighten inherited Windows ACLs. A repo-common random
-key derives a one-way binding digest from the remote name and raw URL, so a
-credential or endpoint change cannot reuse an older transaction while the raw
-URL remains absent from the journal. User information, query values, fragments,
-raw credentials, and unredacted command errors are represented only by that
-keyed binding and the redacted display value. If the binding key is missing
-while prior transaction entries exist, publication fails closed instead of
-creating a new key. The JSON
-`publication_receipt` reports the monotonic
-phase (`prepared`, `push_observed`, `pr_observed`, or `completed`), expected and
-observed head OIDs, exact expected base OID, remote ref, PR URL and verified PR
-fields, whether creation was attempted, whether a contract-checked receipt
-attributed the PR to this transaction, whether reconciliation found an existing PR, and the
-last redacted error. A PR recovered through `list`/`view` after a recorded create
-attempt is attributed to the transaction only after its hidden marker and exact
-provenance contract verify; a pre-attempt existing PR is never adopted. Rerun
-the same `pr publish` command: it reconciles the remote ref and marker-bound PR
-before attempting another write. A completed transaction is idempotent.
+Git pushes, GitHub PRs, GitHub issues, and inbox source comments use an
+authenticated repository-local effect WAL with `planned`, `started`,
+`observed`, and `completed` phases. `started` is durable immediately before the
+provider call. Recovery from `started` performs lookup only and proceeds only
+for exactly one marker-bound receipt; zero, multiple, or failed lookups require
+manual reconciliation and never resend. `observed` and `completed` receipts are
+re-fetched and checked against the exact repository, object ID, URL, operation,
+marker, target, payload, and provider-specific provenance; source-backed effects
+also bind the source action revision. A deleted, closed, or mutated remote object
+therefore blocks without another provider call.
+Immediately before a new effect, the complete source freshness snapshot must
+still match. After a source comment changes volatile `updatedAt`, recovery uses
+the stable action revision so the comment can be adopted without weakening
+title/body/label/head/base checks. Comment discovery reads every bounded REST
+page and then exact-views each marker candidate; truncation or bounds failure is
+fail closed.
+
+The new path does not create plaintext records under
+`.git/maco/state/publication-transactions/`. If any legacy plaintext publication
+journal entry exists, publication stops with an explicit signed-migration
+requirement and neither adopts, signs, overwrites, nor deletes it. This is an
+intentional seam for a future migration command. The JSON
+`publication_receipt` remains a public summary of the verified remote result;
+the authenticated effect WAL is the recovery authority.
 
 These checks do not make Git hosting operations globally atomic. Another actor
-can still move or delete the remote ref after a check, and PR creation plus the
-post-create `gh pr view` verification spans multiple remote operations. The
-post-create check detects a mismatch; it cannot prevent a later one. The
+can still move or delete a remote object after a completed re-verification. A
+later run detects that change and blocks rather than recreating the effect. The
 repo-common lock coordinates this tool's local operations only, and journal
 durability still depends on the underlying filesystem. Managed paths reject
 pre-existing symlinks (and Windows reparse points), but path-based checks do not

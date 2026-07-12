@@ -151,6 +151,28 @@ pub(crate) struct EffectWal<S: EffectWalSpec = DefaultEffectWalSpec> {
 }
 
 impl<S: EffectWalSpec> EffectWal<S> {
+    pub(crate) fn open_or_create_planned<T: Serialize>(
+        mut authenticator: impl FnMut() -> Result<RepositoryAuthenticator>,
+        logical_id: &str,
+        effect_id: &str,
+        data: &T,
+    ) -> Result<Self> {
+        match Self::create_planned(authenticator()?, logical_id, effect_id, data) {
+            Ok(wal) => Ok(wal),
+            Err(create_error) => {
+                let mut wal = Self::open_instance(authenticator()?, logical_id).with_context(|| {
+                    format!(
+                        "effect WAL could neither create nor open its authenticated logical store: create failed with {create_error:#}"
+                    )
+                })?;
+                if wal.phase(effect_id).is_none() {
+                    wal.planned(effect_id, data)?;
+                }
+                Ok(wal)
+            }
+        }
+    }
+
     pub(crate) fn create_planned<T: Serialize>(
         authenticator: RepositoryAuthenticator,
         logical_id: &str,
@@ -663,6 +685,7 @@ mod tests {
     use super::*;
     use crate::artifacts::repository_auth_writer;
     use git2::Repository;
+    use std::fs;
     use tempfile::TempDir;
 
     fn repository() -> (TempDir, std::path::PathBuf) {
@@ -793,5 +816,63 @@ mod tests {
         )
         .expect("open recovers exact init tail");
         assert_eq!(wal.phase("effect-e"), Some(EffectPhase::Planned));
+    }
+
+    fn planned_wal_record_path(path: &std::path::Path, logical_id: &str) -> std::path::PathBuf {
+        let wal = EffectWal::<DefaultEffectWalSpec>::create_planned(
+            authenticator(path),
+            logical_id,
+            "effect-tamper",
+            &serde_json::json!({"payload": "exact"}),
+        )
+        .expect("create tamper WAL");
+        let record = wal
+            .journal
+            .root()
+            .path()
+            .join(&wal.identity().run_id)
+            .join("00000000000000000001.json");
+        drop(wal);
+        record
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effect_wal_rejects_unknown_hardlink_rename_and_truncated_record_tampering() {
+        let (_hardlink_temp, hardlink_repo) = repository();
+        let hardlink_record = planned_wal_record_path(&hardlink_repo, "hardlink-tamper");
+        fs::hard_link(
+            &hardlink_record,
+            hardlink_record.with_file_name("unknown-hardlink"),
+        )
+        .expect("create unknown hardlink");
+        assert!(EffectWal::<DefaultEffectWalSpec>::open_instance(
+            authenticator(&hardlink_repo),
+            "hardlink-tamper"
+        )
+        .is_err());
+
+        let (_rename_temp, rename_repo) = repository();
+        let rename_record = planned_wal_record_path(&rename_repo, "rename-tamper");
+        fs::rename(
+            &rename_record,
+            rename_record.with_file_name("renamed-record.json"),
+        )
+        .expect("rename WAL record");
+        assert!(EffectWal::<DefaultEffectWalSpec>::open_instance(
+            authenticator(&rename_repo),
+            "rename-tamper"
+        )
+        .is_err());
+
+        let (_truncate_temp, truncate_repo) = repository();
+        let truncate_record = planned_wal_record_path(&truncate_repo, "truncate-tamper");
+        let bytes = fs::read(&truncate_record).expect("read WAL record");
+        fs::write(&truncate_record, &bytes[..bytes.len() / 2]).expect("truncate WAL record");
+        assert!(EffectWal::<DefaultEffectWalSpec>::open_instance(
+            authenticator(&truncate_repo),
+            "truncate-tamper"
+        )
+        .is_err());
     }
 }

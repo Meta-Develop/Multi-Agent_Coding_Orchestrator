@@ -10,6 +10,7 @@ use crate::{
     llm::{RedactionSummary, Redactor},
     orchestrator::RunId,
     planning,
+    publication::{self, ExternalSourceGuard, ExternalSourceObjectKind},
     review::{ReviewerConfig, ReviewerMode},
     safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
     semantic_coord::SemanticIntentStore,
@@ -534,10 +535,13 @@ pub struct InboxSourceSnapshotBinding {
     number: u64,
     source_key: String,
     updated_at: String,
+    state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     head_oid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     base_oid: Option<String>,
+    content_digest: String,
+    action_revision_digest: String,
     digest: String,
 }
 
@@ -552,10 +556,13 @@ struct InboxSourceSnapshotBindingWire {
     number: u64,
     source_key: String,
     updated_at: String,
+    state: String,
     #[serde(default)]
     head_oid: Option<String>,
     #[serde(default)]
     base_oid: Option<String>,
+    content_digest: String,
+    action_revision_digest: String,
     digest: String,
 }
 
@@ -569,8 +576,11 @@ struct InboxSourceSnapshotDigestPayload<'a> {
     number: u64,
     source_key: &'a str,
     updated_at: &'a str,
+    state: &'a str,
     head_oid: Option<&'a str>,
     base_oid: Option<&'a str>,
+    content_digest: &'a str,
+    action_revision_digest: &'a str,
 }
 
 struct InboxSourceSnapshotObservation {
@@ -580,17 +590,24 @@ struct InboxSourceSnapshotObservation {
     kind: InboxItemKind,
     number: u64,
     updated_at: String,
+    state: String,
     head_oid: Option<String>,
     base_oid: Option<String>,
+    content_digest: String,
+    action_revision_digest: String,
 }
 
 impl InboxSourceSnapshotBinding {
+    #[allow(clippy::too_many_arguments)]
     pub fn for_issue(
         provider: InboxSourceProvider,
         repository_selector: impl Into<String>,
         repository_identity: impl Into<String>,
         number: u64,
         updated_at: impl Into<String>,
+        state: impl Into<String>,
+        content_digest: impl Into<String>,
+        action_revision_digest: impl Into<String>,
     ) -> Result<Self> {
         Self::from_observation(InboxSourceSnapshotObservation {
             provider,
@@ -599,19 +616,26 @@ impl InboxSourceSnapshotBinding {
             kind: InboxItemKind::Issue,
             number,
             updated_at: updated_at.into(),
+            state: state.into(),
             head_oid: None,
             base_oid: None,
+            content_digest: content_digest.into(),
+            action_revision_digest: action_revision_digest.into(),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn for_pull_request(
         provider: InboxSourceProvider,
         repository_selector: impl Into<String>,
         repository_identity: impl Into<String>,
         number: u64,
         updated_at: impl Into<String>,
+        state: impl Into<String>,
         head_oid: String,
         base_oid: String,
+        content_digest: impl Into<String>,
+        action_revision_digest: impl Into<String>,
     ) -> Result<Self> {
         Self::from_observation(InboxSourceSnapshotObservation {
             provider,
@@ -620,8 +644,11 @@ impl InboxSourceSnapshotBinding {
             kind: InboxItemKind::PullRequest,
             number,
             updated_at: updated_at.into(),
+            state: state.into(),
             head_oid: Some(head_oid),
             base_oid: Some(base_oid),
+            content_digest: content_digest.into(),
+            action_revision_digest: action_revision_digest.into(),
         })
     }
 
@@ -635,8 +662,11 @@ impl InboxSourceSnapshotBinding {
             number: observation.number,
             source_key: source_key(observation.kind, observation.number),
             updated_at: observation.updated_at,
+            state: observation.state,
             head_oid: observation.head_oid,
             base_oid: observation.base_oid,
+            content_digest: observation.content_digest,
+            action_revision_digest: observation.action_revision_digest,
             digest: String::new(),
         };
         binding.digest = binding.deterministic_digest()?;
@@ -654,8 +684,11 @@ impl InboxSourceSnapshotBinding {
             number: self.number,
             source_key: &self.source_key,
             updated_at: &self.updated_at,
+            state: &self.state,
             head_oid: self.head_oid.as_deref(),
             base_oid: self.base_oid.as_deref(),
+            content_digest: &self.content_digest,
+            action_revision_digest: &self.action_revision_digest,
         };
         let mut bytes = SOURCE_SNAPSHOT_DIGEST_DOMAIN.to_vec();
         bytes.extend(
@@ -674,8 +707,12 @@ impl InboxSourceSnapshotBinding {
             128,
             false,
         )?;
-        if !self.repository_identity.starts_with("maco-v1-") {
-            bail!("inbox source snapshot repository_identity is not canonical");
+        validate_git_oid(
+            &self.repository_identity,
+            "inbox source snapshot repository_identity",
+        )?;
+        if self.repository_identity.len() != 64 {
+            bail!("inbox source snapshot repository_identity is not SHA-256");
         }
         if self.number == 0 {
             bail!("inbox source snapshot number must be positive");
@@ -685,6 +722,9 @@ impl InboxSourceSnapshotBinding {
             bail!("inbox source snapshot source_key does not match kind and number");
         }
         validate_timestamp(&self.updated_at)?;
+        validate_bounded_text(&self.state, "inbox source snapshot state", 64, false)?;
+        validate_git_oid(&self.content_digest, "content_digest")?;
+        validate_git_oid(&self.action_revision_digest, "action_revision_digest")?;
         match self.kind {
             InboxItemKind::Issue => {
                 if self.head_oid.is_some() || self.base_oid.is_some() {
@@ -744,12 +784,46 @@ impl InboxSourceSnapshotBinding {
         &self.updated_at
     }
 
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
     pub fn head_oid(&self) -> Option<&str> {
         self.head_oid.as_deref()
     }
 
     pub fn base_oid(&self) -> Option<&str> {
         self.base_oid.as_deref()
+    }
+
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    pub fn action_revision_digest(&self) -> &str {
+        &self.action_revision_digest
+    }
+
+    fn external_source_guard(&self) -> Result<Option<ExternalSourceGuard>> {
+        if self.provider != InboxSourceProvider::Github {
+            return Ok(None);
+        }
+        Ok(Some(ExternalSourceGuard::new(
+            "github",
+            self.repository_selector.clone(),
+            self.repository_identity.clone(),
+            match self.kind {
+                InboxItemKind::Issue => ExternalSourceObjectKind::Issue,
+                InboxItemKind::PullRequest => ExternalSourceObjectKind::PullRequest,
+            },
+            self.number,
+            self.updated_at.clone(),
+            self.state.clone(),
+            self.head_oid.clone(),
+            self.base_oid.clone(),
+            self.content_digest.clone(),
+            self.action_revision_digest.clone(),
+        )?))
     }
 
     pub fn digest(&self) -> &str {
@@ -772,8 +846,11 @@ impl<'de> Deserialize<'de> for InboxSourceSnapshotBinding {
             number: wire.number,
             source_key: wire.source_key,
             updated_at: wire.updated_at,
+            state: wire.state,
             head_oid: wire.head_oid,
             base_oid: wire.base_oid,
+            content_digest: wire.content_digest,
+            action_revision_digest: wire.action_revision_digest,
             digest: wire.digest,
         };
         binding
@@ -1095,6 +1172,9 @@ struct RawIssueCandidate {
     author: Option<String>,
     labels: Vec<String>,
     updated_at: String,
+    state: String,
+    content_digest: String,
+    action_revision_digest: String,
     assigned_paths: Vec<PathBuf>,
     path_proposal: planning::TaskPathProposalDiagnostics,
 }
@@ -1109,6 +1189,9 @@ struct RawPrCandidate {
     author: Option<String>,
     labels: Vec<String>,
     updated_at: String,
+    state: String,
+    content_digest: String,
+    action_revision_digest: String,
     head_ref: Option<String>,
     base_ref: Option<String>,
     head_oid: String,
@@ -1157,7 +1240,7 @@ fn scan_inbox_with_overrides(
     let mut items = Vec::new();
     if loaded.config.selection.issues {
         let issues = if github_enabled {
-            github_issue_candidates(&repo, &loaded.config)?
+            github_issue_candidates(&repo, &loaded.config, &source_repository)?
         } else {
             fake_issue_candidates(&loaded.config)
         };
@@ -1172,7 +1255,7 @@ fn scan_inbox_with_overrides(
     }
     if loaded.config.selection.pull_requests {
         let pull_requests = if github_enabled {
-            github_pr_candidates(&repo, &loaded.config)?
+            github_pr_candidates(&repo, &loaded.config, &source_repository)?
         } else {
             fake_pr_candidates(&loaded.config)
         };
@@ -2218,6 +2301,8 @@ fn run_inbox_item(
     let action_policy = context.action_policy;
     let permission_mode = context.permission_mode;
     let config = context.config;
+    revalidate_inbox_item_source(repo, item)
+        .context("inbox source changed before item processing started")?;
     let plan = autopilot_plan_for_item(item, config, permission_mode)?;
     let plan_relative = PathBuf::from(format!("item-{item_index}-plan.json"));
     write_private_artifact_json(writer, &plan_relative, &plan)?;
@@ -2287,6 +2372,8 @@ fn run_inbox_item(
         });
     }
 
+    revalidate_inbox_item_source(repo, item)
+        .context("inbox source changed immediately before local work started")?;
     let autopilot_result = autopilot::run_autopilot_plan_file(AutopilotRunOptions {
         repo: repo.to_path_buf(),
         plan_file: plan_path.clone(),
@@ -2409,6 +2496,7 @@ fn autopilot_plan_for_item(
         },
         publish_mode: AutopilotPublishMode::DraftOnly,
         auto_merge: false,
+        external_source: item.source_snapshot.external_source_guard()?,
     })
 }
 
@@ -2501,7 +2589,7 @@ fn pr_validation_expectation(failing_checks: &[String]) -> String {
 
 fn github_action_for_item(
     repo: &Path,
-    config: &InboxConfig,
+    _config: &InboxConfig,
     action_policy: InboxActionPolicy,
     permission_mode: InboxPermissionMode,
     item: &InboxItem,
@@ -2533,8 +2621,19 @@ fn github_action_for_item(
             message: Some("autopilot did not succeed; GitHub comment skipped".to_string()),
         };
     }
+    if let Err(error) = revalidate_inbox_item_source(repo, item) {
+        return InboxGithubActionReport {
+            mode: action_policy,
+            permission_mode,
+            status: "source_drift".to_string(),
+            success: false,
+            target: item_target(item),
+            comment_url: None,
+            message: Some(sanitize_public_text(repo, &error.to_string(), GH_DIAGNOSTIC_LIMIT).text),
+        };
+    }
 
-    let Some(number) = item_number(item) else {
+    let Some(_number) = item_number(item) else {
         return InboxGithubActionReport {
             mode: action_policy,
             permission_mode,
@@ -2554,25 +2653,43 @@ fn github_action_for_item(
         COMMENT_BODY_LIMIT,
     )
     .text;
-    let subcommand = match item.kind {
-        InboxItemKind::Issue => "issue",
-        InboxItemKind::PullRequest => "pr",
+    let guard = match item.source_snapshot.external_source_guard() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return InboxGithubActionReport {
+                mode: action_policy,
+                permission_mode,
+                status: "failed".to_string(),
+                success: false,
+                target: item_target(item),
+                comment_url: None,
+                message: Some(
+                    "GitHub comment source omitted its authenticated freshness guard".to_string(),
+                ),
+            };
+        }
+        Err(error) => {
+            return InboxGithubActionReport {
+                mode: action_policy,
+                permission_mode,
+                status: "failed".to_string(),
+                success: false,
+                target: item_target(item),
+                comment_url: None,
+                message: Some(
+                    sanitize_public_text(repo, &error.to_string(), GH_DIAGNOSTIC_LIMIT).text,
+                ),
+            };
+        }
     };
-    let mut args = vec![
-        subcommand.to_string(),
-        "comment".to_string(),
-        number.to_string(),
-    ];
-    args.push("--body".to_string());
-    args.push(body);
-    match run_gh_text(repo, config, &args, "gh comment") {
-        Ok(stdout) => InboxGithubActionReport {
+    match publication::publish_github_source_comment(repo, guard, &body) {
+        Ok(url) => InboxGithubActionReport {
             mode: action_policy,
             permission_mode,
             status: "commented".to_string(),
             success: true,
             target: item_target(item),
-            comment_url: first_non_empty_line(&stdout.text),
+            comment_url: Some(url),
             message: None,
         },
         Err(error) => InboxGithubActionReport {
@@ -2585,6 +2702,14 @@ fn github_action_for_item(
             message: Some(sanitize_public_text(repo, &error.to_string(), GH_DIAGNOSTIC_LIMIT).text),
         },
     }
+}
+
+fn revalidate_inbox_item_source(repo: &Path, item: &InboxItem) -> Result<()> {
+    item.source_snapshot.validate()?;
+    if let Some(guard) = item.source_snapshot.external_source_guard()? {
+        publication::revalidate_external_source(repo, &guard)?;
+    }
+    Ok(())
 }
 
 fn issue_item(
@@ -2607,6 +2732,9 @@ fn issue_item(
         source_repository.identity.clone(),
         raw.number,
         raw.updated_at.clone(),
+        raw.state.clone(),
+        raw.content_digest.clone(),
+        raw.action_revision_digest.clone(),
     )?;
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
@@ -2675,8 +2803,11 @@ fn pr_item(
         source_repository.identity.clone(),
         raw.number,
         raw.updated_at.clone(),
+        raw.state.clone(),
         raw.head_oid.clone(),
         raw.base_oid.clone(),
+        raw.content_digest.clone(),
+        raw.action_revision_digest.clone(),
     )?;
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
@@ -2815,6 +2946,9 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             author: Some("maco-fake".to_string()),
             labels: config.selection.labels.clone(),
             updated_at: "1970-01-01T00:00:00Z".to_string(),
+            state: "OPEN".to_string(),
+            content_digest: fake_source_content_digest(InboxItemKind::Issue, 101),
+            action_revision_digest: fake_source_content_digest(InboxItemKind::Issue, 101),
             assigned_paths: config.default_assigned_paths.clone(),
             path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
@@ -2828,6 +2962,9 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             author: Some("maco-fake".to_string()),
             labels: config.selection.labels.clone(),
             updated_at: "1970-01-01T00:00:00Z".to_string(),
+            state: "OPEN".to_string(),
+            content_digest: fake_source_content_digest(InboxItemKind::Issue, 101),
+            action_revision_digest: fake_source_content_digest(InboxItemKind::Issue, 101),
             assigned_paths: config.default_assigned_paths.clone(),
             path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
@@ -2841,6 +2978,9 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             author: Some("maco-fake".to_string()),
             labels: config.selection.labels.clone(),
             updated_at: "1970-01-01T00:00:00Z".to_string(),
+            state: "OPEN".to_string(),
+            content_digest: fake_source_content_digest(InboxItemKind::Issue, 303),
+            action_revision_digest: fake_source_content_digest(InboxItemKind::Issue, 303),
             assigned_paths: config.default_assigned_paths.clone(),
             path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
@@ -2858,6 +2998,9 @@ fn fake_pr_candidates(config: &InboxConfig) -> Vec<RawPrCandidate> {
         author: Some("maco-fake".to_string()),
         labels: config.selection.labels.clone(),
         updated_at: "1970-01-01T00:00:00Z".to_string(),
+        state: "OPEN".to_string(),
+        content_digest: fake_source_content_digest(InboxItemKind::PullRequest, 202),
+        action_revision_digest: fake_source_content_digest(InboxItemKind::PullRequest, 202),
         head_ref: Some("fake/inbox-pr".to_string()),
         base_ref: config.repository.default_branch.clone(),
         head_oid: "1111111111111111111111111111111111111111".to_string(),
@@ -2881,14 +3024,24 @@ fn fake_pr_candidates(config: &InboxConfig) -> Vec<RawPrCandidate> {
     }]
 }
 
-fn github_issue_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawIssueCandidate>> {
+fn fake_source_content_digest(kind: InboxItemKind, number: u64) -> String {
+    publication::stable_external_digest(
+        format!("maco-fake-source-v1:{kind:?}:{number}:1970-01-01T00:00:00Z").as_bytes(),
+    )
+}
+
+fn github_issue_candidates(
+    repo: &Path,
+    config: &InboxConfig,
+    source_repository: &SourceRepositoryBindingContext,
+) -> Result<Vec<RawIssueCandidate>> {
     let mut args = vec![
         "issue".to_string(),
         "list".to_string(),
         "--state".to_string(),
         "open".to_string(),
         "--json".to_string(),
-        "number,title,body,labels,author,url,updatedAt".to_string(),
+        "number,title,body,labels,author,url,updatedAt,state".to_string(),
         "--limit".to_string(),
         config.selection.max_items.to_string(),
     ];
@@ -2905,20 +3058,24 @@ fn github_issue_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawI
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            raw_issue_from_value(repo, value, config)
+            raw_issue_from_value(repo, value, config, source_repository)
                 .with_context(|| format!("invalid gh issue list item {}", index + 1))
         })
         .collect()
 }
 
-fn github_pr_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawPrCandidate>> {
+fn github_pr_candidates(
+    repo: &Path,
+    config: &InboxConfig,
+    source_repository: &SourceRepositoryBindingContext,
+) -> Result<Vec<RawPrCandidate>> {
     let mut args = vec![
         "pr".to_string(),
         "list".to_string(),
         "--state".to_string(),
         "open".to_string(),
         "--json".to_string(),
-        "number,title,body,labels,author,url,updatedAt,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup".to_string(),
+        "number,title,body,labels,author,url,updatedAt,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup".to_string(),
         "--limit".to_string(),
         config.selection.max_items.to_string(),
     ];
@@ -2935,7 +3092,7 @@ fn github_pr_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawPrCa
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            raw_pr_from_value(value, config)
+            raw_pr_from_value(value, config, source_repository)
                 .with_context(|| format!("invalid gh pr list item {}", index + 1))
         })
         .collect()
@@ -2945,6 +3102,7 @@ fn raw_issue_from_value(
     repo: &Path,
     value: &Value,
     config: &InboxConfig,
+    source_repository: &SourceRepositoryBindingContext,
 ) -> Result<RawIssueCandidate> {
     let object = value
         .as_object()
@@ -2973,6 +3131,12 @@ fn raw_issue_from_value(
         MAX_TIMESTAMP_BYTES,
     )?;
     validate_timestamp(&updated_at)?;
+    let source_guard = publication::github_source_guard_from_value(
+        &source_repository.selector,
+        &source_repository.identity,
+        ExternalSourceObjectKind::Issue,
+        value,
+    )?;
     let (assigned_paths, path_proposal) = issue_path_proposal(repo, &title, &body, config);
     Ok(RawIssueCandidate {
         provider: InboxSourceProvider::Github,
@@ -2987,6 +3151,9 @@ fn raw_issue_from_value(
         author: optional_nested_login(object.get("author"), "GitHub issue author")?,
         labels: labels_from_value(object.get("labels"))?,
         updated_at,
+        state: source_guard.state,
+        content_digest: source_guard.content_digest,
+        action_revision_digest: source_guard.action_revision_digest,
         assigned_paths,
         path_proposal,
     })
@@ -3020,7 +3187,11 @@ fn issue_path_proposal(
     }
 }
 
-fn raw_pr_from_value(value: &Value, _config: &InboxConfig) -> Result<RawPrCandidate> {
+fn raw_pr_from_value(
+    value: &Value,
+    _config: &InboxConfig,
+    source_repository: &SourceRepositoryBindingContext,
+) -> Result<RawPrCandidate> {
     let object = value
         .as_object()
         .context("GitHub PR candidate must be an object")?;
@@ -3037,6 +3208,12 @@ fn raw_pr_from_value(value: &Value, _config: &InboxConfig) -> Result<RawPrCandid
         MAX_TIMESTAMP_BYTES,
     )?;
     validate_timestamp(&updated_at)?;
+    let source_guard = publication::github_source_guard_from_value(
+        &source_repository.selector,
+        &source_repository.identity,
+        ExternalSourceObjectKind::PullRequest,
+        value,
+    )?;
     let head_oid = required_input_string(object.get("headRefOid"), "GitHub PR headRefOid", 64)?;
     let base_oid = required_input_string(object.get("baseRefOid"), "GitHub PR baseRefOid", 64)?;
     validate_git_oid(&head_oid, "headRefOid")?;
@@ -3065,6 +3242,9 @@ fn raw_pr_from_value(value: &Value, _config: &InboxConfig) -> Result<RawPrCandid
         author: optional_nested_login(object.get("author"), "GitHub PR author")?,
         labels: labels_from_value(object.get("labels"))?,
         updated_at,
+        state: source_guard.state,
+        content_digest: source_guard.content_digest,
+        action_revision_digest: source_guard.action_revision_digest,
         head_ref: optional_input_string(
             object.get("headRefName"),
             "GitHub PR headRefName",
@@ -3676,18 +3856,6 @@ fn parse_gh_json_bytes(bytes: Vec<u8>, label: &str) -> Result<Value> {
     serde_json::from_str(&bounded.text).with_context(|| format!("{label} returned invalid JSON"))
 }
 
-fn run_gh_text(
-    repo: &Path,
-    config: &InboxConfig,
-    args: &[String],
-    label: &str,
-) -> Result<BoundedText> {
-    let bytes = run_gh_bytes(repo, config, args, label)?;
-    let text =
-        String::from_utf8(bytes).with_context(|| format!("{label} returned non-UTF-8 text"))?;
-    Ok(sanitize_public_text(repo, &text, GH_OUTPUT_LIMIT))
-}
-
 fn run_gh_bytes(
     repo: &Path,
     config: &InboxConfig,
@@ -4245,10 +4413,10 @@ fn source_repository_binding_context(
     let repo = Repository::open(repo_path).context("failed to bind inbox source repository")?;
     let common = SafeRoot::open_existing(repo.commondir())
         .context("failed to bind inbox source repository common directory")?;
-    let mut identity_payload = b"MACO\0inbox-source-repository\0v1\0".to_vec();
-    identity_payload.extend_from_slice(&common.identity().device.to_be_bytes());
-    identity_payload.extend_from_slice(&common.identity().file.to_be_bytes());
-    let identity = stable_checksum(&identity_payload);
+    let identity = publication::external_source_repository_identity(
+        common.identity().device,
+        common.identity().file,
+    );
     let origin_selector = repo
         .find_remote("origin")
         .ok()
@@ -4551,13 +4719,6 @@ fn check_failed(conclusion: Option<&str>, status: Option<&str>) -> bool {
             "failure" | "failed" | "timed_out" | "cancelled" | "action_required"
         )
     })
-}
-
-fn first_non_empty_line(text: &str) -> Option<String> {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone)]
@@ -5091,15 +5252,18 @@ mod tests {
 
     #[test]
     fn source_snapshot_binding_is_deterministic_validated_and_identity_stable() {
-        let identity = stable_checksum(b"repository-identity");
+        let identity = publication::stable_external_digest(b"repository-identity");
         let first = InboxSourceSnapshotBinding::for_pull_request(
             InboxSourceProvider::Github,
             "acme/repo",
             identity.clone(),
             42,
             "2026-07-08T00:00:00Z",
+            "OPEN",
             "1".repeat(40),
             "2".repeat(40),
+            "3".repeat(64),
+            "4".repeat(64),
         )
         .expect("first binding");
         let second = InboxSourceSnapshotBinding::for_pull_request(
@@ -5108,8 +5272,11 @@ mod tests {
             identity,
             42,
             "2026-07-08T00:00:00Z",
+            "OPEN",
             "1".repeat(40),
             "2".repeat(40),
+            "3".repeat(64),
+            "4".repeat(64),
         )
         .expect("second binding");
         assert_eq!(first, second);
@@ -5120,6 +5287,9 @@ mod tests {
         let decoded: InboxSourceSnapshotBinding =
             serde_json::from_value(encoded.clone()).expect("deserialize binding");
         assert_eq!(decoded, first);
+        let mut tampered_identity = encoded.clone();
+        tampered_identity["repository_identity"] = json!("f".repeat(64));
+        assert!(serde_json::from_value::<InboxSourceSnapshotBinding>(tampered_identity).is_err());
         let mut tampered = encoded;
         tampered["updated_at"] = json!("not-a-timestamp");
         assert!(serde_json::from_value::<InboxSourceSnapshotBinding>(tampered).is_err());
@@ -5127,18 +5297,21 @@ mod tests {
         assert!(InboxSourceSnapshotBinding::for_pull_request(
             InboxSourceProvider::Github,
             "acme/repo",
-            stable_checksum(b"repository-identity"),
+            publication::stable_external_digest(b"repository-identity"),
             42,
             "2026-07-08T00:00:00Z",
+            "OPEN",
             "not-an-oid".to_string(),
             "2".repeat(40),
+            "3".repeat(64),
+            "4".repeat(64),
         )
         .is_err());
 
         let config = InboxConfig::default();
         let context = SourceRepositoryBindingContext {
             selector: ".".to_string(),
-            identity: stable_checksum(b"fake-repository"),
+            identity: publication::stable_external_digest(b"fake-repository"),
         };
         let mut candidates = fake_issue_candidates(&config).into_iter();
         let first_item = issue_item(
@@ -5176,7 +5349,11 @@ mod tests {
             .expect("second repository binding");
         assert_eq!(first.selector, "acme/inbox");
         assert_eq!(first.identity, second.identity);
-        assert!(first.identity.starts_with("maco-v1-"));
+        assert_eq!(first.identity.len(), 64);
+        assert!(first
+            .identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
 
         drop(repo);
         let moved_repo = temp.path().join("moved-repo");
@@ -5191,9 +5368,11 @@ mod tests {
             "body": "body",
             "url": "https://github.com/acme/different/issues/7",
             "updatedAt": "2026-07-08T00:00:00Z",
+            "state": "OPEN",
             "labels": []
         });
-        let raw = raw_issue_from_value(&moved_repo, &wrong_url, &config).expect("raw issue");
+        let raw =
+            raw_issue_from_value(&moved_repo, &wrong_url, &config, &moved).expect("raw issue");
         assert!(issue_item(raw, &config, &moved, &BTreeMap::new()).is_err());
 
         let mut mismatch = config;
@@ -5203,39 +5382,40 @@ mod tests {
 
     #[test]
     fn raw_github_candidates_fail_closed_on_malformed_identity_and_nested_values() {
+        let source = test_source_repository_binding();
         let mut pr = valid_raw_pr_value();
         pr.as_object_mut().unwrap().remove("headRefOid");
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         let mut pr = valid_raw_pr_value();
         pr["updatedAt"] = json!("invalid");
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         let mut pr = valid_raw_pr_value();
         pr["files"] = json!([{"path": "/tmp/outside"}]);
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         let mut pr = valid_raw_pr_value();
         pr["labels"] = json!((0..=MAX_LABELS)
             .map(|index| json!({"name": format!("label-{index}")}))
             .collect::<Vec<_>>());
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         let mut pr = valid_raw_pr_value();
         pr["title"] = json!("x".repeat(MAX_GITHUB_TITLE_BYTES + 1));
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         let mut pr = valid_raw_pr_value();
         pr["author"] = json!({"login": "bad\nlogin"});
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         let mut pr = valid_raw_pr_value();
         pr["statusCheckRollup"] = json!(vec![json!({"name": "ci"}); MAX_GITHUB_CHECKS + 1]);
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         let mut pr = valid_raw_pr_value();
         pr["latestReviews"] = json!(vec![json!({"state": "APPROVED"}); MAX_GITHUB_REVIEWS + 1]);
-        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
 
         assert!(validate_count(
             MAX_GITHUB_ITEMS + 1,
@@ -5249,9 +5429,10 @@ mod tests {
             "number": 0,
             "title": "issue",
             "body": "body",
-            "updatedAt": "2026-07-08T00:00:00Z"
+            "updatedAt": "2026-07-08T00:00:00Z",
+            "state": "OPEN"
         });
-        assert!(raw_issue_from_value(&repo, &issue, &InboxConfig::default()).is_err());
+        assert!(raw_issue_from_value(&repo, &issue, &InboxConfig::default(), &source).is_err());
     }
 
     #[test]
@@ -5609,7 +5790,7 @@ mod tests {
         let snapshot = &report.items[0].source_snapshot;
         snapshot.validate().expect("public snapshot binding");
         assert_eq!(snapshot.repository_selector(), ".");
-        assert!(snapshot.repository_identity().starts_with("maco-v1-"));
+        assert_eq!(snapshot.repository_identity().len(), 64);
         assert!(!public_json.contains(repo.to_str().expect("utf8 repo path")));
         assert!(!public_json.contains(temp.path().to_str().expect("utf8 temp path")));
     }
@@ -5660,6 +5841,10 @@ mod tests {
             "body": "body",
             "url": "https://github.example/acme/repo/pull/9",
             "updatedAt": "2026-07-08T00:00:00Z",
+            "state": "OPEN",
+            "author": {"login": "author"},
+            "headRefName": "feature",
+            "baseRefName": "main",
             "headRefOid": "1111111111111111111111111111111111111111",
             "baseRefOid": "2222222222222222222222222222222222222222",
             "isDraft": false,
@@ -5674,7 +5859,12 @@ mod tests {
             ]
         });
 
-        let raw = raw_pr_from_value(&value, &InboxConfig::default()).expect("raw pr");
+        let raw = raw_pr_from_value(
+            &value,
+            &InboxConfig::default(),
+            &test_source_repository_binding(),
+        )
+        .expect("raw pr");
 
         assert_eq!(raw.labels, vec!["a".to_string(), "z".to_string()]);
         assert_eq!(raw.changed_files, vec![PathBuf::from("src/inbox.rs")]);
@@ -5690,6 +5880,13 @@ mod tests {
         let repo = temp.path().join("repo");
         WorktreeManager::init_repository(&repo, "main").expect("init repo");
         (temp, repo)
+    }
+
+    fn test_source_repository_binding() -> SourceRepositoryBindingContext {
+        SourceRepositoryBindingContext {
+            selector: "acme/repo".to_string(),
+            identity: publication::stable_external_digest(b"inbox-test-source-repository"),
+        }
     }
 
     fn make_issue_item(number: u64, title: &str, assigned_paths: Vec<PathBuf>) -> InboxItem {
@@ -5770,18 +5967,24 @@ mod tests {
             InboxItemKind::Issue => InboxSourceSnapshotBinding::for_issue(
                 InboxSourceProvider::Fake,
                 ".",
-                stable_checksum(b"inbox-test-repository"),
+                publication::stable_external_digest(b"inbox-test-repository"),
                 number,
                 "1970-01-01T00:00:00Z",
+                "OPEN",
+                "3".repeat(64),
+                "4".repeat(64),
             ),
             InboxItemKind::PullRequest => InboxSourceSnapshotBinding::for_pull_request(
                 InboxSourceProvider::Fake,
                 ".",
-                stable_checksum(b"inbox-test-repository"),
+                publication::stable_external_digest(b"inbox-test-repository"),
                 number,
                 "1970-01-01T00:00:00Z",
+                "OPEN",
                 "1111111111111111111111111111111111111111".to_string(),
                 "2222222222222222222222222222222222222222".to_string(),
+                "3".repeat(64),
+                "4".repeat(64),
             ),
         }
         .expect("test source snapshot")
@@ -5796,6 +5999,7 @@ mod tests {
             "author": {"login": "reviewer"},
             "labels": [{"name": "bug"}],
             "updatedAt": "2026-07-08T00:00:00Z",
+            "state": "OPEN",
             "headRefName": "feature/inbox",
             "baseRefName": "main",
             "headRefOid": "1111111111111111111111111111111111111111",

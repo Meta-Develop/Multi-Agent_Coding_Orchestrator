@@ -14,7 +14,8 @@ use crate::{
         Shell, SideEffectConfinementProfile, StrictOfflineWorkspaceProfile,
     },
     publication::{
-        self, ForgeKind, PrPublicationOptions, PrPublicationReport, PrPublicationStatus,
+        self, ExternalSourceGuard, ForgeKind, PrPublicationOptions, PrPublicationReport,
+        PrPublicationStatus,
     },
     review::{
         self, ReviewPrOptions, ReviewReport, ReviewReportStatus, ReviewerConfig, ReviewerMode,
@@ -91,6 +92,8 @@ pub struct AutopilotPlan {
     pub publish_mode: AutopilotPublishMode,
     #[serde(default)]
     pub auto_merge: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_source: Option<ExternalSourceGuard>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -426,6 +429,7 @@ pub fn autopilot_plan_from_task_file(
             reviewer: ReviewerConfig::default(),
             publish_mode: AutopilotPublishMode::DraftOnly,
             auto_merge: false,
+            external_source: None,
         },
     )
 }
@@ -436,6 +440,10 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
     if let Some(command) = options.reviewer_command.clone() {
         plan.reviewer.mode = ReviewerMode::ExternalCommand;
         plan.reviewer.command = Some(command);
+    }
+    if let Some(source) = &plan.external_source {
+        publication::revalidate_external_source(&repo, source)
+            .context("autopilot source changed immediately before local work")?;
     }
     let artifacts = artifact_paths();
     let real_runtime_requested = options.codex_bin.is_some();
@@ -621,10 +629,11 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             validate: |worktree: PathBuf| run_validation_commands(&worktree, &plan),
             review: review::review_pr_for_publication,
             publish: |options, evidence| {
-                publication::publish_prepared_pr_with_write_lease(
+                publication::publish_prepared_pr_with_source_guard(
                     options,
                     &evidence,
                     &worktree_lease,
+                    plan.external_source.clone(),
                 )
             },
         };
@@ -819,6 +828,11 @@ fn validate_autopilot_plan(repo: &Path, mut plan: AutopilotPlan) -> Result<Autop
     }
     if plan.task.body.is_empty() {
         plan.task.body = plan.task.title.clone();
+    }
+    if let Some(source) = &plan.external_source {
+        source
+            .validate()
+            .context("autopilot external source guard is invalid")?;
     }
     if plan.assigned_paths.is_empty() {
         let proposal =
@@ -2652,6 +2666,7 @@ mod tests {
             },
             publish_mode: AutopilotPublishMode::DraftOnly,
             auto_merge: false,
+            external_source: None,
         }
     }
 
@@ -2755,6 +2770,7 @@ mod tests {
                 reviewer: ReviewerConfig::default(),
                 publish_mode: AutopilotPublishMode::DraftOnly,
                 auto_merge: false,
+                external_source: None,
             },
         );
 
