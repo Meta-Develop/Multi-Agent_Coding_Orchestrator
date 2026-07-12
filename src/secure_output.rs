@@ -33,6 +33,7 @@ use std::path::Component;
 #[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildSetupFault {
     None,
@@ -113,6 +114,7 @@ impl SecureOutputRoot {
     }
 
     /// Creates a new private final directory. Existing final paths are refused even when safe.
+    #[cfg(test)]
     pub(crate) fn create_new(path: &Path) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -170,6 +172,7 @@ impl SecureOutputRoot {
     }
 
     /// Creates a private direct child and returns it as another descriptor-held root.
+    #[cfg(test)]
     pub(crate) fn create_child(&self, name: &OsStr) -> Result<Self> {
         self.create_child_impl(name, ChildSetupFault::None)
     }
@@ -184,6 +187,7 @@ impl SecureOutputRoot {
         self.create_child_impl(name, ChildSetupFault::AfterOpen)
     }
 
+    #[cfg(test)]
     fn create_child_impl(&self, name: &OsStr, _fault: ChildSetupFault) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -315,26 +319,6 @@ impl SecureOutputRoot {
                 "secure output root {} may not overlap child-writable workspace {}",
                 root.display(),
                 workspace.display()
-            );
-        }
-        Ok(())
-    }
-
-    /// Refuses identical or ancestor/descendant output roots, both by path and held inode.
-    pub(crate) fn reject_overlap(&self, other: &Self) -> Result<()> {
-        self.verify_path_identity()?;
-        other.verify_path_identity()?;
-        #[cfg(unix)]
-        if self.device == other.device && self.inode == other.inode {
-            bail!("secure output roots resolve to the same inode");
-        }
-        let left = std::fs::canonicalize(&self.path)?;
-        let right = std::fs::canonicalize(&other.path)?;
-        if left.starts_with(&right) || right.starts_with(&left) {
-            bail!(
-                "secure output roots overlap: {} and {}",
-                left.display(),
-                right.display()
             );
         }
         Ok(())
@@ -829,6 +813,7 @@ fn open_or_create_directory_tree(path: &Path) -> Result<File> {
 }
 
 #[cfg(unix)]
+#[cfg(test)]
 fn create_new_directory_tree(path: &Path) -> Result<File> {
     walk_directory_tree(path, DirectoryCreateMode::NewFinal)
 }
@@ -923,6 +908,7 @@ fn openat_directory(parent: RawFd, name: &CString) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
+#[cfg(test)]
 fn created_directory_identity(parent: &File, name: &CString) -> Result<(u64, u64)> {
     // SAFETY: storage is initialized and the descriptor/name are valid.
     let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -1298,6 +1284,7 @@ fn rebind_name_to_sentinel_for_test(parent: &File, name: &CString, sentinel: &Pa
 }
 
 #[cfg(unix)]
+#[cfg(test)]
 fn cleanup_created_directory(
     parent: &File,
     name: &CString,
