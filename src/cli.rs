@@ -29,12 +29,13 @@ use crate::{
     repo_map::{self, RepoEntryKind, RepoMap},
     repo_semantic::{self, SemanticRepoMap},
     review::{self, ReviewPrOptions, ReviewerConfig, ReviewerMode},
+    safe_state::BoundedRegularReader,
     semantic_coord::{
         SemanticCoordinationReport, SemanticIntentRequest, SemanticIntentStore, SemanticIntentToken,
     },
     state_migration,
     supervise::{self, SupervisorRunOptions},
-    sync::ClaimToken,
+    sync::{normalize_repo_relative_path, ClaimToken},
     sync_store::{OwnerReport, SyncStore},
     worktree::{RepositoryInfo, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
 };
@@ -44,10 +45,30 @@ use git2::Repository;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+const MAX_CONSULT_QUESTION_FILE_BYTES: u64 = 64 * 1024;
+const MAX_ISSUE_BODY_FILE_BYTES: u64 = 512 * 1024;
+const MAX_ORCHESTRATION_SUMMARY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ORCHESTRATION_SUMMARY_AGENTS: usize = 256;
+const MAX_ORCHESTRATION_AGENT_ID_BYTES: usize = 256;
+const MAX_ORCHESTRATION_SUMMARY_PATHS: usize = 16 * 1024;
+const MAX_VALIDATION_INPUT_FILES: usize = 1024;
+const MAX_VALIDATION_INPUT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_VALIDATION_INPUT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_VALIDATION_REPORTS: usize = 1024;
+const MAX_VALIDATION_REPORT_NAME_BYTES: usize = 1024;
+const MAX_VALIDATION_REPORT_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_VALIDATION_REPORT_PATHS: usize = 8192;
+const MAX_AGENT_TASK_BYTES: u64 = 32 * 1024;
+const MAX_FAKE_PROPOSAL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FAKE_PROPOSAL_ITEMS: usize = 256;
+const MAX_PROMPT_TASK_BYTES: u64 = 32 * 1024;
+const MAX_PROMPT_EXCERPT_BYTES: u64 = 32 * 1024;
+const MAX_PROMPT_EXCERPT_TOTAL_BYTES: usize = 48 * 1024;
+const MAX_PROMPT_PATHS: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -674,8 +695,10 @@ fn consult_question(args: &AskConsultArgs) -> Result<String> {
     match (&args.question, &args.question_file) {
         (Some(_), Some(_)) => bail!("use only one of --question or --question-file"),
         (Some(question), None) => Ok(question.clone()),
-        (None, Some(path)) => fs::read_to_string(path)
-            .with_context(|| format!("failed to read question file {}", path.display())),
+        (None, Some(path)) => {
+            BoundedRegularReader::read_tree_no_follow_utf8(path, MAX_CONSULT_QUESTION_FILE_BYTES)
+                .with_context(|| format!("failed to read question file {}", path.display()))
+        }
         (None, None) => bail!("one of --question or --question-file is required"),
     }
 }
@@ -2474,8 +2497,10 @@ fn issue_options_from_args(
 ) -> Result<IssuePublicationOptions> {
     let body = match (body, body_file) {
         (Some(body), None) => body,
-        (None, Some(path)) => fs::read_to_string(&path)
-            .with_context(|| format!("failed to read issue body file {}", path.display()))?,
+        (None, Some(path)) => {
+            BoundedRegularReader::read_tree_no_follow_utf8(&path, MAX_ISSUE_BODY_FILE_BYTES)
+                .with_context(|| format!("failed to read issue body file {}", path.display()))?
+        }
         (None, None) => String::new(),
         (Some(_), Some(_)) => bail!("use either --body or --body-file, not both"),
     };
@@ -2500,26 +2525,48 @@ fn collect_orchestration_results(
     summary_json: &Path,
     diff_summary_char_limit: usize,
 ) -> Result<OrchestrationCollectReport> {
-    let contents = fs::read_to_string(summary_json)
-        .with_context(|| format!("failed to read summary JSON {}", summary_json.display()))?;
-    let summary: Value = serde_json::from_str(&contents)
+    let contents =
+        BoundedRegularReader::read_tree_no_follow(summary_json, MAX_ORCHESTRATION_SUMMARY_BYTES)
+            .with_context(|| format!("failed to read summary JSON {}", summary_json.display()))?;
+    let summary: Value = serde_json::from_slice(&contents)
         .with_context(|| format!("failed to parse summary JSON {}", summary_json.display()))?;
     let agents = summary
         .get("agents")
         .and_then(Value::as_array)
         .context("summary JSON must contain an agents array")?;
+    if agents.len() > MAX_ORCHESTRATION_SUMMARY_AGENTS {
+        bail!("orchestration summary exceeds its {MAX_ORCHESTRATION_SUMMARY_AGENTS}-agent limit");
+    }
     let mut candidates = Vec::new();
+    let mut total_paths = 0_usize;
+    let mut total_reports = 0_usize;
 
     for agent in agents {
         let agent_id = agent
             .get("id")
             .and_then(Value::as_str)
             .context("summary agent is missing string id")?;
+        if agent_id.is_empty() || agent_id.len() > MAX_ORCHESTRATION_AGENT_ID_BYTES {
+            bail!("summary agent id must contain 1..={MAX_ORCHESTRATION_AGENT_ID_BYTES} bytes");
+        }
         let claims = agent_paths_from_summary(agent)
             .with_context(|| format!("summary agent '{agent_id}' has invalid paths"))?;
+        total_paths = total_paths
+            .checked_add(claims.len())
+            .context("orchestration summary path count overflowed")?;
+        if total_paths > MAX_ORCHESTRATION_SUMMARY_PATHS {
+            bail!("orchestration summary exceeds its {MAX_ORCHESTRATION_SUMMARY_PATHS}-path limit");
+        }
         let validations = validation_reports_from_summary(agent).with_context(|| {
             format!("summary agent '{agent_id}' has invalid validation reports")
         })?;
+        validate_cli_validation_reports(&validations)?;
+        total_reports = total_reports
+            .checked_add(validations.len())
+            .context("orchestration summary report count overflowed")?;
+        if total_reports > MAX_VALIDATION_REPORTS {
+            bail!("orchestration summary exceeds its validation report limit");
+        }
         candidates.push(merge::collect_agent_result(MergeCollectOptions {
             repo: repo.to_path_buf(),
             agent_id: agent_id.to_string(),
@@ -2546,9 +2593,11 @@ fn agent_paths_from_summary(agent: &Value) -> Result<Vec<PathBuf>> {
     paths
         .iter()
         .map(|path| {
-            path.as_str()
-                .map(PathBuf::from)
-                .context("agent path must be a string")
+            let path = path.as_str().context("agent path must be a string")?;
+            if path.len() > 4096 || Path::new(path).components().count() > 256 {
+                bail!("agent path exceeds its byte or component limit");
+            }
+            normalize_repo_relative_path(path).map_err(anyhow::Error::from)
         })
         .collect()
 }
@@ -2565,18 +2614,62 @@ fn validation_reports_from_summary(agent: &Value) -> Result<Vec<ValidationReport
 }
 
 fn load_validation_evidence(paths: &[PathBuf], agent_id: &str) -> Result<ValidationEvidenceBundle> {
+    if paths.len() > MAX_VALIDATION_INPUT_FILES {
+        bail!("validation evidence exceeds its input file count limit");
+    }
     let mut evidence = ValidationEvidenceBundle::default();
+    let mut total_bytes = 0_u64;
+    let mut total_reports = 0_usize;
     for path in paths {
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("failed to read validation report {}", path.display()))?;
-        let value: Value = serde_json::from_str(&contents)
+        let contents =
+            BoundedRegularReader::read_tree_no_follow(path, MAX_VALIDATION_INPUT_FILE_BYTES)
+                .with_context(|| format!("failed to read validation report {}", path.display()))?;
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(contents.len()).unwrap_or(u64::MAX))
+            .context("validation evidence byte count overflowed")?;
+        if total_bytes > MAX_VALIDATION_INPUT_TOTAL_BYTES {
+            bail!("validation evidence exceeds its aggregate byte limit");
+        }
+        let value: Value = serde_json::from_slice(&contents)
             .with_context(|| format!("failed to parse validation report {}", path.display()))?;
-        evidence.extend(
-            merge::validation_evidence_from_json_for_agent(&value, Some(agent_id))
-                .with_context(|| format!("invalid validation report {}", path.display()))?,
-        );
+        let parsed = merge::validation_evidence_from_json_for_agent(&value, Some(agent_id))
+            .with_context(|| format!("invalid validation report {}", path.display()))?;
+        let reports = parsed.reports();
+        validate_cli_validation_reports(&reports)?;
+        total_reports = total_reports
+            .checked_add(reports.len())
+            .context("validation report count overflowed")?;
+        if total_reports > MAX_VALIDATION_REPORTS {
+            bail!("validation evidence exceeds its report count limit");
+        }
+        evidence.extend(parsed);
     }
     Ok(evidence)
+}
+
+fn validate_cli_validation_reports(reports: &[ValidationReport]) -> Result<()> {
+    if reports.len() > MAX_VALIDATION_REPORTS {
+        bail!("validation evidence exceeds its report count limit");
+    }
+    for report in reports {
+        if report.name.len() > MAX_VALIDATION_REPORT_NAME_BYTES
+            || report
+                .message
+                .as_ref()
+                .is_some_and(|message| message.len() > MAX_VALIDATION_REPORT_MESSAGE_BYTES)
+            || report.paths.len() > MAX_VALIDATION_REPORT_PATHS
+        {
+            bail!("validation report exceeds its structural input limits");
+        }
+        for path in &report.paths {
+            if path.as_os_str().len() > 4096 || path.components().count() > 256 {
+                bail!("validation report path exceeds its input limits");
+            }
+            normalize_repo_relative_path(path)
+                .context("validation report path must be repository-relative")?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -2696,27 +2789,44 @@ struct LlmPromptPreviewReport {
 
 fn build_prompt_preview(args: LlmPromptPreviewArgs) -> Result<LlmPromptPreviewReport> {
     let repo = discover_repo_root(&args.repo)?;
-    let task = fs::read_to_string(&args.task_file)
-        .with_context(|| format!("failed to read task file {}", args.task_file.display()))?;
+    let task =
+        BoundedRegularReader::read_tree_no_follow_utf8(&args.task_file, MAX_PROMPT_TASK_BYTES)
+            .with_context(|| format!("failed to read task file {}", args.task_file.display()))?;
     let mut context = PromptContext::new(task, &args.agent_id);
+    if args.paths.len() > MAX_PROMPT_PATHS {
+        bail!("prompt preview exceeds its {MAX_PROMPT_PATHS}-path input limit");
+    }
     let mut claimed_paths = args
         .paths
         .into_iter()
-        .map(normalize_display_path)
-        .collect::<Vec<_>>();
+        .map(normalize_repo_relative_path)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     claimed_paths.sort();
     claimed_paths.dedup();
 
+    let mut excerpt_bytes = 0_usize;
     for path in &claimed_paths {
         context = context.with_claimed_path(path.clone(), "explicit prompt preview path");
-        let full_path = repo.join(path);
-        if full_path.is_file() {
-            let content = fs::read_to_string(&full_path)
-                .with_context(|| format!("failed to read prompt path {}", path.display()))?;
-            context = context.with_repo_excerpt(
-                RepoExcerpt::new(path.clone(), content).with_language(language_for_path(path)),
+        let content = BoundedRegularReader::read_relative_optional_utf8(
+            &repo,
+            path,
+            MAX_PROMPT_EXCERPT_BYTES,
+        )
+        .with_context(|| format!("failed to read prompt path {}", path.display()))?;
+        let Some(content) = content else {
+            continue;
+        };
+        excerpt_bytes = excerpt_bytes
+            .checked_add(content.len())
+            .context("prompt preview excerpt byte count overflowed")?;
+        if excerpt_bytes > MAX_PROMPT_EXCERPT_TOTAL_BYTES {
+            bail!(
+                "prompt preview excerpts exceed their {MAX_PROMPT_EXCERPT_TOTAL_BYTES}-byte aggregate limit"
             );
         }
+        context = context.with_repo_excerpt(
+            RepoExcerpt::new(path.clone(), content).with_language(language_for_path(path)),
+        );
     }
 
     let provider = LlmProviderInfo {
@@ -2730,6 +2840,12 @@ fn build_prompt_preview(args: LlmPromptPreviewArgs) -> Result<LlmPromptPreviewRe
     };
     let prompt = context.assemble_prompt(&Redactor::new());
     let rendered = prompt.render();
+    if rendered.chars().count() > context.budget.max_input_chars {
+        bail!(
+            "prompt preview exceeds its {}-character input budget",
+            context.budget.max_input_chars
+        );
+    }
     let redactions = prompt.redactions.clone();
 
     Ok(LlmPromptPreviewReport {
@@ -2755,8 +2871,9 @@ fn run_agent_from_args(args: RunAgentArgs) -> Result<AgentRunReport> {
         .fake_proposal
         .context("fake provider agent run requires --fake-proposal <proposal.json>")?;
     let proposal = load_fake_proposal(&proposal_path)?;
-    let task = fs::read_to_string(&args.task_file)
-        .with_context(|| format!("failed to read task file {}", args.task_file.display()))?;
+    let task =
+        BoundedRegularReader::read_tree_no_follow_utf8(&args.task_file, MAX_AGENT_TASK_BYTES)
+            .with_context(|| format!("failed to read task file {}", args.task_file.display()))?;
     let request_id = args
         .request_id
         .unwrap_or_else(|| agent::default_request_id(&args.agent_id));
@@ -2793,10 +2910,18 @@ fn run_agent_from_args(args: RunAgentArgs) -> Result<AgentRunReport> {
 }
 
 fn load_fake_proposal(path: &Path) -> Result<WorkProposal> {
-    let contents = fs::read_to_string(path)
+    let contents = BoundedRegularReader::read_tree_no_follow(path, MAX_FAKE_PROPOSAL_BYTES)
         .with_context(|| format!("failed to read fake proposal {}", path.display()))?;
-    serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse fake proposal {}", path.display()))
+    let proposal: WorkProposal = serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse fake proposal {}", path.display()))?;
+    if proposal.commands.len() > MAX_FAKE_PROPOSAL_ITEMS
+        || proposal.patches.len() > MAX_FAKE_PROPOSAL_ITEMS
+        || proposal.notes.len() > MAX_FAKE_PROPOSAL_ITEMS
+        || proposal.rendered_len() > 32 * 1024
+    {
+        bail!("fake proposal exceeds its structural or output budget");
+    }
+    Ok(proposal)
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {

@@ -1,11 +1,21 @@
 use anyhow::{Context, Result};
 use git2::{Repository, Status};
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::{
-    fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+use crate::safe_state::{
+    BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
+    BoundedTreeWalker,
+};
+
+const REPOSITORY_MAP_MAX_DEPTH: usize = 128;
+const REPOSITORY_MAP_MAX_ENTRIES: usize = 100_000;
+const REPOSITORY_MAP_MAX_PATH_BYTES: usize = 4096;
+const REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
+const REPOSITORY_MAP_MAX_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepoMap {
@@ -56,76 +66,65 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
         .context("repository map requires a non-bare repository")?
         .to_path_buf();
 
-    let git_statuses = collect_git_statuses(&repo)?;
-    let mut entries = Vec::new();
-    walk_directory(&root, &root, &git_statuses, &mut entries)?;
+    let inventory = BoundedTreeWalker::walk_with(
+        &root,
+        BoundedTreeWalkLimits {
+            max_depth: REPOSITORY_MAP_MAX_DEPTH,
+            max_entries: REPOSITORY_MAP_MAX_ENTRIES,
+            max_path_bytes: REPOSITORY_MAP_MAX_PATH_BYTES,
+            max_total_path_bytes: REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
+            max_duration: REPOSITORY_MAP_MAX_DURATION,
+            same_device: true,
+        },
+        |entry| {
+            Ok(if is_ignored_path(&entry.relative_path) {
+                BoundedTreeWalkAction::Skip
+            } else if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )?;
+    let deadline = Instant::now()
+        .checked_add(REPOSITORY_MAP_MAX_DURATION)
+        .context("repository status deadline overflowed")?;
+    let entries = inventory
+        .into_iter()
+        .map(|entry| map_inventory_entry(&repo, entry, deadline))
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(RepoMap { root, entries })
 }
 
-fn walk_directory(
-    root: &Path,
-    directory: &Path,
-    git_statuses: &BTreeMap<PathBuf, RepoGitStatus>,
-    entries: &mut Vec<RepoMapEntry>,
-) -> Result<()> {
-    let mut children = fs::read_dir(directory)
-        .with_context(|| format!("failed to read directory {}", directory.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read directory entry in {}", directory.display()))?;
-
-    children.sort_by_key(|entry| entry.file_name());
-
-    for child in children {
-        let path = child.path();
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("failed to relativize {}", path.display()))?
-            .to_path_buf();
-
-        if is_ignored_path(&relative) {
-            continue;
-        }
-
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-        let kind = entry_kind(&metadata);
-        entries.push(RepoMapEntry {
-            path: relative.clone(),
-            kind,
-            size_bytes: size_bytes(&metadata, kind),
-            category: category_for(&relative, kind),
-            git_status: git_status_for(&relative, kind, git_statuses),
-        });
-
-        if kind == RepoEntryKind::Directory {
-            walk_directory(root, &path, git_statuses, entries)?;
-        }
+fn map_inventory_entry(
+    repo: &Repository,
+    entry: BoundedTreeEntry,
+    deadline: Instant,
+) -> Result<RepoMapEntry> {
+    if Instant::now() >= deadline {
+        anyhow::bail!("repository status inspection exceeded its time limit");
     }
-
-    Ok(())
-}
-
-fn collect_git_statuses(repo: &Repository) -> Result<BTreeMap<PathBuf, RepoGitStatus>> {
-    let mut options = git2::StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true);
-    let statuses = repo
-        .statuses(Some(&mut options))
-        .context("failed to inspect repository git status")?;
-    let mut by_path = BTreeMap::new();
-
-    for entry in statuses.iter() {
-        let Some(path) = entry.path() else {
-            continue;
-        };
-        by_path.insert(PathBuf::from(path), classify_git_status(entry.status()));
-    }
-
-    Ok(by_path)
+    let kind = entry_kind(entry.kind);
+    let git_status = match kind {
+        RepoEntryKind::Directory => RepoGitStatus::Directory,
+        RepoEntryKind::Other => RepoGitStatus::Untracked,
+        RepoEntryKind::File | RepoEntryKind::Symlink => {
+            classify_git_status(repo.status_file(&entry.relative_path).with_context(|| {
+                format!(
+                    "failed to inspect Git status for {}",
+                    entry.relative_path.display()
+                )
+            })?)
+        }
+    };
+    Ok(RepoMapEntry {
+        path: entry.relative_path.clone(),
+        kind,
+        size_bytes: size_bytes(&entry, kind),
+        category: category_for(&entry.relative_path, kind),
+        git_status,
+    })
 }
 
 fn classify_git_status(status: Status) -> RepoGitStatus {
@@ -151,37 +150,18 @@ fn classify_git_status(status: Status) -> RepoGitStatus {
     }
 }
 
-fn git_status_for(
-    path: &Path,
-    kind: RepoEntryKind,
-    git_statuses: &BTreeMap<PathBuf, RepoGitStatus>,
-) -> RepoGitStatus {
-    if kind == RepoEntryKind::Directory {
-        return RepoGitStatus::Directory;
-    }
-
-    git_statuses
-        .get(path)
-        .copied()
-        .unwrap_or(RepoGitStatus::Clean)
-}
-
-fn entry_kind(metadata: &fs::Metadata) -> RepoEntryKind {
-    let file_type = metadata.file_type();
-    if file_type.is_dir() {
-        RepoEntryKind::Directory
-    } else if file_type.is_file() {
-        RepoEntryKind::File
-    } else if file_type.is_symlink() {
-        RepoEntryKind::Symlink
-    } else {
-        RepoEntryKind::Other
-    }
-}
-
-fn size_bytes(metadata: &fs::Metadata, kind: RepoEntryKind) -> Option<u64> {
+fn entry_kind(kind: BoundedTreeEntryKind) -> RepoEntryKind {
     match kind {
-        RepoEntryKind::File | RepoEntryKind::Symlink => Some(metadata.len()),
+        BoundedTreeEntryKind::Directory => RepoEntryKind::Directory,
+        BoundedTreeEntryKind::RegularFile => RepoEntryKind::File,
+        BoundedTreeEntryKind::Symlink => RepoEntryKind::Symlink,
+        BoundedTreeEntryKind::Special => RepoEntryKind::Other,
+    }
+}
+
+fn size_bytes(entry: &BoundedTreeEntry, kind: RepoEntryKind) -> Option<u64> {
+    match kind {
+        RepoEntryKind::File | RepoEntryKind::Symlink => Some(entry.size_bytes),
         RepoEntryKind::Directory | RepoEntryKind::Other => None,
     }
 }
@@ -238,6 +218,7 @@ fn category_for(path: &Path, kind: RepoEntryKind) -> String {
 mod tests {
     use super::*;
     use crate::worktree::WorktreeManager;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]
@@ -318,5 +299,32 @@ mod tests {
         assert!(!paths.iter().any(|path| path.starts_with(".agents/temp")));
         assert!(!paths.iter().any(|path| path.starts_with(".agents/storage")));
         assert!(!paths.iter().any(|path| path.starts_with(".agents/live")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_reports_but_never_follows_links_or_special_files() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("secret"), "secret\n").expect("secret");
+        symlink(&outside, repo_path.join("outside-link")).expect("outside link");
+        let _socket = UnixListener::bind(repo_path.join("socket")).expect("socket");
+
+        let map = scan_repository(&repo_path).expect("scan");
+        assert!(map.entries.iter().any(|entry| {
+            entry.path == Path::new("outside-link") && entry.kind == RepoEntryKind::Symlink
+        }));
+        assert!(map.entries.iter().any(|entry| {
+            entry.path == Path::new("socket") && entry.kind == RepoEntryKind::Other
+        }));
+        assert!(!map
+            .entries
+            .iter()
+            .any(|entry| entry.path == Path::new("outside-link/secret")));
     }
 }

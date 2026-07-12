@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs::{self, File},
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
@@ -475,6 +479,294 @@ fn cli_llm_providers_and_prompt_preview_are_network_free_json() -> Result<()> {
         .as_str()
         .context("rendered prompt")?
         .contains("src/lib.rs"));
+
+    Ok(())
+}
+
+#[test]
+fn cli_prompt_preview_refuses_paths_outside_the_repository() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let task_path = temp.path().join("task.md");
+    let secret_path = temp.path().join("outside-secret.txt");
+    fs::write(&task_path, "Inspect the requested path.\n").context("write task")?;
+    fs::write(&secret_path, "PROMPT_PREVIEW_OUTSIDE_SENTINEL\n").context("write secret")?;
+
+    for candidate in [
+        "../outside-secret.txt".to_string(),
+        secret_path.to_string_lossy().into_owned(),
+    ] {
+        let output = Command::new(BIN)
+            .args([
+                "llm",
+                "prompt-preview",
+                task_path.to_str().context("task path utf8")?,
+                "--agent-id",
+                "agent-a",
+                "--path",
+                &candidate,
+                "--repo",
+                repo_path.to_str().context("repo path utf8")?,
+                "--json",
+            ])
+            .output()
+            .context("run prompt preview")?;
+        assert!(!output.status.success());
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("PROMPT_PREVIEW_OUTSIDE_SENTINEL")
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("PROMPT_PREVIEW_OUTSIDE_SENTINEL")
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn cli_prompt_preview_preserves_directory_and_planned_file_scopes() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let task_path = temp.path().join("task.md");
+    fs::write(&task_path, "新しいファイルを追加します。\n").context("write task")?;
+
+    let preview = run_success_json([
+        "llm",
+        "prompt-preview",
+        task_path.to_str().context("task path utf8")?,
+        "--agent-id",
+        "agent-a",
+        "--path",
+        "src",
+        "--path",
+        "src/planned.rs",
+        "--repo",
+        repo_path.to_str().context("repo path utf8")?,
+        "--json",
+    ])?;
+
+    let claimed_paths = preview["claimed_paths"]
+        .as_array()
+        .context("claimed paths")?;
+    assert!(claimed_paths.iter().any(|path| path == "src"));
+    assert!(claimed_paths.iter().any(|path| path == "src/planned.rs"));
+    assert!(preview["rendered"]
+        .as_str()
+        .context("rendered prompt")?
+        .contains("新しいファイルを追加します"));
+
+    Ok(())
+}
+
+#[test]
+fn bounded_external_cli_inputs_fail_before_creating_work() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let oversized = temp.path().join("oversized-input");
+    File::create(&oversized)
+        .context("create oversized input")?
+        .set_len(64 * 1024 * 1024 + 1)
+        .context("size oversized input")?;
+    let task = temp.path().join("task.md");
+    fs::write(&task, "Update README\n").context("task")?;
+
+    for args in [
+        vec![
+            "consult",
+            "ask",
+            "--question-file",
+            oversized.to_str().context("oversized path utf8")?,
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--json",
+        ],
+        vec![
+            "issue",
+            "preview",
+            "--title",
+            "bounded input",
+            "--body-file",
+            oversized.to_str().context("oversized path utf8")?,
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--json",
+        ],
+        vec![
+            "orchestrate",
+            "collect",
+            oversized.to_str().context("oversized path utf8")?,
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--json",
+        ],
+        vec![
+            "agent",
+            "run",
+            task.to_str().context("task path utf8")?,
+            "--agent-id",
+            "bounded-agent",
+            "--path",
+            "README.md",
+            "--fake-proposal",
+            oversized.to_str().context("oversized path utf8")?,
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--json",
+        ],
+    ] {
+        let output = Command::new(BIN)
+            .args(args)
+            .output()
+            .context("run bounded input")?;
+        assert!(!output.status.success());
+    }
+
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    assert!(repo
+        .find_branch("maco/bounded-agent", git2::BranchType::Local)
+        .is_err());
+    assert!(!repo_path.join(".maco/consult").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn external_cli_file_inputs_refuse_symlink_leafs_before_work() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let question = temp.path().join("question.md");
+    let issue = temp.path().join("issue.md");
+    let summary = temp.path().join("summary.json");
+    let task = temp.path().join("task.md");
+    let proposal = temp.path().join("proposal.json");
+    fs::write(&question, "What changed?\n").context("question")?;
+    fs::write(&issue, "Issue body\n").context("issue")?;
+    fs::write(&summary, "{\"agents\": []}\n").context("summary")?;
+    fs::write(&task, "Update README\n").context("task")?;
+    fs::write(
+        &proposal,
+        "{\"summary\":\"noop\",\"commands\":[],\"patches\":[],\"notes\":[]}",
+    )
+    .context("proposal")?;
+    let question_link = temp.path().join("question-link");
+    let issue_link = temp.path().join("issue-link");
+    let summary_link = temp.path().join("summary-link");
+    let task_link = temp.path().join("task-link");
+    let proposal_link = temp.path().join("proposal-link");
+    symlink(&question, &question_link).context("question link")?;
+    symlink(&issue, &issue_link).context("issue link")?;
+    symlink(&summary, &summary_link).context("summary link")?;
+    symlink(&task, &task_link).context("task link")?;
+    symlink(&proposal, &proposal_link).context("proposal link")?;
+
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let cases = [
+        vec![
+            "consult",
+            "ask",
+            "--question-file",
+            question_link.to_str().context("question link utf8")?,
+            "--repo",
+            repo,
+            "--json",
+        ],
+        vec![
+            "issue",
+            "preview",
+            "--title",
+            "link",
+            "--body-file",
+            issue_link.to_str().context("issue link utf8")?,
+            "--repo",
+            repo,
+            "--json",
+        ],
+        vec![
+            "orchestrate",
+            "collect",
+            summary_link.to_str().context("summary link utf8")?,
+            "--repo",
+            repo,
+            "--json",
+        ],
+        vec![
+            "agent",
+            "run",
+            task.to_str().context("task utf8")?,
+            "--agent-id",
+            "proposal-link-agent",
+            "--path",
+            "README.md",
+            "--fake-proposal",
+            proposal_link.to_str().context("proposal link utf8")?,
+            "--repo",
+            repo,
+            "--json",
+        ],
+        vec![
+            "agent",
+            "run",
+            task_link.to_str().context("task link utf8")?,
+            "--agent-id",
+            "task-link-agent",
+            "--path",
+            "README.md",
+            "--fake-proposal",
+            proposal.to_str().context("proposal utf8")?,
+            "--repo",
+            repo,
+            "--json",
+        ],
+    ];
+    for args in cases {
+        let output = Command::new(BIN)
+            .args(args)
+            .output()
+            .context("run link input")?;
+        assert!(!output.status.success());
+    }
+
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    for branch in ["maco/proposal-link-agent", "maco/task-link-agent"] {
+        assert!(repo.find_branch(branch, git2::BranchType::Local).is_err());
+    }
+    assert!(!repo_path.join(".maco/consult").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_prompt_preview_refuses_symlinked_repository_excerpts() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let task_path = temp.path().join("task.md");
+    let secret_path = temp.path().join("symlink-secret.txt");
+    fs::write(&task_path, "Inspect the requested path.\n").context("write task")?;
+    fs::write(&secret_path, "PROMPT_PREVIEW_SYMLINK_SENTINEL\n").context("write secret")?;
+    symlink(&secret_path, repo_path.join("secret-link.txt")).context("create leaf symlink")?;
+
+    let output = Command::new(BIN)
+        .args([
+            "llm",
+            "prompt-preview",
+            task_path.to_str().context("task path utf8")?,
+            "--agent-id",
+            "agent-a",
+            "--path",
+            "secret-link.txt",
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--json",
+        ])
+        .output()
+        .context("run prompt preview")?;
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("PROMPT_PREVIEW_SYMLINK_SENTINEL"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("PROMPT_PREVIEW_SYMLINK_SENTINEL"));
 
     Ok(())
 }

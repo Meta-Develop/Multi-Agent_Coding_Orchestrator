@@ -20,6 +20,10 @@ use crate::{
     review::{
         self, ReviewPrOptions, ReviewReport, ReviewReportStatus, ReviewerConfig, ReviewerMode,
     },
+    safe_state::{
+        BoundedRegularReader, BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction,
+        BoundedTreeWalkLimits, BoundedTreeWalker,
+    },
     semantic_coord::SemanticIntentStore,
     supervise::{
         self, AgentRole, FindingSeverity, OrchestratorAssignment, ReviewStatus,
@@ -31,7 +35,7 @@ use crate::{
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
-use git2::{Repository, StatusOptions};
+use git2::Repository;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -52,6 +56,25 @@ const VALIDATION_OUTPUT_LIMIT: usize = 8 * 1024;
 const VALIDATION_CAPTURE_LIMIT_BYTES: usize = VALIDATION_OUTPUT_LIMIT * 4;
 const AUTOPILOT_MESSAGE_LIMIT_CHARS: usize = 8 * 1024;
 const ARTIFACT_FINAL_MARKER: &str = ".maco-artifact-final.json";
+const AUTOPILOT_PLAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const AUTOPILOT_TASK_MAX_BYTES: usize = 256 * 1024;
+const AUTOPILOT_MAX_PATHS: usize = 4096;
+const AUTOPILOT_MAX_SEMANTIC_ITEMS: usize = 4096;
+const AUTOPILOT_MAX_VALIDATION_COMMANDS: usize = 128;
+const AUTOPILOT_MAX_REPAIR_ATTEMPTS: usize = 2;
+const AUTOPILOT_MAX_PATH_BYTES: usize = 4096;
+const AUTOPILOT_MAX_PATH_COMPONENTS: usize = 256;
+const AUTOPILOT_MAX_STRING_BYTES: usize = 256 * 1024;
+const AUTOPILOT_MAX_REVIEWER_ARGS: usize = 256;
+const AUTOPILOT_MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const AUTOPILOT_STATUS_MAX_DEPTH: usize = 128;
+const AUTOPILOT_STATUS_MAX_ENTRIES: usize = 100_000;
+const AUTOPILOT_STATUS_MAX_PATH_BYTES: usize = 4096;
+const AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
+const AUTOPILOT_STATUS_MAX_DURATION: Duration = Duration::from_secs(10);
+const AUTOPILOT_ACTIVE_ARTIFACT_MAX_ENTRIES: usize = 256;
+const AUTOPILOT_ACTIVE_ARTIFACT_MAX_TOTAL_PATH_BYTES: usize = 1024 * 1024;
+const AUTOPILOT_ACTIVE_ARTIFACT_MAX_DURATION: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct AutopilotRunOptions {
@@ -405,10 +428,27 @@ pub fn autopilot_plan_from_task_file(
 ) -> Result<AutopilotPlan> {
     let repo = discover_repo_root(repo.as_ref())?;
     let task_file = task_file.as_ref();
-    let contents = fs::read_to_string(task_file)
-        .with_context(|| format!("failed to read autopilot task file {}", task_file.display()))?;
-    if let Ok(plan) = serde_json::from_str::<AutopilotPlan>(&contents) {
-        return validate_autopilot_plan(&repo, plan);
+    let contents =
+        BoundedRegularReader::read_tree_no_follow_utf8(task_file, AUTOPILOT_PLAN_MAX_BYTES)
+            .with_context(|| {
+                format!("failed to read autopilot task file {}", task_file.display())
+            })?;
+    match serde_json::from_str::<AutopilotPlan>(&contents) {
+        Ok(plan) => return validate_autopilot_plan(&repo, plan),
+        Err(error)
+            if matches!(
+                contents.trim_start().as_bytes().first(),
+                Some(b'{') | Some(b'[')
+            ) =>
+        {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to parse JSON-looking autopilot plan {}",
+                    task_file.display()
+                )
+            });
+        }
+        Err(_) => {}
     }
 
     validate_autopilot_plan(
@@ -785,7 +825,7 @@ pub fn autopilot_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Autopil
     let repo = discover_repo_root(repo.as_ref())?;
     let (artifacts, final_report) = match autopilot_artifact_run_state(&repo, &run_id)? {
         ArtifactRunState::Missing => (empty_artifact_status(), None),
-        ArtifactRunState::Active(run_dir) => (unfinalized_artifact_status(&run_dir)?, None),
+        ArtifactRunState::Active(artifacts) => (artifacts, None),
         ArtifactRunState::Finalized(reader) => {
             let final_report = Some(read_artifact_json(&reader, "final-report.json")?);
             (artifact_status(&reader), final_report)
@@ -821,6 +861,7 @@ fn validate_autopilot_plan(repo: &Path, mut plan: AutopilotPlan) -> Result<Autop
     if plan.version != AUTOPILOT_SCHEMA_VERSION {
         bail!("unsupported autopilot plan version {}", plan.version);
     }
+    validate_autopilot_plan_bounds(&plan)?;
     plan.task.title = plan.task.title.trim().to_string();
     plan.task.body = plan.task.body.trim().to_string();
     if plan.task.title.is_empty() {
@@ -861,6 +902,11 @@ fn validate_autopilot_plan(repo: &Path, mut plan: AutopilotPlan) -> Result<Autop
                 index + 1
             );
         }
+        command.timeout_seconds = Some(
+            command
+                .timeout_seconds
+                .unwrap_or(DEFAULT_CHILD_TIMEOUT_SECONDS),
+        );
         command.name = command
             .name
             .take()
@@ -868,6 +914,116 @@ fn validate_autopilot_plan(repo: &Path, mut plan: AutopilotPlan) -> Result<Autop
             .filter(|name| !name.is_empty());
     }
     Ok(plan)
+}
+
+fn validate_autopilot_plan_bounds(plan: &AutopilotPlan) -> Result<()> {
+    validate_autopilot_string(&plan.task.title, AUTOPILOT_TASK_MAX_BYTES, "task title")?;
+    validate_autopilot_string(&plan.task.body, AUTOPILOT_TASK_MAX_BYTES, "task body")?;
+    if plan.assigned_paths.len() > AUTOPILOT_MAX_PATHS {
+        bail!("autopilot plan exceeds its assigned-path count limit");
+    }
+    for path in &plan.assigned_paths {
+        validate_autopilot_path(path, "assigned path")?;
+    }
+    if plan.semantic_symbols.len() > AUTOPILOT_MAX_SEMANTIC_ITEMS
+        || plan.semantic_modules.len() > AUTOPILOT_MAX_SEMANTIC_ITEMS
+        || plan.path_proposal.notes.len() > AUTOPILOT_MAX_SEMANTIC_ITEMS
+    {
+        bail!("autopilot plan exceeds its semantic or diagnostic item limit");
+    }
+    for value in plan
+        .semantic_symbols
+        .iter()
+        .chain(plan.semantic_modules.iter())
+        .chain(plan.path_proposal.notes.iter())
+    {
+        validate_autopilot_string(value, AUTOPILOT_MAX_STRING_BYTES, "plan string")?;
+    }
+    if plan.validation_commands.len() > AUTOPILOT_MAX_VALIDATION_COMMANDS {
+        bail!("autopilot plan exceeds its validation-command count limit");
+    }
+    for command in &plan.validation_commands {
+        if let Some(name) = &command.name {
+            validate_autopilot_string(name, AUTOPILOT_MAX_STRING_BYTES, "validation name")?;
+        }
+        validate_autopilot_string(
+            &command.command,
+            AUTOPILOT_MAX_STRING_BYTES,
+            "validation command",
+        )?;
+        if command
+            .timeout_seconds
+            .is_some_and(|seconds| seconds == 0 || seconds > AUTOPILOT_MAX_TIMEOUT_SECONDS)
+        {
+            bail!("autopilot validation timeout exceeds its safety limit");
+        }
+    }
+    if plan.max_repair_attempts > AUTOPILOT_MAX_REPAIR_ATTEMPTS {
+        bail!(
+            "autopilot max_repair_attempts exceeds its {AUTOPILOT_MAX_REPAIR_ATTEMPTS}-attempt limit"
+        );
+    }
+    if plan.reviewer.blocking_attempts > AUTOPILOT_MAX_REPAIR_ATTEMPTS.saturating_add(1)
+        || plan.reviewer.args.len() > AUTOPILOT_MAX_REVIEWER_ARGS
+        || plan
+            .reviewer
+            .timeout_seconds
+            .is_some_and(|seconds| seconds == 0 || seconds > AUTOPILOT_MAX_TIMEOUT_SECONDS)
+    {
+        bail!("autopilot reviewer configuration exceeds its safety limits");
+    }
+    if let Some(program) = &plan.reviewer.program {
+        validate_autopilot_path_shape(program, "reviewer program")?;
+    }
+    if let Some(command) = &plan.reviewer.command {
+        validate_autopilot_string(command, AUTOPILOT_MAX_STRING_BYTES, "reviewer command")?;
+    }
+    let mut reviewer_arg_bytes = 0_usize;
+    for argument in &plan.reviewer.args {
+        validate_autopilot_string(argument, AUTOPILOT_MAX_STRING_BYTES, "reviewer argument")?;
+        reviewer_arg_bytes = reviewer_arg_bytes
+            .checked_add(argument.len())
+            .context("reviewer argument byte count overflowed")?;
+        if reviewer_arg_bytes > AUTOPILOT_MAX_STRING_BYTES {
+            bail!("autopilot reviewer arguments exceed their aggregate byte limit");
+        }
+    }
+    if let Some(finding) = &plan.reviewer.finding {
+        for (value, label) in [
+            (&finding.severity, "review finding severity"),
+            (&finding.summary, "review finding summary"),
+            (&finding.suggested_fix, "review finding suggested fix"),
+        ] {
+            validate_autopilot_string(value, AUTOPILOT_MAX_STRING_BYTES, label)?;
+        }
+        if let Some(path) = &finding.path {
+            validate_autopilot_path(path, "review finding path")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_autopilot_string(value: &str, max_bytes: usize, label: &str) -> Result<()> {
+    if value.len() > max_bytes {
+        bail!("autopilot {label} exceeds its {max_bytes}-byte limit");
+    }
+    Ok(())
+}
+
+fn validate_autopilot_path(path: &Path, label: &str) -> Result<()> {
+    validate_autopilot_path_shape(path, label)?;
+    normalize_repo_relative_path(path)
+        .with_context(|| format!("autopilot {label} is not repository-relative"))?;
+    Ok(())
+}
+
+fn validate_autopilot_path_shape(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().len() > AUTOPILOT_MAX_PATH_BYTES
+        || path.components().count() > AUTOPILOT_MAX_PATH_COMPONENTS
+    {
+        bail!("autopilot {label} exceeds its path byte or component limit");
+    }
+    Ok(())
 }
 
 fn safety_report(
@@ -1690,15 +1846,7 @@ fn prepared_candidate_from_report(
 }
 
 fn repository_worktree_is_clean(worktree: &Path) -> Result<bool> {
-    let repo = Repository::open(worktree)
-        .with_context(|| format!("failed to open prepared worktree {}", worktree.display()))?;
-    let mut options = StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_ignored(false);
-    let clean = repo.statuses(Some(&mut options))?.is_empty();
-    Ok(clean)
+    Ok(bounded_repository_dirty_paths(worktree)?.is_empty())
 }
 
 fn verify_publication_receipt(
@@ -2179,18 +2327,54 @@ fn artifact_status(reader: &ArtifactRunReader) -> AutopilotArtifactStatus {
 
 enum ArtifactRunState {
     Missing,
-    Active(PathBuf),
+    Active(AutopilotArtifactStatus),
     Finalized(Box<ArtifactRunReader>),
 }
 
 fn autopilot_artifact_run_state(repo: &Path, run_id: &RunId) -> Result<ArtifactRunState> {
-    let Some(run_dir) =
-        verified_unfinalized_run_dir(repo, &[".maco", "autopilot", "runs", run_id.as_str()])?
-    else {
-        return Ok(ArtifactRunState::Missing);
-    };
-    if !known_regular_file_exists(&run_dir, ARTIFACT_FINAL_MARKER)? {
-        return Ok(ArtifactRunState::Active(run_dir));
+    let run_dir = repo
+        .join(".maco")
+        .join("autopilot")
+        .join("runs")
+        .join(run_id.as_str());
+    match fs::symlink_metadata(&run_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArtifactRunState::Missing);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect artifact directory {}", run_dir.display())
+            });
+        }
+        Ok(_) => {}
+    }
+    let inventory = BoundedTreeWalker::walk_with(
+        &run_dir,
+        BoundedTreeWalkLimits {
+            max_depth: 2,
+            max_entries: AUTOPILOT_ACTIVE_ARTIFACT_MAX_ENTRIES,
+            max_path_bytes: AUTOPILOT_STATUS_MAX_PATH_BYTES,
+            max_total_path_bytes: AUTOPILOT_ACTIVE_ARTIFACT_MAX_TOTAL_PATH_BYTES,
+            max_duration: AUTOPILOT_ACTIVE_ARTIFACT_MAX_DURATION,
+            same_device: true,
+        },
+        |_entry| Ok(BoundedTreeWalkAction::Record),
+    )?;
+    for entry in &inventory {
+        if matches!(
+            entry.kind,
+            BoundedTreeEntryKind::Symlink | BoundedTreeEntryKind::Special
+        ) || (entry.kind == BoundedTreeEntryKind::RegularFile && !entry.is_safe_regular_file())
+        {
+            bail!(
+                "artifact entry is not a safe direct file or directory: {}",
+                run_dir.join(&entry.relative_path).display()
+            );
+        }
+    }
+    let artifacts = artifact_status_from_inventory(&inventory)?;
+    if !known_regular_file_exists(&inventory, ARTIFACT_FINAL_MARKER)? {
+        return Ok(ArtifactRunState::Active(artifacts));
     }
     let reader =
         ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, run_id).with_context(|| {
@@ -2202,43 +2386,27 @@ fn autopilot_artifact_run_state(repo: &Path, run_id: &RunId) -> Result<ArtifactR
     Ok(ArtifactRunState::Finalized(Box::new(reader)))
 }
 
-fn verified_unfinalized_run_dir(repo: &Path, components: &[&str]) -> Result<Option<PathBuf>> {
-    let mut current = repo.to_path_buf();
-    for component in components {
-        current.push(component);
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to inspect artifact directory {}", current.display())
-                })
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!(
-                "artifact directory is not a direct non-link directory: {}",
-                current.display()
-            );
-        }
+fn known_regular_file_exists(entries: &[BoundedTreeEntry], name: &str) -> Result<bool> {
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.relative_path == Path::new(name))
+    else {
+        return Ok(false);
+    };
+    if !entry.is_safe_regular_file() {
+        bail!("artifact entry '{name}' is not a safe direct regular file");
     }
-    Ok(Some(current))
+    Ok(true)
 }
 
-fn known_regular_file_exists(run_dir: &Path, name: &str) -> Result<bool> {
-    let path = run_dir.join(name);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            bail!(
-                "artifact entry is not a direct regular file: {}",
-                path.display()
-            )
-        }
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to inspect artifact file {}", path.display())),
-    }
+fn artifact_status_from_inventory(entries: &[BoundedTreeEntry]) -> Result<AutopilotArtifactStatus> {
+    Ok(AutopilotArtifactStatus {
+        plan: known_regular_file_exists(entries, "plan.json")?,
+        supervisor_report: known_regular_file_exists(entries, "supervisor-report.json")?,
+        pr_report: known_regular_file_exists(entries, "pr-report.json")?,
+        review_report: known_regular_file_exists(entries, "review-report.json")?,
+        final_report: known_regular_file_exists(entries, "final-report.json")?,
+    })
 }
 
 fn empty_artifact_status() -> AutopilotArtifactStatus {
@@ -2249,20 +2417,6 @@ fn empty_artifact_status() -> AutopilotArtifactStatus {
         review_report: false,
         final_report: false,
     }
-}
-
-fn unfinalized_artifact_status(run_dir: &Path) -> Result<AutopilotArtifactStatus> {
-    let status = AutopilotArtifactStatus {
-        plan: known_regular_file_exists(run_dir, "plan.json")?,
-        supervisor_report: known_regular_file_exists(run_dir, "supervisor-report.json")?,
-        pr_report: known_regular_file_exists(run_dir, "pr-report.json")?,
-        review_report: known_regular_file_exists(run_dir, "review-report.json")?,
-        final_report: known_regular_file_exists(run_dir, "final-report.json")?,
-    };
-    if known_regular_file_exists(run_dir, ARTIFACT_FINAL_MARKER)? {
-        bail!("artifact run finalized while active status was being inspected; retry status");
-    }
-    Ok(status)
 }
 
 fn write_skipped_stage_reports(writer: &mut ArtifactRunWriter, reason: &str) -> Result<()> {
@@ -2322,19 +2476,123 @@ fn read_artifact_json(reader: &ArtifactRunReader, relative: impl AsRef<Path>) ->
 fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
     let repo = Repository::open(repo_path)
         .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
-    let mut options = StatusOptions::new();
-    options.include_untracked(true).recurse_untracked_dirs(true);
-    let statuses = repo
-        .statuses(Some(&mut options))
-        .context("failed to inspect primary worktree status")?;
-    let mut paths = statuses
-        .iter()
-        .filter_map(|entry| entry.path().map(PathBuf::from))
-        .filter(|path| !is_local_runtime_path(path))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    let workdir = repo
+        .workdir()
+        .context("repository status requires a non-bare worktree")?;
+    bounded_repository_dirty_paths(workdir)
+}
+
+fn bounded_repository_dirty_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
+    let root = repo
+        .workdir()
+        .context("repository status requires a non-bare worktree")?;
+    let inventory = BoundedTreeWalker::walk_with(
+        root,
+        BoundedTreeWalkLimits {
+            max_depth: AUTOPILOT_STATUS_MAX_DEPTH,
+            max_entries: AUTOPILOT_STATUS_MAX_ENTRIES,
+            max_path_bytes: AUTOPILOT_STATUS_MAX_PATH_BYTES,
+            max_total_path_bytes: AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES,
+            max_duration: AUTOPILOT_STATUS_MAX_DURATION,
+            same_device: true,
+        },
+        |entry| {
+            let path = &entry.relative_path;
+            if path == Path::new(".git")
+                || path.starts_with(".git")
+                || is_local_runtime_path(path)
+                || repo.status_should_ignore(path).unwrap_or(false)
+            {
+                return Ok(BoundedTreeWalkAction::Skip);
+            }
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )?;
+    let mut candidates = inventory
+        .into_iter()
+        .filter(|entry| entry.kind != BoundedTreeEntryKind::Directory)
+        .map(|entry| {
+            let kind = if entry.kind == BoundedTreeEntryKind::RegularFile
+                && !entry.is_safe_regular_file()
+            {
+                BoundedTreeEntryKind::Special
+            } else {
+                entry.kind
+            };
+            (entry.relative_path, kind)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let index = repo.index().context("failed to open repository index")?;
+    if index.len() > AUTOPILOT_STATUS_MAX_ENTRIES {
+        bail!("repository index exceeds the bounded status entry limit");
+    }
+    let index_deadline = std::time::Instant::now()
+        .checked_add(AUTOPILOT_STATUS_MAX_DURATION)
+        .context("repository index deadline overflowed")?;
+    let mut index_path_bytes = 0_usize;
+    for entry in index.iter() {
+        if std::time::Instant::now() >= index_deadline {
+            bail!("repository index inspection exceeded its time limit");
+        }
+        if entry.path.len() > AUTOPILOT_STATUS_MAX_PATH_BYTES {
+            bail!("repository index path exceeds the bounded status path limit");
+        }
+        index_path_bytes = index_path_bytes
+            .checked_add(entry.path.len())
+            .context("repository index path byte count overflowed")?;
+        if index_path_bytes > AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES {
+            bail!("repository index paths exceed the bounded status aggregate limit");
+        }
+        let path = git_index_path(&entry.path)?;
+        let path = normalize_repo_relative_path(&path)?;
+        if !is_local_runtime_path(&path) {
+            candidates
+                .entry(path)
+                .or_insert(BoundedTreeEntryKind::RegularFile);
+        }
+    }
+    if candidates.len() > AUTOPILOT_STATUS_MAX_ENTRIES {
+        bail!("repository status candidate set exceeds its entry limit");
+    }
+    let deadline = std::time::Instant::now()
+        .checked_add(AUTOPILOT_STATUS_MAX_DURATION)
+        .context("repository status deadline overflowed")?;
+    let mut dirty = Vec::new();
+    for (path, kind) in candidates {
+        if std::time::Instant::now() >= deadline {
+            bail!("repository status inspection exceeded its time limit");
+        }
+        if kind == BoundedTreeEntryKind::Special {
+            dirty.push(path);
+            continue;
+        }
+        let status = repo.status_file(&path).with_context(|| {
+            format!("failed to inspect repository status for {}", path.display())
+        })?;
+        if !status.is_empty() && !status.contains(git2::Status::IGNORED) {
+            dirty.push(path);
+        }
+    }
+    Ok(dirty)
+}
+
+#[cfg(unix)]
+fn git_index_path(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn git_index_path(bytes: &[u8]) -> Result<PathBuf> {
+    String::from_utf8(bytes.to_vec())
+        .map(PathBuf::from)
+        .context("repository index path is not valid UTF-8")
 }
 
 fn is_local_runtime_path(path: &Path) -> bool {
@@ -2584,10 +2842,149 @@ mod tests {
     use crate::worktree::WorktreeCreateOptions;
     use std::{
         cell::{Cell, RefCell},
+        fs::File,
         sync::mpsc,
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn autopilot_plan_input_is_bounded_nofollow_and_json_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").expect("init repo");
+
+        let malformed = temp.path().join("malformed.json");
+        fs::write(&malformed, "{\"version\": 1,").expect("malformed plan");
+        let error = autopilot_plan_from_task_file(&repo, &malformed)
+            .expect_err("JSON-looking malformed plan must not become plain text");
+        assert!(format!("{error:#}").contains("JSON-looking"));
+
+        let oversized = temp.path().join("oversized.plan");
+        File::create(&oversized)
+            .expect("oversized file")
+            .set_len(AUTOPILOT_PLAN_MAX_BYTES + 1)
+            .expect("set oversized length");
+        let error = autopilot_plan_from_task_file(&repo, &oversized)
+            .expect_err("oversized plan must fail before parsing");
+        assert!(format!("{error:#}").contains("bounded read limit"));
+        assert!(!repo.join(".maco/autopilot").exists());
+    }
+
+    #[test]
+    fn autopilot_plan_bounds_attempts_and_defaults_validation_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").expect("init repo");
+        fs::write(repo.join("README.md"), "# Test\n").expect("readme");
+        let plan_path = temp.path().join("plan.json");
+        fs::write(
+            &plan_path,
+            r#"{
+              "version": 1,
+              "task": {"title": "Test", "body": "Test"},
+              "assigned_paths": ["README.md"],
+              "validation_commands": ["true"],
+              "max_repair_attempts": 2
+            }"#,
+        )
+        .expect("plan");
+        let plan = autopilot_plan_from_task_file(&repo, &plan_path).expect("bounded plan");
+        assert_eq!(
+            plan.validation_commands[0].timeout_seconds,
+            Some(DEFAULT_CHILD_TIMEOUT_SECONDS)
+        );
+
+        fs::write(
+            &plan_path,
+            r#"{
+              "version": 1,
+              "task": {"title": "Test", "body": "Test"},
+              "assigned_paths": ["README.md"],
+              "max_repair_attempts": 3
+            }"#,
+        )
+        .expect("excessive plan");
+        let error = autopilot_plan_from_task_file(&repo, &plan_path)
+            .expect_err("excessive repair attempts must fail");
+        assert!(format!("{error:#}").contains("max_repair_attempts"));
+        assert!(!repo.join(".maco/autopilot").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autopilot_plan_input_refuses_symlink_leaf_and_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").expect("init repo");
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input).expect("input directory");
+        fs::write(input.join("task.md"), "Update README\n").expect("task");
+        symlink(input.join("task.md"), temp.path().join("task-link.md")).expect("leaf link");
+        symlink(&input, temp.path().join("input-link")).expect("ancestor link");
+
+        for path in [
+            temp.path().join("task-link.md"),
+            temp.path().join("input-link/task.md"),
+        ] {
+            assert!(autopilot_plan_from_task_file(&repo, path).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_repository_status_detects_present_deleted_and_untracked_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _manager) = create_managed_worktree_fixture(temp.path(), "status-agent");
+        assert!(bounded_repository_dirty_paths(&repo)
+            .expect("clean status")
+            .is_empty());
+
+        fs::create_dir_all(repo.join(".maco/runtime")).expect("runtime dir");
+        fs::write(repo.join(".maco/runtime/ignored"), "ignored\n").expect("runtime file");
+        fs::write(repo.join("untracked.txt"), "untracked\n").expect("untracked");
+        let dirty = bounded_repository_dirty_paths(&repo).expect("untracked status");
+        assert_eq!(dirty, vec![PathBuf::from("untracked.txt")]);
+
+        fs::remove_file(repo.join("untracked.txt")).expect("remove untracked");
+        fs::hard_link(repo.join("README.md"), repo.join("linked-readme"))
+            .expect("tracked-file hard link");
+        let dirty = bounded_repository_dirty_paths(&repo).expect("hard-linked status");
+        assert_eq!(
+            dirty,
+            vec![PathBuf::from("README.md"), PathBuf::from("linked-readme")]
+        );
+        fs::remove_file(repo.join("linked-readme")).expect("remove hard link");
+
+        fs::remove_file(repo.join("README.md")).expect("remove tracked");
+        let dirty = bounded_repository_dirty_paths(&repo).expect("deleted status");
+        assert_eq!(dirty, vec![PathBuf::from("README.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_artifact_status_uses_nofollow_inventory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").expect("init repo");
+        let run_id = RunId::new("active-inventory").expect("run id");
+        let run_dir = repo.join(".maco/autopilot/runs/active-inventory");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("plan.json"), "{}\n").expect("plan");
+
+        let status = autopilot_status(&repo, run_id.clone()).expect("active status");
+        assert!(status.artifacts.plan);
+        assert!(!status.artifacts.final_report);
+
+        fs::remove_file(run_dir.join("plan.json")).expect("remove plan");
+        let outside = temp.path().join("outside-plan");
+        fs::write(&outside, "{}\n").expect("outside plan");
+        symlink(&outside, run_dir.join("plan.json")).expect("plan link");
+        assert!(autopilot_status(&repo, run_id).is_err());
+    }
 
     fn create_managed_worktree_fixture(root: &Path, agent_id: &str) -> (PathBuf, WorktreeManager) {
         let repo_path = root.join("repo");

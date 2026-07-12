@@ -225,6 +225,15 @@ worktrees and path-claim checks, but it is not an OS or filesystem sandbox.
 Path claims enforce Git-visible repository changes; they do not prevent a
 trusted command from reading or writing arbitrary local filesystem paths.
 
+File-backed CLI inputs are opened as bounded regular files without following
+links in any path component. Multiply linked files, special files, and inputs
+that exceed their command-specific size or structural limits are refused before
+worktrees, claims, or run artifacts are created. Repository discovery for task
+planning, prompt excerpts, repository maps, and Autopilot dirty-state checks is
+also depth-, entry-, path-, byte-, and time-bounded. Prompt excerpt paths must
+be repository-relative; a missing path or directory may still be named as a
+claim scope, but neither is read as prompt content.
+
 Default linked worktrees are created outside the repository at
 `../.maco/worktrees/<repo-name>/<agent-id>`.
 
@@ -1216,6 +1225,11 @@ paths, and lock details such as owner, sync or semantic token, or live claim id
 when available. It also relies on the existing supervise and PR safety gates for
 stale/dirty child worktree reuse and unclaimed edits. Blocking review findings
 or failed validation trigger repair attempts up to `max_repair_attempts`.
+Autopilot accepts at most two repair attempts and 128 validation commands. An
+omitted validation timeout defaults to 600 seconds; explicit timeouts must be
+between 1 and 86400 seconds. Plan files and nested task, path, semantic, review,
+and command collections are bounded and validated before a run directory or
+worker is created.
 External finding summaries, suggested fixes, next actions, diagnostics, and
 finding paths remain available in bounded review artifacts but are never copied
 into a later supervisor task. Retry prompts contain only a parent-selected

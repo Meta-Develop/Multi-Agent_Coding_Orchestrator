@@ -1,12 +1,23 @@
-use crate::{repo_semantic, sync::normalize_repo_relative_path};
-use anyhow::{Context, Result};
+use crate::{
+    repo_semantic,
+    safe_state::{
+        BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits, BoundedTreeWalker,
+    },
+};
+use anyhow::Result;
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
+
+const REPOSITORY_INVENTORY_MAX_DEPTH: usize = 128;
+const REPOSITORY_INVENTORY_MAX_ENTRIES: usize = 100_000;
+const REPOSITORY_INVENTORY_MAX_PATH_BYTES: usize = 4096;
+const REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
+const REPOSITORY_INVENTORY_MAX_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TaskPathProposalDiagnostics {
@@ -282,50 +293,51 @@ fn normalize_text(text: &str) -> String {
 }
 
 fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
     let git_repo = Repository::open(repo).ok();
-    collect_repo_files_from(repo, repo, git_repo.as_ref(), &mut files)?;
+    let inventory = BoundedTreeWalker::walk_with(
+        repo,
+        BoundedTreeWalkLimits {
+            max_depth: REPOSITORY_INVENTORY_MAX_DEPTH,
+            max_entries: REPOSITORY_INVENTORY_MAX_ENTRIES,
+            max_path_bytes: REPOSITORY_INVENTORY_MAX_PATH_BYTES,
+            max_total_path_bytes: REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
+            max_duration: REPOSITORY_INVENTORY_MAX_DURATION,
+            same_device: true,
+        },
+        |entry| {
+            let path = &entry.relative_path;
+            if is_runtime_path(path) || is_ignored_path(git_repo.as_ref(), path) {
+                return Ok(BoundedTreeWalkAction::Skip);
+            }
+            Ok(match entry.kind {
+                BoundedTreeEntryKind::Directory => {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    if should_skip_dir(name) {
+                        BoundedTreeWalkAction::Skip
+                    } else {
+                        BoundedTreeWalkAction::RecordAndDescend
+                    }
+                }
+                BoundedTreeEntryKind::RegularFile if entry.is_safe_regular_file() => {
+                    BoundedTreeWalkAction::Record
+                }
+                BoundedTreeEntryKind::RegularFile
+                | BoundedTreeEntryKind::Symlink
+                | BoundedTreeEntryKind::Special => BoundedTreeWalkAction::Skip,
+            })
+        },
+    )?;
+    let mut files = inventory
+        .into_iter()
+        .filter(|entry| entry.kind == BoundedTreeEntryKind::RegularFile)
+        .map(|entry| entry.relative_path)
+        .collect::<Vec<_>>();
     files.sort();
     files.dedup();
     Ok(files)
-}
-
-fn collect_repo_files_from(
-    root: &Path,
-    directory: &Path,
-    git_repo: Option<&Repository>,
-    files: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let entries = fs::read_dir(directory)
-        .with_context(|| format!("failed to read directory {}", directory.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read directory entry in {}", directory.display()))?;
-
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name();
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("failed to relativize {}", path.display()))?;
-        let relative = normalize_repo_relative_path(relative)?;
-        if path.is_dir() {
-            if should_skip_dir(&name.to_string_lossy()) {
-                continue;
-            }
-            if is_ignored_path(git_repo, &relative) {
-                continue;
-            }
-            collect_repo_files_from(root, &path, git_repo, files)?;
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        if !is_runtime_path(&relative) && !is_ignored_path(git_repo, &relative) {
-            files.push(relative);
-        }
-    }
-    Ok(())
 }
 
 fn is_ignored_path(git_repo: Option<&Repository>, relative: &Path) -> bool {
@@ -364,6 +376,7 @@ fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn propose_task_paths_does_not_match_common_symbol_words() {
@@ -532,6 +545,28 @@ mod tests {
         assert!(files.contains(&PathBuf::from(".gitignore")));
         assert!(files.contains(&PathBuf::from("src/lib.rs")));
         assert!(!files.iter().any(|path| path.starts_with("ignored")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_repo_files_never_follows_links_or_accepts_unsafe_files() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(repo.join("src")).expect("repo tree");
+        fs::create_dir_all(&outside).expect("outside tree");
+        git2::Repository::init(&repo).expect("init repo");
+        fs::write(repo.join("README.md"), "# Safe\n").expect("readme");
+        fs::write(repo.join("src/lib.rs"), "pub fn ok() {}\n").expect("source");
+        fs::write(outside.join("secret.rs"), "pub fn secret() {}\n").expect("secret");
+        symlink(&outside, repo.join("outside-link")).expect("outside link");
+        fs::hard_link(repo.join("src/lib.rs"), repo.join("hardlink.rs")).expect("hardlink");
+        let _socket = UnixListener::bind(repo.join("socket")).expect("socket");
+
+        let files = collect_repo_files(&repo).expect("collect files");
+        assert_eq!(files, vec![PathBuf::from("README.md")]);
     }
 
     fn write_file(repo: &Path, relative: &str, contents: &str) {

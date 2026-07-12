@@ -461,6 +461,122 @@ impl SafeRoot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedTreeEntryKind {
+    Directory,
+    RegularFile,
+    Symlink,
+    Special,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedTreeEntry {
+    pub relative_path: PathBuf,
+    pub kind: BoundedTreeEntryKind,
+    pub size_bytes: u64,
+    pub hard_link_count: u64,
+    pub unix_mode: u32,
+    pub identity: FileIdentity,
+}
+
+impl BoundedTreeEntry {
+    pub fn is_safe_regular_file(&self) -> bool {
+        self.kind == BoundedTreeEntryKind::RegularFile
+            && self.hard_link_count == 1
+            && self.unix_mode & 0o6000 == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedTreeWalkLimits {
+    pub max_depth: usize,
+    pub max_entries: usize,
+    pub max_path_bytes: usize,
+    pub max_total_path_bytes: usize,
+    pub max_duration: Duration,
+    pub same_device: bool,
+}
+
+impl BoundedTreeWalkLimits {
+    fn validate(self) -> Result<Self> {
+        if self.max_depth == 0
+            || self.max_entries == 0
+            || self.max_path_bytes == 0
+            || self.max_total_path_bytes == 0
+            || self.max_duration.is_zero()
+        {
+            bail!("bounded tree walk limits must all be greater than zero");
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedTreeWalkAction {
+    Skip,
+    Record,
+    RecordAndDescend,
+}
+
+pub struct BoundedTreeWalker;
+
+impl BoundedTreeWalker {
+    pub fn walk(
+        root: impl AsRef<Path>,
+        limits: BoundedTreeWalkLimits,
+    ) -> Result<Vec<BoundedTreeEntry>> {
+        Self::walk_with(root, limits, |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        })
+    }
+
+    pub fn walk_with<F>(
+        root: impl AsRef<Path>,
+        limits: BoundedTreeWalkLimits,
+        mut action: F,
+    ) -> Result<Vec<BoundedTreeEntry>>
+    where
+        F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+    {
+        let limits = limits.validate()?;
+        let root = absolute_normalized(root.as_ref())?;
+
+        #[cfg(unix)]
+        {
+            let directory = open_unix_directory(&root)?;
+            let root_stat = fstat(directory.as_raw_fd())?;
+            let deadline = Instant::now()
+                .checked_add(limits.max_duration)
+                .context("bounded tree walk deadline overflowed")?;
+            let mut budget = InventoryBudget {
+                remaining_entries: limits.max_entries,
+                total_path_bytes: 0,
+                deadline,
+            };
+            let mut entries = Vec::new();
+            let mut walker = InventoryWalkState {
+                root_device: root_stat.st_dev,
+                limits,
+                budget: &mut budget,
+                action: &mut action,
+                entries: &mut entries,
+            };
+            walker.walk(directory.as_raw_fd(), Path::new(""), 0)?;
+            Ok(entries)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (&root, limits, &mut action);
+            bail!("descriptor-relative bounded tree walks are unsupported on this platform")
+        }
+    }
+}
+
 pub struct BoundedRegularReader;
 
 impl BoundedRegularReader {
@@ -495,6 +611,15 @@ impl BoundedRegularReader {
             let _ = (absolute, max_bytes);
             bail!("component-wise no-follow reads are unsupported on this platform")
         }
+    }
+
+    /// Reads an arbitrary UTF-8 filesystem input without following symbolic
+    /// links in any ancestor or in the final leaf.
+    pub fn read_tree_no_follow_utf8(path: impl AsRef<Path>, max_bytes: u64) -> Result<String> {
+        let path = path.as_ref();
+        let bytes = Self::read_tree_no_follow(path, max_bytes)?;
+        String::from_utf8(bytes)
+            .with_context(|| format!("file is not valid UTF-8: {}", path.display()))
     }
 
     pub fn read_direct(
@@ -545,6 +670,39 @@ impl BoundedRegularReader {
                 relative_ref.display()
             )
         })
+    }
+
+    /// Reads a repository-relative UTF-8 regular file when it exists. A
+    /// missing path or a safely opened directory is represented as `None`, so
+    /// callers may retain directory and planned-file scopes without weakening
+    /// the no-follow boundary. Links, special files, and multiply-linked
+    /// regular files are rejected.
+    pub fn read_relative_optional_utf8(
+        root: impl AsRef<Path>,
+        relative: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        let root = absolute_normalized(root.as_ref())?;
+        let relative = validated_relative_path(relative.as_ref())?;
+
+        #[cfg(unix)]
+        {
+            let Some(mut file) = open_relative_optional_regular_unix(&root, &relative)? else {
+                return Ok(None);
+            };
+            let bytes = read_bounded_file(&mut file, &root.join(&relative), max_bytes)?;
+            String::from_utf8(bytes)
+                .with_context(|| {
+                    format!(
+                        "repository-relative file is not valid UTF-8: {}",
+                        relative.display()
+                    )
+                })
+                .map(Some)
+        }
+
+        #[cfg(not(unix))]
+        bail!("bounded no-follow reads are unsupported on this platform")
     }
 
     pub fn identity(path: impl AsRef<Path>) -> Result<FileIdentity> {
@@ -1739,6 +1897,62 @@ fn open_relative_regular_unix(root: &Path, relative: &Path) -> Result<File> {
     )
 }
 
+#[cfg(unix)]
+fn open_relative_optional_regular_unix(root: &Path, relative: &Path) -> Result<Option<File>> {
+    let mut directory = open_unix_directory(root)?;
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(segment) = component else {
+            bail!("invalid relative component in {}", relative.display());
+        };
+        let name = c_string(segment)?;
+        let is_final = index + 1 == components.len();
+        let flags = if is_final {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect repository-relative component {} without following links",
+                    segment.to_string_lossy()
+                )
+            });
+        }
+        let opened = unsafe { File::from_raw_fd(fd) };
+        let metadata = opened.metadata().with_context(|| {
+            format!(
+                "failed to inspect repository-relative component {}",
+                segment.to_string_lossy()
+            )
+        })?;
+        if is_final {
+            if metadata.file_type().is_dir() {
+                return Ok(None);
+            }
+            ensure_regular_single_link_metadata(&root.join(relative), &metadata)?;
+            return Ok(Some(opened));
+        }
+        if !metadata.file_type().is_dir() {
+            bail!(
+                "relative path component is not a directory: {}",
+                segment.to_string_lossy()
+            );
+        }
+        directory = opened;
+    }
+    bail!(
+        "relative path has no final component: {}",
+        relative.display()
+    )
+}
+
 fn random_temp_name(file_name: &OsStr) -> OsString {
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let now = SystemTime::now()
@@ -2887,6 +3101,236 @@ struct TreeBudget {
 }
 
 #[cfg(unix)]
+struct InventoryBudget {
+    remaining_entries: usize,
+    total_path_bytes: usize,
+    deadline: Instant,
+}
+
+#[cfg(unix)]
+impl InventoryBudget {
+    fn consume_entry(&mut self) -> Result<()> {
+        self.remaining_entries = self
+            .remaining_entries
+            .checked_sub(1)
+            .context("repository inventory exceeded its global entry limit")?;
+        Ok(())
+    }
+
+    fn consume_path(&mut self, path: &Path, limits: BoundedTreeWalkLimits) -> Result<()> {
+        let bytes = path.as_os_str().as_bytes().len();
+        if bytes == 0 || bytes > limits.max_path_bytes {
+            bail!(
+                "repository inventory path exceeds its {}-byte limit: {}",
+                limits.max_path_bytes,
+                path.display()
+            );
+        }
+        self.total_path_bytes = self
+            .total_path_bytes
+            .checked_add(bytes)
+            .context("repository inventory path byte count overflowed")?;
+        if self.total_path_bytes > limits.max_total_path_bytes {
+            bail!(
+                "repository inventory paths exceed their {}-byte aggregate limit",
+                limits.max_total_path_bytes
+            );
+        }
+        Ok(())
+    }
+
+    fn ensure_before_deadline(&self, phase: &str) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            bail!("repository inventory exceeded its time limit {phase}");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct InventoryWalkState<'a, F> {
+    root_device: libc::dev_t,
+    limits: BoundedTreeWalkLimits,
+    budget: &'a mut InventoryBudget,
+    action: &'a mut F,
+    entries: &'a mut Vec<BoundedTreeEntry>,
+}
+
+#[cfg(unix)]
+fn unsigned_to_u64<T>(value: T) -> u64
+where
+    T: TryInto<u64>,
+{
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+fn unsigned_to_u32<T>(value: T) -> u32
+where
+    T: TryInto<u32>,
+{
+    value.try_into().unwrap_or(u32::MAX)
+}
+
+#[cfg(unix)]
+impl<F> InventoryWalkState<'_, F>
+where
+    F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+{
+    fn walk(&mut self, directory_fd: RawFd, relative_directory: &Path, depth: usize) -> Result<()> {
+        self.budget
+            .ensure_before_deadline("before directory enumeration")?;
+        for name in inventory_directory_entries(directory_fd, self.budget)? {
+            self.budget
+                .ensure_before_deadline("during entry inspection")?;
+            let relative = relative_directory.join(&name);
+            let entry_depth = depth.saturating_add(1);
+            if entry_depth > self.limits.max_depth {
+                bail!(
+                    "repository inventory exceeded its maximum depth of {} at {}",
+                    self.limits.max_depth,
+                    relative.display()
+                );
+            }
+            self.budget.consume_path(&relative, self.limits)?;
+            let name_c = c_string(&name)?;
+            let stat = fstatat_no_follow(directory_fd, &name_c).with_context(|| {
+                format!("failed to inspect repository entry {}", relative.display())
+            })?;
+            if self.limits.same_device && stat.st_dev != self.root_device {
+                bail!(
+                    "repository inventory refused a cross-device entry: {}",
+                    relative.display()
+                );
+            }
+            let file_kind = stat.st_mode & libc::S_IFMT;
+            let kind = if file_kind == libc::S_IFDIR {
+                BoundedTreeEntryKind::Directory
+            } else if file_kind == libc::S_IFREG {
+                BoundedTreeEntryKind::RegularFile
+            } else if file_kind == libc::S_IFLNK {
+                BoundedTreeEntryKind::Symlink
+            } else {
+                BoundedTreeEntryKind::Special
+            };
+            let entry = BoundedTreeEntry {
+                relative_path: relative.clone(),
+                kind,
+                size_bytes: u64::try_from(stat.st_size).unwrap_or(0),
+                hard_link_count: unsigned_to_u64(stat.st_nlink),
+                unix_mode: unsigned_to_u32(stat.st_mode & 0o7777),
+                identity: identity_from_stat(&stat),
+            };
+            let decision = (self.action)(&entry)?;
+            if matches!(
+                decision,
+                BoundedTreeWalkAction::Record | BoundedTreeWalkAction::RecordAndDescend
+            ) {
+                self.entries.push(entry.clone());
+            }
+            if decision == BoundedTreeWalkAction::RecordAndDescend {
+                if kind != BoundedTreeEntryKind::Directory {
+                    bail!(
+                        "bounded tree walk requested descent through a non-directory: {}",
+                        relative.display()
+                    );
+                }
+                if entry_depth >= self.limits.max_depth {
+                    bail!(
+                        "repository inventory refused to descend beyond depth {} at {}",
+                        self.limits.max_depth,
+                        relative.display()
+                    );
+                }
+                let child = openat_directory(directory_fd, &name_c).with_context(|| {
+                    format!(
+                        "failed to open repository directory without following links: {}",
+                        relative.display()
+                    )
+                })?;
+                let opened = fstat(child.as_raw_fd())?;
+                if opened.st_mode & libc::S_IFMT != libc::S_IFDIR
+                    || identity_from_stat(&opened) != entry.identity
+                    || (self.limits.same_device && opened.st_dev != self.root_device)
+                {
+                    bail!(
+                        "repository directory changed during bounded traversal: {}",
+                        relative.display()
+                    );
+                }
+                self.walk(child.as_raw_fd(), &relative, entry_depth)?;
+            }
+            let rebound = fstatat_no_follow(directory_fd, &name_c).with_context(|| {
+                format!(
+                    "failed to revalidate repository entry after traversal: {}",
+                    relative.display()
+                )
+            })?;
+            if rebound.st_mode & libc::S_IFMT != file_kind
+                || identity_from_stat(&rebound) != entry.identity
+            {
+                bail!(
+                    "repository entry changed during bounded traversal: {}",
+                    relative.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn inventory_directory_entries(fd: RawFd, budget: &mut InventoryBudget) -> Result<Vec<OsString>> {
+    budget.ensure_before_deadline("before directory stream open")?;
+    let dot = c".";
+    let stream_fd = unsafe {
+        libc::openat(
+            fd,
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if stream_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open an independent repository directory stream");
+    }
+    let directory = unsafe { libc::fdopendir(stream_fd) };
+    if directory.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(stream_fd) };
+        return Err(error).context("failed to open repository directory stream");
+    }
+    let mut entries = Vec::new();
+    loop {
+        if let Err(error) = budget.ensure_before_deadline("during directory enumeration") {
+            unsafe { libc::closedir(directory) };
+            return Err(error);
+        }
+        clear_thread_errno()?;
+        let raw = unsafe { libc::readdir(directory) };
+        if raw.is_null() {
+            let errno = std::io::Error::last_os_error();
+            unsafe { libc::closedir(directory) };
+            if errno.raw_os_error().unwrap_or(0) != 0 {
+                return Err(errno).context("failed while reading repository directory stream");
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*raw).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        if let Err(error) = budget.consume_entry() {
+            unsafe { libc::closedir(directory) };
+            return Err(error);
+        }
+        entries.push(OsString::from_vec(name.to_bytes().to_vec()));
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+#[cfg(unix)]
 impl TreeBudget {
     fn new() -> Self {
         Self {
@@ -3719,5 +4163,104 @@ mod tests {
             .map(|entry| entry.expect("entry").file_name())
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![OsString::from("bounded-status.lock")]);
+    }
+
+    #[cfg(unix)]
+    fn inventory_limits(max_entries: usize) -> BoundedTreeWalkLimits {
+        BoundedTreeWalkLimits {
+            max_depth: 16,
+            max_entries,
+            max_path_bytes: 4096,
+            max_total_path_bytes: 64 * 1024,
+            max_duration: Duration::from_secs(5),
+            same_device: true,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_tree_walk_records_but_never_follows_unsafe_entries() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(root.join("src")).expect("repo tree");
+        fs::create_dir_all(&outside).expect("outside tree");
+        fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").expect("source");
+        fs::write(outside.join("secret"), "outside\n").expect("outside secret");
+        fs::hard_link(root.join("src/lib.rs"), root.join("hardlink.rs")).expect("hardlink");
+        symlink(&outside, root.join("outside-link")).expect("outside symlink");
+        let _socket = UnixListener::bind(root.join("socket")).expect("unix socket");
+
+        let entries = BoundedTreeWalker::walk(&root, inventory_limits(32)).expect("inventory");
+        assert!(entries.iter().any(|entry| {
+            entry.relative_path == Path::new("outside-link")
+                && entry.kind == BoundedTreeEntryKind::Symlink
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.relative_path == Path::new("socket")
+                && entry.kind == BoundedTreeEntryKind::Special
+        }));
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.relative_path == Path::new("outside-link/secret")));
+        assert!(entries
+            .iter()
+            .filter(|entry| entry.kind == BoundedTreeEntryKind::RegularFile)
+            .all(|entry| entry.hard_link_count == 2 && !entry.is_safe_regular_file()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_tree_walk_enforces_entry_depth_and_path_budgets() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("a/b")).expect("repo tree");
+        fs::write(root.join("a/b/file"), "data").expect("file");
+
+        let error = BoundedTreeWalker::walk(&root, inventory_limits(1))
+            .expect_err("entry limit must fail closed");
+        assert!(format!("{error:#}").contains("entry limit"));
+
+        let mut limits = inventory_limits(16);
+        limits.max_depth = 2;
+        let error =
+            BoundedTreeWalker::walk(&root, limits).expect_err("depth limit must fail closed");
+        assert!(format!("{error:#}").contains("depth"));
+
+        limits = inventory_limits(16);
+        limits.max_total_path_bytes = 2;
+        let error =
+            BoundedTreeWalker::walk(&root, limits).expect_err("path aggregate must fail closed");
+        assert!(format!("{error:#}").contains("aggregate"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_relative_reader_preserves_scopes_and_rejects_unsafe_files() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src")).expect("repo tree");
+        fs::write(root.join("src/lib.rs"), "source\n").expect("source");
+        fs::hard_link(root.join("src/lib.rs"), root.join("hardlink.rs")).expect("hardlink");
+        symlink("src/lib.rs", root.join("link.rs")).expect("symlink");
+        let _socket = UnixListener::bind(root.join("socket")).expect("unix socket");
+
+        assert_eq!(
+            BoundedRegularReader::read_relative_optional_utf8(&root, "missing.rs", 64)
+                .expect("missing scope"),
+            None
+        );
+        assert_eq!(
+            BoundedRegularReader::read_relative_optional_utf8(&root, "src", 64)
+                .expect("directory scope"),
+            None
+        );
+        for path in ["src/lib.rs", "hardlink.rs", "link.rs", "socket"] {
+            assert!(BoundedRegularReader::read_relative_optional_utf8(&root, path, 64).is_err());
+        }
     }
 }
