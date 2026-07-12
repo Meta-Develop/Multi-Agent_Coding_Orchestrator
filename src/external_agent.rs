@@ -149,7 +149,7 @@ impl ExternalAgentCommand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ExternalAgentRun {
     pub command: Vec<String>,
     pub cwd: PathBuf,
@@ -173,6 +173,41 @@ pub struct ExternalAgentRun {
     /// surface so callers cannot confuse a tainted pathname with the held capability.
     #[serde(skip, default)]
     pub(crate) output_last_message: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ExternalAgentRun {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held_output = self
+            .output_last_message
+            .as_ref()
+            .map(|contents| RedactedByteCount(contents.len()));
+        formatter
+            .debug_struct("ExternalAgentRun")
+            .field("command", &self.command)
+            .field("cwd", &self.cwd)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("exit_code", &self.exit_code)
+            .field("duration_ms", &self.duration_ms)
+            .field("timed_out", &self.timed_out)
+            .field("process_tree", &self.process_tree)
+            .field("side_effects", &self.side_effects)
+            .field("publishable", &self.publishable)
+            .field("program_trust", &self.program_trust)
+            .field("codex_permissions", &self.codex_permissions)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .field("error", &self.error)
+            .field("output_last_message", &held_output)
+            .finish()
+    }
+}
+
+struct RedactedByteCount(usize);
+
+impl std::fmt::Debug for RedactedByteCount {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "<redacted:{} bytes>", self.0)
+    }
 }
 
 impl ExternalAgentRun {
@@ -1500,14 +1535,19 @@ mod tests {
             false,
             "failed".to_string(),
         );
-        report.output_last_message = Some(b"private descriptor bytes".to_vec());
+        report.output_last_message = Some(b"DO_NOT_DEBUG_private_descriptor_bytes".to_vec());
         report.stdout.bytes = b"DO_NOT_DEBUG_private_stdout_bytes\0\xff".to_vec();
         let debug = format!("{report:?}");
         assert!(!debug.contains("DO_NOT_DEBUG_private_stdout_bytes"));
+        assert!(!debug.contains("DO_NOT_DEBUG_private_descriptor_bytes"));
         assert!(!debug.contains("target_launch_attempted"));
         assert!(debug.contains(&format!(
             "bytes: <redacted:{} bytes>",
             report.stdout.bytes.len()
+        )));
+        assert!(debug.contains(&format!(
+            "output_last_message: Some(<redacted:{} bytes>)",
+            report.output_last_message().context("held output")?.len()
         )));
         let value = serde_json::to_value(&report)?;
         assert!(value.get("output_last_message").is_none());
