@@ -614,13 +614,17 @@ closed: a concurrent same-UID process could otherwise alter the remote config
 during `receive-pack`, after preflight but before a hook or helper decision.
 
 Network Git runs against a private bare context. The real repo-common
-`maco/state`, primary/source worktrees, and sibling runtimes are masked; only the
-repo-common `objects` directory is rebound read-only at an independent empty
-`source-objects` destination inside that private runtime, and the private
-alternates file points only at that destination. The effective mount identity
-must match the source object directory. Source stores containing Git/http
-alternates, promisor metadata, or partial-clone configuration are refused. The
-child receives a
+`maco/state`, primary/source worktrees, repo-common object database, and sibling
+runtimes are masked. An observation-only `ls-remote` context has an empty object
+database. Before a push, trusted offline code walks the exact reachable closure
+of the reviewed commit and copies only those commit, tree, and blob objects into
+the private object database. The walk has object-count, aggregate-byte, commit-
+and tree-depth bounds; rejects self/duplicate parents and commit cycles; and
+does not traverse gitlinks into another repository. The private database is
+rewalked and enumerated to prove that it contains the same closure, no extra
+object, and no Git/http alternate before it is exposed read-only to the network
+child. Source stores containing Git/http alternates, promisor metadata, or
+partial-clone configuration are refused before materialization. The child receives a
 cleared, exact environment and a fixed trusted `git`; proxy, custom CA, askpass,
 credential helpers, tracing, HOME, SSH-agent, and ambient Git config inputs are
 absent. On Linux the effective unit must prove `PrivateNetwork=no`, exactly
@@ -628,23 +632,42 @@ absent. On Linux the effective unit must prove `PrivateNetwork=no`, exactly
 sockets. Other platforms fail closed until an equivalent verified backend
 exists.
 
-HTTPS authentication is token-only. `github.com` accepts `GH_TOKEN` or
-`GITHUB_TOKEN`; another host accepts `GH_ENTERPRISE_TOKEN` or
-`GITHUB_ENTERPRISE_TOKEN`. If both permitted variables are present they must be
-identical. The token is never placed in argv, the child environment, reports,
-or journals. A private 0600 config binds `Authorization: Basic
+HTTPS authentication is token-only. `github.com` accepts no explicit port or
+canonical `:443` (which is normalized away), and accepts `GH_TOKEN` or
+`GITHUB_TOKEN`. Any enterprise authority, including a non-default port or a
+localhost/private endpoint, must first be explicitly allowlisted by an exact
+canonical `GH_HOST` or `GITHUB_HOST` value; an unapproved authority is rejected
+before any token variable is read. An approved enterprise authority accepts
+`GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN`. If both permitted host or
+token variables are present they must be identical. The token is never placed
+in argv, the child environment, reports, or journals. A private 0600 config binds `Authorization: Basic
 base64("x-access-token:" + token)` to the exact canonical repository URL,
 requires TLS verification, disables redirects, proxies, askpass, and credential
 helpers, and is rebound read-only. Its path/open-file identity, owner, mode,
 single-link count, bounded exact bytes, and containing runtime identity are
 checked immediately before and after every command. Raw and encoded token forms
-are redacted from bounded output and zeroized with the private config on every
-success or error path.
+are redacted from bounded output. On normal success and ordinary error returns,
+config erasure is an explicit fallible step: the same inode is overwritten,
+synced, reread as zero bytes, and only then is the private runtime closed; token
+and remote-binding scratch buffers are also cleared before release. A process
+crash cannot promise memory or file overwriting, so any residue remains in an
+owner-only runtime with a PID/process-start/boot-bound owner record and is
+handled by the bounded dead-owner scavenger on the next private-runtime entry.
 
-GitHub publication observes the remote head and exact base OIDs before PR
-creation, reads the resulting PR with `gh pr view`, and requires matching
-`headRefOid`, `baseRefOid`, base branch, open state, and draft/ready value before
-persisting any PR receipt fields or advancing the receipt phase.
+GitHub publication requires an explicit expected creator login in
+`GH_EXPECTED_AUTHOR` or `GITHUB_EXPECTED_AUTHOR` before token selection; bot
+logins such as `release-bot[bot]` are accepted when named exactly. Each
+transaction generates a persistent unpredictable marker and includes it as a
+hidden comment in the exact PR body. Publication observes the remote head and
+exact base OIDs before PR creation, reads the resulting PR with `gh pr view`,
+and requires exact title, marker-bound body, creator login, `headRefOid`,
+`baseRefOid`, head/base branch, same head-repository owner/name,
+`isCrossRepository=false`, open state, and draft/ready value before persisting
+any PR receipt fields or advancing the receipt phase. A PR already present for
+the unique branch before this transaction records a create attempt is treated
+as a front-run and rejected. After a recorded create attempt, crash/lost-response
+reconciliation adopts only a receipt satisfying the same hidden marker and all
+of those provenance fields.
 The HTTPS origin is also parsed into a bound host/owner/repository identity.
 Every `gh pr` and `gh issue create` call receives that explicit `--repo`;
 `gh` receives a private 0600 `hosts.yml` and an explicit environment allowlist
@@ -681,11 +704,11 @@ phase (`prepared`, `push_observed`, `pr_observed`, or `completed`), expected and
 observed head OIDs, exact expected base OID, remote ref, PR URL and verified PR
 fields, whether creation was attempted, whether a contract-checked receipt
 attributed the PR to this transaction, whether reconciliation found an existing PR, and the
-last redacted error. A PR recovered only through `list`/`view` after a lost
-response is conservatively reported as `created_by_transaction=false` and
-`observed_existing_pr=true`. Rerun the same `pr publish` command: it reconciles
-the remote ref and existing PR before attempting another write. A completed
-transaction is idempotent.
+last redacted error. A PR recovered through `list`/`view` after a recorded create
+attempt is attributed to the transaction only after its hidden marker and exact
+provenance contract verify; a pre-attempt existing PR is never adopted. Rerun
+the same `pr publish` command: it reconciles the remote ref and marker-bound PR
+before attempting another write. A completed transaction is idempotent.
 
 These checks do not make Git hosting operations globally atomic. Another actor
 can still move or delete the remote ref after a check, and PR creation plus the

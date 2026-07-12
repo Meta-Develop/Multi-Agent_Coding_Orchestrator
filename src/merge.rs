@@ -560,6 +560,7 @@ struct CandidateRepositorySnapshot {
 
 struct TemporaryIndex {
     directory: PathBuf,
+    alternate_object_directory: PathBuf,
     _runtime_directory: Option<PrivateRuntimeDirectory>,
 }
 
@@ -607,6 +608,7 @@ pub(crate) struct PrivateRuntimeDirectory {
     path: PathBuf,
     owner: PrivateRuntimeOwner,
     directory_metadata: fs::Metadata,
+    closed: bool,
 }
 
 struct PrivateRuntimeRootLock {
@@ -1716,6 +1718,7 @@ impl TemporaryIndex {
         common_dir: &Path,
         runtime_directory: Option<PrivateRuntimeDirectory>,
     ) -> std::io::Result<Self> {
+        let alternate_object_directory = fs::canonicalize(common_dir.join("objects"))?;
         let result = (|| -> Result<()> {
             let object_directory = directory.join("objects");
             let refs_heads = directory.join("refs/heads");
@@ -1724,7 +1727,7 @@ impl TemporaryIndex {
             create_private_directory(&directory.join("refs"))?;
             create_private_directory(&refs_heads)?;
             create_private_directory(&refs_tags)?;
-            write_git_alternates_file(&object_directory, &common_dir.join("objects"))?;
+            write_git_alternates_file(&object_directory, &alternate_object_directory)?;
             write_private_file(&directory.join("HEAD"), b"ref: refs/heads/maco-isolated\n")?;
             let hooks = directory.join("disabled-hooks");
             create_private_directory(&hooks)?;
@@ -1764,6 +1767,7 @@ impl TemporaryIndex {
         match result {
             Ok(()) => Ok(Self {
                 directory: directory.to_path_buf(),
+                alternate_object_directory,
                 _runtime_directory: runtime_directory,
             }),
             Err(error) => Err(std::io::Error::other(error.to_string())),
@@ -1862,6 +1866,7 @@ impl PrivateRuntimeDirectory {
                 path,
                 owner,
                 directory_metadata,
+                closed: false,
             });
         }
         bail!("failed to reserve a unique private runtime directory")
@@ -1879,6 +1884,9 @@ impl PrivateRuntimeDirectory {
     }
 
     pub(crate) fn verify_identity(&self) -> Result<()> {
+        if self.closed {
+            bail!("managed private runtime was already closed");
+        }
         let directory_metadata = validate_private_runtime_directory(&self.path)?;
         if !same_filesystem_identity(&self.directory_metadata, &directory_metadata) {
             bail!(
@@ -1895,10 +1903,29 @@ impl PrivateRuntimeDirectory {
         }
         Ok(())
     }
+
+    pub(crate) fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.verify_identity()?;
+        let _runtime_lock = PrivateRuntimeRootLock::acquire(&self.runtime_root)?;
+        remove_owned_private_runtime_directory(
+            &self.runtime_root,
+            &self.path,
+            &self.owner,
+            &self.directory_metadata,
+        )?;
+        self.closed = true;
+        Ok(())
+    }
 }
 
 impl Drop for PrivateRuntimeDirectory {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
         let Ok(_runtime_lock) = PrivateRuntimeRootLock::acquire(&self.runtime_root) else {
             return;
         };
@@ -5289,7 +5316,8 @@ fn run_isolated_git_process_os(
     label: &str,
 ) -> Result<GitCommandOutput> {
     let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
-        .with_writable_artifact_root(&context.directory);
+        .with_writable_artifact_root(&context.directory)
+        .with_visible_read_only_root(&context.alternate_object_directory);
     run_required_direct(
         label,
         resolve_trusted_executable("git")?,

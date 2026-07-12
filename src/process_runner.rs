@@ -454,16 +454,9 @@ struct WorkspaceSandboxConfig {
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: Vec<PathBuf>,
     visible_read_only_files: Vec<PathBuf>,
-    visible_read_only_bindings: Vec<ReadOnlyBind>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     resource_limits: ProcessResourceLimits,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ReadOnlyBind {
-    source: PathBuf,
-    destination: PathBuf,
 }
 
 impl WorkspaceSandboxConfig {
@@ -473,7 +466,6 @@ impl WorkspaceSandboxConfig {
             workspace_access,
             visible_read_only_roots: Vec::new(),
             visible_read_only_files: Vec::new(),
-            visible_read_only_bindings: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             resource_limits: ProcessResourceLimits::default(),
@@ -492,18 +484,6 @@ impl WorkspaceSandboxConfig {
 
     fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.visible_read_only_files.push(file.into());
-        self
-    }
-
-    fn with_visible_read_only_bind(
-        mut self,
-        source: impl Into<PathBuf>,
-        destination: impl Into<PathBuf>,
-    ) -> Self {
-        self.visible_read_only_bindings.push(ReadOnlyBind {
-            source: source.into(),
-            destination: destination.into(),
-        });
         self
     }
 
@@ -578,17 +558,13 @@ impl TrustedFixedNetworkProfile {
         }
     }
 
-    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_visible_read_only_file(file);
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
         self
     }
 
-    pub(crate) fn with_visible_read_only_bind(
-        mut self,
-        source: impl Into<PathBuf>,
-        destination: impl Into<PathBuf>,
-    ) -> Self {
-        self.config = self.config.with_visible_read_only_bind(source, destination);
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
         self
     }
 
@@ -615,15 +591,6 @@ impl TrustedFixedNetworkProfile {
     #[cfg(test)]
     pub(crate) fn hidden_roots(&self) -> &[PathBuf] {
         &self.config.hidden_roots
-    }
-
-    #[cfg(test)]
-    pub(crate) fn visible_read_only_bindings(&self) -> Vec<(PathBuf, PathBuf)> {
-        self.config
-            .visible_read_only_bindings
-            .iter()
-            .map(|binding| (binding.source.clone(), binding.destination.clone()))
-            .collect()
     }
 }
 
@@ -1563,22 +1530,9 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
             validate_bounded_path(path, label)?;
         }
     }
-    if config.visible_read_only_bindings.len() > MAX_SANDBOX_PATHS_PER_CLASS {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "sandbox visible read-only bindings exceed their vector limit",
-        ));
-    }
-    for binding in &config.visible_read_only_bindings {
-        validate_bounded_path(&binding.source, "visible read-only bind source")?;
-        validate_bounded_path(&binding.destination, "visible read-only bind destination")?;
-    }
     let total = 1usize
         .checked_add(config.visible_read_only_roots.len())
         .and_then(|total| total.checked_add(config.visible_read_only_files.len()))
-        .and_then(|total| {
-            total.checked_add(config.visible_read_only_bindings.len().saturating_mul(2))
-        })
         .and_then(|total| total.checked_add(config.writable_artifact_roots.len()))
         .and_then(|total| total.checked_add(config.hidden_roots.len()))
         .ok_or_else(|| {
@@ -3468,7 +3422,6 @@ struct ResolvedSystemdSandbox {
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: Vec<PathBuf>,
     visible_read_only_files: Vec<PathBuf>,
-    visible_read_only_bindings: Vec<ReadOnlyBind>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     resource_limits: ProcessResourceLimits,
@@ -3726,46 +3679,6 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .collect::<std::io::Result<Vec<_>>>()?;
     visible_read_only_files.sort();
     visible_read_only_files.dedup();
-    let mut visible_read_only_bindings = config
-        .visible_read_only_bindings
-        .iter()
-        .map(|binding| {
-            Ok(ReadOnlyBind {
-                source: canonical_sandbox_directory(
-                    &binding.source,
-                    "visible read-only bind source",
-                )?,
-                destination: canonical_sandbox_directory(
-                    &binding.destination,
-                    "visible read-only bind destination",
-                )?,
-            })
-        })
-        .collect::<std::io::Result<Vec<_>>>()?;
-    visible_read_only_bindings.sort();
-    visible_read_only_bindings.dedup();
-    for binding in &visible_read_only_bindings {
-        if binding.source == binding.destination
-            || binding.destination == workspace_root
-            || !binding.destination.starts_with(&workspace_root)
-            || binding.source.starts_with(&binding.destination)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "visible read-only bind requires distinct source and private workspace destination",
-            ));
-        }
-        let mut entries = fs::read_dir(&binding.destination)?;
-        if entries.next().transpose()?.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "visible read-only bind destination must be empty: {}",
-                    binding.destination.display()
-                ),
-            ));
-        }
-    }
     let mut writable_artifact_roots = config
         .writable_artifact_roots
         .iter()
@@ -3807,25 +3720,9 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
             "strict workspace confinement refuses '/' as a hidden root",
         ));
     }
-    if visible_read_only_bindings.iter().any(|binding| {
-        hidden_roots
-            .iter()
-            .any(|hidden| binding.destination.starts_with(hidden))
-    }) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "visible read-only bind destination is nested below a hidden root",
-        ));
-    }
-
     let mut identity_paths = vec![workspace_root.clone(), current_dir.clone()];
     identity_paths.extend(visible_read_only_roots.iter().cloned());
     identity_paths.extend(visible_read_only_files.iter().cloned());
-    identity_paths.extend(
-        visible_read_only_bindings
-            .iter()
-            .flat_map(|binding| [binding.source.clone(), binding.destination.clone()]),
-    );
     identity_paths.extend(writable_artifact_roots.iter().cloned());
     identity_paths.extend(hidden_roots.iter().cloned());
     identity_paths.sort();
@@ -3839,7 +3736,6 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         config.workspace_access,
         &visible_read_only_roots,
         &visible_read_only_files,
-        &visible_read_only_bindings,
         &writable_artifact_roots,
         &hidden_roots,
     )?;
@@ -3857,7 +3753,6 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         workspace_access: config.workspace_access,
         visible_read_only_roots,
         visible_read_only_files,
-        visible_read_only_bindings,
         writable_artifact_roots,
         hidden_roots,
         resource_limits: config.resource_limits,
@@ -3995,7 +3890,6 @@ fn build_sandbox_mount_checks(
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: &[PathBuf],
     visible_read_only_files: &[PathBuf],
-    visible_read_only_bindings: &[ReadOnlyBind],
     writable_artifact_roots: &[PathBuf],
     hidden_roots: &[PathBuf],
 ) -> std::io::Result<Vec<SandboxMountCheck>> {
@@ -4060,36 +3954,6 @@ fn build_sandbox_mount_checks(
             })
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mut bind_destinations = BTreeSet::new();
-    for binding in visible_read_only_bindings {
-        if !bind_destinations.insert(binding.destination.clone())
-            || checks.iter().any(|check| check.path == binding.destination)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "sandbox bind destination was requested more than once: {}",
-                    binding.destination.display()
-                ),
-            ));
-        }
-        let metadata = fs::symlink_metadata(&binding.source)?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "sandbox bind source is not a real directory: {}",
-                    binding.source.display()
-                ),
-            ));
-        }
-        checks.push(SandboxMountCheck {
-            path: binding.destination.clone(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            access: SandboxMountAccess::ReadOnly,
-        });
-    }
     let mut inaccessible = hidden_roots.to_vec();
     inaccessible.extend(known_sensitive_socket_paths());
     inaccessible.sort();
@@ -4174,19 +4038,6 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         command
             .arg(systemd_path_property("BindReadOnlyPaths=", file, false))
             .arg(systemd_path_property("ReadOnlyPaths=", file, false));
-    }
-    for binding in &sandbox.visible_read_only_bindings {
-        command
-            .arg(systemd_bind_property(
-                "BindReadOnlyPaths=",
-                &binding.source,
-                &binding.destination,
-            ))
-            .arg(systemd_path_property(
-                "ReadOnlyPaths=",
-                &binding.destination,
-                false,
-            ));
     }
 
     match sandbox.workspace_access {
@@ -4301,19 +4152,6 @@ fn verify_systemd_sandbox_properties(
             "a finite quota",
         )?;
     }
-    for binding in &sandbox.visible_read_only_bindings {
-        require_property_binding(
-            "BindReadOnlyPaths",
-            property_value(properties, "BindReadOnlyPaths")?,
-            &binding.source,
-            &binding.destination,
-        )?;
-        require_property_path(
-            "ReadOnlyPaths",
-            property_value(properties, "ReadOnlyPaths")?,
-            &binding.destination,
-        )?;
-    }
 
     let inaccessible = property_value(properties, "InaccessiblePaths")?;
     for root in &sandbox.hidden_roots {
@@ -4414,24 +4252,12 @@ fn verify_systemd_sandbox_properties(
             .chain(&sandbox.visible_read_only_files)
             .cloned()
             .collect::<BTreeSet<_>>();
-        read_only.extend(
-            sandbox
-                .visible_read_only_bindings
-                .iter()
-                .map(|binding| binding.destination.clone()),
-        );
         let mut read_only_bindings = sandbox
             .visible_read_only_roots
             .iter()
             .chain(&sandbox.visible_read_only_files)
             .map(|path| (path.clone(), path.clone()))
             .collect::<BTreeSet<_>>();
-        read_only_bindings.extend(
-            sandbox
-                .visible_read_only_bindings
-                .iter()
-                .map(|binding| (binding.source.clone(), binding.destination.clone())),
-        );
         let mut read_write = sandbox
             .writable_artifact_roots
             .iter()
@@ -4689,28 +4515,6 @@ fn require_property_path(name: &str, value: &str, path: &Path) -> std::io::Resul
 }
 
 #[cfg(target_os = "linux")]
-fn require_property_binding(
-    name: &str,
-    value: &str,
-    source: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    let expected = (source.to_path_buf(), destination.to_path_buf());
-    if parse_property_bindings(value).contains(&expected) {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "effective {name} omitted required binding {}:{}",
-                source.display(),
-                destination.display()
-            ),
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn parse_property_bindings(value: &str) -> BTreeSet<(PathBuf, PathBuf)> {
     value
         .split_whitespace()
@@ -4947,16 +4751,6 @@ fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
         property.push("-");
     }
     property.push(path.as_os_str());
-    property
-}
-
-#[cfg(target_os = "linux")]
-fn systemd_bind_property(name: &str, source: &Path, destination: &Path) -> OsString {
-    let mut property = OsString::from("--property=");
-    property.push(name);
-    property.push(source.as_os_str());
-    property.push(":");
-    property.push(destination.as_os_str());
     property
 }
 
@@ -7588,83 +7382,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn trusted_network_resolves_hidden_source_to_independent_read_only_bind() {
-        use std::os::unix::fs::MetadataExt;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let source_parent = temp.path().join("source");
-        let source_objects = source_parent.join("objects");
-        let runtime = temp.path().join("runtime");
-        let object_view = runtime.join("source-objects");
-        fs::create_dir_all(&source_objects).expect("source objects");
-        fs::create_dir_all(&object_view).expect("object view");
-        let profile = TrustedFixedNetworkProfile::read_write(&runtime)
-            .with_visible_read_only_bind(&source_objects, &object_view)
-            .with_hidden_root(&source_parent);
-        let spec = ProcessSpec::direct(
-            "resolve network alias",
-            PathBuf::from("/bin/true"),
-            Vec::<OsString>::new(),
-            &runtime,
-            128,
-        )
-        .with_side_effect_confinement(SideEffectConfinementProfile::TrustedFixedNetwork(profile));
-
-        let sandbox = resolve_systemd_sandbox(&spec)
-            .expect("resolve sandbox")
-            .expect("network sandbox");
-        let canonical_source = fs::canonicalize(&source_objects).expect("canonical source");
-        let canonical_view = fs::canonicalize(&object_view).expect("canonical view");
-        assert_eq!(
-            sandbox.visible_read_only_bindings,
-            [ReadOnlyBind {
-                source: canonical_source.clone(),
-                destination: canonical_view.clone(),
-            }]
-        );
-        let check = sandbox
-            .mount_checks
-            .iter()
-            .find(|check| check.path == canonical_view)
-            .expect("bind mount check");
-        let source_metadata = fs::metadata(&canonical_source).expect("source metadata");
-        assert_eq!(check.device, source_metadata.dev());
-        assert_eq!(check.inode, source_metadata.ino());
-        assert_eq!(check.access, SandboxMountAccess::ReadOnly);
-
-        let property = format!(
-            "{}:{}",
-            canonical_source.display(),
-            canonical_view.display()
-        );
-        let expected = BTreeSet::from([(canonical_source, canonical_view)]);
-        verify_exact_property_bindings("BindReadOnlyPaths", &property, &expected)
-            .expect("exact independent bind");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
-    fn trusted_network_profile_masks_repo_state_but_rebinds_only_objects() {
+    fn trusted_network_profile_masks_repo_state_and_seals_private_objects() {
         let temp = tempfile::tempdir().expect("tempdir");
         let primary = temp.path().join("primary");
-        let objects = primary.join(".git/objects");
         let state = primary.join(".git/maco/state");
         let runtime = temp.path().join("runtime");
-        let object_view = runtime.join("source-objects");
-        fs::create_dir_all(&objects).expect("objects");
+        let sealed_objects = runtime.join("objects");
         fs::create_dir_all(&state).expect("state");
-        fs::create_dir_all(&runtime).expect("runtime");
-        fs::create_dir_all(&object_view).expect("object view");
-        fs::write(objects.join("visible"), "object").expect("visible object");
+        fs::create_dir_all(&sealed_objects).expect("sealed objects");
+        fs::write(sealed_objects.join("visible"), "object").expect("visible object");
         fs::write(state.join("auth-key"), "secret").expect("state secret");
         let script = format!(
             "test -r '{}' && test ! -r '{}'",
-            object_view.join("visible").display(),
+            sealed_objects.join("visible").display(),
             state.join("auth-key").display()
         );
         let profile = TrustedFixedNetworkProfile::read_write(&runtime)
-            .with_visible_read_only_bind(&objects, &object_view)
+            .with_visible_read_only_root(&sealed_objects)
             .with_hidden_root(&primary);
         let output = run_process(
             ProcessSpec::direct(
@@ -7771,7 +7506,6 @@ mod tests {
             workspace_access: WorkspaceAccess::ReadWrite,
             visible_read_only_roots: Vec::new(),
             visible_read_only_files: Vec::new(),
-            visible_read_only_bindings: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             resource_limits: ProcessResourceLimits::default(),

@@ -17,13 +17,13 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const SUMMARY_LIMIT: usize = 12 * 1024;
-const PUBLICATION_JOURNAL_VERSION: u32 = 2;
+const PUBLICATION_JOURNAL_VERSION: u32 = 3;
 const REMOTE_BINDING_SECRET_FILE: &str = "publication-remote-binding.key";
 const REMOTE_BINDING_SECRET_BYTES: usize = 32;
 const GH_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -42,9 +42,16 @@ const MAX_PUBLICATION_REF_COMPONENTS: usize = 64;
 const MAX_GITHUB_RECEIPT_URL_BYTES: usize = 8 * 1024;
 const MAX_GITHUB_RECEIPT_STRING_BYTES: usize = 1024;
 const MAX_GITHUB_PR_LIST_RECEIPTS: usize = 32;
+const PUBLICATION_PR_MARKER_BYTES: usize = 32;
+const MAX_GITHUB_RECEIPT_BODY_BYTES: usize = 512 * 1024;
 const MAX_PUBLICATION_SOURCE_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PUBLICATION_OBJECT_ENTRIES: usize = 262_144;
 const MAX_PUBLICATION_OBJECT_DEPTH: usize = 8;
+const MAX_PUBLICATION_CLOSURE_OBJECTS: usize = 262_144;
+const MAX_PUBLICATION_CLOSURE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_PUBLICATION_TREE_DEPTH: usize = 256;
+const MAX_PUBLICATION_COMMIT_DEPTH: usize = 262_144;
+const GITHUB_PR_RECEIPT_FIELDS: &str = "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft,title,body,headRefName,headRepository,headRepositoryOwner,isCrossRepository,author";
 
 #[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
@@ -181,6 +188,10 @@ struct PublicationTransactionJournal {
     remote_ref: String,
     remote_branch: String,
     github_repository: Option<GithubRepositoryIdentity>,
+    pr_marker_nonce: Option<String>,
+    expected_pr_title: Option<String>,
+    expected_pr_body: Option<String>,
+    expected_pr_author: Option<String>,
     base: String,
     draft: bool,
     phase: PublicationTransactionPhase,
@@ -191,6 +202,13 @@ struct PublicationTransactionJournal {
     pr_state: Option<String>,
     pr_is_draft: Option<bool>,
     pr_number: Option<u64>,
+    pr_title: Option<String>,
+    pr_body: Option<String>,
+    pr_head_ref_name: Option<String>,
+    pr_head_repository_owner: Option<String>,
+    pr_head_repository_name: Option<String>,
+    pr_is_cross_repository: Option<bool>,
+    pr_author: Option<String>,
     create_attempted: bool,
     created_by_transaction: bool,
     observed_existing_pr: bool,
@@ -225,6 +243,8 @@ struct PublicationGitContext {
     boundary: PublicationGitBoundary,
     config_files: Vec<PrivateConfigFileIdentity>,
     token: Option<PrivateNetworkToken>,
+    operation: PublicationGitOperation,
+    object_seal: Option<PrivateObjectClosureSeal>,
 }
 
 struct GhCommandContext {
@@ -241,6 +261,7 @@ type PublicationGitContextSetup = (
     PublicationGitBoundary,
     Vec<PrivateConfigFileIdentity>,
     Option<PrivateNetworkToken>,
+    Option<PrivateObjectClosureSeal>,
 );
 
 type GhCommandContextSetup = (
@@ -255,12 +276,121 @@ enum PublicationGitBoundary {
     Https(TrustedFixedNetworkProfile),
 }
 
+#[derive(Clone)]
+enum PublicationGitOperation {
+    ObserveRemoteRef {
+        remote_ref: String,
+    },
+    PushCreateOnly {
+        expected_oid: String,
+        remote_ref: String,
+    },
+}
+
+impl PublicationGitOperation {
+    fn observe(remote_ref: &str) -> Result<Self> {
+        validate_publication_ref(remote_ref)?;
+        Ok(Self::ObserveRemoteRef {
+            remote_ref: remote_ref.to_string(),
+        })
+    }
+
+    fn push_create_only(expected_oid: &str, remote_ref: &str) -> Result<Self> {
+        validate_publication_ref(remote_ref)?;
+        let oid = Oid::from_str(expected_oid).context("publication push OID was invalid")?;
+        if oid.to_string() != expected_oid {
+            bail!("publication push OID was not canonical lowercase hexadecimal");
+        }
+        Ok(Self::PushCreateOnly {
+            expected_oid: expected_oid.to_string(),
+            remote_ref: remote_ref.to_string(),
+        })
+    }
+
+    fn requires_object_closure(&self) -> Option<&str> {
+        match self {
+            Self::ObserveRemoteRef { .. } => None,
+            Self::PushCreateOnly { expected_oid, .. } => Some(expected_oid),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ObserveRemoteRef { .. } => "observe publication remote ref",
+            Self::PushCreateOnly { .. } => "create publication remote ref",
+        }
+    }
+
+    fn arguments(&self) -> Vec<OsString> {
+        match self {
+            Self::ObserveRemoteRef { remote_ref } => vec![
+                OsString::from("ls-remote"),
+                OsString::from("--refs"),
+                OsString::from("maco-publication"),
+                OsString::from(remote_ref),
+            ],
+            Self::PushCreateOnly {
+                expected_oid,
+                remote_ref,
+            } => vec![
+                OsString::from("push"),
+                OsString::from("--no-verify"),
+                OsString::from(format!("--force-with-lease={remote_ref}:")),
+                OsString::from("maco-publication"),
+                OsString::from(format!("{expected_oid}:{remote_ref}")),
+            ],
+        }
+    }
+}
+
+struct PrivateObjectClosureSeal {
+    expected_oid: Oid,
+    object_ids: BTreeSet<Oid>,
+    total_bytes: u64,
+}
+
+enum ClosureObject {
+    Commit(Oid),
+    Tree { oid: Oid, depth: usize },
+    Blob(Oid),
+}
+
 struct PrivateNetworkToken {
     bytes: Vec<u8>,
     basic: Vec<u8>,
 }
 
 struct ZeroizingString(String);
+
+#[derive(PartialEq, Eq)]
+struct ZeroizingBytes(Vec<u8>);
+
+impl ZeroizingBytes {
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl std::fmt::Debug for ZeroizingBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted:zeroizing-bytes>")
+    }
+}
+
+impl Drop for ZeroizingBytes {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+        self.0.clear();
+    }
+}
 
 impl ZeroizingString {
     fn as_str(&self) -> &str {
@@ -299,6 +429,12 @@ impl std::fmt::Debug for PrivateNetworkToken {
 
 impl Drop for PrivateNetworkToken {
     fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl PrivateNetworkToken {
+    fn zeroize(&mut self) {
         zeroize_bytes(&mut self.bytes);
         self.bytes.clear();
         zeroize_bytes(&mut self.basic);
@@ -363,11 +499,17 @@ struct GithubPrResult {
     base_ref_name: String,
     state: String,
     is_draft: bool,
+    title: String,
+    body: String,
+    head_ref_name: String,
+    head_repository_owner: String,
+    head_repository_name: String,
+    is_cross_repository: bool,
+    author: String,
     created: bool,
 }
 
 struct GithubCreateOutput {
-    success: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -1106,7 +1248,6 @@ fn publish_pr_with_verified_authority(
             report.publication_receipt = Some(transaction.receipt());
         }
         ForgeKind::Github => {
-            let body = pr_body(&report.preview);
             merge::resolve_trusted_executable("gh")
                 .context("GitHub publication requires a trusted gh executable")?;
             let expected_head = report
@@ -1136,17 +1277,16 @@ fn publish_pr_with_verified_authority(
             }
             report.pushed = true;
             report.publication_receipt = Some(transaction.receipt());
-            let github =
-                match reconcile_github_pr(&worktree_path, &mut transaction, &report.title, &body) {
-                    Ok(github) => github,
-                    Err(error) => {
-                        return Ok(publication_transaction_failure(
-                            report,
-                            &mut transaction,
-                            error,
-                        ))
-                    }
-                };
+            let github = match reconcile_github_pr(&worktree_path, &mut transaction) {
+                Ok(github) => github,
+                Err(error) => {
+                    return Ok(publication_transaction_failure(
+                        report,
+                        &mut transaction,
+                        error,
+                    ))
+                }
+            };
             report.pr_url = Some(github.url);
             report.pushed = true;
             report.created = github.created;
@@ -1353,6 +1493,37 @@ fn pr_body(preview: &MergeApplyPreview) -> String {
     )
 }
 
+fn generate_publication_pr_marker_nonce() -> Result<String> {
+    let mut bytes = ZeroizingBytes(vec![0_u8; PUBLICATION_PR_MARKER_BYTES]);
+    fill_os_random(bytes.as_mut_slice())?;
+    Ok(bytes
+        .as_slice()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn validate_publication_pr_marker_nonce(value: &str) -> Result<()> {
+    if value.len() != PUBLICATION_PR_MARKER_BYTES * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("GitHub publication marker nonce was not canonical");
+    }
+    Ok(())
+}
+
+fn pr_body_with_publication_marker(body: &str, nonce: &str) -> Result<String> {
+    validate_publication_pr_marker_nonce(nonce)?;
+    if body.len() > MAX_GITHUB_RECEIPT_BODY_BYTES.saturating_sub(128) {
+        bail!("GitHub publication body exceeds its marker-bound safety limit");
+    }
+    Ok(format!(
+        "{body}\n<!-- maco-publication-marker:{nonce} -->\n"
+    ))
+}
+
 fn has_uncommitted_changes(worktree_path: &Path) -> Result<bool> {
     let repo = Repository::open(worktree_path)
         .with_context(|| format!("failed to open agent worktree {}", worktree_path.display()))?;
@@ -1530,8 +1701,8 @@ fn github_repository_identity(remote_url: &str) -> Result<GithubRepositoryIdenti
     validate_github_slug(name, "repository")?;
     Ok(GithubRepositoryIdentity {
         host,
-        owner: owner.to_string(),
-        name: name.to_string(),
+        owner: owner.to_ascii_lowercase(),
+        name: name.to_ascii_lowercase(),
     })
 }
 
@@ -1556,15 +1727,30 @@ fn normalize_github_host(host: &str) -> Result<String> {
     }) {
         bail!("GitHub origin URL DNS label is invalid");
     }
-    if let Some(port) = port {
-        if port.is_empty()
-            || !port.bytes().all(|byte| byte.is_ascii_digit())
-            || port.parse::<u16>().ok().filter(|port| *port != 0).is_none()
-        {
-            bail!("GitHub origin URL port is invalid");
+    let port = port
+        .map(|port| {
+            let parsed = port
+                .parse::<u16>()
+                .ok()
+                .filter(|parsed| *parsed != 0)
+                .context("GitHub origin URL port is invalid")?;
+            if port != parsed.to_string() {
+                bail!("GitHub origin URL port was not canonical");
+            }
+            Ok(parsed)
+        })
+        .transpose()?;
+    let hostname = hostname.to_ascii_lowercase();
+    if hostname == "github.com" {
+        if port.is_some_and(|port| port != 443) {
+            bail!("github.com publication permits only the canonical HTTPS port");
         }
+        return Ok(hostname);
     }
-    Ok(host.to_ascii_lowercase())
+    if let Some(port) = port {
+        return Ok(format!("{hostname}:{port}"));
+    }
+    Ok(hostname)
 }
 
 fn validate_github_slug(value: &str, label: &str) -> Result<()> {
@@ -1578,6 +1764,18 @@ fn validate_github_slug(value: &str, label: &str) -> Result<()> {
         bail!("GitHub {label} component is invalid");
     }
     Ok(())
+}
+
+fn canonical_github_author_login(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.len() > MAX_GITHUB_SLUG_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'[' | b']'))
+    {
+        bail!("GitHub expected author is empty, malformed, or oversized");
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn validate_github_receipt_url(
@@ -1675,18 +1873,18 @@ fn publication_remote_binding_digest(
     if secret.len() != REMOTE_BINDING_SECRET_BYTES {
         bail!("publication remote binding secret has an invalid length");
     }
-    let mut input = b"maco-publication-remote-binding-v1\0".to_vec();
-    input.extend_from_slice(secret);
-    input.push(0);
-    input.extend_from_slice(remote_name.as_bytes());
-    input.push(0);
-    input.extend_from_slice(remote_url.as_bytes());
-    Ok(Oid::hash_object(ObjectType::Blob, &input)
+    let mut input = ZeroizingBytes(b"maco-publication-remote-binding-v1\0".to_vec());
+    input.0.extend_from_slice(secret);
+    input.0.push(0);
+    input.0.extend_from_slice(remote_name.as_bytes());
+    input.0.push(0);
+    input.0.extend_from_slice(remote_url.as_bytes());
+    Ok(Oid::hash_object(ObjectType::Blob, input.as_slice())
         .context("failed to digest publication remote binding")?
         .to_string())
 }
 
-fn load_or_create_remote_binding_secret(state_directory: &Path) -> Result<Vec<u8>> {
+fn load_or_create_remote_binding_secret(state_directory: &Path) -> Result<ZeroizingBytes> {
     let path = state_directory.join(REMOTE_BINDING_SECRET_FILE);
     match fs::symlink_metadata(&path) {
         Ok(_) => return read_remote_binding_secret(&path),
@@ -1710,9 +1908,9 @@ fn load_or_create_remote_binding_secret(state_directory: &Path) -> Result<Vec<u8
         std::process::id(),
         timestamp.as_nanos()
     ));
-    let mut secret = vec![0_u8; REMOTE_BINDING_SECRET_BYTES];
-    fill_os_random(&mut secret)?;
-    let result = (|| -> Result<Vec<u8>> {
+    let mut secret = ZeroizingBytes(vec![0_u8; REMOTE_BINDING_SECRET_BYTES]);
+    fill_os_random(secret.as_mut_slice())?;
+    let result = (|| -> Result<ZeroizingBytes> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1728,7 +1926,7 @@ fn load_or_create_remote_binding_secret(state_directory: &Path) -> Result<Vec<u8
                 temporary_path.display()
             )
         })?;
-        file.write_all(&secret)
+        file.write_all(secret.as_slice())
             .context("failed to write publication remote binding key")?;
         file.sync_all()
             .context("failed to persist publication remote binding key")?;
@@ -1885,7 +2083,7 @@ fn refuse_missing_binding_key_with_existing_transactions(state_directory: &Path)
     }
 }
 
-fn read_remote_binding_secret(path: &Path) -> Result<Vec<u8>> {
+fn read_remote_binding_secret(path: &Path) -> Result<ZeroizingBytes> {
     #[cfg(unix)]
     recover_remote_binding_secret_temp_link(path)?;
     let path_metadata = fs::symlink_metadata(path).with_context(|| {
@@ -1935,10 +2133,10 @@ fn read_remote_binding_secret(path: &Path) -> Result<Vec<u8>> {
             );
         }
     }
-    let mut secret = Vec::new();
+    let mut secret = ZeroizingBytes(Vec::new());
     Read::by_ref(&mut file)
         .take((REMOTE_BINDING_SECRET_BYTES + 1) as u64)
-        .read_to_end(&mut secret)
+        .read_to_end(&mut secret.0)
         .with_context(|| format!("failed to read publication binding key {}", path.display()))?;
     if secret.len() != REMOTE_BINDING_SECRET_BYTES {
         bail!(
@@ -2242,6 +2440,15 @@ impl PublicationTransaction {
             ForgeKind::Github => Some(github_repository_identity(remote_url)?),
             ForgeKind::Git | ForgeKind::Fake => None,
         };
+        let expected_pr_author = match report.forge {
+            ForgeKind::Github => Some(select_github_expected_author_with(|key| {
+                env::var(key).ok()
+            })?),
+            ForgeKind::Git | ForgeKind::Fake => None,
+        };
+        let expected_pr_title = (report.forge == ForgeKind::Github).then(|| report.title.clone());
+        let unmarked_pr_body =
+            (report.forge == ForgeKind::Github).then(|| pr_body(&report.preview));
         let repo = Repository::open(repo_root).with_context(|| {
             format!(
                 "failed to open repository for publication journal {}",
@@ -2251,17 +2458,24 @@ impl PublicationTransaction {
         let state = merge::ensure_repo_common_state_directory(&repo)?;
         let remote_binding_secret = load_or_create_remote_binding_secret(&state)?;
         let remote_display = redact_remote_url(remote_url);
-        let remote_binding_digest =
-            publication_remote_binding_digest(&remote_binding_secret, remote_name, remote_url)?;
-        let identity = format!(
+        let remote_binding_digest = ZeroizingString(publication_remote_binding_digest(
+            remote_binding_secret.as_slice(),
+            remote_name,
+            remote_url,
+        )?);
+        let identity = ZeroizingString(format!(
             "{}\n{forge}\n{expected_oid}\n{remote_name}\n{remote_binding_digest}\n{}\n{}",
-            report.agent_id, report.base, report.draft,
-        );
+            report.agent_id,
+            report.base,
+            report.draft,
+            remote_binding_digest = remote_binding_digest.as_str(),
+        ));
         let transaction_id = format!(
             "{}-{expected_oid}-{:016x}",
             sanitize_url_segment(&report.agent_id),
             stable_hash(identity.as_bytes())
         );
+        let remote_binding_digest = remote_binding_digest.as_str().to_string();
         let publication_transactions =
             merge::ensure_private_managed_directory(&state, "publication-transactions")?;
         let directory =
@@ -2271,6 +2485,11 @@ impl PublicationTransaction {
         }
 
         if let Some(journal) = load_latest_publication_journal(&directory)? {
+            let expected_pr_body = match (&journal.pr_marker_nonce, &unmarked_pr_body) {
+                (Some(nonce), Some(body)) => Some(pr_body_with_publication_marker(body, nonce)?),
+                (None, None) => None,
+                _ => bail!("publication transaction marker did not match its forge"),
+            };
             if journal.version != PUBLICATION_JOURNAL_VERSION
                 || journal.transaction_id != transaction_id
                 || journal.agent_id != report.agent_id
@@ -2283,6 +2502,9 @@ impl PublicationTransaction {
                 || journal.remote_ref != remote_ref
                 || journal.remote_branch != remote_branch
                 || journal.github_repository != github_repository
+                || journal.expected_pr_title != expected_pr_title
+                || journal.expected_pr_body != expected_pr_body
+                || journal.expected_pr_author != expected_pr_author
                 || journal.base != report.base
                 || journal.draft != report.draft
             {
@@ -2297,6 +2519,16 @@ impl PublicationTransaction {
                 remote_url: remote_url.to_string(),
             });
         }
+
+        let pr_marker_nonce = match report.forge {
+            ForgeKind::Github => Some(generate_publication_pr_marker_nonce()?),
+            ForgeKind::Git | ForgeKind::Fake => None,
+        };
+        let expected_pr_body = match (&pr_marker_nonce, &unmarked_pr_body) {
+            (Some(nonce), Some(body)) => Some(pr_body_with_publication_marker(body, nonce)?),
+            (None, None) => None,
+            _ => bail!("publication transaction marker did not match its forge"),
+        };
 
         let mut transaction = Self {
             directory,
@@ -2314,6 +2546,10 @@ impl PublicationTransaction {
                 remote_ref,
                 remote_branch,
                 github_repository,
+                pr_marker_nonce,
+                expected_pr_title,
+                expected_pr_body,
+                expected_pr_author,
                 base: report.base.clone(),
                 draft: report.draft,
                 phase: PublicationTransactionPhase::Prepared,
@@ -2324,6 +2560,13 @@ impl PublicationTransaction {
                 pr_state: None,
                 pr_is_draft: None,
                 pr_number: None,
+                pr_title: None,
+                pr_body: None,
+                pr_head_ref_name: None,
+                pr_head_repository_owner: None,
+                pr_head_repository_name: None,
+                pr_is_cross_repository: None,
+                pr_author: None,
                 create_attempted: false,
                 created_by_transaction: false,
                 observed_existing_pr: false,
@@ -2755,10 +2998,40 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
         if journal.expected_base_oid.is_none() {
             bail!("GitHub publication journal omitted the exact reviewed base OID");
         }
+        let marker = journal
+            .pr_marker_nonce
+            .as_deref()
+            .context("GitHub publication journal omitted its unpredictable PR marker")?;
+        validate_publication_pr_marker_nonce(marker)?;
+        let expected_title = journal
+            .expected_pr_title
+            .as_deref()
+            .context("GitHub publication journal omitted its exact PR title")?;
+        let expected_body = journal
+            .expected_pr_body
+            .as_deref()
+            .context("GitHub publication journal omitted its marker-bound PR body")?;
+        let expected_author = journal
+            .expected_pr_author
+            .as_deref()
+            .context("GitHub publication journal omitted its explicit expected author")?;
+        let canonical_author = canonical_github_author_login(expected_author)
+            .context("GitHub publication journal expected author was malformed")?;
+        if expected_title.is_empty()
+            || expected_title.len() > MAX_GITHUB_RECEIPT_STRING_BYTES
+            || expected_body.len() > MAX_GITHUB_RECEIPT_BODY_BYTES
+            || expected_body
+                .matches(&format!("<!-- maco-publication-marker:{marker} -->"))
+                .count()
+                != 1
+            || canonical_author != expected_author
+        {
+            bail!("GitHub publication journal PR identity fields were invalid");
+        }
         if journal.phase >= PublicationTransactionPhase::PrObserved {
-            if journal.created_by_transaction == journal.observed_existing_pr {
+            if !journal.created_by_transaction || journal.observed_existing_pr {
                 bail!(
-                    "publication journal PR phase did not contain exactly one receipt provenance"
+                    "publication journal PR phase did not prove marker-bound transaction creation"
                 );
             }
             let repository = journal
@@ -2788,6 +3061,33 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
                 .pr_number
                 .filter(|number| *number > 0)
                 .context("publication journal PR phase omitted its number")?;
+            let title = journal
+                .pr_title
+                .as_deref()
+                .context("publication journal PR phase omitted its title")?;
+            let body = journal
+                .pr_body
+                .as_deref()
+                .context("publication journal PR phase omitted its body")?;
+            let head_ref_name = journal
+                .pr_head_ref_name
+                .as_deref()
+                .context("publication journal PR phase omitted its head ref")?;
+            let head_owner = journal
+                .pr_head_repository_owner
+                .as_deref()
+                .context("publication journal PR phase omitted its head owner")?;
+            let head_name = journal
+                .pr_head_repository_name
+                .as_deref()
+                .context("publication journal PR phase omitted its head repository")?;
+            let is_cross_repository = journal
+                .pr_is_cross_repository
+                .context("publication journal PR phase omitted its cross-repository state")?;
+            let author = journal
+                .pr_author
+                .as_deref()
+                .context("publication journal PR phase omitted its author")?;
             if head != journal.expected_oid {
                 bail!("publication journal PR head did not match the expected OID");
             }
@@ -2800,6 +3100,18 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
             if is_draft != journal.draft {
                 bail!("publication journal PR draft state changed from the request");
             }
+            if title != expected_title
+                || body != expected_body
+                || head_ref_name != journal.remote_branch
+                || head_owner != repository.owner
+                || head_name != repository.name
+                || is_cross_repository
+                || author != expected_author
+            {
+                bail!(
+                    "publication journal PR provenance changed from its exact transaction binding"
+                );
+            }
             validate_github_receipt_url(url, repository, number)?;
         } else if journal.pr_url.is_some()
             || journal.pr_head_oid.is_some()
@@ -2807,6 +3119,13 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
             || journal.pr_state.is_some()
             || journal.pr_is_draft.is_some()
             || journal.pr_number.is_some()
+            || journal.pr_title.is_some()
+            || journal.pr_body.is_some()
+            || journal.pr_head_ref_name.is_some()
+            || journal.pr_head_repository_owner.is_some()
+            || journal.pr_head_repository_name.is_some()
+            || journal.pr_is_cross_repository.is_some()
+            || journal.pr_author.is_some()
             || journal.created_by_transaction
             || journal.observed_existing_pr
         {
@@ -2818,6 +3137,17 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
         || journal.pr_state.is_some()
         || journal.pr_is_draft.is_some()
         || journal.pr_number.is_some()
+        || journal.pr_marker_nonce.is_some()
+        || journal.expected_pr_title.is_some()
+        || journal.expected_pr_body.is_some()
+        || journal.expected_pr_author.is_some()
+        || journal.pr_title.is_some()
+        || journal.pr_body.is_some()
+        || journal.pr_head_ref_name.is_some()
+        || journal.pr_head_repository_owner.is_some()
+        || journal.pr_head_repository_name.is_some()
+        || journal.pr_is_cross_repository.is_some()
+        || journal.pr_author.is_some()
         || journal.create_attempted
         || journal.created_by_transaction
         || journal.observed_existing_pr
@@ -2860,6 +3190,10 @@ fn validate_publication_journal_transition(
         || previous.remote_ref != current.remote_ref
         || previous.remote_branch != current.remote_branch
         || previous.github_repository != current.github_repository
+        || previous.pr_marker_nonce != current.pr_marker_nonce
+        || previous.expected_pr_title != current.expected_pr_title
+        || previous.expected_pr_body != current.expected_pr_body
+        || previous.expected_pr_author != current.expected_pr_author
         || previous.base != current.base
         || previous.draft != current.draft
     {
@@ -2879,6 +3213,17 @@ fn validate_publication_journal_transition(
         || (previous.pr_state.is_some() && previous.pr_state != current.pr_state)
         || (previous.pr_is_draft.is_some() && previous.pr_is_draft != current.pr_is_draft)
         || (previous.pr_number.is_some() && previous.pr_number != current.pr_number)
+        || (previous.pr_title.is_some() && previous.pr_title != current.pr_title)
+        || (previous.pr_body.is_some() && previous.pr_body != current.pr_body)
+        || (previous.pr_head_ref_name.is_some()
+            && previous.pr_head_ref_name != current.pr_head_ref_name)
+        || (previous.pr_head_repository_owner.is_some()
+            && previous.pr_head_repository_owner != current.pr_head_repository_owner)
+        || (previous.pr_head_repository_name.is_some()
+            && previous.pr_head_repository_name != current.pr_head_repository_name)
+        || (previous.pr_is_cross_repository.is_some()
+            && previous.pr_is_cross_repository != current.pr_is_cross_repository)
+        || (previous.pr_author.is_some() && previous.pr_author != current.pr_author)
     {
         bail!("publication journal immutable PR receipt changed between records");
     }
@@ -3039,14 +3384,246 @@ fn validate_publication_object_store_is_self_contained(
     Ok(())
 }
 
+fn materialize_publication_object_closure(
+    source: &Repository,
+    private: &Repository,
+    expected_oid: &str,
+) -> Result<PrivateObjectClosureSeal> {
+    let expected_text = expected_oid;
+    let expected_oid =
+        Oid::from_str(expected_text).context("publication closure OID was invalid")?;
+    if expected_oid.to_string() != expected_text {
+        bail!("publication closure OID was not canonical");
+    }
+    let destination_odb = private
+        .odb()
+        .context("failed to open private publication object database")?;
+    let seal = walk_publication_object_closure(source, expected_oid, Some(&destination_odb))?;
+    verify_private_publication_object_closure(private, &seal)?;
+    Ok(seal)
+}
+
+fn verify_private_publication_object_closure(
+    private: &Repository,
+    expected: &PrivateObjectClosureSeal,
+) -> Result<()> {
+    let observed = walk_publication_object_closure(private, expected.expected_oid, None)?;
+    if observed.object_ids != expected.object_ids || observed.total_bytes != expected.total_bytes {
+        bail!("private publication object closure changed after materialization");
+    }
+    let odb = private
+        .odb()
+        .context("failed to reopen private publication object database")?;
+    let mut all_objects = BTreeSet::new();
+    odb.foreach(|oid| {
+        all_objects.insert(*oid);
+        all_objects.len() <= MAX_PUBLICATION_CLOSURE_OBJECTS
+    })
+    .context("failed to enumerate private publication object database")?;
+    if all_objects != expected.object_ids {
+        bail!("private publication object database contained objects outside the exact closure");
+    }
+    for forbidden in [
+        private.path().join("objects/info/alternates"),
+        private.path().join("objects/info/http-alternates"),
+    ] {
+        if fs::symlink_metadata(&forbidden).is_ok() {
+            bail!("private publication object database acquired an alternate object source");
+        }
+    }
+    Ok(())
+}
+
+fn walk_publication_object_closure(
+    source: &Repository,
+    expected_oid: Oid,
+    destination: Option<&git2::Odb<'_>>,
+) -> Result<PrivateObjectClosureSeal> {
+    let source_odb = source
+        .odb()
+        .context("failed to open publication source object database")?;
+    let mut pending = vec![ClosureObject::Commit(expected_oid)];
+    let mut object_ids = BTreeSet::new();
+    let mut object_kinds = BTreeMap::<Oid, ObjectType>::new();
+    let mut commit_edges = BTreeMap::<Oid, Vec<Oid>>::new();
+    let mut tree_depths = BTreeMap::<Oid, usize>::new();
+    let mut total_bytes = 0_u64;
+    let mut traversal_steps = 0usize;
+
+    while let Some(next) = pending.pop() {
+        traversal_steps = traversal_steps
+            .checked_add(1)
+            .context("publication closure traversal count overflow")?;
+        if traversal_steps > MAX_PUBLICATION_CLOSURE_OBJECTS.saturating_mul(4) {
+            bail!("publication closure graph exceeded its traversal safety bound");
+        }
+        let (oid, expected_kind) = match next {
+            ClosureObject::Commit(oid) => (oid, ObjectType::Commit),
+            ClosureObject::Tree { oid, depth } => {
+                if depth > MAX_PUBLICATION_TREE_DEPTH {
+                    bail!("publication tree closure exceeded its depth safety bound");
+                }
+                if tree_depths
+                    .get(&oid)
+                    .is_some_and(|prior_depth| *prior_depth >= depth)
+                {
+                    continue;
+                }
+                tree_depths.insert(oid, depth);
+                (oid, ObjectType::Tree)
+            }
+            ClosureObject::Blob(oid) => (oid, ObjectType::Blob),
+        };
+        if let Some(prior_kind) = object_kinds.get(&oid) {
+            if *prior_kind != expected_kind {
+                bail!("publication closure reused an object with contradictory kinds");
+            }
+            if expected_kind != ObjectType::Tree {
+                continue;
+            }
+        }
+
+        let is_new = !object_ids.contains(&oid);
+        if is_new && object_ids.len() >= MAX_PUBLICATION_CLOSURE_OBJECTS {
+            bail!("publication object closure exceeded its object-count bound");
+        }
+        let (declared_size, declared_kind) = source_odb
+            .read_header(oid)
+            .with_context(|| format!("publication closure omitted object header {oid}"))?;
+        if declared_kind != expected_kind {
+            bail!("publication closure object {oid} had an unexpected kind");
+        }
+        let declared_size = u64::try_from(declared_size)
+            .context("publication closure object size did not fit its byte bound")?;
+        if is_new {
+            let projected_bytes = total_bytes
+                .checked_add(declared_size)
+                .context("publication object closure byte count overflow")?;
+            if projected_bytes > MAX_PUBLICATION_CLOSURE_BYTES {
+                bail!("publication object closure exceeded its aggregate byte bound");
+            }
+        }
+        let object = source_odb
+            .read(oid)
+            .with_context(|| format!("publication closure omitted object {oid}"))?;
+        if object.kind() != expected_kind || object.data().len() as u64 != declared_size {
+            bail!("publication closure object changed after its bounded header was read");
+        }
+        if object_ids.insert(oid) {
+            total_bytes = total_bytes
+                .checked_add(declared_size)
+                .context("publication object closure byte count overflow")?;
+            object_kinds.insert(oid, expected_kind);
+            if let Some(destination) = destination {
+                let written = destination
+                    .write(expected_kind, object.data())
+                    .with_context(|| format!("failed to materialize publication object {oid}"))?;
+                if written != oid {
+                    bail!("private publication object materialization changed an object ID");
+                }
+            }
+        }
+
+        match expected_kind {
+            ObjectType::Commit => {
+                let commit = source
+                    .find_commit(oid)
+                    .with_context(|| format!("failed to parse publication commit {oid}"))?;
+                let mut parents = Vec::new();
+                let mut unique_parents = BTreeSet::new();
+                for parent in commit.parent_ids() {
+                    if parent == oid || !unique_parents.insert(parent) {
+                        bail!("publication commit graph contained a self or duplicate parent");
+                    }
+                    parents.push(parent);
+                    pending.push(ClosureObject::Commit(parent));
+                }
+                commit_edges.insert(oid, parents);
+                pending.push(ClosureObject::Tree {
+                    oid: commit.tree_id(),
+                    depth: 0,
+                });
+            }
+            ObjectType::Tree => {
+                let tree = source
+                    .find_tree(oid)
+                    .with_context(|| format!("failed to parse publication tree {oid}"))?;
+                let depth = *tree_depths
+                    .get(&oid)
+                    .context("publication tree depth tracking was missing")?;
+                for entry in tree.iter() {
+                    let entry_oid = entry.id();
+                    match entry.filemode() {
+                        0o160000 => {
+                            // A gitlink names a commit in another repository. It is provenance
+                            // metadata only and must never make publication read that repository.
+                        }
+                        0o040000 => pending.push(ClosureObject::Tree {
+                            oid: entry_oid,
+                            depth: depth + 1,
+                        }),
+                        _ => pending.push(ClosureObject::Blob(entry_oid)),
+                    }
+                }
+            }
+            ObjectType::Blob => {}
+            _ => bail!("publication closure contained an unsupported object kind"),
+        }
+    }
+
+    validate_publication_commit_graph(&commit_edges, expected_oid)?;
+    Ok(PrivateObjectClosureSeal {
+        expected_oid,
+        object_ids,
+        total_bytes,
+    })
+}
+
+fn validate_publication_commit_graph(edges: &BTreeMap<Oid, Vec<Oid>>, root: Oid) -> Result<()> {
+    let mut stack = vec![(root, false, 0usize)];
+    let mut active = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    while let Some((oid, exiting, depth)) = stack.pop() {
+        if depth > MAX_PUBLICATION_COMMIT_DEPTH {
+            bail!("publication commit graph exceeded its depth safety bound");
+        }
+        if exiting {
+            active.remove(&oid);
+            complete.insert(oid);
+            continue;
+        }
+        if complete.contains(&oid) {
+            continue;
+        }
+        if !active.insert(oid) {
+            bail!("publication commit graph contained a cycle");
+        }
+        stack.push((oid, true, depth));
+        let parents = edges
+            .get(&oid)
+            .with_context(|| format!("publication commit graph omitted {oid}"))?;
+        for parent in parents.iter().rev() {
+            stack.push((*parent, false, depth + 1));
+        }
+    }
+    Ok(())
+}
+
 impl PublicationGitContext {
-    fn create(worktree_path: &Path, remote_url: &str) -> Result<Self> {
-        Self::create_with_token_source(worktree_path, remote_url, |key| env::var(key).ok())
+    fn create(
+        worktree_path: &Path,
+        remote_url: &str,
+        operation: PublicationGitOperation,
+    ) -> Result<Self> {
+        Self::create_with_token_source(worktree_path, remote_url, operation, |key| {
+            env::var(key).ok()
+        })
     }
 
     fn create_with_token_source(
         worktree_path: &Path,
         remote_url: &str,
+        operation: PublicationGitOperation,
         mut value_for: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
         let transport = publication_remote_transport(remote_url)?;
@@ -3056,24 +3633,18 @@ impl PublicationGitContext {
                 worktree_path.display()
             )
         })?;
-        let runtime_directory = merge::PrivateRuntimeDirectory::create(
+        let mut runtime_directory = merge::PrivateRuntimeDirectory::create(
             worktree_path,
             merge::PrivateRuntimeKind::PublicationGit,
         )?;
         let directory = runtime_directory.path().to_path_buf();
         let result = (|| -> Result<PublicationGitContextSetup> {
             let objects = directory.join("objects");
-            let source_objects = directory.join("source-objects");
             merge::create_private_directory(&objects)?;
-            merge::create_private_directory(&source_objects)?;
             merge::create_private_directory(&directory.join("refs"))?;
             merge::create_private_directory(&directory.join("refs/heads"))?;
             merge::create_private_directory(&directory.join("refs/tags"))?;
             merge::create_private_directory(&directory.join("disabled-hooks"))?;
-            let common_objects = fs::canonicalize(repo.commondir().join("objects"))
-                .context("failed to resolve publication source object directory")?;
-            validate_publication_object_store_is_self_contained(&repo, &common_objects)?;
-            merge::write_git_alternates_file(&objects, &source_objects)?;
             merge::write_private_file(
                 &directory.join("HEAD"),
                 b"ref: refs/heads/maco-publication\n",
@@ -3108,6 +3679,23 @@ impl PublicationGitContext {
                 .context("failed to disable external publication protocol")?;
             let global_config = directory.join("disabled-global-config");
             merge::write_private_file(&global_config, b"")?;
+            drop(config);
+
+            let object_seal = match operation.requires_object_closure() {
+                Some(expected_oid) => {
+                    let common_objects = fs::canonicalize(repo.commondir().join("objects"))
+                        .context("failed to resolve publication source object directory")?;
+                    validate_publication_object_store_is_self_contained(&repo, &common_objects)?;
+                    let private = Repository::open_bare(&directory)
+                        .context("failed to open private publication Git repository")?;
+                    Some(materialize_publication_object_closure(
+                        &repo,
+                        &private,
+                        expected_oid,
+                    )?)
+                }
+                None => None,
+            };
             let common_state = fs::canonicalize(merge::ensure_repo_common_state_directory(&repo)?)
                 .context("failed to resolve publication repository state directory")?;
             let common_directory = fs::canonicalize(repo.commondir())
@@ -3127,6 +3715,8 @@ impl PublicationGitContext {
                 host, command_url, ..
             } = &transport;
             let token = select_network_token_with(host, &mut value_for)?;
+            let mut config = git2::Config::open(&config_path)
+                .context("failed to reopen private publication Git config")?;
             let auth_scope_key = format!("http.{command_url}.extraheader");
             let authorization_header =
                 ZeroizingString(format!("Authorization: Basic {}", token.basic_str()?));
@@ -3171,7 +3761,7 @@ impl PublicationGitContext {
 
             let profile = TrustedFixedNetworkProfile::read_write(&directory)
                 .with_resource_limits(Default::default())
-                .with_visible_read_only_bind(&common_objects, &source_objects)
+                .with_visible_read_only_root(&objects)
                 .with_visible_read_only_file(&config_path)
                 .with_visible_read_only_file(&global_config)
                 .with_hidden_root(&primary_worktree)
@@ -3182,28 +3772,62 @@ impl PublicationGitContext {
                 PublicationGitBoundary::Https(profile),
                 config_files,
                 Some(token),
+                object_seal,
             ))
         })();
         match result {
-            Ok((environment, boundary, config_files, token)) => Ok(Self {
+            Ok((environment, boundary, config_files, token, object_seal)) => Ok(Self {
                 directory,
                 runtime_directory,
                 environment,
                 boundary,
                 config_files,
                 token,
+                operation,
+                object_seal,
             }),
-            Err(error) => Err(error),
+            Err(error) => {
+                let erase = erase_private_config_paths_if_present(&[
+                    directory.join("config"),
+                    directory.join("disabled-global-config"),
+                ]);
+                let close = runtime_directory.close();
+                match (erase, close) {
+                    (Ok(()), Ok(())) => Err(error),
+                    (erase, close) => Err(anyhow::anyhow!(
+                        "{error:#}; publication setup cleanup failed: erase={:?}, close={:?}",
+                        erase.err().map(|error| format!("{error:#}")),
+                        close.err().map(|error| format!("{error:#}")),
+                    )),
+                }
+            }
         }
     }
 
-    fn run(&self, label: &str, operation: Vec<OsString>) -> Result<merge::RequiredCommandOutput> {
+    fn run(mut self) -> Result<merge::RequiredCommandOutput> {
+        let execution = self.run_inner();
+        let cleanup = self.close();
+        match (execution, cleanup) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup)) => Err(cleanup
+                .context("publication command completed but private token runtime cleanup failed")),
+            (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+                "{error:#}; private token runtime cleanup also failed: {cleanup:#}"
+            )),
+        }
+    }
+
+    fn run_inner(&self) -> Result<merge::RequiredCommandOutput> {
+        let label = self.operation.label();
         self.runtime_directory
             .verify_identity()
             .context("private publication Git runtime changed before command execution")?;
         verify_private_config_files(&self.config_files)?;
         let global_config = self.directory.join("disabled-global-config");
         validate_publication_git_environment(&self.environment, &global_config)?;
+        self.verify_object_seal()?;
+        let operation = self.operation.arguments();
         validate_publication_git_operation(&operation)?;
         let args = self.command_args(operation);
         let output = match &self.boundary {
@@ -3225,8 +3849,47 @@ impl PublicationGitContext {
             .verify_identity()
             .context("private publication Git runtime changed during command execution")?;
         verify_private_config_files(&self.config_files)?;
+        self.verify_object_seal()?;
         self.redact_output(&mut output);
         Ok(output)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let erase = erase_private_config_files(&mut self.config_files);
+        self.environment.clear();
+        drop(self.token.take());
+        let close = self.runtime_directory.close();
+        match (erase, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(erase), Err(close)) => Err(anyhow::anyhow!(
+                "private config erasure failed: {erase:#}; private runtime close failed: {close:#}"
+            )),
+        }
+    }
+
+    fn verify_object_seal(&self) -> Result<()> {
+        if let Some(seal) = &self.object_seal {
+            let private = Repository::open_bare(&self.directory)
+                .context("failed to reopen private publication object database")?;
+            verify_private_publication_object_closure(&private, seal)?;
+        } else {
+            let private = Repository::open_bare(&self.directory)
+                .context("failed to inspect observation-only publication object database")?;
+            let odb = private
+                .odb()
+                .context("failed to open observation-only publication object database")?;
+            let mut found = false;
+            odb.foreach(|_| {
+                found = true;
+                false
+            })
+            .context("failed to inspect observation-only publication object database")?;
+            if found {
+                bail!("observation-only publication context unexpectedly contained Git objects");
+            }
+        }
+        Ok(())
     }
 
     fn command_args(&self, operation: Vec<OsString>) -> Vec<OsString> {
@@ -3292,8 +3955,8 @@ fn select_network_token_with(
     host: &str,
     mut value_for: impl FnMut(&str) -> Option<String>,
 ) -> Result<PrivateNetworkToken> {
-    let hostname = host.split_once(':').map_or(host, |(hostname, _)| hostname);
-    let keys = if hostname == "github.com" {
+    authorize_network_host_with(host, &mut value_for)?;
+    let keys = if host == "github.com" {
         ["GH_TOKEN", "GITHUB_TOKEN"]
     } else {
         ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
@@ -3336,6 +3999,71 @@ fn select_network_token_with(
         bytes: first.as_bytes().to_vec(),
         basic,
     })
+}
+
+fn authorize_network_host_with(
+    host: &str,
+    mut value_for: impl FnMut(&str) -> Option<String>,
+) -> Result<()> {
+    let canonical = normalize_github_host(host)?;
+    if canonical != host {
+        bail!("HTTPS publication host authority was not canonical");
+    }
+    if host == "github.com" {
+        return Ok(());
+    }
+    let keys = ["GH_HOST", "GITHUB_HOST"];
+    let values = keys
+        .into_iter()
+        .filter_map(|key| value_for(key).map(|value| (key, value)))
+        .filter(|(_, value)| !value.is_empty())
+        .collect::<Vec<_>>();
+    let (_, first) = values.first().with_context(|| {
+        format!(
+            "enterprise HTTPS publication to {host} requires an explicit exact {} or {} host allowlist entry before token selection",
+            keys[0], keys[1]
+        )
+    })?;
+    if values.iter().any(|(_, value)| value != first) {
+        bail!(
+            "enterprise publication host variables {} and {} disagree",
+            keys[0],
+            keys[1]
+        );
+    }
+    let approved = normalize_github_host(first)
+        .context("enterprise publication host allowlist entry was invalid")?;
+    if approved != *first || approved != host {
+        bail!(
+            "enterprise publication host allowlist entry must exactly match the canonical remote authority"
+        );
+    }
+    Ok(())
+}
+
+fn select_github_expected_author_with(
+    mut value_for: impl FnMut(&str) -> Option<String>,
+) -> Result<String> {
+    let keys = ["GH_EXPECTED_AUTHOR", "GITHUB_EXPECTED_AUTHOR"];
+    let values = keys
+        .into_iter()
+        .filter_map(|key| value_for(key).map(|value| (key, value)))
+        .filter(|(_, value)| !value.is_empty())
+        .collect::<Vec<_>>();
+    let (_, first) = values.first().with_context(|| {
+        format!(
+            "GitHub publication requires an explicit {} or {} provenance binding before token selection",
+            keys[0], keys[1]
+        )
+    })?;
+    if values.iter().any(|(_, value)| value != first) {
+        bail!(
+            "GitHub expected-author variables {} and {} disagree",
+            keys[0],
+            keys[1]
+        );
+    }
+    canonical_github_author_login(first)
 }
 
 fn encode_base64(input: &[u8]) -> String {
@@ -3482,6 +4210,89 @@ fn verify_private_config_files(files: &[PrivateConfigFileIdentity]) -> Result<()
         }
     }
     Ok(())
+}
+
+fn erase_private_config_files(files: &mut [PrivateConfigFileIdentity]) -> Result<()> {
+    verify_private_config_files(files)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        for expected in files {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            let mut file = options.open(&expected.path).with_context(|| {
+                format!(
+                    "failed to reopen private config for erasure {}",
+                    expected.path.display()
+                )
+            })?;
+            let metadata = file.metadata().with_context(|| {
+                format!(
+                    "failed to inspect private config for erasure {}",
+                    expected.path.display()
+                )
+            })?;
+            if metadata.dev() != expected.device
+                || metadata.ino() != expected.inode
+                || metadata.len() != expected.bytes.len() as u64
+            {
+                bail!(
+                    "private config {} changed before explicit erasure",
+                    expected.path.display()
+                );
+            }
+            file.seek(SeekFrom::Start(0))
+                .context("failed to seek private config for erasure")?;
+            let zeros = vec![0_u8; expected.bytes.len()];
+            file.write_all(&zeros)
+                .context("failed to overwrite private config during erasure")?;
+            file.sync_all()
+                .context("failed to persist private config erasure")?;
+            zeroize_bytes(&mut expected.bytes);
+            expected.bytes.clear();
+            expected.bytes.resize(zeros.len(), 0);
+            let erased = capture_bound_config_file(&expected.path, expected.private_owner_only)?;
+            if erased.device != expected.device
+                || erased.inode != expected.inode
+                || erased.bytes != expected.bytes
+            {
+                bail!(
+                    "private config {} did not verify as erased",
+                    expected.path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = files;
+        bail!("explicit private config erasure is unsupported on this platform")
+    }
+}
+
+fn erase_private_config_paths_if_present(paths: &[PathBuf]) -> Result<()> {
+    let mut files = Vec::new();
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                harden_private_config_mode(path)?;
+                files.push(capture_private_config_file(path)?);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect setup config for erasure {}",
+                        path.display()
+                    )
+                })
+            }
+        }
+    }
+    erase_private_config_files(&mut files)
 }
 
 fn redact_private_bytes(output: &mut Vec<u8>, private: &[u8]) {
@@ -3636,7 +4447,9 @@ fn publication_remote_transport(remote_url: &str) -> Result<PublicationRemoteTra
         bail!("HTTPS publication remote may not contain userinfo");
     }
     let host = normalize_github_host(authority)?;
-    if host != authority
+    let authority_is_canonical =
+        host == authority || (host == "github.com" && authority == "github.com:443");
+    if !authority_is_canonical
         || path.is_empty()
         || path.len() > MAX_PUBLICATION_PATH_BYTES
         || path.split('/').count() > MAX_PUBLICATION_PATH_COMPONENTS
@@ -3672,9 +4485,12 @@ fn ensure_remote_expected_commit(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
 ) -> Result<()> {
-    let git = PublicationGitContext::create(worktree_path, &transaction.remote_url)?;
     let previous = transaction.journal.clone();
-    let before = observe_remote_ref(&git, &transaction.journal.remote_ref)?;
+    let before = observe_remote_ref(
+        worktree_path,
+        &transaction.remote_url,
+        &transaction.journal.remote_ref,
+    )?;
     if let Some(observed) = before {
         if observed != transaction.journal.expected_oid {
             bail!(
@@ -3692,11 +4508,16 @@ fn ensure_remote_expected_commit(
     }
 
     let push = push_git_commit_create_only(
-        &git,
+        worktree_path,
+        &transaction.remote_url,
         &transaction.journal.remote_ref,
         &transaction.journal.expected_oid,
     )?;
-    let after = observe_remote_ref(&git, &transaction.journal.remote_ref)?;
+    let after = observe_remote_ref(
+        worktree_path,
+        &transaction.remote_url,
+        &transaction.journal.remote_ref,
+    )?;
     if after.as_deref() == Some(transaction.journal.expected_oid.as_str()) {
         transaction.journal.push_observed_oid = after;
         transaction.advance_phase(PublicationTransactionPhase::PushObserved);
@@ -3734,16 +4555,14 @@ fn ensure_github_remote_expected_commit(
     ensure_remote_expected_commit(worktree_path, transaction)
 }
 
-fn observe_remote_ref(context: &PublicationGitContext, remote_ref: &str) -> Result<Option<String>> {
-    let output = context.run(
-        "observe publication remote ref",
-        vec![
-            OsString::from("ls-remote"),
-            OsString::from("--refs"),
-            OsString::from("maco-publication"),
-            OsString::from(remote_ref),
-        ],
-    )?;
+fn observe_remote_ref(
+    worktree_path: &Path,
+    remote_url: &str,
+    remote_ref: &str,
+) -> Result<Option<String>> {
+    let operation = PublicationGitOperation::observe(remote_ref)?;
+    let context = PublicationGitContext::create(worktree_path, remote_url, operation)?;
+    let output = context.run()?;
     if !output.success {
         bail!(
             "git ls-remote failed for {}: {}",
@@ -3777,46 +4596,48 @@ fn observe_remote_ref(context: &PublicationGitContext, remote_ref: &str) -> Resu
 }
 
 fn push_git_commit_create_only(
-    context: &PublicationGitContext,
+    worktree_path: &Path,
+    remote_url: &str,
     remote_ref: &str,
     expected_oid: &str,
 ) -> Result<merge::RequiredCommandOutput> {
-    let lease = format!("--force-with-lease={remote_ref}:");
-    let refspec = format!("{expected_oid}:{remote_ref}");
-    context.run(
-        "create publication remote ref",
-        vec![
-            OsString::from("push"),
-            OsString::from("--no-verify"),
-            OsString::from(lease),
-            OsString::from("maco-publication"),
-            OsString::from(refspec),
-        ],
-    )
+    let operation = PublicationGitOperation::push_create_only(expected_oid, remote_ref)?;
+    let context = PublicationGitContext::create(worktree_path, remote_url, operation)?;
+    context.run()
 }
 
 fn reconcile_github_pr(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
-    title: &str,
-    body: &str,
 ) -> Result<GithubPrResult> {
-    reconcile_github_pr_with_api(worktree_path, transaction, title, body, &mut CliGithubApi)
+    reconcile_github_pr_with_api(worktree_path, transaction, &mut CliGithubApi)
 }
 
 fn reconcile_github_pr_with_api(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
-    title: &str,
-    body: &str,
     api: &mut impl GithubApi,
+) -> Result<GithubPrResult> {
+    reconcile_github_pr_with_api_and_remote_check(
+        worktree_path,
+        transaction,
+        api,
+        require_remote_expected,
+    )
+}
+
+fn reconcile_github_pr_with_api_and_remote_check(
+    worktree_path: &Path,
+    transaction: &mut PublicationTransaction,
+    api: &mut impl GithubApi,
+    mut remote_check: impl FnMut(&Path, &PublicationTransaction, &str) -> Result<()>,
 ) -> Result<GithubPrResult> {
     let github_repository = transaction
         .journal
         .github_repository
         .clone()
         .context("GitHub publication transaction omitted forge repository binding")?;
-    require_remote_expected(
+    remote_check(
         worktree_path,
         transaction,
         "before GitHub PR reconciliation",
@@ -3829,12 +4650,13 @@ fn reconcile_github_pr_with_api(
             .map(|number| number.to_string())
             .unwrap_or_else(|| transaction.journal.remote_branch.clone());
         if let Ok(receipt) = api.view(worktree_path, &selector, &github_repository) {
-            return verify_github_receipt(
+            return verify_github_receipt_with_remote_check(
                 worktree_path,
                 transaction,
                 receipt,
                 transaction.journal.created_by_transaction,
                 transaction.journal.observed_existing_pr,
+                &mut remote_check,
             );
         }
     }
@@ -3851,25 +4673,40 @@ fn reconcile_github_pr_with_api(
         );
     }
     if let Some(existing) = existing.into_iter().next() {
+        if !transaction.journal.create_attempted {
+            bail!(
+                "a GitHub PR already exists for the publication branch before this transaction attempted creation; refusing front-run reconciliation"
+            );
+        }
         let selector = existing.number.to_string();
         let receipt = api.view(worktree_path, &selector, &github_repository)?;
-        let created_by_transaction = transaction.journal.created_by_transaction;
-        return verify_github_receipt(
+        return verify_github_receipt_with_remote_check(
             worktree_path,
             transaction,
             receipt,
-            created_by_transaction,
-            !created_by_transaction,
+            true,
+            false,
+            &mut remote_check,
         );
     }
 
-    require_remote_expected(
+    remote_check(
         worktree_path,
         transaction,
         "immediately before gh pr create",
     )?;
     transaction.journal.create_attempted = true;
     transaction.persist()?;
+    let title = transaction
+        .journal
+        .expected_pr_title
+        .as_deref()
+        .context("GitHub publication transaction omitted its bound title")?;
+    let body = transaction
+        .journal
+        .expected_pr_body
+        .as_deref()
+        .context("GitHub publication transaction omitted its marker-bound body")?;
     let create = api.create(
         worktree_path,
         &transaction.journal.remote_branch,
@@ -3879,7 +4716,6 @@ fn reconcile_github_pr_with_api(
         transaction.journal.draft,
         &github_repository,
     )?;
-    let create_succeeded = create.success;
     let hinted_url = first_non_empty_line(&String::from_utf8_lossy(&create.stdout));
 
     let receipt = if hinted_url.is_some() {
@@ -3918,24 +4754,26 @@ fn reconcile_github_pr_with_api(
             api.view(worktree_path, &selector, &github_repository)?
         }
     };
-    verify_github_receipt(
+    verify_github_receipt_with_remote_check(
         worktree_path,
         transaction,
         receipt,
-        create_succeeded,
-        !create_succeeded,
+        true,
+        false,
+        &mut remote_check,
     )
 }
 
-fn verify_github_receipt(
+fn verify_github_receipt_with_remote_check(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
     receipt: GithubPrResult,
     created_by_transaction: bool,
     observed_existing_pr: bool,
+    mut remote_check: impl FnMut(&Path, &PublicationTransaction, &str) -> Result<()>,
 ) -> Result<GithubPrResult> {
     validate_github_receipt_contract(&receipt, &transaction.journal)?;
-    require_remote_expected(worktree_path, transaction, "after GitHub PR creation")?;
+    remote_check(worktree_path, transaction, "after GitHub PR creation")?;
     let previous = transaction.journal.clone();
     transaction.journal.pr_url = Some(receipt.url.clone());
     transaction.journal.pr_head_oid = Some(receipt.head_oid.clone());
@@ -3943,6 +4781,13 @@ fn verify_github_receipt(
     transaction.journal.pr_state = Some(receipt.state.clone());
     transaction.journal.pr_is_draft = Some(receipt.is_draft);
     transaction.journal.pr_number = Some(receipt.number);
+    transaction.journal.pr_title = Some(receipt.title.clone());
+    transaction.journal.pr_body = Some(receipt.body.clone());
+    transaction.journal.pr_head_ref_name = Some(receipt.head_ref_name.clone());
+    transaction.journal.pr_head_repository_owner = Some(receipt.head_repository_owner.clone());
+    transaction.journal.pr_head_repository_name = Some(receipt.head_repository_name.clone());
+    transaction.journal.pr_is_cross_repository = Some(receipt.is_cross_repository);
+    transaction.journal.pr_author = Some(receipt.author.clone());
     transaction.journal.created_by_transaction =
         transaction.journal.created_by_transaction || created_by_transaction;
     transaction.journal.observed_existing_pr = !transaction.journal.created_by_transaction
@@ -3957,6 +4802,13 @@ fn verify_github_receipt(
         base_ref_name: receipt.base_ref_name,
         state: receipt.state,
         is_draft: receipt.is_draft,
+        title: receipt.title,
+        body: receipt.body,
+        head_ref_name: receipt.head_ref_name,
+        head_repository_owner: receipt.head_repository_owner,
+        head_repository_name: receipt.head_repository_name,
+        is_cross_repository: receipt.is_cross_repository,
+        author: receipt.author,
         created: transaction.journal.created_by_transaction,
     })
 }
@@ -3995,6 +4847,35 @@ fn validate_github_receipt_contract(
             journal.base
         );
     }
+    let expected_title = journal
+        .expected_pr_title
+        .as_deref()
+        .context("GitHub publication journal omitted its exact PR title")?;
+    let expected_body = journal
+        .expected_pr_body
+        .as_deref()
+        .context("GitHub publication journal omitted its marker-bound PR body")?;
+    let expected_author = journal
+        .expected_pr_author
+        .as_deref()
+        .context("GitHub publication journal omitted its explicit expected author")?;
+    if receipt.title != expected_title || receipt.body != expected_body {
+        bail!("GitHub PR receipt title/body did not match the marker-bound transaction content");
+    }
+    if receipt.head_ref_name != journal.remote_branch {
+        bail!("GitHub PR receipt headRefName did not match the unique publication branch");
+    }
+    if receipt.head_repository_owner != github_repository.owner
+        || receipt.head_repository_name != github_repository.name
+        || receipt.is_cross_repository
+    {
+        bail!(
+            "GitHub PR receipt head repository provenance did not match the bound same-repository publication"
+        );
+    }
+    if receipt.author != expected_author {
+        bail!("GitHub PR receipt author did not match the explicit expected author");
+    }
     if receipt.is_draft != journal.draft {
         bail!(
             "GitHub PR receipt draft state {} does not match requested draft state {}",
@@ -4016,8 +4897,11 @@ fn require_remote_expected(
     transaction: &PublicationTransaction,
     stage: &str,
 ) -> Result<()> {
-    let git = PublicationGitContext::create(worktree_path, &transaction.remote_url)?;
-    let observed = observe_remote_ref(&git, &transaction.journal.remote_ref)?;
+    let observed = observe_remote_ref(
+        worktree_path,
+        &transaction.remote_url,
+        &transaction.journal.remote_ref,
+    )?;
     if observed.as_deref() != Some(transaction.journal.expected_oid.as_str()) {
         bail!(
             "publication remote ref {} changed {stage}: observed {:?}, expected {}",
@@ -4026,7 +4910,7 @@ fn require_remote_expected(
             transaction.journal.expected_oid
         );
     }
-    require_remote_expected_base_with_context(&git, transaction, stage)?;
+    require_remote_expected_base_with_context(worktree_path, transaction, stage)?;
     Ok(())
 }
 
@@ -4035,12 +4919,11 @@ fn require_remote_expected_base(
     transaction: &PublicationTransaction,
     stage: &str,
 ) -> Result<()> {
-    let git = PublicationGitContext::create(worktree_path, &transaction.remote_url)?;
-    require_remote_expected_base_with_context(&git, transaction, stage)
+    require_remote_expected_base_with_context(worktree_path, transaction, stage)
 }
 
 fn require_remote_expected_base_with_context(
-    git: &PublicationGitContext,
+    worktree_path: &Path,
     transaction: &PublicationTransaction,
     stage: &str,
 ) -> Result<()> {
@@ -4050,7 +4933,7 @@ fn require_remote_expected_base_with_context(
         .as_deref()
         .context("GitHub publication journal omitted exact base OID")?;
     let base_ref = format!("refs/heads/{}", transaction.journal.base);
-    let observed_base = observe_remote_ref(git, &base_ref)?;
+    let observed_base = observe_remote_ref(worktree_path, &transaction.remote_url, &base_ref)?;
     if observed_base.as_deref() != Some(expected_base_oid) {
         bail!(
             "publication base ref {} changed {stage}: observed {:?}, expected {}",
@@ -4072,7 +4955,7 @@ impl GhCommandContext {
         repository: &GithubRepositoryIdentity,
         mut value_for: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
-        let runtime_directory = merge::PrivateRuntimeDirectory::create(
+        let mut runtime_directory = merge::PrivateRuntimeDirectory::create(
             worktree_path,
             merge::PrivateRuntimeKind::GhConfig,
         )?;
@@ -4146,11 +5029,43 @@ impl GhCommandContext {
                 repository: repository.clone(),
                 token,
             }),
-            Err(error) => Err(error),
+            Err(error) => {
+                let erase = erase_private_config_paths_if_present(&[directory.join("hosts.yml")]);
+                let close = runtime_directory.close();
+                match (erase, close) {
+                    (Ok(()), Ok(())) => Err(error),
+                    (erase, close) => Err(anyhow::anyhow!(
+                        "{error:#}; gh setup cleanup failed: erase={:?}, close={:?}",
+                        erase.err().map(|error| format!("{error:#}")),
+                        close.err().map(|error| format!("{error:#}")),
+                    )),
+                }
+            }
         }
     }
 
     fn run(
+        mut self,
+        label: &str,
+        args: Vec<OsString>,
+        stdin: StdinMode,
+    ) -> Result<merge::RequiredCommandOutput> {
+        let execution = self.run_inner(label, args, stdin);
+        let cleanup = self.close();
+        match (execution, cleanup) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup)) => {
+                Err(cleanup
+                    .context("gh command completed but private token runtime cleanup failed"))
+            }
+            (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+                "{error:#}; gh private token runtime cleanup also failed: {cleanup:#}"
+            )),
+        }
+    }
+
+    fn run_inner(
         &self,
         label: &str,
         args: Vec<OsString>,
@@ -4195,6 +5110,20 @@ impl GhCommandContext {
         redact_private_bytes(&mut output.stderr, &self.token.basic);
         Ok(output)
     }
+
+    fn close(&mut self) -> Result<()> {
+        let erase = erase_private_config_files(&mut self.config_files);
+        self.environment.clear();
+        self.token.zeroize();
+        let close = self.runtime_directory.close();
+        match (erase, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(erase), Err(close)) => Err(anyhow::anyhow!(
+                "gh private config erasure failed: {erase:#}; private runtime close failed: {close:#}"
+            )),
+        }
+    }
 }
 
 fn validate_gh_environment(
@@ -4235,7 +5164,7 @@ fn validate_gh_operation(
         })
         .collect::<Result<Vec<_>>>()?;
     let selector = repository.selector();
-    let receipt_fields = "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft";
+    let receipt_fields = GITHUB_PR_RECEIPT_FIELDS;
     match args.as_slice() {
         ["pr", "list", "--repo", bound, "--head", branch, "--state", "all", "--json", fields]
             if *bound == selector
@@ -4313,7 +5242,7 @@ fn cli_github_pr_list(
             "--state",
             "all",
             "--json",
-            "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft",
+            GITHUB_PR_RECEIPT_FIELDS,
         ]
         .into_iter()
         .map(OsString::from)
@@ -4351,7 +5280,7 @@ fn cli_github_pr_view(
             "--repo",
             &repository.selector(),
             "--json",
-            "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft",
+            GITHUB_PR_RECEIPT_FIELDS,
         ]
         .into_iter()
         .map(OsString::from)
@@ -4417,6 +5346,64 @@ fn github_pr_receipt_from_json(value: &serde_json::Value) -> Result<GithubPrResu
         .get("isDraft")
         .and_then(serde_json::Value::as_bool)
         .context("GitHub PR receipt omitted isDraft")?;
+    let title = value
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub PR receipt omitted title")?;
+    let body = value
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub PR receipt omitted body")?;
+    let head_ref_name = value
+        .get("headRefName")
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub PR receipt omitted headRefName")?;
+    for (label, text, limit) in [
+        ("title", title, MAX_GITHUB_RECEIPT_STRING_BYTES),
+        ("body", body, MAX_GITHUB_RECEIPT_BODY_BYTES),
+        ("headRefName", head_ref_name, MAX_PUBLICATION_REF_BYTES),
+    ] {
+        if text.is_empty() || text.len() > limit || text.as_bytes().contains(&0) {
+            bail!("GitHub PR receipt {label} was empty, malformed, or oversized");
+        }
+    }
+    let head_repository = value
+        .get("headRepository")
+        .and_then(serde_json::Value::as_object)
+        .context("GitHub PR receipt omitted headRepository")?;
+    let head_repository_name = head_repository
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub PR receipt omitted headRepository.name")?;
+    let head_repository_owner = value
+        .get("headRepositoryOwner")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|owner| owner.get("login"))
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub PR receipt omitted headRepositoryOwner.login")?;
+    validate_github_slug(head_repository_owner, "receipt head owner")?;
+    validate_github_slug(head_repository_name, "receipt head repository")?;
+    if let Some(name_with_owner) = head_repository
+        .get("nameWithOwner")
+        .and_then(serde_json::Value::as_str)
+    {
+        let expected = format!("{head_repository_owner}/{head_repository_name}");
+        if !name_with_owner.eq_ignore_ascii_case(&expected) {
+            bail!("GitHub PR receipt headRepository.nameWithOwner was inconsistent");
+        }
+    }
+    let is_cross_repository = value
+        .get("isCrossRepository")
+        .and_then(serde_json::Value::as_bool)
+        .context("GitHub PR receipt omitted isCrossRepository")?;
+    let author = value
+        .get("author")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|author| author.get("login"))
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub PR receipt omitted author.login")?;
+    let author =
+        canonical_github_author_login(author).context("GitHub PR receipt author was malformed")?;
     Ok(GithubPrResult {
         url: url.to_string(),
         head_oid,
@@ -4425,6 +5412,13 @@ fn github_pr_receipt_from_json(value: &serde_json::Value) -> Result<GithubPrResu
         base_ref_name: base_ref_name.to_string(),
         state: state.to_string(),
         is_draft,
+        title: title.to_string(),
+        body: body.to_string(),
+        head_ref_name: head_ref_name.to_string(),
+        head_repository_owner: head_repository_owner.to_ascii_lowercase(),
+        head_repository_name: head_repository_name.to_ascii_lowercase(),
+        is_cross_repository,
+        author,
         created: false,
     })
 }
@@ -4465,7 +5459,6 @@ fn cli_github_pr_create(
         StdinMode::Bytes(body.as_bytes().to_vec()),
     )?;
     Ok(GithubCreateOutput {
-        success: output.success,
         stdout: output.stdout,
         stderr: output.stderr,
     })
@@ -5218,7 +6211,30 @@ mod tests {
         drop(existing_reader);
     }
 
+    fn test_publication_pr_marker() -> String {
+        "ab".repeat(PUBLICATION_PR_MARKER_BYTES)
+    }
+
+    fn test_publication_pr_body() -> String {
+        pr_body_with_publication_marker("test publication body", &test_publication_pr_marker())
+            .expect("marker-bound test PR body")
+    }
+
+    fn enterprise_test_value(host: &str, key: &str) -> Option<String> {
+        match key {
+            "GH_HOST" => Some(host.to_string()),
+            "GH_ENTERPRISE_TOKEN" => Some("test-token".to_string()),
+            _ => None,
+        }
+    }
+
+    fn test_observe_operation() -> PublicationGitOperation {
+        PublicationGitOperation::observe("refs/heads/test").expect("test observation operation")
+    }
+
     fn completed_github_journal(sequence: u64) -> PublicationTransactionJournal {
+        let marker = test_publication_pr_marker();
+        let body = test_publication_pr_body();
         PublicationTransactionJournal {
             version: PUBLICATION_JOURNAL_VERSION,
             transaction_id: "completed-test-transaction".to_string(),
@@ -5237,6 +6253,10 @@ mod tests {
                 owner: "owner".to_string(),
                 name: "repo".to_string(),
             }),
+            pr_marker_nonce: Some(marker),
+            expected_pr_title: Some("Agent agent-a changes".to_string()),
+            expected_pr_body: Some(body.clone()),
+            expected_pr_author: Some("publisher".to_string()),
             base: "main".to_string(),
             draft: true,
             phase: PublicationTransactionPhase::Completed,
@@ -5247,12 +6267,240 @@ mod tests {
             pr_state: Some("OPEN".to_string()),
             pr_is_draft: Some(true),
             pr_number: Some(7),
+            pr_title: Some("Agent agent-a changes".to_string()),
+            pr_body: Some(body),
+            pr_head_ref_name: Some("maco/review/agent-a/test".to_string()),
+            pr_head_repository_owner: Some("owner".to_string()),
+            pr_head_repository_name: Some("repo".to_string()),
+            pr_is_cross_repository: Some(false),
+            pr_author: Some("publisher".to_string()),
             create_attempted: true,
             created_by_transaction: true,
             observed_existing_pr: false,
             last_error: None,
             updated_unix_seconds: sequence,
         }
+    }
+
+    fn prepared_github_transaction(
+        directory: &Path,
+        create_attempted: bool,
+    ) -> PublicationTransaction {
+        let mut journal = completed_github_journal(0);
+        journal.transaction_id = "prepared-test-transaction".to_string();
+        journal.phase = PublicationTransactionPhase::PushObserved;
+        journal.pr_url = None;
+        journal.pr_head_oid = None;
+        journal.pr_base = None;
+        journal.pr_state = None;
+        journal.pr_is_draft = None;
+        journal.pr_number = None;
+        journal.pr_title = None;
+        journal.pr_body = None;
+        journal.pr_head_ref_name = None;
+        journal.pr_head_repository_owner = None;
+        journal.pr_head_repository_name = None;
+        journal.pr_is_cross_repository = None;
+        journal.pr_author = None;
+        journal.create_attempted = create_attempted;
+        journal.created_by_transaction = false;
+        journal.observed_existing_pr = false;
+        PublicationTransaction {
+            directory: directory.to_path_buf(),
+            journal,
+            remote_url: "https://example.invalid/owner/repo.git".to_string(),
+        }
+    }
+
+    fn exact_github_receipt(journal: &PublicationTransactionJournal) -> GithubPrResult {
+        GithubPrResult {
+            url: "https://example.invalid/owner/repo/pull/7".to_string(),
+            head_oid: journal.expected_oid.clone(),
+            base_oid: journal.expected_base_oid.clone().expect("base oid"),
+            number: 7,
+            base_ref_name: journal.base.clone(),
+            state: "OPEN".to_string(),
+            is_draft: journal.draft,
+            title: journal.expected_pr_title.clone().expect("expected title"),
+            body: journal.expected_pr_body.clone().expect("expected body"),
+            head_ref_name: journal.remote_branch.clone(),
+            head_repository_owner: "owner".to_string(),
+            head_repository_name: "repo".to_string(),
+            is_cross_repository: false,
+            author: journal.expected_pr_author.clone().expect("expected author"),
+            created: false,
+        }
+    }
+
+    struct ScriptedGithubApi {
+        lists: std::collections::VecDeque<Vec<GithubPrResult>>,
+        views: std::collections::VecDeque<GithubPrResult>,
+        create_output: Option<GithubCreateOutput>,
+        create_calls: usize,
+        created_title: Option<String>,
+        created_body: Option<String>,
+    }
+
+    impl ScriptedGithubApi {
+        fn new(
+            lists: impl IntoIterator<Item = Vec<GithubPrResult>>,
+            views: impl IntoIterator<Item = GithubPrResult>,
+        ) -> Self {
+            Self {
+                lists: lists.into_iter().collect(),
+                views: views.into_iter().collect(),
+                create_output: Some(GithubCreateOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }),
+                create_calls: 0,
+                created_title: None,
+                created_body: None,
+            }
+        }
+    }
+
+    impl GithubApi for ScriptedGithubApi {
+        fn list(
+            &mut self,
+            _worktree_path: &Path,
+            _branch: &str,
+            _repository: &GithubRepositoryIdentity,
+        ) -> Result<Vec<GithubPrResult>> {
+            self.lists
+                .pop_front()
+                .context("scripted GitHub API omitted a list response")
+        }
+
+        fn view(
+            &mut self,
+            _worktree_path: &Path,
+            _selector: &str,
+            _repository: &GithubRepositoryIdentity,
+        ) -> Result<GithubPrResult> {
+            self.views
+                .pop_front()
+                .context("scripted GitHub API omitted a view response")
+        }
+
+        fn create(
+            &mut self,
+            _worktree_path: &Path,
+            _branch: &str,
+            _base: &str,
+            title: &str,
+            body: &str,
+            _draft: bool,
+            _repository: &GithubRepositoryIdentity,
+        ) -> Result<GithubCreateOutput> {
+            self.create_calls += 1;
+            self.created_title = Some(title.to_string());
+            self.created_body = Some(body.to_string());
+            self.create_output
+                .take()
+                .context("scripted GitHub API omitted a create response")
+        }
+    }
+
+    #[test]
+    fn github_reconciliation_rejects_preexisting_branch_pr_as_a_front_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut transaction = prepared_github_transaction(temp.path(), false);
+        let receipt = exact_github_receipt(&transaction.journal);
+        let mut api = ScriptedGithubApi::new([vec![receipt]], []);
+        let error = reconcile_github_pr_with_api_and_remote_check(
+            temp.path(),
+            &mut transaction,
+            &mut api,
+            |_, _, _| Ok(()),
+        )
+        .expect_err("a PR predating the create intent must fail closed");
+        assert!(error.to_string().contains("front-run"));
+        assert_eq!(api.create_calls, 0);
+        assert!(!transaction.journal.create_attempted);
+        assert!(transaction.journal.pr_url.is_none());
+    }
+
+    #[test]
+    fn github_crash_reconciliation_accepts_only_exact_marker_and_provenance() {
+        let wrong = tempfile::tempdir().expect("wrong tempdir");
+        let mut wrong_transaction = prepared_github_transaction(wrong.path(), true);
+        let mut wrong_receipt = exact_github_receipt(&wrong_transaction.journal);
+        wrong_receipt.body = pr_body_with_publication_marker(
+            "test publication body",
+            &"cd".repeat(PUBLICATION_PR_MARKER_BYTES),
+        )
+        .expect("different marker body");
+        let mut wrong_api = ScriptedGithubApi::new([vec![wrong_receipt.clone()]], [wrong_receipt]);
+        let error = reconcile_github_pr_with_api_and_remote_check(
+            wrong.path(),
+            &mut wrong_transaction,
+            &mut wrong_api,
+            |_, _, _| Ok(()),
+        )
+        .expect_err("a different marker must never be adopted after a crash");
+        assert!(error.to_string().contains("marker-bound"));
+        assert!(wrong_transaction.journal.pr_url.is_none());
+
+        let exact = tempfile::tempdir().expect("exact tempdir");
+        let exact_journal = exact.path().join("journal");
+        merge::create_private_directory(&exact_journal).expect("exact journal directory");
+        let mut exact_transaction = prepared_github_transaction(&exact_journal, true);
+        let exact_receipt = exact_github_receipt(&exact_transaction.journal);
+        let mut exact_api = ScriptedGithubApi::new([vec![exact_receipt.clone()]], [exact_receipt]);
+        let reconciled = reconcile_github_pr_with_api_and_remote_check(
+            exact.path(),
+            &mut exact_transaction,
+            &mut exact_api,
+            |_, _, _| Ok(()),
+        )
+        .expect("exact marker-bound receipt is the transaction's crash outcome");
+        assert!(reconciled.created);
+        assert_eq!(exact_api.create_calls, 0);
+        assert!(exact_transaction.journal.created_by_transaction);
+        assert!(!exact_transaction.journal.observed_existing_pr);
+        validate_publication_journal(&exact_transaction.journal)
+            .expect("reconciled receipt journal is exact");
+    }
+
+    #[test]
+    fn github_create_recovery_binds_exact_title_body_author_and_head_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_directory = temp.path().join("journal");
+        merge::create_private_directory(&journal_directory).expect("journal directory");
+        let mut transaction = prepared_github_transaction(&journal_directory, false);
+        let receipt = exact_github_receipt(&transaction.journal);
+        let mut api =
+            ScriptedGithubApi::new([Vec::new(), vec![receipt.clone()]], [receipt.clone()]);
+        let mut remote_checks = 0usize;
+        let result = reconcile_github_pr_with_api_and_remote_check(
+            temp.path(),
+            &mut transaction,
+            &mut api,
+            |_, _, _| {
+                remote_checks += 1;
+                Ok(())
+            },
+        )
+        .expect("recover exact receipt after an ambiguous create response");
+
+        assert_eq!(api.create_calls, 1);
+        assert_eq!(remote_checks, 3);
+        assert_eq!(
+            api.created_title.as_deref(),
+            transaction.journal.expected_pr_title.as_deref()
+        );
+        assert_eq!(
+            api.created_body.as_deref(),
+            transaction.journal.expected_pr_body.as_deref()
+        );
+        assert_eq!(result.author, "publisher");
+        assert_eq!(result.head_repository_owner, "owner");
+        assert_eq!(result.head_repository_name, "repo");
+        assert!(!result.is_cross_repository);
+        assert!(transaction.journal.created_by_transaction);
+        validate_publication_journal(&transaction.journal)
+            .expect("created receipt journal is exact");
     }
 
     fn write_test_journal_record(directory: &Path, journal: &PublicationTransactionJournal) {
@@ -5292,6 +6540,10 @@ mod tests {
                     owner: "owner".to_string(),
                     name: "repo".to_string(),
                 }),
+                pr_marker_nonce: Some(test_publication_pr_marker()),
+                expected_pr_title: Some("Agent agent-a changes".to_string()),
+                expected_pr_body: Some(test_publication_pr_body()),
+                expected_pr_author: Some("publisher".to_string()),
                 base: "main".to_string(),
                 draft: true,
                 phase: PublicationTransactionPhase::Prepared,
@@ -5302,6 +6554,13 @@ mod tests {
                 pr_state: None,
                 pr_is_draft: None,
                 pr_number: None,
+                pr_title: None,
+                pr_body: None,
+                pr_head_ref_name: None,
+                pr_head_repository_owner: None,
+                pr_head_repository_name: None,
+                pr_is_cross_repository: None,
+                pr_author: None,
                 create_attempted: false,
                 created_by_transaction: false,
                 observed_existing_pr: false,
@@ -5541,9 +6800,13 @@ mod tests {
                 owner: "owner".to_string(),
                 name: "repo".to_string(),
             }),
+            pr_marker_nonce: Some(test_publication_pr_marker()),
+            expected_pr_title: Some("Agent agent-a changes".to_string()),
+            expected_pr_body: Some(test_publication_pr_body()),
+            expected_pr_author: Some("publisher".to_string()),
             base: "main".to_string(),
             draft: true,
-            phase: PublicationTransactionPhase::PrObserved,
+            phase: PublicationTransactionPhase::Prepared,
             push_observed_oid: None,
             pr_url: None,
             pr_head_oid: None,
@@ -5551,9 +6814,16 @@ mod tests {
             pr_state: None,
             pr_is_draft: None,
             pr_number: None,
+            pr_title: None,
+            pr_body: None,
+            pr_head_ref_name: None,
+            pr_head_repository_owner: None,
+            pr_head_repository_name: None,
+            pr_is_cross_repository: None,
+            pr_author: None,
             create_attempted: false,
             created_by_transaction: false,
-            observed_existing_pr: true,
+            observed_existing_pr: false,
             last_error: None,
             updated_unix_seconds: 1,
         };
@@ -5565,6 +6835,13 @@ mod tests {
             base_ref_name: "release".to_string(),
             state: "OPEN".to_string(),
             is_draft: true,
+            title: "Agent agent-a changes".to_string(),
+            body: test_publication_pr_body(),
+            head_ref_name: "maco/review/agent-a/test".to_string(),
+            head_repository_owner: "owner".to_string(),
+            head_repository_name: "repo".to_string(),
+            is_cross_repository: false,
+            author: "publisher".to_string(),
             created: false,
         };
         assert!(validate_github_receipt_contract(&receipt, &journal)
@@ -5577,6 +6854,43 @@ mod tests {
             .expect_err("closed PR must fail")
             .to_string()
             .contains("not OPEN"));
+    }
+
+    #[test]
+    fn github_receipt_requires_exact_marker_head_repository_and_author_provenance() {
+        let journal = completed_github_journal(1);
+        let exact = exact_github_receipt(&journal);
+        validate_github_receipt_contract(&exact, &journal).expect("exact receipt");
+
+        let mut cases = Vec::new();
+        let mut changed = exact.clone();
+        changed.title.push('!');
+        cases.push(("title", changed));
+        let mut changed = exact.clone();
+        changed.body.push_str("different");
+        cases.push(("body", changed));
+        let mut changed = exact.clone();
+        changed.head_ref_name = "maco/review/agent-a/front-run".to_string();
+        cases.push(("head ref", changed));
+        let mut changed = exact.clone();
+        changed.head_repository_owner = "attacker".to_string();
+        cases.push(("head owner", changed));
+        let mut changed = exact.clone();
+        changed.head_repository_name = "fork".to_string();
+        cases.push(("head repository", changed));
+        let mut changed = exact.clone();
+        changed.is_cross_repository = true;
+        cases.push(("cross repository", changed));
+        let mut changed = exact;
+        changed.author = "unexpected-bot[bot]".to_string();
+        cases.push(("author", changed));
+
+        for (label, changed) in cases {
+            assert!(
+                validate_github_receipt_contract(&changed, &journal).is_err(),
+                "changed {label} provenance must fail"
+            );
+        }
     }
 
     #[test]
@@ -5620,7 +6934,7 @@ mod tests {
     fn github_repository_binding_accepts_only_https_without_url_credentials() {
         let https = github_repository_identity("https://github.example/Owner/repo.git")
             .expect("parse HTTPS origin");
-        assert_eq!(https.selector(), "github.example/Owner/repo");
+        assert_eq!(https.selector(), "github.example/owner/repo");
         assert!(github_repository_identity("/tmp/local-origin.git").is_err());
         assert!(github_repository_identity("ssh://git@github.example/Owner/repo.git").is_err());
         assert!(github_repository_identity("git@github.example:Owner/repo.git").is_err());
@@ -5722,6 +7036,16 @@ mod tests {
             "baseRefName": "main",
             "state": "OPEN",
             "isDraft": true,
+            "title": "Agent agent-a changes",
+            "body": test_publication_pr_body(),
+            "headRefName": "maco/review/agent-a/test",
+            "headRepository": {
+                "name": "repo",
+                "nameWithOwner": "owner/repo"
+            },
+            "headRepositoryOwner": { "login": "owner" },
+            "isCrossRepository": false,
+            "author": { "login": "publisher" },
         });
         github_pr_receipt_from_json(&valid).expect("valid PR receipt");
 
@@ -5736,6 +7060,9 @@ mod tests {
         assert!(github_pr_receipt_from_json(&invalid).is_err());
         let mut invalid = valid.clone();
         invalid["baseRefName"] = serde_json::json!("a".repeat(MAX_GITHUB_RECEIPT_STRING_BYTES + 1));
+        assert!(github_pr_receipt_from_json(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid["body"] = serde_json::json!("a".repeat(MAX_GITHUB_RECEIPT_BODY_BYTES + 1));
         assert!(github_pr_receipt_from_json(&invalid).is_err());
         let excessive = serde_json::Value::Array(
             std::iter::repeat_n(valid, MAX_GITHUB_PR_LIST_RECEIPTS + 1).collect(),
@@ -5766,6 +7093,10 @@ mod tests {
                     owner: "owner".to_string(),
                     name: "repo".to_string(),
                 }),
+                pr_marker_nonce: Some(test_publication_pr_marker()),
+                expected_pr_title: Some("Agent agent-a changes".to_string()),
+                expected_pr_body: Some(test_publication_pr_body()),
+                expected_pr_author: Some("publisher".to_string()),
                 base: "main".to_string(),
                 draft: true,
                 phase: PublicationTransactionPhase::PushObserved,
@@ -5776,6 +7107,13 @@ mod tests {
                 pr_state: None,
                 pr_is_draft: None,
                 pr_number: None,
+                pr_title: None,
+                pr_body: None,
+                pr_head_ref_name: None,
+                pr_head_repository_owner: None,
+                pr_head_repository_name: None,
+                pr_is_cross_repository: None,
+                pr_author: None,
                 create_attempted: true,
                 created_by_transaction: false,
                 observed_existing_pr: false,
@@ -5792,11 +7130,25 @@ mod tests {
             base_ref_name: "main".to_string(),
             state: "OPEN".to_string(),
             is_draft: true,
+            title: "Agent agent-a changes".to_string(),
+            body: test_publication_pr_body(),
+            head_ref_name: "maco/review/agent-a/test".to_string(),
+            head_repository_owner: "owner".to_string(),
+            head_repository_name: "repo".to_string(),
+            is_cross_repository: false,
+            author: "publisher".to_string(),
             created: false,
         };
 
-        let error = verify_github_receipt(temp.path(), &mut transaction, receipt, true, false)
-            .expect_err("wrong base receipt must fail before persistence");
+        let error = verify_github_receipt_with_remote_check(
+            temp.path(),
+            &mut transaction,
+            receipt,
+            true,
+            false,
+            |_, _, _| Ok(()),
+        )
+        .expect_err("wrong base receipt must fail before persistence");
 
         assert!(error.to_string().contains("baseRefOid"));
         assert_eq!(transaction.journal.sequence, 0);
@@ -5822,7 +7174,7 @@ mod tests {
             name: "repo".to_string(),
         };
         let context = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
-            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
+            enterprise_test_value("github.example", key)
         })
         .expect("create gh context");
         for key in [
@@ -5869,9 +7221,12 @@ mod tests {
         let repo_path = temp.path().join("repo");
         Repository::init(&repo_path).expect("init repo");
         let raw = "https://example.invalid/owner/repo";
-        let context = PublicationGitContext::create_with_token_source(&repo_path, raw, |key| {
-            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
-        })
+        let context = PublicationGitContext::create_with_token_source(
+            &repo_path,
+            raw,
+            test_observe_operation(),
+            |key| enterprise_test_value("example.invalid", key),
+        )
         .expect("create publication Git context");
         let args = context.command_args(vec![
             OsString::from("ls-remote"),
@@ -5929,18 +7284,15 @@ mod tests {
         let context = PublicationGitContext::create_with_token_source(
             &repo_path,
             "https://github.example/owner/repo.git",
-            |key| (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string()),
+            test_observe_operation(),
+            |key| enterprise_test_value("github.example", key),
         )
         .expect("create publication context");
         let PublicationGitBoundary::Https(profile) = &context.boundary;
-        assert!(profile.visible_read_only_roots().is_empty());
-        let bindings = profile.visible_read_only_bindings();
-        assert_eq!(bindings.len(), 1);
         assert_eq!(
-            bindings[0].0,
-            fs::canonicalize(repo.commondir().join("objects")).expect("objects")
+            profile.visible_read_only_roots(),
+            &[context.directory.join("objects")]
         );
-        assert_eq!(bindings[0].1, context.directory.join("source-objects"));
         assert_eq!(profile.visible_read_only_files().len(), 2);
         let state = fs::canonicalize(repo.commondir().join("maco/state")).expect("state");
         assert!(profile.hidden_roots().contains(&state));
@@ -5954,7 +7306,7 @@ mod tests {
             name: "repo".to_string(),
         };
         let gh = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
-            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
+            enterprise_test_value("github.example", key)
         })
         .expect("create gh context");
         assert!(gh.profile.visible_read_only_roots().is_empty());
@@ -5969,17 +7321,26 @@ mod tests {
         let repo = Repository::init(&repo_path).expect("init repo");
         merge::ensure_repo_common_state_directory(&repo).expect("state");
         let runtime_root = merge::trusted_runtime_root(&repo_path).expect("runtime root");
-        let before = fs::read_dir(&runtime_root).expect("runtime root").count();
+        let before = fs::read_dir(&runtime_root)
+            .expect("runtime root")
+            .map(|entry| entry.expect("runtime entry").file_name())
+            .collect::<BTreeSet<_>>();
         assert!(PublicationGitContext::create_with_token_source(
             &repo_path,
             "https://github.example/owner/repo.git",
-            |_| None,
+            test_observe_operation(),
+            |key| (key == "GH_HOST").then(|| "github.example".to_string()),
         )
         .is_err());
         let after = fs::read_dir(&runtime_root)
             .expect("runtime root after failure")
-            .count();
-        assert_eq!(before, after);
+            .map(|entry| entry.expect("runtime entry after failure").file_name())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            after.is_subset(&before),
+            "failed setup left a new private runtime entry: {:?}",
+            after.difference(&before).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -5990,7 +7351,8 @@ mod tests {
         let context = PublicationGitContext::create_with_token_source(
             &repo_path,
             "https://github.example/owner/repo.git",
-            |key| (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string()),
+            test_observe_operation(),
+            |key| enterprise_test_value("github.example", key),
         )
         .expect("create publication context");
         let config_path = context.directory.join("config");
@@ -6009,6 +7371,66 @@ mod tests {
         assert!(capture_private_config_file(&config_path).is_err());
         fs::remove_file(hardlink).expect("remove hardlink before secret cleanup");
         zeroize_bytes(&mut original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_network_configs_are_verifiably_erased_before_explicit_runtime_close() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let mut git = PublicationGitContext::create_with_token_source(
+            &repo_path,
+            "https://github.example/owner/repo.git",
+            test_observe_operation(),
+            |key| enterprise_test_value("github.example", key),
+        )
+        .expect("create publication context");
+        let git_runtime = git.directory.clone();
+        let git_config_paths = git
+            .config_files
+            .iter()
+            .map(|identity| (identity.path.clone(), identity.bytes.len()))
+            .collect::<Vec<_>>();
+        assert!(git_config_paths.iter().any(|(path, _)| {
+            fs::read(path).is_ok_and(|bytes| {
+                bytes
+                    .windows(b"Authorization".len())
+                    .any(|part| part == b"Authorization")
+            })
+        }));
+        erase_private_config_files(&mut git.config_files).expect("verified Git config erasure");
+        for (path, length) in &git_config_paths {
+            let bytes = fs::read(path).expect("read erased Git config");
+            assert_eq!(bytes.len(), *length);
+            assert!(bytes.iter().all(|byte| *byte == 0));
+        }
+        git.close().expect("close erased Git runtime");
+        assert!(!git_runtime.exists());
+
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        };
+        let mut gh = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
+            enterprise_test_value("github.example", key)
+        })
+        .expect("create gh context");
+        let gh_runtime = gh.runtime_directory.path().to_path_buf();
+        let gh_config_paths = gh
+            .config_files
+            .iter()
+            .map(|identity| (identity.path.clone(), identity.bytes.len()))
+            .collect::<Vec<_>>();
+        erase_private_config_files(&mut gh.config_files).expect("verified gh config erasure");
+        for (path, length) in &gh_config_paths {
+            let bytes = fs::read(path).expect("read erased gh config");
+            assert_eq!(bytes.len(), *length);
+            assert!(bytes.iter().all(|byte| *byte == 0));
+        }
+        gh.close().expect("close erased gh runtime");
+        assert!(!gh_runtime.exists());
     }
 
     #[test]
@@ -6035,6 +7457,21 @@ mod tests {
             PublicationRemoteTransport::Https { command_url, .. }
                 if command_url == "https://github.example/owner/repo.git"
         ));
+        assert!(matches!(
+            publication_remote_transport("https://github.com:443/owner/repo")
+                .expect("normalize canonical public HTTPS port"),
+            PublicationRemoteTransport::Https { host, command_url, .. }
+                if host == "github.com" && command_url == "https://github.com/owner/repo.git"
+        ));
+        for remote in [
+            "https://github.com:0443/owner/repo.git",
+            "https://github.com:444/owner/repo.git",
+        ] {
+            assert!(
+                publication_remote_transport(remote).is_err(),
+                "noncanonical public GitHub authority must fail: {remote}"
+            );
+        }
 
         for remote in [
             "ssh://github.example/owner/repo.git",
@@ -6096,6 +7533,136 @@ mod tests {
     }
 
     #[test]
+    fn private_publication_object_database_contains_only_exact_reachable_closure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = Repository::init_bare(temp.path().join("source.git")).expect("source repo");
+        let destination =
+            Repository::init_bare(temp.path().join("destination.git")).expect("destination repo");
+        let blob = source
+            .blob(b"reachable publication content\n")
+            .expect("blob");
+        let gitlink =
+            Oid::from_str("7777777777777777777777777777777777777777").expect("gitlink oid");
+        let mut tree = source.treebuilder(None).expect("tree builder");
+        tree.insert("README.md", blob, 0o100644)
+            .expect("insert reachable blob");
+        tree.insert("vendor", gitlink, 0o160000)
+            .expect("insert non-traversed gitlink");
+        let tree_oid = tree.write().expect("write tree");
+        let tree = source.find_tree(tree_oid).expect("find tree");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        let commit = source
+            .commit(None, &signature, &signature, "candidate", &tree, &[])
+            .expect("commit candidate");
+        let unreachable = source
+            .blob(b"unreachable local secret\n")
+            .expect("extra blob");
+
+        let seal =
+            materialize_publication_object_closure(&source, &destination, &commit.to_string())
+                .expect("materialize exact publication closure");
+
+        assert_eq!(seal.expected_oid, commit);
+        assert_eq!(seal.object_ids, BTreeSet::from([commit, tree_oid, blob]));
+        assert!(destination.find_object(commit, None).is_ok());
+        assert!(destination.find_object(tree_oid, None).is_ok());
+        assert!(destination.find_object(blob, None).is_ok());
+        assert!(destination.find_object(gitlink, None).is_err());
+        assert!(destination.find_object(unreachable, None).is_err());
+        verify_private_publication_object_closure(&destination, &seal)
+            .expect("private closure remains exact");
+
+        destination
+            .blob(b"object outside sealed closure")
+            .expect("inject extra private object");
+        assert!(
+            verify_private_publication_object_closure(&destination, &seal)
+                .expect_err("extra private object must break the seal")
+                .to_string()
+                .contains("outside the exact closure")
+        );
+    }
+
+    #[test]
+    fn publication_closure_rejects_duplicate_parents_cycles_and_excessive_tree_depth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = Repository::init_bare(temp.path().join("source.git")).expect("source repo");
+        let destination =
+            Repository::init_bare(temp.path().join("destination.git")).expect("destination repo");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        let empty_tree_oid = source
+            .treebuilder(None)
+            .expect("empty tree")
+            .write()
+            .expect("write empty tree");
+        let empty_tree = source.find_tree(empty_tree_oid).expect("find empty tree");
+        let root_oid = source
+            .commit(None, &signature, &signature, "root", &empty_tree, &[])
+            .expect("root commit");
+        let root = source.find_commit(root_oid).expect("find root commit");
+        let duplicate_parent = source
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "duplicate parent",
+                &empty_tree,
+                &[&root, &root],
+            )
+            .expect("write duplicate-parent commit");
+        let duplicate_error = match materialize_publication_object_closure(
+            &source,
+            &destination,
+            &duplicate_parent.to_string(),
+        ) {
+            Ok(_) => panic!("duplicate commit parent must fail"),
+            Err(error) => error,
+        };
+        assert!(duplicate_error
+            .to_string()
+            .contains("self or duplicate parent"));
+
+        let first = Oid::from_str("1111111111111111111111111111111111111111").expect("first oid");
+        let second = Oid::from_str("2222222222222222222222222222222222222222").expect("second oid");
+        let cycle = BTreeMap::from([(first, vec![second]), (second, vec![first])]);
+        assert!(validate_publication_commit_graph(&cycle, first)
+            .expect_err("cycle must fail")
+            .to_string()
+            .contains("cycle"));
+
+        let leaf = source.blob(b"leaf").expect("leaf blob");
+        let mut nested_oid = leaf;
+        for depth in 0..=MAX_PUBLICATION_TREE_DEPTH + 1 {
+            let mut nested = source.treebuilder(None).expect("nested tree");
+            let mode = if depth == 0 { 0o100644 } else { 0o040000 };
+            nested
+                .insert("entry", nested_oid, mode)
+                .expect("insert nested object");
+            nested_oid = nested.write().expect("write nested tree");
+        }
+        let deep_tree = source.find_tree(nested_oid).expect("find deep tree");
+        let deep_commit = source
+            .commit(None, &signature, &signature, "deep", &deep_tree, &[])
+            .expect("deep commit");
+        let deep_destination = Repository::init_bare(temp.path().join("deep-destination.git"))
+            .expect("deep destination");
+        let depth_error = match materialize_publication_object_closure(
+            &source,
+            &deep_destination,
+            &deep_commit.to_string(),
+        ) {
+            Ok(_) => panic!("excessive tree depth must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            depth_error.to_string().contains("depth safety bound"),
+            "unexpected deep-tree error: {depth_error:#}"
+        );
+    }
+
+    #[test]
     fn token_selection_is_host_specific_unambiguous_and_basic_encoded() {
         let public = select_network_token_with("github.com", |key| {
             (key == "GH_TOKEN").then(|| "test-token".to_string())
@@ -6108,6 +7675,7 @@ mod tests {
         assert!(select_network_token_with("github.com", |_| None).is_err());
         assert!(
             select_network_token_with("github.example", |key| match key {
+                "GH_HOST" => Some("github.example".to_string()),
                 "GH_ENTERPRISE_TOKEN" => Some("first-token".to_string()),
                 "GITHUB_ENTERPRISE_TOKEN" => Some("second-token".to_string()),
                 _ => None,
@@ -6118,6 +7686,89 @@ mod tests {
             (key == "GH_TOKEN").then(|| "unsafe'token".to_string())
         })
         .is_err());
+    }
+
+    #[test]
+    fn enterprise_host_authorization_precedes_and_exactly_scopes_token_selection() {
+        use std::cell::Cell;
+
+        let token_was_requested = Cell::new(false);
+        let missing_host = select_network_token_with("github.example", |key| {
+            if key.contains("TOKEN") {
+                token_was_requested.set(true);
+                Some("test-token".to_string())
+            } else {
+                None
+            }
+        });
+        assert!(missing_host.is_err());
+        assert!(!token_was_requested.get());
+
+        let mismatch = select_network_token_with("github.example:8443", |key| match key {
+            "GH_HOST" => Some("github.example".to_string()),
+            "GH_ENTERPRISE_TOKEN" => Some("test-token".to_string()),
+            _ => None,
+        });
+        assert!(mismatch.is_err());
+
+        select_network_token_with("github.example:8443", |key| match key {
+            "GH_HOST" => Some("github.example:8443".to_string()),
+            "GH_ENTERPRISE_TOKEN" => Some("test-token".to_string()),
+            _ => None,
+        })
+        .expect("exact enterprise authority is explicitly approved");
+
+        let private_token_was_requested = Cell::new(false);
+        let private_unapproved = select_network_token_with("127.0.0.1", |key| {
+            if key.contains("TOKEN") {
+                private_token_was_requested.set(true);
+                Some("test-token".to_string())
+            } else {
+                None
+            }
+        });
+        assert!(private_unapproved.is_err());
+        assert!(!private_token_was_requested.get());
+        select_network_token_with("127.0.0.1", |key| match key {
+            "GH_HOST" => Some("127.0.0.1".to_string()),
+            "GH_ENTERPRISE_TOKEN" => Some("test-token".to_string()),
+            _ => None,
+        })
+        .expect("owner may explicitly approve an exact private enterprise endpoint");
+    }
+
+    #[test]
+    fn github_expected_author_is_explicit_exact_and_bot_compatible() {
+        assert!(select_github_expected_author_with(|_| None).is_err());
+        assert!(select_github_expected_author_with(|key| match key {
+            "GH_EXPECTED_AUTHOR" => Some("publisher".to_string()),
+            "GITHUB_EXPECTED_AUTHOR" => Some("other".to_string()),
+            _ => None,
+        })
+        .is_err());
+        assert_eq!(
+            select_github_expected_author_with(|key| {
+                (key == "GH_EXPECTED_AUTHOR").then(|| "Release-Bot[bot]".to_string())
+            })
+            .expect("explicit bot provenance"),
+            "release-bot[bot]"
+        );
+    }
+
+    #[test]
+    fn publication_pr_markers_are_canonical_unpredictable_and_exactly_embedded() {
+        let first = generate_publication_pr_marker_nonce().expect("first marker");
+        let second = generate_publication_pr_marker_nonce().expect("second marker");
+        validate_publication_pr_marker_nonce(&first).expect("canonical first marker");
+        validate_publication_pr_marker_nonce(&second).expect("canonical second marker");
+        assert_ne!(first, second);
+        let body = pr_body_with_publication_marker("body", &first).expect("marker body");
+        assert_eq!(
+            body.matches(&format!("<!-- maco-publication-marker:{first} -->"))
+                .count(),
+            1
+        );
+        assert!(!body.contains(&second));
     }
 
     #[test]
@@ -6339,17 +7990,18 @@ mod tests {
             owner: "owner".to_string(),
             name: "repo".to_string(),
         };
-        let context = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
-            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
-        })
-        .expect("create gh context");
+        let mut context =
+            GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
+                enterprise_test_value("github.example", key)
+            })
+            .expect("create gh context");
         assert_ne!(context.runtime_directory.path(), repo_path);
         fs::set_permissions(
             context.runtime_directory.path(),
             fs::Permissions::from_mode(0o755),
         )
         .expect("weaken gh runtime mode");
-        let result = context.run(
+        let result = context.run_inner(
             "gh identity test",
             vec![OsString::from("--version")],
             StdinMode::Null,
@@ -6364,6 +8016,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("private gh runtime changed"));
+        context.close().expect("explicit gh context cleanup");
     }
 
     #[cfg(unix)]
