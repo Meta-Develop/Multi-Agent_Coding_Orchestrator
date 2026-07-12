@@ -2014,8 +2014,11 @@ fn supervise_run_protects_primary_during_parent_auditor_invocation() -> Result<(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn supervise_run_final_quiescence_detects_delayed_background_primary_mutation() -> Result<()> {
+fn supervise_run_contains_setsid_delayed_background_primary_mutation() -> Result<()> {
+    use std::{thread, time::Duration};
+
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let fake_codex = write_fake_codex(temp.path())?;
@@ -2049,22 +2052,19 @@ fn supervise_run_final_quiescence_detects_delayed_background_primary_mutation() 
         .context("run delayed primary mutation case")?;
     let report: Value =
         serde_json::from_slice(&output.stdout).context("parse delayed primary mutation report")?;
-    let primary_mutated = fs::read_to_string(repo_path.join("README.md"))
-        .context("read primary after delayed mutation case")?
-        .contains("delayed primary mutation");
-    if primary_mutated {
-        assert!(!output.status.success());
-        assert_eq!(report["success"], false);
-        assert_finding(
-            &report["findings"],
-            "error",
-            "final acceptance",
-            "README.md",
-        )?;
-    } else {
-        assert!(output.status.success());
-        assert_eq!(report["success"], true);
-    }
+    assert!(
+        output.status.success(),
+        "contained delayed-mutation run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["success"], true);
+    thread::sleep(Duration::from_millis(400));
+    let primary = fs::read_to_string(repo_path.join("README.md"))
+        .context("read primary after delayed mutation case")?;
+    assert!(
+        !primary.contains("delayed primary mutation"),
+        "setsid descendant mutated the primary after supervise returned"
+    );
     Ok(())
 }
 
@@ -4187,7 +4187,8 @@ if [ "$logical_name" = "child-primary-sparse-directory" ]; then
 fi
 if [ "$logical_name" = "child-primary-delayed-mutation" ]; then
   primary="${report%%/.maco/o2/runs/*}"
-  (sleep 0.1; printf '\ndelayed primary mutation from %s\n' "$name" >> "$primary/README.md") >/dev/null 2>&1 &
+  export primary name
+  setsid sh -c 'sleep 0.1; printf "\ndelayed primary mutation from %s\n" "$name" >> "$primary/README.md"' </dev/null >/dev/null 2>&1 &
 fi
 if [ "$logical_name" = "child-primary-dirty-submodule" ]; then
   primary="${report%%/.maco/o2/runs/*}"

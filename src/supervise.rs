@@ -2,6 +2,7 @@ use crate::{
     artifacts::{self, RunArtifactFamily},
     external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
     orchestrator::{RunId, SemanticCoordinationMode},
+    process_runner::ContainmentEvidence,
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
@@ -22,7 +23,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -1062,6 +1062,15 @@ fn run_supervisor_plan(
     consultant: SupervisorConsultantPlan,
     options: SupervisorRunOptions,
 ) -> Result<SupervisorFinalReport> {
+    run_supervisor_plan_with_runner(plan, consultant, options, &mut run_external_agent)
+}
+
+fn run_supervisor_plan_with_runner(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+) -> Result<SupervisorFinalReport> {
     let repo = discover_repo_root(&options.repo)?;
     if !options.allow_dirty_primary {
         ensure_clean_primary(&repo)?;
@@ -1080,6 +1089,7 @@ fn run_supervisor_plan(
     let mut orchestrator_reports = Vec::new();
     let mut findings = Vec::new();
     let mut primary_run_baseline = None;
+    let mut external_containment_failed = false;
 
     let run_result = (|| -> Result<()> {
         write_plan_snapshot(
@@ -1175,6 +1185,7 @@ fn run_supervisor_plan(
             })?;
 
             let mut child_report = None;
+            let mut child_containment_verified = false;
             let mut retry_feedback: Option<Vec<String>> = None;
             let mut attempt_history = Vec::new();
             let max_attempts = usize::from(plan.max_child_retries).saturating_add(1);
@@ -1207,7 +1218,22 @@ fn run_supervisor_plan(
                 );
                 command.output_schema = Some(schema_path.clone());
 
-                let external_run = run_external_agent(&command);
+                let external_run = external_runner(&command);
+                let attempt_containment_verified =
+                    external_containment_verified_empty(external_run.containment);
+                if !attempt_containment_verified {
+                    external_containment_failed = true;
+                    findings.push(Finding {
+                        severity: FindingSeverity::Error,
+                        message: format!(
+                            "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
+                            assignment.id,
+                            external_run.containment,
+                            attempt_artifacts.report_path.display()
+                        ),
+                        paths: vec![attempt_artifacts.report_path.clone()],
+                    });
+                }
                 command_records.push(command_record_from_external(&external_run, &command));
                 let primary_after = primary_worktree_snapshot(&repo)?;
                 let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
@@ -1225,6 +1251,22 @@ fn run_supervisor_plan(
                         &primary_changes,
                         &mut attempt_report,
                     );
+                }
+                if !attempt_containment_verified {
+                    mark_child_containment_violation(
+                        assignment,
+                        &attempt_artifacts.report_path,
+                        external_run.containment,
+                        &mut attempt_report,
+                    );
+                    attempt_history.push(ChildAttemptHistory {
+                        attempt,
+                        report_path: attempt_artifacts.report_path.clone(),
+                        structural_problems: report_shape_problems,
+                        corrective_retry_used,
+                    });
+                    child_report = Some(attempt_report);
+                    break;
                 }
                 let retry_used = should_retry_child_report(
                     &attempt_report,
@@ -1251,6 +1293,7 @@ fn run_supervisor_plan(
                         paths: vec![attempt_artifacts.report_path.clone()],
                     });
                 }
+                child_containment_verified = true;
                 child_report = Some(attempt_report);
                 break;
             }
@@ -1267,7 +1310,8 @@ fn run_supervisor_plan(
             }
             write_child_report(&final_report_path, &child_report)?;
 
-            if parent_auditor_required(assignment, &child_report) {
+            let mut assignment_containment_verified = child_containment_verified;
+            if child_containment_verified && parent_auditor_required(assignment, &child_report) {
                 let auditor_id = parent_auditor_id(assignment);
                 let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
                 let auditor_report_path = dirs.reports.join(format!("{auditor_id}.json"));
@@ -1308,7 +1352,23 @@ fn run_supervisor_plan(
                         "refusing to launch parent review auditor without a complete primary integrity snapshot: {error}"
                     );
                 }
-                let auditor_run = run_external_agent(&auditor_command);
+                let auditor_run = external_runner(&auditor_command);
+                let auditor_containment_verified =
+                    external_containment_verified_empty(auditor_run.containment);
+                if !auditor_containment_verified {
+                    assignment_containment_verified = false;
+                    external_containment_failed = true;
+                    findings.push(Finding {
+                        severity: FindingSeverity::Error,
+                        message: format!(
+                            "external parent auditor process containment was not verified empty for '{}'; evidence: {:?}; report: {}",
+                            auditor_id,
+                            auditor_run.containment,
+                            auditor_report_path.display()
+                        ),
+                        paths: vec![auditor_report_path.clone()],
+                    });
+                }
                 let auditor_command_record =
                     command_record_from_external(&auditor_run, &auditor_command);
                 command_records.push(auditor_command_record.clone());
@@ -1331,7 +1391,9 @@ fn run_supervisor_plan(
                 }
                 child_report.audit_reports.push(auditor_report);
             }
-            validate_auditor_reports(assignment, &final_report_path, &mut child_report);
+            if child_containment_verified {
+                validate_auditor_reports(assignment, &final_report_path, &mut child_report);
+            }
             write_child_report(&final_report_path, &child_report)?;
             if child_report.status != ReviewStatus::Succeeded {
                 findings.push(Finding {
@@ -1361,6 +1423,9 @@ fn run_supervisor_plan(
                 });
             }
             orchestrator_reports.push(child_report);
+            if !assignment_containment_verified {
+                break;
+            }
         }
         Ok(())
     })();
@@ -1377,40 +1442,37 @@ fn run_supervisor_plan(
     let (released_semantic_intents, semantic_release_errors) =
         release_semantic_intents(&semantic_store, acquired_semantic_tokens);
     let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
-        Some(baseline) => match primary_worktree_quiescence_snapshot(&repo) {
-            Ok(final_quiescence) => {
-                let mut integrity_failed = false;
-                if !final_quiescence.interval_changes.is_empty() {
+        Some(baseline) => match primary_worktree_snapshot(&repo) {
+            Ok(final_snapshot) => {
+                if let Some(error) = final_snapshot.inspection_problem() {
                     findings.push(Finding {
                         severity: FindingSeverity::Error,
                         message: format!(
-                            "primary worktree did not remain quiescent during final acceptance: {}",
-                            final_quiescence.interval_changes.details.join("; ")
+                            "primary worktree final integrity snapshot was incomplete: {error}"
                         ),
-                        paths: final_quiescence.interval_changes.paths,
+                        paths: Vec::new(),
                     });
-                    integrity_failed = true;
+                    true
+                } else {
+                    let changes = primary_integrity_changes(baseline, &final_snapshot);
+                    let integrity_failed = !changes.is_empty();
+                    if integrity_failed {
+                        findings.push(Finding {
+                            severity: FindingSeverity::Error,
+                            message: format!(
+                                "primary worktree integrity differed from the supervise-run baseline during final acceptance: {}",
+                                changes.details.join("; ")
+                            ),
+                            paths: changes.paths,
+                        });
+                    }
+                    integrity_failed
                 }
-                let changes = primary_integrity_changes(baseline, &final_quiescence.snapshot);
-                if !changes.is_empty() {
-                    findings.push(Finding {
-                        severity: FindingSeverity::Error,
-                        message: format!(
-                            "primary worktree integrity differed from the supervise-run baseline during final acceptance: {}",
-                            changes.details.join("; ")
-                        ),
-                        paths: changes.paths,
-                    });
-                    integrity_failed = true;
-                }
-                integrity_failed
             }
             Err(error) => {
                 findings.push(Finding {
                     severity: FindingSeverity::Error,
-                    message: format!(
-                        "primary worktree final integrity/quiescence check failed: {error}"
-                    ),
+                    message: format!("primary worktree final integrity check failed: {error}"),
                     paths: Vec::new(),
                 });
                 true
@@ -1421,6 +1483,7 @@ fn run_supervisor_plan(
     let failed = run_result.is_err()
         || !release_errors.is_empty()
         || !semantic_release_errors.is_empty()
+        || external_containment_failed
         || final_primary_integrity_failed
         || orchestrator_reports.iter().any(report_failed);
     let success = !failed;
@@ -1488,13 +1551,19 @@ fn run_supervisor_plan(
         remaining_risk: if success {
             "no failed child orchestrator reports; worker changes remain isolated in child worktrees"
                 .to_string()
+        } else if external_containment_failed {
+            "one or more external agent process trees lacked verified-empty containment; delayed child activity cannot be ruled out"
+                .to_string()
         } else if final_primary_integrity_failed {
-            "primary worktree integrity or final quiescence could not be established".to_string()
+            "primary worktree final integrity could not be established".to_string()
         } else {
             "one or more child or worker reports failed, were rejected, or were missing".to_string()
         },
         next_safe_action: if success {
             "review child worktree diffs before any separate merge preview or apply step"
+                .to_string()
+        } else if external_containment_failed {
+            "do not trust or merge child outputs; restore the primary worktree if needed, fix host containment support, and rerun supervise"
                 .to_string()
         } else if final_primary_integrity_failed {
             "inspect and restore the primary worktree before rerunning supervise".to_string()
@@ -2456,6 +2525,31 @@ fn validation_failed(result: &ValidationResult) -> bool {
     result.status != ReviewStatus::Succeeded
 }
 
+fn mark_child_containment_violation(
+    assignment: &OrchestratorAssignment,
+    report_path: &Path,
+    evidence: Option<ContainmentEvidence>,
+    report: &mut OrchestratorReviewReport,
+) {
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: format!(
+            "child orchestrator '{}' process containment was not verified empty; evidence: {evidence:?}",
+            assignment.id
+        ),
+        paths: vec![report_path.to_path_buf()],
+    });
+    report.remaining_risk =
+        "the child process tree may still be live, so no retry or parent auditor was launched"
+            .to_string();
+    report.next_safe_action =
+        "restore the primary worktree if needed, fix host containment support, and rerun this child scope"
+            .to_string();
+}
+
 fn mark_primary_integrity_violation(
     assignment: &OrchestratorAssignment,
     changes: &PrimaryIntegrityChanges,
@@ -2619,28 +2713,6 @@ impl PrimaryWorktreeSnapshot {
 fn primary_worktree_snapshot(repo_path: &Path) -> Result<PrimaryWorktreeSnapshot> {
     let mut visited_gitdirs = BTreeSet::new();
     primary_worktree_snapshot_at_depth(repo_path, 0, &mut visited_gitdirs)
-}
-
-struct PrimaryQuiescenceSnapshot {
-    snapshot: PrimaryWorktreeSnapshot,
-    interval_changes: PrimaryIntegrityChanges,
-}
-
-fn primary_worktree_quiescence_snapshot(repo_path: &Path) -> Result<PrimaryQuiescenceSnapshot> {
-    let first = primary_worktree_snapshot(repo_path)?;
-    if let Some(error) = first.inspection_problem() {
-        bail!("initial final-quiescence snapshot was incomplete: {error}");
-    }
-    thread::sleep(Duration::from_millis(200));
-    let second = primary_worktree_snapshot(repo_path)?;
-    if let Some(error) = second.inspection_problem() {
-        bail!("final final-quiescence snapshot was incomplete: {error}");
-    }
-    let interval_changes = primary_integrity_changes(&first, &second);
-    Ok(PrimaryQuiescenceSnapshot {
-        snapshot: second,
-        interval_changes,
-    })
 }
 
 fn primary_worktree_snapshot_at_depth(
@@ -3648,6 +3720,10 @@ impl ReportStatus for AuditorReport {
     }
 }
 
+fn external_containment_verified_empty(evidence: Option<ContainmentEvidence>) -> bool {
+    matches!(evidence, Some(ContainmentEvidence::VerifiedEmpty(_)))
+}
+
 fn command_record_from_external(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
@@ -4357,6 +4433,211 @@ pub fn generated_run_id() -> Result<RunId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_runner::ContainmentBackend;
+
+    #[test]
+    fn external_containment_gate_accepts_only_verified_empty_evidence() {
+        assert!(external_containment_verified_empty(Some(
+            ContainmentEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+        )));
+        assert!(!external_containment_verified_empty(Some(
+            ContainmentEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        )));
+        assert!(!external_containment_verified_empty(Some(
+            ContainmentEvidence::Unverified(ContainmentBackend::WindowsJobObject)
+        )));
+        assert!(!external_containment_verified_empty(None));
+    }
+
+    #[test]
+    fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
+        use crate::{
+            external_agent::CapturedOutput,
+            process_runner::{ContainmentBackend, ContainmentEvidence},
+        };
+        use git2::Signature;
+
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repo = Repository::init(temp.path()).expect("initialize repository");
+        fs::write(temp.path().join("README.md"), "baseline\n").expect("write baseline");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage baseline");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("create signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
+            .expect("commit baseline");
+        drop(tree);
+        drop(repo);
+
+        let assignment_id = "child-unverified";
+        let worker_id = "worker-unverified";
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "stop after unverified containment".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 1,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            assignments: vec![OrchestratorAssignment {
+                id: assignment_id.to_string(),
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: vec![PathBuf::from("README.md")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: None,
+                worker_assignments: vec![WorkerAssignment {
+                    id: worker_id.to_string(),
+                    role: AgentRole::Worker,
+                    assigned_paths: vec![PathBuf::from("README.md")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    task: None,
+                    report_path: None,
+                }],
+                notes: None,
+            }],
+        };
+        let options = SupervisorRunOptions {
+            repo: temp.path().to_path_buf(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("unverified-containment-stops-followups").expect("valid run id"),
+            codex_bin: PathBuf::from("unused-codex"),
+            allow_dirty_primary: false,
+        };
+
+        let child_report = |id: &str| OrchestratorReviewReport {
+            id: id.to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            worker_reports: vec![WorkerReport {
+                id: worker_id.to_string(),
+                role: AgentRole::Worker,
+                assigned_paths: vec![PathBuf::from("README.md")],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                claim_token: None,
+                semantic_intent_token: None,
+                commands_run: Vec::new(),
+                files_changed: Vec::new(),
+                validation_results: Vec::new(),
+                findings: Vec::new(),
+                no_further_delegation: Some(true),
+                accepted: true,
+                rejected: false,
+                status: ReviewStatus::Succeeded,
+                remaining_risk: "none".to_string(),
+                next_safe_action: "review".to_string(),
+            }],
+            audit_reports: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "review".to_string(),
+        };
+        let auditor_report = AuditorReport {
+            id: format!("{assignment_id}-review-auditor"),
+            role: AgentRole::Auditor,
+            reviewed_worker_ids: vec![worker_id.to_string()],
+            reviewed_paths: vec![PathBuf::from("README.md")],
+            commands_run: Vec::new(),
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            no_further_delegation: Some(true),
+            read_only: true,
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "review".to_string(),
+        };
+        let mut invocations = Vec::new();
+        let report = {
+            let mut runner = |command: &ExternalAgentCommand| {
+                let report_name = command
+                    .output_last_message
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .expect("UTF-8 report filename");
+                invocations.push(report_name.to_string());
+                let first_attempt = report_name.ends_with(".attempt-1.json");
+                let contents = if report_name.contains("review-auditor") {
+                    serde_json::to_vec(&auditor_report).expect("serialize auditor report")
+                } else {
+                    let id = if first_attempt {
+                        "wrong-child-id"
+                    } else {
+                        assignment_id
+                    };
+                    serde_json::to_vec(&child_report(id)).expect("serialize child report")
+                };
+                fs::write(&command.output_last_message, contents).expect("write injected report");
+                ExternalAgentRun {
+                    command: vec!["injected-runner".to_string()],
+                    cwd: command.cwd.clone(),
+                    timeout_seconds: command.timeout.as_secs(),
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                    timed_out: false,
+                    containment: Some(if first_attempt {
+                        ContainmentEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                    } else {
+                        ContainmentEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+                    }),
+                    stdout: CapturedOutput::default(),
+                    stderr: CapturedOutput::default(),
+                    error: None,
+                }
+            };
+
+            run_supervisor_plan_with_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                &mut runner,
+            )
+            .expect("collect failed supervisor report")
+        };
+
+        assert_eq!(invocations.len(), 1, "unexpected external follow-up launch");
+        assert_eq!(
+            invocations
+                .iter()
+                .filter(|name| name.ends_with(".attempt-2.json"))
+                .count(),
+            0,
+            "unverified attempt launched a corrective retry"
+        );
+        assert_eq!(
+            invocations
+                .iter()
+                .filter(|name| name.contains("review-auditor"))
+                .count(),
+            0,
+            "unverified attempt launched a parent auditor"
+        );
+        assert!(!report.success);
+        assert!(report.remaining_risk.contains("verified-empty containment"));
+        assert!(report.orchestrator_reports[0]
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("Unverified")));
+    }
 
     #[test]
     fn parses_clean_child_report_json_without_recovery() {
