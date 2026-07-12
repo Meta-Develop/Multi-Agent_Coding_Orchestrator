@@ -8,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     fs::{File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
@@ -642,15 +644,35 @@ fn codex_permission_evidence(
     }
 }
 
-fn argv_digest(argv: &[String]) -> Result<String> {
-    let mut bytes = Vec::new();
+fn argv_digest(argv: &[OsString]) -> Result<String> {
+    let mut bytes = b"maco-external-agent-argv-v2\0".to_vec();
+    let encoding = os_argument_encoding_tag();
+    bytes.extend_from_slice(&(encoding.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(encoding);
+    bytes.extend_from_slice(&(argv.len() as u64).to_be_bytes());
     for argument in argv {
+        let argument = os_argument_bytes(argument.as_os_str());
         bytes.extend_from_slice(&(argument.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(argument.as_bytes());
+        bytes.extend_from_slice(&argument);
     }
     git2::Oid::hash_object(git2::ObjectType::Blob, &bytes)
         .map(|oid| oid.to_string())
         .context("failed to hash external-agent argv")
+}
+
+#[cfg(unix)]
+const fn os_argument_encoding_tag() -> &'static [u8] {
+    b"unix-bytes"
+}
+
+#[cfg(target_os = "windows")]
+const fn os_argument_encoding_tag() -> &'static [u8] {
+    b"windows-utf16le"
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+const fn os_argument_encoding_tag() -> &'static [u8] {
+    b"portable-lossy-utf8"
 }
 
 fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -1078,7 +1100,7 @@ fn append_external_error(existing: Option<String>, next: Option<String>) -> Opti
     }
 }
 
-fn command_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     match spec.invocation {
         ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec),
         ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec),
@@ -1086,36 +1108,36 @@ fn command_argv(spec: &ExternalAgentCommand) -> Vec<String> {
     }
 }
 
-fn codex_supervisor_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+fn codex_supervisor_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     let mut argv = codex_hardened_argv(spec);
     argv.extend([
-        "--enable".to_string(),
-        "goals".to_string(),
-        "--enable".to_string(),
-        "multi_agent".to_string(),
-        "--json".to_string(),
-        "--output-last-message".to_string(),
-        spec.output_last_message.display().to_string(),
+        OsString::from("--enable"),
+        OsString::from("goals"),
+        OsString::from("--enable"),
+        OsString::from("multi_agent"),
+        OsString::from("--json"),
+        OsString::from("--output-last-message"),
+        spec.output_last_message.as_os_str().to_os_string(),
     ]);
     if let Some(schema) = &spec.output_schema {
-        argv.push("--output-schema".to_string());
-        argv.push(schema.display().to_string());
+        argv.push(OsString::from("--output-schema"));
+        argv.push(schema.as_os_str().to_os_string());
     }
-    argv.push("-".to_string());
+    argv.push(OsString::from("-"));
     argv
 }
 
-fn codex_consultant_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+fn codex_consultant_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     let mut argv = codex_hardened_argv(spec);
     argv.extend([
-        "--output-last-message".to_string(),
-        spec.output_last_message.display().to_string(),
-        "-".to_string(),
+        OsString::from("--output-last-message"),
+        spec.output_last_message.as_os_str().to_os_string(),
+        OsString::from("-"),
     ]);
     argv
 }
 
-fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     let filesystem_permissions = match spec.workspace_access {
         WorkspaceAccess::ReadOnly => {
             "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\"}"
@@ -1125,28 +1147,29 @@ fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<String> {
         }
     };
     let mut argv = vec![
-        "-a".to_string(),
-        "never".to_string(),
-        "exec".to_string(),
-        "--strict-config".to_string(),
-        "--ignore-user-config".to_string(),
-        "--ignore-rules".to_string(),
-        "--ephemeral".to_string(),
-        "--cd".to_string(),
-        spec.cwd.display().to_string(),
-        "-c".to_string(),
-        "default_permissions=\"maco_external_codex\"".to_string(),
-        "-c".to_string(),
-        "permissions.maco_external_codex.network={enabled=false}".to_string(),
-        "-c".to_string(),
-        filesystem_permissions.to_string(),
-        "-c".to_string(),
-        "shell_environment_policy.inherit=\"none\"".to_string(),
-        "-c".to_string(),
-        "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}"
-            .to_string(),
-        "-c".to_string(),
-        "web_search=\"disabled\"".to_string(),
+        OsString::from("-a"),
+        OsString::from("never"),
+        OsString::from("exec"),
+        OsString::from("--strict-config"),
+        OsString::from("--ignore-user-config"),
+        OsString::from("--ignore-rules"),
+        OsString::from("--ephemeral"),
+        OsString::from("--cd"),
+        spec.cwd.as_os_str().to_os_string(),
+        OsString::from("-c"),
+        OsString::from("default_permissions=\"maco_external_codex\""),
+        OsString::from("-c"),
+        OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+        OsString::from("-c"),
+        OsString::from(filesystem_permissions),
+        OsString::from("-c"),
+        OsString::from("shell_environment_policy.inherit=\"none\""),
+        OsString::from("-c"),
+        OsString::from(
+            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
+        ),
+        OsString::from("-c"),
+        OsString::from("web_search=\"disabled\""),
     ];
     for feature in [
         "apps",
@@ -1159,17 +1182,17 @@ fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<String> {
         "computer_use",
         "image_generation",
     ] {
-        argv.push("--disable".to_string());
-        argv.push(feature.to_string());
+        argv.push(OsString::from("--disable"));
+        argv.push(OsString::from(feature));
     }
     argv
 }
 
-fn claude_consultant_argv() -> Vec<String> {
+fn claude_consultant_argv() -> Vec<OsString> {
     vec![
-        "-p".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
+        OsString::from("-p"),
+        OsString::from("--output-format"),
+        OsString::from("json"),
     ]
 }
 
@@ -1211,11 +1234,43 @@ fn allowed_env(
     environment
 }
 
-fn command_display(program: &Path, argv: &[String]) -> Vec<String> {
+fn command_display(program: &Path, argv: &[OsString]) -> Vec<String> {
     let mut command = Vec::with_capacity(argv.len() + 1);
-    command.push(program.display().to_string());
-    command.extend(argv.iter().cloned());
+    command.push(display_os_argument(program.as_os_str()));
+    command.extend(
+        argv.iter()
+            .map(|argument| display_os_argument(argument.as_os_str())),
+    );
     command
+}
+
+#[cfg(unix)]
+fn os_argument_bytes(argument: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    argument.as_bytes().to_vec()
+}
+
+#[cfg(target_os = "windows")]
+fn os_argument_bytes(argument: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    argument.encode_wide().flat_map(u16::to_le_bytes).collect()
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn os_argument_bytes(argument: &OsStr) -> Vec<u8> {
+    argument.to_string_lossy().as_bytes().to_vec()
+}
+
+fn display_os_argument(argument: &OsStr) -> String {
+    argument.to_str().map(str::to_string).unwrap_or_else(|| {
+        let bytes = os_argument_bytes(argument);
+        let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        format!("<non-unicode-argv:{encoded}>")
+    })
 }
 
 fn ensure_existing_output_parent(path: &Path) -> Result<()> {
@@ -1370,6 +1425,62 @@ mod tests {
         )
         .expect_err("custom program must not receive provider-network authority");
         assert!(error.to_string().contains("trusted system Codex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_argv_and_digest_preserve_non_utf8_paths_without_collision() -> Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let raw_component = OsString::from_vec(b"repo-\xff".to_vec());
+        let mut raw_root = PathBuf::from("/tmp");
+        raw_root.push(raw_component);
+        let replacement_root = PathBuf::from("/tmp/repo-\u{fffd}");
+        let raw_report = raw_root.join("report-\u{fffd}.json");
+        let raw_schema = raw_root.join(OsString::from_vec(b"schema-\xfe.json".to_vec()));
+        let mut raw = ExternalAgentCommand::codex(
+            "codex",
+            &raw_root,
+            raw_root.join("prompt.md"),
+            raw_root.join("events.jsonl"),
+            &raw_report,
+            Duration::from_secs(1),
+        );
+        raw.output_schema = Some(raw_schema.clone());
+        let replacement = ExternalAgentCommand::codex(
+            "codex",
+            &replacement_root,
+            replacement_root.join("prompt.md"),
+            replacement_root.join("events.jsonl"),
+            replacement_root.join("report-\u{fffd}.json"),
+            Duration::from_secs(1),
+        );
+
+        let raw_argv = command_argv(&raw);
+        let replacement_argv = command_argv(&replacement);
+        let cd_index = raw_argv
+            .iter()
+            .position(|argument| argument == "--cd")
+            .context("--cd argument")?;
+        assert_eq!(
+            raw_argv[cd_index + 1].as_bytes(),
+            raw_root.as_os_str().as_bytes()
+        );
+        assert!(raw_argv
+            .iter()
+            .any(|argument| argument.as_bytes() == raw_report.as_os_str().as_bytes()));
+        assert!(raw_argv
+            .iter()
+            .any(|argument| argument.as_bytes() == raw_schema.as_os_str().as_bytes()));
+        assert_ne!(argv_digest(&raw_argv)?, argv_digest(&replacement_argv)?);
+        let rendered = command_display(Path::new("codex"), &raw_argv);
+        assert!(rendered
+            .iter()
+            .any(|argument| argument.starts_with("<non-unicode-argv:")));
+        assert!(!rendered
+            .iter()
+            .any(|argument| argument == &raw_root.to_string_lossy()));
+        Ok(())
     }
 
     #[cfg(unix)]

@@ -17,6 +17,7 @@ use git2::{Delta, DiffOptions, Oid, Repository, ResetType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -2424,9 +2425,13 @@ fn mark_untracked_intent_to_add(
         return Ok(());
     }
 
-    let mut arguments = vec!["add".to_string(), "-N".to_string(), "--".to_string()];
+    let mut arguments = vec![
+        OsString::from("add"),
+        OsString::from("-N"),
+        OsString::from("--"),
+    ];
     for path in paths {
-        arguments.push(String::from_utf8_lossy(path).into_owned());
+        arguments.push(git_path_argument(path)?);
     }
 
     let output = run_fixed_git(
@@ -2449,6 +2454,19 @@ fn mark_untracked_intent_to_add(
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn git_path_argument(path: &[u8]) -> Result<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(OsString::from_vec(path.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn git_path_argument(path: &[u8]) -> Result<OsString> {
+    String::from_utf8(path.to_vec())
+        .map(OsString::from)
+        .context("Git returned a non-UTF-8 path that this platform cannot represent losslessly")
 }
 
 impl LinkedGitAdminWriteGuard {
@@ -5069,6 +5087,48 @@ mod tests {
         fs::write(guard.directory.join("HEAD"), "ref: refs/heads/tampered\n")
             .expect("tamper linked HEAD");
         assert!(guard.verify().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intent_to_add_preserves_non_utf8_and_replacement_character_paths_distinctly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# paths\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "lossless-path-agent".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+        let raw = b"raw-\xff.txt".to_vec();
+        let replacement = "raw-\u{fffd}.txt";
+        fs::write(worktree.path.join(OsString::from_vec(raw.clone())), "raw\n")
+            .expect("write raw path");
+        fs::write(worktree.path.join(replacement), "replacement\n")
+            .expect("write replacement path");
+
+        mark_untracked_intent_to_add(
+            &worktree.path,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("mark both paths intent-to-add");
+
+        let worktree_repo = Repository::open(&worktree.path).expect("open worktree repo");
+        let index = worktree_repo.index().expect("open linked index");
+        let indexed = index
+            .iter()
+            .map(|entry| entry.path)
+            .collect::<BTreeSet<_>>();
+        assert!(indexed.contains(&raw));
+        assert!(indexed.contains(replacement.as_bytes()));
     }
 
     fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
