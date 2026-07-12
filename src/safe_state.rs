@@ -1607,6 +1607,15 @@ fn open_regular_no_follow(path: &Path, _writable: bool) -> Result<File> {
 }
 
 fn read_bounded_file(file: &mut File, path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    read_bounded_file_with_hook(file, path, max_bytes, || {})
+}
+
+fn read_bounded_file_with_hook(
+    file: &mut File,
+    path: &Path,
+    max_bytes: u64,
+    after_initial_metadata: impl FnOnce(),
+) -> Result<Vec<u8>> {
     let before = file
         .metadata()
         .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
@@ -1621,6 +1630,7 @@ fn read_bounded_file(file: &mut File, path: &Path, max_bytes: u64) -> Result<Vec
     }
     let capacity = usize::try_from(before.len().min(max_bytes))
         .context("bounded read size does not fit in memory address space")?;
+    after_initial_metadata();
     let mut contents = Vec::with_capacity(capacity);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut contents)
@@ -1632,19 +1642,52 @@ fn read_bounded_file(file: &mut File, path: &Path, max_bytes: u64) -> Result<Vec
             path.display()
         );
     }
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) != before.len() {
+        bail!(
+            "file changed or was truncated during bounded read: {}",
+            path.display()
+        );
+    }
     let after = file
         .metadata()
         .with_context(|| format!("failed to revalidate opened file {}", path.display()))?;
     ensure_regular_single_link_metadata(path, &after)?;
-    if identity_from_metadata(&before) != identity_from_metadata(&after)
-        || before.len() != after.len()
-    {
+    if !same_file_generation(&before, &after) {
         bail!(
             "file identity changed during bounded read: {}",
             path.display()
         );
     }
     Ok(contents)
+}
+
+#[cfg(unix)]
+fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.mode() == after.mode()
+        && before.nlink() == after.nlink()
+        && before.uid() == after.uid()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(windows)]
+fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.volume_serial_number() == after.volume_serial_number()
+        && before.file_index() == after.file_index()
+        && before.file_attributes() == after.file_attributes()
+        && before.file_size() == after.file_size()
+        && before.creation_time() == after.creation_time()
+        && before.last_write_time() == after.last_write_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    identity_from_metadata(before) == identity_from_metadata(after) && before.len() == after.len()
 }
 
 #[cfg(unix)]
@@ -3261,7 +3304,64 @@ mod tests {
         let fifo = root.join("fifo");
         let fifo_name = c_string(fifo.as_os_str()).expect("fifo path");
         assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let fifo_started = Instant::now();
         assert!(BoundedRegularReader::read(&fifo, 32).is_err());
+        assert!(
+            fifo_started.elapsed() < Duration::from_secs(1),
+            "no-writer FIFO open must fail without blocking"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_same_inode_generation_change_and_truncation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("changing-input");
+        fs::write(&path, b"original").expect("write input");
+
+        let mut changing = open_regular_no_follow(&path, false).expect("open changing input");
+        let changed = read_bounded_file_with_hook(&mut changing, &path, 32, || {
+            fs::write(&path, b"replaced").expect("replace same-length contents");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+                .expect("change input generation");
+        })
+        .expect_err("same-inode generation change must fail");
+        assert!(changed.to_string().contains("changed"));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore permissions");
+        fs::write(&path, b"original").expect("restore input");
+        let mut truncating = open_regular_no_follow(&path, false).expect("open truncating input");
+        let truncated = read_bounded_file_with_hook(&mut truncating, &path, 32, || {
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open for truncate")
+                .set_len(3)
+                .expect("truncate input");
+        })
+        .expect_err("truncation during read must fail");
+        assert!(truncated.to_string().contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_rejects_path_replacement_during_read() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("replaceable-input");
+        let displaced = temp.path().join("displaced-input");
+        fs::write(&path, b"original").expect("write original input");
+
+        let mut opened = open_regular_no_follow(&path, false).expect("open original input");
+        let replaced = read_bounded_file_with_hook(&mut opened, &path, 32, || {
+            fs::rename(&path, &displaced).expect("displace original path");
+            fs::write(&path, b"attacker").expect("replace input path");
+        })
+        .expect_err("path replacement must fail closed");
+
+        assert!(replaced.to_string().contains("identity changed"));
+        assert_eq!(fs::read(&path).expect("read replacement"), b"attacker");
     }
 
     #[cfg(unix)]

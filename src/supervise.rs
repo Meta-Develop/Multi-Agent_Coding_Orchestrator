@@ -12,6 +12,7 @@ use crate::{
         EnvironmentMode, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
+    safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
@@ -45,6 +46,7 @@ const SNAPSHOT_GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUPERVISOR_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_SUPERVISOR_INPUT_BYTES: u64 = 4 * 1024 * 1024;
 const ARTIFACT_FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
@@ -446,8 +448,7 @@ fn supervisor_plan_and_consultant_from_task_file(
 ) -> Result<LoadedSupervisorPlan> {
     let repo = discover_repo_root(repo.as_ref())?;
     let task_file = task_file.as_ref();
-    let task = fs::read_to_string(task_file)
-        .with_context(|| format!("failed to read task file {}", task_file.display()))?;
+    let task = read_supervisor_input(task_file, "task file")?;
     if serde_json::from_str::<Value>(&task).is_ok() {
         return parse_supervisor_plan_with_consultant(&task)
             .with_context(|| format!("failed to parse supervisor plan {}", task_file.display()));
@@ -477,10 +478,19 @@ fn load_supervisor_plan_file_with_consultant(
     path: impl AsRef<Path>,
 ) -> Result<LoadedSupervisorPlan> {
     let path = path.as_ref();
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read supervisor plan {}", path.display()))?;
+    let contents = read_supervisor_input(path, "supervisor plan")?;
     parse_supervisor_plan_with_consultant(&contents)
         .with_context(|| format!("failed to parse supervisor plan {}", path.display()))
+}
+
+fn read_supervisor_input(path: &Path, label: &str) -> Result<String> {
+    #[cfg(unix)]
+    let bytes = BoundedRegularReader::read_tree_no_follow(path, MAX_SUPERVISOR_INPUT_BYTES);
+    #[cfg(not(unix))]
+    let bytes = BoundedRegularReader::read(path, MAX_SUPERVISOR_INPUT_BYTES);
+    let bytes = bytes.with_context(|| format!("failed to read {label} {}", path.display()))?;
+    String::from_utf8(bytes)
+        .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))
 }
 
 fn parse_supervisor_plan_with_consultant(contents: &str) -> Result<LoadedSupervisorPlan> {
@@ -5296,6 +5306,77 @@ mod tests {
             !ProcessTreeEvidence::Unverified(ContainmentBackend::WindowsJobObject)
                 .is_verified_empty()
         );
+    }
+
+    fn bounded_loader_plan_json() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "task": "bounded loader",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "max_child_retries": 0,
+            "child_timeout_seconds": 60,
+            "assignments": [{
+                "id": "child-a",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": []
+            }]
+        }))
+        .expect("serialize bounded loader plan")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_inputs() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize repository");
+        fs::write(repo.join("README.md"), "# test\n").expect("write readme");
+
+        let plain = temp.path().join("task.txt");
+        fs::write(&plain, "ordinary direct UTF-8 task\n").expect("write plain task");
+        let task = supervisor_plan_from_task_file(&repo, &plain).expect("load plain task");
+        assert_eq!(task.task, "ordinary direct UTF-8 task\n");
+
+        let plan = temp.path().join("plan.json");
+        fs::write(&plan, bounded_loader_plan_json()).expect("write plan");
+        assert_eq!(
+            load_supervisor_plan_file(&plan)
+                .expect("load direct regular plan")
+                .task,
+            "bounded loader"
+        );
+
+        let invalid_utf8 = temp.path().join("invalid.json");
+        fs::write(&invalid_utf8, [0xff, 0xfe]).expect("write invalid utf8");
+        assert!(load_supervisor_plan_file(&invalid_utf8)
+            .expect_err("invalid UTF-8 must fail")
+            .to_string()
+            .contains("not valid UTF-8"));
+
+        let oversized = temp.path().join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b' '; usize::try_from(MAX_SUPERVISOR_INPUT_BYTES).unwrap_or(usize::MAX) + 1],
+        )
+        .expect("write oversized input");
+        assert!(load_supervisor_plan_file(&oversized).is_err());
+
+        let symlinked = temp.path().join("symlinked.json");
+        symlink(&plan, &symlinked).expect("create plan symlink");
+        assert!(load_supervisor_plan_file(&symlinked).is_err());
+
+        let hardlinked = temp.path().join("hardlinked.json");
+        fs::hard_link(&plan, &hardlinked).expect("create plan hardlink");
+        assert!(load_supervisor_plan_file(&hardlinked).is_err());
+
+        let fifo = temp.path().join("plan.fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(load_supervisor_plan_file(&fifo).is_err());
     }
 
     #[test]
