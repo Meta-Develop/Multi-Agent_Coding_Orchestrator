@@ -36,6 +36,10 @@ const VALIDATION_RAW_MAX_ENTRIES: usize = 8 * 1024;
 const VALIDATION_RAW_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const VALIDATION_RAW_MAX_SINGLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const VALIDATION_MARKER_MAX_BYTES: u64 = 64 * 1024;
+const MAX_BOUND_VALIDATION_REPORTS: usize = 1024;
+const MAX_BOUND_VALIDATION_NAME_BYTES: usize = 1024;
+const MAX_BOUND_VALIDATION_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_BOUND_VALIDATION_PATHS_PER_REPORT: usize = 8192;
 const LOCAL_GIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const NETWORK_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const CANDIDATE_VALIDATION_PROCESS_TIMEOUT: Duration = Duration::from_secs(600);
@@ -105,6 +109,8 @@ pub struct MergeCandidate {
     pub validation_evidence: ValidationEvidenceBundle,
     #[serde(skip_serializing)]
     pub(crate) raw_diff: Vec<u8>,
+    #[serde(skip_serializing)]
+    pub(crate) snapshot_tree: Oid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,6 +184,17 @@ pub struct ValidationEvidenceBundle {
     groups: Vec<ValidationEvidenceGroup>,
 }
 
+/// Canonical passed validation evidence bound to exactly one candidate.
+///
+/// The fields are private so strict publication call sites can only obtain
+/// this capability through the validating factories on
+/// [`ValidationEvidenceBundle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundValidationEvidenceBundle {
+    binding: CandidateValidationBinding,
+    evidence: ValidationEvidenceBundle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidationEvidenceGroup {
     binding: Option<CandidateValidationBinding>,
@@ -243,6 +260,50 @@ impl ValidationEvidenceBundle {
         self.groups.append(&mut other.groups);
     }
 
+    /// Constructs canonical passed evidence for one exact candidate binding.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the Autopilot integration commit")
+    )]
+    pub(crate) fn bound_to(
+        binding: CandidateValidationBinding,
+        reports: Vec<ValidationReport>,
+    ) -> Result<BoundValidationEvidenceBundle> {
+        Self {
+            groups: vec![ValidationEvidenceGroup {
+                binding: Some(binding),
+                reports,
+            }],
+        }
+        .try_into_exact_bound()
+    }
+
+    /// Validates an existing bundle before granting strict publication
+    /// authority. Legacy, unbound, multi-group, malformed, empty, skipped, or
+    /// failed evidence cannot be upgraded by naming it bound.
+    pub(crate) fn try_into_exact_bound(self) -> Result<BoundValidationEvidenceBundle> {
+        if self.groups.len() != 1 {
+            bail!("strict publication evidence must contain exactly one bound group");
+        }
+        let group = self
+            .groups
+            .into_iter()
+            .next()
+            .context("strict publication evidence group disappeared")?;
+        let binding = group
+            .binding
+            .context("strict publication evidence uses the legacy unbound format")?
+            .canonicalized()?;
+        let reports = canonical_bound_validation_reports(group.reports)?;
+        let evidence = Self {
+            groups: vec![ValidationEvidenceGroup {
+                binding: Some(binding.clone()),
+                reports,
+            }],
+        };
+        Ok(BoundValidationEvidenceBundle { binding, evidence })
+    }
+
     fn push_bound_reports(
         &mut self,
         binding: CandidateValidationBinding,
@@ -256,6 +317,63 @@ impl ValidationEvidenceBundle {
             reports,
         });
     }
+}
+
+impl BoundValidationEvidenceBundle {
+    pub(crate) fn binding(&self) -> &CandidateValidationBinding {
+        &self.binding
+    }
+
+    pub(crate) fn evidence(&self) -> &ValidationEvidenceBundle {
+        &self.evidence
+    }
+}
+
+fn canonical_bound_validation_reports(
+    mut reports: Vec<ValidationReport>,
+) -> Result<Vec<ValidationReport>> {
+    if reports.is_empty() {
+        bail!("strict publication evidence requires at least one passed validation report");
+    }
+    if reports.len() > MAX_BOUND_VALIDATION_REPORTS {
+        bail!(
+            "strict publication evidence exceeds its {MAX_BOUND_VALIDATION_REPORTS}-report limit"
+        );
+    }
+    for report in &mut reports {
+        report.name = report.name.trim().to_string();
+        if report.name.is_empty()
+            || report.name.len() > MAX_BOUND_VALIDATION_NAME_BYTES
+            || report.name.chars().any(char::is_control)
+        {
+            bail!("strict publication validation report name is invalid");
+        }
+        if report.status != ValidationStatus::Passed {
+            bail!("strict publication evidence accepts only passed validation reports");
+        }
+        if report
+            .message
+            .as_ref()
+            .is_some_and(|message| message.len() > MAX_BOUND_VALIDATION_MESSAGE_BYTES)
+        {
+            bail!("strict publication validation message exceeds its size limit");
+        }
+        if report.paths.len() > MAX_BOUND_VALIDATION_PATHS_PER_REPORT {
+            bail!(
+                "strict publication validation report exceeds its {MAX_BOUND_VALIDATION_PATHS_PER_REPORT}-path limit"
+            );
+        }
+        report.paths = report
+            .paths
+            .iter()
+            .map(|path| normalize_repo_relative_path(path).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        report.paths.sort();
+        report.paths.dedup();
+    }
+    sort_validation_reports(&mut reports);
+    reports.dedup();
+    Ok(reports)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -639,6 +757,7 @@ fn collect_agent_result_from_verified_record(
     let claimed_paths = normalize_claim_paths(options.claimed_paths)?;
     let snapshot =
         capture_consistent_candidate_snapshot(&primary_repo, &agent_repo, record, repo_root)?;
+    let snapshot_tree = snapshot.snapshot_tree;
     let metadata = snapshot.metadata;
     let changes = snapshot.changes;
     let changed_paths = changes
@@ -666,6 +785,7 @@ fn collect_agent_result_from_verified_record(
         validation_binding,
         validation_evidence,
         raw_diff,
+        snapshot_tree,
     })
 }
 
@@ -5982,6 +6102,127 @@ mod tests {
 
     static VALIDATION_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn exact_test_validation_binding() -> CandidateValidationBinding {
+        CandidateValidationBinding {
+            version: VALIDATION_BINDING_VERSION,
+            agent_id: "agent-a".to_string(),
+            primary_head: Some("1111111111111111111111111111111111111111".to_string()),
+            agent_head: Some("2222222222222222222222222222222222222222".to_string()),
+            merge_base: Some("1111111111111111111111111111111111111111".to_string()),
+            diff_oid: "3333333333333333333333333333333333333333".to_string(),
+        }
+    }
+
+    fn passed_test_validation_report() -> ValidationReport {
+        ValidationReport {
+            name: " unit ".to_string(),
+            status: ValidationStatus::Passed,
+            message: None,
+            paths: vec![
+                PathBuf::from("src/../README.md"),
+                PathBuf::from("README.md"),
+            ],
+        }
+    }
+
+    #[test]
+    fn exact_bound_validation_factory_canonicalizes_passed_evidence() {
+        let binding = exact_test_validation_binding();
+
+        let bound = ValidationEvidenceBundle::bound_to(
+            binding.clone(),
+            vec![passed_test_validation_report()],
+        )
+        .expect("construct exact bound evidence");
+
+        assert_eq!(bound.binding(), &binding);
+        assert_eq!(bound.evidence().groups.len(), 1);
+        let group = &bound.evidence().groups[0];
+        assert_eq!(group.binding.as_ref(), Some(&binding));
+        assert_eq!(group.reports.len(), 1);
+        assert_eq!(group.reports[0].name, "unit");
+        assert_eq!(group.reports[0].paths, vec![PathBuf::from("README.md")]);
+    }
+
+    #[test]
+    fn exact_bound_validation_factory_rejects_malformed_or_nonpassing_input() {
+        assert!(
+            ValidationEvidenceBundle::bound_to(exact_test_validation_binding(), Vec::new())
+                .expect_err("empty evidence must be refused")
+                .to_string()
+                .contains("at least one passed")
+        );
+
+        let mut malformed = exact_test_validation_binding();
+        malformed.version = VALIDATION_BINDING_VERSION + 1;
+        assert!(ValidationEvidenceBundle::bound_to(
+            malformed,
+            vec![passed_test_validation_report()]
+        )
+        .expect_err("malformed binding must be refused")
+        .to_string()
+        .contains("unsupported validation binding version"));
+
+        let mut malformed_oid = exact_test_validation_binding();
+        malformed_oid.diff_oid = "ABC".to_string();
+        let malformed_oid_error = ValidationEvidenceBundle::bound_to(
+            malformed_oid,
+            vec![passed_test_validation_report()],
+        )
+        .expect_err("malformed binding OID must be refused");
+        assert!(
+            format!("{malformed_oid_error:#}").contains("canonical 40-character lowercase"),
+            "unexpected error: {malformed_oid_error:#}"
+        );
+
+        let mut skipped = passed_test_validation_report();
+        skipped.status = ValidationStatus::Skipped;
+        assert!(
+            ValidationEvidenceBundle::bound_to(exact_test_validation_binding(), vec![skipped])
+                .expect_err("nonpassing report must be refused")
+                .to_string()
+                .contains("only passed validation reports")
+        );
+
+        let mut absolute = passed_test_validation_report();
+        absolute.paths = vec![PathBuf::from("/private/result")];
+        let absolute_error =
+            ValidationEvidenceBundle::bound_to(exact_test_validation_binding(), vec![absolute])
+                .expect_err("absolute evidence path must be refused");
+        assert!(
+            format!("{absolute_error:#}").contains("repository-relative"),
+            "unexpected error: {absolute_error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_bound_validation_upgrade_rejects_legacy_and_multiple_groups() {
+        let report = passed_test_validation_report();
+        assert!(ValidationEvidenceBundle::legacy(vec![report.clone()])
+            .try_into_exact_bound()
+            .expect_err("legacy evidence must not become bound")
+            .to_string()
+            .contains("legacy unbound"));
+
+        let first = ValidationEvidenceBundle::bound_to(
+            exact_test_validation_binding(),
+            vec![report.clone()],
+        )
+        .expect("first bound evidence");
+        let mut combined = first.evidence().clone();
+        combined.extend(
+            ValidationEvidenceBundle::bound_to(exact_test_validation_binding(), vec![report])
+                .expect("second bound evidence")
+                .evidence()
+                .clone(),
+        );
+        assert!(combined
+            .try_into_exact_bound()
+            .expect_err("multi-group evidence must be refused")
+            .to_string()
+            .contains("exactly one bound group"));
+    }
+
     fn create_managed_merge_fixture(
         root: &Path,
     ) -> (PathBuf, WorktreeManager, WorktreeRecord, WorktreeRecord) {
@@ -6735,6 +6976,7 @@ mod tests {
                 },
                 validation_evidence: ValidationEvidenceBundle::default(),
                 raw_diff: b"this is not a patch\n".to_vec(),
+                snapshot_tree: tree_id,
             },
             safety: MergeApplySafety {
                 primary_state_unchanged: passed.clone(),

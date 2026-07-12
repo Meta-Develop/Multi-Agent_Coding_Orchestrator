@@ -2,9 +2,9 @@ use crate::{
     llm::{RedactionSummary, Redactor},
     merge::{
         self, ApplyBlocker, ApplyBlockerDetail, ApplyBlockerDisposition, ApplyReadinessStatus,
-        MergeApplyPreview, MergeCollectOptions, MergeForceOptions, MergePreviewOptions,
-        OutputSummary, RepoCommonLock, SafetyCheckStatus, ValidationEvidenceBundle,
-        ValidationReport,
+        BoundValidationEvidenceBundle, MergeApplyPreview, MergeCandidate, MergeCollectOptions,
+        MergeForceOptions, MergePreviewOptions, OutputSummary, RepoCommonLock, SafetyCheckStatus,
+        ValidationEvidenceBundle, ValidationReport,
     },
     process_runner::StdinMode,
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
@@ -33,6 +33,11 @@ const PUBLICATION_JOURNAL_MAX_RECORDS: usize = 64;
 const PUBLICATION_JOURNAL_MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES: [&str; 2] =
     ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
+
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static FAKE_PR_URL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationRemoteTransport {
@@ -345,6 +350,262 @@ pub(crate) fn preview_pr_with_validation_evidence_and_write_lease(
     publication_report_from_preview(options, preview)
 }
 
+/// Stabilizes an agent candidate for validation without any push, forge, or PR
+/// side effect.
+///
+/// A dirty candidate is committed locally under the caller's existing write
+/// lease and one repository mutation lock. The pre-commit, commit-tree, and
+/// post-commit snapshots must describe identical candidate content; only the
+/// expected agent HEAD transition may differ.
+#[cfg_attr(
+    any(not(test), not(target_os = "linux")),
+    expect(dead_code, reason = "consumed by the Autopilot integration commit")
+)]
+pub(crate) fn prepare_pr_candidate_with_write_lease(
+    options: PrPublicationOptions,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<PrPublicationReport> {
+    prepare_pr_candidate_with_write_lease_after_preview(options, write_lease, |_| {})
+}
+
+fn prepare_pr_candidate_with_write_lease_after_preview<F>(
+    options: PrPublicationOptions,
+    write_lease: &ManagedWorktreeWriteLease,
+    after_preview: F,
+) -> Result<PrPublicationReport>
+where
+    F: FnOnce(&PrPublicationReport),
+{
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo_root);
+    manager.verify_write_execution_lease(&options.agent_id, write_lease)?;
+    let _lock = RepoCommonLock::acquire(&repo_root, "pr-publish")?;
+    let initial = preview_pr_with_validation_evidence_and_write_lease(
+        options.clone(),
+        false,
+        ValidationEvidenceBundle::default(),
+        write_lease,
+    )?;
+    after_preview(&initial);
+    prepare_pr_candidate_with_verified_authority(options, write_lease, initial)
+}
+
+fn prepare_pr_candidate_with_verified_authority(
+    options: PrPublicationOptions,
+    write_lease: &ManagedWorktreeWriteLease,
+    initial: PrPublicationReport,
+) -> Result<PrPublicationReport> {
+    if initial.readiness == ApplyReadinessStatus::Blocked {
+        return Ok(initial);
+    }
+    let worktree_path = initial.preview.candidate.metadata.worktree_path.clone();
+    let initially_dirty = has_uncommitted_changes(&worktree_path)?;
+    let stable = preview_pr_with_validation_evidence_and_write_lease(
+        options.clone(),
+        false,
+        ValidationEvidenceBundle::default(),
+        write_lease,
+    )?;
+    if stable.readiness == ApplyReadinessStatus::Blocked {
+        return Ok(stable);
+    }
+    ensure_same_candidate_snapshot(
+        &initial.preview.candidate,
+        &stable.preview.candidate,
+        "before candidate preparation",
+    )?;
+    if has_uncommitted_changes(&worktree_path)? != initially_dirty {
+        bail!("agent worktree dirty state changed before candidate preparation");
+    }
+
+    let prepared_commit = if initially_dirty {
+        let previous_head = stable
+            .preview
+            .candidate
+            .metadata
+            .agent_head
+            .as_deref()
+            .context("dirty publication candidate has no agent HEAD")?;
+        let commit_id = commit_agent_changes(
+            &worktree_path,
+            &stable.agent_id,
+            &stable.changed_paths,
+            &stable.preview,
+        )?;
+        if commit_id.to_string() == previous_head {
+            bail!("dirty publication candidate produced an empty local commit capture");
+        }
+        verify_prepared_commit(
+            &worktree_path,
+            previous_head,
+            commit_id,
+            stable.preview.candidate.snapshot_tree,
+        )?;
+        commit_id
+    } else {
+        stable
+            .preview
+            .candidate
+            .metadata
+            .agent_head
+            .as_deref()
+            .context("clean publication candidate has no agent HEAD")?
+            .parse::<Oid>()
+            .context("clean publication candidate agent HEAD is malformed")?
+    };
+
+    if has_uncommitted_changes(&worktree_path)? {
+        bail!("agent worktree remained dirty after candidate preparation");
+    }
+    let mut prepared = preview_pr_with_validation_evidence_and_write_lease(
+        options,
+        false,
+        ValidationEvidenceBundle::default(),
+        write_lease,
+    )?;
+    if prepared.readiness == ApplyReadinessStatus::Blocked {
+        prepared.commit_id = Some(prepared_commit.to_string());
+        prepared.head_id = prepared.preview.candidate.metadata.agent_head.clone();
+        return Ok(prepared);
+    }
+    if initially_dirty {
+        ensure_candidate_commit_transition(
+            &stable.preview.candidate,
+            &prepared.preview.candidate,
+            prepared_commit,
+        )?;
+    } else {
+        ensure_same_candidate_snapshot(
+            &stable.preview.candidate,
+            &prepared.preview.candidate,
+            "while confirming an already-clean candidate",
+        )?;
+    }
+    let prepared_commit = prepared_commit.to_string();
+    if prepared.preview.candidate.metadata.agent_head.as_deref() != Some(&prepared_commit)
+        || prepared
+            .preview
+            .candidate
+            .validation_binding
+            .agent_head
+            .as_deref()
+            != Some(&prepared_commit)
+    {
+        bail!("prepared candidate HEAD did not match its exact validation binding");
+    }
+    prepared.status = PrPublicationStatus::Preview;
+    prepared.commit_id = Some(prepared_commit.clone());
+    prepared.head_id = Some(prepared_commit);
+    prepared.pushed = false;
+    prepared.created = false;
+    prepared.pr_url = None;
+    prepared.publication_receipt = None;
+    prepared.next_action =
+        "validate and review this exact candidate.validation_binding, then call strict prepared publication"
+            .to_string();
+    Ok(prepared)
+}
+
+fn ensure_same_candidate_snapshot(
+    before: &MergeCandidate,
+    after: &MergeCandidate,
+    phase: &str,
+) -> Result<()> {
+    if before.raw_diff != after.raw_diff
+        || before.snapshot_tree != after.snapshot_tree
+        || before.claimed_paths != after.claimed_paths
+        || before.changed_paths != after.changed_paths
+        || before.changes != after.changes
+        || before.unclaimed_changed_paths != after.unclaimed_changed_paths
+        || before.diff != after.diff
+        || before.validations != after.validations
+        || before.validation_evidence != after.validation_evidence
+        || before.metadata != after.metadata
+        || before.validation_binding != after.validation_binding
+    {
+        bail!("publication candidate changed {phase}; refusing preparation");
+    }
+    Ok(())
+}
+
+fn ensure_candidate_commit_transition(
+    before: &MergeCandidate,
+    after: &MergeCandidate,
+    expected_commit: Oid,
+) -> Result<()> {
+    if before.raw_diff != after.raw_diff
+        || before.snapshot_tree != after.snapshot_tree
+        || before.claimed_paths != after.claimed_paths
+        || before.changed_paths != after.changed_paths
+        || !prepared_change_kinds_match(&before.changes, &after.changes)
+        || before.unclaimed_changed_paths != after.unclaimed_changed_paths
+        || before.diff != after.diff
+        || before.validations != after.validations
+        || before.validation_evidence != after.validation_evidence
+        || before.metadata.agent_id != after.metadata.agent_id
+        || before.metadata.worktree_path != after.metadata.worktree_path
+        || before.metadata.branch != after.metadata.branch
+        || before.metadata.primary_repo_root != after.metadata.primary_repo_root
+        || before.metadata.primary_head != after.metadata.primary_head
+        || before.metadata.merge_base != after.metadata.merge_base
+        || before.metadata.base_matches_primary != after.metadata.base_matches_primary
+        || before.validation_binding.version != after.validation_binding.version
+        || before.validation_binding.agent_id != after.validation_binding.agent_id
+        || before.validation_binding.primary_head != after.validation_binding.primary_head
+        || before.validation_binding.merge_base != after.validation_binding.merge_base
+        || before.validation_binding.diff_oid != after.validation_binding.diff_oid
+    {
+        bail!("publication candidate content or base changed across its local preparation commit");
+    }
+    let expected_commit = expected_commit.to_string();
+    if after.metadata.agent_head.as_deref() != Some(&expected_commit)
+        || after.validation_binding.agent_head.as_deref() != Some(&expected_commit)
+    {
+        bail!("publication candidate did not make the expected preparation HEAD transition");
+    }
+    Ok(())
+}
+
+fn prepared_change_kinds_match(
+    before: &[merge::ChangedPath],
+    after: &[merge::ChangedPath],
+) -> bool {
+    before.len() == after.len()
+        && before.iter().zip(after).all(|(before, after)| {
+            before.path == after.path
+                && (before.kind == after.kind
+                    || (before.kind == merge::ChangeKind::Untracked
+                        && after.kind == merge::ChangeKind::Added))
+        })
+}
+
+fn verify_prepared_commit(
+    worktree_path: &Path,
+    expected_parent: &str,
+    commit_id: Oid,
+    expected_tree: Oid,
+) -> Result<()> {
+    let repo = Repository::open(worktree_path).with_context(|| {
+        format!(
+            "failed to verify prepared worktree {}",
+            worktree_path.display()
+        )
+    })?;
+    let commit = repo
+        .find_commit(commit_id)
+        .context("failed to find prepared publication commit")?;
+    let expected_parent =
+        Oid::from_str(expected_parent).context("reviewed publication parent HEAD is malformed")?;
+    if commit.parent_count() != 1
+        || commit.parent_id(0).ok() != Some(expected_parent)
+        || commit.tree_id() != expected_tree
+        || repo.head().ok().and_then(|head| head.target()) != Some(commit_id)
+    {
+        bail!("prepared publication commit did not match the reviewed parent, tree, and HEAD");
+    }
+    Ok(())
+}
+
 fn publication_report_from_preview(
     options: PrPublicationOptions,
     preview: MergeApplyPreview,
@@ -496,6 +757,29 @@ pub(crate) fn publish_pr_with_write_lease(
 ) -> Result<PrPublicationReport> {
     let evidence = ValidationEvidenceBundle::legacy(options.validations.clone());
     publish_pr_with_validation_evidence_and_write_lease(options, false, evidence, write_lease)
+}
+
+/// Publishes a previously prepared candidate with mandatory exact validation
+/// evidence. There is intentionally no `require_validation` argument: callers
+/// cannot downgrade this strict bridge to legacy or unbound validation.
+#[cfg_attr(
+    any(not(test), not(target_os = "linux")),
+    expect(dead_code, reason = "consumed by the Autopilot integration commit")
+)]
+pub(crate) fn publish_prepared_pr_with_write_lease(
+    options: PrPublicationOptions,
+    bound_evidence: &BoundValidationEvidenceBundle,
+    write_lease: &ManagedWorktreeWriteLease,
+) -> Result<PrPublicationReport> {
+    if bound_evidence.binding().agent_id != options.agent_id {
+        bail!("strict publication evidence belongs to a different agent");
+    }
+    publish_pr_with_validation_evidence_and_write_lease(
+        options,
+        true,
+        bound_evidence.evidence().clone(),
+        write_lease,
+    )
 }
 
 fn publish_pr_with_validation_evidence_and_write_lease_after_lock<F>(
@@ -1013,6 +1297,9 @@ fn commit_agent_changes(
     let tree = repo
         .find_tree(tree_id)
         .context("failed to read publication commit tree")?;
+    if tree_id != preview.candidate.snapshot_tree {
+        bail!("agent worktree changed before the exact reviewed publication tree was committed");
+    }
     if parent.tree_id() == tree_id {
         return Ok(parent.id());
     }
@@ -3802,6 +4089,8 @@ fn normalized_labels(labels: Vec<String>) -> Vec<String> {
 }
 
 fn fake_pr_url(agent_id: &str, branch: &str, changed_paths: &[PathBuf]) -> String {
+    #[cfg(all(test, target_os = "linux"))]
+    FAKE_PR_URL_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let mut input = Vec::new();
     input.extend_from_slice(agent_id.as_bytes());
     input.push(b'\n');
@@ -3891,6 +4180,26 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::{sync::mpsc, time::Duration};
 
+    #[test]
+    fn prepared_change_kinds_allow_only_untracked_to_added_transition() {
+        let untracked = vec![merge::ChangedPath {
+            path: PathBuf::from("new.txt"),
+            kind: merge::ChangeKind::Untracked,
+        }];
+        let added = vec![merge::ChangedPath {
+            path: PathBuf::from("new.txt"),
+            kind: merge::ChangeKind::Added,
+        }];
+        let changed_path = vec![merge::ChangedPath {
+            path: PathBuf::from("other.txt"),
+            kind: merge::ChangeKind::Added,
+        }];
+
+        assert!(prepared_change_kinds_match(&untracked, &added));
+        assert!(!prepared_change_kinds_match(&added, &untracked));
+        assert!(!prepared_change_kinds_match(&untracked, &changed_path));
+    }
+
     #[cfg(target_os = "linux")]
     fn create_publication_lease_fixture(
         root: &Path,
@@ -3953,6 +4262,305 @@ mod tests {
             forge: ForgeKind::Fake,
             draft: true,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_agent_readme(worktree: &Path, contents: &str, message: &str) -> Oid {
+        fs::write(worktree.join("README.md"), contents).expect("write committed README");
+        let repo = Repository::open(worktree).expect("open agent repository");
+        let mut index = repo.index().expect("open agent index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage agent README");
+        index.write().expect("write agent index");
+        let tree_id = index.write_tree().expect("write agent tree");
+        let tree = repo.find_tree(tree_id).expect("find agent tree");
+        let parent = repo
+            .head()
+            .expect("agent HEAD")
+            .peel_to_commit()
+            .expect("agent parent commit");
+        let signature = repo.signature().expect("agent signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent],
+        )
+        .expect("commit agent README")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn passed_prepared_validation() -> ValidationReport {
+        ValidationReport {
+            name: "prepared-unit".to_string(),
+            status: merge::ValidationStatus::Passed,
+            message: None,
+            paths: vec![PathBuf::from("README.md")],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publication_transactions_path(repo: &Path) -> PathBuf {
+        repo.join(".git/maco/state/publication-transactions")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reset_fake_pr_url_calls() {
+        FAKE_PR_URL_CALLS.with(|calls| calls.set(0));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_pr_url_calls() -> usize {
+        FAKE_PR_URL_CALLS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_dirty_candidate_commits_exact_content_without_external_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Prepared dirty\n")
+            .expect("edit dirty candidate");
+        let before_head = Repository::open(&agent_a.path)
+            .expect("open agent repository")
+            .head()
+            .expect("agent HEAD")
+            .target()
+            .expect("direct agent HEAD");
+        let write_lease = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("publication write lease");
+        let options = fake_publication_options(&repo_path, "agent-a");
+        reset_fake_pr_url_calls();
+
+        let prepared = prepare_pr_candidate_with_write_lease(options, &write_lease)
+            .expect("prepare dirty candidate");
+
+        assert_eq!(prepared.status, PrPublicationStatus::Preview);
+        assert!(!prepared.pushed);
+        assert!(!prepared.created);
+        assert!(prepared.pr_url.is_none());
+        assert!(prepared.publication_receipt.is_none());
+        let prepared_commit = prepared.commit_id.as_deref().expect("prepared commit id");
+        assert_ne!(prepared_commit, before_head.to_string());
+        assert_eq!(prepared.head_id.as_deref(), Some(prepared_commit));
+        assert_eq!(
+            prepared
+                .preview
+                .candidate
+                .validation_binding
+                .agent_head
+                .as_deref(),
+            Some(prepared_commit)
+        );
+        assert!(!has_uncommitted_changes(&agent_a.path).expect("clean prepared worktree"));
+        assert!(!publication_transactions_path(&repo_path).exists());
+        assert_eq!(fake_pr_url_calls(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_already_clean_candidate_preserves_existing_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        let existing = commit_agent_readme(&agent_a.path, "# Already clean\n", "clean candidate");
+        let write_lease = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("publication write lease");
+        let mut options = fake_publication_options(&repo_path, "agent-a");
+        options.forge = ForgeKind::Github;
+
+        let prepared = prepare_pr_candidate_with_write_lease(options, &write_lease)
+            .expect("prepare clean candidate without invoking GitHub");
+
+        assert_eq!(prepared.status, PrPublicationStatus::Preview);
+        assert_eq!(
+            prepared.commit_id.as_deref(),
+            Some(existing.to_string()).as_deref()
+        );
+        assert_eq!(prepared.head_id, prepared.commit_id);
+        assert!(!has_uncommitted_changes(&agent_a.path).expect("clean candidate remains clean"));
+        assert!(!publication_transactions_path(&repo_path).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_refuses_drift_before_creating_local_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Reviewed candidate\n")
+            .expect("write reviewed candidate");
+        let before_head = Repository::open(&agent_a.path)
+            .expect("open agent repository")
+            .head()
+            .expect("agent HEAD")
+            .target()
+            .expect("direct agent HEAD");
+        let write_lease = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("publication write lease");
+        let drift_path = agent_a.path.join("README.md");
+
+        let error = prepare_pr_candidate_with_write_lease_after_preview(
+            fake_publication_options(&repo_path, "agent-a"),
+            &write_lease,
+            move |_| {
+                fs::write(drift_path, "# Drifted candidate\n").expect("inject candidate drift");
+            },
+        )
+        .expect_err("candidate drift must fail preparation");
+
+        assert!(error
+            .to_string()
+            .contains("changed before candidate preparation"));
+        assert_eq!(
+            Repository::open(&agent_a.path)
+                .expect("reopen agent repository")
+                .head()
+                .expect("agent HEAD after drift")
+                .target(),
+            Some(before_head)
+        );
+        assert!(!publication_transactions_path(&repo_path).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_prepared_publish_blocks_candidate_drift_before_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Prepared candidate\n")
+            .expect("write prepared candidate");
+        let write_lease = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("publication write lease");
+        let prepared = prepare_pr_candidate_with_write_lease(
+            fake_publication_options(&repo_path, "agent-a"),
+            &write_lease,
+        )
+        .expect("prepare candidate");
+        let bound = ValidationEvidenceBundle::bound_to(
+            prepared.preview.candidate.validation_binding.clone(),
+            vec![passed_prepared_validation()],
+        )
+        .expect("bind prepared validation");
+        commit_agent_readme(&agent_a.path, "# Later reviewed drift\n", "candidate drift");
+        let mut options = fake_publication_options(&repo_path, "agent-a");
+        options.forge = ForgeKind::Github;
+
+        let report = publish_prepared_pr_with_write_lease(options, &bound, &write_lease)
+            .expect("strict publication reports candidate mismatch");
+
+        assert_eq!(report.status, PrPublicationStatus::Blocked);
+        assert_eq!(
+            report.preview.safety.validation_evidence.binding_status,
+            merge::ValidationBindingStatus::Mismatched
+        );
+        assert!(!report.pushed);
+        assert!(!report.created);
+        assert!(report.pr_url.is_none());
+        assert!(!publication_transactions_path(&repo_path).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_prepared_publish_accepts_matching_bound_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, _) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Matching candidate\n")
+            .expect("write matching candidate");
+        let write_lease = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("publication write lease");
+        let options = fake_publication_options(&repo_path, "agent-a");
+        let prepared = prepare_pr_candidate_with_write_lease(options.clone(), &write_lease)
+            .expect("prepare matching candidate");
+        let bound = ValidationEvidenceBundle::bound_to(
+            prepared.preview.candidate.validation_binding.clone(),
+            vec![passed_prepared_validation()],
+        )
+        .expect("bind matching validation");
+        reset_fake_pr_url_calls();
+
+        let report = publish_prepared_pr_with_write_lease(options, &bound, &write_lease)
+            .expect("publish matching prepared candidate");
+
+        assert_eq!(report.status, PrPublicationStatus::Published);
+        assert_eq!(
+            report.preview.safety.validation_evidence.binding_status,
+            merge::ValidationBindingStatus::Bound
+        );
+        assert!(report.created);
+        assert!(!report.pushed);
+        assert_eq!(fake_pr_url_calls(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_holds_and_releases_worktree_and_repository_locks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, agent_b) = create_publication_lease_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Lock candidate\n")
+            .expect("write lock candidate");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let publisher_repo = repo_path.clone();
+        let publisher_manager = manager.clone();
+        let publisher = std::thread::spawn(move || {
+            let write_lease = publisher_manager
+                .acquire_write_execution_lease("agent-a")
+                .expect("publisher write lease");
+            prepare_pr_candidate_with_write_lease_after_preview(
+                fake_publication_options(&publisher_repo, "agent-a"),
+                &write_lease,
+                |_| {
+                    ready_tx.send(()).expect("signal held preparation locks");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release preparation locks");
+                },
+            )
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("preparation acquired both locks");
+        manager
+            .acquire_read_execution_lease("agent-a")
+            .expect_err("preparation writer excludes readers");
+        manager
+            .acquire_write_execution_lease("agent-a")
+            .expect_err("preparation writer excludes writers");
+        manager
+            .remove("agent-a", true, false)
+            .expect_err("preparation writer excludes removal");
+        match RepoCommonLock::acquire(&repo_path, "merge-apply") {
+            Ok(_) => panic!("preparation must retain repository mutation lock"),
+            Err(error) => assert!(format!("{error:#}").contains("kernel lock is held")),
+        }
+        let unrelated = manager
+            .acquire_write_execution_lease("agent-b")
+            .expect("unrelated worktree remains available");
+        assert_eq!(unrelated.path(), agent_b.path);
+        drop(unrelated);
+
+        release_tx.send(()).expect("release preparation");
+        publisher
+            .join()
+            .expect("join preparation")
+            .expect("complete preparation");
+        drop(
+            manager
+                .acquire_read_execution_lease("agent-a")
+                .expect("preparation releases worktree lock"),
+        );
+        drop(
+            RepoCommonLock::acquire(&repo_path, "merge-apply")
+                .expect("preparation releases repository lock"),
+        );
     }
 
     #[cfg(target_os = "linux")]
