@@ -200,12 +200,21 @@ impl ExternalAgentRun {
     pub(crate) fn output_last_message(&self) -> Option<&[u8]> {
         self.output_last_message.as_deref()
     }
+
+    /// Exact bounded prefix captured from the owned stdout pipe. The bytes are
+    /// private held evidence and are deliberately excluded from serialization.
+    #[allow(dead_code)] // Used by artifact producer migrations that may cherry-pick this API first.
+    pub(crate) fn stdout_bytes(&self) -> &[u8] {
+        &self.stdout.bytes
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CapturedOutput {
     pub text: String,
     pub truncated: bool,
+    #[serde(skip, default)]
+    bytes: Vec<u8>,
 }
 
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
@@ -1269,6 +1278,7 @@ fn summarize_output(output: &CapturedBytes) -> CapturedOutput {
     CapturedOutput {
         text: summary.text,
         truncated: summary.truncated,
+        bytes: output.as_bytes().to_vec(),
     }
 }
 
@@ -1424,10 +1434,16 @@ mod tests {
             "failed".to_string(),
         );
         report.output_last_message = Some(b"private descriptor bytes".to_vec());
+        report.stdout.bytes = b"private stdout bytes\0\xff".to_vec();
         let value = serde_json::to_value(&report)?;
         assert!(value.get("output_last_message").is_none());
+        assert!(value
+            .get("stdout")
+            .and_then(|stdout| stdout.get("bytes"))
+            .is_none());
         let decoded: ExternalAgentRun = serde_json::from_value(value)?;
         assert_eq!(decoded.output_last_message(), None);
+        assert_eq!(decoded.stdout_bytes(), b"");
         Ok(())
     }
 
@@ -1655,8 +1671,52 @@ printf '\n{"type":"done"}\n'
         assert!(report.stderr.truncated);
         assert!(report.stdout.text.len() >= OUTPUT_CHAR_LIMIT);
         assert!(report.stderr.text.len() >= OUTPUT_CHAR_LIMIT);
-        assert!(fs::metadata(&spec.json_log)?.len() > (OUTPUT_CHAR_LIMIT as u64 * 2));
+        let exact_tee = fs::read(&spec.json_log)?;
+        assert!(exact_tee.len() > OUTPUT_CAPTURE_LIMIT_BYTES);
+        assert_eq!(report.stdout_bytes().len(), OUTPUT_CAPTURE_LIMIT_BYTES);
+        assert_eq!(
+            report.stdout_bytes(),
+            &exact_tee[..OUTPUT_CAPTURE_LIMIT_BYTES]
+        );
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_stdout_accessor_preserves_non_utf8_bytes() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+cat >/dev/null
+printf 'A\377B\n'
+"#,
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "read-only prompt\n")?;
+        let output_dir = temp.path().join("incoming");
+        fs::create_dir(&output_dir)?;
+        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700))?;
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            output_dir.join("last-message.txt"),
+            Duration::from_secs(3),
+        );
+
+        let report = run_external_agent_nonpublishable_simulation(&spec);
+
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.error, None);
+        assert_eq!(report.stdout_bytes(), b"A\xffB\n");
+        assert!(report.stdout.text.contains('\u{fffd}'));
         Ok(())
     }
 
