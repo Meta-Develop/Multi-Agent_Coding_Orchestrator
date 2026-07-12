@@ -57,9 +57,10 @@ The current implementation covers a local-first command-line slice:
 - `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when validation is not required, re-previews the resulting clean commit, then either emits a deterministic fake PR URL or, with explicit `--forge github`, publishes an OID-bound remote ref and verifies the resulting GitHub receipt. A durable transaction journal reconciles a lost push or `gh` response when the same command is rerun. With `--require-validation`, publication is a two-stage workflow: commit first, preview and validate that exact binding, then publish with the bound envelope.
 - `maco issue preview` redacts issue bodies without creating anything.
 - `maco issue create --forge fake|github` creates a deterministic fake issue URL locally or, with explicit `--forge github`, shells out to `gh issue create`.
-- `maco live status`, `maco live validate`, `maco live heartbeat`, and
-  `maco live override-release` expose repo-local Markdown claim liveness for
-  active, blocked, handoff, and done work.
+- `maco live status`, `maco live validate`, `maco live apply`,
+  `maco live heartbeat`, `maco live release`, and `maco live override-release`
+  expose and safely mutate repo-local Markdown claim liveness for active,
+  blocked, ready-for-review, handoff, and done work.
 - `maco llm providers` and `maco llm prompt-preview` expose the provider-neutral prompt boundary without network calls.
 - `maco agent run` runs a local fake-provider-backed proposal in an isolated worktree with durable claims, boundary checks, validation, merge-preview reporting, and no real network providers by default.
 - `maco supervise plan` normalizes an opt-in supervisor task or JSON plan for
@@ -745,7 +746,9 @@ Inspect and refresh live work claims:
 ```bash
 cargo run -- live status --repo . --json
 cargo run -- live validate --repo . --json
+cargo run -- live apply ../claim-drafts/claim-id.md --repo . --by owner-id --json
 cargo run -- live heartbeat claim-id --repo . --by owner-id --json
+cargo run -- live release claim-id --repo . --by owner-id --status done --reason "claim completed" --json
 cargo run -- live override-release claim-id --repo . --by project-owner --reason "stale claim owner unavailable" --json
 ```
 
@@ -760,17 +763,34 @@ files. Every entry is read without following links, with a 64 KiB per-file
 limit, strict UTF-8 and bounded filename, line, field, timestamp, owner, path,
 and item-count grammar. Links, hard links, special files, nested directories,
 unsupported extras, and any invalid claim make the board fail closed.
+All reads and mutations hold the same stable board lock and compare the sorted
+entry names plus each entry's identity and bytes before accepting a snapshot.
+Component-aware ancestor/equality overlap between `active` or `blocked` owned
+paths is a board validation error. Canonical crash residue from the atomic
+claim writer is scavenged under that lock; unknown or malformed residue is
+left in place and refused for manual inspection.
 
-`heartbeat` is limited to `active` or `blocked` claims and requires `--by` to
-exactly match the recorded owner. `override-release` is also limited to those
-states and requires a claim that is provably stale; a fresh, future-dated, or
-otherwise unknown liveness result is refused. Its required `--by` value is an
-audited actor label, not an authentication credential, and `--reason` is
-bounded and rejects control-character injection. Mutations run under a stable
-board lock, compare the exact file identity and content generation, then use a
-fenced, durable atomic replacement so concurrent or rebound-file changes are
-refused instead of overwriting them. `--now` is available on live subcommands
-for deterministic test runs.
+Supported owner mutation flows are `apply`, `heartbeat`, and `release`.
+`apply` takes a bounded no-follow Markdown draft outside the claim board and
+atomically creates a new claim or updates a claim whose recorded owner exactly
+matches `--by`; the proposed whole board must remain valid and free of active
+path overlap. Direct edits below `.agents/live/claims/` are unsupported, and a
+concurrent direct edit invalidates the stable board snapshot instead of being
+silently overwritten. `heartbeat` is limited to `active` or `blocked` claims
+and requires `--by` to exactly match the recorded owner. `override-release` is
+also limited to those states and requires a claim that is provably stale; a
+fresh, future-dated, or otherwise unknown liveness result is refused. Its
+required `--by` value is an audited actor label, not an authentication
+credential, and `--reason` is bounded and rejects control-character injection.
+`release` requires the exact recorded owner and moves the claim to `done` or
+`handoff`; `override-release` is the audited stale-claim administrative
+exception. Mutations run under a stable board lock, fence the complete board
+generation, then use a durable atomic replacement so concurrent name, content,
+or rebound-file changes are refused instead of overwritten. Audit growth is
+compacted into a bounded digest entry, and heartbeat writes reserve release
+headroom. Mutation timestamps always use the process's real system clock and
+refuse future/rollback heartbeat generations; public `--now` injection is
+available only for the observational `status` and `validate` commands.
 
 Preview the local LLM boundary without credentials or network access:
 
@@ -968,6 +988,7 @@ cargo run -- autopilot status readme-demo --repo . --json
 cargo run -- autopilot collect readme-demo --repo . --json
 cargo run -- autopilot artifacts latest --repo . --json
 cargo run -- review pr 123 --repo . --json
+cargo run -- review pr 123 --repo . --reviewer-program tools/reviewer --reviewer-arg strict --json
 ```
 
 Plain task files are accepted too; the first non-empty line becomes the title.
@@ -985,30 +1006,43 @@ By default, autopilot creates a deterministic fake child subprocess locally, use
 the fake forge, and runs the fake reviewer. It does not require network access,
 credentials, or a real Codex binary. Passing `--codex-bin` opts into an external
 Codex-compatible executable. Setting `forge_mode` to `github` in the plan opts
-into `git push` and `gh pr create`; fake remains the default. Passing
-`--reviewer-command` opts into an external reviewer command. The independent
-review report uses a separate reviewer identity from the child worker, includes
+into `git push` and `gh pr create`; fake remains the default. The legacy
+`--reviewer-command` shell-string option is retained only for an explicit
+fail-closed compatibility error and cannot grant real review authority. A JSON
+reviewer configuration opts in with `mode: "external_command"`, a canonical
+repo-relative or absolute `program`, and bounded `args`. PATH lookup, shell
+strings, and shell `-c` are refused. The independent review report uses a
+separate reviewer identity from the child worker, includes
 structured findings with `blocking`, and currently reports
 `ci_reaction_supported=false`. Reviewer configuration serializes as version 1;
 an omitted config version remains accepted for compatibility, while unknown
-fields are rejected recursively. Fake mode rejects external-command fields,
-and external-command mode requires a bounded command, rejects fake-only fields,
-and uses a 300-second timeout unless an explicit 1-to-86400-second value is
-provided.
+fields are rejected recursively. Fake mode rejects external-program fields.
+External-command mode rejects fake-only fields and uses a 300-second timeout
+unless an explicit 1-to-86400-second value is provided. Program symlinks are
+rejected; a script must use a single absolute shebang interpreter, whose
+canonical regular-file identity and content are bound as well.
 
 An external reviewer receives strict version-1 JSON on standard input and must
 return one strict UTF-8 JSON object on standard output. The JSON result is
 limited to 256 KiB, process capture is limited to 4 MiB per stream, truncated
 output is refused, and nested unknown fields or mismatched target, attempt,
 repository-relative paths, reviewer identity, or request binding are rejected.
-The parent derives the reviewer identity from the full command and binds each
-request to the exact pre-run repository snapshot, canonical request, and
-command digest; the reviewer must echo that binding. The snapshot covers
+The selected program and any script interpreter are opened without following
+links, bounded and hashed, then copied with create-new semantics into an
+owner-private runtime directory. Only the read-only executable copy is run.
+The parent derives the reviewer identity from those copied bytes and bounded
+argv, and binds each request to the pre-run repository snapshot, canonical
+request, effective timeout, and sandbox-policy version; the reviewer must echo
+that binding. A bounded descriptor prewalk rejects oversized or excessive
+ignored/untracked trees before Git status construction. The snapshot covers
 tracked, untracked, and ignored content, modes, link targets, file generations,
 Git HEAD/ref/index/packed-ref state, and linked-worktree identities. Hard links,
-special files, external links, and gitlinks fail closed, and any concurrent
-repository or administrative-state mutation invalidates the result. Sensitive
-output is redacted and converted into a blocking failed review.
+special files, external links, and gitlinks fail closed. Concurrent changes to
+those enumerated worktree entries, bound program/interpreter files, HEAD and its
+bound ref, packed refs, index, worktree backlink, or bound MACO-state identity
+invalidate the result; unrelated Git administrative files are not claimed as
+part of this snapshot. Sensitive output is redacted and converted into a
+blocking failed review.
 
 The verified external-review runtime enforces the integrity boundary with a
 read-only workspace and no network access. This is not yet a confidentiality

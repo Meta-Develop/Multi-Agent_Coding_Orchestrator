@@ -73,6 +73,58 @@ fn fake_review_rejects_external_only_timeout_before_repository_access() -> Resul
     Ok(())
 }
 
+#[test]
+fn legacy_shell_reviewer_cli_is_non_authoritative_before_repository_access() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let output = Command::new(BIN)
+        .current_dir(temp.path())
+        .args([
+            "review",
+            "pr",
+            "123",
+            "--repo",
+            "missing-repository",
+            "--reviewer-command",
+            "reviewer --shell-string",
+            "--json",
+        ])
+        .output()
+        .context("run legacy reviewer refusal")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("non-authoritative"));
+    assert!(!stderr.contains(temp.path().to_string_lossy().as_ref()));
+    Ok(())
+}
+
+#[test]
+fn direct_reviewer_program_and_literal_args_reach_repository_binding() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let output = Command::new(BIN)
+        .current_dir(temp.path())
+        .args([
+            "review",
+            "pr",
+            "123",
+            "--repo",
+            "missing-repository",
+            "--reviewer-program",
+            "reviewer",
+            "--reviewer-arg",
+            "literal-argument",
+            "--json",
+        ])
+        .output()
+        .context("run direct reviewer option plumbing")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to bind review repository"));
+    assert!(!stderr.contains("non-authoritative"));
+    assert!(!stderr.contains("fake reviewer mode"));
+    assert!(!stderr.contains(temp.path().to_string_lossy().as_ref()));
+    Ok(())
+}
+
 fn run_success_json(cwd: &Path, args: &[&str]) -> Result<Value> {
     let output = Command::new(BIN)
         .current_dir(cwd)

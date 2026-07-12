@@ -1,10 +1,14 @@
+#[cfg(target_os = "linux")]
+use crate::process_runner::trusted_linux_runtime_root;
 use crate::{
     llm::Redactor,
     process_runner::{
-        run_process, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
-        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
+        run_process, EnvironmentMode, ProcessOutput, ProcessSpec, SideEffectConfinementProfile,
+        StdinMode, StrictOfflineWorkspaceProfile,
     },
-    safe_state::{FileIdentity, SafeRoot},
+    safe_state::{
+        remove_direct_child_tree, BoundedRegularReader, FileIdentity, SafeRoot, TreeLinkPolicy,
+    },
 };
 use anyhow::{bail, Context, Result};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
@@ -12,9 +16,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -30,6 +34,8 @@ const REVIEW_JSON_LIMIT_BYTES: usize = 256 * 1024;
 const REVIEW_INPUT_LIMIT_BYTES: usize = 256 * 1024;
 const REVIEW_CONFIG_LIMIT_BYTES: usize = 64 * 1024;
 const REVIEW_COMMAND_LIMIT_BYTES: usize = 16 * 1024;
+const REVIEW_ARG_LIMIT: usize = 128;
+const REVIEW_ARG_LIMIT_BYTES: usize = 4 * 1024;
 const REVIEW_TIMEOUT_LIMIT_SECONDS: u64 = 24 * 60 * 60;
 const REVIEW_DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 const REVIEW_ATTEMPT_LIMIT: usize = 64;
@@ -44,7 +50,10 @@ const REVIEW_SNAPSHOT_ENTRY_LIMIT: usize = 32 * 1024;
 const REVIEW_SNAPSHOT_FILE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 const REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 const REVIEW_SYMLINK_LIMIT_BYTES: usize = 4 * 1024;
+const REVIEW_PREWALK_MAX_DEPTH: usize = 128;
+const REVIEW_PREWALK_TIMEOUT: Duration = Duration::from_secs(5);
 const REVIEW_SCHEMA_VERSION: u32 = 1;
+const REVIEW_SANDBOX_POLICY_VERSION: u32 = 1;
 const EXTERNAL_REVIEWER_BINDING_DOMAIN: &[u8] = b"MACO\0external-reviewer-binding\0v1\0";
 const EXTERNAL_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0external-review-request\0v1\0";
 const FAKE_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0fake-review-request\0v1\0";
@@ -71,6 +80,9 @@ pub struct ReviewerConfig {
     pub mode: ReviewerMode,
     pub blocking_attempts: usize,
     pub finding: Option<FakeReviewFindingTemplate>,
+    pub program: Option<PathBuf>,
+    pub args: Vec<String>,
+    /// Legacy shell-string input. Real external review authority rejects it.
     pub command: Option<String>,
     pub timeout_seconds: Option<u64>,
 }
@@ -87,6 +99,11 @@ struct ReviewerConfigWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     finding: Option<FakeReviewFindingTemplate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    program: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    args: Vec<String>,
+    /// Version-1 compatibility input only; external authority fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_seconds: Option<u64>,
@@ -102,6 +119,8 @@ impl Serialize for ReviewerConfig {
             mode: self.mode,
             blocking_attempts: self.blocking_attempts,
             finding: self.finding.clone(),
+            program: self.program.clone(),
+            args: self.args.clone(),
             command: self.command.clone(),
             timeout_seconds: self.timeout_seconds,
         }
@@ -124,6 +143,8 @@ impl<'de> Deserialize<'de> for ReviewerConfig {
             mode: wire.mode,
             blocking_attempts: wire.blocking_attempts,
             finding: wire.finding,
+            program: wire.program,
+            args: wire.args,
             command: wire.command,
             timeout_seconds: wire.timeout_seconds,
         })
@@ -136,6 +157,8 @@ impl Default for ReviewerConfig {
             mode: ReviewerMode::Fake,
             blocking_attempts: 0,
             finding: None,
+            program: None,
+            args: Vec::new(),
             command: None,
             timeout_seconds: None,
         }
@@ -354,8 +377,12 @@ fn validate_review_options(options: &ReviewPrOptions) -> Result<()> {
 
     match options.reviewer.mode {
         ReviewerMode::Fake => {
-            if options.reviewer.command.is_some() || options.reviewer.timeout_seconds.is_some() {
-                bail!("fake reviewer mode must not set command or timeout_seconds");
+            if options.reviewer.program.is_some()
+                || !options.reviewer.args.is_empty()
+                || options.reviewer.command.is_some()
+                || options.reviewer.timeout_seconds.is_some()
+            {
+                bail!("fake reviewer mode must not set program, args, command, or timeout_seconds");
             }
             if let Some(finding) = &options.reviewer.finding {
                 validate_fake_finding_template(finding)?;
@@ -367,19 +394,37 @@ fn validate_review_options(options: &ReviewPrOptions) -> Result<()> {
                     "external reviewer mode must not set fake blocking_attempts or finding fields"
                 );
             }
-            let command = options
+            if options.reviewer.command.is_some() {
+                bail!(
+                    "legacy reviewer shell commands are non-authoritative; use direct program and args"
+                );
+            }
+            let program = options
                 .reviewer
-                .command
+                .program
                 .as_deref()
-                .context("external reviewer mode requires a reviewer command")?;
-            validate_bounded_scalar(
-                command,
-                "external reviewer command",
-                REVIEW_COMMAND_LIMIT_BYTES,
-                false,
-            )?;
-            if command.trim() != command {
-                bail!("external reviewer command must not have leading or trailing whitespace");
+                .context("external reviewer mode requires a direct program")?;
+            validate_reviewer_program_path(program)?;
+            if options.reviewer.args.len() > REVIEW_ARG_LIMIT {
+                bail!("external reviewer args exceed their item limit");
+            }
+            let mut total_arg_bytes = 0usize;
+            for arg in &options.reviewer.args {
+                validate_bounded_scalar(
+                    arg,
+                    "external reviewer arg",
+                    REVIEW_ARG_LIMIT_BYTES,
+                    true,
+                )?;
+                total_arg_bytes = total_arg_bytes
+                    .checked_add(arg.len())
+                    .context("external reviewer arg byte total overflow")?;
+                if total_arg_bytes > REVIEW_COMMAND_LIMIT_BYTES {
+                    bail!("external reviewer args exceed their total byte limit");
+                }
+            }
+            if is_shell_program(program) && shell_args_request_command(&options.reviewer.args) {
+                bail!("shell -c reviewer authority is unsupported");
             }
             if let Some(timeout_seconds) = options.reviewer.timeout_seconds {
                 if timeout_seconds == 0 || timeout_seconds > REVIEW_TIMEOUT_LIMIT_SECONDS {
@@ -558,16 +603,29 @@ fn external_review_runtime(
     options: ReviewPrOptions,
     runtime: ReviewExecutionRuntime,
 ) -> Result<ReviewReport> {
-    let command = options
+    let program = options
         .reviewer
-        .command
+        .program
         .as_deref()
-        .context("external reviewer mode requires a reviewer command")?;
+        .context("external reviewer mode requires a direct program")?;
     let repository = ReviewRepositoryBinding::bind(&options.repo)?;
+    let source_program = BoundReviewerProgram::bind(&repository, program)?;
+    let materialized_program = MaterializedReviewerProgram::create(source_program)?;
     let before = repository.snapshot()?;
-    let reviewer_identity = bound_external_reviewer_identity(command);
-    let request_binding =
-        external_review_request_binding(&options, &before, &reviewer_identity, command)?;
+    materialized_program.verify(&repository)?;
+    let effective_timeout_seconds = options
+        .reviewer
+        .timeout_seconds
+        .unwrap_or(REVIEW_DEFAULT_TIMEOUT_SECONDS);
+    let reviewer_identity =
+        bound_external_reviewer_identity(&materialized_program.binding, &options.reviewer.args)?;
+    let request_binding = external_review_request_binding(
+        &options,
+        &before,
+        &reviewer_identity,
+        &materialized_program.binding,
+        effective_timeout_seconds,
+    )?;
     let input = serde_json::to_vec(&ExternalReviewInput {
         version: REVIEW_SCHEMA_VERSION,
         target: &options.target,
@@ -584,17 +642,13 @@ fn external_review_runtime(
             REVIEW_INPUT_LIMIT_BYTES
         );
     }
-    let effective_timeout_seconds = options
-        .reviewer
-        .timeout_seconds
-        .unwrap_or(REVIEW_DEFAULT_TIMEOUT_SECONDS);
     let timeout = Some(Duration::from_secs(effective_timeout_seconds));
     let confinement = repository.confinement_profile()?;
-    let process_spec = ProcessSpec::shell(
-        "external reviewer command",
-        Shell::for_current_platform(),
-        command,
-        &options.repo,
+    let process_spec = ProcessSpec::direct(
+        "external reviewer program",
+        &materialized_program.execution_path,
+        options.reviewer.args.clone(),
+        repository.worktree_root.path(),
         REVIEW_CAPTURE_LIMIT_BYTES,
     )
     .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
@@ -610,8 +664,9 @@ fn external_review_runtime(
         ReviewExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })
-    .context("failed to run external reviewer command")?;
+    .context("failed to run external reviewer program")?;
     repository.verify()?;
+    materialized_program.verify(&repository)?;
     let after = repository.snapshot()?;
     if let Some(error) = &output.stdin_error {
         bail!(error.clone());
@@ -625,6 +680,7 @@ fn external_review_runtime(
             });
     if after != before {
         return Ok(failed_external_review(
+            &reviewer_identity,
             options,
             &request_binding,
             "external reviewer changed repository state despite its read-only contract",
@@ -633,6 +689,7 @@ fn external_review_runtime(
     }
     if output.timed_out {
         return Ok(failed_external_review(
+            &reviewer_identity,
             options,
             &request_binding,
             "external reviewer command timed out",
@@ -651,6 +708,7 @@ fn external_review_runtime(
     };
     if !command_succeeded {
         return Ok(failed_external_review(
+            &reviewer_identity,
             options,
             &request_binding,
             "external reviewer command failed",
@@ -665,6 +723,7 @@ fn external_review_runtime(
     }
     if diagnostics_contain_unsafe_evidence {
         return Ok(failed_external_review(
+            &reviewer_identity,
             options,
             &request_binding,
             "external reviewer diagnostics contained unsafe evidence",
@@ -685,6 +744,7 @@ fn external_review_runtime(
             Ok(*report)
         }
         ParsedExternalReview::RejectedSensitive => Ok(failed_external_review(
+            &reviewer_identity,
             options,
             &request_binding,
             "external reviewer report contained unsafe authorization evidence",
@@ -711,6 +771,470 @@ struct ReviewRepoSnapshot {
     common_dir_identity: FileIdentity,
     git_backlink: GitBacklinkSnapshot,
     state_identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BoundReviewerProgram {
+    path: PathBuf,
+    file: BoundReviewerProgramFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BoundReviewerProgramFile {
+    mode: u32,
+    length: u64,
+    sha256: [u8; 32],
+    identity: FileIdentity,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    #[serde(skip)]
+    bytes: Vec<u8>,
+}
+
+impl BoundReviewerProgram {
+    fn bind(repository: &ReviewRepositoryBinding, path: &Path) -> Result<Self> {
+        validate_reviewer_program_path(path)?;
+        let file = if path.is_absolute() {
+            read_absolute_reviewer_program(path)?
+        } else {
+            read_worktree_reviewer_program(repository, path)?
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
+    fn verify(&self, repository: &ReviewRepositoryBinding) -> Result<()> {
+        let observed = if self.path.is_absolute() {
+            read_absolute_reviewer_program(&self.path)?
+        } else {
+            read_worktree_reviewer_program(repository, &self.path)?
+        };
+        if observed != self.file {
+            bail!("external reviewer program identity or content changed");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MaterializedReviewerBinding {
+    source: BoundReviewerProgram,
+    program_copy: MaterializedReviewerFile,
+    interpreter_source: Option<BoundReviewerProgram>,
+    interpreter_copy: Option<MaterializedReviewerFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MaterializedReviewerFile {
+    mode: u32,
+    length: u64,
+    sha256: [u8; 32],
+    identity: FileIdentity,
+}
+
+#[derive(Debug)]
+struct MaterializedReviewerProgram {
+    root: SafeRoot,
+    directory_name: OsString,
+    directory_identity: FileIdentity,
+    execution_path: PathBuf,
+    interpreter_path: Option<PathBuf>,
+    binding: MaterializedReviewerBinding,
+}
+
+impl MaterializedReviewerProgram {
+    fn create(source: BoundReviewerProgram) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let runtime_root = trusted_linux_runtime_root()
+                .context("external reviewer requires an owner-private runtime root")?;
+            let root = SafeRoot::open_existing(runtime_root)
+                .map_err(|_| anyhow::anyhow!("external reviewer runtime root is unsafe"))?;
+            let reserved = root.reserve_random_direct_child_directory("maco-review-program")?;
+            let directory_name = reserved
+                .path()
+                .file_name()
+                .context("external reviewer runtime directory has no name")?
+                .to_os_string();
+            let directory_identity = reserved.identity().clone();
+            let execution_path = reserved.path().join("reviewer-program");
+
+            let (program_bytes, interpreter_source, interpreter_path, interpreter_copy) =
+                if let Some(interpreter) = reviewer_script_interpreter(&source.file.bytes)? {
+                    let interpreter_source =
+                        BoundReviewerProgram::bind_absolute_canonical(&interpreter)?;
+                    if reviewer_script_interpreter(&interpreter_source.file.bytes)?.is_some() {
+                        bail!("nested script reviewer interpreters are unsupported");
+                    }
+                    let interpreter_path = reserved.path().join("reviewer-interpreter");
+                    let interpreter_copy = materialize_reviewer_file(
+                        &interpreter_path,
+                        &interpreter_source.file.bytes,
+                    )?;
+                    let program_bytes =
+                        rewrite_reviewer_shebang(&source.file.bytes, &interpreter_path)?;
+                    (
+                        program_bytes,
+                        Some(interpreter_source),
+                        Some(interpreter_path),
+                        Some(interpreter_copy),
+                    )
+                } else {
+                    (source.file.bytes.clone(), None, None, None)
+                };
+            let program_copy = materialize_reviewer_file(&execution_path, &program_bytes)?;
+            reserved.verify(&root)?;
+            Ok(Self {
+                root,
+                directory_name,
+                directory_identity,
+                execution_path,
+                interpreter_path,
+                binding: MaterializedReviewerBinding {
+                    source,
+                    program_copy,
+                    interpreter_source,
+                    interpreter_copy,
+                },
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = source;
+            bail!("external reviewer materialization is unsupported on this platform")
+        }
+    }
+
+    fn verify(&self, repository: &ReviewRepositoryBinding) -> Result<()> {
+        self.root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("external reviewer runtime root changed"))?;
+        let reserved = self
+            .root
+            .bind_existing_direct_child_directory(&self.directory_name)?;
+        if reserved.identity() != &self.directory_identity {
+            bail!("external reviewer runtime directory identity changed");
+        }
+        self.binding.source.verify(repository)?;
+        if let Some(interpreter) = &self.binding.interpreter_source {
+            interpreter.verify(repository)?;
+        }
+        if materialized_reviewer_file(&self.execution_path)? != self.binding.program_copy {
+            bail!("materialized reviewer program changed");
+        }
+        match (&self.interpreter_path, &self.binding.interpreter_copy) {
+            (Some(path), Some(expected)) if materialized_reviewer_file(path)? == *expected => {}
+            (None, None) => {}
+            _ => bail!("materialized reviewer interpreter changed"),
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MaterializedReviewerProgram {
+    fn drop(&mut self) {
+        let _ = remove_direct_child_tree(
+            &self.root,
+            &self.directory_name,
+            Some(&self.directory_identity),
+            TreeLinkPolicy::RejectLinksAndSpecialFiles,
+        );
+    }
+}
+
+impl BoundReviewerProgram {
+    fn bind_absolute_canonical(path: &Path) -> Result<Self> {
+        validate_reviewer_program_path(path)?;
+        if !path.is_absolute() {
+            bail!("reviewer interpreter must resolve to a canonical absolute path");
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: read_absolute_reviewer_program(path)?,
+        })
+    }
+}
+
+fn reviewer_script_interpreter(bytes: &[u8]) -> Result<Option<PathBuf>> {
+    if !bytes.starts_with(b"#!") {
+        return Ok(None);
+    }
+    let first_line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .context("reviewer script shebang is missing")?;
+    let shebang = std::str::from_utf8(&first_line[2..])
+        .context("reviewer script shebang is not valid UTF-8")?
+        .trim();
+    if shebang.is_empty() || shebang.chars().any(char::is_whitespace) {
+        bail!("reviewer script shebang arguments are unsupported");
+    }
+    let requested = Path::new(shebang);
+    if !requested.is_absolute() {
+        bail!("reviewer script shebang must use an absolute interpreter");
+    }
+    let canonical = requested
+        .canonicalize()
+        .context("reviewer script interpreter could not be resolved")?;
+    validate_reviewer_program_path(&canonical)?;
+    Ok(Some(canonical))
+}
+
+fn rewrite_reviewer_shebang(bytes: &[u8], interpreter: &Path) -> Result<Vec<u8>> {
+    let newline = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    let rest = if newline < bytes.len() {
+        &bytes[newline.saturating_add(1)..]
+    } else {
+        &[]
+    };
+    let interpreter = interpreter
+        .to_str()
+        .context("materialized reviewer interpreter path is not valid UTF-8")?;
+    let mut rewritten = format!("#!{interpreter}\n").into_bytes();
+    rewritten.extend_from_slice(rest);
+    if rewritten.len() > usize::try_from(REVIEW_SNAPSHOT_FILE_LIMIT_BYTES).unwrap_or(usize::MAX) {
+        bail!("materialized reviewer script exceeds its bounded size");
+    }
+    Ok(rewritten)
+}
+
+fn materialize_reviewer_file(path: &Path, bytes: &[u8]) -> Result<MaterializedReviewerFile> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o500)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options
+            .open(path)
+            .context("failed to create materialized reviewer file")?;
+        file.write_all(bytes)
+            .context("failed to write materialized reviewer file")?;
+        file.sync_all()
+            .context("failed to flush materialized reviewer file")?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o500))?;
+        file.sync_all()
+            .context("failed to flush materialized reviewer file mode")?;
+        drop(file);
+        File::open(
+            path.parent()
+                .context("materialized reviewer file has no parent")?,
+        )?
+        .sync_all()?;
+        materialized_reviewer_file(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, bytes);
+        bail!("reviewer file materialization is unsupported on this platform")
+    }
+}
+
+fn materialized_reviewer_file(path: &Path) -> Result<MaterializedReviewerFile> {
+    #[cfg(unix)]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        let mut file = options
+            .open(path)
+            .context("failed to open materialized reviewer file")?;
+        let before = fstat_file(&file)?;
+        if before.st_mode & libc::S_IFMT != libc::S_IFREG
+            || before.st_nlink != 1
+            || before.st_uid != unsafe { libc::geteuid() }
+            || before.st_mode & 0o777 != 0o500
+        {
+            bail!("materialized reviewer file metadata is unsafe");
+        }
+        let length = u64::try_from(before.st_size)
+            .context("materialized reviewer file has a negative length")?;
+        if length == 0 || length > REVIEW_SNAPSHOT_FILE_LIMIT_BYTES {
+            bail!("materialized reviewer file is empty or oversized");
+        }
+        let mut contents = Vec::with_capacity(
+            usize::try_from(length).context("materialized reviewer file length does not fit")?,
+        );
+        (&mut file)
+            .take(REVIEW_SNAPSHOT_FILE_LIMIT_BYTES.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        let after = fstat_file(&file)?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) != length
+            || !same_stat_generation(&before, &after)
+        {
+            bail!("materialized reviewer file changed during verification");
+        }
+        Ok(MaterializedReviewerFile {
+            mode: before.st_mode,
+            length,
+            sha256: sha256_bytes(&contents),
+            identity: file_identity_from_stat(&before),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("materialized reviewer verification is unsupported on this platform")
+    }
+}
+
+fn validate_reviewer_program_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return validate_repo_relative_path(path, "external reviewer program");
+    }
+    let encoded = path
+        .to_str()
+        .context("external reviewer program path must be valid UTF-8")?;
+    if encoded.len() > REVIEW_PATH_LIMIT_BYTES || encoded.chars().any(char::is_control) {
+        bail!("external reviewer program path is invalid or out of bounds");
+    }
+    if encoded.contains("//") || encoded.ends_with('/') {
+        bail!("external reviewer program path is not canonical absolute form");
+    }
+    for component in path.components() {
+        if !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        ) {
+            bail!("external reviewer program path is not canonical absolute form");
+        }
+    }
+    Ok(())
+}
+
+fn is_shell_program(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| matches!(name, "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish"))
+}
+
+fn shell_args_request_command(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| {
+            arg == "--command"
+                || arg.starts_with("--command=")
+                || arg
+                    .strip_prefix('-')
+                    .filter(|option| !option.starts_with('-'))
+                    .is_some_and(|option| option.bytes().any(|byte| byte == b'c'))
+        })
+}
+
+fn read_worktree_reviewer_program(
+    repository: &ReviewRepositoryBinding,
+    path: &Path,
+) -> Result<BoundReviewerProgramFile> {
+    let reader = ReviewTreeReader::bind(&repository.worktree_root)?;
+    let mut total_content_bytes = 0u64;
+    let entry = reader.snapshot_entry(path, &mut total_content_bytes)?;
+    reader.verify(&repository.worktree_root)?;
+    let bytes = BoundedRegularReader::read_relative(
+        repository.worktree_root.path(),
+        path,
+        REVIEW_SNAPSHOT_FILE_LIMIT_BYTES,
+    )
+    .map_err(|_| anyhow::anyhow!("external reviewer program bounded read was refused"))?;
+    let mut verify_total = 0u64;
+    let verified_entry = reader.snapshot_entry(path, &mut verify_total)?;
+    reader.verify(&repository.worktree_root)?;
+    if entry != verified_entry {
+        bail!("external reviewer program changed during binding");
+    }
+    match entry {
+        SnapshotTreeEntry::Regular {
+            mode,
+            length,
+            sha256,
+            identity,
+            modified_seconds,
+            modified_nanoseconds,
+            changed_seconds,
+            changed_nanoseconds,
+        } if length > 0
+            && mode & 0o111 != 0
+            && u64::try_from(bytes.len()).unwrap_or(u64::MAX) == length
+            && sha256_bytes(&bytes) == sha256 =>
+        {
+            Ok(BoundReviewerProgramFile {
+                mode,
+                length,
+                sha256,
+                identity,
+                modified_seconds,
+                modified_nanoseconds,
+                changed_seconds,
+                changed_nanoseconds,
+                bytes,
+            })
+        }
+        SnapshotTreeEntry::Regular { .. } => {
+            bail!("external reviewer program must be a non-empty executable regular file")
+        }
+        SnapshotTreeEntry::Missing | SnapshotTreeEntry::Symlink { .. } => {
+            bail!("external reviewer program must be a bound no-follow regular file")
+        }
+    }
+}
+
+fn read_absolute_reviewer_program(path: &Path) -> Result<BoundReviewerProgramFile> {
+    #[cfg(unix)]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        let mut file = options
+            .open(path)
+            .context("failed to open absolute reviewer program without following links")?;
+        let before = fstat_file(&file)?;
+        if before.st_mode & libc::S_IFMT != libc::S_IFREG || before.st_mode & 0o111 == 0 {
+            bail!("absolute reviewer program must be an executable regular file");
+        }
+        let length = u64::try_from(before.st_size)
+            .context("absolute reviewer program has a negative length")?;
+        if length == 0 || length > REVIEW_SNAPSHOT_FILE_LIMIT_BYTES {
+            bail!("absolute reviewer program is empty or exceeds its bounded size");
+        }
+        let mut contents = Vec::with_capacity(
+            usize::try_from(length).context("absolute reviewer program length does not fit")?,
+        );
+        (&mut file)
+            .take(REVIEW_SNAPSHOT_FILE_LIMIT_BYTES.saturating_add(1))
+            .read_to_end(&mut contents)
+            .context("failed to read absolute reviewer program")?;
+        let after = fstat_file(&file)?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) != length
+            || !same_stat_generation(&before, &after)
+        {
+            bail!("absolute reviewer program changed during bounded read");
+        }
+        Ok(BoundReviewerProgramFile {
+            mode: before.st_mode,
+            length,
+            sha256: sha256_bytes(&contents),
+            identity: file_identity_from_stat(&before),
+            modified_seconds: before.st_mtime,
+            modified_nanoseconds: stat_modified_nanoseconds(&before),
+            changed_seconds: before.st_ctime,
+            changed_nanoseconds: stat_changed_nanoseconds(&before),
+            bytes: contents,
+        })
+    }
+    #[cfg(not(unix))]
+    bail!("absolute no-follow reviewer programs are unsupported on this platform")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -874,6 +1398,10 @@ impl ReviewRepositoryBinding {
         )?;
         git_admin_reader.verify(&self.git_dir_root)?;
         common_admin_reader.verify(&self.common_dir_root)?;
+
+        let prewalk_reader = ReviewTreeReader::bind(&self.worktree_root)?;
+        prewalk_reader.prewalk()?;
+        prewalk_reader.verify(&self.worktree_root)?;
 
         let mut origins = BTreeMap::<PathBuf, SnapshotPathOrigin>::new();
         let index = repository.index().context("failed to read review index")?;
@@ -1196,6 +1724,29 @@ impl ReviewTreeReader {
         bail!("exact no-follow review snapshots are unsupported on this platform")
     }
 
+    fn prewalk(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = Instant::now()
+                .checked_add(REVIEW_PREWALK_TIMEOUT)
+                .context("review prewalk deadline overflow")?;
+            let root_stat = fstat_file(&self.root)?;
+            let mut entry_count = 0usize;
+            let mut total_bytes = 0u64;
+            prewalk_review_directory(
+                &self.root,
+                Path::new(""),
+                root_stat.st_dev,
+                0,
+                &mut entry_count,
+                &mut total_bytes,
+                deadline,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("bounded descriptor review prewalk is unsupported on this platform")
+    }
+
     fn snapshot_entry(
         &self,
         path: &Path,
@@ -1437,6 +1988,170 @@ impl ReviewTreeReader {
         }
         Ok(Some((directory, name.clone())))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn prewalk_review_directory(
+    directory: &File,
+    relative: &Path,
+    device: libc::dev_t,
+    depth: usize,
+    entry_count: &mut usize,
+    total_bytes: &mut u64,
+    deadline: Instant,
+) -> Result<()> {
+    if Instant::now() > deadline {
+        bail!("review descriptor prewalk exceeded its bounded deadline");
+    }
+    if depth > REVIEW_PREWALK_MAX_DEPTH {
+        bail!("review descriptor prewalk exceeded its depth limit");
+    }
+    for name in review_directory_entries(directory, deadline)? {
+        if Instant::now() > deadline {
+            bail!("review descriptor prewalk exceeded its bounded deadline");
+        }
+        if relative.as_os_str().is_empty() && name == OsStr::new(".git") {
+            continue;
+        }
+        *entry_count = entry_count.saturating_add(1);
+        if *entry_count > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+            bail!("review descriptor prewalk exceeded its entry limit");
+        }
+        let path = relative.join(&name);
+        validate_snapshot_relative_path(&path)?;
+        let name_c = c_string(&name)?;
+        let stat = stat_at_nofollow(directory, &name_c)
+            .context("failed to inspect review descriptor prewalk entry")?;
+        if stat.st_dev != device || stat.st_uid != unsafe { libc::geteuid() } {
+            bail!("review descriptor prewalk crossed an unsafe filesystem or owner boundary");
+        }
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to bind review descriptor prewalk directory");
+                }
+                let child = unsafe { File::from_raw_fd(fd) };
+                let opened = fstat_file(&child)?;
+                if !same_stat_generation(&stat, &opened) {
+                    bail!("review descriptor prewalk directory changed while binding");
+                }
+                prewalk_review_directory(
+                    &child,
+                    &path,
+                    device,
+                    depth.saturating_add(1),
+                    entry_count,
+                    total_bytes,
+                    deadline,
+                )?;
+            }
+            libc::S_IFREG => {
+                if stat.st_nlink != 1 {
+                    bail!("review descriptor prewalk found an unsafe hard link");
+                }
+                let length = u64::try_from(stat.st_size)
+                    .context("review descriptor prewalk found a negative file length")?;
+                if length > REVIEW_SNAPSHOT_FILE_LIMIT_BYTES {
+                    bail!("review descriptor prewalk found an oversized file");
+                }
+                *total_bytes = total_bytes
+                    .checked_add(length)
+                    .context("review descriptor prewalk byte total overflow")?;
+                if *total_bytes > REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES {
+                    bail!("review descriptor prewalk exceeded its total byte limit");
+                }
+            }
+            libc::S_IFLNK => {
+                let mut target = vec![0u8; REVIEW_SYMLINK_LIMIT_BYTES.saturating_add(1)];
+                let read = unsafe {
+                    libc::readlinkat(
+                        directory.as_raw_fd(),
+                        name_c.as_ptr(),
+                        target.as_mut_ptr().cast(),
+                        target.len(),
+                    )
+                };
+                if read < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to read review descriptor prewalk symlink");
+                }
+                let read = usize::try_from(read).context("review symlink length overflow")?;
+                if read > REVIEW_SYMLINK_LIMIT_BYTES {
+                    bail!("review descriptor prewalk found an oversized symlink target");
+                }
+                target.truncate(read);
+                let after = stat_at_nofollow(directory, &name_c)
+                    .context("failed to revalidate review descriptor prewalk symlink")?;
+                if !same_stat_generation(&stat, &after) {
+                    bail!("review descriptor prewalk symlink changed during inspection");
+                }
+                validate_internal_symlink_target(&path, &target)?;
+            }
+            _ => bail!("review descriptor prewalk found an unsupported special file"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn review_directory_entries(directory: &File, deadline: Instant) -> Result<Vec<OsString>> {
+    let duplicated = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to duplicate review directory descriptor");
+    }
+    let stream = unsafe { libc::fdopendir(duplicated) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicated);
+        }
+        return Err(error).context("failed to enumerate review directory descriptor");
+    }
+    let mut names = Vec::new();
+    loop {
+        if Instant::now() > deadline {
+            unsafe {
+                libc::closedir(stream);
+            }
+            bail!("review descriptor prewalk exceeded its bounded deadline");
+        }
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::closedir(stream);
+            }
+            if error.raw_os_error().unwrap_or_default() != 0 {
+                return Err(error).context("failed during review directory enumeration");
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        names.push(OsString::from_vec(name.to_vec()));
+        if names.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+            unsafe {
+                libc::closedir(stream);
+            }
+            bail!("review descriptor prewalk directory exceeded its entry limit");
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn validate_snapshot_relative_path(path: &Path) -> Result<()> {
@@ -2023,27 +2738,18 @@ fn sandbox_environment() -> BTreeMap<String, String> {
 }
 
 fn failed_external_review(
+    reviewer: &ReviewerIdentity,
     options: ReviewPrOptions,
     request_binding: &str,
     reason: &str,
     diagnostics: ReviewCommandDiagnostics,
 ) -> ReviewReport {
-    let reviewer = options
-        .reviewer
-        .command
-        .as_deref()
-        .map(bound_external_reviewer_identity)
-        .unwrap_or(ReviewerIdentity {
-            mode: ReviewerMode::ExternalCommand,
-            reviewer_id: "external-command-unbound".to_string(),
-            model: "parent-bound-external-command-v1".to_string(),
-        });
     ReviewReport {
         version: REVIEW_SCHEMA_VERSION,
         status: ReviewReportStatus::Failed,
         success: false,
         target: options.target,
-        reviewer,
+        reviewer: reviewer.clone(),
         attempt: options.attempt,
         request_binding: request_binding.to_string(),
         findings: vec![ReviewFinding {
@@ -2242,24 +2948,44 @@ struct ExternalReviewRequestBindingPayload<'a> {
     changed_paths: &'a [PathBuf],
     diff_summary: Option<&'a str>,
     reviewer: &'a ReviewerIdentity,
-    command_sha256: String,
+    program: &'a MaterializedReviewerBinding,
+    args: &'a [String],
+    effective_timeout_seconds: u64,
+    sandbox_policy_version: u32,
     repository_snapshot: &'a ReviewRepoSnapshot,
 }
 
-fn bound_external_reviewer_identity(command: &str) -> ReviewerIdentity {
-    let command_binding = domain_sha256(EXTERNAL_REVIEWER_BINDING_DOMAIN, command.as_bytes());
-    ReviewerIdentity {
+#[derive(Serialize)]
+struct ExternalReviewerLaunchBinding<'a> {
+    version: u32,
+    program: &'a MaterializedReviewerBinding,
+    args: &'a [String],
+}
+
+fn bound_external_reviewer_identity(
+    program: &MaterializedReviewerBinding,
+    args: &[String],
+) -> Result<ReviewerIdentity> {
+    let launch = serde_json::to_vec(&ExternalReviewerLaunchBinding {
+        version: REVIEW_SCHEMA_VERSION,
+        program,
+        args,
+    })
+    .context("failed to serialize external reviewer launch identity")?;
+    let command_binding = domain_sha256(EXTERNAL_REVIEWER_BINDING_DOMAIN, &launch);
+    Ok(ReviewerIdentity {
         mode: ReviewerMode::ExternalCommand,
-        reviewer_id: format!("external-command-{}", &command_binding[..32]),
-        model: "parent-bound-external-command-v1".to_string(),
-    }
+        reviewer_id: format!("external-program-{}", &command_binding[..32]),
+        model: "parent-bound-direct-program-v1".to_string(),
+    })
 }
 
 fn external_review_request_binding(
     options: &ReviewPrOptions,
     snapshot: &ReviewRepoSnapshot,
     reviewer: &ReviewerIdentity,
-    command: &str,
+    program: &MaterializedReviewerBinding,
+    effective_timeout_seconds: u64,
 ) -> Result<String> {
     let payload = serde_json::to_vec(&ExternalReviewRequestBindingPayload {
         version: REVIEW_SCHEMA_VERSION,
@@ -2268,7 +2994,10 @@ fn external_review_request_binding(
         changed_paths: &options.changed_paths,
         diff_summary: options.diff_summary.as_deref(),
         reviewer,
-        command_sha256: domain_sha256(EXTERNAL_REVIEWER_BINDING_DOMAIN, command.as_bytes()),
+        program,
+        args: &options.reviewer.args,
+        effective_timeout_seconds,
+        sandbox_policy_version: REVIEW_SANDBOX_POLICY_VERSION,
         repository_snapshot: snapshot,
     })
     .context("failed to serialize external review request binding")?;
@@ -2558,8 +3287,7 @@ mod tests {
                     summary: "deterministic template finding".to_string(),
                     suggested_fix: "apply the deterministic fix".to_string(),
                 }),
-                command: None,
-                timeout_seconds: None,
+                ..ReviewerConfig::default()
             },
             attempt: 1,
             changed_paths: vec![PathBuf::from("src/review.rs")],
@@ -2595,13 +3323,14 @@ mod tests {
             "pr_target_only",
             "i=0; while [ \"$i\" -lt 256 ]; do printf '%4096s' ' ' >&2; i=$((i + 1)); done;",
         );
+        let program = write_reviewer_script(temp.path(), "reviewer-large", &command)?;
 
         let report = external_review_simulation(ReviewPrOptions {
             repo: temp.path().to_path_buf(),
             target: "#44".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some(command),
+                program: Some(program),
                 timeout_seconds: Some(3),
                 ..ReviewerConfig::default()
             },
@@ -2677,7 +3406,7 @@ mod tests {
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
                 blocking_attempts: 1,
-                command: Some("true".to_string()),
+                program: Some(PathBuf::from("reviewer")),
                 ..ReviewerConfig::default()
             },
             attempt: 1,
@@ -2694,7 +3423,7 @@ mod tests {
             target: "#1".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some("true".to_string()),
+                program: Some(PathBuf::from("reviewer")),
                 timeout_seconds: Some(REVIEW_TIMEOUT_LIMIT_SECONDS.saturating_add(1)),
                 ..ReviewerConfig::default()
             },
@@ -2704,6 +3433,39 @@ mod tests {
         })
         .expect_err("oversized timeout must be rejected");
         assert!(invalid_timeout.to_string().contains("timeout_seconds"));
+
+        let legacy_shell = review_pr(ReviewPrOptions {
+            repo: PathBuf::from("/repository/does/not/exist"),
+            target: "#1".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some("reviewer --unsafe-shell".to_string()),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })
+        .expect_err("legacy shell reviewer authority must fail before repository access");
+        assert!(legacy_shell.to_string().contains("non-authoritative"));
+
+        for shell_arg in ["-c", "-ec", "--command=unsafe"] {
+            let shell_command = review_pr(ReviewPrOptions {
+                repo: PathBuf::from("/repository/does/not/exist"),
+                target: "#1".to_string(),
+                reviewer: ReviewerConfig {
+                    mode: ReviewerMode::ExternalCommand,
+                    program: Some(PathBuf::from("/bin/sh")),
+                    args: vec![shell_arg.to_string(), "unsafe".to_string()],
+                    ..ReviewerConfig::default()
+                },
+                attempt: 1,
+                changed_paths: Vec::new(),
+                diff_summary: None,
+            })
+            .expect_err("shell command-string authority must fail before repository access");
+            assert!(shell_command.to_string().contains("shell -c"));
+        }
 
         let noncanonical_path = review_pr(ReviewPrOptions {
             repo: PathBuf::from("/repository/does/not/exist"),
@@ -2762,7 +3524,7 @@ mod tests {
             target: "#77".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some("true".to_string()),
+                program: Some(PathBuf::from("reviewer")),
                 ..ReviewerConfig::default()
             },
             attempt: 2,
@@ -2777,7 +3539,11 @@ mod tests {
             changed_paths: options.changed_paths.clone(),
             diff_summary: options.diff_summary.clone(),
         });
-        let expected_reviewer = bound_external_reviewer_identity("true");
+        let expected_reviewer = ReviewerIdentity {
+            mode: ReviewerMode::ExternalCommand,
+            reviewer_id: "external-program-test".to_string(),
+            model: "parent-bound-direct-program-v1".to_string(),
+        };
         let expected_binding = "a".repeat(64);
         report.reviewer = expected_reviewer.clone();
         report.request_binding = expected_binding.clone();
@@ -2972,8 +3738,17 @@ mod tests {
         std::fs::create_dir(temp.path().join("ignored"))?;
         std::fs::write(temp.path().join("ignored/secret.txt"), "ignored-a")?;
         symlink("target-a.txt", temp.path().join("link.txt"))?;
+        std::fs::write(temp.path().join("reviewer.sh"), "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(
+            temp.path().join("reviewer.sh"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
 
         let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        let program = MaterializedReviewerProgram::create(BoundReviewerProgram::bind(
+            &binding,
+            Path::new("reviewer.sh"),
+        )?)?;
         let baseline = binding.snapshot()?;
 
         std::fs::write(temp.path().join("tracked.txt"), "tracked-b")?;
@@ -2984,24 +3759,101 @@ mod tests {
             target: "#snapshot".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some("true".to_string()),
+                program: Some(PathBuf::from("reviewer.sh")),
                 ..ReviewerConfig::default()
             },
             attempt: 1,
             changed_paths: vec![PathBuf::from("tracked.txt")],
             diff_summary: Some("same labels".to_string()),
         };
-        let identity = bound_external_reviewer_identity("true");
+        let identity = bound_external_reviewer_identity(&program.binding, &[])?;
+        let baseline_binding = external_review_request_binding(
+            &request,
+            &baseline,
+            &identity,
+            &program.binding,
+            REVIEW_DEFAULT_TIMEOUT_SECONDS,
+        )?;
         assert_ne!(
-            external_review_request_binding(&request, &baseline, &identity, "true")?,
-            external_review_request_binding(&request, &changed_content, &identity, "true")?
+            baseline_binding,
+            external_review_request_binding(
+                &request,
+                &baseline,
+                &identity,
+                &program.binding,
+                REVIEW_DEFAULT_TIMEOUT_SECONDS.saturating_add(1)
+            )?
+        );
+        let changed_policy_payload = serde_json::to_vec(&ExternalReviewRequestBindingPayload {
+            version: REVIEW_SCHEMA_VERSION,
+            target: &request.target,
+            attempt: request.attempt,
+            changed_paths: &request.changed_paths,
+            diff_summary: request.diff_summary.as_deref(),
+            reviewer: &identity,
+            program: &program.binding,
+            args: &request.reviewer.args,
+            effective_timeout_seconds: REVIEW_DEFAULT_TIMEOUT_SECONDS,
+            sandbox_policy_version: REVIEW_SANDBOX_POLICY_VERSION.saturating_add(1),
+            repository_snapshot: &baseline,
+        })?;
+        assert_ne!(
+            baseline_binding,
+            domain_sha256(EXTERNAL_REVIEW_REQUEST_DOMAIN, &changed_policy_payload)
+        );
+        let args_request = ReviewPrOptions {
+            reviewer: ReviewerConfig {
+                args: vec!["--bounded".to_string()],
+                ..request.reviewer.clone()
+            },
+            ..request.clone()
+        };
+        let args_identity =
+            bound_external_reviewer_identity(&program.binding, &args_request.reviewer.args)?;
+        assert_ne!(
+            baseline_binding,
+            external_review_request_binding(
+                &args_request,
+                &baseline,
+                &args_identity,
+                &program.binding,
+                REVIEW_DEFAULT_TIMEOUT_SECONDS
+            )?
+        );
+        assert_ne!(
+            external_review_request_binding(
+                &request,
+                &baseline,
+                &identity,
+                &program.binding,
+                REVIEW_DEFAULT_TIMEOUT_SECONDS
+            )?,
+            external_review_request_binding(
+                &request,
+                &changed_content,
+                &identity,
+                &program.binding,
+                REVIEW_DEFAULT_TIMEOUT_SECONDS
+            )?
         );
         std::fs::write(temp.path().join("tracked.txt"), "tracked-a")?;
         let restored_content = binding.snapshot()?;
         assert_ne!(baseline, restored_content);
         assert_ne!(
-            external_review_request_binding(&request, &baseline, &identity, "true")?,
-            external_review_request_binding(&request, &restored_content, &identity, "true")?
+            external_review_request_binding(
+                &request,
+                &baseline,
+                &identity,
+                &program.binding,
+                REVIEW_DEFAULT_TIMEOUT_SECONDS
+            )?,
+            external_review_request_binding(
+                &request,
+                &restored_content,
+                &identity,
+                &program.binding,
+                REVIEW_DEFAULT_TIMEOUT_SECONDS
+            )?
         );
 
         let mut permissions = std::fs::metadata(temp.path().join("tracked.txt"))?.permissions();
@@ -3089,6 +3941,58 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_prewalk_rejects_oversized_ignored_file_before_git_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
+        std::fs::write(temp.path().join(".gitignore"), "ignored.bin\n")?;
+        let ignored = File::create(temp.path().join("ignored.bin"))?;
+        ignored.set_len(REVIEW_SNAPSHOT_FILE_LIMIT_BYTES.saturating_add(1))?;
+
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        let error = binding
+            .snapshot()
+            .expect_err("oversized ignored files must fail in descriptor prewalk");
+        assert!(error.to_string().contains("prewalk"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reviewer_program_materialization_binds_source_copy_and_interpreter() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
+        let relative = write_reviewer_script(temp.path(), "reviewer-script", "exit 0")?;
+        let repository = ReviewRepositoryBinding::bind(temp.path())?;
+        let source = BoundReviewerProgram::bind(&repository, &relative)?;
+        let materialized = MaterializedReviewerProgram::create(source)?;
+        assert_ne!(
+            materialized.execution_path,
+            temp.path().join("reviewer-script")
+        );
+        assert!(materialized.binding.interpreter_source.is_some());
+        assert!(materialized.binding.interpreter_copy.is_some());
+        materialized.verify(&repository)?;
+
+        std::fs::write(temp.path().join("reviewer-script"), "#!/bin/sh\nexit 1\n")?;
+        std::fs::set_permissions(
+            temp.path().join("reviewer-script"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        assert!(materialized.verify(&repository).is_err());
+
+        let canonical_interpreter = Path::new("/bin/sh").canonicalize()?;
+        let absolute = BoundReviewerProgram::bind(&repository, &canonical_interpreter)?;
+        assert!(absolute.path.is_absolute());
+        let symlink_path = temp.path().join("reviewer-link");
+        symlink(&canonical_interpreter, &symlink_path)?;
+        assert!(BoundReviewerProgram::bind(&repository, &symlink_path).is_err());
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn review_profile_hides_bound_common_state_without_reading_keys() -> Result<()> {
@@ -3120,15 +4024,17 @@ mod tests {
     fn external_simulation_rejects_truncated_stderr_and_applies_default_timeout() -> Result<()> {
         let temp = tempfile::tempdir()?;
         git2::Repository::init(temp.path())?;
+        let truncated_program = write_reviewer_script(
+            temp.path(),
+            "reviewer-truncated",
+            "cat >/dev/null; i=0; while [ \"$i\" -lt 1100 ]; do printf '%4096s' ' ' >&2; i=$((i + 1)); done",
+        )?;
         let report = external_review_simulation(ReviewPrOptions {
             repo: temp.path().to_path_buf(),
             target: "#88".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some(
-                    "cat >/dev/null; i=0; while [ \"$i\" -lt 1100 ]; do printf '%4096s' ' ' >&2; i=$((i + 1)); done"
-                        .to_string(),
-                ),
+                program: Some(truncated_program),
                 timeout_seconds: None,
                 ..ReviewerConfig::default()
             },
@@ -3140,12 +4046,13 @@ mod tests {
         assert!(report.to_string().contains("stdout or stderr"));
 
         let command = external_echo_command("#89", 1, "[]", "pr_target_only", "");
+        let accepted_program = write_reviewer_script(temp.path(), "reviewer-accepted", &command)?;
         let accepted = external_review_simulation(ReviewPrOptions {
             repo: temp.path().to_path_buf(),
             target: "#89".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some(command),
+                program: Some(accepted_program),
                 timeout_seconds: None,
                 ..ReviewerConfig::default()
             },
@@ -3160,18 +4067,23 @@ mod tests {
             Some(REVIEW_DEFAULT_TIMEOUT_SECONDS)
         );
 
+        let unsafe_program = write_reviewer_script(
+            temp.path(),
+            "reviewer-unsafe-diagnostics",
+            &external_echo_command(
+                "#90",
+                1,
+                "[]",
+                "pr_target_only",
+                "printf 'API_TOKEN=top-secret' >&2;",
+            ),
+        )?;
         let unsafe_diagnostics = external_review_simulation(ReviewPrOptions {
             repo: temp.path().to_path_buf(),
             target: "#90".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some(external_echo_command(
-                    "#90",
-                    1,
-                    "[]",
-                    "pr_target_only",
-                    "printf 'API_TOKEN=top-secret' >&2;",
-                )),
+                program: Some(unsafe_program),
                 timeout_seconds: Some(30),
                 ..ReviewerConfig::default()
             },
@@ -3205,6 +4117,16 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn write_reviewer_script(repo: &Path, name: &str, body: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = repo.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        Ok(PathBuf::from(name))
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires exclusive strict-systemd runtime validation"]
@@ -3221,14 +4143,17 @@ mod tests {
         )?;
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
         std::fs::write(state.join("private.key"), "hidden")?;
+        let program = write_reviewer_script(
+            temp.path(),
+            "reviewer-hidden-state",
+            "cat .git/maco/state/private.key >/dev/null; exit 99",
+        )?;
         let report = external_review(ReviewPrOptions {
             repo: temp.path().to_path_buf(),
             target: "#90".to_string(),
             reviewer: ReviewerConfig {
                 mode: ReviewerMode::ExternalCommand,
-                command: Some(
-                    "set -e; cat .git/maco/state/private.key >/dev/null; exit 99".to_string(),
-                ),
+                program: Some(program),
                 timeout_seconds: Some(30),
                 ..ReviewerConfig::default()
             },

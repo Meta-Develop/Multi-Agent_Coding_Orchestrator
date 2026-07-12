@@ -127,18 +127,18 @@ fn heartbeat_updates_timestamp_and_audit_log() -> Result<()> {
         repo_str(repo)?,
         "--by",
         "heartbeat-me",
-        "--now",
-        "2026-05-20T03:04:05Z",
         "--json",
     ])?;
 
     assert_eq!(report["claim_id"], "heartbeat-me");
     assert_eq!(report["actor"], "heartbeat-me");
     assert_eq!(report["status"], "active");
-    assert_eq!(report["claim"]["heartbeat"], "2026-05-20T03:04:05Z");
+    let updated = report["updated"].as_str().context("updated timestamp")?;
+    assert_eq!(report["claim"]["heartbeat"], updated);
+    assert_ne!(updated, "2026-05-20T00:00:00Z");
     let claim_text = fs::read_to_string(claim_path(repo, "heartbeat-me")).context("read claim")?;
-    assert!(claim_text.contains("- Updated: `2026-05-20T03:04:05Z`"));
-    assert!(claim_text.contains("- Heartbeat: `2026-05-20T03:04:05Z`"));
+    assert!(claim_text.contains(&format!("- Updated: `{updated}`")));
+    assert!(claim_text.contains(&format!("- Heartbeat: `{updated}`")));
     assert!(claim_text.contains("`heartbeat-me` heartbeat"));
 
     Ok(())
@@ -160,8 +160,6 @@ fn heartbeat_rejects_blank_actor_without_touching_claim() -> Result<()> {
         repo_str(repo)?,
         "--by",
         "   ",
-        "--now",
-        "2026-05-20T03:04:05Z",
         "--json",
     ])?;
 
@@ -175,6 +173,162 @@ fn heartbeat_rejects_blank_actor_without_touching_claim() -> Result<()> {
         original_claim
     );
 
+    Ok(())
+}
+
+#[test]
+fn mutation_cli_rejects_public_now_override_without_touching_claim() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo = temp.path();
+    write_modern_claim(repo, "real-clock-only", "active", "src/live_claim.rs")?;
+    let path = claim_path(repo, "real-clock-only");
+    let original = fs::read(&path)?;
+    let draft = repo.join("real-clock-only-draft.md");
+    fs::write(
+        &draft,
+        modern_claim_text("real-clock-only", "blocked", "src/live_claim.rs"),
+    )?;
+
+    for args in [
+        vec![
+            "live",
+            "apply",
+            path_str(&draft)?,
+            "--repo",
+            repo_str(repo)?,
+            "--by",
+            "real-clock-only",
+            "--now",
+            "2999-01-01T00:00:00Z",
+            "--json",
+        ],
+        vec![
+            "live",
+            "heartbeat",
+            "real-clock-only",
+            "--repo",
+            repo_str(repo)?,
+            "--by",
+            "real-clock-only",
+            "--now",
+            "2999-01-01T00:00:00Z",
+            "--json",
+        ],
+        vec![
+            "live",
+            "override-release",
+            "real-clock-only",
+            "--repo",
+            repo_str(repo)?,
+            "--by",
+            "project-owner",
+            "--reason",
+            "attempted clock override",
+            "--now",
+            "2999-01-01T00:00:00Z",
+            "--json",
+        ],
+        vec![
+            "live",
+            "release",
+            "real-clock-only",
+            "--repo",
+            repo_str(repo)?,
+            "--by",
+            "real-clock-only",
+            "--reason",
+            "attempted clock override",
+            "--now",
+            "2999-01-01T00:00:00Z",
+            "--json",
+        ],
+    ] {
+        let output = run_failure_output(&args)?;
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--now'"));
+        assert_eq!(fs::read(&path)?, original);
+    }
+    Ok(())
+}
+
+#[test]
+fn apply_and_owner_release_publish_through_the_locked_cli_path() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo = temp.path();
+    fs::create_dir_all(repo.join(".agents/live/claims"))?;
+    let draft = repo.join("draft-claim.md");
+    fs::write(
+        &draft,
+        modern_claim_text("cli-applied", "active", "src/review.rs"),
+    )?;
+
+    let created = run_success_json(&[
+        "live",
+        "apply",
+        path_str(&draft)?,
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "cli-applied",
+        "--json",
+    ])?;
+    assert_eq!(created["created"], true);
+    assert_eq!(created["claim"]["status"], "active");
+
+    fs::write(
+        &draft,
+        modern_claim_text("cli-applied", "blocked", "src/review.rs"),
+    )?;
+    let updated = run_success_json(&[
+        "live",
+        "apply",
+        path_str(&draft)?,
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "cli-applied",
+        "--json",
+    ])?;
+    assert_eq!(updated["created"], false);
+    assert_eq!(updated["claim"]["status"], "blocked");
+
+    let before_wrong_owner = fs::read(claim_path(repo, "cli-applied"))?;
+    let wrong_owner = run_failure_output(&[
+        "live",
+        "release",
+        "cli-applied",
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "other-owner",
+        "--reason",
+        "not the recorded owner",
+        "--json",
+    ])?;
+    assert!(String::from_utf8_lossy(&wrong_owner.stderr).contains("exactly match"));
+    assert_eq!(
+        fs::read(claim_path(repo, "cli-applied"))?,
+        before_wrong_owner
+    );
+
+    let released = run_success_json(&[
+        "live",
+        "release",
+        "cli-applied",
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "cli-applied",
+        "--status",
+        "done",
+        "--reason",
+        "owner completed the claim",
+        "--json",
+    ])?;
+    assert_eq!(released["status"], "done");
+    assert!(released["audit_entry"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("released claim as `done`"));
     Ok(())
 }
 
@@ -194,8 +348,6 @@ fn override_release_changes_active_to_handoff_and_records_reason() -> Result<()>
         "project-owner",
         "--reason",
         "stale claim blocked required files",
-        "--now",
-        "2026-05-20T04:00:00Z",
         "--json",
     ])?;
 
@@ -289,6 +441,8 @@ fn mutation_cli_refuses_wrong_owner_fresh_override_and_markdown_injection() -> R
     let repo = temp.path();
     write_modern_claim(repo, "owned-claim", "active", "src/live_claim.rs")?;
     let path = claim_path(repo, "owned-claim");
+    let future = fs::read_to_string(&path)?.replace("2026-05-20T00:00:00Z", "2999-05-20T00:00:00Z");
+    fs::write(&path, future)?;
     let original = fs::read(&path).context("read original claim")?;
 
     let wrong_owner = run_failure_output(&[
@@ -299,8 +453,6 @@ fn mutation_cli_refuses_wrong_owner_fresh_override_and_markdown_injection() -> R
         repo_str(repo)?,
         "--by",
         "other-owner",
-        "--now",
-        "2026-05-20T00:30:00Z",
         "--json",
     ])?;
     assert!(String::from_utf8_lossy(&wrong_owner.stderr).contains("exactly match"));
@@ -316,8 +468,6 @@ fn mutation_cli_refuses_wrong_owner_fresh_override_and_markdown_injection() -> R
         "project-owner",
         "--reason",
         "fresh claim remains owned",
-        "--now",
-        "2026-05-20T00:30:00Z",
         "--json",
     ])?;
     assert!(String::from_utf8_lossy(&fresh.stderr).contains("provably stale"));
@@ -333,8 +483,6 @@ fn mutation_cli_refuses_wrong_owner_fresh_override_and_markdown_injection() -> R
         "project-owner",
         "--reason",
         "unsafe\n## injected",
-        "--now",
-        "2026-05-20T03:00:00Z",
         "--json",
     ])?;
     assert!(String::from_utf8_lossy(&injected.stderr).contains("unsafe"));
@@ -377,8 +525,6 @@ fn stale_publication_claim_override_release_does_not_touch_owned_files() -> Resu
         "project-owner",
         "--reason",
         "original owner/session unavailable; stale active claim blocked required integration files; preserving all existing file changes",
-        "--now",
-        "2026-05-20T05:00:00Z",
         "--json",
     ])?;
 
@@ -395,11 +541,12 @@ fn stale_publication_claim_override_release_does_not_touch_owned_files() -> Resu
 }
 
 fn write_modern_claim(repo: &Path, claim_id: &str, status: &str, path: &str) -> Result<()> {
-    write_claim(
-        repo,
-        claim_id,
-        &format!(
-            r#"# Claim: {claim_id}
+    write_claim(repo, claim_id, &modern_claim_text(claim_id, status, path))
+}
+
+fn modern_claim_text(claim_id: &str, status: &str, path: &str) -> String {
+    format!(
+        r#"# Claim: {claim_id}
 
 - Claim ID: `{claim_id}`
 - Owner: `{claim_id}`
@@ -415,7 +562,6 @@ fn write_modern_claim(repo: &Path, claim_id: &str, status: &str, path: &str) -> 
 
 - `2026-05-20T00:00:00Z` - `{claim_id}` created
 "#
-        ),
     )
 }
 
@@ -460,4 +606,8 @@ fn claim_by_id<'a>(status: &'a Value, claim_id: &str) -> Result<&'a Value> {
 
 fn repo_str(repo: &Path) -> Result<&str> {
     repo.to_str().context("repo path utf8")
+}
+
+fn path_str(path: &Path) -> Result<&str> {
+    path.to_str().context("path utf8")
 }

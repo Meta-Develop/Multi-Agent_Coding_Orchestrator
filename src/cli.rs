@@ -1050,7 +1050,7 @@ struct RunAutopilotArgs {
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
-    /// External reviewer shell command. Omit for deterministic fake review mode.
+    /// Legacy reviewer shell string; retained only to return a fail-closed error.
     #[arg(long)]
     reviewer_command: Option<String>,
     /// Allow autopilot to run when the primary worktree is dirty.
@@ -1157,7 +1157,15 @@ impl ReviewCommand {
         match self.command {
             ReviewSubcommand::Pr(args) => {
                 let target = review::target_from_pr_arg(&args.target)?;
-                let reviewer = if let Some(command) = args.reviewer_command {
+                let reviewer = if let Some(program) = args.reviewer_program {
+                    ReviewerConfig {
+                        mode: ReviewerMode::ExternalCommand,
+                        program: Some(program),
+                        args: args.reviewer_args,
+                        timeout_seconds: args.timeout_seconds,
+                        ..ReviewerConfig::default()
+                    }
+                } else if let Some(command) = args.reviewer_command {
                     ReviewerConfig {
                         mode: ReviewerMode::ExternalCommand,
                         command: Some(command),
@@ -1201,10 +1209,16 @@ struct ReviewPrArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// External reviewer shell command. Omit for deterministic fake review mode.
-    #[arg(long)]
+    /// Direct external reviewer program. Omit for deterministic fake review mode.
+    #[arg(long, conflicts_with = "reviewer_command")]
+    reviewer_program: Option<PathBuf>,
+    /// One literal external reviewer argument. Repeat for multiple arguments.
+    #[arg(long = "reviewer-arg", requires = "reviewer_program")]
+    reviewer_args: Vec<String>,
+    /// Legacy shell-string input; retained only to return a fail-closed error.
+    #[arg(long, conflicts_with = "reviewer_program")]
     reviewer_command: Option<String>,
-    /// Timeout for the external reviewer command.
+    /// Timeout for the external reviewer program.
     #[arg(long)]
     timeout_seconds: Option<u64>,
     /// Emit machine-readable JSON.
@@ -1538,19 +1552,30 @@ impl LiveCommand {
                 let report = live_claim::validate(args.repo, &now)?;
                 print_query_report(&report, args.json)
             }
+            LiveSubcommand::Apply(args) => {
+                let report = live_claim::apply(args.repo, args.draft, &args.by)?;
+                print_query_report(&report, args.json)
+            }
             LiveSubcommand::Heartbeat(args) => {
-                let now = live_clock(args.now.as_deref())?;
-                let report = live_claim::heartbeat(args.repo, &args.claim_id, &args.by, &now)?;
+                let report = live_claim::heartbeat(args.repo, &args.claim_id, &args.by)?;
                 print_query_report(&report, args.json)
             }
             LiveSubcommand::OverrideRelease(args) => {
-                let now = live_clock(args.now.as_deref())?;
                 let report = live_claim::override_release(
                     args.repo,
                     &args.claim_id,
                     &args.by,
                     &args.reason,
-                    &now,
+                )?;
+                print_query_report(&report, args.json)
+            }
+            LiveSubcommand::Release(args) => {
+                let report = live_claim::release(
+                    args.repo,
+                    &args.claim_id,
+                    &args.by,
+                    &args.status,
+                    &args.reason,
                 )?;
                 print_query_report(&report, args.json)
             }
@@ -1564,10 +1589,14 @@ enum LiveSubcommand {
     Status(LiveStatusArgs),
     /// Validate live claim file fields.
     Validate(LiveValidateArgs),
+    /// Atomically create or owner-update a claim from an external Markdown draft.
+    Apply(LiveApplyArgs),
     /// Refresh a claim heartbeat timestamp.
     Heartbeat(LiveHeartbeatArgs),
     /// Move a stale active claim to handoff by explicit override.
     OverrideRelease(LiveOverrideReleaseArgs),
+    /// Let the exact owner release a claim as done or handoff.
+    Release(LiveReleaseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1597,6 +1626,21 @@ struct LiveValidateArgs {
 }
 
 #[derive(Debug, Args)]
+struct LiveApplyArgs {
+    /// Bounded no-follow Markdown draft outside the live claim board.
+    draft: PathBuf,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Exact claim owner applying the draft.
+    #[arg(long)]
+    by: String,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct LiveHeartbeatArgs {
     /// Claim id to refresh.
     claim_id: String,
@@ -1606,9 +1650,6 @@ struct LiveHeartbeatArgs {
     /// Actor refreshing the claim.
     #[arg(long)]
     by: String,
-    /// Deterministic current timestamp for tests.
-    #[arg(long)]
-    now: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1627,9 +1668,27 @@ struct LiveOverrideReleaseArgs {
     /// Reason recorded in the audit log.
     #[arg(long)]
     reason: String,
-    /// Deterministic current timestamp for tests.
+    /// Emit machine-readable JSON.
     #[arg(long)]
-    now: Option<String>,
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LiveReleaseArgs {
+    /// Claim id to release.
+    claim_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Exact recorded owner releasing the claim.
+    #[arg(long)]
+    by: String,
+    /// Terminal release status.
+    #[arg(long, default_value = "done", value_parser = ["done", "handoff"])]
+    status: String,
+    /// Reason recorded in the bounded audit log.
+    #[arg(long)]
+    reason: String,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
