@@ -69,12 +69,13 @@ The current implementation covers a local-first command-line slice:
   is instructed to read `AGENTS.md` and project-local `.agents` guidance before
   acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
   worker/researcher assignments when available, preserve the O1/O2 subprocess
-  launch boundary of the `ExternalCodex` custom permission profile with goals
-  and multi-agent support enabled, require outer-launcher verified systemd
-  cgroup ownership evidence, leave O1/O2 hierarchy and enforced audit gates to
-  MACO/Codex CLI subprocess workflows, report peer-O2 escalation candidates
-  instead of taking them over, and preserve structured reporting without
-  applying worker changes to the primary worktree
+  launch boundary of the outer verified MACO sandbox with verified systemd
+  cgroup ownership evidence plus the fixed `maco_external_codex` inner
+  permission profile, enable goals and multi-agent support only for the
+  supervisor role, leave O1/O2 hierarchy and enforced audit gates to MACO/Codex
+  CLI subprocess workflows, report peer-O2 escalation candidates instead of
+  taking them over, and preserve structured reporting without applying worker
+  changes to the primary worktree
   automatically.
 - `maco supervise status` reports durable supervisor run artifact state without
   launching workers or applying changes.
@@ -856,13 +857,15 @@ Autonomous O2 runs carry context through `STATE.tsv`, `HEARTBEAT.tsv`,
 `queue.tsv`, `NEXT_O2_TASKS.tsv`, task prompts, captured final messages,
 event streams, and `SUMMARY.md` under `.maco/o2-autopilot/runs/<run-id>/`.
 
-O1/O2 subprocess orchestration uses the Codex CLI `ExternalCodex` custom
-permission profile with goals and multi-agent support enabled. The outer
-launcher must establish and return verified systemd cgroup ownership evidence
-before MACO accepts a child result, and nested O2/O1 subprocess chains preserve
-that boundary for orchestrator roles. The ordinary workspace-write profile is
-not used for these chains because nested Codex state DB access can collide,
-corrupt, or fail under workspace-scoped restrictions.
+O1/O2 subprocess orchestration uses MACO's verified outer process-tree and
+side-effect boundary plus verified systemd cgroup ownership evidence and the
+fixed `maco_external_codex` inner permission profile. Goals and multi-agent
+features are enabled only for the supervisor role; inner model-generated
+network access remains disabled. Nested O2/O1 subprocess chains must go through
+the same validated MACO launch path instead of invoking a raw Codex process or
+selecting a broader sandbox mode. The ordinary workspace-write profile is not
+used for these chains because nested Codex state DB access can collide, corrupt,
+or fail under workspace-scoped restrictions.
 
 For worker assignments, child orchestrators should use Codex native
 SubAgent/delegated-worker mechanisms when available only for terminal worker or

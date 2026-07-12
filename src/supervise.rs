@@ -4548,9 +4548,9 @@ fn write_final_report(slot: &mut ReservedOutputFile, report: &SupervisorFinalRep
 }
 
 fn read_supervisor_final_report(path: &Path) -> Result<SupervisorFinalReport> {
-    let contents = fs::read_to_string(path)
+    let contents = read_bounded_regular_file_nofollow(path, MAX_SUPERVISOR_REPORT_BYTES)
         .with_context(|| format!("failed to read supervisor final report {}", path.display()))?;
-    serde_json::from_str(&contents)
+    serde_json::from_slice(&contents)
         .with_context(|| format!("failed to parse supervisor final report {}", path.display()))
 }
 
