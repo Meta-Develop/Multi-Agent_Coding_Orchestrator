@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
     fmt,
@@ -22,8 +22,24 @@ const PIPE_CHANNEL_CAPACITY: usize = 8;
 const MAX_PIPE_EVENTS_PER_POLL: usize = PIPE_CHANNEL_CAPACITY * 2;
 const DEFAULT_MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_TEE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REQUIRED_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROCESS_ARGUMENTS: usize = 2048;
+const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_PROCESS_ARGUMENT_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PROCESS_ENVIRONMENT_ENTRIES: usize = 256;
+const MAX_PROCESS_ENVIRONMENT_KEY_BYTES: usize = 256;
+const MAX_PROCESS_ENVIRONMENT_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_PROCESS_ENVIRONMENT_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROCESS_LABEL_BYTES: usize = 4096;
+const MAX_SHELL_COMMAND_BYTES: usize = 1024 * 1024;
+const MAX_SANDBOX_PATHS_PER_CLASS: usize = 128;
+const MAX_SANDBOX_TOTAL_PATHS: usize = 512;
+const MAX_SANDBOX_PATH_BYTES: usize = 4096;
+const MAX_SANDBOX_MOUNT_CHECKS: usize = 768;
 #[cfg(target_os = "linux")]
 const MAX_PRIVATE_RUNTIME_FILE_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_PRIVATE_RUNTIME_FILES: usize = 32;
 #[cfg(target_os = "linux")]
 const MAX_SANDBOX_ENTRY_SCAN: usize = 200_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -438,9 +454,16 @@ struct WorkspaceSandboxConfig {
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: Vec<PathBuf>,
     visible_read_only_files: Vec<PathBuf>,
+    visible_read_only_bindings: Vec<ReadOnlyBind>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     resource_limits: ProcessResourceLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReadOnlyBind {
+    source: PathBuf,
+    destination: PathBuf,
 }
 
 impl WorkspaceSandboxConfig {
@@ -450,6 +473,7 @@ impl WorkspaceSandboxConfig {
             workspace_access,
             visible_read_only_roots: Vec::new(),
             visible_read_only_files: Vec::new(),
+            visible_read_only_bindings: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             resource_limits: ProcessResourceLimits::default(),
@@ -468,6 +492,18 @@ impl WorkspaceSandboxConfig {
 
     fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.visible_read_only_files.push(file.into());
+        self
+    }
+
+    fn with_visible_read_only_bind(
+        mut self,
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+    ) -> Self {
+        self.visible_read_only_bindings.push(ReadOnlyBind {
+            source: source.into(),
+            destination: destination.into(),
+        });
         self
     }
 
@@ -523,9 +559,72 @@ impl StrictOfflineWorkspaceProfile {
 }
 
 /// Linux profile for a fixed trusted command that needs parent-process network access.
+///
+/// This is an opaque capability: external callers can name it but cannot construct one.
+///
+/// ```compile_fail
+/// use multi_agent_coding_orchestrator::process_runner::TrustedFixedNetworkProfile;
+/// let _profile = TrustedFixedNetworkProfile::read_write(".");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedFixedNetworkProfile {
     config: WorkspaceSandboxConfig,
+}
+
+impl TrustedFixedNetworkProfile {
+    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+        }
+    }
+
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_bind(
+        mut self,
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+    ) -> Self {
+        self.config = self.config.with_visible_read_only_bind(source, destination);
+        self
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+
+    pub(crate) fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.config = self.config.with_resource_limits(limits);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_only_roots(&self) -> &[PathBuf] {
+        &self.config.visible_read_only_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_only_files(&self) -> &[PathBuf] {
+        &self.config.visible_read_only_files
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hidden_roots(&self) -> &[PathBuf] {
+        &self.config.hidden_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_only_bindings(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.config
+            .visible_read_only_bindings
+            .iter()
+            .map(|binding| (binding.source.clone(), binding.destination.clone()))
+            .collect()
+    }
 }
 
 /// Outer Linux profile for Codex. The parent CLI may reach its provider, while model-generated
@@ -1003,6 +1102,12 @@ pub enum ProcessRunError {
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
     let command_display = spec.command.display();
+    validate_process_spec_bounds(&spec).map_err(|source| ProcessRunError::Spawn {
+        label: spec.label.clone(),
+        command: command_display.clone(),
+        current_dir: spec.current_dir.clone(),
+        source,
+    })?;
     if let StdinMode::Bytes(bytes) = &spec.stdin {
         if bytes.len() > spec.max_stdin_bytes {
             return Err(ProcessRunError::StdinTooLarge {
@@ -1318,6 +1423,249 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         process_error,
         stdin_error,
     })
+}
+
+fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
+    if spec.label.is_empty()
+        || spec.label.len() > MAX_PROCESS_LABEL_BYTES
+        || contains_ascii_control(spec.label.as_bytes())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process label is empty or exceeds its safety bound",
+        ));
+    }
+    let mut argument_count = 0usize;
+    let mut argument_bytes = 0usize;
+    match &spec.command {
+        ProcessCommand::Shell { command, .. } => {
+            if command.len() > MAX_SHELL_COMMAND_BYTES || command.as_bytes().contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "shell command exceeds its safety bound",
+                ));
+            }
+        }
+        ProcessCommand::Direct { program, args } => {
+            validate_bounded_os_str(
+                program.as_os_str(),
+                MAX_SANDBOX_PATH_BYTES,
+                "direct executable path",
+            )?;
+            argument_count = args.len();
+            for argument in args {
+                let bytes = validate_bounded_os_str(
+                    argument.as_os_str(),
+                    MAX_PROCESS_ARGUMENT_BYTES,
+                    "direct command argument",
+                )?;
+                argument_bytes = argument_bytes.checked_add(bytes).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "direct command argument size overflow",
+                    )
+                })?;
+            }
+        }
+    }
+    if argument_count > MAX_PROCESS_ARGUMENTS || argument_bytes > MAX_PROCESS_ARGUMENT_TOTAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "direct command argument vector exceeds its safety bound",
+        ));
+    }
+    validate_environment_bounds(&spec.environment)?;
+    for capture in [&spec.stdout, &spec.stderr] {
+        if capture.max_bytes > MAX_REQUIRED_STREAM_BYTES
+            || capture.max_tee_bytes > MAX_REQUIRED_STREAM_BYTES
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "process stream capture exceeds its safety bound",
+            ));
+        }
+        if let Some(path) = capture.tee_path.as_ref() {
+            validate_bounded_path(path, "process tee path")?;
+        }
+    }
+    if spec.max_stdin_bytes > MAX_REQUIRED_STREAM_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process stdin limit exceeds its safety bound",
+        ));
+    }
+    validate_bounded_path(&spec.current_dir, "process working directory")?;
+    if let Some(config) = spec.side_effects.workspace_config() {
+        validate_workspace_config_bounds(config)?;
+    }
+    Ok(())
+}
+
+fn validate_environment_bounds(mode: &EnvironmentMode) -> std::io::Result<()> {
+    let environment = match mode {
+        EnvironmentMode::Inherit => return Ok(()),
+        EnvironmentMode::InheritAndSet(environment) | EnvironmentMode::ClearAndSet(environment) => {
+            environment
+        }
+    };
+    if environment.len() > MAX_PROCESS_ENVIRONMENT_ENTRIES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process environment exceeds its entry limit",
+        ));
+    }
+    let mut total = 0usize;
+    for (key, value) in environment {
+        if key.is_empty()
+            || key.len() > MAX_PROCESS_ENVIRONMENT_KEY_BYTES
+            || value.len() > MAX_PROCESS_ENVIRONMENT_VALUE_BYTES
+            || contains_ascii_control(key.as_bytes())
+            || contains_ascii_control(value.as_bytes())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "process environment entry is empty, malformed, or oversized",
+            ));
+        }
+        total = total
+            .checked_add(key.len())
+            .and_then(|total| total.checked_add(value.len()))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "process environment size overflow",
+                )
+            })?;
+    }
+    if total > MAX_PROCESS_ENVIRONMENT_TOTAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process environment exceeds its aggregate size limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io::Result<()> {
+    for (label, paths) in [
+        ("visible read-only roots", &config.visible_read_only_roots),
+        ("visible read-only files", &config.visible_read_only_files),
+        ("writable artifact roots", &config.writable_artifact_roots),
+        ("hidden roots", &config.hidden_roots),
+    ] {
+        if paths.len() > MAX_SANDBOX_PATHS_PER_CLASS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("sandbox {label} exceeds its vector limit"),
+            ));
+        }
+        for path in paths {
+            validate_bounded_path(path, label)?;
+        }
+    }
+    if config.visible_read_only_bindings.len() > MAX_SANDBOX_PATHS_PER_CLASS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sandbox visible read-only bindings exceed their vector limit",
+        ));
+    }
+    for binding in &config.visible_read_only_bindings {
+        validate_bounded_path(&binding.source, "visible read-only bind source")?;
+        validate_bounded_path(&binding.destination, "visible read-only bind destination")?;
+    }
+    let total = 1usize
+        .checked_add(config.visible_read_only_roots.len())
+        .and_then(|total| total.checked_add(config.visible_read_only_files.len()))
+        .and_then(|total| {
+            total.checked_add(config.visible_read_only_bindings.len().saturating_mul(2))
+        })
+        .and_then(|total| total.checked_add(config.writable_artifact_roots.len()))
+        .and_then(|total| total.checked_add(config.hidden_roots.len()))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sandbox path vector size overflow",
+            )
+        })?;
+    if total > MAX_SANDBOX_TOTAL_PATHS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sandbox path vectors exceed their aggregate limit",
+        ));
+    }
+    validate_bounded_path(&config.workspace_root, "workspace root")?;
+    validate_resource_limits(config.resource_limits)
+}
+
+fn validate_bounded_path(path: &Path, label: &str) -> std::io::Result<()> {
+    validate_bounded_os_str(path.as_os_str(), MAX_SANDBOX_PATH_BYTES, label).map(|_| ())
+}
+
+fn contains_ascii_control(bytes: &[u8]) -> bool {
+    bytes.iter().any(|byte| byte.is_ascii_control())
+}
+
+#[cfg(unix)]
+fn validate_bounded_os_str(value: &OsStr, max_bytes: usize, label: &str) -> std::io::Result<usize> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > max_bytes || contains_ascii_control(bytes) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{label} is empty, malformed, or exceeds its encoded-length bound"),
+        ));
+    }
+    Ok(bytes.len())
+}
+
+#[cfg(windows)]
+fn validate_bounded_os_str(value: &OsStr, max_bytes: usize, label: &str) -> std::io::Result<usize> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut encoded_units = 0usize;
+    for unit in value.encode_wide() {
+        if unit == 0 || unit <= 0x1f || unit == 0x7f {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{label} contains a control code unit"),
+            ));
+        }
+        encoded_units = encoded_units.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{label} encoded-length overflow"),
+            )
+        })?;
+    }
+    let encoded_bytes = encoded_units.checked_mul(2).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{label} encoded-length overflow"),
+        )
+    })?;
+    if encoded_bytes == 0 || encoded_bytes > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{label} is empty or exceeds its encoded-length bound"),
+        ));
+    }
+    Ok(encoded_bytes)
+}
+
+fn validate_resource_limits(limits: ProcessResourceLimits) -> std::io::Result<()> {
+    if !(16 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(&limits.memory_max_bytes)
+        || !(1..=4096).contains(&limits.tasks_max)
+        || !(1..=1600).contains(&limits.cpu_quota_percent)
+        || !(16..=65_536).contains(&limits.open_files_max)
+        || !(1..=16 * 1024 * 1024 * 1024).contains(&limits.file_size_max_bytes)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process resource limits are zero or exceed their safety bounds",
+        ));
+    }
+    Ok(())
 }
 
 fn preflight_direct_program(command: &ProcessCommand) -> std::io::Result<()> {
@@ -3120,6 +3468,7 @@ struct ResolvedSystemdSandbox {
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: Vec<PathBuf>,
     visible_read_only_files: Vec<PathBuf>,
+    visible_read_only_bindings: Vec<ReadOnlyBind>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     resource_limits: ProcessResourceLimits,
@@ -3377,6 +3726,46 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .collect::<std::io::Result<Vec<_>>>()?;
     visible_read_only_files.sort();
     visible_read_only_files.dedup();
+    let mut visible_read_only_bindings = config
+        .visible_read_only_bindings
+        .iter()
+        .map(|binding| {
+            Ok(ReadOnlyBind {
+                source: canonical_sandbox_directory(
+                    &binding.source,
+                    "visible read-only bind source",
+                )?,
+                destination: canonical_sandbox_directory(
+                    &binding.destination,
+                    "visible read-only bind destination",
+                )?,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    visible_read_only_bindings.sort();
+    visible_read_only_bindings.dedup();
+    for binding in &visible_read_only_bindings {
+        if binding.source == binding.destination
+            || binding.destination == workspace_root
+            || !binding.destination.starts_with(&workspace_root)
+            || binding.source.starts_with(&binding.destination)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "visible read-only bind requires distinct source and private workspace destination",
+            ));
+        }
+        let mut entries = fs::read_dir(&binding.destination)?;
+        if entries.next().transpose()?.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "visible read-only bind destination must be empty: {}",
+                    binding.destination.display()
+                ),
+            ));
+        }
+    }
     let mut writable_artifact_roots = config
         .writable_artifact_roots
         .iter()
@@ -3401,16 +3790,42 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .collect::<std::io::Result<Vec<_>>>()?;
     hidden_roots.sort();
     hidden_roots.dedup();
+    let mut minimal_hidden_roots: Vec<PathBuf> = Vec::new();
+    for root in hidden_roots {
+        if minimal_hidden_roots
+            .iter()
+            .any(|ancestor| root.starts_with(ancestor))
+        {
+            continue;
+        }
+        minimal_hidden_roots.push(root);
+    }
+    let hidden_roots = minimal_hidden_roots;
     if hidden_roots.iter().any(|root| root == Path::new("/")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "strict workspace confinement refuses '/' as a hidden root",
         ));
     }
+    if visible_read_only_bindings.iter().any(|binding| {
+        hidden_roots
+            .iter()
+            .any(|hidden| binding.destination.starts_with(hidden))
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "visible read-only bind destination is nested below a hidden root",
+        ));
+    }
 
     let mut identity_paths = vec![workspace_root.clone(), current_dir.clone()];
     identity_paths.extend(visible_read_only_roots.iter().cloned());
     identity_paths.extend(visible_read_only_files.iter().cloned());
+    identity_paths.extend(
+        visible_read_only_bindings
+            .iter()
+            .flat_map(|binding| [binding.source.clone(), binding.destination.clone()]),
+    );
     identity_paths.extend(writable_artifact_roots.iter().cloned());
     identity_paths.extend(hidden_roots.iter().cloned());
     identity_paths.sort();
@@ -3424,9 +3839,16 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         config.workspace_access,
         &visible_read_only_roots,
         &visible_read_only_files,
+        &visible_read_only_bindings,
         &writable_artifact_roots,
         &hidden_roots,
     )?;
+    if mount_checks.len() > MAX_SANDBOX_MOUNT_CHECKS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sandbox mount-check vector exceeds its safety bound",
+        ));
+    }
 
     let sandbox = ResolvedSystemdSandbox {
         kind: spec.side_effects.kind(),
@@ -3435,6 +3857,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         workspace_access: config.workspace_access,
         visible_read_only_roots,
         visible_read_only_files,
+        visible_read_only_bindings,
         writable_artifact_roots,
         hidden_roots,
         resource_limits: config.resource_limits,
@@ -3572,6 +3995,7 @@ fn build_sandbox_mount_checks(
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: &[PathBuf],
     visible_read_only_files: &[PathBuf],
+    visible_read_only_bindings: &[ReadOnlyBind],
     writable_artifact_roots: &[PathBuf],
     hidden_roots: &[PathBuf],
 ) -> std::io::Result<Vec<SandboxMountCheck>> {
@@ -3636,6 +4060,36 @@ fn build_sandbox_mount_checks(
             })
         })
         .collect::<std::io::Result<Vec<_>>>()?;
+    let mut bind_destinations = BTreeSet::new();
+    for binding in visible_read_only_bindings {
+        if !bind_destinations.insert(binding.destination.clone())
+            || checks.iter().any(|check| check.path == binding.destination)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "sandbox bind destination was requested more than once: {}",
+                    binding.destination.display()
+                ),
+            ));
+        }
+        let metadata = fs::symlink_metadata(&binding.source)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "sandbox bind source is not a real directory: {}",
+                    binding.source.display()
+                ),
+            ));
+        }
+        checks.push(SandboxMountCheck {
+            path: binding.destination.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            access: SandboxMountAccess::ReadOnly,
+        });
+    }
     let mut inaccessible = hidden_roots.to_vec();
     inaccessible.extend(known_sensitive_socket_paths());
     inaccessible.sort();
@@ -3687,6 +4141,7 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         ]);
     } else {
         command.args([
+            "--property=PrivateNetwork=no",
             "--property=RestrictAddressFamilies=AF_INET AF_INET6",
             "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
@@ -3719,6 +4174,19 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         command
             .arg(systemd_path_property("BindReadOnlyPaths=", file, false))
             .arg(systemd_path_property("ReadOnlyPaths=", file, false));
+    }
+    for binding in &sandbox.visible_read_only_bindings {
+        command
+            .arg(systemd_bind_property(
+                "BindReadOnlyPaths=",
+                &binding.source,
+                &binding.destination,
+            ))
+            .arg(systemd_path_property(
+                "ReadOnlyPaths=",
+                &binding.destination,
+                false,
+            ));
     }
 
     match sandbox.workspace_access {
@@ -3806,28 +4274,7 @@ fn verify_systemd_sandbox_properties(
         "yes",
     )?;
 
-    let address_families = property_value(properties, "RestrictAddressFamilies")?;
-    let has_family = |family: &str| {
-        address_families
-            .split_whitespace()
-            .any(|item| item == family)
-    };
-    if (sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace
-        && (!has_family("AF_UNIX") || has_family("AF_INET") || has_family("AF_INET6")))
-        || (sandbox.kind != SideEffectConfinementProfileKind::StrictOfflineWorkspace
-            && (has_family("AF_UNIX") || !has_family("AF_INET") || !has_family("AF_INET6")))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "effective RestrictAddressFamilies does not match {:?}: {address_families:?}",
-                sandbox.kind
-            ),
-        ));
-    }
-    if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
-        require_effective_property(properties, "PrivateNetwork", |value| value == "yes", "yes")?;
-    }
+    verify_systemd_network_properties(sandbox.kind, properties)?;
 
     let limits = sandbox.resource_limits;
     for (name, expected) in [
@@ -3838,12 +4285,35 @@ fn verify_systemd_sandbox_properties(
     ] {
         require_effective_property(properties, name, |value| value == expected, &expected)?;
     }
-    require_effective_property(
-        properties,
-        "CPUQuotaPerSecUSec",
-        |value| !value.is_empty() && value != "infinity",
-        "a finite quota",
-    )?;
+    if sandbox.kind == SideEffectConfinementProfileKind::TrustedFixedNetwork {
+        let expected_quota_micros = u64::from(limits.cpu_quota_percent) * 10_000;
+        require_effective_property(
+            properties,
+            "CPUQuotaPerSecUSec",
+            |value| parse_systemd_duration_micros(value) == Some(expected_quota_micros),
+            &format!("exactly {expected_quota_micros} microseconds per second"),
+        )?;
+    } else {
+        require_effective_property(
+            properties,
+            "CPUQuotaPerSecUSec",
+            |value| !value.is_empty() && value != "infinity",
+            "a finite quota",
+        )?;
+    }
+    for binding in &sandbox.visible_read_only_bindings {
+        require_property_binding(
+            "BindReadOnlyPaths",
+            property_value(properties, "BindReadOnlyPaths")?,
+            &binding.source,
+            &binding.destination,
+        )?;
+        require_property_path(
+            "ReadOnlyPaths",
+            property_value(properties, "ReadOnlyPaths")?,
+            &binding.destination,
+        )?;
+    }
 
     let inaccessible = property_value(properties, "InaccessiblePaths")?;
     for root in &sandbox.hidden_roots {
@@ -3924,6 +4394,111 @@ fn verify_systemd_sandbox_properties(
             property_value(properties, "ReadWritePaths")?,
             root,
         )?;
+    }
+    if sandbox.kind == SideEffectConfinementProfileKind::TrustedFixedNetwork {
+        let mut inaccessible = sandbox
+            .hidden_roots
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        inaccessible.extend(known_sensitive_socket_paths());
+        verify_exact_property_paths(
+            "InaccessiblePaths",
+            property_value(properties, "InaccessiblePaths")?,
+            &inaccessible,
+        )?;
+
+        let mut read_only = sandbox
+            .visible_read_only_roots
+            .iter()
+            .chain(&sandbox.visible_read_only_files)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        read_only.extend(
+            sandbox
+                .visible_read_only_bindings
+                .iter()
+                .map(|binding| binding.destination.clone()),
+        );
+        let mut read_only_bindings = sandbox
+            .visible_read_only_roots
+            .iter()
+            .chain(&sandbox.visible_read_only_files)
+            .map(|path| (path.clone(), path.clone()))
+            .collect::<BTreeSet<_>>();
+        read_only_bindings.extend(
+            sandbox
+                .visible_read_only_bindings
+                .iter()
+                .map(|binding| (binding.source.clone(), binding.destination.clone())),
+        );
+        let mut read_write = sandbox
+            .writable_artifact_roots
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        match sandbox.workspace_access {
+            WorkspaceAccess::ReadOnly => {
+                read_only.insert(sandbox.workspace_root.clone());
+                read_only_bindings.insert((
+                    sandbox.workspace_root.clone(),
+                    sandbox.workspace_root.clone(),
+                ));
+            }
+            WorkspaceAccess::ReadWrite => {
+                read_write.insert(sandbox.workspace_root.clone());
+            }
+        }
+        read_write.insert(runtime_dir.to_path_buf());
+        verify_exact_property_bindings(
+            "BindReadOnlyPaths",
+            property_value(properties, "BindReadOnlyPaths")?,
+            &read_only_bindings,
+        )?;
+        verify_exact_property_paths(
+            "ReadOnlyPaths",
+            property_value(properties, "ReadOnlyPaths")?,
+            &read_only,
+        )?;
+        verify_exact_property_paths(
+            "BindPaths",
+            property_value(properties, "BindPaths")?,
+            &read_write,
+        )?;
+        verify_exact_property_paths(
+            "ReadWritePaths",
+            property_value(properties, "ReadWritePaths")?,
+            &read_write,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_systemd_network_properties(
+    kind: SideEffectConfinementProfileKind,
+    properties: &BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let address_families = property_value(properties, "RestrictAddressFamilies")?;
+    let actual_families = address_families.split_whitespace().collect::<BTreeSet<_>>();
+    let expected_families = if kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+        BTreeSet::from(["AF_UNIX"])
+    } else {
+        BTreeSet::from(["AF_INET", "AF_INET6"])
+    };
+    if actual_families != expected_families {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective RestrictAddressFamilies does not match {:?}: {address_families:?}",
+                kind
+            ),
+        ));
+    }
+    if kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+        require_effective_property(properties, "PrivateNetwork", |value| value == "yes", "yes")?;
+    } else {
+        require_effective_property(properties, "PrivateNetwork", |value| value == "no", "no")?;
     }
     Ok(())
 }
@@ -4073,6 +4648,24 @@ fn require_effective_property(
 }
 
 #[cfg(target_os = "linux")]
+fn parse_systemd_duration_micros(value: &str) -> Option<u64> {
+    for (suffix, multiplier) in [
+        ("us", 1u64),
+        ("ms", 1_000u64),
+        ("s", 1_000_000u64),
+        ("min", 60_000_000u64),
+    ] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return number
+                .parse::<u64>()
+                .ok()
+                .and_then(|number| number.checked_mul(multiplier));
+        }
+    }
+    value.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
 fn require_property_path(name: &str, value: &str, path: &Path) -> std::io::Result<()> {
     let path = path.to_str().ok_or_else(|| {
         std::io::Error::new(
@@ -4091,6 +4684,89 @@ fn require_property_path(name: &str, value: &str, path: &Path) -> std::io::Resul
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("effective {name} omitted required path {path}"),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_property_binding(
+    name: &str,
+    value: &str,
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    let expected = (source.to_path_buf(), destination.to_path_buf());
+    if parse_property_bindings(value).contains(&expected) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective {name} omitted required binding {}:{}",
+                source.display(),
+                destination.display()
+            ),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_property_bindings(value: &str) -> BTreeSet<(PathBuf, PathBuf)> {
+    value
+        .split_whitespace()
+        .filter_map(|entry| {
+            let entry = entry.strip_prefix('-').unwrap_or(entry);
+            let mut parts = entry.split(':');
+            let source = parts.next()?;
+            let destination = parts
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(source);
+            Some((PathBuf::from(source), PathBuf::from(destination)))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn verify_exact_property_bindings(
+    name: &str,
+    value: &str,
+    expected: &BTreeSet<(PathBuf, PathBuf)>,
+) -> std::io::Result<()> {
+    let actual = parse_property_bindings(value);
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective {name} binding set differed from the exact requested set: expected {expected:?}, observed {actual:?}"
+            ),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_exact_property_paths(
+    name: &str,
+    value: &str,
+    expected: &BTreeSet<PathBuf>,
+) -> std::io::Result<()> {
+    let actual = value
+        .split_whitespace()
+        .map(|entry| {
+            let entry = entry.strip_prefix('-').unwrap_or(entry);
+            PathBuf::from(entry.split(':').next().unwrap_or(entry))
+        })
+        .collect::<BTreeSet<_>>();
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective {name} path set differed from the exact requested set: expected {expected:?}, observed {actual:?}"
+            ),
         ))
     }
 }
@@ -4271,6 +4947,16 @@ fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
         property.push("-");
     }
     property.push(path.as_os_str());
+    property
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_bind_property(name: &str, source: &Path, destination: &Path) -> OsString {
+    let mut property = OsString::from("--property=");
+    property.push(name);
+    property.push(source.as_os_str());
+    property.push(":");
+    property.push(destination.as_os_str());
     property
 }
 
@@ -5601,6 +6287,12 @@ pub(crate) fn trusted_linux_runtime_root() -> std::io::Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn validate_private_runtime_files(files: &[PrivateRuntimeFile]) -> std::io::Result<()> {
+    if files.len() > MAX_PRIVATE_RUNTIME_FILES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private runtime file vector exceeds its safety bound",
+        ));
+    }
     let mut names = std::collections::BTreeSet::new();
     for file in files {
         let path = Path::new(&file.name);
@@ -6803,6 +7495,241 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_spec_bounds_reject_oversized_vectors_controls_and_streams() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut profile = StrictOfflineWorkspaceProfile::read_write(temp.path());
+        for _ in 0..=MAX_SANDBOX_PATHS_PER_CLASS {
+            profile = profile.with_hidden_root(temp.path());
+        }
+        let oversized_paths = ProcessSpec::direct(
+            "bounded paths",
+            PathBuf::from("/bin/true"),
+            Vec::<OsString>::new(),
+            temp.path(),
+            128,
+        )
+        .with_side_effect_confinement(
+            SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
+        );
+        assert!(validate_process_spec_bounds(&oversized_paths).is_err());
+
+        let controlled_argument = ProcessSpec::direct(
+            "bounded args",
+            PathBuf::from("/bin/true"),
+            vec![OsString::from("line\nfeed")],
+            temp.path(),
+            128,
+        );
+        assert!(validate_process_spec_bounds(&controlled_argument).is_err());
+
+        let oversized_capture = ProcessSpec::direct(
+            "bounded capture",
+            PathBuf::from("/bin/true"),
+            Vec::<OsString>::new(),
+            temp.path(),
+            MAX_REQUIRED_STREAM_BYTES + 1,
+        );
+        assert!(validate_process_spec_bounds(&oversized_capture).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_spec_bounds_measure_non_utf8_arguments_without_lossy_shortening() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let argument = OsString::from_vec(vec![0xff; MAX_PROCESS_ARGUMENT_BYTES + 1]);
+        let spec = ProcessSpec::direct(
+            "non UTF-8 bound",
+            PathBuf::from("/bin/true"),
+            vec![argument],
+            temp.path(),
+            128,
+        );
+        assert!(validate_process_spec_bounds(&spec).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_network_properties_require_exact_ip_families_without_private_network() {
+        let mut properties = BTreeMap::from([
+            (
+                "RestrictAddressFamilies".to_string(),
+                "AF_INET AF_INET6".to_string(),
+            ),
+            ("PrivateNetwork".to_string(), "no".to_string()),
+        ]);
+        verify_systemd_network_properties(
+            SideEffectConfinementProfileKind::TrustedFixedNetwork,
+            &properties,
+        )
+        .expect("exact trusted network properties");
+
+        properties.insert(
+            "RestrictAddressFamilies".to_string(),
+            "AF_UNIX AF_INET AF_INET6".to_string(),
+        );
+        assert!(verify_systemd_network_properties(
+            SideEffectConfinementProfileKind::TrustedFixedNetwork,
+            &properties,
+        )
+        .is_err());
+        properties.insert(
+            "RestrictAddressFamilies".to_string(),
+            "AF_INET AF_INET6".to_string(),
+        );
+        properties.insert("PrivateNetwork".to_string(), "yes".to_string());
+        assert!(verify_systemd_network_properties(
+            SideEffectConfinementProfileKind::TrustedFixedNetwork,
+            &properties,
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_network_resolves_hidden_source_to_independent_read_only_bind() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_parent = temp.path().join("source");
+        let source_objects = source_parent.join("objects");
+        let runtime = temp.path().join("runtime");
+        let object_view = runtime.join("source-objects");
+        fs::create_dir_all(&source_objects).expect("source objects");
+        fs::create_dir_all(&object_view).expect("object view");
+        let profile = TrustedFixedNetworkProfile::read_write(&runtime)
+            .with_visible_read_only_bind(&source_objects, &object_view)
+            .with_hidden_root(&source_parent);
+        let spec = ProcessSpec::direct(
+            "resolve network alias",
+            PathBuf::from("/bin/true"),
+            Vec::<OsString>::new(),
+            &runtime,
+            128,
+        )
+        .with_side_effect_confinement(SideEffectConfinementProfile::TrustedFixedNetwork(profile));
+
+        let sandbox = resolve_systemd_sandbox(&spec)
+            .expect("resolve sandbox")
+            .expect("network sandbox");
+        let canonical_source = fs::canonicalize(&source_objects).expect("canonical source");
+        let canonical_view = fs::canonicalize(&object_view).expect("canonical view");
+        assert_eq!(
+            sandbox.visible_read_only_bindings,
+            [ReadOnlyBind {
+                source: canonical_source.clone(),
+                destination: canonical_view.clone(),
+            }]
+        );
+        let check = sandbox
+            .mount_checks
+            .iter()
+            .find(|check| check.path == canonical_view)
+            .expect("bind mount check");
+        let source_metadata = fs::metadata(&canonical_source).expect("source metadata");
+        assert_eq!(check.device, source_metadata.dev());
+        assert_eq!(check.inode, source_metadata.ino());
+        assert_eq!(check.access, SandboxMountAccess::ReadOnly);
+
+        let property = format!(
+            "{}:{}",
+            canonical_source.display(),
+            canonical_view.display()
+        );
+        let expected = BTreeSet::from([(canonical_source, canonical_view)]);
+        verify_exact_property_bindings("BindReadOnlyPaths", &property, &expected)
+            .expect("exact independent bind");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
+    fn trusted_network_profile_masks_repo_state_but_rebinds_only_objects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary = temp.path().join("primary");
+        let objects = primary.join(".git/objects");
+        let state = primary.join(".git/maco/state");
+        let runtime = temp.path().join("runtime");
+        let object_view = runtime.join("source-objects");
+        fs::create_dir_all(&objects).expect("objects");
+        fs::create_dir_all(&state).expect("state");
+        fs::create_dir_all(&runtime).expect("runtime");
+        fs::create_dir_all(&object_view).expect("object view");
+        fs::write(objects.join("visible"), "object").expect("visible object");
+        fs::write(state.join("auth-key"), "secret").expect("state secret");
+        let script = format!(
+            "test -r '{}' && test ! -r '{}'",
+            object_view.join("visible").display(),
+            state.join("auth-key").display()
+        );
+        let profile = TrustedFixedNetworkProfile::read_write(&runtime)
+            .with_visible_read_only_bind(&objects, &object_view)
+            .with_hidden_root(&primary);
+        let output = run_process(
+            ProcessSpec::direct(
+                "trusted network mount denial",
+                PathBuf::from("/bin/sh"),
+                [OsString::from("-c"), OsString::from(script)],
+                &runtime,
+                1024,
+            )
+            .with_side_effect_confinement(
+                SideEffectConfinementProfile::TrustedFixedNetwork(profile),
+            ),
+        )
+        .expect("run trusted network mount test");
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert_eq!(
+            output.side_effects,
+            SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::TrustedFixedNetwork
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
+    fn trusted_network_profile_bounds_timeout_output_and_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = run_process(
+            ProcessSpec::direct(
+                "trusted network bounded output",
+                PathBuf::from("/bin/sh"),
+                [OsString::from("-c"), OsString::from("printf 123456789")],
+                temp.path(),
+                8,
+            )
+            .with_side_effect_confinement(
+                SideEffectConfinementProfile::TrustedFixedNetwork(
+                    TrustedFixedNetworkProfile::read_write(temp.path()),
+                ),
+            ),
+        )
+        .expect("run bounded output test");
+        assert!(output.stdout.is_truncated());
+        assert!(output.process_tree.is_verified_empty());
+
+        let timeout = run_process(
+            ProcessSpec::direct(
+                "trusted network bounded timeout",
+                PathBuf::from("/bin/sh"),
+                [OsString::from("-c"), OsString::from("sleep 30")],
+                temp.path(),
+                128,
+            )
+            .with_side_effect_confinement(SideEffectConfinementProfile::TrustedFixedNetwork(
+                TrustedFixedNetworkProfile::read_write(temp.path()),
+            ))
+            .with_timeout(Some(Duration::from_millis(50))),
+        )
+        .expect("run timeout test");
+        assert!(timeout.timed_out);
+        assert!(timeout.process_tree.is_verified_empty());
+    }
+
+    #[test]
     fn required_confinement_rejects_existing_tee_before_target_start() {
         let temp = tempfile::tempdir().expect("tempdir");
         let tee = temp.path().join("existing.log");
@@ -6844,6 +7771,7 @@ mod tests {
             workspace_access: WorkspaceAccess::ReadWrite,
             visible_read_only_roots: Vec::new(),
             visible_read_only_files: Vec::new(),
+            visible_read_only_bindings: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             resource_limits: ProcessResourceLimits::default(),

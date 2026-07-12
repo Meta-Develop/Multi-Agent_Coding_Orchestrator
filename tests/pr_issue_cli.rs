@@ -160,18 +160,9 @@ fn pr_publish_fake_commits_uncommitted_worktree_changes_without_pushing() -> Res
 }
 
 #[test]
-fn pr_publish_ignores_untrusted_git_path_shadow_during_internal_commit() -> Result<()> {
+fn pr_publish_fake_ignores_untrusted_git_path_shadow_during_internal_commit() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    let origin_path = init_bare_origin(temp.path())?;
-    run_git(&[
-        "-C",
-        path_str(&repo_path)?,
-        "remote",
-        "add",
-        "origin",
-        path_str(&origin_path)?,
-    ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
@@ -197,7 +188,7 @@ fn pr_publish_ignores_untrusted_git_path_shadow_during_internal_commit() -> Resu
             "--claim",
             "README.md",
             "--forge",
-            "git",
+            "fake",
             "--json",
         ],
         &[("PATH", path.as_os_str())],
@@ -205,8 +196,8 @@ fn pr_publish_ignores_untrusted_git_path_shadow_during_internal_commit() -> Resu
 
     assert!(wrapper.exists());
     assert_eq!(report["status"], "published");
-    assert_eq!(report["pushed"], true);
-    assert_eq!(report["created"], false);
+    assert_eq!(report["pushed"], false);
+    assert_eq!(report["created"], true);
     assert!(
         report["commit_id"]
             .as_str()
@@ -222,15 +213,11 @@ fn pr_publish_ignores_untrusted_git_path_shadow_during_internal_commit() -> Resu
         fs::read_to_string(&mutation_target).context("read late mutation")?,
         "# Smoke\n\nreviewed snapshot\n"
     );
-    let remote_ref = report["publication_receipt"]["remote_ref"]
-        .as_str()
-        .context("remote ref")?;
-    assert!(git_ref_exists(&origin_path, remote_ref)?);
     Ok(())
 }
 
 #[test]
-fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
+fn pr_publish_git_refuses_local_origin_without_calling_gh() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -250,8 +237,8 @@ fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
     let gh_log = write_failing_gh(&fake_bin)?;
     let path = path_with_prefix(&fake_bin)?;
 
-    let report = run_success_json_with_env(
-        &[
+    let output = Command::new(BIN)
+        .args([
             "pr",
             "publish",
             "agent-a",
@@ -262,31 +249,22 @@ fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
             "--forge",
             "git",
             "--json",
-        ],
-        &[("PATH", path.as_os_str())],
-    )?;
+        ])
+        .env("PATH", path)
+        .output()
+        .context("run Git publication with local origin")?;
 
-    assert_eq!(report["status"], "published");
-    assert_eq!(report["forge"], "git");
-    assert_eq!(report["pushed"], true);
-    assert_eq!(report["created"], false);
-    assert_eq!(report["pr_url"], Value::Null);
-    assert_eq!(
-        report["next_action"],
-        "open a pull request on your Git host manually"
-    );
-    assert!(report["commit_id"].as_str().context("commit id")?.len() >= 12);
-    assert_eq!(report["head_id"], report["commit_id"]);
-
-    let remote_ref = report["publication_receipt"]["remote_ref"]
-        .as_str()
-        .context("publication remote ref")?;
-    let remote_head = git_rev_parse(&origin_path, remote_ref)?;
-    assert_eq!(remote_head, report["head_id"].as_str().context("head id")?);
-    assert_eq!(
-        git_show_bare_file(&origin_path, &format!("{remote_head}:README.md"))?,
-        "# Smoke\n\ngit push\n"
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
+    let reviewed_head = Repository::open(worktree_path)
+        .context("reopen agent repo")?
+        .head()
+        .context("read reviewed HEAD")?
+        .target()
+        .context("reviewed HEAD target")?
+        .to_string();
+    let remote_ref = format!("refs/heads/maco/review/agent-a/{reviewed_head}");
+    assert!(!git_ref_exists(&origin_path, &remote_ref)?);
     assert_eq!(git_status_porcelain(worktree_path)?, "");
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
@@ -302,7 +280,7 @@ fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
 }
 
 #[test]
-fn pr_publish_git_ignores_worktree_config_url_redirect_during_push() -> Result<()> {
+fn pr_publish_git_refuses_local_origin_before_config_url_redirects_can_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -353,27 +331,35 @@ fn pr_publish_git_ignores_worktree_config_url_redirect_during_push() -> Result<(
     )
     .context("edit worktree")?;
 
-    let report = run_success_json(&[
-        "pr",
-        "publish",
-        "agent-a",
-        "--repo",
-        repo,
-        "--claim",
-        "README.md",
-        "--forge",
-        "git",
-        "--json",
-    ])?;
+    let output = Command::new(BIN)
+        .args([
+            "pr",
+            "publish",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--forge",
+            "git",
+            "--json",
+        ])
+        .output()
+        .context("run Git publication with local redirected origin")?;
 
-    assert_eq!(report["status"], "published");
-    assert_eq!(report["pushed"], true);
-    let remote_ref = report["publication_receipt"]["remote_ref"]
-        .as_str()
-        .context("publication ref")?;
-    assert!(git_ref_exists(&origin_path, remote_ref)?);
-    assert!(!git_ref_exists(&attack_path, remote_ref)?);
-    assert!(!git_ref_exists(&local_attack_path, remote_ref)?);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
+    let reviewed_head = Repository::open(worktree_path)
+        .context("reopen agent repo")?
+        .head()
+        .context("read reviewed HEAD")?
+        .target()
+        .context("reviewed HEAD target")?
+        .to_string();
+    let remote_ref = format!("refs/heads/maco/review/agent-a/{reviewed_head}");
+    assert!(!git_ref_exists(&origin_path, &remote_ref)?);
+    assert!(!git_ref_exists(&attack_path, &remote_ref)?);
+    assert!(!git_ref_exists(&local_attack_path, &remote_ref)?);
     Ok(())
 }
 
@@ -454,7 +440,7 @@ fn pr_publish_fake_does_not_execute_repository_filter_or_diff_driver() -> Result
 }
 
 #[test]
-fn pr_publish_git_forces_trusted_ssh_without_home_repo_or_env_commands() -> Result<()> {
+fn pr_publish_git_refuses_ssh_without_running_home_repo_or_env_commands() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     run_git(&[
@@ -524,66 +510,8 @@ fn pr_publish_git_forces_trusted_ssh_without_home_repo_or_env_commands() -> Resu
 
     assert!(!output.status.success());
     assert!(!invoked.exists());
-    let report: Value = serde_json::from_slice(&output.stdout).context("parse blocked report")?;
-    assert_eq!(report["status"], "blocked");
-    assert_eq!(report["pushed"], false);
-    Ok(())
-}
-
-#[test]
-fn pr_publish_refuses_symlink_publication_transaction_directory() -> Result<()> {
-    use std::os::unix::fs::symlink;
-
-    let temp = TempDir::new().context("tempdir")?;
-    let repo_path = create_committed_repo(temp.path())?;
-    let origin_path = init_bare_origin(temp.path())?;
-    run_git(&[
-        "-C",
-        path_str(&repo_path)?,
-        "remote",
-        "add",
-        "origin",
-        path_str(&origin_path)?,
-    ])?;
-    let repo = repo_path.to_str().context("repo path utf8")?;
-    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
-    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
-    fs::write(
-        worktree_path.join("README.md"),
-        "# Smoke\n\ntransaction symlink\n",
-    )
-    .context("edit worktree")?;
-    let args = [
-        "pr",
-        "publish",
-        "agent-a",
-        "--repo",
-        repo,
-        "--claim",
-        "README.md",
-        "--forge",
-        "git",
-        "--json",
-    ];
-    let first = run_success_json(&args)?;
-    assert_eq!(first["status"], "published");
-
-    let transactions = repo_path.join(".git/maco/state/publication-transactions");
-    let transaction_dirs = fs::read_dir(&transactions)?.collect::<std::io::Result<Vec<_>>>()?;
-    assert_eq!(transaction_dirs.len(), 1);
-    let transaction_dir = transaction_dirs[0].path();
-    fs::remove_dir_all(&transaction_dir).context("remove transaction directory")?;
-    let target = temp.path().join("transaction-target");
-    fs::create_dir(&target).context("create transaction symlink target")?;
-    symlink(&target, &transaction_dir).context("create transaction directory symlink")?;
-
-    let output = Command::new(BIN)
-        .args(args)
-        .output()
-        .context("rerun publication with transaction symlink")?;
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing symbolic links"));
-    assert_eq!(fs::read_dir(&target)?.count(), 0);
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("publication supports only canonical HTTPS remotes"));
     Ok(())
 }
 
@@ -681,7 +609,7 @@ fi
         .context("run rejected GitHub publication")?;
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("supported HTTPS, SSH, or SCP"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
     assert!(!gh_env_path.exists());
     assert!(!gh_state_path.exists());
     assert!(!git_trace_path.exists());
@@ -689,7 +617,7 @@ fi
 }
 
 #[test]
-fn pr_publish_github_untrusted_gh_cannot_move_remote_ref() -> Result<()> {
+fn pr_publish_github_refuses_local_origin_before_untrusted_gh_can_move_remote_ref() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -787,7 +715,7 @@ fi
         .context("run publication with attacking gh shadow")?;
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("supported HTTPS, SSH, or SCP"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
     assert!(!state.exists());
     assert!(!git_ref_exists(
         &origin_path,
@@ -801,7 +729,7 @@ fi
 }
 
 #[test]
-fn pr_publish_github_does_not_invoke_untrusted_lost_response_shim() -> Result<()> {
+fn pr_publish_github_refuses_local_origin_before_untrusted_lost_response_shim() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -894,7 +822,7 @@ fi
         .output()
         .context("run publication with lost-response shim")?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("supported HTTPS, SSH, or SCP"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
     assert!(!pr_state.exists());
     assert!(!list_count.exists());
     assert!(!create_count.exists());
@@ -902,7 +830,7 @@ fi
 }
 
 #[test]
-fn pr_publish_ignores_untrusted_git_path_shadow_for_push() -> Result<()> {
+fn pr_publish_git_refuses_local_origin_before_untrusted_path_shadow_can_push() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -937,8 +865,8 @@ fn pr_publish_ignores_untrusted_git_path_shadow_for_push() -> Result<()> {
     let path = path_with_prefix(&fake_bin)?;
     let push_ready = temp.path().join("push-ready");
     let push_release = temp.path().join("push-release");
-    let report = run_success_json_with_env(
-        &[
+    let output = Command::new(BIN)
+        .args([
             "pr",
             "publish",
             "agent-a",
@@ -949,29 +877,29 @@ fn pr_publish_ignores_untrusted_git_path_shadow_for_push() -> Result<()> {
             "--forge",
             "git",
             "--json",
-        ],
-        &[
-            ("PATH", path.as_os_str()),
-            ("MACO_PUSH_READY", push_ready.as_os_str()),
-            ("MACO_PUSH_RELEASE", push_release.as_os_str()),
-            ("GIT_CONFIG_GLOBAL", malicious_config.as_os_str()),
-            ("TMPDIR", repo_path.as_os_str()),
-        ],
-    )?;
+        ])
+        .env("PATH", path)
+        .env("MACO_PUSH_READY", &push_ready)
+        .env("MACO_PUSH_RELEASE", &push_release)
+        .env("GIT_CONFIG_GLOBAL", &malicious_config)
+        .env("TMPDIR", &repo_path)
+        .output()
+        .context("run Git publication with local origin and untrusted path shadow")?;
 
-    assert_eq!(report["status"], "published");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
     assert!(!push_ready.exists());
     assert!(!push_release.exists());
-    let reviewed_head = report["head_id"].as_str().context("head id")?;
-    let remote_ref = report["publication_receipt"]["remote_ref"]
-        .as_str()
-        .context("publication remote ref")?;
-    assert_eq!(git_rev_parse(&origin_path, remote_ref)?, reviewed_head);
-    assert!(!git_ref_exists(&attack_path, remote_ref)?);
-    assert_eq!(
-        git_show_bare_file(&origin_path, &format!("{reviewed_head}:README.md"))?,
-        "# Smoke\n\npublish lock\n"
-    );
+    let reviewed_head = Repository::open(worktree_path)
+        .context("reopen agent repo")?
+        .head()
+        .context("read reviewed HEAD")?
+        .target()
+        .context("reviewed HEAD target")?
+        .to_string();
+    let remote_ref = format!("refs/heads/maco/review/agent-a/{reviewed_head}");
+    assert!(!git_ref_exists(&origin_path, &remote_ref)?);
+    assert!(!git_ref_exists(&attack_path, &remote_ref)?);
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         "# Smoke\n"
@@ -1826,22 +1754,6 @@ fn git_ref_exists(bare_repo: &Path, ref_name: &str) -> Result<bool> {
         .output()
         .context("git show-ref")?;
     Ok(output.status.success())
-}
-
-fn git_show_bare_file(bare_repo: &Path, revision: &str) -> Result<String> {
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(bare_repo)
-        .args(["show", revision])
-        .output()
-        .context("git show bare file")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git show bare file failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8(output.stdout).context("bare file utf8")
 }
 
 fn path_str(path: &Path) -> Result<&str> {

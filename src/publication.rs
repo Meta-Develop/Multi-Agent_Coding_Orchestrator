@@ -6,7 +6,7 @@ use crate::{
         MergeForceOptions, MergePreviewOptions, OutputSummary, RepoCommonLock, SafetyCheckStatus,
         ValidationEvidenceBundle, ValidationReport,
     },
-    process_runner::StdinMode,
+    process_runner::{StdinMode, TrustedFixedNetworkProfile},
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
@@ -31,18 +31,33 @@ const GH_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
 const PUBLICATION_JOURNAL_MAX_DIRECTORY_ENTRIES: usize = 96;
 const PUBLICATION_JOURNAL_MAX_RECORDS: usize = 64;
 const PUBLICATION_JOURNAL_MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
-const SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES: [&str; 2] =
-    ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
+const MAX_NETWORK_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_PUBLICATION_REMOTE_URL_BYTES: usize = 8 * 1024;
+const MAX_PUBLICATION_HOST_BYTES: usize = 253;
+const MAX_PUBLICATION_PATH_BYTES: usize = 2 * 1024;
+const MAX_PUBLICATION_PATH_COMPONENTS: usize = 32;
+const MAX_GITHUB_SLUG_BYTES: usize = 100;
+const MAX_PUBLICATION_REF_BYTES: usize = 1024;
+const MAX_PUBLICATION_REF_COMPONENTS: usize = 64;
+const MAX_GITHUB_RECEIPT_URL_BYTES: usize = 8 * 1024;
+const MAX_GITHUB_RECEIPT_STRING_BYTES: usize = 1024;
+const MAX_GITHUB_PR_LIST_RECEIPTS: usize = 32;
+const MAX_PUBLICATION_SOURCE_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_PUBLICATION_OBJECT_ENTRIES: usize = 262_144;
+const MAX_PUBLICATION_OBJECT_DEPTH: usize = 8;
 
 #[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
     static FAKE_PR_URL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PublicationRemoteTransport {
-    NonSsh,
-    Ssh,
+    Https {
+        host: String,
+        path: String,
+        command_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -201,19 +216,130 @@ struct PublicationTransaction {
     directory: PathBuf,
     journal: PublicationTransactionJournal,
     remote_url: String,
-    remote_private_values: Vec<String>,
 }
 
 struct PublicationGitContext {
     directory: PathBuf,
-    _runtime_directory: merge::PrivateRuntimeDirectory,
+    runtime_directory: merge::PrivateRuntimeDirectory,
     environment: BTreeMap<String, String>,
-    trusted_global_known_hosts: Option<PathBuf>,
+    boundary: PublicationGitBoundary,
+    config_files: Vec<PrivateConfigFileIdentity>,
+    token: Option<PrivateNetworkToken>,
 }
 
 struct GhCommandContext {
     runtime_directory: merge::PrivateRuntimeDirectory,
     environment: BTreeMap<String, String>,
+    profile: TrustedFixedNetworkProfile,
+    config_files: Vec<PrivateConfigFileIdentity>,
+    repository: GithubRepositoryIdentity,
+    token: PrivateNetworkToken,
+}
+
+type PublicationGitContextSetup = (
+    BTreeMap<String, String>,
+    PublicationGitBoundary,
+    Vec<PrivateConfigFileIdentity>,
+    Option<PrivateNetworkToken>,
+);
+
+type GhCommandContextSetup = (
+    BTreeMap<String, String>,
+    TrustedFixedNetworkProfile,
+    Vec<PrivateConfigFileIdentity>,
+    PrivateNetworkToken,
+);
+
+#[derive(Clone)]
+enum PublicationGitBoundary {
+    Https(TrustedFixedNetworkProfile),
+}
+
+struct PrivateNetworkToken {
+    bytes: Vec<u8>,
+    basic: Vec<u8>,
+}
+
+struct ZeroizingString(String);
+
+impl ZeroizingString {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    fn zeroize(&mut self) {
+        // SAFETY: replacing every UTF-8 byte with NUL preserves UTF-8 validity; the string is
+        // cleared immediately after the overwrite and is not observed during mutation.
+        zeroize_bytes(unsafe { self.0.as_bytes_mut() });
+        self.0.clear();
+    }
+}
+
+impl std::fmt::Debug for ZeroizingString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted:zeroizing-string>")
+    }
+}
+
+impl Drop for ZeroizingString {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl std::fmt::Debug for PrivateNetworkToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted:network-token>")
+    }
+}
+
+impl Drop for PrivateNetworkToken {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.bytes);
+        self.bytes.clear();
+        zeroize_bytes(&mut self.basic);
+        self.basic.clear();
+    }
+}
+
+struct PrivateConfigFileIdentity {
+    path: PathBuf,
+    private_owner_only: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for PrivateConfigFileIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivateConfigFileIdentity")
+            .field("path", &self.path)
+            .field("private_owner_only", &self.private_owner_only)
+            .field(
+                "bytes",
+                &format_args!("<redacted:{} bytes>", self.bytes.len()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PrivateConfigFileIdentity {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.bytes);
+        self.bytes.clear();
+    }
+}
+
+fn zeroize_bytes(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 #[derive(Debug, Serialize)]
@@ -1084,17 +1210,12 @@ fn publication_transaction_failure(
     transaction: &mut PublicationTransaction,
     error: anyhow::Error,
 ) -> PrPublicationReport {
-    let mut redactor = Redactor::new();
-    for value in &transaction.remote_private_values {
-        redactor = redactor.with_private_value("remote-credential", value.clone());
-    }
-    let mut message = redactor.redact(&format!("{error:#}")).text;
+    let mut message = format!("{error:#}");
     transaction.journal.last_error = Some(message.clone());
     if let Err(journal_error) = transaction.persist() {
         message.push_str(&format!(
             "; additionally failed to persist the latest transaction error: {journal_error:#}"
         ));
-        message = redactor.redact(&message).text;
         transaction.journal.last_error = Some(message.clone());
     }
     report.status = PrPublicationStatus::Blocked;
@@ -1389,109 +1510,9 @@ fn redact_remote_url(url: &str) -> String {
     redacted
 }
 
-fn remote_private_values(url: &str) -> Vec<String> {
-    let mut values = vec![url.to_string()];
-    if let Some(scheme_end) = url.find("://") {
-        let authority_start = scheme_end + 3;
-        let authority_end = url[authority_start..]
-            .find(['/', '?', '#'])
-            .map(|offset| authority_start + offset)
-            .unwrap_or(url.len());
-        let authority = &url[authority_start..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            let userinfo = &authority[..at];
-            if !userinfo.is_empty() {
-                values.push(userinfo.to_string());
-                if let Some((user, password)) = userinfo.split_once(':') {
-                    if !user.is_empty() {
-                        values.push(user.to_string());
-                    }
-                    if !password.is_empty() {
-                        values.push(password.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if let Some(query) = url.split_once('?').map(|(_, suffix)| suffix) {
-        let query = query.split('#').next().unwrap_or(query);
-        if !query.is_empty() {
-            values.push(query.to_string());
-            for item in query.split('&').filter(|item| !item.is_empty()) {
-                values.push(item.to_string());
-                if let Some((_, value)) = item.split_once('=') {
-                    if !value.is_empty() {
-                        values.push(value.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if let Some((_, fragment)) = url.split_once('#') {
-        if !fragment.is_empty() {
-            values.push(fragment.to_string());
-        }
-    }
-    sort_private_values(&mut values);
-    values
-}
-
-fn publication_private_values(remote_url: &str) -> Vec<String> {
-    let mut values = remote_private_values(remote_url);
-    values.extend(network_auth_private_values());
-    sort_private_values(&mut values);
-    values
-}
-
-fn network_auth_private_values() -> Vec<String> {
-    let mut values = [
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GITHUB_ENTERPRISE_TOKEN",
-        "SSH_AUTH_SOCK",
-    ]
-    .into_iter()
-    .filter_map(|key| env::var(key).ok())
-    .filter(|value| !value.is_empty())
-    .collect::<Vec<_>>();
-    sort_private_values(&mut values);
-    values
-}
-
-fn sort_private_values(values: &mut Vec<String>) {
-    values.retain(|value| !value.is_empty());
-    values.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    values.dedup();
-}
-
 fn github_repository_identity(remote_url: &str) -> Result<GithubRepositoryIdentity> {
-    let identity_end = remote_url.find(['?', '#']).unwrap_or(remote_url.len());
-    let identity = remote_url[..identity_end].trim_end_matches('/');
-    let (host, path) = if let Some((scheme, remainder)) = identity.split_once("://") {
-        if !matches!(scheme, "https" | "ssh" | "git+ssh" | "ssh+git") {
-            bail!(
-                "GitHub publication requires an https://, ssh://, git+ssh://, or ssh+git:// origin URL"
-            );
-        }
-        let slash = remainder
-            .find('/')
-            .context("GitHub origin URL omitted owner/repository path")?;
-        let authority = &remainder[..slash];
-        let host = authority
-            .rsplit_once('@')
-            .map_or(authority, |(_, host)| host);
-        (host, &remainder[slash + 1..])
-    } else {
-        let (authority, path) = identity.split_once(':').context(
-            "GitHub publication requires a supported HTTPS, SSH, or SCP-style origin URL",
-        )?;
-        let host = authority
-            .rsplit_once('@')
-            .map_or(authority, |(_, host)| host);
-        (host, path)
-    };
-    let host = normalize_github_host(host)?;
+    let PublicationRemoteTransport::Https { host, path, .. } =
+        publication_remote_transport(remote_url)?;
     let mut components = path.split('/');
     let owner = components
         .next()
@@ -1519,6 +1540,7 @@ fn normalize_github_host(host: &str) -> Result<String> {
         .rsplit_once(':')
         .map_or((host, None), |(hostname, port)| (hostname, Some(port)));
     if hostname.is_empty()
+        || hostname.len() > MAX_PUBLICATION_HOST_BYTES
         || hostname.contains(':')
         || host.starts_with('.')
         || host.ends_with('.')
@@ -1529,8 +1551,16 @@ fn normalize_github_host(host: &str) -> Result<String> {
     {
         bail!("GitHub origin URL host is invalid");
     }
+    if hostname.split('.').any(|label| {
+        label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-')
+    }) {
+        bail!("GitHub origin URL DNS label is invalid");
+    }
     if let Some(port) = port {
-        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().ok().filter(|port| *port != 0).is_none()
+        {
             bail!("GitHub origin URL port is invalid");
         }
     }
@@ -1539,6 +1569,7 @@ fn normalize_github_host(host: &str) -> Result<String> {
 
 fn validate_github_slug(value: &str, label: &str) -> Result<()> {
     if value.is_empty()
+        || value.len() > MAX_GITHUB_SLUG_BYTES
         || matches!(value, "." | "..")
         || !value
             .bytes()
@@ -1554,9 +1585,11 @@ fn validate_github_receipt_url(
     expected: &GithubRepositoryIdentity,
     expected_number: u64,
 ) -> Result<()> {
-    let identity_end = url.find(['?', '#']).unwrap_or(url.len());
-    let identity = &url[..identity_end];
-    let (scheme, remainder) = identity
+    if expected_number == 0 {
+        bail!("GitHub PR receipt number was zero");
+    }
+    validate_github_receipt_url_text(url)?;
+    let (scheme, remainder) = url
         .split_once("://")
         .context("GitHub PR receipt URL was not absolute")?;
     if scheme != "https" {
@@ -1565,11 +1598,15 @@ fn validate_github_receipt_url(
     let slash = remainder
         .find('/')
         .context("GitHub PR receipt URL omitted repository path")?;
-    let host = normalize_github_host(&remainder[..slash])?;
+    let authority = &remainder[..slash];
+    let host = normalize_github_host(authority)?;
+    if host != authority {
+        bail!("GitHub PR receipt URL host was not canonical");
+    }
     let components = remainder[slash + 1..].split('/').collect::<Vec<_>>();
     if components.len() != 4
         || components[2] != "pull"
-        || components[3].parse::<u64>().ok() != Some(expected_number)
+        || components[3] != expected_number.to_string()
     {
         bail!("GitHub PR receipt URL did not identify the expected pull request");
     }
@@ -1578,6 +1615,54 @@ fn validate_github_receipt_url(
         || !components[1].eq_ignore_ascii_case(&expected.name)
     {
         bail!("GitHub PR receipt URL did not match the bound forge repository");
+    }
+    Ok(())
+}
+
+fn validate_github_issue_receipt_url(
+    url: &str,
+    expected: &GithubRepositoryIdentity,
+) -> Result<String> {
+    validate_github_receipt_url_text(url)?;
+    let (scheme, remainder) = url
+        .split_once("://")
+        .context("GitHub issue receipt URL was not absolute")?;
+    if scheme != "https" {
+        bail!("GitHub issue receipt URL was not HTTPS");
+    }
+    let slash = remainder
+        .find('/')
+        .context("GitHub issue receipt URL omitted repository path")?;
+    let authority = &remainder[..slash];
+    let host = normalize_github_host(authority)?;
+    let components = remainder[slash + 1..].split('/').collect::<Vec<_>>();
+    let issue_number = components
+        .get(3)
+        .and_then(|component| component.parse::<u64>().ok())
+        .filter(|number| *number > 0);
+    if host != authority
+        || components.len() != 4
+        || components[2] != "issues"
+        || issue_number.is_none_or(|number| components[3] != number.to_string())
+        || host != expected.host
+        || !components[0].eq_ignore_ascii_case(&expected.owner)
+        || !components[1].eq_ignore_ascii_case(&expected.name)
+    {
+        bail!("GitHub issue receipt URL did not match the bound repository and issue");
+    }
+    Ok(url.to_string())
+}
+
+fn validate_github_receipt_url_text(url: &str) -> Result<()> {
+    if url.is_empty()
+        || url.len() > MAX_GITHUB_RECEIPT_URL_BYTES
+        || url
+            .as_bytes()
+            .iter()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || url.contains(['?', '#', '%', '\\', '@'])
+    {
+        bail!("GitHub receipt URL was empty, noncanonical, or oversized");
     }
     Ok(())
 }
@@ -2127,8 +2212,15 @@ impl PublicationTransaction {
         remote_url: &str,
         expected_oid: &str,
     ) -> Result<Self> {
-        Oid::from_str(expected_oid).context("publication expected OID was invalid")?;
+        let expected =
+            Oid::from_str(expected_oid).context("publication expected OID was invalid")?;
+        if expected.to_string() != expected_oid {
+            bail!("publication expected OID was not canonical lowercase hexadecimal");
+        }
         validate_publication_remote_url(remote_url)?;
+        if matches!(report.forge, ForgeKind::Git | ForgeKind::Github) {
+            publication_remote_transport(remote_url)?;
+        }
         let expected_base_oid = report
             .base_head
             .as_deref()
@@ -2203,7 +2295,6 @@ impl PublicationTransaction {
                 directory,
                 journal,
                 remote_url: remote_url.to_string(),
-                remote_private_values: publication_private_values(remote_url),
             });
         }
 
@@ -2240,7 +2331,6 @@ impl PublicationTransaction {
                 updated_unix_seconds: 0,
             },
             remote_url: remote_url.to_string(),
-            remote_private_values: publication_private_values(remote_url),
         };
         transaction.persist()?;
         Ok(transaction)
@@ -2827,9 +2917,139 @@ fn publication_remote_branch(agent_id: &str, expected_oid: &str) -> String {
     )
 }
 
+fn validate_publication_object_store_is_self_contained(
+    repo: &Repository,
+    common_objects: &Path,
+) -> Result<()> {
+    for alternate in [
+        common_objects.join("info/alternates"),
+        common_objects.join("info/http-alternates"),
+    ] {
+        match fs::symlink_metadata(&alternate) {
+            Ok(_) => {
+                bail!("HTTPS publication refuses object stores with alternate object directories")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect publication object alternate {}",
+                        alternate.display()
+                    )
+                })
+            }
+        }
+    }
+
+    let config_path = repo.commondir().join("config");
+    let path_metadata = fs::symlink_metadata(&config_path).with_context(|| {
+        format!(
+            "failed to inspect publication source config {}",
+            config_path.display()
+        )
+    })?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.file_type().is_file()
+        || path_metadata.len() > MAX_PUBLICATION_SOURCE_CONFIG_BYTES
+    {
+        bail!("HTTPS publication source config is not a bounded real regular file");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut config_file = options.open(&config_path).with_context(|| {
+        format!(
+            "failed to open publication source config {}",
+            config_path.display()
+        )
+    })?;
+    let file_metadata = config_file
+        .metadata()
+        .context("failed to inspect open publication source config")?;
+    if !publication_same_filesystem_identity(&path_metadata, &file_metadata)
+        || file_metadata.len() != path_metadata.len()
+    {
+        bail!("HTTPS publication source config changed while it was opened");
+    }
+    let mut config_bytes = Vec::new();
+    Read::by_ref(&mut config_file)
+        .take(MAX_PUBLICATION_SOURCE_CONFIG_BYTES + 1)
+        .read_to_end(&mut config_bytes)
+        .context("failed to read publication source config")?;
+    let after = fs::symlink_metadata(&config_path)
+        .context("failed to recheck publication source config")?;
+    if config_bytes.len() as u64 != file_metadata.len()
+        || !publication_same_filesystem_identity(&file_metadata, &after)
+        || after.len() != file_metadata.len()
+    {
+        bail!("HTTPS publication source config changed while it was read");
+    }
+    let config_text = std::str::from_utf8(&config_bytes)
+        .map(str::to_ascii_lowercase)
+        .context("publication source config was not UTF-8");
+    zeroize_bytes(&mut config_bytes);
+    let config_text = ZeroizingString(config_text?);
+    if config_text.as_str().contains("partialclone") || config_text.as_str().contains("promisor") {
+        bail!("HTTPS publication refuses partial-clone or promisor object stores");
+    }
+
+    let mut pending = vec![(common_objects.to_path_buf(), 0usize)];
+    let mut entry_count = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        for entry in fs::read_dir(&directory).with_context(|| {
+            format!(
+                "failed to inspect publication object directory {}",
+                directory.display()
+            )
+        })? {
+            let entry = entry.context("failed to read publication object entry")?;
+            entry_count = entry_count
+                .checked_add(1)
+                .context("publication object entry count overflow")?;
+            if entry_count > MAX_PUBLICATION_OBJECT_ENTRIES {
+                bail!("HTTPS publication object store exceeded its entry safety bound");
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).with_context(|| {
+                format!("failed to inspect publication object {}", path.display())
+            })?;
+            if metadata.file_type().is_symlink()
+                || (!metadata.file_type().is_file() && !metadata.file_type().is_dir())
+            {
+                bail!("HTTPS publication object store contains a special or linked entry");
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "promisor")
+            {
+                bail!("HTTPS publication refuses promisor pack metadata");
+            }
+            if metadata.file_type().is_dir() {
+                if depth >= MAX_PUBLICATION_OBJECT_DEPTH {
+                    bail!("HTTPS publication object store exceeded its depth safety bound");
+                }
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl PublicationGitContext {
     fn create(worktree_path: &Path, remote_url: &str) -> Result<Self> {
-        validate_publication_remote_url(remote_url)?;
+        Self::create_with_token_source(worktree_path, remote_url, |key| env::var(key).ok())
+    }
+
+    fn create_with_token_source(
+        worktree_path: &Path,
+        remote_url: &str,
+        mut value_for: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let transport = publication_remote_transport(remote_url)?;
         let repo = Repository::open(worktree_path).with_context(|| {
             format!(
                 "failed to open publication worktree {}",
@@ -2841,14 +3061,19 @@ impl PublicationGitContext {
             merge::PrivateRuntimeKind::PublicationGit,
         )?;
         let directory = runtime_directory.path().to_path_buf();
-        let result = (|| -> Result<(BTreeMap<String, String>, Option<PathBuf>)> {
+        let result = (|| -> Result<PublicationGitContextSetup> {
             let objects = directory.join("objects");
+            let source_objects = directory.join("source-objects");
             merge::create_private_directory(&objects)?;
+            merge::create_private_directory(&source_objects)?;
             merge::create_private_directory(&directory.join("refs"))?;
             merge::create_private_directory(&directory.join("refs/heads"))?;
             merge::create_private_directory(&directory.join("refs/tags"))?;
             merge::create_private_directory(&directory.join("disabled-hooks"))?;
-            merge::write_git_alternates_file(&objects, &repo.commondir().join("objects"))?;
+            let common_objects = fs::canonicalize(repo.commondir().join("objects"))
+                .context("failed to resolve publication source object directory")?;
+            validate_publication_object_store_is_self_contained(&repo, &common_objects)?;
+            merge::write_git_alternates_file(&objects, &source_objects)?;
             merge::write_private_file(
                 &directory.join("HEAD"),
                 b"ref: refs/heads/maco-publication\n",
@@ -2881,24 +3106,60 @@ impl PublicationGitContext {
             config
                 .set_str("protocol.ext.allow", "never")
                 .context("failed to disable external publication protocol")?;
-            let uses_ssh =
-                publication_remote_transport(remote_url)? == PublicationRemoteTransport::Ssh;
-            let trusted_global_known_hosts = if uses_ssh {
-                let global_known_hosts = trusted_global_known_hosts_file()?;
-                config
-                    .set_str(
-                        "core.sshcommand",
-                        &fixed_trusted_ssh_command(&global_known_hosts)?,
-                    )
-                    .context("failed to bind trusted publication SSH command")?;
-                Some(global_known_hosts)
-            } else {
-                None
-            };
-            drop(config);
             let global_config = directory.join("disabled-global-config");
             merge::write_private_file(&global_config, b"")?;
-            let mut environment = merge::minimal_network_environment(uses_ssh)?;
+            let common_state = fs::canonicalize(merge::ensure_repo_common_state_directory(&repo)?)
+                .context("failed to resolve publication repository state directory")?;
+            let common_directory = fs::canonicalize(repo.commondir())
+                .context("failed to resolve publication common Git directory")?;
+            let primary_worktree = common_directory
+                .parent()
+                .context("publication common Git directory omitted its repository root")?
+                .to_path_buf();
+            let source_worktree = fs::canonicalize(worktree_path).with_context(|| {
+                format!(
+                    "failed to resolve publication source worktree {}",
+                    worktree_path.display()
+                )
+            })?;
+
+            let PublicationRemoteTransport::Https {
+                host, command_url, ..
+            } = &transport;
+            let token = select_network_token_with(host, &mut value_for)?;
+            let auth_scope_key = format!("http.{command_url}.extraheader");
+            let authorization_header =
+                ZeroizingString(format!("Authorization: Basic {}", token.basic_str()?));
+            config
+                .set_str(&auth_scope_key, authorization_header.as_str())
+                .context("failed to bind the host-and-repository HTTPS authorization header")?;
+            config
+                .set_str("http.followredirects", "false")
+                .context("failed to constrain publication redirects")?;
+            config
+                .set_bool("http.sslverify", true)
+                .context("failed to require publication TLS verification")?;
+            config
+                .set_str("http.proxy", "")
+                .context("failed to disable publication proxy discovery")?;
+            config
+                .set_str("credential.helper", "")
+                .context("failed to disable publication credential helpers")?;
+            config
+                .set_str("core.askpass", "")
+                .context("failed to disable publication askpass helpers")?;
+            let command_url = command_url.clone();
+            config
+                .set_str("remote.maco-publication.url", &command_url)
+                .context("failed to bind the validated publication remote")?;
+            drop(config);
+            harden_private_config_mode(&config_path)?;
+
+            let config_files = vec![
+                capture_private_config_file(&config_path)?,
+                capture_private_config_file(&global_config)?,
+            ];
+            let mut environment = merge::minimal_network_environment()?;
             environment.insert(
                 "GIT_CONFIG_GLOBAL".to_string(),
                 global_config
@@ -2906,48 +3167,66 @@ impl PublicationGitContext {
                     .context("publication global config path was not UTF-8")?
                     .to_string(),
             );
-            environment.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
-            environment.insert(
-                "GIT_CONFIG_KEY_0".to_string(),
-                "remote.maco-publication.url".to_string(),
-            );
-            environment.insert("GIT_CONFIG_VALUE_0".to_string(), remote_url.to_string());
-            Ok((environment, trusted_global_known_hosts))
+            validate_publication_git_environment(&environment, &global_config)?;
+
+            let profile = TrustedFixedNetworkProfile::read_write(&directory)
+                .with_resource_limits(Default::default())
+                .with_visible_read_only_bind(&common_objects, &source_objects)
+                .with_visible_read_only_file(&config_path)
+                .with_visible_read_only_file(&global_config)
+                .with_hidden_root(&primary_worktree)
+                .with_hidden_root(&source_worktree)
+                .with_hidden_root(&common_state);
+            Ok((
+                environment,
+                PublicationGitBoundary::Https(profile),
+                config_files,
+                Some(token),
+            ))
         })();
         match result {
-            Ok((environment, trusted_global_known_hosts)) => Ok(Self {
+            Ok((environment, boundary, config_files, token)) => Ok(Self {
                 directory,
-                _runtime_directory: runtime_directory,
+                runtime_directory,
                 environment,
-                trusted_global_known_hosts,
+                boundary,
+                config_files,
+                token,
             }),
             Err(error) => Err(error),
         }
     }
 
     fn run(&self, label: &str, operation: Vec<OsString>) -> Result<merge::RequiredCommandOutput> {
-        if let Some(expected) = &self.trusted_global_known_hosts {
-            let current = trusted_global_known_hosts_file()?;
-            if &current != expected {
-                bail!(
-                    "trusted global SSH known-hosts binding changed from {} to {} before command execution",
-                    expected.display(),
-                    current.display()
-                );
-            }
-        }
+        self.runtime_directory
+            .verify_identity()
+            .context("private publication Git runtime changed before command execution")?;
+        verify_private_config_files(&self.config_files)?;
+        let global_config = self.directory.join("disabled-global-config");
+        validate_publication_git_environment(&self.environment, &global_config)?;
+        validate_publication_git_operation(&operation)?;
         let args = self.command_args(operation);
-        merge::run_required_direct(
-            label,
-            merge::resolve_trusted_executable("git")?,
-            args,
-            &self.directory,
-            self.environment.clone(),
-            StdinMode::Null,
-            merge::NETWORK_PROCESS_TIMEOUT,
-            GH_CAPTURE_LIMIT_BYTES,
-            0,
-        )
+        let output = match &self.boundary {
+            PublicationGitBoundary::Https(profile) => merge::run_required_network_direct(
+                label,
+                merge::resolve_trusted_executable("git")?,
+                args,
+                &self.directory,
+                self.environment.clone(),
+                StdinMode::Null,
+                merge::NETWORK_PROCESS_TIMEOUT,
+                GH_CAPTURE_LIMIT_BYTES,
+                0,
+                profile.clone(),
+            ),
+        };
+        let mut output = output.map_err(|error| self.redact_error(error))?;
+        self.runtime_directory
+            .verify_identity()
+            .context("private publication Git runtime changed during command execution")?;
+        verify_private_config_files(&self.config_files)?;
+        self.redact_output(&mut output);
+        Ok(output)
     }
 
     fn command_args(&self, operation: Vec<OsString>) -> Vec<OsString> {
@@ -2960,14 +3239,367 @@ impl PublicationGitContext {
             OsString::from("core.untrackedCache=false"),
             OsString::from("-c"),
             OsString::from("protocol.ext.allow=never"),
+            OsString::from("-c"),
+            OsString::from(format!(
+                "core.hooksPath={}",
+                self.directory.join("disabled-hooks").display()
+            )),
         ];
         args.extend(operation);
         args
     }
+
+    fn redact_output(&self, output: &mut merge::RequiredCommandOutput) {
+        if let Some(token) = &self.token {
+            redact_private_bytes(&mut output.stdout, &token.bytes);
+            redact_private_bytes(&mut output.stderr, &token.bytes);
+            redact_private_bytes(&mut output.stdout, &token.basic);
+            redact_private_bytes(&mut output.stderr, &token.basic);
+        }
+    }
+
+    fn redact_error(&self, error: anyhow::Error) -> anyhow::Error {
+        let mut text = format!("{error:#}");
+        if let Some(token) = &self.token {
+            if let Ok(private) = token.as_str() {
+                text = text.replace(private, "<redacted:network-token>");
+            }
+            if let Ok(private) = token.basic_str() {
+                text = text.replace(private, "<redacted:network-token>");
+            }
+        }
+        anyhow::anyhow!(text)
+    }
+}
+
+impl Drop for PublicationGitContext {
+    fn drop(&mut self) {
+        self.environment.clear();
+    }
+}
+
+impl PrivateNetworkToken {
+    fn as_str(&self) -> Result<&str> {
+        std::str::from_utf8(&self.bytes).context("network token was not UTF-8")
+    }
+
+    fn basic_str(&self) -> Result<&str> {
+        std::str::from_utf8(&self.basic).context("encoded network token was not UTF-8")
+    }
+}
+
+fn select_network_token_with(
+    host: &str,
+    mut value_for: impl FnMut(&str) -> Option<String>,
+) -> Result<PrivateNetworkToken> {
+    let hostname = host.split_once(':').map_or(host, |(hostname, _)| hostname);
+    let keys = if hostname == "github.com" {
+        ["GH_TOKEN", "GITHUB_TOKEN"]
+    } else {
+        ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+    };
+    let values = keys
+        .into_iter()
+        .filter_map(|key| value_for(key).map(|value| (key, ZeroizingString(value))))
+        .filter(|(_, value)| !value.as_str().is_empty())
+        .collect::<Vec<_>>();
+    let (_, first) = values.first().with_context(|| {
+        format!(
+            "HTTPS publication to {host} requires {} or {} before any remote effect",
+            keys[0], keys[1]
+        )
+    })?;
+    if values
+        .iter()
+        .any(|(_, value)| value.as_str() != first.as_str())
+    {
+        bail!(
+            "HTTPS publication token variables {} and {} disagree; refusing ambiguous authentication",
+            keys[0], keys[1]
+        );
+    }
+    if first.as_str().len() < 4
+        || first.as_str().len() > MAX_NETWORK_TOKEN_BYTES
+        || first
+            .as_str()
+            .as_bytes()
+            .iter()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.'))
+    {
+        bail!("HTTPS publication token is empty, malformed, or exceeds its safety bound");
+    }
+    let mut basic_source = b"x-access-token:".to_vec();
+    basic_source.extend_from_slice(first.as_bytes());
+    let basic = encode_base64(&basic_source).into_bytes();
+    zeroize_bytes(&mut basic_source);
+    Ok(PrivateNetworkToken {
+        bytes: first.as_bytes().to_vec(),
+        basic,
+    })
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[usize::from(first >> 2)] as char);
+        output.push(ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[usize::from(((second & 0x0f) << 2) | (third >> 6))] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[usize::from(third & 0x3f)] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+fn capture_private_config_file(path: &Path) -> Result<PrivateConfigFileIdentity> {
+    capture_bound_config_file(path, true)
+}
+
+fn harden_private_config_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let file = options
+            .open(path)
+            .with_context(|| format!("failed to reopen private config {}", path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to harden private config {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to persist private config {}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("private network config hardening is unsupported on this platform")
+    }
+}
+
+fn capture_bound_config_file(
+    path: &Path,
+    private_owner_only: bool,
+) -> Result<PrivateConfigFileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path_metadata_before = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect private config {}", path.display()))?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("failed to open private config {}", path.display()))?;
+        let file_metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect open private config {}", path.display()))?;
+        let path_metadata_after = fs::symlink_metadata(path).with_context(|| {
+            format!(
+                "failed to re-inspect private config {} after open",
+                path.display()
+            )
+        })?;
+        let safe = |metadata: &fs::Metadata| {
+            let mode = metadata.permissions().mode() & 0o777;
+            let owner_is_trusted = metadata.uid() == unsafe { libc::geteuid() }
+                || (!private_owner_only && metadata.uid() == 0);
+            !metadata.file_type().is_symlink()
+                && metadata.file_type().is_file()
+                && if private_owner_only {
+                    mode == 0o600
+                } else {
+                    mode & 0o022 == 0
+                }
+                && owner_is_trusted
+                && metadata.nlink() == 1
+        };
+        let same_identity = |left: &fs::Metadata, right: &fs::Metadata| {
+            left.dev() == right.dev() && left.ino() == right.ino()
+        };
+        if !safe(&path_metadata_before)
+            || !safe(&file_metadata)
+            || !safe(&path_metadata_after)
+            || !same_identity(&path_metadata_before, &file_metadata)
+            || !same_identity(&file_metadata, &path_metadata_after)
+        {
+            bail!(
+                "private config {} is not a single-link, owner-only, path-bound regular file",
+                path.display()
+            );
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((MAX_NETWORK_TOKEN_BYTES * 4 + 64 * 1024 + 1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read private config {}", path.display()))?;
+        if bytes.len() > MAX_NETWORK_TOKEN_BYTES * 4 + 64 * 1024 {
+            zeroize_bytes(&mut bytes);
+            bail!("private config {} exceeds its safety bound", path.display());
+        }
+        Ok(PrivateConfigFileIdentity {
+            path: path.to_path_buf(),
+            private_owner_only,
+            device: file_metadata.dev(),
+            inode: file_metadata.ino(),
+            bytes,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, private_owner_only);
+        bail!("private network config identity verification is unsupported on this platform")
+    }
+}
+
+fn verify_private_config_files(files: &[PrivateConfigFileIdentity]) -> Result<()> {
+    for expected in files {
+        let actual = capture_bound_config_file(&expected.path, expected.private_owner_only)?;
+        #[cfg(unix)]
+        let identity_matches = actual.device == expected.device && actual.inode == expected.inode;
+        #[cfg(not(unix))]
+        let identity_matches = false;
+        if !identity_matches || actual.bytes != expected.bytes {
+            bail!(
+                "private network config {} changed identity or contents while in use",
+                expected.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn redact_private_bytes(output: &mut Vec<u8>, private: &[u8]) {
+    if private.is_empty() || private.len() > output.len() {
+        return;
+    }
+    const REPLACEMENT: &[u8] = b"<redacted:network-token>";
+    let mut redacted = Vec::with_capacity(output.len());
+    let mut offset = 0usize;
+    while let Some(position) = output[offset..]
+        .windows(private.len())
+        .position(|window| window == private)
+    {
+        let absolute = offset + position;
+        redacted.extend_from_slice(&output[offset..absolute]);
+        redacted.extend_from_slice(REPLACEMENT);
+        offset = absolute + private.len();
+    }
+    if offset != 0 {
+        redacted.extend_from_slice(&output[offset..]);
+        zeroize_bytes(output);
+        *output = redacted;
+    }
+}
+
+fn validate_publication_git_environment(
+    environment: &BTreeMap<String, String>,
+    global_config: &Path,
+) -> Result<()> {
+    let required = [
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_ATTR_NOSYSTEM", "1"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ];
+    for (key, expected) in required {
+        if environment.get(key).map(String::as_str) != Some(expected) {
+            bail!("publication Git environment omitted the exact required {key}={expected}");
+        }
+    }
+    let expected_global = global_config
+        .to_str()
+        .context("publication global Git config path was not UTF-8")?;
+    if environment.get("GIT_CONFIG_GLOBAL").map(String::as_str) != Some(expected_global) {
+        bail!("publication Git environment changed its private global config binding");
+    }
+    if environment
+        .keys()
+        .any(|key| key.starts_with("GH_") || key.starts_with("GITHUB_"))
+    {
+        bail!("publication Git environment may not contain gh authentication inputs");
+    }
+    Ok(())
+}
+
+fn validate_publication_git_operation(operation: &[OsString]) -> Result<()> {
+    let operation = operation
+        .iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .context("publication Git argument was not strict UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    match operation.as_slice() {
+        ["ls-remote", "--refs", "maco-publication", remote_ref] => {
+            validate_publication_ref(remote_ref)
+        }
+        ["push", "--no-verify", lease, "maco-publication", refspec] => {
+            let leased_ref = lease
+                .strip_prefix("--force-with-lease=")
+                .and_then(|value| value.strip_suffix(':'))
+                .context("publication Git push omitted its create-only lease")?;
+            validate_publication_ref(leased_ref)?;
+            let (oid, remote_ref) = refspec
+                .split_once(':')
+                .context("publication Git push omitted its bound refspec")?;
+            if remote_ref != leased_ref
+                || oid.len() != 40
+                || !oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                || Oid::from_str(oid).is_err()
+            {
+                bail!("publication Git push refspec did not match its exact create-only lease");
+            }
+            Ok(())
+        }
+        _ => bail!("publication Git command is outside the fixed ls-remote/push allowlist"),
+    }
+}
+
+fn validate_publication_ref(value: &str) -> Result<()> {
+    if value.len() > MAX_PUBLICATION_REF_BYTES {
+        bail!("publication ref exceeds its safety bound");
+    }
+    let suffix = value
+        .strip_prefix("refs/heads/")
+        .context("publication ref is outside refs/heads")?;
+    if suffix.is_empty()
+        || suffix.starts_with('/')
+        || suffix.ends_with(['/', '.'])
+        || suffix.contains("..")
+        || suffix.contains("//")
+        || suffix.contains("@{")
+        || suffix.split('/').count() > MAX_PUBLICATION_REF_COMPONENTS
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+    {
+        bail!("publication ref is malformed");
+    }
+    Ok(())
 }
 
 fn validate_publication_remote_url(remote_url: &str) -> Result<()> {
     if remote_url.is_empty()
+        || remote_url.len() > MAX_PUBLICATION_REMOTE_URL_BYTES
         || remote_url
             .as_bytes()
             .iter()
@@ -2976,405 +3608,64 @@ fn validate_publication_remote_url(remote_url: &str) -> Result<()> {
         bail!("publication remote URL is empty or contains control bytes");
     }
     if remote_url.contains(['?', '#']) {
-        bail!(
-            "publication remote URLs containing query or fragment credentials are unsupported; use SSH agent authentication or URL userinfo without encoded secrets"
-        );
+        bail!("publication remote URLs may not contain a query or fragment");
     }
-    let authority = if let Some((_, remainder)) = remote_url.split_once("://") {
-        remainder
-            .split_once('/')
-            .map_or(remainder, |(authority, _)| authority)
-    } else {
-        remote_url
-            .split_once(':')
-            .map_or(remote_url, |(authority, _)| authority)
-    };
-    if authority.contains('@') && authority.contains('%') {
-        bail!(
-            "percent-encoded publication URL credentials are unsupported because safe error redaction cannot be guaranteed"
-        );
+    if remote_url.contains(['%', '\\', '@']) {
+        bail!("publication remote URLs may not contain escapes, backslashes, or userinfo");
     }
-    publication_remote_transport(remote_url)?;
     Ok(())
 }
 
 fn publication_remote_transport(remote_url: &str) -> Result<PublicationRemoteTransport> {
-    if let Some((scheme, remainder)) = remote_url.split_once("://") {
-        if scheme != scheme.to_ascii_lowercase() {
-            bail!("publication remote URL scheme must be lowercase");
-        }
-        return match scheme.to_ascii_lowercase().as_str() {
-            "ssh" | "git+ssh" | "ssh+git" => {
-                validate_ssh_url_remote(remainder)?;
-                Ok(PublicationRemoteTransport::Ssh)
-            }
-            "https" | "http" | "git" => {
-                validate_non_ssh_network_remote(remainder)?;
-                Ok(PublicationRemoteTransport::NonSsh)
-            }
-            "file" => {
-                if remainder.is_empty() {
-                    bail!("file publication remote omitted a path");
-                }
-                Ok(PublicationRemoteTransport::NonSsh)
-            }
-            _ => bail!("publication remote uses an unsupported URL scheme"),
-        };
+    validate_publication_remote_url(remote_url)?;
+    if remote_url.starts_with("file://") || remote_url.starts_with('/') {
+        bail!(
+            "local/file publication is disabled because a concurrent same-UID process could mutate bare-repository config during receive-pack; use a canonical HTTPS remote"
+        );
     }
-
-    if publication_remote_is_local_path(remote_url) {
-        return Ok(PublicationRemoteTransport::NonSsh);
+    let remainder = remote_url.strip_prefix("https://").context(
+        "publication supports only canonical HTTPS remotes; local/file, SSH, HTTP, git, helpers, and SCP syntax are refused",
+    )?;
+    if remote_url.contains('%') || remote_url.contains('\\') {
+        bail!("HTTPS publication remote may not contain escapes or backslashes");
     }
-    if remote_url.contains(':') {
-        validate_scp_style_remote(remote_url)?;
-        return Ok(PublicationRemoteTransport::Ssh);
-    }
-    Ok(PublicationRemoteTransport::NonSsh)
-}
-
-fn publication_remote_is_local_path(remote_url: &str) -> bool {
-    remote_url.starts_with('/')
-        || remote_url.starts_with('\\')
-        || remote_url.starts_with("./")
-        || remote_url.starts_with("../")
-        || remote_url.starts_with("~/")
-        || remote_url.as_bytes().get(1) == Some(&b':')
-            && remote_url
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_alphabetic)
-            && remote_url
-                .as_bytes()
-                .get(2)
-                .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
-}
-
-fn validate_non_ssh_network_remote(remainder: &str) -> Result<()> {
     let (authority, path) = remainder
         .split_once('/')
-        .context("publication remote URL omitted a repository path")?;
-    if authority.is_empty() || path.is_empty() {
-        bail!("publication remote URL omitted an authority or repository path");
+        .context("HTTPS publication remote omitted a repository path")?;
+    if authority.contains('@') {
+        bail!("HTTPS publication remote may not contain userinfo");
     }
-    Ok(())
-}
-
-fn validate_ssh_url_remote(remainder: &str) -> Result<()> {
-    let (authority, path) = remainder
-        .split_once('/')
-        .context("SSH publication remote omitted a repository path")?;
-    if path.is_empty() {
-        bail!("SSH publication remote omitted a repository path");
-    }
-    validate_ssh_authority(authority, true)
-}
-
-fn validate_scp_style_remote(remote_url: &str) -> Result<()> {
-    let delimiter = if let Some(bracket_start) = remote_url.find('[') {
-        let bracket_end = remote_url[bracket_start + 1..]
-            .find(']')
-            .map(|offset| bracket_start + 1 + offset)
-            .context("SCP-style publication remote contained an unterminated IPv6 host")?;
-        if remote_url[bracket_end + 1..].starts_with(':') {
-            bracket_end + 1
-        } else {
-            bail!("SCP-style publication remote omitted ':' after its IPv6 host");
-        }
-    } else {
-        remote_url
-            .find(':')
-            .context("SCP-style publication remote omitted ':'")?
-    };
-    let authority = &remote_url[..delimiter];
-    let path = &remote_url[delimiter + 1..];
-    if path.is_empty() || path.starts_with(':') {
-        bail!("SCP-style publication remote omitted a repository path");
-    }
-    validate_ssh_authority(authority, false)
-}
-
-fn validate_ssh_authority(authority: &str, allow_port: bool) -> Result<()> {
-    if authority.is_empty()
-        || authority
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\'))
+    let host = normalize_github_host(authority)?;
+    if host != authority
+        || path.is_empty()
+        || path.len() > MAX_PUBLICATION_PATH_BYTES
+        || path.split('/').count() > MAX_PUBLICATION_PATH_COMPONENTS
+        || path.starts_with('/')
+        || path.ends_with('/')
     {
-        bail!("SSH publication remote authority is invalid");
+        bail!("HTTPS publication remote is not canonical");
     }
-    let mut user_and_host = authority.split('@');
-    let first = user_and_host
-        .next()
-        .context("SSH publication remote authority was empty")?;
-    let (user, host_and_port) = match user_and_host.next() {
-        Some(host) => (Some(first), host),
-        None => (None, first),
-    };
-    if user_and_host.next().is_some()
-        || user.is_some_and(|user| {
-            user.is_empty()
-                || !user.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
-                })
-        })
-    {
-        bail!("SSH publication remote user is invalid");
+    for component in path.split('/') {
+        if component.is_empty()
+            || matches!(component, "." | "..")
+            || !component.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~')
+            })
+        {
+            bail!("HTTPS publication repository path is malformed");
+        }
     }
-
-    if let Some(host) = host_and_port.strip_prefix('[') {
-        let close = host
-            .find(']')
-            .context("SSH publication remote contained an unterminated IPv6 host")?;
-        let address = &host[..close];
-        if address.parse::<std::net::Ipv6Addr>().is_err() {
-            bail!("SSH publication remote IPv6 host is invalid");
-        }
-        let suffix = &host[close + 1..];
-        if suffix.is_empty() {
-            return Ok(());
-        }
-        if !allow_port {
-            bail!("SCP-style publication remote IPv6 authority contained unexpected data");
-        }
-        validate_ssh_port(suffix)
+    let path = if path.ends_with(".git") {
+        path.to_string()
     } else {
-        let (host, port) = if allow_port {
-            host_and_port
-                .split_once(':')
-                .map_or((host_and_port, None), |(host, port)| (host, Some(port)))
-        } else {
-            (host_and_port, None)
-        };
-        if host.is_empty()
-            || host.contains(':')
-            || !host
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-        {
-            bail!("SSH publication remote host is invalid");
-        }
-        if let Some(port) = port {
-            validate_ssh_port(&format!(":{port}"))?;
-        }
-        Ok(())
-    }
-}
-
-fn validate_ssh_port(suffix: &str) -> Result<()> {
-    let port = suffix
-        .strip_prefix(':')
-        .context("SSH publication remote port separator was invalid")?;
-    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("SSH publication remote port is invalid");
-    }
-    Ok(())
-}
-
-fn fixed_trusted_ssh_command(global_known_hosts: &Path) -> Result<String> {
-    let ssh = merge::resolve_trusted_executable("ssh")?;
-    let ssh = ssh
-        .to_str()
-        .context("trusted SSH executable path was not UTF-8")?;
-    let global_known_hosts = global_known_hosts
-        .to_str()
-        .context("trusted global SSH known-hosts path was not UTF-8")?;
-    if !ssh_shell_token_is_safe(ssh) || !ssh_shell_token_is_safe(global_known_hosts) {
-        bail!("trusted SSH executable or known-hosts path contained unsafe shell characters");
-    }
-    let mut command = vec![ssh.to_string()];
-    command.extend(fixed_trusted_ssh_options(global_known_hosts));
-    Ok(command.join(" "))
-}
-
-fn fixed_trusted_ssh_options(global_known_hosts: &str) -> Vec<String> {
-    [
-        "-F".to_string(),
-        "/dev/null".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        "IdentityFile=none".to_string(),
-        "-o".to_string(),
-        "CertificateFile=none".to_string(),
-        "-o".to_string(),
-        "PKCS11Provider=none".to_string(),
-        "-o".to_string(),
-        "SecurityKeyProvider=none".to_string(),
-        "-o".to_string(),
-        "PreferredAuthentications=publickey".to_string(),
-        "-o".to_string(),
-        "PubkeyAuthentication=yes".to_string(),
-        "-o".to_string(),
-        "GSSAPIAuthentication=no".to_string(),
-        "-o".to_string(),
-        "HostbasedAuthentication=no".to_string(),
-        "-o".to_string(),
-        "PasswordAuthentication=no".to_string(),
-        "-o".to_string(),
-        "KbdInteractiveAuthentication=no".to_string(),
-        "-o".to_string(),
-        "ForwardAgent=no".to_string(),
-        "-o".to_string(),
-        "AddKeysToAgent=no".to_string(),
-        "-o".to_string(),
-        "PermitLocalCommand=no".to_string(),
-        "-o".to_string(),
-        "ProxyCommand=none".to_string(),
-        "-o".to_string(),
-        "ClearAllForwardings=yes".to_string(),
-        "-o".to_string(),
-        "RequestTTY=no".to_string(),
-        "-o".to_string(),
-        "UserKnownHostsFile=/dev/null".to_string(),
-        "-o".to_string(),
-        format!("GlobalKnownHostsFile={global_known_hosts}"),
-        "-o".to_string(),
-        "StrictHostKeyChecking=yes".to_string(),
-        "-o".to_string(),
-        "VerifyHostKeyDNS=no".to_string(),
-        "-o".to_string(),
-        "UpdateHostKeys=no".to_string(),
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn ssh_shell_token_is_safe(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.' | b'+')
-        })
-}
-
-#[cfg(unix)]
-fn trusted_global_known_hosts_file() -> Result<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    for candidate in SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES {
-        let candidate = Path::new(candidate);
-        match fs::symlink_metadata(candidate) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to inspect trusted global SSH known-hosts candidate {}",
-                        candidate.display()
-                    )
-                })
-            }
-        }
-        validate_trusted_ssh_path_ancestors(
-            candidate
-                .parent()
-                .context("global SSH known-hosts candidate omitted its parent")?,
-        )?;
-        let canonical = fs::canonicalize(candidate).with_context(|| {
-            format!(
-                "failed to resolve trusted global SSH known-hosts candidate {}",
-                candidate.display()
-            )
-        })?;
-        let metadata = fs::symlink_metadata(&canonical).with_context(|| {
-            format!(
-                "failed to inspect resolved global SSH known-hosts file {}",
-                canonical.display()
-            )
-        })?;
-        if metadata.file_type().is_symlink()
-            || !metadata.file_type().is_file()
-            || metadata.uid() != 0
-            || metadata.permissions().mode() & 0o022 != 0
-        {
-            bail!(
-                "trusted global SSH known-hosts file {} is not a root-owned, non-writable regular file",
-                canonical.display()
-            );
-        }
-        validate_trusted_ssh_path_ancestors(
-            canonical
-                .parent()
-                .context("resolved global SSH known-hosts file omitted its parent")?,
-        )?;
-        return Ok(canonical);
-    }
-    bail!(
-        "SSH publication requires a root-managed global known-hosts file at {} or {}; configure the target host key there before retrying",
-        SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES[0],
-        SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES[1]
-    )
-}
-
-#[cfg(unix)]
-fn validate_trusted_ssh_path_ancestors(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor).with_context(|| {
-            format!(
-                "failed to inspect global SSH known-hosts ancestor {}",
-                ancestor.display()
-            )
-        })?;
-        let mode = metadata.permissions().mode();
-        let filesystem_read_only = if mode & 0o022 != 0 {
-            ssh_path_filesystem_is_read_only(ancestor)?
-        } else {
-            false
-        };
-        if !trusted_ssh_ancestor_metadata_is_safe(
-            metadata.file_type().is_symlink(),
-            metadata.file_type().is_dir(),
-            metadata.uid(),
-            mode,
-            filesystem_read_only,
-        ) {
-            bail!(
-                "global SSH known-hosts ancestor {} is not a trusted root-owned directory",
-                ancestor.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn trusted_ssh_ancestor_metadata_is_safe(
-    is_symlink: bool,
-    is_directory: bool,
-    uid: u32,
-    mode: u32,
-    filesystem_read_only: bool,
-) -> bool {
-    !is_symlink && is_directory && uid == 0 && (mode & 0o022 == 0 || filesystem_read_only)
-}
-
-#[cfg(unix)]
-fn ssh_path_filesystem_is_read_only(path: &Path) -> Result<bool> {
-    use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
-
-    let path_bytes = path.as_os_str().as_bytes();
-    let path_c = CString::new(path_bytes).with_context(|| {
-        format!(
-            "global SSH known-hosts path {} contained an interior NUL",
-            path.display()
-        )
-    })?;
-    let mut status = MaybeUninit::<libc::statvfs>::uninit();
-    if unsafe { libc::statvfs(path_c.as_ptr(), status.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "failed to inspect filesystem flags for global SSH known-hosts path {}",
-                path.display()
-            )
-        });
-    }
-    let status = unsafe { status.assume_init() };
-    Ok(status.f_flag & libc::ST_RDONLY as libc::c_ulong != 0)
-}
-
-#[cfg(not(unix))]
-fn trusted_global_known_hosts_file() -> Result<PathBuf> {
-    bail!("trusted global SSH known-hosts resolution is unsupported on this platform")
+        format!("{path}.git")
+    };
+    let command_url = format!("https://{host}/{path}");
+    Ok(PublicationRemoteTransport::Https {
+        host,
+        path,
+        command_url,
+    })
 }
 
 fn ensure_remote_expected_commit(
@@ -3772,25 +4063,62 @@ fn require_remote_expected_base_with_context(
 }
 
 impl GhCommandContext {
-    fn create(worktree_path: &Path) -> Result<Self> {
+    fn create(worktree_path: &Path, repository: &GithubRepositoryIdentity) -> Result<Self> {
+        Self::create_with_token_source(worktree_path, repository, |key| env::var(key).ok())
+    }
+
+    fn create_with_token_source(
+        worktree_path: &Path,
+        repository: &GithubRepositoryIdentity,
+        mut value_for: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
         let runtime_directory = merge::PrivateRuntimeDirectory::create(
             worktree_path,
             merge::PrivateRuntimeKind::GhConfig,
         )?;
         let directory = runtime_directory.path().to_path_buf();
-        let result = (|| -> Result<BTreeMap<String, String>> {
-            let mut environment = merge::minimal_network_environment(false)?;
+        let result = (|| -> Result<GhCommandContextSetup> {
+            let source = Repository::discover(worktree_path).with_context(|| {
+                format!(
+                    "failed to discover gh source repository from {}",
+                    worktree_path.display()
+                )
+            })?;
+            let token = select_network_token_with(&repository.host, &mut value_for)?;
+            let hosts_path = directory.join("hosts.yml");
+            let escaped_token = ZeroizingString(token.as_str()?.replace('\'', "''"));
+            let hosts = ZeroizingString(format!(
+                "'{}':\n    oauth_token: '{}'\n    git_protocol: https\n",
+                repository.host,
+                escaped_token.as_str()
+            ));
+            merge::write_private_file(&hosts_path, hosts.as_bytes())?;
+            let config_files = vec![capture_private_config_file(&hosts_path)?];
+
+            let common_state =
+                fs::canonicalize(merge::ensure_repo_common_state_directory(&source)?)
+                    .context("failed to resolve gh repository state directory")?;
+            let common_directory = fs::canonicalize(source.commondir())
+                .context("failed to resolve gh common Git directory")?;
+            let primary_worktree = common_directory
+                .parent()
+                .context("gh common Git directory omitted its repository root")?
+                .to_path_buf();
+            let source_worktree = source
+                .workdir()
+                .map(fs::canonicalize)
+                .transpose()
+                .context("failed to resolve gh source worktree")?
+                .unwrap_or_else(|| common_directory.clone());
+
+            let mut environment = merge::minimal_network_environment()?;
             for key in [
-                "GH_TOKEN",
-                "GITHUB_TOKEN",
-                "GH_ENTERPRISE_TOKEN",
-                "GITHUB_ENTERPRISE_TOKEN",
+                "GIT_CONFIG_NOSYSTEM",
+                "GIT_ATTR_NOSYSTEM",
+                "GIT_OPTIONAL_LOCKS",
+                "GIT_TERMINAL_PROMPT",
             ] {
-                if let Ok(value) = env::var(key) {
-                    if !value.is_empty() {
-                        environment.insert(key.to_string(), value);
-                    }
-                }
+                environment.remove(key);
             }
             environment.insert(
                 "GH_CONFIG_DIR".to_string(),
@@ -3800,12 +4128,23 @@ impl GhCommandContext {
                     .to_string(),
             );
             environment.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
-            Ok(environment)
+            validate_gh_environment(&environment, &directory)?;
+            let profile = TrustedFixedNetworkProfile::read_write(&directory)
+                .with_resource_limits(Default::default())
+                .with_visible_read_only_file(&hosts_path)
+                .with_hidden_root(&primary_worktree)
+                .with_hidden_root(&source_worktree)
+                .with_hidden_root(&common_state);
+            Ok((environment, profile, config_files, token))
         })();
         match result {
-            Ok(environment) => Ok(Self {
+            Ok((environment, profile, config_files, token)) => Ok(Self {
                 runtime_directory,
                 environment,
+                profile,
+                config_files,
+                repository: repository.clone(),
+                token,
             }),
             Err(error) => Err(error),
         }
@@ -3820,7 +4159,10 @@ impl GhCommandContext {
         self.runtime_directory
             .verify_identity()
             .context("private gh runtime changed before command execution")?;
-        merge::run_required_direct(
+        verify_private_config_files(&self.config_files)?;
+        validate_gh_environment(&self.environment, self.runtime_directory.path())?;
+        validate_gh_operation(&args, &stdin, &self.repository)?;
+        let output = merge::run_required_network_direct(
             label,
             merge::resolve_trusted_executable("gh")?,
             args,
@@ -3830,8 +4172,121 @@ impl GhCommandContext {
             merge::NETWORK_PROCESS_TIMEOUT,
             GH_CAPTURE_LIMIT_BYTES,
             GH_STDIN_LIMIT_BYTES,
+            self.profile.clone(),
         )
+        .map_err(|error| {
+            let mut message = format!("{error:#}");
+            for private in [self.token.as_str(), self.token.basic_str()]
+                .into_iter()
+                .flatten()
+            {
+                message = message.replace(private, "<redacted:network-token>");
+            }
+            anyhow::anyhow!(message)
+        })?;
+        self.runtime_directory
+            .verify_identity()
+            .context("private gh runtime changed during command execution")?;
+        verify_private_config_files(&self.config_files)?;
+        let mut output = output;
+        redact_private_bytes(&mut output.stdout, &self.token.bytes);
+        redact_private_bytes(&mut output.stderr, &self.token.bytes);
+        redact_private_bytes(&mut output.stdout, &self.token.basic);
+        redact_private_bytes(&mut output.stderr, &self.token.basic);
+        Ok(output)
     }
+}
+
+fn validate_gh_environment(
+    environment: &BTreeMap<String, String>,
+    config_directory: &Path,
+) -> Result<()> {
+    let expected_directory = config_directory
+        .to_str()
+        .context("private gh config directory was not UTF-8")?;
+    if environment.get("GH_CONFIG_DIR").map(String::as_str) != Some(expected_directory)
+        || environment.get("GH_PROMPT_DISABLED").map(String::as_str) != Some("1")
+    {
+        bail!("gh environment omitted its exact private config and prompt bindings");
+    }
+    if environment.keys().any(|key| {
+        key.starts_with("GIT_")
+            || matches!(
+                key.as_str(),
+                "GH_TOKEN" | "GITHUB_TOKEN" | "GH_ENTERPRISE_TOKEN" | "GITHUB_ENTERPRISE_TOKEN"
+            )
+    }) {
+        bail!("gh environment contains ambient Git or token inputs");
+    }
+    Ok(())
+}
+
+fn validate_gh_operation(
+    args: &[OsString],
+    stdin: &StdinMode,
+    repository: &GithubRepositoryIdentity,
+) -> Result<()> {
+    let args = args
+        .iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .context("gh command argument was not strict UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selector = repository.selector();
+    let receipt_fields = "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft";
+    match args.as_slice() {
+        ["pr", "list", "--repo", bound, "--head", branch, "--state", "all", "--json", fields]
+            if *bound == selector
+                && *fields == receipt_fields
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_gh_argument_value(branch, "PR branch")
+        }
+        ["pr", "view", view, "--repo", bound, "--json", fields]
+            if *bound == selector
+                && *fields == receipt_fields
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_gh_argument_value(view, "PR selector")
+        }
+        ["pr", "create", "--repo", bound, "--base", base, "--head", branch, "--title", title, "--body-file", "-"]
+        | ["pr", "create", "--repo", bound, "--base", base, "--head", branch, "--title", title, "--body-file", "-", "--draft"]
+            if *bound == selector && matches!(stdin, StdinMode::Bytes(_)) =>
+        {
+            validate_gh_argument_value(base, "PR base")?;
+            validate_gh_argument_value(branch, "PR branch")?;
+            validate_gh_argument_value(title, "PR title")
+        }
+        ["issue", "create", "--repo", bound, "--title", title, "--body-file", "-", labels @ ..]
+            if *bound == selector && matches!(stdin, StdinMode::Bytes(_)) =>
+        {
+            validate_gh_argument_value(title, "issue title")?;
+            if labels.len() % 2 != 0 {
+                bail!("gh issue label arguments were not paired");
+            }
+            for pair in labels.chunks_exact(2) {
+                if pair[0] != "--label" {
+                    bail!("gh issue command contains an unapproved option");
+                }
+                validate_gh_argument_value(pair[1], "issue label")?;
+            }
+            Ok(())
+        }
+        _ => bail!("gh command is outside the fixed PR/issue allowlist"),
+    }
+}
+
+fn validate_gh_argument_value(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.len() > 64 * 1024
+        || value.as_bytes().iter().any(|byte| byte.is_ascii_control())
+    {
+        bail!("{label} is empty, malformed, or oversized");
+    }
+    Ok(())
 }
 
 impl Drop for GhCommandContext {
@@ -3845,7 +4300,7 @@ fn cli_github_pr_list(
     branch: &str,
     repository: &GithubRepositoryIdentity,
 ) -> Result<Vec<GithubPrResult>> {
-    let context = GhCommandContext::create(worktree_path)?;
+    let context = GhCommandContext::create(worktree_path, repository)?;
     let output = context.run(
         "gh pr list",
         [
@@ -3868,12 +4323,17 @@ fn cli_github_pr_list(
     let stdout = required_command_stdout(output, "gh pr list")?;
     let value: serde_json::Value =
         serde_json::from_str(&stdout).context("gh pr list did not return valid JSON")?;
-    value
+    github_pr_list_from_json(&value)
+}
+
+fn github_pr_list_from_json(value: &serde_json::Value) -> Result<Vec<GithubPrResult>> {
+    let receipts = value
         .as_array()
-        .context("gh pr list JSON was not an array")?
-        .iter()
-        .map(github_pr_receipt_from_json)
-        .collect()
+        .context("gh pr list JSON was not an array")?;
+    if receipts.len() > MAX_GITHUB_PR_LIST_RECEIPTS {
+        bail!("gh pr list returned too many receipts");
+    }
+    receipts.iter().map(github_pr_receipt_from_json).collect()
 }
 
 fn cli_github_pr_view(
@@ -3881,7 +4341,7 @@ fn cli_github_pr_view(
     selector: &str,
     repository: &GithubRepositoryIdentity,
 ) -> Result<GithubPrResult> {
-    let context = GhCommandContext::create(worktree_path)?;
+    let context = GhCommandContext::create(worktree_path, repository)?;
     let output = context.run(
         "gh pr view",
         [
@@ -3909,24 +4369,34 @@ fn github_pr_receipt_from_json(value: &serde_json::Value) -> Result<GithubPrResu
         .get("url")
         .and_then(serde_json::Value::as_str)
         .context("GitHub PR receipt omitted url")?;
+    validate_github_receipt_url_text(url)?;
     let head_oid = value
         .get("headRefOid")
         .and_then(serde_json::Value::as_str)
         .context("GitHub PR receipt omitted headRefOid")?;
-    let head_oid = Oid::from_str(head_oid)
-        .context("GitHub PR receipt headRefOid was invalid")?
-        .to_string();
+    let parsed_head =
+        Oid::from_str(head_oid).context("GitHub PR receipt headRefOid was invalid")?;
+    if parsed_head.to_string() != head_oid {
+        bail!("GitHub PR receipt headRefOid was not canonical lowercase hexadecimal");
+    }
+    let head_oid = parsed_head.to_string();
     let base_oid = value
         .get("baseRefOid")
         .and_then(serde_json::Value::as_str)
         .context("GitHub PR receipt omitted baseRefOid")?;
-    let base_oid = Oid::from_str(base_oid)
-        .context("GitHub PR receipt baseRefOid was invalid")?
-        .to_string();
+    let parsed_base =
+        Oid::from_str(base_oid).context("GitHub PR receipt baseRefOid was invalid")?;
+    if parsed_base.to_string() != base_oid {
+        bail!("GitHub PR receipt baseRefOid was not canonical lowercase hexadecimal");
+    }
+    let base_oid = parsed_base.to_string();
     let number = value
         .get("number")
         .and_then(serde_json::Value::as_u64)
         .context("GitHub PR receipt omitted number")?;
+    if number == 0 {
+        bail!("GitHub PR receipt number was zero");
+    }
     let base_ref_name = value
         .get("baseRefName")
         .and_then(serde_json::Value::as_str)
@@ -3935,12 +4405,20 @@ fn github_pr_receipt_from_json(value: &serde_json::Value) -> Result<GithubPrResu
         .get("state")
         .and_then(serde_json::Value::as_str)
         .context("GitHub PR receipt omitted state")?;
+    for (label, text) in [("baseRefName", base_ref_name), ("state", state)] {
+        if text.is_empty()
+            || text.len() > MAX_GITHUB_RECEIPT_STRING_BYTES
+            || text.as_bytes().iter().any(|byte| byte.is_ascii_control())
+        {
+            bail!("GitHub PR receipt {label} was empty, malformed, or oversized");
+        }
+    }
     let is_draft = value
         .get("isDraft")
         .and_then(serde_json::Value::as_bool)
         .context("GitHub PR receipt omitted isDraft")?;
     Ok(GithubPrResult {
-        url: redact_remote_url(url),
+        url: url.to_string(),
         head_oid,
         base_oid,
         number,
@@ -3960,7 +4438,7 @@ fn cli_github_pr_create(
     draft: bool,
     repository: &GithubRepositoryIdentity,
 ) -> Result<GithubCreateOutput> {
-    let context = GhCommandContext::create(worktree_path)?;
+    let context = GhCommandContext::create(worktree_path, repository)?;
     let mut args = [
         "pr",
         "create",
@@ -4003,7 +4481,7 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
     let remote_url = remote_url(&repository, "origin")
         .context("GitHub issue creation requires an 'origin' remote")?;
     let github_repository = github_repository_identity(&remote_url)?;
-    let context = GhCommandContext::create(repo)?;
+    let context = GhCommandContext::create(repo, &github_repository)?;
     let mut args = [
         "issue",
         "create",
@@ -4027,24 +4505,22 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
         StdinMode::Bytes(body.as_bytes().to_vec()),
     )?;
     let stdout = required_command_stdout(output, "gh issue create")?;
-    Ok(first_non_empty_line(&stdout).unwrap_or_else(|| {
-        format!(
-            "https://{}/{}/{}/issues",
-            github_repository.host, github_repository.owner, github_repository.name
-        )
-    }))
+    let mut receipts = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let receipt = receipts
+        .next()
+        .context("gh issue create returned no issue receipt URL")?;
+    if receipts.next().is_some() {
+        bail!("gh issue create returned multiple receipt lines");
+    }
+    validate_github_issue_receipt_url(receipt, &github_repository)
 }
 
 fn required_command_stdout(output: merge::RequiredCommandOutput, label: &str) -> Result<String> {
     if !output.success {
-        let redactor = network_auth_private_values()
-            .into_iter()
-            .fold(Redactor::new(), |redactor, value| {
-                redactor.with_private_value("network-auth", value)
-            });
-        let stderr = redactor
-            .redact(String::from_utf8_lossy(&output.stderr).trim())
-            .text;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!("{label} failed: {}", stderr);
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -4168,7 +4644,6 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::worktree::{WorktreeCreateOptions, WorktreeRecord};
-    use std::process::Command;
     #[cfg(target_os = "linux")]
     use std::{sync::mpsc, time::Duration};
 
@@ -4790,58 +5265,6 @@ mod tests {
         .expect("write private test journal");
     }
 
-    struct LostResponseGithubApi {
-        list_calls: usize,
-        create_calls: usize,
-        exists: bool,
-        receipt: GithubPrResult,
-    }
-
-    impl GithubApi for LostResponseGithubApi {
-        fn list(
-            &mut self,
-            _worktree_path: &Path,
-            _branch: &str,
-            _repository: &GithubRepositoryIdentity,
-        ) -> Result<Vec<GithubPrResult>> {
-            self.list_calls += 1;
-            match self.list_calls {
-                1 => Ok(Vec::new()),
-                2 => bail!("temporary list failure after lost create response"),
-                _ if self.exists => Ok(vec![self.receipt.clone()]),
-                _ => Ok(Vec::new()),
-            }
-        }
-
-        fn view(
-            &mut self,
-            _worktree_path: &Path,
-            _selector: &str,
-            _repository: &GithubRepositoryIdentity,
-        ) -> Result<GithubPrResult> {
-            Ok(self.receipt.clone())
-        }
-
-        fn create(
-            &mut self,
-            _worktree_path: &Path,
-            _branch: &str,
-            _base: &str,
-            _title: &str,
-            _body: &str,
-            _draft: bool,
-            _repository: &GithubRepositoryIdentity,
-        ) -> Result<GithubCreateOutput> {
-            self.create_calls += 1;
-            self.exists = true;
-            Ok(GithubCreateOutput {
-                success: false,
-                stdout: Vec::new(),
-                stderr: b"response lost after create".to_vec(),
-            })
-        }
-    }
-
     #[test]
     fn publication_journal_retains_only_latest_32_of_100_retries() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4886,7 +5309,6 @@ mod tests {
                 updated_unix_seconds: 0,
             },
             remote_url: "https://example.invalid/owner/repo.git".to_string(),
-            remote_private_values: Vec::new(),
         };
 
         for retry in 0..100 {
@@ -5190,36 +5612,22 @@ mod tests {
         assert!(!serialized.contains("fragment-secret"));
         assert!(serialized.contains("<redacted>"));
 
-        let redactor = remote_private_values(raw)
-            .into_iter()
-            .fold(Redactor::new(), |redactor, value| {
-                redactor.with_private_value("remote-credential", value)
-            });
-        let error = redactor
-            .redact("push failed for super-secret query-secret fragment-secret")
-            .text;
-        assert!(!error.contains("super-secret"));
-        assert!(!error.contains("query-secret"));
-        assert!(!error.contains("fragment-secret"));
+        assert!(publication_remote_transport(raw).is_err());
+        assert!(publication_remote_transport(equivalent).is_err());
     }
 
     #[test]
-    fn github_repository_binding_parses_supported_origins_and_rejects_local_paths() {
-        let https = github_repository_identity(
-            "https://user:secret@github.example/Owner/repo.git?token=secret#fragment",
-        )
-        .expect("parse HTTPS origin");
-        let ssh = github_repository_identity("ssh://git@github.example/Owner/repo.git")
-            .expect("parse SSH origin");
-        let git_ssh = github_repository_identity("git+ssh://github.example/Owner/repo.git")
-            .expect("parse git+ssh origin");
-        let scp = github_repository_identity("git@github.example:Owner/repo.git")
-            .expect("parse SCP origin");
-        assert_eq!(https, ssh);
-        assert_eq!(https, git_ssh);
-        assert_eq!(https, scp);
+    fn github_repository_binding_accepts_only_https_without_url_credentials() {
+        let https = github_repository_identity("https://github.example/Owner/repo.git")
+            .expect("parse HTTPS origin");
         assert_eq!(https.selector(), "github.example/Owner/repo");
         assert!(github_repository_identity("/tmp/local-origin.git").is_err());
+        assert!(github_repository_identity("ssh://git@github.example/Owner/repo.git").is_err());
+        assert!(github_repository_identity("git@github.example:Owner/repo.git").is_err());
+        assert!(
+            github_repository_identity("https://user:secret@github.example/Owner/repo.git")
+                .is_err()
+        );
         assert!(github_repository_identity("https://github.example/group/owner/repo.git").is_err());
     }
 
@@ -5246,392 +5654,93 @@ mod tests {
             7,
         )
         .is_err());
+        assert!(validate_github_receipt_url(
+            "https://github.example/owner/repo/pull/7?token=x",
+            &repository,
+            7,
+        )
+        .is_err());
+        assert!(validate_github_receipt_url(
+            "https://github.example/owner/repo/pull/7#fragment",
+            &repository,
+            7,
+        )
+        .is_err());
+        assert!(validate_github_receipt_url(
+            "https://github.example/owner/repo/pull/0",
+            &repository,
+            0,
+        )
+        .is_err());
+        assert!(validate_github_receipt_url(
+            "https://github.example/owner/repo/pull/007",
+            &repository,
+            7,
+        )
+        .is_err());
     }
 
     #[test]
-    fn github_reconcile_lost_response_does_not_duplicate_or_overstate_creator() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        let origin_path = temp.path().join("origin.git");
-        let repo = Repository::init(&repo_path).expect("init repo");
-        Repository::init_bare(&origin_path).expect("init bare origin");
-        fs::write(repo_path.join("README.md"), "reviewed\n").expect("write candidate");
-        let mut index = repo.index().expect("open index");
-        index
-            .add_path(Path::new("README.md"))
-            .expect("add candidate");
-        index.write().expect("write index");
-        let tree_id = index.write_tree().expect("write tree");
-        let tree = repo.find_tree(tree_id).expect("find tree");
-        let signature =
-            git2::Signature::now("maco test", "maco@example.invalid").expect("signature");
-        let expected = repo
-            .commit(Some("HEAD"), &signature, &signature, "reviewed", &tree, &[])
-            .expect("commit reviewed")
-            .to_string();
-        repo.remote("origin", origin_path.to_str().expect("origin UTF-8"))
-            .expect("configure origin");
-        let remote_branch = format!("maco/review/agent-a/{expected}");
-        let remote_ref = format!("refs/heads/{remote_branch}");
-        let git = merge::resolve_trusted_executable("git").expect("trusted git");
-        let push = Command::new(git)
-            .arg("-C")
-            .arg(&repo_path)
-            .args([
-                "push",
-                "origin",
-                &format!("{expected}:{remote_ref}"),
-                &format!("{expected}:refs/heads/main"),
-            ])
-            .output()
-            .expect("push reviewed ref");
-        assert!(
-            push.status.success(),
-            "{}",
-            String::from_utf8_lossy(&push.stderr)
-        );
-
-        let journal_directory = temp.path().join("journal");
-        merge::create_private_directory(&journal_directory).expect("private journal directory");
+    fn github_issue_receipt_requires_exact_nonzero_bound_url() {
         let repository = GithubRepositoryIdentity {
             host: "github.example".to_string(),
             owner: "owner".to_string(),
             name: "repo".to_string(),
         };
-        let mut transaction = PublicationTransaction {
-            directory: journal_directory,
-            journal: PublicationTransactionJournal {
-                version: PUBLICATION_JOURNAL_VERSION,
-                transaction_id: "lost-response".to_string(),
-                sequence: 0,
-                agent_id: "agent-a".to_string(),
-                forge: ForgeKind::Github,
-                expected_oid: expected.clone(),
-                expected_base_oid: Some(expected.clone()),
-                remote_name: "origin".to_string(),
-                remote_binding_digest: "2222222222222222222222222222222222222222".to_string(),
-                remote_display: "https://github.example/owner/repo.git".to_string(),
-                remote_ref,
-                remote_branch,
-                github_repository: Some(repository),
-                base: "main".to_string(),
-                draft: true,
-                phase: PublicationTransactionPhase::PushObserved,
-                push_observed_oid: Some(expected.clone()),
-                pr_url: None,
-                pr_head_oid: None,
-                pr_base: None,
-                pr_state: None,
-                pr_is_draft: None,
-                pr_number: None,
-                create_attempted: false,
-                created_by_transaction: false,
-                observed_existing_pr: false,
-                last_error: None,
-                updated_unix_seconds: 0,
-            },
-            remote_url: origin_path.to_string_lossy().to_string(),
-            remote_private_values: Vec::new(),
-        };
-        let mut api = LostResponseGithubApi {
-            list_calls: 0,
-            create_calls: 0,
-            exists: false,
-            receipt: GithubPrResult {
-                url: "https://github.example/owner/repo/pull/11".to_string(),
-                head_oid: expected.clone(),
-                base_oid: expected,
-                number: 11,
-                base_ref_name: "main".to_string(),
-                state: "OPEN".to_string(),
-                is_draft: true,
-                created: false,
-            },
-        };
-
-        let first =
-            reconcile_github_pr_with_api(&repo_path, &mut transaction, "title", "body", &mut api)
-                .expect_err("lost response must remain incomplete");
-        assert!(first.to_string().contains("temporary list failure"));
-        assert!(transaction.journal.create_attempted);
-        assert!(!transaction.journal.created_by_transaction);
-
-        let second =
-            reconcile_github_pr_with_api(&repo_path, &mut transaction, "title", "body", &mut api)
-                .expect("reconcile existing PR");
-        assert!(!second.created);
-        assert_eq!(api.create_calls, 1);
-        assert!(transaction.journal.observed_existing_pr);
-        assert!(!transaction.journal.created_by_transaction);
-    }
-
-    #[test]
-    fn github_base_mismatch_blocks_before_publication_ref_creation() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        let origin_path = temp.path().join("origin.git");
-        let repo = Repository::init(&repo_path).expect("init repo");
-        Repository::init_bare(&origin_path).expect("init bare origin");
-        fs::write(repo_path.join("README.md"), "reviewed\n").expect("write reviewed file");
-        let mut index = repo.index().expect("open index");
-        index
-            .add_path(Path::new("README.md"))
-            .expect("add reviewed file");
-        index.write().expect("write reviewed index");
-        let reviewed_tree_id = index.write_tree().expect("write reviewed tree");
-        let reviewed_tree = repo
-            .find_tree(reviewed_tree_id)
-            .expect("find reviewed tree");
-        let signature =
-            git2::Signature::now("maco test", "maco@example.invalid").expect("signature");
-        let expected = repo
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                "reviewed",
-                &reviewed_tree,
-                &[],
-            )
-            .expect("commit reviewed")
-            .to_string();
-        drop(reviewed_tree);
-
-        fs::write(repo_path.join("README.md"), "moved base\n").expect("write moved base");
-        let mut index = repo.index().expect("reopen index");
-        index
-            .add_path(Path::new("README.md"))
-            .expect("add moved base");
-        index.write().expect("write moved base index");
-        let moved_tree_id = index.write_tree().expect("write moved base tree");
-        let moved_tree = repo.find_tree(moved_tree_id).expect("find moved base tree");
-        let reviewed_parent = repo
-            .find_commit(Oid::from_str(&expected).expect("expected oid"))
-            .expect("find reviewed parent");
-        let moved_base = repo
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                "moved base",
-                &moved_tree,
-                &[&reviewed_parent],
-            )
-            .expect("commit moved base")
-            .to_string();
-        repo.remote("origin", origin_path.to_str().expect("origin UTF-8"))
-            .expect("configure origin");
-        let git = merge::resolve_trusted_executable("git").expect("trusted git");
-        let push = Command::new(git)
-            .arg("-C")
-            .arg(&repo_path)
-            .args(["push", "origin", &format!("{moved_base}:refs/heads/main")])
-            .output()
-            .expect("push moved base");
-        assert!(
-            push.status.success(),
-            "{}",
-            String::from_utf8_lossy(&push.stderr)
-        );
-
-        let remote_branch = format!("maco/review/agent-a/{expected}");
-        let remote_ref = format!("refs/heads/{remote_branch}");
-        let journal_directory = temp.path().join("journal");
-        merge::create_private_directory(&journal_directory).expect("private journal directory");
-        let mut transaction = PublicationTransaction {
-            directory: journal_directory,
-            journal: PublicationTransactionJournal {
-                version: PUBLICATION_JOURNAL_VERSION,
-                transaction_id: "base-mismatch-before-push".to_string(),
-                sequence: 0,
-                agent_id: "agent-a".to_string(),
-                forge: ForgeKind::Github,
-                expected_oid: expected.clone(),
-                expected_base_oid: Some(expected.clone()),
-                remote_name: "origin".to_string(),
-                remote_binding_digest: "2222222222222222222222222222222222222222".to_string(),
-                remote_display: "https://github.example/owner/repo.git".to_string(),
-                remote_ref: remote_ref.clone(),
-                remote_branch,
-                github_repository: Some(GithubRepositoryIdentity {
-                    host: "github.example".to_string(),
-                    owner: "owner".to_string(),
-                    name: "repo".to_string(),
-                }),
-                base: "main".to_string(),
-                draft: true,
-                phase: PublicationTransactionPhase::Prepared,
-                push_observed_oid: None,
-                pr_url: None,
-                pr_head_oid: None,
-                pr_base: None,
-                pr_state: None,
-                pr_is_draft: None,
-                pr_number: None,
-                create_attempted: false,
-                created_by_transaction: false,
-                observed_existing_pr: false,
-                last_error: None,
-                updated_unix_seconds: 0,
-            },
-            remote_url: origin_path.to_string_lossy().to_string(),
-            remote_private_values: Vec::new(),
-        };
-
-        let error = ensure_github_remote_expected_commit(&repo_path, &mut transaction)
-            .expect_err("moved base must block before publication push");
-        assert!(error
-            .to_string()
-            .contains("before publication ref creation"));
-        assert!(transaction.journal.push_observed_oid.is_none());
-        let origin = Repository::open_bare(&origin_path).expect("open bare origin");
-        assert!(origin.find_reference(&remote_ref).is_err());
-    }
-
-    #[test]
-    fn wrong_remote_oid_records_diagnostic_without_poisoning_recovery_journal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        let origin_path = temp.path().join("origin.git");
-        let repo = Repository::init(&repo_path).expect("init repo");
-        Repository::init_bare(&origin_path).expect("init bare origin");
-        fs::write(repo_path.join("README.md"), "reviewed\n").expect("write reviewed file");
-        let mut index = repo.index().expect("open index");
-        index
-            .add_path(Path::new("README.md"))
-            .expect("add reviewed file");
-        index.write().expect("write index");
-        let tree_id = index.write_tree().expect("write reviewed tree");
-        let tree = repo.find_tree(tree_id).expect("find reviewed tree");
-        let signature =
-            git2::Signature::now("maco test", "maco@example.invalid").expect("signature");
-        let expected = repo
-            .commit(Some("HEAD"), &signature, &signature, "reviewed", &tree, &[])
-            .expect("commit reviewed")
-            .to_string();
-        drop(tree);
-        fs::write(repo_path.join("README.md"), "unreviewed\n").expect("write attack file");
-        let mut index = repo.index().expect("reopen index");
-        index
-            .add_path(Path::new("README.md"))
-            .expect("add attack file");
-        index.write().expect("write attack index");
-        let attack_tree_id = index.write_tree().expect("write attack tree");
-        let attack_tree = repo.find_tree(attack_tree_id).expect("find attack tree");
-        let parent = repo
-            .find_commit(Oid::from_str(&expected).expect("expected oid"))
-            .expect("find reviewed parent");
-        let attack = repo
-            .commit(
-                Some("HEAD"),
-                &signature,
-                &signature,
-                "unreviewed",
-                &attack_tree,
-                &[&parent],
-            )
-            .expect("commit attack")
-            .to_string();
-        repo.remote("origin", origin_path.to_str().expect("origin UTF-8"))
-            .expect("configure origin");
-        let remote_ref = format!("refs/heads/maco/review/agent-a/{expected}");
-        let git = merge::resolve_trusted_executable("git").expect("trusted git");
-        let initial = Command::new(&git)
-            .arg("-C")
-            .arg(&repo_path)
-            .args([
-                "push",
-                "origin",
-                &format!("{expected}:{remote_ref}"),
-                &format!("{expected}:refs/heads/main"),
-            ])
-            .output()
-            .expect("push reviewed refs");
-        assert!(
-            initial.status.success(),
-            "{}",
-            String::from_utf8_lossy(&initial.stderr)
-        );
-
-        let journal_directory = temp.path().join("journal");
-        merge::create_private_directory(&journal_directory).expect("private journal directory");
-        let mut transaction = PublicationTransaction {
-            directory: journal_directory.clone(),
-            journal: PublicationTransactionJournal {
-                version: PUBLICATION_JOURNAL_VERSION,
-                transaction_id: "wrong-remote-recovery".to_string(),
-                sequence: 0,
-                agent_id: "agent-a".to_string(),
-                forge: ForgeKind::Git,
-                expected_oid: expected.clone(),
-                expected_base_oid: Some(expected.clone()),
-                remote_name: "origin".to_string(),
-                remote_binding_digest: "2222222222222222222222222222222222222222".to_string(),
-                remote_display: origin_path.to_string_lossy().to_string(),
-                remote_ref: remote_ref.clone(),
-                remote_branch: remote_ref.trim_start_matches("refs/heads/").to_string(),
-                github_repository: None,
-                base: "main".to_string(),
-                draft: true,
-                phase: PublicationTransactionPhase::Completed,
-                push_observed_oid: Some(expected.clone()),
-                pr_url: None,
-                pr_head_oid: None,
-                pr_base: None,
-                pr_state: None,
-                pr_is_draft: None,
-                pr_number: None,
-                create_attempted: false,
-                created_by_transaction: false,
-                observed_existing_pr: false,
-                last_error: None,
-                updated_unix_seconds: 0,
-            },
-            remote_url: origin_path.to_string_lossy().to_string(),
-            remote_private_values: Vec::new(),
-        };
-        transaction.persist().expect("persist initial receipt");
-        let moved = Command::new(&git)
-            .arg("-C")
-            .arg(&repo_path)
-            .args([
-                "push",
-                "--force",
-                "origin",
-                &format!("{attack}:{remote_ref}"),
-            ])
-            .output()
-            .expect("move remote ref");
-        assert!(moved.status.success());
-
-        let error = ensure_remote_expected_commit(&repo_path, &mut transaction)
-            .expect_err("wrong remote OID must block");
         assert_eq!(
-            transaction.journal.push_observed_oid.as_deref(),
-            Some(expected.as_str())
+            validate_github_issue_receipt_url(
+                "https://github.example/owner/repo/issues/9",
+                &repository,
+            )
+            .expect("valid issue receipt"),
+            "https://github.example/owner/repo/issues/9"
         );
-        transaction.journal.last_error = Some(error.to_string());
-        transaction.persist().expect("persist safe diagnostic");
-        let loaded = load_latest_publication_journal(&journal_directory)
-            .expect("load journal after wrong observation")
-            .expect("journal exists");
-        assert_eq!(loaded.push_observed_oid.as_deref(), Some(expected.as_str()));
+        for invalid in [
+            "",
+            "https://github.example/owner/repo/issues",
+            "https://github.example/owner/repo/issues/0",
+            "https://github.example/owner/repo/issues/009",
+            "https://github.example/other/repo/issues/9",
+            "https://github.example/owner/repo/issues/9?token=x",
+            "https://github.example/owner/repo/issues/9#fragment",
+            "http://github.example/owner/repo/issues/9",
+        ] {
+            assert!(
+                validate_github_issue_receipt_url(invalid, &repository).is_err(),
+                "invalid issue receipt passed: {invalid}"
+            );
+        }
+    }
 
-        let restored = Command::new(&git)
-            .arg("-C")
-            .arg(&repo_path)
-            .args([
-                "push",
-                "--force",
-                "origin",
-                &format!("{expected}:{remote_ref}"),
-            ])
-            .output()
-            .expect("restore remote ref");
-        assert!(restored.status.success());
-        ensure_remote_expected_commit(&repo_path, &mut transaction)
-            .expect("reconcile restored remote ref");
-        assert!(transaction.journal.last_error.is_none());
+    #[test]
+    fn github_pr_receipt_parser_bounds_strings_and_requires_canonical_values() {
+        let valid = serde_json::json!({
+            "url": "https://github.example/owner/repo/pull/7",
+            "headRefOid": "1111111111111111111111111111111111111111",
+            "baseRefOid": "2222222222222222222222222222222222222222",
+            "number": 7,
+            "baseRefName": "main",
+            "state": "OPEN",
+            "isDraft": true,
+        });
+        github_pr_receipt_from_json(&valid).expect("valid PR receipt");
+
+        let mut invalid = valid.clone();
+        invalid["url"] = serde_json::json!("https://github.example/owner/repo/pull/7?x=1");
+        assert!(github_pr_receipt_from_json(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid["number"] = serde_json::json!(0);
+        assert!(github_pr_receipt_from_json(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid["headRefOid"] = serde_json::json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert!(github_pr_receipt_from_json(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid["baseRefName"] = serde_json::json!("a".repeat(MAX_GITHUB_RECEIPT_STRING_BYTES + 1));
+        assert!(github_pr_receipt_from_json(&invalid).is_err());
+        let excessive = serde_json::Value::Array(
+            std::iter::repeat_n(valid, MAX_GITHUB_PR_LIST_RECEIPTS + 1).collect(),
+        );
+        assert!(github_pr_list_from_json(&excessive).is_err());
     }
 
     #[test]
@@ -5674,7 +5783,6 @@ mod tests {
                 updated_unix_seconds: 0,
             },
             remote_url: "https://github.example/owner/repo.git".to_string(),
-            remote_private_values: Vec::new(),
         };
         let receipt = GithubPrResult {
             url: "https://github.example/owner/repo/pull/7".to_string(),
@@ -5706,7 +5814,17 @@ mod tests {
     #[test]
     fn github_command_environment_is_an_explicit_data_auth_allowlist() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let context = GhCommandContext::create(temp.path()).expect("create gh context");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        };
+        let context = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
+            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
+        })
+        .expect("create gh context");
         for key in [
             "GH_REPO",
             "GH_HOST",
@@ -5720,6 +5838,12 @@ mod tests {
             "SSL_CERT_DIR",
             "GIT_SSL_CAINFO",
             "GIT_SSL_CAPATH",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
         ] {
             assert!(
                 !context.environment.contains_key(key),
@@ -5740,13 +5864,15 @@ mod tests {
     }
 
     #[test]
-    fn publication_git_keeps_remote_credentials_out_of_argv_and_disk_config() {
+    fn publication_git_uses_only_private_path_scoped_basic_auth_config() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_path = temp.path().join("repo");
         Repository::init(&repo_path).expect("init repo");
-        let raw = "https://user:abcdef@example.invalid/owner/repo.git";
-        let context =
-            PublicationGitContext::create(&repo_path, raw).expect("create publication Git context");
+        let raw = "https://example.invalid/owner/repo";
+        let context = PublicationGitContext::create_with_token_source(&repo_path, raw, |key| {
+            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
+        })
+        .expect("create publication Git context");
         let args = context.command_args(vec![
             OsString::from("ls-remote"),
             OsString::from("--refs"),
@@ -5759,16 +5885,130 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(!argv.contains(raw));
-        assert!(!argv.contains("abcdef"));
+        assert!(!argv.contains("test-token"));
+        assert!(!context
+            .environment
+            .values()
+            .any(|value| value.contains("test-token")));
+        let config = git2::Config::open(&context.directory.join("config"))
+            .expect("open private publication config");
+        let header = config
+            .get_string("http.https://example.invalid/owner/repo.git.extraheader")
+            .expect("scoped auth header");
         assert_eq!(
-            context
-                .environment
-                .get("GIT_CONFIG_VALUE_0")
-                .map(String::as_str),
-            Some(raw)
+            header,
+            "Authorization: Basic eC1hY2Nlc3MtdG9rZW46dGVzdC10b2tlbg=="
         );
-        let config = fs::read(context.directory.join("config")).expect("read private config");
-        assert!(!String::from_utf8_lossy(&config).contains("abcdef"));
+        assert_eq!(
+            config
+                .get_string("remote.maco-publication.url")
+                .expect("bound remote"),
+            "https://example.invalid/owner/repo.git"
+        );
+        assert_eq!(
+            config
+                .get_string("http.followredirects")
+                .expect("redirect setting"),
+            "false"
+        );
+        assert!(config.get_bool("http.sslverify").expect("TLS setting"));
+        assert_eq!(config.get_string("http.proxy").expect("proxy setting"), "");
+        assert_eq!(
+            config
+                .get_string("credential.helper")
+                .expect("credential helper setting"),
+            ""
+        );
+    }
+
+    #[test]
+    fn publication_profiles_expose_only_required_config_and_git_objects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let repo = Repository::init(&repo_path).expect("init repo");
+        let context = PublicationGitContext::create_with_token_source(
+            &repo_path,
+            "https://github.example/owner/repo.git",
+            |key| (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string()),
+        )
+        .expect("create publication context");
+        let PublicationGitBoundary::Https(profile) = &context.boundary;
+        assert!(profile.visible_read_only_roots().is_empty());
+        let bindings = profile.visible_read_only_bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].0,
+            fs::canonicalize(repo.commondir().join("objects")).expect("objects")
+        );
+        assert_eq!(bindings[0].1, context.directory.join("source-objects"));
+        assert_eq!(profile.visible_read_only_files().len(), 2);
+        let state = fs::canonicalize(repo.commondir().join("maco/state")).expect("state");
+        assert!(profile.hidden_roots().contains(&state));
+        assert!(profile
+            .hidden_roots()
+            .contains(&fs::canonicalize(&repo_path).expect("repo root")));
+
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        };
+        let gh = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
+            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
+        })
+        .expect("create gh context");
+        assert!(gh.profile.visible_read_only_roots().is_empty());
+        assert_eq!(gh.profile.visible_read_only_files().len(), 1);
+        assert!(gh.profile.hidden_roots().contains(&state));
+    }
+
+    #[test]
+    fn missing_https_token_cleans_private_runtime_without_residue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let repo = Repository::init(&repo_path).expect("init repo");
+        merge::ensure_repo_common_state_directory(&repo).expect("state");
+        let runtime_root = merge::trusted_runtime_root(&repo_path).expect("runtime root");
+        let before = fs::read_dir(&runtime_root).expect("runtime root").count();
+        assert!(PublicationGitContext::create_with_token_source(
+            &repo_path,
+            "https://github.example/owner/repo.git",
+            |_| None,
+        )
+        .is_err());
+        let after = fs::read_dir(&runtime_root)
+            .expect("runtime root after failure")
+            .count();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn private_config_in_place_mutation_and_hardlink_are_detected_before_spawn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let context = PublicationGitContext::create_with_token_source(
+            &repo_path,
+            "https://github.example/owner/repo.git",
+            |key| (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string()),
+        )
+        .expect("create publication context");
+        let config_path = context.directory.join("config");
+        let mut original = fs::read(&config_path).expect("read config");
+        fs::write(&config_path, b"[core]\n\tbare = true\n").expect("mutate config in place");
+        assert!(verify_private_config_files(&context.config_files).is_err());
+        merge::write_private_file(&context.directory.join("replacement"), &original)
+            .expect("write replacement");
+        fs::remove_file(&config_path).expect("remove mutated config");
+        fs::rename(context.directory.join("replacement"), &config_path)
+            .expect("restore config path with changed inode");
+        assert!(verify_private_config_files(&context.config_files).is_err());
+
+        let hardlink = context.directory.join("config-hardlink");
+        fs::hard_link(&config_path, &hardlink).expect("hardlink config");
+        assert!(capture_private_config_file(&config_path).is_err());
+        fs::remove_file(hardlink).expect("remove hardlink before secret cleanup");
+        zeroize_bytes(&mut original);
     }
 
     #[test]
@@ -5788,7 +6028,14 @@ mod tests {
     }
 
     #[test]
-    fn publication_remote_structurally_classifies_every_supported_ssh_form() {
+    fn publication_remote_accepts_only_bounded_canonical_https() {
+        assert!(matches!(
+            publication_remote_transport("https://github.example/owner/repo")
+                .expect("classify HTTPS remote"),
+            PublicationRemoteTransport::Https { command_url, .. }
+                if command_url == "https://github.example/owner/repo.git"
+        ));
+
         for remote in [
             "ssh://github.example/owner/repo.git",
             "ssh://git@github.example:2222/owner/repo.git",
@@ -5798,33 +6045,22 @@ mod tests {
             "git@github.example:owner/repo.git",
             "[2001:db8::1]:owner/repo.git",
             "git@[2001:db8::1]:owner/repo.git",
-        ] {
-            assert_eq!(
-                publication_remote_transport(remote).expect("classify supported SSH remote"),
-                PublicationRemoteTransport::Ssh,
-                "{remote}"
-            );
-        }
-        for remote in [
-            "https://github.example/owner/repo.git",
-            "file:///tmp/repo.git",
             "/tmp/repo.git",
+            "file:///tmp/repo.git",
             "../repo.git",
             r"C:\\repo.git",
-        ] {
-            assert_eq!(
-                publication_remote_transport(remote).expect("classify supported non-SSH remote"),
-                PublicationRemoteTransport::NonSsh,
-                "{remote}"
-            );
-        }
-        for remote in [
+            "http://github.example/owner/repo.git",
+            "git://github.example/owner/repo.git",
             "ext://host/repo",
             "SSH://host/repo",
             "host::remote-helper",
             "ssh://user@@host/repo",
             "ssh://[2001:db8::1/repo",
             "host:",
+            "https://user@github.example/owner/repo.git",
+            "https://github.example/owner/repo.git?token=x",
+            "https://github.example/owner/repo.git#fragment",
+            "https://github.example/owner/%72epo.git",
         ] {
             assert!(
                 publication_remote_transport(remote).is_err(),
@@ -5834,209 +6070,260 @@ mod tests {
     }
 
     #[test]
-    fn userless_scp_remote_is_bound_to_fixed_trusted_ssh_command() {
+    fn publication_object_store_rejects_alternates_promisor_and_partial_clone_inputs() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_path = temp.path().join("repo");
-        Repository::init(&repo_path).expect("init repo");
-        let expected_known_hosts = match trusted_global_known_hosts_file() {
-            Ok(path) => path,
-            Err(expected_error) => {
-                let actual_error = match PublicationGitContext::create(
-                    &repo_path,
-                    "github.example:owner/repo.git",
-                ) {
-                    Ok(_) => panic!("SSH publication context must fail without trusted host keys"),
-                    Err(error) => error,
-                };
-                assert_eq!(actual_error.to_string(), expected_error.to_string());
-                assert!(actual_error.to_string().contains("global SSH known-hosts"));
-                return;
+        let repo = Repository::init(&repo_path).expect("init repo");
+        let objects = fs::canonicalize(repo.commondir().join("objects")).expect("objects");
+        validate_publication_object_store_is_self_contained(&repo, &objects)
+            .expect("ordinary object store");
+
+        let alternates = objects.join("info/alternates");
+        fs::write(&alternates, b"/tmp/escape\n").expect("write alternates");
+        assert!(validate_publication_object_store_is_self_contained(&repo, &objects).is_err());
+        fs::remove_file(&alternates).expect("remove alternates");
+
+        let promisor = objects.join("pack/pack-test.promisor");
+        fs::write(&promisor, b"").expect("write promisor marker");
+        assert!(validate_publication_object_store_is_self_contained(&repo, &objects).is_err());
+        fs::remove_file(&promisor).expect("remove promisor marker");
+
+        repo.config()
+            .expect("repo config")
+            .set_str("extensions.partialClone", "origin")
+            .expect("set partial clone extension");
+        assert!(validate_publication_object_store_is_self_contained(&repo, &objects).is_err());
+    }
+
+    #[test]
+    fn token_selection_is_host_specific_unambiguous_and_basic_encoded() {
+        let public = select_network_token_with("github.com", |key| {
+            (key == "GH_TOKEN").then(|| "test-token".to_string())
+        })
+        .expect("public token");
+        assert_eq!(
+            public.basic_str().expect("basic token"),
+            "eC1hY2Nlc3MtdG9rZW46dGVzdC10b2tlbg=="
+        );
+        assert!(select_network_token_with("github.com", |_| None).is_err());
+        assert!(
+            select_network_token_with("github.example", |key| match key {
+                "GH_ENTERPRISE_TOKEN" => Some("first-token".to_string()),
+                "GITHUB_ENTERPRISE_TOKEN" => Some("second-token".to_string()),
+                _ => None,
+            })
+            .is_err()
+        );
+        assert!(select_network_token_with("github.com", |key| {
+            (key == "GH_TOKEN").then(|| "unsafe'token".to_string())
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn token_redaction_covers_raw_and_basic_forms() {
+        let token = select_network_token_with("github.com", |key| {
+            (key == "GH_TOKEN").then(|| "test-token".to_string())
+        })
+        .expect("token");
+        let mut output = format!(
+            "raw={} basic={}",
+            token.as_str().expect("raw"),
+            token.basic_str().expect("basic")
+        )
+        .into_bytes();
+        redact_private_bytes(&mut output, &token.bytes);
+        redact_private_bytes(&mut output, &token.basic);
+        let output = String::from_utf8(output).expect("UTF-8 redaction");
+        assert!(!output.contains("test-token"));
+        assert!(!output.contains("eC1hY2Nlc3MtdG9rZW46dGVzdC10b2tlbg=="));
+        assert_eq!(output.matches("<redacted:network-token>").count(), 2);
+    }
+
+    #[test]
+    fn publication_network_capability_callsites_are_exactly_audited() {
+        let source_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut constructors = Vec::new();
+        let mut runners = Vec::new();
+        let constructor_needle = ["TrustedFixedNetworkProfile", "::read_write("].concat();
+        let runner_needle = ["merge::run_required_", "network_direct("].concat();
+        for entry in fs::read_dir(&source_directory).expect("read source directory") {
+            let entry = entry.expect("read source entry");
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
             }
+            let source = fs::read_to_string(&path).expect("read Rust source");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("UTF-8 source name");
+            let production_source = if name == "process_runner.rs" {
+                source
+                    .split_once("#[cfg(test)]\nmod tests")
+                    .map_or(source.as_str(), |(production, _)| production)
+            } else {
+                source.as_str()
+            };
+            for _ in production_source.match_indices(&constructor_needle) {
+                constructors.push(name.to_string());
+            }
+            for _ in production_source.match_indices(&runner_needle) {
+                runners.push(name.to_string());
+            }
+        }
+        constructors.sort();
+        runners.sort();
+        assert_eq!(
+            constructors,
+            ["process_runner.rs", "publication.rs", "publication.rs"]
+        );
+        assert_eq!(runners, ["publication.rs", "publication.rs"]);
+    }
+
+    #[test]
+    fn publication_url_slug_ref_and_oid_bounds_fail_closed() {
+        assert!(publication_remote_transport(&format!(
+            "https://example.invalid/owner/{}",
+            "a".repeat(MAX_PUBLICATION_PATH_BYTES)
+        ))
+        .is_err());
+        assert!(publication_remote_transport(&format!(
+            "https://{}.example/owner/repo",
+            "a".repeat(64)
+        ))
+        .is_err());
+        assert!(github_repository_identity(&format!(
+            "https://example.invalid/{}/repo",
+            "a".repeat(MAX_GITHUB_SLUG_BYTES + 1)
+        ))
+        .is_err());
+        assert!(validate_publication_ref(&format!(
+            "refs/heads/{}",
+            "a".repeat(MAX_PUBLICATION_REF_BYTES)
+        ))
+        .is_err());
+        assert!(validate_publication_git_operation(&[
+            OsString::from("push"),
+            OsString::from("--no-verify"),
+            OsString::from("--force-with-lease=refs/heads/review:"),
+            OsString::from("maco-publication"),
+            OsString::from(format!("{}:refs/heads/review", "A".repeat(40))),
+        ])
+        .is_err());
+
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
         };
-        let context = PublicationGitContext::create(&repo_path, "github.example:owner/repo.git")
-            .expect("create userless SCP publication context");
-        let config = git2::Config::open(&context.directory.join("config"))
-            .expect("open private publication config");
-        let command = config
-            .get_string("core.sshcommand")
-            .expect("fixed SSH command must be configured");
-        assert!(command.contains(" -F /dev/null "));
-        for required in [
-            "BatchMode=yes",
-            "IdentityFile=none",
-            "CertificateFile=none",
-            "PKCS11Provider=none",
-            "SecurityKeyProvider=none",
-            "PreferredAuthentications=publickey",
-            "PubkeyAuthentication=yes",
-            "GSSAPIAuthentication=no",
-            "HostbasedAuthentication=no",
-            "PasswordAuthentication=no",
-            "KbdInteractiveAuthentication=no",
-            "ForwardAgent=no",
-            "AddKeysToAgent=no",
-            "PermitLocalCommand=no",
-            "ProxyCommand=none",
-            "ClearAllForwardings=yes",
-            "RequestTTY=no",
-            "UserKnownHostsFile=/dev/null",
-            "StrictHostKeyChecking=yes",
-            "VerifyHostKeyDNS=no",
-            "UpdateHostKeys=no",
-        ] {
+        for malicious in ["--web", "--help"] {
+            let view = [
+                "pr",
+                "view",
+                malicious,
+                "--repo",
+                "github.example/owner/repo",
+                "--json",
+                "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+            assert!(validate_gh_operation(&view, &StdinMode::Null, &repository).is_err());
+
+            let create = [
+                "pr",
+                "create",
+                "--repo",
+                "github.example/owner/repo",
+                "--base",
+                malicious,
+                "--head",
+                "branch",
+                "--title",
+                "title",
+                "--body-file",
+                "-",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
             assert!(
-                command.contains(required),
-                "missing SSH control: {required}"
+                validate_gh_operation(&create, &StdinMode::Bytes(Vec::new()), &repository).is_err()
             );
-        }
-        assert!(command.contains(&format!(
-            "GlobalKnownHostsFile={}",
-            expected_known_hosts.display()
-        )));
-        assert_eq!(
-            context.trusted_global_known_hosts.as_ref(),
-            Some(&expected_known_hosts)
-        );
-        assert_eq!(
-            context.environment.get("SSH_AUTH_SOCK"),
-            env::var("SSH_AUTH_SOCK").ok().as_ref()
-        );
-        for key in [
-            "HOME",
-            "GIT_SSH",
-            "GIT_SSH_COMMAND",
-            "SSH_ASKPASS",
-            "SSH_ASKPASS_REQUIRE",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-        ] {
-            assert!(
-                !context.environment.contains_key(key),
-                "unexpected inherited SSH input {key}"
-            );
+
+            for args in [
+                vec![
+                    "pr",
+                    "list",
+                    "--repo",
+                    "github.example/owner/repo",
+                    "--head",
+                    malicious,
+                    "--state",
+                    "all",
+                    "--json",
+                    "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft",
+                ],
+                vec![
+                    "pr",
+                    "create",
+                    "--repo",
+                    "github.example/owner/repo",
+                    "--base",
+                    "main",
+                    "--head",
+                    malicious,
+                    "--title",
+                    "title",
+                    "--body-file",
+                    "-",
+                ],
+                vec![
+                    "pr",
+                    "create",
+                    "--repo",
+                    "github.example/owner/repo",
+                    "--base",
+                    "main",
+                    "--head",
+                    "branch",
+                    "--title",
+                    malicious,
+                    "--body-file",
+                    "-",
+                ],
+                vec![
+                    "issue",
+                    "create",
+                    "--repo",
+                    "github.example/owner/repo",
+                    "--title",
+                    "title",
+                    "--body-file",
+                    "-",
+                    "--label",
+                    malicious,
+                ],
+            ] {
+                let stdin = if args.get(1) == Some(&"list") {
+                    StdinMode::Null
+                } else {
+                    StdinMode::Bytes(Vec::new())
+                };
+                let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+                assert!(validate_gh_operation(&args, &stdin, &repository).is_err());
+            }
         }
     }
 
     #[test]
-    fn fixed_ssh_options_disable_ambient_auth_and_host_discovery() {
-        let rendered = fixed_trusted_ssh_options("/etc/ssh/ssh_known_hosts").join(" ");
-        for required in [
-            "-F /dev/null",
-            "IdentityFile=none",
-            "CertificateFile=none",
-            "PKCS11Provider=none",
-            "SecurityKeyProvider=none",
-            "PreferredAuthentications=publickey",
-            "GSSAPIAuthentication=no",
-            "HostbasedAuthentication=no",
-            "PasswordAuthentication=no",
-            "KbdInteractiveAuthentication=no",
-            "ForwardAgent=no",
-            "AddKeysToAgent=no",
-            "ProxyCommand=none",
-            "UserKnownHostsFile=/dev/null",
-            "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts",
-            "StrictHostKeyChecking=yes",
-            "VerifyHostKeyDNS=no",
-            "UpdateHostKeys=no",
-        ] {
-            assert!(
-                rendered.contains(required),
-                "missing SSH control: {required}"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn live_ssh_effective_config_has_only_fixed_auth_and_host_key_inputs() {
-        fn values<'a>(config: &'a str, key: &str) -> Vec<&'a str> {
-            config
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix(key)
-                        .and_then(|line| line.strip_prefix(' '))
-                })
-                .collect()
-        }
-
-        let ssh = merge::resolve_trusted_executable("ssh").expect("resolve trusted ssh");
-        let known_hosts = "/etc/ssh/ssh_known_hosts";
-        let output = Command::new(ssh)
-            .args(fixed_trusted_ssh_options(known_hosts))
-            .args(["-G", "maco-publication.invalid"])
-            .env_clear()
-            .output()
-            .expect("inspect effective trusted SSH configuration");
-        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        assert!(
-            output.status.success(),
-            "ssh -G failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let effective = String::from_utf8(output.stdout).expect("ssh -G output is UTF-8");
-        let assert_disabled = |key: &str| {
-            let actual = values(&effective, key);
-            assert!(
-                actual.len() == 1 && matches!(actual[0], "no" | "false"),
-                "effective {key} was not disabled: {actual:?}"
-            );
-        };
-
-        assert_eq!(values(&effective, "identityfile"), ["none"]);
-        assert_eq!(values(&effective, "certificatefile"), ["none"]);
-        assert_eq!(values(&effective, "userknownhostsfile"), ["/dev/null"]);
-        assert_eq!(values(&effective, "globalknownhostsfile"), [known_hosts]);
-        assert_eq!(values(&effective, "stricthostkeychecking"), ["true"]);
-        assert_disabled("verifyhostkeydns");
-        assert_disabled("updatehostkeys");
-        assert_eq!(
-            values(&effective, "preferredauthentications"),
-            ["publickey"]
-        );
-        assert_eq!(values(&effective, "pubkeyauthentication"), ["true"]);
-        assert_disabled("hostbasedauthentication");
-        assert_disabled("passwordauthentication");
-        assert_disabled("kbdinteractiveauthentication");
-        assert_disabled("forwardagent");
-        assert_disabled("addkeystoagent");
-
-        for key in [
-            "proxycommand",
-            "proxyjump",
-            "pkcs11provider",
-            "securitykeyprovider",
-        ] {
-            assert!(
-                values(&effective, key).iter().all(|value| *value == "none"),
-                "unexpected effective {key}: {:?}",
-                values(&effective, key)
-            );
-        }
-        let gssapi = values(&effective, "gssapiauthentication");
-        assert!(
-            (gssapi.len() == 1 && matches!(gssapi[0], "no" | "false"))
-                || (gssapi.is_empty()
-                    && stderr.contains("unsupported option")
-                    && stderr.contains("gssapiauthentication")),
-            "GSSAPI was not disabled: effective={gssapi:?}, stderr={stderr:?}"
-        );
-        assert!(!effective.contains("/.ssh/"));
-        assert!(!effective.contains(".ssh/id_"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn writable_sticky_ssh_ancestor_requires_read_only_mount_proof() {
-        assert!(!trusted_ssh_ancestor_metadata_is_safe(
-            false, true, 0, 0o17_75, false
-        ));
-        assert!(trusted_ssh_ancestor_metadata_is_safe(
-            false, true, 0, 0o17_75, true
-        ));
-        assert!(!trusted_ssh_ancestor_metadata_is_safe(
-            false, true, 1000, 0o755, true
-        ));
+    fn zeroizing_string_debug_is_redacted_and_explicit_clear_empties_it() {
+        let mut secret = ZeroizingString("test-token".to_string());
+        assert_eq!(format!("{secret:?}"), "<redacted:zeroizing-string>");
+        secret.zeroize();
+        assert!(secret.as_str().is_empty());
     }
 
     #[cfg(unix)]
@@ -6045,8 +6332,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let context = GhCommandContext::create(temp.path()).expect("create gh context");
-        assert_ne!(context.runtime_directory.path(), temp.path());
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        };
+        let context = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
+            (key == "GH_ENTERPRISE_TOKEN").then(|| "test-token".to_string())
+        })
+        .expect("create gh context");
+        assert_ne!(context.runtime_directory.path(), repo_path);
         fs::set_permissions(
             context.runtime_directory.path(),
             fs::Permissions::from_mode(0o755),

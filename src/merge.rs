@@ -2,7 +2,9 @@ use crate::{
     llm::Redactor,
     process_runner::{
         run_process, ContainmentEvidence, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
-        StdinMode,
+        SideEffectConfinementEvidence, SideEffectConfinementProfile,
+        SideEffectConfinementProfileKind, StdinMode, StrictOfflineWorkspaceProfile,
+        TrustedFixedNetworkProfile,
     },
     sync::normalize_repo_relative_path,
     worktree::{
@@ -4170,7 +4172,11 @@ fn run_candidate_validation_command_with_timeout(
 
     match output {
         Ok(output) => {
-            let evidence = require_verified_process_output("candidate validation command", &output);
+            let evidence = require_verified_process_output(
+                "candidate validation command",
+                &output,
+                SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            );
             let passed = evidence.is_ok()
                 && output.status.is_some_and(|status| status.success())
                 && !output.timed_out;
@@ -5276,12 +5282,14 @@ fn run_isolated_git_process(
 }
 
 fn run_isolated_git_process_os(
-    _context: &TemporaryIndex,
+    context: &TemporaryIndex,
     worktree_path: &Path,
     command_args: Vec<OsString>,
     stdin: StdinMode,
     label: &str,
 ) -> Result<GitCommandOutput> {
+    let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
+        .with_writable_artifact_root(&context.directory);
     run_required_direct(
         label,
         resolve_trusted_executable("git")?,
@@ -5292,6 +5300,7 @@ fn run_isolated_git_process_os(
         LOCAL_GIT_PROCESS_TIMEOUT,
         GIT_CAPTURE_LIMIT_BYTES,
         GIT_STDIN_LIMIT_BYTES,
+        profile,
     )
 }
 
@@ -5453,10 +5462,8 @@ fn validation_private_environment_key(key: &str) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
-pub(crate) fn minimal_network_environment(
-    allow_ssh_agent: bool,
-) -> Result<BTreeMap<String, String>> {
-    let mut allowed = vec![
+pub(crate) fn minimal_network_environment() -> Result<BTreeMap<String, String>> {
+    let allowed = [
         "SystemRoot",
         "WINDIR",
         "COMSPEC",
@@ -5465,9 +5472,6 @@ pub(crate) fn minimal_network_environment(
         "LC_ALL",
         "LC_CTYPE",
     ];
-    if allow_ssh_agent {
-        allowed.push("SSH_AUTH_SOCK");
-    }
     let mut environment = explicit_environment(&allowed);
     environment.insert("PATH".to_string(), trusted_path_text()?);
     environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
@@ -5506,6 +5510,75 @@ pub(crate) fn run_required_direct(
     timeout: Duration,
     capture_limit_bytes: usize,
     stdin_limit_bytes: usize,
+    profile: StrictOfflineWorkspaceProfile,
+) -> Result<RequiredCommandOutput> {
+    run_required_direct_with_profile(
+        label,
+        program,
+        args,
+        current_dir,
+        environment,
+        stdin,
+        timeout,
+        capture_limit_bytes,
+        stdin_limit_bytes,
+        SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_required_network_direct(
+    label: &str,
+    program: PathBuf,
+    args: Vec<OsString>,
+    current_dir: &Path,
+    environment: BTreeMap<String, String>,
+    stdin: StdinMode,
+    timeout: Duration,
+    capture_limit_bytes: usize,
+    stdin_limit_bytes: usize,
+    profile: TrustedFixedNetworkProfile,
+) -> Result<RequiredCommandOutput> {
+    validate_fixed_network_command(
+        label,
+        &program,
+        &args,
+        current_dir,
+        &environment,
+        &stdin,
+        timeout,
+        capture_limit_bytes,
+        stdin_limit_bytes,
+    )?;
+    run_required_direct_with_profile(
+        label,
+        program,
+        args,
+        current_dir,
+        environment,
+        stdin,
+        timeout,
+        capture_limit_bytes,
+        stdin_limit_bytes,
+        SideEffectConfinementProfile::TrustedFixedNetwork(profile),
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_required_direct_with_profile(
+    label: &str,
+    program: PathBuf,
+    args: Vec<OsString>,
+    current_dir: &Path,
+    environment: BTreeMap<String, String>,
+    stdin: StdinMode,
+    timeout: Duration,
+    capture_limit_bytes: usize,
+    stdin_limit_bytes: usize,
+    profile: SideEffectConfinementProfile,
+    expected_profile: SideEffectConfinementProfileKind,
 ) -> Result<RequiredCommandOutput> {
     if let StdinMode::Bytes(bytes) = &stdin {
         if bytes.len() > stdin_limit_bytes {
@@ -5515,11 +5588,12 @@ pub(crate) fn run_required_direct(
     let output = run_process(
         ProcessSpec::direct(label, program, args, current_dir, capture_limit_bytes)
             .with_environment(EnvironmentMode::ClearAndSet(environment))
+            .with_side_effect_confinement(profile)
             .with_stdin(stdin)
             .with_timeout(Some(timeout)),
     )
     .with_context(|| format!("failed to run {label}"))?;
-    require_verified_process_output(label, &output)?;
+    require_verified_process_output(label, &output, expected_profile)?;
     Ok(RequiredCommandOutput {
         success: output.status.is_some_and(|status| status.success()),
         stdout: output.stdout.as_bytes().to_vec(),
@@ -5527,12 +5601,16 @@ pub(crate) fn run_required_direct(
     })
 }
 
-fn require_verified_process_output(label: &str, output: &ProcessOutput) -> Result<()> {
+fn require_verified_process_output(
+    label: &str,
+    output: &ProcessOutput,
+    expected_profile: SideEffectConfinementProfileKind,
+) -> Result<()> {
     require_verified_containment(label, output.process_tree)?;
-    if !output.side_effects.is_verified() {
+    if output.side_effects != SideEffectConfinementEvidence::Verified(expected_profile) {
         bail!(
-            "{label} returned without verified side-effect confinement: {:?}",
-            output.side_effects
+            "{label} returned without exact verified {expected_profile:?} side-effect confinement: {:?}",
+            output.side_effects,
         );
     }
     if output.timed_out {
@@ -5546,6 +5624,144 @@ fn require_verified_process_output(label: &str, output: &ProcessOutput) -> Resul
     }
     if output.stdout.is_truncated() || output.stderr.is_truncated() {
         bail!("{label} exceeded its bounded output capture limit");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_fixed_network_command(
+    label: &str,
+    program: &Path,
+    args: &[OsString],
+    current_dir: &Path,
+    environment: &BTreeMap<String, String>,
+    stdin: &StdinMode,
+    timeout: Duration,
+    capture_limit_bytes: usize,
+    stdin_limit_bytes: usize,
+) -> Result<()> {
+    if label.is_empty()
+        || label.len() > 1024
+        || label.as_bytes().iter().any(|byte| byte.is_ascii_control())
+    {
+        bail!("trusted network command label is empty or oversized");
+    }
+    let program_text = program
+        .to_str()
+        .context("trusted network executable path was not strict UTF-8")?;
+    if program_text.len() > 4096
+        || program_text
+            .as_bytes()
+            .iter()
+            .any(|byte| byte.is_ascii_control())
+    {
+        bail!("trusted network executable path is malformed or oversized");
+    }
+    let executable_name = program
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("trusted network executable name was not UTF-8")?;
+    if !program.is_absolute() || !matches!(executable_name, "git" | "gh") {
+        bail!("trusted network command requires an absolute fixed git or gh executable");
+    }
+    let expected = resolve_trusted_executable(executable_name)?;
+    if expected != program {
+        bail!("trusted network executable did not match its fixed resolved identity");
+    }
+    if timeout.is_zero() || timeout > Duration::from_secs(10 * 60) {
+        bail!("trusted network command deadline is zero or exceeds ten minutes");
+    }
+    if capture_limit_bytes == 0
+        || capture_limit_bytes > 64 * 1024 * 1024
+        || stdin_limit_bytes > 64 * 1024 * 1024
+    {
+        bail!("trusted network stream bounds are zero or oversized");
+    }
+    if args.len() > 2048 {
+        bail!("trusted network argument vector is oversized");
+    }
+    let mut total_argument_bytes = 0usize;
+    for argument in args {
+        let argument = argument
+            .to_str()
+            .context("trusted network command argument was not strict UTF-8")?;
+        if argument.len() > 64 * 1024
+            || argument
+                .as_bytes()
+                .iter()
+                .any(|byte| byte.is_ascii_control())
+        {
+            bail!("trusted network command argument is malformed or oversized");
+        }
+        total_argument_bytes = total_argument_bytes
+            .checked_add(argument.len())
+            .context("trusted network argument size overflow")?;
+    }
+    if total_argument_bytes > 2 * 1024 * 1024 {
+        bail!("trusted network argument vector exceeds its aggregate bound");
+    }
+    if let StdinMode::Bytes(bytes) = stdin {
+        if bytes.len() > stdin_limit_bytes {
+            bail!("trusted network stdin exceeds its declared bound");
+        }
+    }
+    if matches!(stdin, StdinMode::Inherit) {
+        bail!("trusted network commands may not inherit stdin");
+    }
+    if !current_dir.is_absolute() {
+        bail!("trusted network working directory must be absolute");
+    }
+    validate_fixed_network_environment(environment, current_dir)
+}
+
+fn validate_fixed_network_environment(
+    environment: &BTreeMap<String, String>,
+    current_dir: &Path,
+) -> Result<()> {
+    const ALLOWED: &[&str] = &[
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_OPTIONAL_LOCKS",
+        "GIT_TERMINAL_PROMPT",
+        "GH_CONFIG_DIR",
+        "GH_PROMPT_DISABLED",
+    ];
+    if environment.len() > 32 {
+        bail!("trusted network environment exceeds its entry bound");
+    }
+    for (key, value) in environment {
+        if !ALLOWED.contains(&key.as_str())
+            || key.len() > 128
+            || value.len() > 1024 * 1024
+            || key
+                .as_bytes()
+                .iter()
+                .chain(value.as_bytes())
+                .any(|byte| byte.is_ascii_control())
+        {
+            bail!("trusted network environment contains an unapproved or oversized entry");
+        }
+    }
+    let trusted_path = trusted_path_text()?;
+    if environment.get("PATH").map(String::as_str) != Some(trusted_path.as_str()) {
+        bail!("trusted network PATH differs from the fixed system executable path");
+    }
+    for key in ["GIT_CONFIG_GLOBAL", "GH_CONFIG_DIR"] {
+        if let Some(value) = environment.get(key) {
+            let path = Path::new(value);
+            if !path.is_absolute() || !path.starts_with(current_dir) {
+                bail!("trusted network private config escaped its fixed runtime directory");
+            }
+        }
     }
     Ok(())
 }
@@ -5593,7 +5809,7 @@ fn is_git_injection_environment_key(key: &str) -> bool {
 }
 
 pub(crate) fn resolve_trusted_executable(name: &str) -> Result<PathBuf> {
-    if !matches!(name, "git" | "gh" | "ssh") {
+    if !matches!(name, "git" | "gh") {
         bail!("unsupported trusted executable name '{name}'");
     }
     #[cfg(target_os = "windows")]
@@ -6340,11 +6556,73 @@ mod tests {
             stdin_error: None,
         };
 
-        let error = require_verified_process_output("test command", &output).unwrap_err();
+        let error = require_verified_process_output(
+            "test command",
+            &output,
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        )
+        .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("without verified side-effect confinement"));
+        assert!(error.to_string().contains("without exact verified"));
+    }
+
+    #[test]
+    fn required_network_output_rejects_even_verified_wrong_profile() {
+        let output = ProcessOutput {
+            status: None,
+            duration: Duration::ZERO,
+            timed_out: false,
+            process_tree: ContainmentEvidence::VerifiedEmpty(
+                crate::process_runner::ContainmentBackend::DirectChild,
+            ),
+            side_effects: crate::process_runner::SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            ),
+            stdout: crate::process_runner::CapturedBytes::default(),
+            stderr: crate::process_runner::CapturedBytes::default(),
+            process_error: None,
+            stdin_error: None,
+        };
+        assert!(require_verified_process_output(
+            "network test command",
+            &output,
+            SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn trusted_network_environment_and_stdin_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global_config = temp.path().join("global-config");
+        write_private_file(&global_config, b"").expect("global config");
+        let mut environment = minimal_network_environment().expect("minimal environment");
+        environment.insert(
+            "GIT_CONFIG_GLOBAL".to_string(),
+            global_config.to_string_lossy().into_owned(),
+        );
+        validate_fixed_network_environment(&environment, temp.path())
+            .expect("exact network environment");
+        environment.insert(
+            "HTTPS_PROXY".to_string(),
+            "https://proxy.invalid".to_string(),
+        );
+        assert!(validate_fixed_network_environment(&environment, temp.path()).is_err());
+        environment.remove("HTTPS_PROXY");
+
+        let git = resolve_trusted_executable("git").expect("trusted git");
+        assert!(validate_fixed_network_command(
+            "network stdin test",
+            &git,
+            &[OsString::from("ls-remote")],
+            temp.path(),
+            &environment,
+            &StdinMode::Inherit,
+            Duration::from_secs(1),
+            1024,
+            0,
+        )
+        .is_err());
     }
 
     fn private_runtime_test_root(temp: &tempfile::TempDir) -> PathBuf {

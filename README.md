@@ -605,44 +605,56 @@ holder.
 
 Validation evidence remains bound to the exact candidate snapshot described
 above. Git and GitHub publication use a unique OID-derived remote ref and push
-the reviewed object with a create-only lease. Network Git runs against a private
-bare context and structurally reads none of the real repository's local,
-worktree, included, global, or system config. The raw origin URL is supplied as
-guarded child-only config data, not an argument, process display, journal field,
-or on-disk temporary config. Proxy, custom CA, askpass, credential-helper, HOME,
-and custom SSH routing variables are absent. `ssh://`, `git+ssh://`,
-`ssh+git://`, and SCP-style origins with an optional user (including userless
-`host:path` and bracketed IPv6 hosts) are structurally classified as SSH. Every
-such origin uses a trusted absolute `ssh` with user config disabled, batch mode,
-`ProxyCommand=none`, and local commands disabled. Default identity and certificate
-files, PKCS#11/security-key providers, GSSAPI, host-based, password, and
-keyboard-interactive authentication are disabled; agent forwarding and adding
-keys to the agent are also disabled. `SSH_AUTH_SOCK` is therefore the only
-preserved SSH data-auth input. Host authentication is separate and fail-closed:
-user known-host files and DNS/update discovery are disabled, strict host-key
-checking is enabled, and `GlobalKnownHostsFile` is bound to the canonical target
-of a root-owned, non-writable `/etc/ssh/ssh_known_hosts` (or
-`ssh_known_hosts2`). If neither system file exists, is trusted, or contains the
-requested host, an administrator must provision it before SSH publication can
-succeed. Ambiguous authorities and unsupported URL schemes are refused. HTTPS
-Git publication therefore requires credentials in
-unencoded URL userinfo or another transport that needs no inherited helper.
-Query, fragment, and percent-encoded credential forms are refused because
-reliable transport and error redaction semantics cannot be guaranteed.
+the reviewed lowercase object ID with a create-only lease. External publication
+accepts only a bounded, canonical `https://host/repository/path(.git)` origin;
+GitHub mode further requires exactly `owner/repository`.
+HTTP, SSH, SCP, Git helpers, URL userinfo, query/fragment credentials, escapes,
+and relative paths are refused. Local and `file://` bare remotes also fail
+closed: a concurrent same-UID process could otherwise alter the remote config
+during `receive-pack`, after preflight but before a hook or helper decision.
+
+Network Git runs against a private bare context. The real repo-common
+`maco/state`, primary/source worktrees, and sibling runtimes are masked; only the
+repo-common `objects` directory is rebound read-only at an independent empty
+`source-objects` destination inside that private runtime, and the private
+alternates file points only at that destination. The effective mount identity
+must match the source object directory. Source stores containing Git/http
+alternates, promisor metadata, or partial-clone configuration are refused. The
+child receives a
+cleared, exact environment and a fixed trusted `git`; proxy, custom CA, askpass,
+credential helpers, tracing, HOME, SSH-agent, and ambient Git config inputs are
+absent. On Linux the effective unit must prove `PrivateNetwork=no`, exactly
+`AF_INET AF_INET6`, bounded resources, exact mounts, and masked same-user IPC
+sockets. Other platforms fail closed until an equivalent verified backend
+exists.
+
+HTTPS authentication is token-only. `github.com` accepts `GH_TOKEN` or
+`GITHUB_TOKEN`; another host accepts `GH_ENTERPRISE_TOKEN` or
+`GITHUB_ENTERPRISE_TOKEN`. If both permitted variables are present they must be
+identical. The token is never placed in argv, the child environment, reports,
+or journals. A private 0600 config binds `Authorization: Basic
+base64("x-access-token:" + token)` to the exact canonical repository URL,
+requires TLS verification, disables redirects, proxies, askpass, and credential
+helpers, and is rebound read-only. Its path/open-file identity, owner, mode,
+single-link count, bounded exact bytes, and containing runtime identity are
+checked immediately before and after every command. Raw and encoded token forms
+are redacted from bounded output and zeroized with the private config on every
+success or error path.
 
 GitHub publication observes the remote head and exact base OIDs before PR
 creation, reads the resulting PR with `gh pr view`, and requires matching
 `headRefOid`, `baseRefOid`, base branch, open state, and draft/ready value before
 persisting any PR receipt fields or advancing the receipt phase.
-The HTTPS/SSH origin is also parsed into a bound host/owner/repository identity.
+The HTTPS origin is also parsed into a bound host/owner/repository identity.
 Every `gh pr` and `gh issue create` call receives that explicit `--repo`;
-`gh` receives an empty private config directory and an explicit environment
-allowlist containing only OS/locale essentials plus GitHub token variables.
-HOME, proxy, custom CA, ambient repository, debug, pager, and forced-TTY routing
-are absent. Its current directory is that private config runtime, whose identity,
-owner record, and owner-only mode are rechecked immediately before each spawn;
-the potentially hostile source worktree is never the `gh` current directory.
-The receipt URL must identify the same repository and PR number.
+`gh` receives a private 0600 `hosts.yml` and an explicit environment allowlist
+containing only OS/locale essentials, fixed PATH, `GH_CONFIG_DIR`, and disabled
+prompts; token variables are not inherited. HOME, Git config, proxy, custom CA,
+ambient repository, debug, pager, and forced-TTY routing are absent. Its current
+directory is that private config runtime, while repo state and source/primary
+worktrees are masked. Config identity and bytes are rechecked around every
+allowlisted PR/issue subcommand. The receipt URL must identify the same bound
+repository and PR number.
 Publication observes the remote head and base again after that receipt. A
 mismatch is reported as blocked rather than published.
 
