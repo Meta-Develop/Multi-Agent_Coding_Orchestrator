@@ -45,6 +45,10 @@ const ENTRY_QUARANTINE_PREFIX: &str = ".maco-entry-quarantine-";
 const TEMP_QUARANTINE_PREFIX: &str = ".maco-temp-quarantine-";
 #[cfg(target_os = "linux")]
 const DELETION_QUARANTINE_PREFIX: &str = ".maco-delete-";
+#[cfg(target_os = "linux")]
+const DELETION_QUARANTINE_V2_PREFIX: &str = ".maco-delete-v2-";
+#[cfg(target_os = "linux")]
+const DELETION_QUARANTINE_V2_DOMAIN: &[u8] = b"MACO\0deletion-quarantine\0v2\0";
 const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -551,6 +555,22 @@ impl AtomicStateWriter {
         file_name: impl AsRef<OsStr>,
         contents: &[u8],
     ) -> Result<()> {
+        Self::write_direct_fenced(root, file_name, contents, || root.verify())
+    }
+
+    /// Stages a complete private file, then consults `fence` immediately
+    /// before and after the atomic destination replacement. Callers protecting
+    /// a state file with a pathname-bound kernel lock use this to prevent a
+    /// stale lock domain from committing after its lock name was rebound.
+    pub(crate) fn write_direct_fenced<F>(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+        contents: &[u8],
+        mut fence: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         let file_name = file_name.as_ref();
         validate_single_component(file_name)?;
         root.verify()?;
@@ -567,9 +587,10 @@ impl AtomicStateWriter {
                 format!("failed to flush temporary state {}", temp_path.display())
             })?;
             drop(file);
-            root.verify()?;
+            fence().context("state mutation fence failed before atomic replacement")?;
             atomic_replace_at(root, &temp_name, file_name)?;
             sync_directory(root)?;
+            fence().context("state mutation fence failed after atomic replacement")?;
             Ok(())
         })();
         // A failed write deliberately leaves its random temporary name for
@@ -668,6 +689,9 @@ impl AtomicStateWriter {
 pub struct KernelStateLock {
     file: File,
     path: PathBuf,
+    file_name: OsString,
+    identity: FileIdentity,
+    root_identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -704,9 +728,18 @@ impl KernelStateLock {
         root.verify()?;
         let path = root.direct_child(file_name)?;
         let file = open_stable_private_file_at(root, file_name)?;
+        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
         lock_file(&file, &path, timeout)?;
-        root.verify()?;
-        Ok(Self { file, path })
+        run_kernel_lock_after_flock_hook(&path);
+        let lock = Self {
+            file,
+            path,
+            file_name: file_name.to_os_string(),
+            identity,
+            root_identity: root.identity().clone(),
+        };
+        lock.verify_direct_binding(root)?;
+        Ok(lock)
     }
 
     pub(crate) fn try_acquire_shared_direct(
@@ -740,15 +773,141 @@ impl KernelStateLock {
         root.verify()?;
         let path = root.direct_child(file_name)?;
         let file = open_stable_private_file_at(root, file_name)?;
+        let identity = verify_open_lock_binding(root, file_name, &file, None, &path)?;
         try_lock_file(&file, &path, operation)?;
-        root.verify()?;
-        Ok(Self { file, path })
+        run_kernel_lock_after_flock_hook(&path);
+        let lock = Self {
+            file,
+            path,
+            file_name: file_name.to_os_string(),
+            identity,
+            root_identity: root.identity().clone(),
+        };
+        lock.verify_direct_binding(root)?;
+        Ok(lock)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+
+    /// Revalidates both the held descriptor and the direct pathname that must
+    /// still name it. This check is intentionally usable before and after each
+    /// protected state operation, not only during acquisition.
+    pub(crate) fn verify_direct_binding(&self, root: &SafeRoot) -> Result<()> {
+        if self.root_identity != *root.identity() {
+            bail!("kernel state lock was presented with a different root inode");
+        }
+        let observed = verify_open_lock_binding(
+            root,
+            &self.file_name,
+            &self.file,
+            Some(&self.identity),
+            &self.path,
+        )?;
+        if observed != self.identity {
+            bail!(
+                "kernel state lock descriptor identity changed unexpectedly: {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
 }
+
+#[cfg(unix)]
+fn verify_open_lock_binding(
+    root: &SafeRoot,
+    file_name: &OsStr,
+    file: &File,
+    expected: Option<&FileIdentity>,
+    path: &Path,
+) -> Result<FileIdentity> {
+    root.verify()?;
+    let descriptor = fstat(file.as_raw_fd())?;
+    validate_private_lock_stat(&descriptor, path)?;
+    let name = c_string(file_name)?;
+    let pathname = fstatat_no_follow(root.directory.as_raw_fd(), &name)?;
+    validate_private_lock_stat(&pathname, path)?;
+    let descriptor_identity = identity_from_stat(&descriptor);
+    let pathname_identity = identity_from_stat(&pathname);
+    if descriptor_identity != pathname_identity {
+        bail!(
+            "kernel state lock path does not name its opened descriptor: {}",
+            path.display()
+        );
+    }
+    if expected.is_some_and(|expected| expected != &descriptor_identity) {
+        bail!(
+            "kernel state lock path was rebound while its original inode remained locked: {}",
+            path.display()
+        );
+    }
+    root.verify()?;
+    Ok(descriptor_identity)
+}
+
+#[cfg(not(unix))]
+fn verify_open_lock_binding(
+    _root: &SafeRoot,
+    _file_name: &OsStr,
+    _file: &File,
+    _expected: Option<&FileIdentity>,
+    path: &Path,
+) -> Result<FileIdentity> {
+    bail!(
+        "descriptor/path lock binding verification is unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn validate_private_lock_stat(stat: &libc::stat, path: &Path) -> Result<()> {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_nlink != 1
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_mode & 0o777 != 0o600
+    {
+        bail!(
+            "kernel state lock is not an owner-private single-link regular file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+type KernelLockAfterFlockHook = Box<dyn FnMut(&Path) -> bool>;
+
+#[cfg(test)]
+thread_local! {
+    static KERNEL_LOCK_AFTER_FLOCK_HOOK: std::cell::RefCell<Option<KernelLockAfterFlockHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_kernel_lock_after_flock_hook(hook: impl FnMut(&Path) -> bool + 'static) {
+    KERNEL_LOCK_AFTER_FLOCK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_kernel_lock_after_flock_hook(path: &Path) {
+    let hook = KERNEL_LOCK_AFTER_FLOCK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(mut hook) = hook {
+        if !hook(path) {
+            KERNEL_LOCK_AFTER_FLOCK_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(hook);
+            });
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn run_kernel_lock_after_flock_hook(_path: &Path) {}
 
 impl Drop for KernelStateLock {
     fn drop(&mut self) {
@@ -773,6 +932,7 @@ pub(crate) struct PrivateDirectoryScavengeLimits {
     pub max_directories: usize,
     pub max_tree_entries: usize,
     pub max_total_bytes: u64,
+    pub max_duration: Duration,
 }
 
 /// Removes bounded owner-private crash directories created through
@@ -785,21 +945,55 @@ pub(crate) struct PrivateDirectoryScavengeLimits {
 /// Live directories are atomically quarantined before recursive deletion.
 /// Existing deletion quarantines are resumed in place, so an interrupted
 /// cleanup remains recoverable on the next lock-held invocation.
+#[cfg(test)]
 pub(crate) fn scavenge_private_random_directories(
     root: &SafeRoot,
     stable_lock_file: impl AsRef<OsStr>,
     random_name_seed: impl AsRef<OsStr>,
     limits: PrivateDirectoryScavengeLimits,
 ) -> Result<usize> {
+    if limits.max_duration.is_zero() {
+        bail!("private directory scavenging limits must be non-zero");
+    }
+    let deadline = Instant::now()
+        .checked_add(limits.max_duration)
+        .context("private directory scavenging deadline overflowed")?;
+    scavenge_private_random_directories_until(
+        root,
+        stable_lock_file,
+        random_name_seed,
+        limits,
+        deadline,
+    )
+}
+
+pub(crate) fn scavenge_private_random_directories_until(
+    root: &SafeRoot,
+    stable_lock_file: impl AsRef<OsStr>,
+    random_name_seed: impl AsRef<OsStr>,
+    limits: PrivateDirectoryScavengeLimits,
+    outer_deadline: Instant,
+) -> Result<usize> {
     let stable_lock_file = stable_lock_file.as_ref();
     let random_name_seed = random_name_seed.as_ref();
     validate_single_component(stable_lock_file)?;
     validate_single_component(random_name_seed)?;
     root.verify()?;
+    let local_deadline = Instant::now()
+        .checked_add(limits.max_duration)
+        .context("private directory scavenging deadline overflowed")?;
+    let deadline = std::cmp::min(local_deadline, outer_deadline);
+    ensure_before_deadline(Some(deadline), "before private directory scavenging")?;
 
     #[cfg(target_os = "linux")]
     {
-        scavenge_private_random_directories_linux(root, stable_lock_file, random_name_seed, limits)
+        scavenge_private_random_directories_linux(
+            root,
+            stable_lock_file,
+            random_name_seed,
+            limits,
+            deadline,
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1887,12 +2081,94 @@ fn component_checksum(name: &OsStr) -> String {
 
 #[cfg(target_os = "linux")]
 fn deletion_quarantine_name(name: &OsStr, identity: &FileIdentity) -> OsString {
+    let source = base64url_encode(name.as_bytes());
+    let tag = deletion_quarantine_tag(name, identity);
     OsString::from(format!(
-        "{DELETION_QUARANTINE_PREFIX}{}-{:016x}-{:016x}",
-        component_checksum(name),
-        identity.device,
-        identity.file
+        "{DELETION_QUARANTINE_V2_PREFIX}{source}-{tag}-{:016x}-{:016x}",
+        identity.device, identity.file
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn deletion_quarantine_tag(name: &OsStr, identity: &FileIdentity) -> String {
+    let mut payload = Vec::with_capacity(
+        DELETION_QUARANTINE_V2_DOMAIN
+            .len()
+            .saturating_add(8)
+            .saturating_add(name.as_bytes().len())
+            .saturating_add(16),
+    );
+    payload.extend_from_slice(DELETION_QUARANTINE_V2_DOMAIN);
+    payload.extend_from_slice(
+        &u64::try_from(name.as_bytes().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    payload.extend_from_slice(name.as_bytes());
+    payload.extend_from_slice(&identity.device.to_be_bytes());
+    payload.extend_from_slice(&identity.file.to_be_bytes());
+    let checksum = stable_checksum(&payload);
+    // stable_checksum has a fixed `maco-v1-` prefix followed by two u64s.
+    checksum[8..40].to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn base64url_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(bytes.len().saturating_add(2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+        let second_index = (first & 0x03) << 4 | chunk.get(1).copied().unwrap_or(0) >> 4;
+        encoded.push(char::from(ALPHABET[usize::from(second_index)]));
+        if let Some(second) = chunk.get(1).copied() {
+            let third_index = (second & 0x0f) << 2 | chunk.get(2).copied().unwrap_or(0) >> 6;
+            encoded.push(char::from(ALPHABET[usize::from(third_index)]));
+        }
+        if let Some(third) = chunk.get(2).copied() {
+            encoded.push(char::from(ALPHABET[usize::from(third & 0x3f)]));
+        }
+    }
+    encoded
+}
+
+#[cfg(target_os = "linux")]
+fn base64url_decode(encoded: &[u8]) -> Result<Vec<u8>> {
+    if encoded.is_empty() || encoded.len() % 4 == 1 {
+        bail!("private residue quarantine source encoding is malformed");
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3 + 2);
+    for chunk in encoded.chunks(4) {
+        let mut values = [0u8; 4];
+        for (index, byte) in chunk.iter().copied().enumerate() {
+            values[index] = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'-' => 62,
+                b'_' => 63,
+                _ => bail!("private residue quarantine source is not canonical base64url"),
+            };
+        }
+        decoded.push(values[0] << 2 | values[1] >> 4);
+        if chunk.len() >= 3 {
+            decoded.push(values[1] << 4 | values[2] >> 2);
+        }
+        if chunk.len() == 4 {
+            decoded.push(values[2] << 6 | values[3]);
+        }
+    }
+    if base64url_encode(&decoded).as_bytes() != encoded {
+        bail!("private residue quarantine source encoding is not canonical");
+    }
+    Ok(decoded)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct DeletionQuarantineBinding {
+    source: OsString,
+    identity: FileIdentity,
 }
 
 #[cfg(target_os = "linux")]
@@ -1909,27 +2185,35 @@ fn scavenge_private_random_directories_linux(
     stable_lock_file: &OsStr,
     random_name_seed: &OsStr,
     limits: PrivateDirectoryScavengeLimits,
+    deadline: Instant,
 ) -> Result<usize> {
-    if limits.max_root_entries == 0 || limits.max_directories == 0 || limits.max_tree_entries == 0 {
+    if limits.max_root_entries == 0
+        || limits.max_directories == 0
+        || limits.max_tree_entries == 0
+        || limits.max_duration.is_zero()
+    {
         bail!("private directory scavenging limits must be non-zero");
     }
+    ensure_before_deadline(Some(deadline), "before private residue root verification")?;
     root.verify()?;
     let root_stat = fstat(root.directory.as_raw_fd())?;
     let mut root_budget = TreeBudget {
         remaining_entries: limits.max_root_entries,
     };
     let names =
-        directory_entries(root.directory.as_raw_fd(), &mut root_budget).with_context(|| {
-            format!(
-                "private residue root exceeded its {} entry budget",
-                limits.max_root_entries
-            )
-        })?;
+        directory_entries_until(root.directory.as_raw_fd(), &mut root_budget, Some(deadline))
+            .with_context(|| {
+                format!(
+                    "private residue root exceeded its {} entry budget",
+                    limits.max_root_entries
+                )
+            })?;
     let mut saw_lock = false;
     let mut residues = Vec::new();
     let mut identities = BTreeMap::new();
 
     for name in names {
+        ensure_before_deadline(Some(deadline), "during private residue root scan")?;
         let name_c = c_string(&name)?;
         let stat = fstatat_no_follow(root.directory.as_raw_fd(), &name_c)?;
         if name == stable_lock_file {
@@ -1939,8 +2223,8 @@ fn scavenge_private_random_directories_linux(
         }
 
         let live = is_canonical_random_temp_name(random_name_seed, &name);
-        let quarantined_identity = deletion_quarantine_identity(&name)?;
-        if !live && quarantined_identity.is_none() {
+        let quarantined = deletion_quarantine_binding(&name)?;
+        if !live && quarantined.is_none() {
             bail!(
                 "unexpected entry in private residue root requires manual inspection: {}",
                 root.path().join(&name).display()
@@ -1948,8 +2232,14 @@ fn scavenge_private_random_directories_linux(
         }
         validate_private_scavenge_directory(root, &name, &stat, root_stat.st_dev)?;
         let identity = identity_from_stat(&stat);
-        if let Some(encoded) = quarantined_identity {
-            if encoded != identity {
+        if let Some(encoded) = quarantined {
+            if !is_canonical_random_temp_name(random_name_seed, &encoded.source) {
+                bail!(
+                    "private residue quarantine does not encode a canonical source name: {}",
+                    root.path().join(&name).display()
+                );
+            }
+            if encoded.identity != identity {
                 bail!(
                     "private residue quarantine identity is malformed or changed: {}",
                     root.path().join(&name).display()
@@ -1992,6 +2282,7 @@ fn scavenge_private_random_directories_linux(
     };
     let mut remaining_bytes = limits.max_total_bytes;
     for residue in &residues {
+        ensure_before_deadline(Some(deadline), "before private residue tree audit")?;
         let name_c = c_string(&residue.name)?;
         let directory = openat_directory(root.directory.as_raw_fd(), &name_c)?;
         let opened = fstat(directory.as_raw_fd())?;
@@ -2007,6 +2298,7 @@ fn scavenge_private_random_directories_linux(
             0,
             &mut tree_budget,
             &mut remaining_bytes,
+            Some(deadline),
         )
         .with_context(|| {
             format!(
@@ -2018,6 +2310,7 @@ fn scavenge_private_random_directories_linux(
 
     let mut removed = 0usize;
     for residue in residues {
+        ensure_before_deadline(Some(deadline), "before top-level residue quarantine")?;
         let cleanup_name = if residue.already_quarantined {
             residue.name
         } else {
@@ -2030,14 +2323,16 @@ fn scavenge_private_random_directories_linux(
             )?;
             cleanup_name
         };
-        remove_tree_at_name_linux(
+        remove_tree_at_name_linux_with_deadline(
             root,
             &cleanup_name,
             &residue.identity,
             TreeLinkPolicy::UnlinkLinks,
+            Some(deadline),
         )?;
         removed = removed.saturating_add(1);
     }
+    ensure_before_deadline(Some(deadline), "after private residue cleanup")?;
     root.verify()?;
     Ok(removed)
 }
@@ -2121,14 +2416,18 @@ fn canonical_decimal_u64(bytes: &[u8]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn deletion_quarantine_identity(name: &OsStr) -> Result<Option<FileIdentity>> {
+fn deletion_quarantine_binding(name: &OsStr) -> Result<Option<DeletionQuarantineBinding>> {
     let bytes = name.as_bytes();
     let prefix = DELETION_QUARANTINE_PREFIX.as_bytes();
     if !bytes.starts_with(prefix) {
         return Ok(None);
     }
-    let body = &bytes[prefix.len()..];
-    if body.len() < 8 + 32 + 2 + 16 + 1 + 16 {
+    let v2_prefix = DELETION_QUARANTINE_V2_PREFIX.as_bytes();
+    if !bytes.starts_with(v2_prefix) {
+        bail!("private residue deletion quarantine version is unsupported");
+    }
+    let body = &bytes[v2_prefix.len()..];
+    if body.len() < 2 + 32 + 1 + 16 + 1 + 16 {
         bail!("private residue deletion quarantine name is malformed");
     }
     let inode_separator = body
@@ -2141,27 +2440,33 @@ fn deletion_quarantine_identity(name: &OsStr) -> Result<Option<FileIdentity>> {
     if body.get(inode_separator) != Some(&b'-') || body.get(device_separator) != Some(&b'-') {
         bail!("private residue deletion quarantine identity is malformed");
     }
-    let checksum = &body[..device_separator];
-    if checksum.len() < 8 + 32 + 2
-        || !checksum.starts_with(b"maco-v1-")
-        || !checksum[8..40]
+    let source_and_tag = &body[..device_separator];
+    let tag_separator = source_and_tag
+        .len()
+        .checked_sub(33)
+        .context("private residue quarantine tag underflow")?;
+    if source_and_tag.get(tag_separator) != Some(&b'-') {
+        bail!("private residue deletion quarantine tag is malformed");
+    }
+    let encoded_source = &source_and_tag[..tag_separator];
+    let tag = &source_and_tag[tag_separator + 1..];
+    if tag.len() != 32
+        || !tag
             .iter()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        || checksum.get(40) != Some(&b'-')
-        || !canonical_decimal_u64(&checksum[41..])
     {
-        bail!("private residue deletion quarantine checksum is malformed");
+        bail!("private residue deletion quarantine tag is not canonical lowercase hex");
     }
-    let component_len = std::str::from_utf8(&checksum[41..])
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .context("private residue deletion quarantine length is malformed")?;
-    if component_len == 0 || component_len > 255 {
-        bail!("private residue deletion quarantine component length is unsafe");
-    }
+    let source = OsString::from_vec(base64url_decode(encoded_source)?);
+    validate_single_component(&source)?;
     let device = parse_fixed_lower_hex_u64(&body[device_separator + 1..inode_separator])?;
     let file = parse_fixed_lower_hex_u64(&body[inode_separator + 1..])?;
-    Ok(Some(FileIdentity { device, file }))
+    let identity = FileIdentity { device, file };
+    let expected = deletion_quarantine_name(&source, &identity);
+    if expected.as_bytes() != bytes {
+        bail!("private residue deletion quarantine authentication tag does not match");
+    }
+    Ok(Some(DeletionQuarantineBinding { source, identity }))
 }
 
 #[cfg(target_os = "linux")]
@@ -2184,11 +2489,14 @@ fn audit_private_residue_tree(
     depth: usize,
     entry_budget: &mut TreeBudget,
     remaining_bytes: &mut u64,
+    deadline: Option<Instant>,
 ) -> Result<()> {
+    ensure_before_deadline(deadline, "during private residue tree audit")?;
     if depth > MAX_TREE_DEPTH {
         bail!("private residue tree exceeded its maximum depth of {MAX_TREE_DEPTH}");
     }
-    for name in directory_entries(fd, entry_budget)? {
+    for name in directory_entries_until(fd, entry_budget, deadline)? {
+        ensure_before_deadline(deadline, "during private residue tree audit")?;
         let name_c = c_string(&name)?;
         let stat = fstatat_no_follow(fd, &name_c)?;
         if stat.st_dev != device || stat.st_uid != unsafe { libc::geteuid() } {
@@ -2220,6 +2528,7 @@ fn audit_private_residue_tree(
                     depth.saturating_add(1),
                     entry_budget,
                     remaining_bytes,
+                    deadline,
                 )?;
             }
             libc::S_IFREG => {
@@ -2439,6 +2748,18 @@ fn remove_tree_at_name_linux(
     expected: &FileIdentity,
     policy: TreeLinkPolicy,
 ) -> Result<()> {
+    remove_tree_at_name_linux_with_deadline(root, name, expected, policy, None)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_tree_at_name_linux_with_deadline(
+    root: &SafeRoot,
+    name: &OsStr,
+    expected: &FileIdentity,
+    policy: TreeLinkPolicy,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    ensure_before_deadline(deadline, "before opening quarantined tree")?;
     let directory = root.directory.as_ref();
     let root_stat = fstat(directory.as_raw_fd())?;
     let cname = c_string(name)?;
@@ -2464,6 +2785,7 @@ fn remove_tree_at_name_linux(
         policy,
         0,
         &mut audit_budget,
+        deadline,
     )?;
     let mut removal_budget = TreeBudget::new();
     remove_directory_contents_unix(
@@ -2472,8 +2794,10 @@ fn remove_tree_at_name_linux(
         policy,
         0,
         &mut removal_budget,
+        deadline,
     )?;
     drop(child);
+    ensure_before_deadline(deadline, "before top-level quarantine removal")?;
     let rebound = fstatat_no_follow(directory.as_raw_fd(), &cname)?;
     if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR || identity_from_stat(&rebound) != observed {
         bail!(
@@ -2523,11 +2847,14 @@ fn audit_directory_unix(
     policy: TreeLinkPolicy,
     depth: usize,
     budget: &mut TreeBudget,
+    deadline: Option<Instant>,
 ) -> Result<()> {
+    ensure_before_deadline(deadline, "during recursive deletion audit")?;
     if depth > MAX_TREE_DEPTH {
         bail!("recursive deletion exceeded its maximum depth of {MAX_TREE_DEPTH}");
     }
-    for name in directory_entries(fd, budget)? {
+    for name in directory_entries_until(fd, budget, deadline)? {
+        ensure_before_deadline(deadline, "during recursive deletion audit")?;
         let cname = c_string(&name)?;
         let stat = fstatat_no_follow(fd, &cname)?;
         if stat.st_dev != device {
@@ -2552,6 +2879,7 @@ fn audit_directory_unix(
                 policy,
                 depth.saturating_add(1),
                 budget,
+                deadline,
             )?;
         } else if kind == libc::S_IFLNK {
             if policy == TreeLinkPolicy::RejectLinksAndSpecialFiles {
@@ -2584,11 +2912,14 @@ fn remove_directory_contents_unix(
     policy: TreeLinkPolicy,
     depth: usize,
     budget: &mut TreeBudget,
+    deadline: Option<Instant>,
 ) -> Result<()> {
+    ensure_before_deadline(deadline, "during recursive deletion")?;
     if depth > MAX_TREE_DEPTH {
         bail!("recursive deletion exceeded its maximum depth of {MAX_TREE_DEPTH}");
     }
-    for name in directory_entries(fd, budget)? {
+    for name in directory_entries_until(fd, budget, deadline)? {
+        ensure_before_deadline(deadline, "before child quarantine")?;
         let source_name = c_string(&name)?;
         let stat = fstatat_no_follow(fd, &source_name)?;
         if stat.st_dev != device {
@@ -2639,8 +2970,10 @@ fn remove_directory_contents_unix(
                 policy,
                 depth.saturating_add(1),
                 budget,
+                deadline,
             )?;
             drop(child);
+            ensure_before_deadline(deadline, "before child directory unlink")?;
             let rebound = fstatat_no_follow(fd, &cname)?;
             if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR
                 || identity_from_stat(&rebound) != expected
@@ -2674,6 +3007,7 @@ fn remove_directory_contents_unix(
                     name.to_string_lossy()
                 );
             }
+            ensure_before_deadline(deadline, "before child unlink")?;
             if unsafe { libc::unlinkat(fd, cname.as_ptr(), 0) } != 0 {
                 return Err(std::io::Error::last_os_error())
                     .with_context(|| format!("failed to unlink child {}", name.to_string_lossy()));
@@ -2685,6 +3019,16 @@ fn remove_directory_contents_unix(
 
 #[cfg(unix)]
 fn directory_entries(fd: RawFd, budget: &mut TreeBudget) -> Result<Vec<OsString>> {
+    directory_entries_until(fd, budget, None)
+}
+
+#[cfg(unix)]
+fn directory_entries_until(
+    fd: RawFd,
+    budget: &mut TreeBudget,
+    deadline: Option<Instant>,
+) -> Result<Vec<OsString>> {
+    ensure_before_deadline(deadline, "before directory enumeration")?;
     let dot = c".";
     let stream_fd = unsafe {
         libc::openat(
@@ -2705,6 +3049,10 @@ fn directory_entries(fd: RawFd, budget: &mut TreeBudget) -> Result<Vec<OsString>
     }
     let mut entries = Vec::new();
     loop {
+        if let Err(error) = ensure_before_deadline(deadline, "during directory enumeration") {
+            unsafe { libc::closedir(directory) };
+            return Err(error);
+        }
         clear_thread_errno()?;
         let entry = unsafe { libc::readdir(directory) };
         if entry.is_null() {
@@ -2727,6 +3075,41 @@ fn directory_entries(fd: RawFd, budget: &mut TreeBudget) -> Result<Vec<OsString>
     }
     entries.sort();
     Ok(entries)
+}
+
+fn ensure_before_deadline(deadline: Option<Instant>, phase: &str) -> Result<()> {
+    #[cfg(test)]
+    {
+        let forced = SCAVENGE_DEADLINE_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let triggered = slot.as_mut().is_some_and(|hook| hook(phase));
+            if triggered {
+                slot.take();
+            }
+            triggered
+        });
+        if forced {
+            bail!("private directory scavenging exceeded its total time budget at {phase}");
+        }
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        bail!("private directory scavenging exceeded its total time budget at {phase}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+type ScavengeDeadlineHook = Box<dyn FnMut(&str) -> bool>;
+
+#[cfg(test)]
+thread_local! {
+    static SCAVENGE_DEADLINE_HOOK: std::cell::RefCell<Option<ScavengeDeadlineHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_scavenge_deadline_hook(hook: impl FnMut(&str) -> bool + 'static) {
+    SCAVENGE_DEADLINE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(target_os = "linux")]
@@ -3038,6 +3421,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stable_lock_rejects_path_replacement_after_flock() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("state")).expect("state root");
+        let lock_path = root.path().join("state.lock");
+        let moved_path = root.path().join("state.lock.original");
+        set_kernel_lock_after_flock_hook({
+            let moved_path = moved_path.clone();
+            move |path| {
+                fs::rename(path, &moved_path).expect("move acquired lock inode");
+                fs::write(path, b"").expect("create replacement lock inode");
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .expect("private replacement mode");
+                true
+            }
+        });
+
+        let error = KernelStateLock::acquire(&lock_path)
+            .expect_err("post-flock pathname replacement must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not name its opened descriptor")
+                || error.to_string().contains("was rebound"),
+            "unexpected error: {error:#}"
+        );
+        assert!(lock_path.exists());
+        assert!(moved_path.exists());
+        assert_ne!(
+            identity_for_path(&lock_path).expect("replacement identity"),
+            identity_for_path(&moved_path).expect("original identity")
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn locked_writer_scavenges_only_safe_matching_crash_temps() {
@@ -3074,5 +3492,112 @@ mod tests {
             BoundedRegularReader::read_direct(&root, "claims.json", 32).expect("read"),
             b"complete\n"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forged_or_legacy_deletion_quarantine_is_never_removed() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("residues")).expect("root");
+        let _lock = KernelStateLock::acquire_direct(&root, "bounded-status.lock").expect("lock");
+        let residue = root
+            .reserve_random_direct_child_directory("git-status")
+            .expect("residue");
+        let source = residue
+            .path()
+            .file_name()
+            .expect("source name")
+            .to_os_string();
+        fs::write(residue.path().join("sentinel"), b"keep").expect("sentinel");
+        fs::set_permissions(
+            residue.path().join("sentinel"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("sentinel mode");
+        let mut forged = deletion_quarantine_name(&source, residue.identity())
+            .as_bytes()
+            .to_vec();
+        let tag_start = forged.len().checked_sub(66).expect("tag position");
+        forged[tag_start] = if forged[tag_start] == b'a' {
+            b'b'
+        } else {
+            b'a'
+        };
+        let forged = OsString::from_vec(forged);
+        fs::rename(residue.path(), root.path().join(&forged)).expect("forge quarantine name");
+
+        let error = scavenge_private_random_directories(
+            &root,
+            "bounded-status.lock",
+            "git-status",
+            PrivateDirectoryScavengeLimits {
+                max_root_entries: 8,
+                max_directories: 4,
+                max_tree_entries: 16,
+                max_total_bytes: 1024,
+                max_duration: Duration::from_secs(5),
+            },
+        )
+        .expect_err("forged quarantine must fail closed");
+        assert!(format!("{error:#}").contains("authentication tag"));
+        assert!(root.path().join(&forged).join("sentinel").exists());
+
+        let legacy = OsStr::new(".maco-delete-maco-v1-deadbeef-0000000000000001-0000000000000002");
+        assert!(deletion_quarantine_binding(legacy)
+            .expect_err("legacy quarantine must be rejected")
+            .to_string()
+            .contains("version is unsupported"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deadline_interrupted_scavenge_resumes_from_authenticated_quarantine() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("residues")).expect("root");
+        let _lock = KernelStateLock::acquire_direct(&root, "bounded-status.lock").expect("lock");
+        let residue = root
+            .reserve_random_direct_child_directory("git-status")
+            .expect("residue");
+        for name in ["first", "second"] {
+            fs::write(residue.path().join(name), name).expect("residue file");
+            fs::set_permissions(residue.path().join(name), fs::Permissions::from_mode(0o600))
+                .expect("private residue file");
+        }
+        let limits = PrivateDirectoryScavengeLimits {
+            max_root_entries: 8,
+            max_directories: 4,
+            max_tree_entries: 16,
+            max_total_bytes: 1024,
+            max_duration: Duration::from_secs(5),
+        };
+        let mut child_quarantines = 0usize;
+        set_scavenge_deadline_hook(move |phase| {
+            if phase == "before child quarantine" {
+                child_quarantines = child_quarantines.saturating_add(1);
+            }
+            child_quarantines == 2
+        });
+
+        let error =
+            scavenge_private_random_directories(&root, "bounded-status.lock", "git-status", limits)
+                .expect_err("forced deadline must interrupt cleanup");
+        assert!(format!("{error:#}").contains("time budget"));
+        assert!(!residue.path().exists());
+
+        assert_eq!(
+            scavenge_private_random_directories(
+                &root,
+                "bounded-status.lock",
+                "git-status",
+                limits,
+            )
+            .expect("resume authenticated cleanup"),
+            1
+        );
+        let entries = fs::read_dir(root.path())
+            .expect("root entries")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![OsString::from("bounded-status.lock")]);
     }
 }

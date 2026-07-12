@@ -143,7 +143,7 @@ impl RepositoryStateRoot {
 
     pub(crate) fn lock(&self) -> Result<RepositoryStateLock> {
         let lock = KernelStateLock::acquire_direct(&self.root, self.lock_file)?;
-        let lock_identity = ensure_private_state_file(lock.path())?;
+        let lock_identity = lock.identity().clone();
         Ok(RepositoryStateLock {
             _lock: lock,
             root_identity: self.root.identity().clone(),
@@ -184,6 +184,7 @@ impl RepositoryStateRoot {
         max_bytes: u64,
     ) -> Result<()> {
         self.verify_lock(lock)?;
+        run_repository_state_after_precheck_hook();
         let result = (|| -> Result<()> {
             if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
                 bail!(
@@ -195,8 +196,11 @@ impl RepositoryStateRoot {
             if self.root.direct_child_exists(self.state_file)? {
                 ensure_private_state_file(&self.state_path)?;
             }
+            self.verify_lock(lock)?;
             AtomicStateWriter::scavenge_direct_temps(&self.root, self.state_file)?;
-            AtomicStateWriter::write_direct(&self.root, self.state_file, contents)?;
+            AtomicStateWriter::write_direct_fenced(&self.root, self.state_file, contents, || {
+                self.verify_lock(lock)
+            })?;
             ensure_private_state_file(&self.state_path)?;
             Ok(())
         })();
@@ -207,17 +211,38 @@ impl RepositoryStateRoot {
         if lock.root_identity != *self.root.identity() || lock.state_file != self.state_file {
             bail!("repository state lock does not match the protected state file");
         }
-        self.root.verify()?;
-        let observed = ensure_private_state_file(lock._lock.path())?;
-        if observed != lock.lock_identity {
+        lock._lock.verify_direct_binding(&self.root)?;
+        if lock._lock.identity() != &lock.lock_identity {
             bail!(
-                "repository state lock path was rebound while its original inode remained locked: {}",
+                "repository state lock identity changed unexpectedly: {}",
                 lock._lock.path().display()
             );
         }
         Ok(())
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    static REPOSITORY_STATE_AFTER_PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_repository_state_after_precheck_hook(hook: impl FnOnce() + 'static) {
+    REPOSITORY_STATE_AFTER_PRECHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_repository_state_after_precheck_hook() {
+    let hook = REPOSITORY_STATE_AFTER_PRECHECK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_repository_state_after_precheck_hook() {}
 
 fn finish_with_lock_verification<T>(result: Result<T>, verification: Result<()>) -> Result<T> {
     match (result, verification) {
@@ -894,7 +919,55 @@ mod tests {
         let error = store
             .save_snapshot(&stale_lock, stale_snapshot)
             .expect_err("stale writer must fail closed");
-        assert!(error.to_string().contains("lock path was rebound"));
+        assert!(
+            error.to_string().contains("lock path was rebound")
+                || error
+                    .to_string()
+                    .contains("does not name its opened descriptor"),
+            "unexpected error: {error:#}"
+        );
+        drop(stale_lock);
+
+        let claims = store.snapshot().expect("final snapshot");
+        assert_eq!(claims.len(), 2);
+        assert!(claims.iter().any(|claim| claim.agent_id == "agent-a"));
+        assert!(claims.iter().any(|claim| claim.agent_id == "agent-b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_rebind_after_write_precheck_cannot_overwrite_newer_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        store
+            .claim_paths("agent-a", ["first"])
+            .expect("initial claim");
+
+        let stale_lock = store.state.lock().expect("stale lock");
+        let stale_snapshot = store.load_snapshot(&stale_lock).expect("stale snapshot");
+        let nested_store = store.clone();
+        let lock_path = stale_lock._lock.path().to_path_buf();
+        let moved_lock = lock_path.with_file_name("claims.lock.precheck-original");
+        set_repository_state_after_precheck_hook(move || {
+            fs::rename(&lock_path, &moved_lock).expect("move stale lock inode");
+            fs::write(&lock_path, b"").expect("create replacement lock inode");
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                .expect("replacement mode");
+            nested_store
+                .claim_paths("agent-b", ["second"])
+                .expect("commit in replacement lock domain");
+        });
+
+        let error = store
+            .save_snapshot(&stale_lock, stale_snapshot)
+            .expect_err("stale writer must fail before destination replacement");
+        assert!(
+            error.to_string().contains("lock path")
+                || error.to_string().contains("opened descriptor"),
+            "unexpected error: {error:#}"
+        );
         drop(stale_lock);
 
         let claims = store.snapshot().expect("final snapshot");

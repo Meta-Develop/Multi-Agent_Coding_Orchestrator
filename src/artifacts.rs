@@ -312,7 +312,7 @@ struct ArtifactMacKeyWriter {
 impl BoundArtifactLock {
     fn acquire(root: &SafeRoot, name: &str) -> Result<Self> {
         let lock = KernelStateLock::acquire_direct(root, name)?;
-        let lock_identity = ensure_private_regular_file(lock.path())?;
+        let lock_identity = lock.identity().clone();
         let bound = Self {
             lock,
             root_identity: root.identity().clone(),
@@ -327,21 +327,11 @@ impl BoundArtifactLock {
         if self.root_identity != *root.identity() {
             bail!("artifact lock was presented with a different root inode");
         }
-        let name = self
-            .lock
-            .path()
-            .file_name()
-            .context("artifact lock path has no file name")?;
-        let observed = ensure_private_regular_file(&root.path().join(name)).with_context(|| {
-            format!(
-                "artifact lock path no longer names its acquired inode: {}",
-                root.path().join(name).display()
-            )
-        })?;
-        if observed != self.lock_identity {
+        self.lock.verify_direct_binding(root)?;
+        if self.lock.identity() != &self.lock_identity {
             bail!(
-                "artifact lock path was rebound while its original inode remained locked: {}",
-                root.path().join(name).display()
+                "artifact lock identity changed unexpectedly: {}",
+                self.lock.path().display()
             );
         }
         Ok(())
@@ -449,7 +439,12 @@ impl ArtifactMacKeyWriter {
                 let mut bytes = [0u8; ARTIFACT_MAC_KEY_BYTES];
                 fill_os_random(&mut bytes)?;
                 AtomicStateWriter::scavenge_direct_temps(&root, ARTIFACT_MAC_KEY_FILE)?;
-                AtomicStateWriter::write_direct(&root, ARTIFACT_MAC_KEY_FILE, &bytes)?;
+                AtomicStateWriter::write_direct_fenced(
+                    &root,
+                    ARTIFACT_MAC_KEY_FILE,
+                    &bytes,
+                    || lock.verify(&root),
+                )?;
                 lock.verify(&root)?;
             }
             let key = ArtifactMacKey::load(&root)?;
@@ -583,8 +578,11 @@ impl ArtifactRunWriter {
 
             let (parent, file_name) = artifact_parent_and_name(&self.run, &relative, true)?;
             AtomicStateWriter::scavenge_direct_temps(&parent, file_name)?;
-            AtomicStateWriter::write_direct(&parent, file_name, contents)
-                .with_context(|| format!("failed to write artifact file {}", relative.display()))?;
+            AtomicStateWriter::write_direct_fenced(&parent, file_name, contents, || {
+                self.run_lock.verify(&self.run)?;
+                parent.verify()
+            })
+            .with_context(|| format!("failed to write artifact file {}", relative.display()))?;
             ensure_private_regular_file(&self.run.path().join(&relative))?;
             let observed = BoundedRegularReader::read_relative(
                 self.run.path(),
@@ -693,7 +691,15 @@ impl ArtifactRunWriter {
                 bail!("artifact finalization marker exceeds its bounded size");
             }
             AtomicStateWriter::scavenge_direct_temps(&self.run, FINALIZATION_MARKER)?;
-            AtomicStateWriter::write_direct(&self.run, FINALIZATION_MARKER, &marker)?;
+            AtomicStateWriter::write_direct_fenced(
+                &self.run,
+                FINALIZATION_MARKER,
+                &marker,
+                || {
+                    self.run_lock.verify(&self.run)?;
+                    mac_key.verify()
+                },
+            )?;
             ensure_private_regular_file(&self.run.path().join(FINALIZATION_MARKER))?;
             let post_audit = audit_artifact_tree(&self.run, true)?;
             verify_manifest_paths_with_marker(&finalization.files, &post_audit)?;
@@ -3003,7 +3009,12 @@ mod tests {
                 ArtifactFileDisposition::PrivateEvidence,
             )
             .expect_err("rebound run lock must fail");
-        assert!(run_error.to_string().contains("lock path was rebound"));
+        assert!(
+            run_error.to_string().contains("lock path was rebound")
+                || run_error
+                    .to_string()
+                    .contains("does not name its opened descriptor")
+        );
         assert!(!writer.run.path().join("final-report.json").exists());
         drop(replacement_run_lock);
 
@@ -3017,7 +3028,12 @@ mod tests {
             BoundArtifactLock::acquire(&key_writer.key.root, ARTIFACT_MAC_KEY_LOCK)
                 .expect("replacement key lock");
         let key_error = key_writer.verify().expect_err("rebound key lock must fail");
-        assert!(key_error.to_string().contains("lock path was rebound"));
+        assert!(
+            key_error.to_string().contains("lock path was rebound")
+                || key_error
+                    .to_string()
+                    .contains("does not name its opened descriptor")
+        );
         drop(replacement_key_lock);
 
         let root =
@@ -3032,7 +3048,12 @@ mod tests {
         let root_error = root_lock
             .verify(&root)
             .expect_err("rebound root lock must fail");
-        assert!(root_error.to_string().contains("lock path was rebound"));
+        assert!(
+            root_error.to_string().contains("lock path was rebound")
+                || root_error
+                    .to_string()
+                    .contains("does not name its opened descriptor")
+        );
         drop(replacement_root_lock);
     }
 
@@ -3117,6 +3138,34 @@ mod tests {
         assert_eq!(fs::read_dir(quarantine).expect("quarantine").count(), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prune_refuses_run_lock_replacement_immediately_after_flock() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("prune-after-flock-rebind").expect("run id");
+        finalize_private_test_run(&repo, RunArtifactFamily::Autopilot, &run_id, "autopilot");
+        crate::safe_state::set_kernel_lock_after_flock_hook(|path| {
+            if path.file_name() != Some(OsStr::new(RUN_LOCK_FILE)) {
+                return false;
+            }
+            let original = path.with_file_name("artifact.lock.after-flock-original");
+            fs::rename(path, &original).expect("move acquired writer lock");
+            write_private(path, b"");
+            true
+        });
+
+        let error = prune_runs(&repo, RunArtifactFamily::Autopilot, 0, false)
+            .expect_err("post-flock lock replacement must abort prune");
+        assert!(
+            error
+                .to_string()
+                .contains("does not name its opened descriptor")
+                || error.to_string().contains("was rebound"),
+            "unexpected error: {error:#}"
+        );
+        assert!(run_dir(&repo, RunArtifactFamily::Autopilot, &run_id).exists());
+    }
+
     fn finalize_private_test_run(
         repo: &Path,
         family: RunArtifactFamily,
@@ -3133,7 +3182,7 @@ mod tests {
             )
             .expect("write test report");
         writer
-            .finalize(&family.final_report_relative_path(), false)
+            .finalize(family.final_report_relative_path(), false)
             .expect("finalize test run");
     }
 

@@ -1,9 +1,11 @@
+#[cfg(test)]
+use crate::safe_state::scavenge_private_random_directories;
 use crate::{
     process_runner::{run_process, ContainmentPolicy, EnvironmentMode, ProcessSpec, StdinMode},
     safe_state::{
         identity_for_path, quarantine_direct_child_directory, remove_direct_child_tree,
         remove_quarantined_direct_child_tree, replace_reserved_directory_from,
-        scavenge_private_random_directories, stable_checksum, AtomicStateWriter,
+        scavenge_private_random_directories_until, stable_checksum, AtomicStateWriter,
         BoundedRegularReader, FileIdentity, KernelStateLock, PrivateDirectoryScavengeLimits,
         SafeRoot, TreeLinkPolicy,
     },
@@ -46,9 +48,16 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
         max_directories: 64,
         max_tree_entries: 65_536,
         max_total_bytes: 64 * 1024 * 1024,
+        max_duration: Duration::from_secs(10),
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
-const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+// The total budget includes contention on the process-wide runtime lock,
+// startup scavenging, repository/index capture, private Git setup, both Git
+// commands, and resumable cleanup. Individual Git commands remain bounded by
+// the same absolute deadline; this larger envelope prevents unrelated local
+// repositories from spuriously exhausting the shared runtime-lock budget.
+const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2734,17 +2743,21 @@ fn bounded_worktree_is_clean(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<bool> {
+    let deadline = worktree_status_deadline(timeout)?;
+    ensure_worktree_status_deadline(deadline, "before bounded-status runtime-root setup")?;
     let state_root = bounded_status_runtime_root(path)?;
-    bounded_worktree_is_clean_in_runtime(
+    ensure_worktree_status_deadline(deadline, "after bounded-status runtime-root setup")?;
+    bounded_worktree_is_clean_in_runtime_until(
         path,
         max_entries,
         max_output_bytes,
-        timeout,
         &state_root,
         |_| Ok(()),
+        deadline,
     )
 }
 
+#[cfg(test)]
 fn bounded_worktree_is_clean_in_runtime<F>(
     path: &Path,
     max_entries: usize,
@@ -2756,50 +2769,92 @@ fn bounded_worktree_is_clean_in_runtime<F>(
 where
     F: FnOnce(&SafeRoot) -> Result<()>,
 {
-    let _status_lock = KernelStateLock::acquire_direct_with_timeout(
+    let deadline = worktree_status_deadline(timeout)?;
+    bounded_worktree_is_clean_in_runtime_until(
+        path,
+        max_entries,
+        max_output_bytes,
+        state_root,
+        after_index_snapshot,
+        deadline,
+    )
+}
+
+fn bounded_worktree_is_clean_in_runtime_until<F>(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    state_root: &SafeRoot,
+    after_index_snapshot: F,
+    deadline: Instant,
+) -> Result<bool>
+where
+    F: FnOnce(&SafeRoot) -> Result<()>,
+{
+    let lock_timeout = remaining_worktree_status_time(
+        deadline,
+        "before global bounded-status runtime lock acquisition",
+    )?
+    .min(WORKTREE_STATUS_LOCK_TIMEOUT);
+    let status_lock = KernelStateLock::acquire_direct_with_timeout(
         state_root,
         WORKTREE_STATUS_RUNTIME_LOCK,
-        WORKTREE_STATUS_LOCK_TIMEOUT,
+        lock_timeout,
     )
     .context("failed to acquire global bounded-status runtime lock")?;
-    scavenge_bounded_status_runtimes(state_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+    ensure_worktree_status_deadline(deadline, "after bounded-status runtime lock acquisition")?;
+    status_lock.verify_direct_binding(state_root)?;
+    scavenge_bounded_status_runtimes_until(state_root, WORKTREE_STATUS_SCAVENGE_LIMITS, deadline)
         .context("failed to scavenge bounded-status crash residue")?;
+    status_lock.verify_direct_binding(state_root)?;
+    ensure_worktree_status_deadline(deadline, "after bounded-status startup cleanup")?;
     let repository = Repository::open(path).with_context(|| {
         format!(
             "failed to open bounded-status repository {}",
             path.display()
         )
     })?;
+    ensure_worktree_status_deadline(deadline, "after opening bounded-status repository")?;
     let head = repository
         .head()
         .context("failed to inspect bounded-status HEAD")?
         .target()
         .context("bounded-status HEAD has no direct target")?;
+    ensure_worktree_status_deadline(deadline, "after capturing bounded-status HEAD")?;
     let index_path = repository.path().join("index");
     let index = BoundedRegularReader::read(&index_path, MAX_WORKTREE_INDEX_BYTES)
         .context("failed to capture bounded-status index")?;
+    ensure_worktree_status_deadline(deadline, "after capturing bounded-status index")?;
     let common_objects = SafeRoot::open_existing(repository.commondir().join("objects"))?;
+    ensure_worktree_status_deadline(deadline, "after binding bounded-status objects")?;
     let runtime = state_root.reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)?;
+    ensure_worktree_status_deadline(deadline, "after reserving bounded-status runtime")?;
     let result = (|| -> Result<bool> {
         let runtime_root = SafeRoot::open_existing(runtime.path())?;
+        ensure_worktree_status_deadline(deadline, "after opening bounded-status runtime")?;
         runtime_root.reserve_direct_child_directory("home")?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status HOME setup")?;
         runtime_root.reserve_direct_child_directory("tmp")?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status TMP setup")?;
         let git_dir = runtime_root.reserve_direct_child_directory("git")?;
         let git_root = SafeRoot::open_existing(git_dir.path())?;
         git_root.reserve_direct_child_directory("refs")?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status Git root setup")?;
         AtomicStateWriter::write_direct(&git_root, "index", &index)?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status index staging")?;
         after_index_snapshot(&runtime_root)?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status setup callback")?;
         AtomicStateWriter::write_direct(&git_root, "HEAD", format!("{head}\n").as_bytes())?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status HEAD staging")?;
         create_validated_object_link(&git_root, common_objects.path())?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status object-link setup")?;
         let worktree_alias = create_bounded_status_worktree_link(&runtime_root, path)?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status worktree-link setup")?;
         let git_context = BoundedGitContext {
             worktree: &worktree_alias,
             runtime_root: &runtime_root,
             git_dir: git_dir.path(),
         };
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .context("worktree status time budget overflowed")?;
         run_bounded_git_records(
             &git_context,
             ["--no-optional-locks", "ls-files", "-z", "--cached"],
@@ -2808,6 +2863,7 @@ where
             deadline,
             "bounded managed-worktree index listing",
         )?;
+        ensure_worktree_status_deadline(deadline, "after bounded managed-worktree index listing")?;
         let bytes = run_bounded_git_records(
             &git_context,
             [
@@ -2823,20 +2879,46 @@ where
             deadline,
             "bounded managed-worktree status",
         )?;
+        ensure_worktree_status_deadline(deadline, "after bounded managed-worktree status")?;
         Ok(bytes.is_empty())
     })();
-    let cleanup = scavenge_bounded_status_runtimes(state_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
-        .context("failed to remove bounded-status private runtime");
-    match (result, cleanup) {
+    let cleanup = (|| -> Result<usize> {
+        status_lock.verify_direct_binding(state_root)?;
+        let removed = scavenge_bounded_status_runtimes_until(
+            state_root,
+            WORKTREE_STATUS_SCAVENGE_LIMITS,
+            deadline,
+        )
+        .context("failed to remove bounded-status private runtime")?;
+        status_lock.verify_direct_binding(state_root)?;
+        Ok(removed)
+    })();
+    let finished = match (result, cleanup) {
         (Ok(clean), Ok(_)) => Ok(clean),
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
         (Err(error), Err(cleanup_error)) => Err(error.context(format!(
             "bounded-status runtime cleanup also failed: {cleanup_error:#}"
         ))),
+    };
+    finish_with_status_lock_verification(finished, status_lock.verify_direct_binding(state_root))
+}
+
+fn finish_with_status_lock_verification<T>(
+    result: Result<T>,
+    verification: Result<()>,
+) -> Result<T> {
+    match (result, verification) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(lock_error)) => Err(lock_error),
+        (Err(error), Err(lock_error)) => Err(error.context(format!(
+            "operation also lost its bounded-status lock-path binding: {lock_error:#}"
+        ))),
     }
 }
 
+#[cfg(test)]
 fn scavenge_bounded_status_runtimes(
     state_root: &SafeRoot,
     limits: PrivateDirectoryScavengeLimits,
@@ -2847,6 +2929,42 @@ fn scavenge_bounded_status_runtimes(
         WORKTREE_STATUS_RUNTIME_SEED,
         limits,
     )
+}
+
+fn scavenge_bounded_status_runtimes_until(
+    state_root: &SafeRoot,
+    mut limits: PrivateDirectoryScavengeLimits,
+    deadline: Instant,
+) -> Result<usize> {
+    limits.max_duration =
+        remaining_worktree_status_time(deadline, "before bounded-status runtime scavenging")?;
+    scavenge_private_random_directories_until(
+        state_root,
+        WORKTREE_STATUS_RUNTIME_LOCK,
+        WORKTREE_STATUS_RUNTIME_SEED,
+        limits,
+        deadline,
+    )
+}
+
+fn worktree_status_deadline(timeout: Duration) -> Result<Instant> {
+    if timeout.is_zero() {
+        bail!("worktree status total time budget must be non-zero");
+    }
+    Instant::now()
+        .checked_add(timeout)
+        .context("worktree status total time budget overflowed")
+}
+
+fn remaining_worktree_status_time(deadline: Instant, phase: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .with_context(|| format!("worktree status exhausted its total time budget {phase}"))
+}
+
+fn ensure_worktree_status_deadline(deadline: Instant, phase: &str) -> Result<()> {
+    remaining_worktree_status_time(deadline, phase).map(|_| ())
 }
 
 struct BoundedGitContext<'a> {
@@ -2954,7 +3072,8 @@ fn run_bounded_git_records<const N: usize>(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .context("worktree status exhausted its total time budget")?;
+        .context("worktree status exhausted its total time budget")?
+        .min(WORKTREE_STATUS_COMMAND_TIMEOUT);
     context.runtime_root.verify()?;
     let mut environment = BTreeMap::new();
     environment.insert("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string());
@@ -3597,6 +3716,75 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn bounded_status_total_deadline_caps_lock_wait() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let runtime_root =
+            SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let _held = KernelStateLock::acquire_direct(&runtime_root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("hold runtime lock");
+
+        let started = Instant::now();
+        let error = bounded_worktree_is_clean_in_runtime(
+            &repo_path,
+            MAX_WORKTREE_STATUS_ENTRIES,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            Duration::from_millis(50),
+            &runtime_root,
+            |_| Ok(()),
+        )
+        .expect_err("total deadline must cap lock acquisition");
+        assert!(format!("{error:#}").contains("runtime lock"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "lock wait ignored the total operation deadline"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_expired_setup_leaves_resumable_runtime() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let runtime_root =
+            SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+
+        let error = bounded_worktree_is_clean_in_runtime(
+            &repo_path,
+            MAX_WORKTREE_STATUS_ENTRIES,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            Duration::from_millis(500),
+            &runtime_root,
+            |_| {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(())
+            },
+        )
+        .expect_err("setup callback must consume the same total deadline");
+        assert!(format!("{error:#}").contains("total time budget"));
+        assert!(
+            fs::read_dir(runtime_root.path())
+                .expect("runtime entries")
+                .count()
+                > 1,
+            "expired cleanup should leave an authenticated resumable residue"
+        );
+
+        let _lock = KernelStateLock::acquire_direct(&runtime_root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("recovery lock");
+        scavenge_bounded_status_runtimes(&runtime_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+            .expect("resume cleanup");
+        assert_status_root_contains_only_lock(&runtime_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bounded_status_scavenges_prior_crash_index_and_symlink_tree() {
         use std::os::unix::fs::symlink;
 
@@ -3704,6 +3892,7 @@ mod tests {
                 max_directories: 1,
                 max_tree_entries: 1,
                 max_total_bytes: 1,
+                max_duration: Duration::from_secs(10),
             },
         )
         .expect_err("root entry budget");
@@ -3728,6 +3917,7 @@ mod tests {
                 max_directories: 1,
                 max_tree_entries: 1,
                 max_total_bytes: 1,
+                max_duration: Duration::from_secs(10),
             },
         )
         .expect_err("directory work budget");
@@ -3751,6 +3941,7 @@ mod tests {
                 max_directories: 1,
                 max_tree_entries: 1,
                 max_total_bytes: 2,
+                max_duration: Duration::from_secs(10),
             },
         )
         .expect_err("tree entry budget");
@@ -3773,6 +3964,7 @@ mod tests {
                 max_directories: 1,
                 max_tree_entries: 1,
                 max_total_bytes: 8,
+                max_duration: Duration::from_secs(10),
             },
         )
         .expect_err("byte budget");
