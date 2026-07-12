@@ -174,7 +174,21 @@ while [ "$sandbox_check_count" -gt 0 ]; do
     shift 2
     if [ "$sandbox_mode" = inaccessible ]; then
         if "$stat_program" -L -c '%d %i' -- "$sandbox_path" >/dev/null 2>&1; then
-            fail_guardian "inaccessible path remained visible: $sandbox_path"
+            inaccessible_source=$("$findmnt_program" --raw --noheadings --output SOURCE --mountpoint "$sandbox_path") || fail_guardian "could not inspect inaccessible-path source: $sandbox_path"
+            inaccessible_options=$("$findmnt_program" --raw --noheadings --output VFS-OPTIONS --mountpoint "$sandbox_path") || fail_guardian "could not inspect inaccessible-path mount options: $sandbox_path"
+            inaccessible_mode=$("$stat_program" -L -c '%a' -- "$sandbox_path") || fail_guardian "could not inspect inaccessible-path mode: $sandbox_path"
+            case "$inaccessible_source" in
+                *'[/systemd/inaccessible/'*']') ;;
+                *) fail_guardian "inaccessible path remained on a non-systemd mount: $sandbox_path" ;;
+            esac
+            [ "$inaccessible_mode" = 0 ] || fail_guardian "inaccessible path placeholder was not mode 000: $sandbox_path"
+            inaccessible_read_only=false
+            for inaccessible_option_line in $inaccessible_options; do
+                case ",$inaccessible_option_line," in
+                    *,ro,*) inaccessible_read_only=true ;;
+                esac
+            done
+            [ "$inaccessible_read_only" = true ] || fail_guardian "inaccessible path placeholder was not read-only: $sandbox_path"
         fi
         printf 'inaccessible\n' >> "$sandbox_report" || fail_guardian "could not write inaccessible-path report"
         sandbox_check_count=$((sandbox_check_count - 1))
@@ -3765,7 +3779,6 @@ fn verify_systemd_sandbox_properties(
         ("ProtectProc", "invisible"),
         ("ProcSubset", "pid"),
         ("SystemCallArchitectures", "native"),
-        ("SystemCallErrorNumber", "EPERM"),
         ("RestrictRealtime", "yes"),
         ("KeyringMode", "private"),
         ("UMask", "0077"),
@@ -3775,13 +3788,17 @@ fn verify_systemd_sandbox_properties(
     ] {
         require_effective_property(properties, name, |value| value == expected, expected)?;
     }
+    verify_system_call_error_number(property_value(properties, "SystemCallErrorNumber")?)?;
     require_effective_property(
         properties,
         "SystemCallFilter",
         |value| !value.trim().is_empty(),
         "a non-empty syscall filter",
     )?;
-    verify_effective_system_call_filter(sandbox, property_value(properties, "SystemCallFilter")?)?;
+    verify_effective_system_call_filter(
+        sandbox.kind,
+        property_value(properties, "SystemCallFilter")?,
+    )?;
     require_effective_property(
         properties,
         "RestrictNamespaces",
@@ -4079,70 +4096,159 @@ fn require_property_path(name: &str, value: &str, path: &Path) -> std::io::Resul
 }
 
 #[cfg(target_os = "linux")]
+fn verify_system_call_error_number(value: &str) -> std::io::Result<()> {
+    if value == "EPERM" || value == libc::EPERM.to_string() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("effective SystemCallErrorNumber={value:?}; required EPERM"),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+const REQUIRED_DENIED_SYSCALLS: &[&str] = &[
+    "bpf",
+    "fanotify_init",
+    "fanotify_mark",
+    "ipc",
+    "mq_getsetattr",
+    "mq_notify",
+    "mq_open",
+    "mq_timedreceive",
+    "mq_timedreceive_time64",
+    "mq_timedsend",
+    "mq_timedsend_time64",
+    "mq_unlink",
+    "msgctl",
+    "msgget",
+    "msgrcv",
+    "msgsnd",
+    "open_by_handle_at",
+    "process_madvise",
+    "process_vm_readv",
+    "process_vm_writev",
+    "quotactl",
+    "quotactl_fd",
+    "semctl",
+    "semget",
+    "semop",
+    "semtimedop",
+    "semtimedop_time64",
+    "shmat",
+    "shmctl",
+    "shmdt",
+    "shmget",
+    "link",
+    "linkat",
+    "mknod",
+    "mknodat",
+];
+
+#[cfg(target_os = "linux")]
+fn required_denied_group_representatives() -> [(&'static str, &'static [&'static str]); 8] {
+    let raw_io_representatives: &[&str] = if cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+    {
+        &["ioperm", "iopl"]
+    } else if cfg!(target_arch = "s390x") {
+        &[
+            "s390_pci_mmio_read",
+            "s390_pci_mmio_write",
+            "s390_runtime_instr",
+        ]
+    } else {
+        // Linux exposes no architecture-common raw-I/O syscall outside the families above. A
+        // systemd version that expands this group on another architecture therefore fails closed;
+        // versions retaining the requested group token remain supported.
+        &[]
+    };
+    [
+        (
+            "@clock",
+            &["adjtimex", "clock_adjtime", "clock_settime", "settimeofday"],
+        ),
+        (
+            "@debug",
+            &[
+                "perf_event_open",
+                "ptrace",
+                "process_vm_readv",
+                "process_vm_writev",
+            ],
+        ),
+        ("@module", &["delete_module", "finit_module", "init_module"]),
+        (
+            "@mount",
+            &[
+                "fsconfig",
+                "fsmount",
+                "fsopen",
+                "fspick",
+                "mount",
+                "mount_setattr",
+                "move_mount",
+                "pivot_root",
+                "umount2",
+            ],
+        ),
+        ("@obsolete", &["_sysctl", "sysfs"]),
+        ("@raw-io", raw_io_representatives),
+        ("@reboot", &["kexec_load", "reboot"]),
+        ("@swap", &["swapon", "swapoff"]),
+    ]
+}
+
+#[cfg(target_os = "linux")]
 fn verify_effective_system_call_filter(
-    sandbox: &ResolvedSystemdSandbox,
+    kind: SideEffectConfinementProfileKind,
     value: &str,
 ) -> std::io::Result<()> {
     let tokens = value.split_whitespace().collect::<Vec<_>>();
     let configured_as_deny_list = tokens.first().is_some_and(|token| token.starts_with('~'));
-    if configured_as_deny_list {
-        for group in [
-            "@clock",
-            "@debug",
-            "@module",
-            "@mount",
-            "@obsolete",
-            "@raw-io",
-            "@reboot",
-            "@swap",
-        ] {
-            if !tokens
-                .iter()
-                .any(|token| token.trim_start_matches('~') == group)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("effective SystemCallFilter omitted denied group {group}"),
-                ));
-            }
+    if !configured_as_deny_list {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "effective SystemCallFilter was not a deny list",
+        ));
+    }
+
+    // Older systemd releases may retain group names here, while newer releases expose their
+    // architecture-specific expansion. Require either the group token or every selected
+    // architecture-common member from each requested group.
+    for (group, representatives) in required_denied_group_representatives() {
+        let retained_group = tokens
+            .iter()
+            .any(|token| token.trim_start_matches('~') == group);
+        let expanded_group = !representatives.is_empty()
+            && representatives.iter().all(|representative| {
+                tokens
+                    .iter()
+                    .any(|token| token.trim_start_matches('~') == *representative)
+            });
+        if !retained_group && !expanded_group {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "effective SystemCallFilter omitted denied group {group} and its complete representative expansion"
+                ),
+            ));
         }
-        for syscall in [
-            "bpf",
-            "fanotify_init",
-            "fanotify_mark",
-            "ipc",
-            "mq_getsetattr",
-            "mq_notify",
-            "mq_open",
-            "mq_timedreceive",
-            "mq_timedreceive_time64",
-            "mq_timedsend",
-            "mq_timedsend_time64",
-            "mq_unlink",
-            "msgctl",
-            "msgget",
-            "msgrcv",
-            "msgsnd",
-            "open_by_handle_at",
-            "process_madvise",
-            "process_vm_readv",
-            "process_vm_writev",
-            "quotactl",
-            "quotactl_fd",
-            "semctl",
-            "semget",
-            "semop",
-            "semtimedop",
-            "semtimedop_time64",
-            "shmat",
-            "shmctl",
-            "shmdt",
-            "shmget",
-            "link",
-            "linkat",
-            "mknod",
-            "mknodat",
-        ] {
+    }
+
+    for syscall in REQUIRED_DENIED_SYSCALLS {
+        if !tokens
+            .iter()
+            .any(|token| token.trim_start_matches('~') == *syscall)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("effective SystemCallFilter omitted denied syscall {syscall}"),
+            ));
+        }
+    }
+    if kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+        for syscall in ["socket", "socketpair", "socketcall"] {
             if !tokens
                 .iter()
                 .any(|token| token.trim_start_matches('~') == syscall)
@@ -4150,67 +4256,6 @@ fn verify_effective_system_call_filter(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!("effective SystemCallFilter omitted denied syscall {syscall}"),
-                ));
-            }
-        }
-        if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
-            for syscall in ["socket", "socketpair", "socketcall"] {
-                if !tokens
-                    .iter()
-                    .any(|token| token.trim_start_matches('~') == syscall)
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!("effective SystemCallFilter omitted denied syscall {syscall}"),
-                    ));
-                }
-            }
-        }
-        return Ok(());
-    }
-
-    for blocked in [
-        "reboot",
-        "swapon",
-        "swapoff",
-        "init_module",
-        "finit_module",
-        "delete_module",
-        "kexec_load",
-        "ptrace",
-        "process_vm_writev",
-        "iopl",
-        "ioperm",
-    ] {
-        if tokens.contains(&blocked) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("effective SystemCallFilter still permits {blocked}"),
-            ));
-        }
-    }
-    for blocked in ["mount", "umount2", "pivot_root", "open_tree", "move_mount"] {
-        if tokens.contains(&blocked) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("effective SystemCallFilter still permits {blocked}"),
-            ));
-        }
-    }
-    for blocked in ["link", "linkat", "mknod", "mknodat"] {
-        if tokens.contains(&blocked) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("effective SystemCallFilter still permits {blocked}"),
-            ));
-        }
-    }
-    if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
-        for blocked in ["socket", "socketpair", "socketcall"] {
-            if tokens.contains(&blocked) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("effective SystemCallFilter still permits {blocked}"),
                 ));
             }
         }
@@ -6862,6 +6907,99 @@ mod tests {
         assert!(verify_sandbox_mount_report(&report, &checks).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_call_error_number_accepts_name_and_numeric_eperm_only() {
+        verify_system_call_error_number("EPERM").expect("named EPERM");
+        verify_system_call_error_number(&libc::EPERM.to_string()).expect("numeric EPERM");
+        assert!(verify_system_call_error_number("0").is_err());
+        assert!(verify_system_call_error_number("EACCES").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_call_filter_accepts_retained_and_complete_expanded_deny_forms() {
+        let retained = retained_system_call_filter_fixture();
+        verify_effective_system_call_filter(
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            &retained,
+        )
+        .expect("retained deny groups");
+
+        let expanded = expanded_system_call_filter_fixture();
+        verify_effective_system_call_filter(
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            &expanded.join(" "),
+        )
+        .expect("complete expanded deny groups");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_call_filter_rejects_each_incomplete_group_and_allow_list() {
+        let expanded = expanded_system_call_filter_fixture();
+        for (group, representatives) in required_denied_group_representatives() {
+            let Some(missing) = representatives.first() else {
+                continue;
+            };
+            let incomplete = expanded
+                .iter()
+                .filter(|token| token.trim_start_matches('~') != *missing)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let error = verify_effective_system_call_filter(
+                SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+                &incomplete,
+            )
+            .expect_err("incomplete group expansion must fail closed");
+            assert!(
+                error.to_string().contains(group),
+                "unexpected {group} failure: {error}"
+            );
+        }
+        assert!(verify_effective_system_call_filter(
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            "read write exit exit_group",
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_system_call_filter_fixture() -> String {
+        let mut tokens = required_denied_group_representatives()
+            .into_iter()
+            .map(|(group, _)| group.to_string())
+            .collect::<Vec<_>>();
+        tokens[0].insert(0, '~');
+        tokens.extend(
+            REQUIRED_DENIED_SYSCALLS
+                .iter()
+                .map(|value| value.to_string()),
+        );
+        tokens.extend(["socket", "socketpair", "socketcall"].map(str::to_string));
+        tokens.join(" ")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expanded_system_call_filter_fixture() -> Vec<String> {
+        let mut tokens = vec!["~expanded-deny-list".to_string()];
+        for (group, representatives) in required_denied_group_representatives() {
+            if representatives.is_empty() {
+                tokens.push(group.to_string());
+            } else {
+                tokens.extend(representatives.iter().map(|value| value.to_string()));
+            }
+        }
+        tokens.extend(
+            REQUIRED_DENIED_SYSCALLS
+                .iter()
+                .map(|value| value.to_string()),
+        );
+        tokens.extend(["socket", "socketpair", "socketcall"].map(str::to_string));
+        tokens
+    }
+
     #[cfg(unix)]
     #[test]
     fn drains_large_stdout_and_stderr_without_false_timeout() {
@@ -7117,6 +7255,132 @@ mod tests {
             }
             Err(error) => panic!("unexpected strict backend probe failure: {error:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inaccessible_placeholder_blocks_nix_daemon_socket_access() {
+        use std::os::unix::net::UnixStream;
+
+        const CHILD_ENV: &str = "MACO_TEST_INACCESSIBLE_SOCKET_CHILD";
+        const SOCKET_PATH: &str = "/nix/var/nix/daemon-socket/socket";
+        if env::var_os(CHILD_ENV).is_some() {
+            let marker = PathBuf::from(
+                env::var_os("MACO_TEST_INACCESSIBLE_SOCKET_MARKER").expect("marker path"),
+            );
+            let open_error = File::open(SOCKET_PATH).expect_err("masked socket must not open");
+            let connect_error =
+                UnixStream::connect(SOCKET_PATH).expect_err("masked socket must not connect");
+            fs::write(
+                marker,
+                format!(
+                    "open={:?};connect={:?}\n",
+                    open_error.raw_os_error(),
+                    connect_error.raw_os_error()
+                ),
+            )
+            .expect("write inaccessible-socket evidence");
+            return;
+        }
+        match UnixStream::connect(SOCKET_PATH) {
+            Ok(control) => drop(control),
+            Err(error) => {
+                eprintln!(
+                    "skipping inaccessible-placeholder causal probe because the host Nix daemon socket is unavailable: {error}"
+                );
+                return;
+            }
+        }
+        if !strict_backend_available_for_tests() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("socket-access-blocked");
+        let mut environment = BTreeMap::new();
+        environment.insert(CHILD_ENV.to_string(), "1".to_string());
+        environment.insert(
+            "MACO_TEST_INACCESSIBLE_SOCKET_MARKER".to_string(),
+            marker.display().to_string(),
+        );
+        let output = run_process(
+            ProcessSpec::direct(
+                "inaccessible socket placeholder probe",
+                env::current_exe().expect("current test executable"),
+                [
+                    OsString::from("--exact"),
+                    OsString::from(
+                        "process_runner::tests::inaccessible_placeholder_blocks_nix_daemon_socket_access",
+                    ),
+                ],
+                temp.path(),
+                4 * 1024,
+            )
+            .with_environment(EnvironmentMode::InheritAndSet(environment))
+            .with_timeout(Some(Duration::from_secs(5))),
+        )
+        .expect("run inaccessible socket placeholder probe");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(output.safety_evidence_verified());
+        let evidence = fs::read_to_string(&marker).expect("socket denial evidence");
+        assert!(evidence.contains("open=Some("));
+        assert!(evidence.contains("connect=Some("));
+        assert_current_runner_has_no_systemd_residue();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
+        if !strict_backend_available_for_tests() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("bounded-runtime");
+        let worktree = temp.path().join("verified-worktree");
+        let objects = temp.path().join("verified-common-objects");
+        let sibling = temp.path().join("unrelated-sibling");
+        for directory in [&workspace, &worktree, &objects, &sibling] {
+            fs::create_dir(directory).expect("create sandbox fixture directory");
+        }
+        fs::write(worktree.join("tracked"), "tracked\n").expect("worktree marker");
+        fs::write(objects.join("object"), "object\n").expect("objects marker");
+        fs::write(sibling.join("sentinel"), "untouched\n").expect("sibling sentinel");
+        let completed = workspace.join("completed");
+        let command = format!(
+            "test -r '{}' && test -r '{}' && test ! -e '{}' && touch '{}'",
+            worktree.join("tracked").display(),
+            objects.join("object").display(),
+            sibling.join("sentinel").display(),
+            completed.display()
+        );
+        let profile = StrictOfflineWorkspaceProfile::read_write(&workspace)
+            .with_visible_read_only_root(&worktree)
+            .with_visible_read_only_root(&objects);
+        let output = run_process(
+            ProcessSpec::shell(
+                "exact bounded Git read roots",
+                Shell::UnixSh,
+                command,
+                &workspace,
+                1024,
+            )
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                profile,
+            ))
+            .with_timeout(Some(Duration::from_secs(3))),
+        )
+        .expect("run exact bounded Git read-root probe");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(output.safety_evidence_verified());
+        assert!(completed.is_file());
+        assert_eq!(
+            fs::read_to_string(sibling.join("sentinel")).expect("preserved sibling sentinel"),
+            "untouched\n"
+        );
+        assert_current_runner_has_no_systemd_residue();
     }
 
     #[cfg(target_os = "linux")]
@@ -7895,10 +8159,17 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
     #[cfg(target_os = "linux")]
     fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
-        matches!(error, ProcessRunError::ProcessOwnership { .. })
-            && error
-                .to_string()
-                .contains("inaccessible path remained visible")
+        if !matches!(error, ProcessRunError::ProcessOwnership { .. }) {
+            return false;
+        }
+        let message = error.to_string();
+        [
+            "inaccessible path remained",
+            "inaccessible path placeholder",
+            "could not inspect inaccessible-path",
+        ]
+        .iter()
+        .any(|diagnostic| message.contains(diagnostic))
     }
 
     #[cfg(target_os = "linux")]

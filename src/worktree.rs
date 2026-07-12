@@ -2,7 +2,8 @@
 use crate::safe_state::scavenge_private_random_directories;
 use crate::{
     process_runner::{
-        run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessSpec, StdinMode,
+        run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessSpec,
+        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
     },
     safe_state::{
         identity_for_path, quarantine_direct_child_directory, remove_direct_child_tree,
@@ -3029,8 +3030,10 @@ where
         ensure_worktree_status_deadline(deadline, "after bounded-status worktree-link setup")?;
         let git_context = BoundedGitContext {
             worktree: &worktree_alias,
+            worktree_target: path,
             runtime_root: &runtime_root,
             git_dir: git_dir.path(),
+            objects_target: common_objects.path(),
         };
         run_bounded_git_records(
             &git_context,
@@ -3146,8 +3149,10 @@ fn ensure_worktree_status_deadline(deadline: Instant, phase: &str) -> Result<()>
 
 struct BoundedGitContext<'a> {
     worktree: &'a Path,
+    worktree_target: &'a Path,
     runtime_root: &'a SafeRoot,
     git_dir: &'a Path,
+    objects_target: &'a Path,
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -3274,6 +3279,11 @@ fn run_bounded_git_records<const N: usize>(
     command_args.push(std::ffi::OsString::from("--work-tree"));
     command_args.push(context.worktree.as_os_str().to_os_string());
     command_args.extend(args.into_iter().map(std::ffi::OsString::from));
+    let mut side_effects = StrictOfflineWorkspaceProfile::read_write(context.runtime_root.path())
+        .with_visible_read_only_root(context.worktree_target);
+    if !context.objects_target.starts_with(context.worktree_target) {
+        side_effects = side_effects.with_visible_read_only_root(context.objects_target);
+    }
     let spec = ProcessSpec::direct(
         label,
         git,
@@ -3283,6 +3293,9 @@ fn run_bounded_git_records<const N: usize>(
     )
     .with_environment(EnvironmentMode::ClearAndSet(environment))
     .with_containment(ContainmentPolicy::Required)
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        side_effects,
+    ))
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(remaining));
     let output = run_process(spec).context("bounded worktree status command failed")?;
