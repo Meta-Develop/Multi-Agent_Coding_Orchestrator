@@ -1084,7 +1084,12 @@ fields are rejected recursively. Fake mode rejects external-program fields.
 External-command mode rejects fake-only fields and uses a 300-second timeout
 unless an explicit 1-to-86400-second value is provided. Program symlinks are
 rejected; a script must use a single absolute shebang interpreter, whose
-canonical regular-file identity and content are bound as well.
+canonical regular-file identity and content are bound as well. A configured
+native shell, language interpreter, or command dispatcher cannot act as the
+authoritative reviewer program, including stdin/eval forms such as `sh -s`,
+`python -`, or `node --eval`; this prevents the review request JSON itself from
+becoming executable program text. A reviewer script with a direct native
+shebang remains supported, while dispatcher shebangs are refused.
 
 An external reviewer receives strict version-1 JSON on standard input and must
 return one strict UTF-8 JSON object on standard output. The JSON result is
@@ -1093,13 +1098,20 @@ output is refused, and nested unknown fields or mismatched target, attempt,
 repository-relative paths, reviewer identity, or request binding are rejected.
 The selected program and any script interpreter are opened without following
 links, bounded and hashed, then copied with create-new semantics into an
-owner-private runtime directory. The materialized copy is selected as the
-launch pathname and the source pathname is not passed to the process runner,
-but execution is not yet descriptor-bound. Until fd-bound execution is added,
-the pre-exec pathname handoff remains an integrity gap against a non-cooperating
-same-UID replacement and must not be described as proof that the kernel ran the
-exact bound bytes. The parent derives the reviewer identity from those copied
-bytes and bounded argv, and binds each request to the pre-run repository
+owner-private runtime directory. Verified authority captures the materialized
+program and, for scripts, its materialized native interpreter before the
+systemd start gate opens. The bounded request descriptor is authenticated by a
+digest fixed in the transient unit's argument vector; the helper revalidates
+the bound identity and content, copies each entry image into a sealed memory
+file, and executes by descriptor rather than reopening the launch pathname.
+The source pathname is not passed to the process runner. This closes the
+same-UID pathname-replacement gap for the entry images, but does not pin their
+dynamic-library or language-module dependency closure. The authority path also
+requires the running `maco` helper and all of its ancestors to be root-owned and
+non-writable, so development and user-local binaries fail closed. Test-only
+nonpublishable simulation remains unpinned and cannot create an authority
+receipt. The parent derives the reviewer identity from the copied bytes and
+bounded argv, and binds each request to the pre-run repository
 snapshot, canonical request, effective timeout, and sandbox-policy version;
 the reviewer must echo that binding. Report strings alone do not grant real
 publication authority: the Review boundary also returns a non-serializable

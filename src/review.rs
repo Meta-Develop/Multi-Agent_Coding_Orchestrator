@@ -2,6 +2,7 @@
 use crate::process_runner::trusted_linux_runtime_root;
 use crate::{
     llm::Redactor,
+    pinned_exec::PinnedDirectExecutable,
     process_runner::{
         run_process, EnvironmentMode, ProcessOutput, ProcessSpec, SideEffectConfinementProfile,
         StdinMode, StrictOfflineWorkspaceProfile,
@@ -694,6 +695,9 @@ fn external_review_runtime(
         .context("external reviewer mode requires a direct program")?;
     let repository = ReviewRepositoryBinding::bind(&options.repo)?;
     let source_program = BoundReviewerProgram::bind(&repository, program)?;
+    if runtime == ReviewExecutionRuntime::Verified {
+        validate_verified_reviewer_program(&repository, &source_program, &options.reviewer.args)?;
+    }
     let materialized_program = MaterializedReviewerProgram::create(source_program)?;
     let before = repository.snapshot()?;
     materialized_program.verify(&repository)?;
@@ -728,7 +732,7 @@ fn external_review_runtime(
     }
     let timeout = Some(Duration::from_secs(effective_timeout_seconds));
     let confinement = repository.confinement_profile()?;
-    let process_spec = ProcessSpec::direct(
+    let mut process_spec = ProcessSpec::direct(
         "external reviewer program",
         &materialized_program.execution_path,
         options.reviewer.args.clone(),
@@ -738,6 +742,13 @@ fn external_review_runtime(
     .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
     .with_stdin(StdinMode::Bytes(input))
     .with_timeout(timeout);
+    if runtime == ReviewExecutionRuntime::Verified {
+        let pinned = PinnedDirectExecutable::capture(&materialized_program.execution_path)
+            .context("failed to bind the materialized reviewer executable")?;
+        process_spec = process_spec
+            .with_pinned_direct_executable(pinned)
+            .context("failed to attach the bound reviewer executable")?;
+    }
     let output = run_process(match runtime {
         ReviewExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
@@ -1065,7 +1076,167 @@ fn reviewer_script_interpreter(bytes: &[u8]) -> Result<Option<PathBuf>> {
         .canonicalize()
         .context("reviewer script interpreter could not be resolved")?;
     validate_reviewer_program_path(&canonical)?;
+    if is_native_dispatcher_program(requested) || is_native_dispatcher_program(&canonical) {
+        bail!("reviewer script shebang command dispatchers are unsupported");
+    }
     Ok(Some(canonical))
+}
+
+fn validate_verified_reviewer_program(
+    repository: &ReviewRepositoryBinding,
+    program: &BoundReviewerProgram,
+    args: &[String],
+) -> Result<()> {
+    let configured = if program.path.is_absolute() {
+        program.path.clone()
+    } else {
+        repository.worktree_root.path().join(&program.path)
+    };
+    let canonical = configured
+        .canonicalize()
+        .context("verified reviewer program could not be resolved")?;
+    validate_reviewer_program_path(&canonical)?;
+    verify_canonical_reviewer_identity(&canonical, &program.file.identity)?;
+    validate_verified_reviewer_image(&program.path, &canonical, args, &program.file.bytes)
+}
+
+fn validate_verified_reviewer_image(
+    configured: &Path,
+    canonical: &Path,
+    _args: &[String],
+    bytes: &[u8],
+) -> Result<()> {
+    if reviewer_script_interpreter(bytes)?.is_some() {
+        return Ok(());
+    }
+    if is_native_interpreter_or_dispatcher_program(configured)
+        || is_native_interpreter_or_dispatcher_program(canonical)
+    {
+        bail!(
+            "verified external reviewer direct program cannot be a shell, language interpreter, or command dispatcher; use a dedicated compiled reviewer or an executable reviewer script with a direct absolute shebang"
+        );
+    }
+    Ok(())
+}
+
+fn verify_canonical_reviewer_identity(path: &Path, expected: &FileIdentity) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let metadata = std::fs::symlink_metadata(path)
+            .context("verified reviewer canonical identity could not be inspected")?;
+        if !metadata.is_file()
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.file
+        {
+            bail!("verified reviewer canonical identity changed during binding");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected);
+        bail!("verified reviewer canonical identity is unsupported on this platform")
+    }
+}
+
+fn is_native_interpreter_or_dispatcher_program(path: &Path) -> bool {
+    let Some(name) = normalized_program_basename(path) else {
+        return true;
+    };
+    const EXACT_NAMES: &[&str] = &[
+        "ash",
+        "awk",
+        "bash",
+        "bun",
+        "busybox",
+        "chroot",
+        "coreutils",
+        "csh",
+        "dash",
+        "deno",
+        "dotnet",
+        "env",
+        "fish",
+        "gawk",
+        "groovy",
+        "irb",
+        "java",
+        "js",
+        "jshell",
+        "ksh",
+        "kotlin",
+        "luajit",
+        "mawk",
+        "mksh",
+        "mono",
+        "nawk",
+        "nice",
+        "node",
+        "nodejs",
+        "nohup",
+        "nu",
+        "pdksh",
+        "php",
+        "pwsh",
+        "qjs",
+        "r",
+        "rscript",
+        "runuser",
+        "setsid",
+        "sh",
+        "stdbuf",
+        "su",
+        "sudo",
+        "tcsh",
+        "timeout",
+        "wish",
+        "xargs",
+        "yash",
+        "zsh",
+    ];
+    EXACT_NAMES.contains(&name.as_str())
+        || ["lua", "perl", "pypy", "python", "ruby", "tclsh"]
+            .iter()
+            .any(|prefix| is_versioned_program_name(&name, prefix))
+}
+
+fn is_native_dispatcher_program(path: &Path) -> bool {
+    let Some(name) = normalized_program_basename(path) else {
+        return true;
+    };
+    matches!(
+        name.as_str(),
+        "busybox"
+            | "chroot"
+            | "coreutils"
+            | "env"
+            | "nice"
+            | "nohup"
+            | "runuser"
+            | "setsid"
+            | "stdbuf"
+            | "su"
+            | "sudo"
+            | "timeout"
+            | "xargs"
+    )
+}
+
+fn normalized_program_basename(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    Some(name.strip_suffix(".exe").unwrap_or(&name).to_string())
+}
+
+fn is_versioned_program_name(name: &str, prefix: &str) -> bool {
+    if name == prefix {
+        return true;
+    }
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.' || byte == b'-')
+    })
 }
 
 fn rewrite_reviewer_shebang(bytes: &[u8], interpreter: &Path) -> Result<Vec<u8>> {
@@ -3393,6 +3564,136 @@ mod tests {
             }]
         );
         assert!(!report.ci_reaction_supported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_reviewer_rejects_native_interpreter_stdin_eval_and_dispatch_forms() {
+        let native_image = b"\x7fELF dedicated fixture";
+        let cases = [
+            ("/bin/sh", "/usr/bin/dash", Vec::<String>::new()),
+            ("/bin/sh", "/usr/bin/dash", vec!["-s".to_string()]),
+            (
+                "/usr/bin/python3",
+                "/usr/bin/python3.13",
+                vec!["-c".to_string(), "review()".to_string()],
+            ),
+            (
+                "/usr/bin/python3",
+                "/usr/bin/python3.13",
+                vec!["-".to_string()],
+            ),
+            (
+                "/usr/bin/node",
+                "/usr/bin/node",
+                vec!["--eval".to_string(), "review()".to_string()],
+            ),
+            ("/usr/bin/node", "/usr/bin/node", vec!["-".to_string()]),
+            (
+                "/usr/bin/perl",
+                "/usr/bin/perl5.40",
+                vec!["-e".to_string(), "review()".to_string()],
+            ),
+            ("/usr/bin/perl", "/usr/bin/perl5.40", vec!["-".to_string()]),
+            (
+                "/usr/bin/ruby",
+                "/usr/bin/ruby3.4",
+                vec!["-e".to_string(), "review()".to_string()],
+            ),
+            ("/usr/bin/ruby", "/usr/bin/ruby3.4", vec!["-".to_string()]),
+            (
+                "/usr/bin/env",
+                "/usr/bin/coreutils",
+                vec!["python3".to_string(), "-".to_string()],
+            ),
+            (
+                "/opt/reviewer-alias",
+                "/usr/bin/python3.13",
+                vec!["-".to_string()],
+            ),
+            (
+                "/opt/reviewer-alias",
+                "/usr/bin/busybox",
+                vec!["sh".to_string()],
+            ),
+        ];
+
+        for (configured, canonical, args) in cases {
+            let error = validate_verified_reviewer_image(
+                Path::new(configured),
+                Path::new(canonical),
+                &args,
+                native_image,
+            )
+            .expect_err("native interpreter and dispatcher authority must fail closed");
+            assert!(error
+                .to_string()
+                .contains("shell, language interpreter, or command dispatcher"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_reviewer_allows_direct_shebang_script_and_dedicated_binary() -> Result<()> {
+        validate_verified_reviewer_image(
+            Path::new("reviewer-script"),
+            Path::new("/private/runtime/reviewer-script"),
+            &[],
+            b"#!/bin/sh\nexit 0\n",
+        )?;
+        validate_verified_reviewer_image(
+            Path::new("reviewer-python-adapter"),
+            Path::new("/opt/review/reviewer-python-adapter"),
+            &["--strict".to_string()],
+            b"\x7fELF dedicated reviewer fixture",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewer_script_rejects_configured_and_canonical_dispatcher_shebangs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let dispatcher = temp.path().join("env");
+        std::fs::write(&dispatcher, b"native dispatcher fixture")?;
+        std::fs::set_permissions(&dispatcher, std::fs::Permissions::from_mode(0o700))?;
+        let script = format!("#!{}\nexit 0\n", dispatcher.display());
+        let error = reviewer_script_interpreter(script.as_bytes())
+            .expect_err("dispatcher shebang must fail closed");
+        assert!(error.to_string().contains("command dispatchers"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_verified_reviewer_classifies_script_binary_and_interpreter_images() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
+        for (name, bytes) in [
+            ("reviewer-binary", b"\x7fELF dedicated reviewer".as_slice()),
+            ("sh", b"#!/bin/sh\nexit 0\n".as_slice()),
+            ("python3", b"\x7fELF interpreter fixture".as_slice()),
+        ] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, bytes)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let repository = ReviewRepositoryBinding::bind(temp.path())?;
+
+        let binary = BoundReviewerProgram::bind(&repository, Path::new("reviewer-binary"))?;
+        validate_verified_reviewer_program(&repository, &binary, &[])?;
+        let script = BoundReviewerProgram::bind(&repository, Path::new("sh"))?;
+        validate_verified_reviewer_program(&repository, &script, &[])?;
+        let interpreter = BoundReviewerProgram::bind(&repository, Path::new("python3"))?;
+        assert!(
+            validate_verified_reviewer_program(&repository, &interpreter, &["-".to_string()])
+                .is_err()
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
