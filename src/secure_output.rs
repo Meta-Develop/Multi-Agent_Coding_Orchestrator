@@ -469,7 +469,7 @@ impl SecureOutputRoot {
         }
         #[cfg(not(unix))]
         {
-            let _ = (name, allow_existing);
+            let _ = (name, allow_existing, create_if_missing, fail_after_open);
             bail!("secure output capabilities are not implemented on this host")
         }
     }
