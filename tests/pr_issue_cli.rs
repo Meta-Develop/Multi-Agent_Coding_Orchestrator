@@ -7,9 +7,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::Command,
 };
 use tempfile::TempDir;
 
@@ -26,6 +24,9 @@ fn pr_publish_help_describes_bound_two_stage_validation() -> Result<()> {
     assert!(help.contains("clean committed candidate"));
     assert!(help.contains("legacy report arrays are unbound"));
     assert!(help.contains("bound exactly to its current preview binding"));
+    assert!(help.contains("origin host/owner/repo"));
+    assert!(help.contains("OID receipt"));
+    assert!(help.contains("journals retry state"));
     Ok(())
 }
 
@@ -64,6 +65,51 @@ fn pr_preview_reports_safe_fake_preview_for_claimed_worktree_edit() -> Result<()
         0
     );
 
+    Ok(())
+}
+
+#[test]
+fn pr_preview_redacts_remote_url_userinfo_query_and_fragment() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        "https://user:super-secret@example.invalid/repo.git?token=query-secret#fragment-secret",
+    ])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(
+        worktree_path.join("README.md"),
+        "# Smoke\n\nredacted remote\n",
+    )
+    .context("edit worktree")?;
+
+    let preview = run_success_json(&[
+        "pr",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--forge",
+        "github",
+        "--json",
+    ])?;
+    let serialized = serde_json::to_string(&preview).context("serialize preview")?;
+    assert_eq!(
+        preview["remote"],
+        "https://<redacted>@example.invalid/repo.git?<redacted>#<redacted>"
+    );
+    assert!(!serialized.contains("user"));
+    assert!(!serialized.contains("super-secret"));
+    assert!(!serialized.contains("query-secret"));
+    assert!(!serialized.contains("fragment-secret"));
     Ok(())
 }
 
@@ -112,7 +158,7 @@ fn pr_publish_fake_commits_uncommitted_worktree_changes_without_pushing() -> Res
 }
 
 #[test]
-fn pr_publish_blocks_when_claimed_path_changes_during_internal_commit() -> Result<()> {
+fn pr_publish_ignores_untrusted_git_path_shadow_during_internal_commit() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -134,11 +180,12 @@ fn pr_publish_blocks_when_claimed_path_changes_during_internal_commit() -> Resul
     .context("edit worktree")?;
 
     let fake_bin = temp.path().join("bin");
-    let wrapper = write_git_wrapper_that_mutates_after_real_add(&fake_bin)?;
-    let path = path_with_prefix(&fake_bin)?;
     let real_git = find_command("git")?;
     let mutation_target = worktree_path.join("README.md");
-    let report = run_failure_json_with_env(
+    let wrapper =
+        write_git_wrapper_that_mutates_after_real_add(&fake_bin, &real_git, &mutation_target)?;
+    let path = path_with_prefix(&fake_bin)?;
+    let report = run_success_json_with_env(
         &[
             "pr",
             "publish",
@@ -151,18 +198,13 @@ fn pr_publish_blocks_when_claimed_path_changes_during_internal_commit() -> Resul
             "git",
             "--json",
         ],
-        &[
-            ("PATH", path.as_os_str()),
-            ("MACO_REAL_GIT", real_git.as_os_str()),
-            ("MACO_MUTATION_TARGET", mutation_target.as_os_str()),
-        ],
+        &[("PATH", path.as_os_str())],
     )?;
 
     assert!(wrapper.exists());
-    assert_eq!(report["status"], "blocked");
-    assert_eq!(report["pushed"], false);
+    assert_eq!(report["status"], "published");
+    assert_eq!(report["pushed"], true);
     assert_eq!(report["created"], false);
-    assert_contains(&report["blockers"], "stale_base")?;
     assert!(
         report["commit_id"]
             .as_str()
@@ -176,13 +218,12 @@ fn pr_publish_blocks_when_claimed_path_changes_during_internal_commit() -> Resul
     );
     assert_eq!(
         fs::read_to_string(&mutation_target).context("read late mutation")?,
-        "# Smoke\n\nlate mutation\n"
+        "# Smoke\n\nreviewed snapshot\n"
     );
-    let branch = report["branch"].as_str().context("branch")?;
-    assert!(!git_ref_exists(
-        &origin_path,
-        &format!("refs/heads/{branch}")
-    )?);
+    let remote_ref = report["publication_receipt"]["remote_ref"]
+        .as_str()
+        .context("remote ref")?;
+    assert!(git_ref_exists(&origin_path, remote_ref)?);
     Ok(())
 }
 
@@ -235,8 +276,10 @@ fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
     assert!(report["commit_id"].as_str().context("commit id")?.len() >= 12);
     assert_eq!(report["head_id"], report["commit_id"]);
 
-    let branch = report["branch"].as_str().context("branch string")?;
-    let remote_head = git_rev_parse(&origin_path, &format!("refs/heads/{branch}"))?;
+    let remote_ref = report["publication_receipt"]["remote_ref"]
+        .as_str()
+        .context("publication remote ref")?;
+    let remote_head = git_rev_parse(&origin_path, remote_ref)?;
     assert_eq!(remote_head, report["head_id"].as_str().context("head id")?);
     assert_eq!(
         git_show_bare_file(&origin_path, &format!("{remote_head}:README.md"))?,
@@ -257,7 +300,183 @@ fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
 }
 
 #[test]
-fn pr_publish_github_sanitizes_git_environment_for_push_and_gh() -> Result<()> {
+fn pr_publish_git_rejects_repository_local_url_redirect_before_push() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let origin_path = init_bare_origin(temp.path())?;
+    let attack_path = temp.path().join("attack.git");
+    Repository::init_bare(&attack_path).context("init attack origin")?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        path_str(&origin_path)?,
+    ])?;
+    let redirect_key = format!("url.{}.insteadOf", path_str(&attack_path)?);
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "config",
+        "--add",
+        &redirect_key,
+        path_str(&origin_path)?,
+    ])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(
+        worktree_path.join("README.md"),
+        "# Smoke\n\nredirect audit\n",
+    )
+    .context("edit worktree")?;
+
+    let report = run_failure_json(&[
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--forge",
+        "git",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(report["pushed"], false);
+    assert!(report["publication_receipt"]["last_error"]
+        .as_str()
+        .context("publication error")?
+        .contains("can redirect or execute"));
+    let remote_ref = report["publication_receipt"]["remote_ref"]
+        .as_str()
+        .context("publication ref")?;
+    assert!(!git_ref_exists(&origin_path, remote_ref)?);
+    assert!(!git_ref_exists(&attack_path, remote_ref)?);
+    Ok(())
+}
+
+#[test]
+fn pr_publish_git_removes_ambient_custom_ssh_command() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        "ssh://localhost:1/owner/repo.git",
+    ])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(
+        worktree_path.join("README.md"),
+        "# Smoke\n\nssh env audit\n",
+    )
+    .context("edit worktree")?;
+    let invoked = temp.path().join("custom-ssh-invoked");
+    let fake_ssh = temp.path().join("fake-ssh");
+    fs::write(
+        &fake_ssh,
+        format!(
+            "#!/bin/sh\nprintf invoked > {}\nexit 1\n",
+            shell_quote_path(&invoked)
+        ),
+    )
+    .context("write fake SSH command")?;
+    let mut permissions = fs::metadata(&fake_ssh)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ssh, permissions)?;
+
+    let output = Command::new(BIN)
+        .args([
+            "pr",
+            "publish",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--forge",
+            "git",
+            "--json",
+        ])
+        .env("GIT_SSH_COMMAND", &fake_ssh)
+        .output()
+        .context("run publication with custom SSH injection")?;
+
+    assert!(!output.status.success());
+    assert!(!invoked.exists());
+    let report: Value = serde_json::from_slice(&output.stdout).context("parse blocked report")?;
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(report["pushed"], false);
+    Ok(())
+}
+
+#[test]
+fn pr_publish_refuses_symlink_publication_transaction_directory() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let origin_path = init_bare_origin(temp.path())?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        path_str(&origin_path)?,
+    ])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(
+        worktree_path.join("README.md"),
+        "# Smoke\n\ntransaction symlink\n",
+    )
+    .context("edit worktree")?;
+    let args = [
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--forge",
+        "git",
+        "--json",
+    ];
+    let first = run_success_json(&args)?;
+    assert_eq!(first["status"], "published");
+
+    let transactions = repo_path.join(".git/maco/state/publication-transactions");
+    let transaction_dirs = fs::read_dir(&transactions)?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(transaction_dirs.len(), 1);
+    let transaction_dir = transaction_dirs[0].path();
+    fs::remove_dir_all(&transaction_dir).context("remove transaction directory")?;
+    let target = temp.path().join("transaction-target");
+    fs::create_dir(&target).context("create transaction symlink target")?;
+    symlink(&target, &transaction_dir).context("create transaction directory symlink")?;
+
+    let output = Command::new(BIN)
+        .args(args)
+        .output()
+        .context("rerun publication with transaction symlink")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing symbolic links"));
+    assert_eq!(fs::read_dir(&target)?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn pr_publish_github_rejects_local_origin_and_untrusted_gh_shadow() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
@@ -276,9 +495,12 @@ fn pr_publish_github_sanitizes_git_environment_for_push_and_gh() -> Result<()> {
         .context("edit worktree")?;
     let agent_repo = Repository::open(worktree_path).context("open agent repo")?;
     let committed = commit_all(&agent_repo, "github candidate").context("commit candidate")?;
+    let committed_text = committed.to_string();
 
     let fake_bin = temp.path().join("bin");
     let gh_env_path = temp.path().join("gh-pr-env.txt");
+    let gh_state_path = temp.path().join("gh-pr-state");
+    let git_trace_path = temp.path().join("github-trace.log");
     fs::create_dir_all(&fake_bin).context("create fake bin dir")?;
     let gh_path = fake_bin.join("gh");
     fs::write(
@@ -293,7 +515,23 @@ printf 'GIT_ALTERNATE_OBJECT_DIRECTORIES=%s\n' "${GIT_ALTERNATE_OBJECT_DIRECTORI
 printf 'GIT_CONFIG_COUNT=%s\n' "${GIT_CONFIG_COUNT-unset}" >> "$MACO_GH_ENV"
 printf 'GIT_CONFIG_KEY_0=%s\n' "${GIT_CONFIG_KEY_0-unset}" >> "$MACO_GH_ENV"
 printf 'GIT_CONFIG_VALUE_0=%s\n' "${GIT_CONFIG_VALUE_0-unset}" >> "$MACO_GH_ENV"
-printf '%s\n' 'https://github.example/pull/7'
+printf 'GIT_TRACE=%s\n' "${GIT_TRACE-unset}" >> "$MACO_GH_ENV"
+printf 'GIT_TRACE2_EVENT=%s\n' "${GIT_TRACE2_EVENT-unset}" >> "$MACO_GH_ENV"
+printf 'GIT_REDIRECT_STDERR=%s\n' "${GIT_REDIRECT_STDERR-unset}" >> "$MACO_GH_ENV"
+if [ "$1 $2" = 'pr list' ]; then
+    if [ -f "$MACO_GH_STATE" ]; then
+        printf '[{"url":"https://github.example/pull/7","headRefOid":"%s","number":7,"baseRefName":"main","state":"OPEN","isDraft":true}]\n' "$MACO_EXPECTED_OID"
+    else
+        printf '[]\n'
+    fi
+elif [ "$1 $2" = 'pr create' ]; then
+    printf created > "$MACO_GH_STATE"
+    printf '%s\n' 'https://github.example/pull/7'
+elif [ "$1 $2" = 'pr view' ]; then
+    printf '{"url":"https://github.example/pull/7","headRefOid":"%s","number":7,"baseRefName":"main","state":"OPEN","isDraft":true}\n' "$MACO_EXPECTED_OID"
+else
+    exit 64
+fi
 "#,
     )
     .context("write fake gh")?;
@@ -304,8 +542,9 @@ printf '%s\n' 'https://github.example/pull/7'
     fs::set_permissions(&gh_path, permissions).context("chmod fake gh")?;
     let path = path_with_prefix(&fake_bin)?;
 
-    let report = run_success_json_with_env(
-        &[
+    let mut command = Command::new(BIN);
+    command
+        .args([
             "pr",
             "publish",
             "agent-a",
@@ -316,47 +555,256 @@ printf '%s\n' 'https://github.example/pull/7'
             "--forge",
             "github",
             "--json",
-        ],
-        &[
-            ("PATH", path.as_os_str()),
-            ("MACO_GH_ENV", gh_env_path.as_os_str()),
-            ("GIT_DIR", OsStr::new("/decoy/git-dir")),
-            ("GIT_WORK_TREE", OsStr::new("/decoy/worktree")),
-            ("GIT_INDEX_FILE", OsStr::new("/decoy/index")),
-            ("GIT_COMMON_DIR", OsStr::new("/decoy/common")),
-            ("GIT_OBJECT_DIRECTORY", OsStr::new("/decoy/objects")),
-            (
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                OsStr::new("/decoy/alternates"),
-            ),
-            ("GIT_CONFIG_COUNT", OsStr::new("1")),
-            ("GIT_CONFIG_KEY_0", OsStr::new("user.name")),
-            ("GIT_CONFIG_VALUE_0", OsStr::new("decoy")),
-        ],
-    )?;
+        ])
+        .env("PATH", &path)
+        .env("MACO_GH_ENV", &gh_env_path)
+        .env("MACO_GH_STATE", &gh_state_path)
+        .env("MACO_EXPECTED_OID", &committed_text)
+        .env("GH_REPO", "attacker/wrong-repo")
+        .env("GH_HOST", "attacker.invalid")
+        .env("GIT_SSH_COMMAND", &gh_path)
+        .env("GIT_TRACE", &git_trace_path);
+    let output = command
+        .output()
+        .context("run rejected GitHub publication")?;
 
-    assert_eq!(report["status"], "published");
-    assert_eq!(report["pushed"], true);
-    assert_eq!(report["created"], true);
-    assert_eq!(report["pr_url"], "https://github.example/pull/7");
-    assert_eq!(report["head_id"], committed.to_string());
-    let branch = report["branch"].as_str().context("branch")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("supported HTTPS, SSH, or SCP"));
+    assert!(!gh_env_path.exists());
+    assert!(!gh_state_path.exists());
+    assert!(!git_trace_path.exists());
+    Ok(())
+}
+
+#[test]
+fn pr_publish_github_untrusted_gh_cannot_move_remote_ref() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let origin_path = init_bare_origin(temp.path())?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        path_str(&origin_path)?,
+    ])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(
+        worktree_path.join("README.md"),
+        "# Smoke\n\nreviewed github\n",
+    )
+    .context("edit candidate")?;
+    let agent_repo = Repository::open(worktree_path).context("open agent repo")?;
+    let reviewed = commit_all(&agent_repo, "reviewed candidate")?;
+    let attack = create_unreferenced_readme_commit(
+        &agent_repo,
+        reviewed,
+        "# Smoke\n\nunreviewed remote move\n",
+    )?;
+    run_git(&[
+        "-C",
+        path_str(worktree_path)?,
+        "push",
+        "origin",
+        &format!("{attack}:refs/heads/attack-source"),
+    ])?;
+
+    let fake_bin = temp.path().join("bin");
+    let state = temp.path().join("attack-pr-state");
+    fs::create_dir_all(&fake_bin).context("create fake bin")?;
+    let gh_path = fake_bin.join("gh");
+    fs::write(
+        &gh_path,
+        r#"#!/bin/sh
+if [ "$1 $2" = 'pr list' ]; then
+    if [ -f "$MACO_GH_STATE" ]; then
+        printf '[{"url":"https://github.example/pull/9","headRefOid":"%s","number":9,"baseRefName":"main","state":"OPEN","isDraft":true}]\n' "$MACO_ATTACK_OID"
+    else
+        printf '[]\n'
+    fi
+elif [ "$1 $2" = 'pr create' ]; then
+    head=
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = '--head' ]; then
+            shift
+            head=$1
+            break
+        fi
+        shift
+    done
+    git --git-dir "$MACO_ORIGIN" update-ref "refs/heads/$head" "$MACO_ATTACK_OID" || exit 65
+    printf created > "$MACO_GH_STATE"
+    printf '%s\n' 'https://github.example/pull/9'
+elif [ "$1 $2" = 'pr view' ]; then
+    printf '{"url":"https://github.example/pull/9","headRefOid":"%s","number":9,"baseRefName":"main","state":"OPEN","isDraft":true}\n' "$MACO_ATTACK_OID"
+else
+    exit 64
+fi
+"#,
+    )
+    .context("write attacking gh")?;
+    let mut permissions = fs::metadata(&gh_path)
+        .context("stat attacking gh")?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&gh_path, permissions).context("chmod attacking gh")?;
+    let path = path_with_prefix(&fake_bin)?;
+    let attack_text = attack.to_string();
+
+    let output = Command::new(BIN)
+        .args([
+            "pr",
+            "publish",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--forge",
+            "github",
+            "--json",
+        ])
+        .env("PATH", path)
+        .env("MACO_GH_STATE", &state)
+        .env("MACO_ORIGIN", &origin_path)
+        .env("MACO_ATTACK_OID", &attack_text)
+        .output()
+        .context("run publication with attacking gh shadow")?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("supported HTTPS, SSH, or SCP"));
+    assert!(!state.exists());
+    assert!(!git_ref_exists(
+        &origin_path,
+        &format!("refs/heads/maco/review/agent-a/{reviewed}")
+    )?);
     assert_eq!(
-        git_rev_parse(&origin_path, &format!("refs/heads/{branch}"))?,
-        committed.to_string()
-    );
-    assert_eq!(
-        fs::read_to_string(&gh_env_path).context("read gh pr environment")?,
-        "GIT_DIR=unset\nGIT_WORK_TREE=unset\nGIT_INDEX_FILE=unset\nGIT_COMMON_DIR=unset\nGIT_OBJECT_DIRECTORY=unset\nGIT_ALTERNATE_OBJECT_DIRECTORIES=unset\nGIT_CONFIG_COUNT=unset\nGIT_CONFIG_KEY_0=unset\nGIT_CONFIG_VALUE_0=unset\n"
+        git_rev_parse(&origin_path, "refs/heads/attack-source")?,
+        attack.to_string()
     );
     Ok(())
 }
 
 #[test]
-fn merge_apply_cannot_run_while_pr_publish_pushes_reviewed_commit() -> Result<()> {
+fn pr_publish_github_does_not_invoke_untrusted_lost_response_shim() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "remote",
+        "add",
+        "origin",
+        path_str(&origin_path)?,
+    ])?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nreconcile pr\n")
+        .context("edit candidate")?;
+    let agent_repo = Repository::open(worktree_path).context("open agent repo")?;
+    let reviewed = commit_all(&agent_repo, "reconcile candidate")?;
+
+    let fake_bin = temp.path().join("bin");
+    let pr_state = temp.path().join("reconcile-pr-state");
+    let list_count = temp.path().join("reconcile-list-count");
+    let create_count = temp.path().join("reconcile-create-count");
+    fs::create_dir_all(&fake_bin).context("create fake bin")?;
+    let gh_path = fake_bin.join("gh");
+    fs::write(
+        &gh_path,
+        r#"#!/bin/sh
+if [ "$1 $2" = 'pr list' ]; then
+    count=0
+    if [ -f "$MACO_LIST_COUNT" ]; then
+        count=$(cat "$MACO_LIST_COUNT")
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$MACO_LIST_COUNT"
+    if [ "$count" -eq 1 ]; then
+        printf '[]\n'
+    elif [ "$count" -eq 2 ]; then
+        printf 'temporary list failure\n' >&2
+        exit 70
+    elif [ -f "$MACO_PR_STATE" ]; then
+        printf '[{"url":"https://github.example/pull/11","headRefOid":"%s","number":11,"baseRefName":"main","state":"OPEN","isDraft":true}]\n' "$MACO_EXPECTED_OID"
+    else
+        printf '[]\n'
+    fi
+elif [ "$1 $2" = 'pr create' ]; then
+    count=0
+    if [ -f "$MACO_CREATE_COUNT" ]; then
+        count=$(cat "$MACO_CREATE_COUNT")
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$MACO_CREATE_COUNT"
+    printf created > "$MACO_PR_STATE"
+    printf 'response lost after create\n' >&2
+    exit 71
+elif [ "$1 $2" = 'pr view' ]; then
+    printf '{"url":"https://github.example/pull/11","headRefOid":"%s","number":11,"baseRefName":"main","state":"OPEN","isDraft":true}\n' "$MACO_EXPECTED_OID"
+else
+    exit 64
+fi
+"#,
+    )
+    .context("write reconciling gh")?;
+    let mut permissions = fs::metadata(&gh_path)
+        .context("stat reconciling gh")?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&gh_path, permissions).context("chmod reconciling gh")?;
+    let path = path_with_prefix(&fake_bin)?;
+    let reviewed_text = reviewed.to_string();
+    let args = [
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--forge",
+        "github",
+        "--json",
+    ];
+    let output = Command::new(BIN)
+        .args(args)
+        .env("PATH", path)
+        .env("MACO_PR_STATE", &pr_state)
+        .env("MACO_LIST_COUNT", &list_count)
+        .env("MACO_CREATE_COUNT", &create_count)
+        .env("MACO_EXPECTED_OID", &reviewed_text)
+        .output()
+        .context("run publication with lost-response shim")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("supported HTTPS, SSH, or SCP"));
+    assert!(!pr_state.exists());
+    assert!(!list_count.exists());
+    assert!(!create_count.exists());
+    Ok(())
+}
+
+#[test]
+fn pr_publish_ignores_untrusted_git_path_shadow_for_push() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let origin_path = init_bare_origin(temp.path())?;
+    let attack_path = temp.path().join("ambient-attack.git");
+    Repository::init_bare(&attack_path).context("init ambient attack origin")?;
+    let malicious_config = temp.path().join("ambient-gitconfig");
+    let redirect_key = format!("url.{}.insteadOf", path_str(&attack_path)?);
+    run_git(&[
+        "config",
+        "--file",
+        path_str(&malicious_config)?,
+        &redirect_key,
+        path_str(&origin_path)?,
+    ])?;
     run_git(&[
         "-C",
         path_str(&repo_path)?,
@@ -372,14 +820,13 @@ fn merge_apply_cannot_run_while_pr_publish_pushes_reviewed_commit() -> Result<()
         .context("edit worktree")?;
 
     let fake_bin = temp.path().join("bin");
-    write_git_wrapper_that_waits_before_push(&fake_bin)?;
-    let path = path_with_prefix(&fake_bin)?;
     let real_git = find_command("git")?;
+    write_git_wrapper_that_waits_before_push(&fake_bin, &real_git)?;
+    let path = path_with_prefix(&fake_bin)?;
     let push_ready = temp.path().join("push-ready");
     let push_release = temp.path().join("push-release");
-    let mut publish = Command::new(BIN);
-    publish
-        .args([
+    let report = run_success_json_with_env(
+        &[
             "pr",
             "publish",
             "agent-a",
@@ -390,67 +837,25 @@ fn merge_apply_cannot_run_while_pr_publish_pushes_reviewed_commit() -> Result<()
             "--forge",
             "git",
             "--json",
-        ])
-        .env("PATH", &path)
-        .env("MACO_REAL_GIT", &real_git)
-        .env("MACO_PUSH_READY", &push_ready)
-        .env("MACO_PUSH_RELEASE", &push_release)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut publish = publish.spawn().context("start pr publication")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !push_ready.exists() {
-        if Instant::now() >= deadline {
-            let _ = publish.kill();
-            anyhow::bail!("publication did not reach push before timeout");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+        ],
+        &[
+            ("PATH", path.as_os_str()),
+            ("MACO_PUSH_READY", push_ready.as_os_str()),
+            ("MACO_PUSH_RELEASE", push_release.as_os_str()),
+            ("GIT_CONFIG_GLOBAL", malicious_config.as_os_str()),
+            ("TMPDIR", repo_path.as_os_str()),
+        ],
+    )?;
 
-    let apply = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--json",
-        ])
-        .output()
-        .context("run concurrent merge apply")?;
-    fs::write(
-        worktree_path.join("README.md"),
-        "# Smoke\n\nlate branch commit\n",
-    )
-    .context("write late branch change")?;
-    let late_head = commit_all(
-        &Repository::open(worktree_path).context("reopen agent repo")?,
-        "late branch move",
-    )
-    .context("commit late branch move")?;
-    fs::write(&push_release, "release\n").context("release push")?;
-    let published = publish.wait_with_output().context("wait for publication")?;
-
-    assert!(!apply.status.success());
-    let apply_stderr = String::from_utf8_lossy(&apply.stderr);
-    assert!(apply_stderr.contains("repository mutation lock"));
-    assert!(apply_stderr.contains("pr-publish"));
-    assert!(
-        published.status.success(),
-        "{}",
-        String::from_utf8_lossy(&published.stderr)
-    );
-    let report: Value = serde_json::from_slice(&published.stdout).context("parse publication")?;
     assert_eq!(report["status"], "published");
-    let branch = report["branch"].as_str().context("branch")?;
+    assert!(!push_ready.exists());
+    assert!(!push_release.exists());
     let reviewed_head = report["head_id"].as_str().context("head id")?;
-    assert_ne!(reviewed_head, late_head.to_string());
-    assert_eq!(
-        git_rev_parse(&origin_path, &format!("refs/heads/{branch}"))?,
-        reviewed_head
-    );
+    let remote_ref = report["publication_receipt"]["remote_ref"]
+        .as_str()
+        .context("publication remote ref")?;
+    assert_eq!(git_rev_parse(&origin_path, remote_ref)?, reviewed_head);
+    assert!(!git_ref_exists(&attack_path, remote_ref)?);
     assert_eq!(
         git_show_bare_file(&origin_path, &format!("{reviewed_head}:README.md"))?,
         "# Smoke\n\npublish lock\n"
@@ -749,12 +1154,21 @@ fn pr_publish_refuses_live_repo_common_publication_lock() -> Result<()> {
     fs::create_dir_all(&lock_dir).context("create lock dir")?;
     fs::write(
         lock_dir.join("repository-mutation.lock"),
-        format!(
-            "{{\"version\":1,\"pid\":{},\"nonce\":\"held\",\"created_unix_seconds\":1,\"operation\":\"merge-apply\"}}\n",
-            std::process::id()
+        lock_record(
+            std::process::id(),
+            "merge-apply",
+            process_start_ticks(std::process::id())?,
         ),
     )
     .context("write publication lock")?;
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_dir.join("repository-mutation.lock"))
+        .context("open publication lock")?;
+    lock_file
+        .try_lock()
+        .context("hold publication kernel lock")?;
 
     let output = Command::new(BIN)
         .args([
@@ -774,7 +1188,8 @@ fn pr_publish_refuses_live_repo_common_publication_lock() -> Result<()> {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("by live pid"));
+    assert!(stderr.contains("kernel lock is held"));
+    assert!(stderr.contains("by pid"));
     assert!(stderr.contains("merge-apply"));
     assert_eq!(git_status_porcelain(worktree_path)?, " M README.md\n");
     Ok(())
@@ -912,12 +1327,13 @@ fn issue_create_fake_returns_deterministic_local_issue_url() -> Result<()> {
 }
 
 #[test]
-fn issue_create_github_passes_redacted_body_to_gh() -> Result<()> {
+fn issue_create_github_rejects_unbound_repo_before_untrusted_gh_shadow() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
     let fake_bin = temp.path().join("bin");
     let gh_args_path = temp.path().join("gh-args.txt");
     let gh_env_path = temp.path().join("gh-env.txt");
+    let gh_trace_path = temp.path().join("gh-trace.log");
     fs::create_dir_all(&repo_path).context("create repo dir")?;
     fs::create_dir_all(&fake_bin).context("create fake bin dir")?;
     let gh_path = fake_bin.join("gh");
@@ -937,6 +1353,9 @@ printf 'GIT_ALTERNATE_OBJECT_DIRECTORIES=%s\n' "${GIT_ALTERNATE_OBJECT_DIRECTORI
 printf 'GIT_CONFIG_COUNT=%s\n' "${GIT_CONFIG_COUNT-unset}" >> "$MACO_GH_ENV"
 printf 'GIT_CONFIG_KEY_0=%s\n' "${GIT_CONFIG_KEY_0-unset}" >> "$MACO_GH_ENV"
 printf 'GIT_CONFIG_VALUE_0=%s\n' "${GIT_CONFIG_VALUE_0-unset}" >> "$MACO_GH_ENV"
+printf 'GIT_TRACE=%s\n' "${GIT_TRACE-unset}" >> "$MACO_GH_ENV"
+printf 'GIT_TRACE2_EVENT=%s\n' "${GIT_TRACE2_EVENT-unset}" >> "$MACO_GH_ENV"
+printf 'GIT_REDIRECT_STDERR=%s\n' "${GIT_REDIRECT_STDERR-unset}" >> "$MACO_GH_ENV"
 printf '%s\n' 'https://github.example/issues/1'
 "#,
     )
@@ -951,8 +1370,8 @@ printf '%s\n' 'https://github.example/issues/1'
     path_entries.extend(env::split_paths(&original_path));
     let path = env::join_paths(path_entries).context("join PATH")?;
 
-    let report = run_success_json_with_env(
-        &[
+    let output = Command::new(BIN)
+        .args([
             "issue",
             "create",
             "--repo",
@@ -964,37 +1383,22 @@ printf '%s\n' 'https://github.example/issues/1'
             "--forge",
             "github",
             "--json",
-        ],
-        &[
-            ("PATH", path.as_os_str()),
-            ("MACO_GH_ARGS", gh_args_path.as_os_str()),
-            ("MACO_GH_ENV", gh_env_path.as_os_str()),
-            ("GIT_DIR", OsStr::new("/decoy/git-dir")),
-            ("GIT_WORK_TREE", OsStr::new("/decoy/worktree")),
-            ("GIT_INDEX_FILE", OsStr::new("/decoy/index")),
-            ("GIT_COMMON_DIR", OsStr::new("/decoy/common")),
-            ("GIT_OBJECT_DIRECTORY", OsStr::new("/decoy/objects")),
-            (
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                OsStr::new("/decoy/alternates"),
-            ),
-            ("GIT_CONFIG_COUNT", OsStr::new("1")),
-            ("GIT_CONFIG_KEY_0", OsStr::new("user.name")),
-            ("GIT_CONFIG_VALUE_0", OsStr::new("decoy")),
-        ],
-    )?;
+        ])
+        .env("PATH", path)
+        .env("MACO_GH_ARGS", &gh_args_path)
+        .env("MACO_GH_ENV", &gh_env_path)
+        .env("GH_REPO", "attacker/wrong-repo")
+        .env("GH_HOST", "attacker.invalid")
+        .env("GIT_SSH_COMMAND", &gh_path)
+        .env("GIT_TRACE", &gh_trace_path)
+        .output()
+        .context("run unbound issue creation")?;
 
-    assert_eq!(report["forge"], "github");
-    assert_eq!(report["created"], true);
-    assert_eq!(report["url"], "https://github.example/issues/1");
-    assert_eq!(report["redacted_body"], "API_TOKEN=<redacted:secret>");
-    let gh_args = fs::read_to_string(&gh_args_path).context("read fake gh args")?;
-    assert!(gh_args.contains("--body\nAPI_TOKEN=<redacted:secret>\n"));
-    assert!(!gh_args.contains("API_TOKEN=secret"));
-    assert_eq!(
-        fs::read_to_string(&gh_env_path).context("read fake gh environment")?,
-        "GIT_DIR=unset\nGIT_WORK_TREE=unset\nGIT_INDEX_FILE=unset\nGIT_COMMON_DIR=unset\nGIT_OBJECT_DIRECTORY=unset\nGIT_ALTERNATE_OBJECT_DIRECTORIES=unset\nGIT_CONFIG_COUNT=unset\nGIT_CONFIG_KEY_0=unset\nGIT_CONFIG_VALUE_0=unset\n"
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to discover issue repository"));
+    assert!(!gh_args_path.exists());
+    assert!(!gh_env_path.exists());
+    assert!(!gh_trace_path.exists());
 
     Ok(())
 }
@@ -1044,19 +1448,6 @@ fn run_success_json_with_env(args: &[&str], envs: &[(&str, &OsStr)]) -> Result<V
 
 fn run_failure_json(args: &[&str]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
-    if output.status.success() {
-        anyhow::bail!("maco command unexpectedly succeeded");
-    }
-    serde_json::from_slice(&output.stdout).context("parse failure json")
-}
-
-fn run_failure_json_with_env(args: &[&str], envs: &[(&str, &OsStr)]) -> Result<Value> {
-    let mut command = Command::new(BIN);
-    command.args(args);
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let output = command.output().context("run maco")?;
     if output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
@@ -1126,6 +1517,35 @@ fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
     .context("commit")
 }
 
+fn create_unreferenced_readme_commit(
+    repo: &Repository,
+    parent_oid: Oid,
+    readme: &str,
+) -> Result<Oid> {
+    let parent = repo.find_commit(parent_oid).context("find parent commit")?;
+    let parent_tree = parent.tree().context("find parent tree")?;
+    let mut builder = repo
+        .treebuilder(Some(&parent_tree))
+        .context("create tree builder")?;
+    let blob = repo.blob(readme.as_bytes()).context("create README blob")?;
+    builder
+        .insert("README.md", blob, 0o100644)
+        .context("insert README blob")?;
+    let tree_id = builder.write().context("write attack tree")?;
+    let tree = repo.find_tree(tree_id).context("find attack tree")?;
+    let signature =
+        Signature::now("maco test", "maco-test@example.invalid").context("signature")?;
+    repo.commit(
+        None,
+        &signature,
+        &signature,
+        "unreviewed remote commit",
+        &tree,
+        &[&parent],
+    )
+    .context("create unreferenced commit")
+}
+
 fn init_bare_origin(root: &Path) -> Result<PathBuf> {
     let origin_path = root.join("origin.git");
     let output = Command::new("git")
@@ -1162,25 +1582,35 @@ fn write_failing_gh(path_dir: &Path) -> Result<PathBuf> {
     Ok(log_path)
 }
 
-fn write_git_wrapper_that_mutates_after_real_add(path_dir: &Path) -> Result<PathBuf> {
+fn write_git_wrapper_that_mutates_after_real_add(
+    path_dir: &Path,
+    real_git: &Path,
+    mutation_target: &Path,
+) -> Result<PathBuf> {
     fs::create_dir_all(path_dir).context("create fake bin dir")?;
     let git_path = path_dir.join("git");
     fs::write(
         &git_path,
-        r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
+real_git={}
+mutation_target={}
 saw_add=false
 for arg in "$@"; do
     if [ "$arg" = add ]; then
         saw_add=true
     fi
 done
-"$MACO_REAL_GIT" "$@"
+"$real_git" "$@"
 status=$?
-if [ "$status" -eq 0 ] && [ "$saw_add" = true ] && [ -z "${GIT_OBJECT_DIRECTORY+x}" ]; then
-    printf '# Smoke\n\nlate mutation\n' > "$MACO_MUTATION_TARGET"
+if [ "$status" -eq 0 ] && [ "$saw_add" = true ] && [ -z "${{GIT_OBJECT_DIRECTORY+x}}" ]; then
+    printf '# Smoke\n\nlate mutation\n' > "$mutation_target"
 fi
 exit "$status"
 "#,
+            shell_quote_path(real_git),
+            shell_quote_path(mutation_target),
+        ),
     )
     .context("write mutating git wrapper")?;
     let mut permissions = fs::metadata(&git_path)
@@ -1191,12 +1621,14 @@ exit "$status"
     Ok(git_path)
 }
 
-fn write_git_wrapper_that_waits_before_push(path_dir: &Path) -> Result<PathBuf> {
+fn write_git_wrapper_that_waits_before_push(path_dir: &Path, real_git: &Path) -> Result<PathBuf> {
     fs::create_dir_all(path_dir).context("create fake bin dir")?;
     let git_path = path_dir.join("git");
     fs::write(
         &git_path,
-        r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
+real_git={}
 saw_push=false
 for arg in "$@"; do
     if [ "$arg" = push ]; then
@@ -1209,8 +1641,10 @@ if [ "$saw_push" = true ]; then
         sleep 0.05
     done
 fi
-exec "$MACO_REAL_GIT" "$@"
+exec "$real_git" "$@"
 "#,
+            shell_quote_path(real_git),
+        ),
     )
     .context("write waiting git wrapper")?;
     let mut permissions = fs::metadata(&git_path)
@@ -1219,6 +1653,10 @@ exec "$MACO_REAL_GIT" "$@"
     permissions.set_mode(0o755);
     fs::set_permissions(&git_path, permissions).context("chmod waiting git wrapper")?;
     Ok(git_path)
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 fn find_command(name: &str) -> Result<PathBuf> {
@@ -1328,6 +1766,27 @@ fn git_show_file(worktree_path: &Path, revision: &str) -> Result<String> {
         );
     }
     String::from_utf8(output.stdout).context("git show output utf8")
+}
+
+fn lock_record(pid: u32, operation: &str, process_start_ticks: u64) -> String {
+    format!(
+        "{{\"version\":3,\"pid\":{pid},\"nonce\":\"held-{pid}\",\"created_unix_seconds\":1,\"operation\":\"{operation}\",\"process_start\":{{\"kind\":\"linux_proc_start_ticks\",\"value\":{process_start_ticks}}}}}\n"
+    )
+}
+
+fn process_start_ticks(pid: u32) -> Result<u64> {
+    let bytes = fs::read(format!("/proc/{pid}/stat")).context("read process stat")?;
+    let closing = bytes
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .context("process stat command terminator")?;
+    let fields = bytes[closing + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    std::str::from_utf8(fields.get(19).context("process starttime field")?)?
+        .parse()
+        .context("parse process starttime")
 }
 
 fn assert_contains(value: &Value, expected: &str) -> Result<()> {

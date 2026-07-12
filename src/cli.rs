@@ -2089,7 +2089,7 @@ struct MergeApplyArgs {
     /// Require an exact candidate-bound passed report or a passed candidate validation command.
     #[arg(long)]
     require_validation: bool,
-    /// Shell command to validate the temporary merged candidate before applying to primary.
+    /// Validate a temporary merged candidate; recursive candidate or submodule changes block apply.
     #[arg(long = "validation-command")]
     validation_command: Vec<String>,
     #[command(flatten)]
@@ -2159,9 +2159,10 @@ impl PrCommand {
                     require_validation,
                     validation_evidence,
                 )?;
+                let blocked_message = report.next_action.clone();
                 print_pr_publication_report(&report, json)?;
                 if report.status == PrPublicationStatus::Blocked {
-                    bail!("pr publish refused: merge-preview blockers remain");
+                    bail!("pr publish refused: {blocked_message}");
                 }
                 Ok(())
             }
@@ -2173,7 +2174,7 @@ impl PrCommand {
 enum PrSubcommand {
     /// Preview whether an agent worktree is ready to publish as a pull request.
     Preview(PrPreviewArgs),
-    /// Publish an agent worktree through an explicit forge.
+    /// Publish an exact reviewed commit through an explicit forge with retry reconciliation.
     Publish(PrPublishArgs),
 }
 
@@ -2220,7 +2221,7 @@ struct PrPublishArgs {
     /// Require a clean committed candidate and passed evidence bound exactly to its current preview binding.
     #[arg(long)]
     require_validation: bool,
-    /// Forge adapter. `fake` is deterministic and local-only; `github` shells out explicitly.
+    /// Forge adapter. `github` binds origin host/owner/repo, verifies the OID receipt, and journals retry state.
     #[arg(long, value_parser = parse_forge_kind)]
     forge: ForgeKind,
     /// Mark the pull request ready for review instead of draft.

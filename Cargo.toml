@@ -31,6 +31,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 git2 = { version = "0.20", default-features = false }
+libc = "0.2"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 serde = { version = "1", features = ["derive"] }

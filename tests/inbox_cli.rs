@@ -654,7 +654,7 @@ fn github_git_permission_pushes_without_creating_github_pr_when_validated() -> R
 }
 
 #[test]
-fn github_pr_permission_creates_draft_pr_only_when_explicit_and_validated() -> Result<()> {
+fn github_pr_permission_rejects_local_origin_before_creating_draft_pr() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path(), "github-pr-origin.git")?;
@@ -676,7 +676,7 @@ fn github_pr_permission_creates_draft_pr_only_when_explicit_and_validated() -> R
     commit_all(&Repository::open(&repo_path)?, "inbox github pr config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_success_json_with_path(
+    let report = run_failure_json_with_path(
         &[
             "inbox",
             "run",
@@ -692,20 +692,21 @@ fn github_pr_permission_creates_draft_pr_only_when_explicit_and_validated() -> R
     )?;
 
     assert_eq!(report["permission_mode"], "github_pr");
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["success"], true);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["success"], false);
+    assert_eq!(report["item_reports"][0]["autopilot_success"], false);
     let autopilot = read_json_file(
         &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-autopilot-report.json"),
     )?;
-    assert_eq!(autopilot["validation"]["status"], "passed");
-    assert_eq!(autopilot["pr"]["forge"], "github");
-    assert_eq!(autopilot["pr"]["draft"], true);
-    assert_eq!(autopilot["pr"]["pushed"], true);
-    assert_eq!(autopilot["pr"]["created"], true);
-    assert_eq!(
-        autopilot["pr"]["pr_url"],
-        "https://github.test/acme/demo/pull/1"
-    );
+    assert_eq!(autopilot["status"], "failed");
+    assert_eq!(autopilot["success"], false);
+    assert!(autopilot["error"]
+        .as_str()
+        .context("autopilot error")?
+        .contains("supported HTTPS, SSH, or SCP-style origin URL"));
+    assert!(!autopilot
+        .to_string()
+        .contains(&origin_path.display().to_string()));
     let github = read_json_file(
         &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-github-report.json"),
     )?;
@@ -713,8 +714,7 @@ fn github_pr_permission_creates_draft_pr_only_when_explicit_and_validated() -> R
 
     let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
     assert!(gh_log.contains("issue list"));
-    assert!(gh_log.contains("pr create"));
-    assert!(gh_log.contains("--draft"));
+    assert!(!gh_log.contains("pr create"));
     assert!(!gh_log.contains("comment"));
     assert_no_approval_or_merge_in_gh_log(&gh_log);
 
@@ -722,7 +722,7 @@ fn github_pr_permission_creates_draft_pr_only_when_explicit_and_validated() -> R
 }
 
 #[test]
-fn github_full_permission_comments_only_after_success_when_explicit_and_validated() -> Result<()> {
+fn github_full_permission_skips_comments_when_publication_or_validation_fails() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let success_repo = create_named_committed_repo(temp.path(), "github-full-success")?;
     let fail_repo = create_named_committed_repo(temp.path(), "github-full-fail")?;
@@ -797,10 +797,10 @@ fn github_full_permission_comments_only_after_success_when_explicit_and_validate
 
     let success_entry = workspace_repo_entry(&report, "success")?;
     assert_eq!(success_entry["permission_mode"], "github_full");
-    assert_eq!(success_entry["status"], "succeeded");
+    assert_eq!(success_entry["status"], "failed");
     assert_eq!(
         success_entry["run_report"]["item_reports"][0]["autopilot_success"],
-        true
+        false
     );
     assert_eq!(
         success_entry["run_report"]["item_reports"][0]["github_success"],
@@ -813,10 +813,10 @@ fn github_full_permission_comments_only_after_success_when_explicit_and_validate
                 .context("success github report path")?,
         ),
     )?;
-    assert_eq!(success_github["status"], "commented");
+    assert_eq!(success_github["status"], "skipped");
     assert_eq!(
-        success_github["comment_url"],
-        "https://github.test/acme/demo/comment/1"
+        success_github["message"],
+        "autopilot did not succeed; GitHub comment skipped"
     );
 
     let failed_entry = workspace_repo_entry(&report, "failed-validation")?;
@@ -841,8 +841,8 @@ fn github_full_permission_comments_only_after_success_when_explicit_and_validate
 
     let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
     assert_eq!(gh_log.matches("issue list").count(), 4);
-    assert_eq!(gh_log.matches("pr create").count(), 1);
-    assert_eq!(gh_log.matches("issue comment").count(), 1);
+    assert_eq!(gh_log.matches("pr create").count(), 0);
+    assert_eq!(gh_log.matches("issue comment").count(), 0);
     assert_no_approval_or_merge_in_gh_log(&gh_log);
 
     let serialized = serde_json::to_string(&report).context("serialize report")?;
@@ -2307,6 +2307,10 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
 
 fn run_success_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
     run_json_command(args, None, Some(path_dir), true)
+}
+
+fn run_failure_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
+    run_json_command(args, None, Some(path_dir), false)
 }
 
 fn run_success_json_in_dir(args: &[&str], cwd: &Path) -> Result<Value> {

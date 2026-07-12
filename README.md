@@ -50,10 +50,11 @@ The current implementation covers a local-first command-line slice:
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
 - `maco merge preview` and `maco merge apply` collect one stable agent snapshot and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, candidate-bound validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report`; `--require-validation` accepts passed reports only when their envelope contains the exact current `candidate.validation_binding` (or a passed `merge apply --validation-command`).
 - `maco merge apply --validation-command <command>` validates a temporary merged
-  candidate before mutating the primary worktree. A command failure blocks the
-  apply and leaves the primary worktree unchanged.
+  candidate before mutating the primary worktree. A command failure or a
+  recursive candidate-state change, including an initialized or uninitialized
+  submodule change, blocks the apply and leaves the primary worktree unchanged.
 - `maco pr preview` checks whether an agent worktree is ready to publish without mutating the primary worktree or contacting a forge.
-- `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when validation is not required, re-previews the resulting clean commit, then either emits a deterministic fake PR URL or, with explicit `--forge github`, pushes that exact reviewed commit and runs `gh pr create`. With `--require-validation`, publication is a two-stage workflow: commit first, preview and validate that exact binding, then publish with the bound envelope.
+- `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when validation is not required, re-previews the resulting clean commit, then either emits a deterministic fake PR URL or, with explicit `--forge github`, publishes an OID-bound remote ref and verifies the resulting GitHub receipt. A durable transaction journal reconciles a lost push or `gh` response when the same command is rerun. With `--require-validation`, publication is a two-stage workflow: commit first, preview and validate that exact binding, then publish with the bound envelope.
 - `maco issue preview` redacts issue bodies without creating anything.
 - `maco issue create --forge fake|github` creates a deterministic fake issue URL locally or, with explicit `--forge github`, shells out to `gh issue create`.
 - `maco live status`, `maco live validate`, `maco live heartbeat`, and
@@ -132,7 +133,10 @@ Known limitations and roadmap for 0.3.0:
 3. PR and issue publication are intentionally narrow. The fake forge is
    deterministic and local-only. GitHub publication is opt-in with explicit
    `--forge github` and shells out to local `git` and `gh`; tests cover the
-   fake adapter without network access. Autopilot keeps the same boundary:
+   fake adapter without network access. Remote push, PR creation, and the
+   post-create receipt check are not one globally atomic operation; the durable
+   receipt supports detection and retry reconciliation rather than claiming
+   cross-service atomicity. Autopilot keeps the same boundary:
    GitHub publication is selected only by a plan's explicit
    `forge_mode: "github"`. Inbox intake keeps deterministic fake data as the default;
    GitHub inbox scanning is selected only with an explicit GitHub source.
@@ -472,19 +476,98 @@ related paths when available, and report the next safe operation.
 `merge apply --validation-command <command>` creates an independent temporary
 candidate worktree for each command, applies the agent diff there, and runs the
 command against that merged candidate before applying anything to the primary
-worktree. A failed command or any tracked/non-ignored candidate mutation is a
-blocker and leaves the primary worktree unchanged. This
-is different from automatic post-apply validation: `merge apply` still does not
-run project checks after a successful primary apply, so release managers should
-run final verification after accepting changes. With `--json`, a blocked apply
-emits a machine-readable report with readiness blockers, blocker details, and
-related paths before exiting with an error.
+worktree. A failed command blocks the apply. A successful command is also
+rejected if it changes the candidate's HEAD, index, tracked files,
+non-ignored untracked files, or recursive submodule state. For an initialized
+submodule, checking records the `.git` marker identity plus the recursive
+repository fingerprint, so ignored build output is outside the comparison. For
+an uninitialized submodule, a bounded raw-path fallback detects initialization,
+marker removal, or checkout deletion. That fallback fails closed if it exceeds
+8,192 entries, 64 MiB total content, or 16 MiB for one file. The tool does not
+initialize or fetch submodules during this check.
 
-Merge apply and PR publication share one repo-common transaction lock at
-`.git/maco/state/repository-mutation.lock`. Its typed owner record identifies
-the operation, PID, nonce, and creation time, so validation/apply cannot overlap
-publication commit/push in the same repository. Live, unknown, and malformed
-owners are refused; only a confirmed-absent PID is reclaimed atomically.
+The races addressed by the merge and publication boundary are concrete: a
+candidate can change while validation runs, another local process can start a
+merge or publication, a branch can move between preview and push, and GitHub can
+create a pull request even when the local `gh` process loses its response.
+Ambient Git repository, config, trace, and temporary-directory variables can
+also redirect an otherwise read-only command. Candidate capture therefore uses
+a restricted Git environment and an owner-only runtime below `/run/user/<uid>`
+or an owner-validated `0700` fallback below the root-owned sticky `/tmp`.
+Internal `git` and `gh` commands resolve only through the fixed
+`/run/current-system/sw/bin`, `/usr/bin`, or `/bin` entries, then verify the
+canonical executable and its ancestors are root-owned and non-writable. An
+arbitrary `PATH` entry is never a candidate, including a directly named
+immutable Nix store output whose build provenance is not established. User Nix
+profiles and Homebrew therefore fail closed at this boundary. External commands remove Git routing, trace, dynamic-loader,
+askpass/proxy, and custom-SSH execution variables while preserving
+non-executable authentication such as `SSH_AUTH_SOCK` and GitHub token
+variables; preserved authentication values are registered for error redaction.
+Windows external-tool trust and ACL resolution is not implemented,
+so these command paths fail closed on Windows.
+
+Merge apply and PR publication share a kernel-managed advisory lock on the
+stable repo-common file `.git/maco/state/repository-mutation.lock`. The file is
+not deleted when the operation finishes; closing or crashing the process
+releases the kernel lock. Its typed owner record contains the operation, PID,
+process-start identity when available, nonce, and creation time for diagnostics.
+The owner record does not decide whether the lock is live. A locked malformed
+record is refused, while an unlocked stale record is replaced by the next lock
+holder.
+
+Validation evidence remains bound to the exact candidate snapshot described
+above. Git and GitHub publication use a unique OID-derived remote ref and push
+the reviewed object to the bound raw origin URL with a create-only lease.
+System/global Git config is disabled for network commands, and publication
+rejects repository-local URL redirects, credential helpers, custom SSH/proxy
+commands, push URLs, and config includes before contacting the remote. GitHub publication observes the
+remote OID before PR creation, reads the resulting PR with `gh pr view`, and
+requires the expected head OID, base branch, open state, and draft/ready value.
+The HTTPS/SSH origin is also parsed into a bound host/owner/repository identity.
+Every `gh pr` and `gh issue create` call receives that explicit `--repo`;
+ambient `GH_REPO`, `GH_HOST`, config routing, debug, pager, and forced-TTY
+variables are removed. The receipt URL must identify the same repository and PR
+number. Publication observes the remote OID again after that receipt. A mismatch
+is reported as blocked rather than published.
+
+Publication writes versioned, append-only transaction records below the common
+`.git/maco/state/publication-transactions/` directory. Record replacement is
+atomic, the latest 32 records are kept for each transaction, and Unix creates
+the managed directories with mode `0700` and key/journal files with mode
+`0600`. Windows rejects reparse points and verifies file identity, but this
+workflow does not claim to tighten inherited Windows ACLs. A repo-common random
+key derives a one-way binding digest from the remote name and raw URL, so a
+credential or endpoint change cannot reuse an older transaction while the raw
+URL remains absent from the journal. User information, query values, fragments,
+raw credentials, and unredacted command errors are represented only by that
+keyed binding and the redacted display value. If the binding key is missing
+while prior transaction entries exist, publication fails closed instead of
+creating a new key. The JSON
+`publication_receipt` reports the monotonic
+phase (`prepared`, `push_observed`, `pr_observed`, or `completed`), expected and
+observed OIDs, remote ref, PR URL and verified PR fields, whether creation was
+attempted, whether a successful create response or URL directly attributed the
+PR to this transaction, whether reconciliation found an existing PR, and the
+last redacted error. A PR recovered only through `list`/`view` after a lost
+response is conservatively reported as `created_by_transaction=false` and
+`observed_existing_pr=true`. Rerun the same `pr publish` command: it reconciles
+the remote ref and existing PR before attempting another write. A completed
+transaction is idempotent.
+
+These checks do not make Git hosting operations globally atomic. Another actor
+can still move or delete the remote ref after a check, and PR creation plus the
+post-create `gh pr view` verification spans multiple remote operations. The
+post-create check detects a mismatch; it cannot prevent a later one. The
+repo-common lock coordinates this tool's local operations only, and journal
+durability still depends on the underlying filesystem. Managed paths reject
+pre-existing symlinks (and Windows reparse points), but path-based checks do not
+claim protection from a hostile same-user process replacing components during
+the check; this boundary coordinates non-adversarial concurrent local actors.
+`merge apply` also does
+not run project checks after a successful primary apply, so release managers
+should run final verification after accepting changes. With `--json`, a blocked
+apply emits a machine-readable report with readiness blockers, blocker details,
+and related paths before exiting with an error.
 
 Preview and publish agent worktree changes as a pull request:
 
@@ -513,11 +596,10 @@ change the binding after review. A dirty required candidate is blocked with the
 commit -> preview -> validate -> publish recovery sequence. Without
 `--require-validation`, publish may commit safe uncommitted changes in the agent
 worktree only, but it re-previews the clean commit and checks it again immediately
-before external publication. Git and GitHub publication push the explicit
-reviewed commit object, not a branch name that may move concurrently. The fake
-forge returns deterministic `fake://pr/...` URLs and never uses the network.
-GitHub publication runs only when `--forge github` is passed and shells out to
-`git push` and `gh pr create`.
+before external publication. The fake forge returns deterministic
+`fake://pr/...` URLs and never uses the network. GitHub publication runs only
+when `--forge github` is passed and shells out to local `git` and `gh` using the
+transaction and verification sequence above.
 
 Preview and create issues:
 

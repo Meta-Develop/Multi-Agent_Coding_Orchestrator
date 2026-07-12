@@ -12,8 +12,8 @@ use std::{
     ffi::{OsStr, OsString},
     fmt::Write as FmtWrite,
     fs::{self, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -21,8 +21,13 @@ use std::{
 pub const DEFAULT_DIFF_SUMMARY_CHAR_LIMIT: usize = 32 * 1024;
 pub const VALIDATION_BINDING_VERSION: u32 = 1;
 const CANDIDATE_CAPTURE_ATTEMPTS: usize = 3;
-const LOCK_RECORD_VERSION: u32 = 1;
+const LOCK_RECORD_VERSION: u32 = 3;
 const REPOSITORY_MUTATION_LOCK_FILE: &str = "repository-mutation.lock";
+const MAX_LOCK_RECORD_BYTES: u64 = 4 * 1024;
+const VALIDATION_RAW_MAX_ENTRIES: usize = 8 * 1024;
+const VALIDATION_RAW_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const VALIDATION_RAW_MAX_SINGLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const VALIDATION_MARKER_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeCollectOptions {
@@ -372,15 +377,7 @@ struct GitCommandOutput {
 }
 
 pub(crate) struct RepoCommonLock {
-    path: PathBuf,
-    owner_bytes: Vec<u8>,
-}
-
-struct PendingRepoCommonLock {
-    path: PathBuf,
-    owner_bytes: Vec<u8>,
-    file: Option<fs::File>,
-    committed: bool,
+    file: fs::File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -391,13 +388,16 @@ struct RepoLockOwner {
     nonce: String,
     created_unix_seconds: u64,
     operation: String,
+    process_start: Option<ProcessStartIdentity>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessLiveness {
-    Live,
-    Absent,
-    Unknown,
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum ProcessStartIdentity {
+    #[cfg(target_os = "linux")]
+    LinuxProcStartTicks(u64),
+    #[cfg(target_os = "windows")]
+    WindowsCreationFiletime(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1112,7 +1112,7 @@ fn snapshot_worktree_candidate_from_base(
     base_commit: Option<Oid>,
 ) -> Result<CapturedWorktreeTree> {
     let index = TemporaryIndex::create(repo.commondir())?;
-    let mut read_tree = git_command(worktree_path, &["read-tree"]);
+    let mut read_tree = git_command(worktree_path, &["read-tree"])?;
     index.configure_command(&mut read_tree);
     match head {
         Some(oid) => {
@@ -1124,11 +1124,11 @@ fn snapshot_worktree_candidate_from_base(
     }
     run_command_success(read_tree, "initialize candidate snapshot index")?;
 
-    let mut add = git_command(worktree_path, &["add", "--all", "--", "."]);
+    let mut add = git_command(worktree_path, &["add", "--all", "--", "."])?;
     index.configure_command(&mut add);
     run_command_success(add, "populate candidate snapshot index")?;
 
-    let mut write_tree = git_command(worktree_path, &["write-tree"]);
+    let mut write_tree = git_command(worktree_path, &["write-tree"])?;
     index.configure_command(&mut write_tree);
     let output = write_tree
         .output()
@@ -1166,7 +1166,7 @@ fn temporary_base_tree_oid(
         return Ok(tree_id);
     }
 
-    let mut command = git_command(worktree_path, &["mktree"]);
+    let mut command = git_command(worktree_path, &["mktree"])?;
     index.configure_command(&mut command);
     command.stdin(Stdio::null());
     let output = command
@@ -1201,7 +1201,7 @@ fn collect_snapshot_changes(
             &snapshot,
             "--",
         ],
-    );
+    )?;
     index.configure_command(&mut command);
     let output = command
         .output()
@@ -1262,7 +1262,7 @@ fn collect_snapshot_diff(
             &snapshot,
             "--",
         ],
-    );
+    )?;
     index.configure_command(&mut command);
     let output = command
         .output()
@@ -1278,12 +1278,13 @@ fn collect_snapshot_diff(
 
 impl TemporaryIndex {
     fn create(common_dir: &Path) -> Result<Self> {
+        let runtime_root = trusted_runtime_root(common_dir)?;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system time before UNIX epoch")?
             .as_nanos();
         for attempt in 0..32_u32 {
-            let directory = env::temp_dir().join(format!(
+            let directory = runtime_root.join(format!(
                 "maco-candidate-capture-{}-{nanos}-{attempt}",
                 std::process::id()
             ));
@@ -1797,7 +1798,75 @@ fn run_candidate_validation_commands(
 struct CandidateValidationSandbox {
     primary_repo_root: PathBuf,
     path: PathBuf,
-    baseline_binding: CandidateValidationBinding,
+    baseline_integrity: Option<CandidateValidationSandboxIntegrity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateValidationSandboxIntegrity {
+    binding: CandidateValidationBinding,
+    repository: ValidationRepositoryFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationRepositoryFingerprint {
+    head: Option<Oid>,
+    index_digest: Option<Oid>,
+    status: Vec<u8>,
+    snapshot_tree: Oid,
+    submodules: Vec<ValidationSubmoduleFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationSubmoduleFingerprint {
+    path: PathBuf,
+    expected_gitlink: Oid,
+    initialized: bool,
+    filesystem: ValidationFilesystemFingerprint,
+    repository: Option<Box<ValidationRepositoryFingerprint>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationFilesystemFingerprint {
+    exists: bool,
+    entries: Vec<ValidationFilesystemEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationFilesystemEntry {
+    path: PathBuf,
+    kind: ValidationFilesystemEntryKind,
+    mode: u32,
+    content_digest: Option<Oid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationFilesystemEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ValidationFilesystemFingerprintError {
+    #[error("validation submodule raw fingerprint exceeded the {limit}-entry limit at {path:?}")]
+    EntryCountExceeded { path: PathBuf, limit: usize },
+    #[error(
+        "validation submodule raw fingerprint file {path:?} exceeded the {limit}-byte single-file limit"
+    )]
+    SingleFileTooLarge { path: PathBuf, limit: u64 },
+    #[error(
+        "validation submodule raw fingerprint exceeded the {limit}-byte total-content limit at {path:?}"
+    )]
+    TotalContentTooLarge { path: PathBuf, limit: u64 },
+}
+
+struct ValidationFilesystemBudget {
+    entries: usize,
+    total_bytes: u64,
+    max_entries: usize,
+    max_total_bytes: u64,
+    max_single_file_bytes: u64,
 }
 
 impl CandidateValidationSandbox {
@@ -1810,7 +1879,7 @@ impl CandidateValidationSandbox {
             .primary_head
             .as_deref()
             .unwrap_or("HEAD");
-        let mut add_command = sanitized_git_command(&primary_repo_root);
+        let mut add_command = sanitized_git_command(&primary_repo_root)?;
         add_command
             .args(["worktree", "add", "--detach", "--force"])
             .arg(&path)
@@ -1830,7 +1899,7 @@ impl CandidateValidationSandbox {
         let mut sandbox = Self {
             primary_repo_root,
             path,
-            baseline_binding: preview.candidate.validation_binding.clone(),
+            baseline_integrity: None,
         };
 
         let patch = preview.candidate.raw_diff.as_slice();
@@ -1850,7 +1919,7 @@ impl CandidateValidationSandbox {
             }
         }
 
-        sandbox.baseline_binding = sandbox.current_binding(preview)?;
+        sandbox.baseline_integrity = Some(sandbox.current_integrity(preview)?);
 
         Ok(sandbox)
     }
@@ -1864,9 +1933,9 @@ impl CandidateValidationSandbox {
         preview: &MergeApplyPreview,
         mut report: ValidationReport,
     ) -> ValidationReport {
-        let integrity = self.current_binding(preview);
+        let integrity = self.current_integrity(preview);
         match integrity {
-            Ok(binding) if binding == self.baseline_binding => report,
+            Ok(integrity) if Some(&integrity) == self.baseline_integrity.as_ref() => report,
             Ok(_) => {
                 report.status = ValidationStatus::Failed;
                 report.message = append_validation_message(
@@ -1888,26 +1957,393 @@ impl CandidateValidationSandbox {
         }
     }
 
-    fn current_binding(&self, preview: &MergeApplyPreview) -> Result<CandidateValidationBinding> {
+    fn current_integrity(
+        &self,
+        preview: &MergeApplyPreview,
+    ) -> Result<CandidateValidationSandboxIntegrity> {
         let repo = Repository::open(&self.path).with_context(|| {
             format!("failed to open validation sandbox {}", self.path.display())
         })?;
-        let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
         let base = collection_base_oid(&preview.candidate.metadata)?;
-        let captured = capture_two_matching(|| {
-            snapshot_worktree_candidate_from_base(&repo, &self.path, head, base).map(Some)
+        capture_two_matching(|| {
+            let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
+            let captured = snapshot_worktree_candidate_from_base(&repo, &self.path, head, base)?;
+            let binding =
+                candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)?;
+            let repository =
+                validation_repository_fingerprint(&repo, &self.path, Some(captured.oid), 0)?;
+            Ok(Some(CandidateValidationSandboxIntegrity {
+                binding,
+                repository,
+            }))
+        })
+    }
+}
+
+fn validation_repository_fingerprint(
+    repo: &Repository,
+    worktree_path: &Path,
+    known_snapshot_tree: Option<Oid>,
+    depth: usize,
+) -> Result<ValidationRepositoryFingerprint> {
+    if depth > 32 {
+        bail!("validation sandbox submodule nesting exceeded 32 levels");
+    }
+    let head = head_oid(repo).context("failed to read validation repository HEAD")?;
+    let index_digest = hash_optional_file(&repo.path().join("index"))?;
+    let status = run_git_capture(
+        worktree_path,
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
+    .context("failed to capture recursive validation repository status")?;
+    if !status.success {
+        bail!(
+            "git status failed while fingerprinting validation repository: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        );
+    }
+    let snapshot_tree = match known_snapshot_tree {
+        Some(snapshot_tree) => snapshot_tree,
+        None => snapshot_worktree_candidate(repo, worktree_path, head)?.oid,
+    };
+
+    let mut submodules = Vec::new();
+    for (path, expected_gitlink) in validation_gitlinks(worktree_path)? {
+        let submodule_path = worktree_path.join(&path);
+        let marker = submodule_path.join(".git");
+        let marker_present = match fs::symlink_metadata(&marker) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect submodule marker {}", marker.display())
+                })
+            }
+        };
+        if !marker_present {
+            let filesystem = validation_filesystem_fingerprint(&submodule_path)?;
+            submodules.push(ValidationSubmoduleFingerprint {
+                path,
+                expected_gitlink,
+                initialized: false,
+                filesystem,
+                repository: None,
+            });
+            continue;
+        }
+        let filesystem = validation_submodule_marker_fingerprint(&marker)?;
+        let submodule_repo = Repository::open(&submodule_path).with_context(|| {
+            format!(
+                "initialized validation submodule {} could not be opened",
+                path_json_text(&path)
+            )
         })?;
-        candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)
+        let repository =
+            validation_repository_fingerprint(&submodule_repo, &submodule_path, None, depth + 1)?;
+        submodules.push(ValidationSubmoduleFingerprint {
+            path,
+            expected_gitlink,
+            initialized: true,
+            filesystem,
+            repository: Some(Box::new(repository)),
+        });
+    }
+
+    Ok(ValidationRepositoryFingerprint {
+        head,
+        index_digest,
+        status: status.stdout,
+        snapshot_tree,
+        submodules,
+    })
+}
+
+fn validation_gitlinks(worktree_path: &Path) -> Result<Vec<(PathBuf, Oid)>> {
+    let output = run_git_capture(worktree_path, &["ls-files", "--stage", "-z", "--"])
+        .context("failed to enumerate validation repository gitlinks")?;
+    if !output.success {
+        bail!(
+            "git ls-files failed while enumerating validation submodules: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut gitlinks = BTreeMap::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("git ls-files stage record did not contain a path separator")?;
+        let metadata = std::str::from_utf8(&entry[..tab])
+            .context("git ls-files stage metadata was not ASCII")?;
+        let mut fields = metadata.split_ascii_whitespace();
+        let mode = fields.next().context("gitlink record missing mode")?;
+        let oid = fields.next().context("gitlink record missing object id")?;
+        let stage = fields.next().context("gitlink record missing stage")?;
+        if fields.next().is_some() {
+            bail!("gitlink record contained unexpected metadata fields");
+        }
+        if mode != "160000" {
+            continue;
+        }
+        if stage != "0" {
+            bail!(
+                "validation repository contains a conflicted submodule gitlink; refusing incomplete integrity capture"
+            );
+        }
+        let path = normalize_repo_relative_path(path_buf_from_git_bytes(&entry[tab + 1..])?)?;
+        let oid = Oid::from_str(oid).context("gitlink object id was invalid")?;
+        if gitlinks.insert(path.clone(), oid).is_some() {
+            bail!(
+                "validation repository reported duplicate gitlink {}",
+                path_json_text(&path)
+            );
+        }
+    }
+    Ok(gitlinks.into_iter().collect())
+}
+
+fn validation_filesystem_fingerprint(root: &Path) -> Result<ValidationFilesystemFingerprint> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ValidationFilesystemFingerprint {
+                exists: false,
+                entries: Vec::new(),
+            })
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect submodule filesystem {}", root.display())
+            })
+        }
+    }
+    let mut entries = Vec::new();
+    let mut budget = ValidationFilesystemBudget {
+        entries: 0,
+        total_bytes: 0,
+        max_entries: VALIDATION_RAW_MAX_ENTRIES,
+        max_total_bytes: VALIDATION_RAW_MAX_TOTAL_BYTES,
+        max_single_file_bytes: VALIDATION_RAW_MAX_SINGLE_FILE_BYTES,
+    };
+    collect_validation_filesystem_entries(root, root, &mut entries, &mut budget)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(ValidationFilesystemFingerprint {
+        exists: true,
+        entries,
+    })
+}
+
+fn validation_submodule_marker_fingerprint(
+    marker: &Path,
+) -> Result<ValidationFilesystemFingerprint> {
+    let metadata = fs::symlink_metadata(marker)
+        .with_context(|| format!("failed to inspect submodule marker {}", marker.display()))?;
+    let mut budget = ValidationFilesystemBudget {
+        entries: 0,
+        total_bytes: 0,
+        max_entries: 1,
+        max_total_bytes: VALIDATION_MARKER_MAX_BYTES,
+        max_single_file_bytes: VALIDATION_MARKER_MAX_BYTES,
+    };
+    let entry = validation_filesystem_entry(marker, PathBuf::from(".git"), &metadata, &mut budget)?;
+    Ok(ValidationFilesystemFingerprint {
+        exists: true,
+        entries: vec![entry],
+    })
+}
+
+fn collect_validation_filesystem_entries(
+    root: &Path,
+    path: &Path,
+    entries: &mut Vec<ValidationFilesystemEntry>,
+    budget: &mut ValidationFilesystemBudget,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect validation path {}", path.display()))?;
+    let relative = path
+        .strip_prefix(root)
+        .context("validation filesystem path escaped submodule root")?
+        .to_path_buf();
+    let file_type = metadata.file_type();
+    entries.push(validation_filesystem_entry(
+        path, relative, &metadata, budget,
+    )?);
+
+    if file_type.is_dir() {
+        let mut children = Vec::new();
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("failed to list validation directory {}", path.display()))?
+        {
+            let child = entry
+                .with_context(|| {
+                    format!(
+                        "failed to read validation directory entry in {}",
+                        path.display()
+                    )
+                })?
+                .path();
+            if budget
+                .entries
+                .saturating_add(children.len())
+                .saturating_add(1)
+                > budget.max_entries
+            {
+                return Err(ValidationFilesystemFingerprintError::EntryCountExceeded {
+                    path: child,
+                    limit: budget.max_entries,
+                }
+                .into());
+            }
+            children.push(child);
+        }
+        children.sort();
+        for child in children {
+            collect_validation_filesystem_entries(root, &child, entries, budget)?;
+        }
+    }
+    Ok(())
+}
+
+fn validation_filesystem_entry(
+    path: &Path,
+    relative: PathBuf,
+    metadata: &fs::Metadata,
+    budget: &mut ValidationFilesystemBudget,
+) -> Result<ValidationFilesystemEntry> {
+    budget.entries = budget.entries.saturating_add(1);
+    if budget.entries > budget.max_entries {
+        return Err(ValidationFilesystemFingerprintError::EntryCountExceeded {
+            path: relative,
+            limit: budget.max_entries,
+        }
+        .into());
+    }
+    let file_type = metadata.file_type();
+    let (kind, content_digest) = if file_type.is_dir() {
+        (ValidationFilesystemEntryKind::Directory, None)
+    } else if file_type.is_file() {
+        (
+            ValidationFilesystemEntryKind::File,
+            Some(validation_file_content_digest(
+                path, &relative, metadata, budget,
+            )?),
+        )
+    } else if file_type.is_symlink() {
+        let target = fs::read_link(path)
+            .with_context(|| format!("failed to read validation symlink {}", path.display()))?;
+        let target = raw_path_bytes(&target);
+        budget.add_content_bytes(&relative, target.len() as u64)?;
+        (
+            ValidationFilesystemEntryKind::Symlink,
+            Some(
+                Oid::hash_object(ObjectType::Blob, &target)
+                    .context("failed to hash validation symlink target")?,
+            ),
+        )
+    } else {
+        (ValidationFilesystemEntryKind::Other, None)
+    };
+    Ok(ValidationFilesystemEntry {
+        path: relative,
+        kind,
+        mode: validation_file_mode(metadata),
+        content_digest,
+    })
+}
+
+fn validation_file_content_digest(
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+    budget: &mut ValidationFilesystemBudget,
+) -> Result<Oid> {
+    if metadata.len() > budget.max_single_file_bytes {
+        return Err(ValidationFilesystemFingerprintError::SingleFileTooLarge {
+            path: relative.to_path_buf(),
+            limit: budget.max_single_file_bytes,
+        }
+        .into());
+    }
+    let remaining_total = budget.max_total_bytes.saturating_sub(budget.total_bytes);
+    let read_limit = budget
+        .max_single_file_bytes
+        .min(remaining_total)
+        .saturating_add(1);
+    let mut content = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("failed to open validation file {}", path.display()))?
+        .take(read_limit)
+        .read_to_end(&mut content)
+        .with_context(|| format!("failed to read validation file {}", path.display()))?;
+    let content_len = content.len() as u64;
+    if content_len > budget.max_single_file_bytes {
+        return Err(ValidationFilesystemFingerprintError::SingleFileTooLarge {
+            path: relative.to_path_buf(),
+            limit: budget.max_single_file_bytes,
+        }
+        .into());
+    }
+    budget.add_content_bytes(relative, content_len)?;
+    Oid::hash_object(ObjectType::Blob, &content).context("failed to hash validation file content")
+}
+
+impl ValidationFilesystemBudget {
+    fn add_content_bytes(&mut self, path: &Path, bytes: u64) -> Result<()> {
+        if bytes > self.max_single_file_bytes {
+            return Err(ValidationFilesystemFingerprintError::SingleFileTooLarge {
+                path: path.to_path_buf(),
+                limit: self.max_single_file_bytes,
+            }
+            .into());
+        }
+        let Some(total) = self.total_bytes.checked_add(bytes) else {
+            return Err(ValidationFilesystemFingerprintError::TotalContentTooLarge {
+                path: path.to_path_buf(),
+                limit: self.max_total_bytes,
+            }
+            .into());
+        };
+        if total > self.max_total_bytes {
+            return Err(ValidationFilesystemFingerprintError::TotalContentTooLarge {
+                path: path.to_path_buf(),
+                limit: self.max_total_bytes,
+            }
+            .into());
+        }
+        self.total_bytes = total;
+        Ok(())
+    }
+}
+
+fn validation_file_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        u32::from(metadata.permissions().readonly())
     }
 }
 
 impl Drop for CandidateValidationSandbox {
     fn drop(&mut self) {
-        let mut command = sanitized_git_command(&self.primary_repo_root);
-        let _ = command
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.path)
-            .output();
+        if let Ok(mut command) = sanitized_git_command(&self.primary_repo_root) {
+            let _ = command
+                .args(["worktree", "remove", "--force"])
+                .arg(&self.path)
+                .output();
+        }
         let _ = fs::remove_dir_all(&self.path);
     }
 }
@@ -1921,7 +2357,7 @@ fn candidate_validation_sandbox_path(primary_repo_root: &Path) -> Result<PathBuf
         .duration_since(UNIX_EPOCH)
         .context("system time before UNIX epoch")?
         .as_nanos();
-    Ok(env::temp_dir().join(format!(
+    Ok(trusted_runtime_root(primary_repo_root)?.join(format!(
         "maco-candidate-validation-{repo_name}-{}-{nanos}",
         std::process::id()
     )))
@@ -1934,7 +2370,7 @@ fn run_candidate_validation_command(
     changed_paths: &[PathBuf],
 ) -> ValidationReport {
     let mut command = shell_command(&validation.command);
-    sanitize_git_environment(&mut command);
+    sanitize_validation_command_environment(&mut command);
     let output = command
         .current_dir(worktree_path)
         .stdout(Stdio::piped())
@@ -2462,92 +2898,344 @@ impl RepoCommonLock {
                 repo_root.display()
             )
         })?;
-        let state_dir = repo.commondir().join("maco").join("state");
-        fs::create_dir_all(&state_dir).with_context(|| {
-            format!(
-                "failed to create {operation} lock directory {}",
-                state_dir.display()
-            )
-        })?;
+        let state_dir = ensure_repo_common_state_directory(&repo)
+            .with_context(|| format!("failed to prepare {operation} lock directory"))?;
         let path = state_dir.join(REPOSITORY_MUTATION_LOCK_FILE);
+        let mut file = open_repo_lock_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return repository_lock_contention(&mut file, &path, operation)
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "{operation} could not acquire kernel repository mutation lock {}; refusing to continue",
+                        path.display()
+                    )
+                })
+            }
+        }
+
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system time before UNIX epoch")?;
+        let process_start = lock_owner_process_start_identity()?;
         let owner = RepoLockOwner {
             version: LOCK_RECORD_VERSION,
             pid: std::process::id(),
             nonce: format!("{}-{}", std::process::id(), duration.as_nanos()),
             created_unix_seconds: duration.as_secs(),
             operation: operation.to_string(),
+            process_start,
         };
         let mut owner_bytes = serde_json::to_vec(&owner).context("failed to encode lock owner")?;
         owner_bytes.push(b'\n');
+        write_lock_owner(&mut file, &path, operation, &owner_bytes)?;
+        Ok(Self { file })
+    }
+}
 
-        for _ in 0..CANDIDATE_CAPTURE_ATTEMPTS {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    return PendingRepoCommonLock {
-                        path,
-                        owner_bytes,
-                        file: Some(file),
-                        committed: false,
-                    }
-                    .commit(operation);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing = fs::read(&path).with_context(|| {
-                        format!(
-                            "failed to read existing {operation} lock {}",
-                            path.display()
-                        )
-                    })?;
-                    let current: RepoLockOwner = serde_json::from_slice(&existing).with_context(|| {
-                        format!(
-                            "{operation} lock is malformed and will not be reclaimed automatically ({})",
-                            path.display()
-                        )
-                    })?;
-                    validate_lock_owner(&current, operation)?;
-                    match process_liveness(current.pid) {
-                        ProcessLiveness::Live => bail!(
-                            "{operation} cannot acquire repository mutation lock: it is held for {} by live pid {} (nonce {}, created {})",
-                            current.operation,
-                            current.pid,
-                            current.nonce,
-                            current.created_unix_seconds
-                        ),
-                        ProcessLiveness::Unknown => bail!(
-                            "{operation} cannot acquire repository mutation lock held for {}: owner pid {} could not be checked; refusing unsafe stale-lock recovery",
-                            current.operation,
-                            current.pid,
-                        ),
-                        ProcessLiveness::Absent => {
-                            reclaim_absent_owner_lock(&path, &existing, &owner.nonce, operation)?;
-                            continue;
-                        }
-                    }
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to acquire {operation} lock {}", path.display())
-                    });
-                }
+fn open_repo_lock_file(path: &Path) -> Result<fs::File> {
+    let mut create_options = OpenOptions::new();
+    create_options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        create_options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let (file, created) = match create_options.open(path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            reject_unsafe_lock_path(path)?;
+            let mut existing_options = OpenOptions::new();
+            existing_options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                existing_options
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
             }
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                existing_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            (
+                existing_options.open(path).with_context(|| {
+                    format!("failed to open repository lock {}", path.display())
+                })?,
+                false,
+            )
         }
-        bail!("failed to acquire {operation} lock after bounded stale-lock recovery")
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create repository lock {}", path.display()))
+        }
+    };
+    validate_open_lock_file(path, &file)?;
+    if created {
+        let parent = path
+            .parent()
+            .context("repository mutation lock has no parent directory")?;
+        sync_managed_directory(parent)?;
+    }
+    Ok(file)
+}
+
+pub(crate) fn ensure_repo_common_state_directory(repo: &Repository) -> Result<PathBuf> {
+    let common_dir = repo.commondir();
+    validate_managed_directory(common_dir).with_context(|| {
+        format!(
+            "repository common directory {} is unsafe",
+            common_dir.display()
+        )
+    })?;
+    let maco = ensure_private_managed_directory(common_dir, "maco")?;
+    ensure_private_managed_directory(&maco, "state")
+}
+
+pub(crate) fn ensure_private_managed_directory(parent: &Path, name: &str) -> Result<PathBuf> {
+    validate_managed_directory(parent)?;
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        bail!("managed directory component is invalid");
+    }
+    let path = parent.join(name);
+    let created = match fs::create_dir(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create managed directory {}", path.display()))
+        }
+    };
+    validate_managed_directory(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure managed directory {}", path.display()))?;
+        validate_managed_directory(&path)?;
+    }
+    sync_managed_directory(&path)?;
+    if created {
+        sync_managed_directory(parent)?;
+    }
+    Ok(path)
+}
+
+fn validate_managed_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect managed directory {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&metadata)
+        || !metadata.file_type().is_dir()
+    {
+        bail!(
+            "managed directory {} is not a real directory; refusing symbolic links and non-directory paths",
+            path.display()
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.number_of_links() != Some(1) {
+            bail!(
+                "repository mutation lock {} has multiple hard links; refusing to trust it",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn metadata_is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn sync_managed_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("failed to open managed directory {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to persist managed directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_managed_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn reject_unsafe_lock_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect repository lock {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&metadata)
+    {
+        bail!(
+            "repository mutation lock {} is not a regular file; refusing to follow it",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!(
+                "repository mutation lock {} has multiple hard links; refusing to trust it",
+                path.display()
+            );
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.number_of_links() != Some(1) {
+            bail!(
+                "repository mutation lock {} has multiple hard links; refusing to trust it",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_open_lock_file(path: &Path, file: &fs::File) -> Result<()> {
+    reject_unsafe_lock_path(path)?;
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to re-inspect repository lock {}", path.display()))?;
+    let file_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect open repository lock {}", path.display()))?;
+    if !file_metadata.file_type().is_file() || metadata_is_windows_reparse_point(&file_metadata) {
+        bail!(
+            "repository mutation lock {} changed type while being opened",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != file_metadata.dev()
+            || path_metadata.ino() != file_metadata.ino()
+            || file_metadata.nlink() != 1
+        {
+            bail!(
+                "repository mutation lock {} changed while being opened",
+                path.display()
+            );
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        let path_volume = path_metadata
+            .volume_serial_number()
+            .context("repository lock path omitted volume identity")?;
+        let file_volume = file_metadata
+            .volume_serial_number()
+            .context("open repository lock omitted volume identity")?;
+        let path_index = path_metadata
+            .file_index()
+            .context("repository lock path omitted file identity")?;
+        let file_index = file_metadata
+            .file_index()
+            .context("open repository lock omitted file identity")?;
+        if path_volume != file_volume
+            || path_index != file_index
+            || file_metadata.number_of_links() != Some(1)
+        {
+            bail!(
+                "repository mutation lock {} changed while being opened",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_lock_owner(
+    file: &mut fs::File,
+    path: &Path,
+    operation: &str,
+    owner_bytes: &[u8],
+) -> Result<()> {
+    file.set_len(0)
+        .with_context(|| format!("failed to truncate {operation} lock owner record"))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to seek {operation} lock owner record"))?;
+    file.write_all(owner_bytes)
+        .with_context(|| format!("failed to record {operation} lock owner"))?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed to persist {operation} lock owner record {}",
+            path.display()
+        )
+    })
+}
+
+fn repository_lock_contention<T>(file: &mut fs::File, path: &Path, operation: &str) -> Result<T> {
+    let current = read_lock_record(file, path)
+        .and_then(|bytes| {
+            serde_json::from_slice::<RepoLockOwner>(&bytes)
+                .context("active repository lock owner JSON is malformed")
+        })
+        .and_then(|owner| {
+            validate_lock_owner(&owner, operation)?;
+            Ok(owner)
+        });
+    match current {
+        Ok(owner) => bail!(
+            "{operation} cannot acquire repository mutation lock: kernel lock is held for {} by pid {} (nonce {}, created {})",
+            owner.operation,
+            owner.pid,
+            owner.nonce,
+            owner.created_unix_seconds
+        ),
+        Err(error) => bail!(
+            "{operation} cannot acquire repository mutation lock {}: an active kernel lock has an invalid owner record ({error:#})",
+            path.display()
+        ),
     }
 }
 
 fn validate_lock_owner(owner: &RepoLockOwner, operation: &str) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time before UNIX epoch while validating repository lock")?
+        .as_secs();
     if owner.version != LOCK_RECORD_VERSION
         || owner.pid == 0
-        || owner.nonce.trim().is_empty()
+        || owner.nonce.is_empty()
+        || owner.nonce.len() > 128
+        || !owner
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         || owner.created_unix_seconds == 0
+        || owner.created_unix_seconds > now.saturating_add(300)
         || owner.operation.is_empty()
+        || owner.operation.len() > 64
         || !owner
             .operation
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || !valid_process_start_identity(owner.process_start.as_ref())
     {
         bail!(
             "{operation} repository mutation lock owner record is invalid and will not be reclaimed automatically"
@@ -2556,118 +3244,156 @@ fn validate_lock_owner(owner: &RepoLockOwner, operation: &str) -> Result<()> {
     Ok(())
 }
 
-fn reclaim_absent_owner_lock(
-    path: &Path,
-    expected: &[u8],
-    nonce: &str,
-    operation: &str,
-) -> Result<()> {
-    let quarantine = path.with_file_name(format!(
-        ".{}.reclaim-{}",
-        path.file_name().and_then(OsStr::to_str).unwrap_or("lock"),
-        nonce
-    ));
-    match fs::rename(path, &quarantine) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to atomically quarantine stale {operation} lock"))
-        }
-    }
-    let actual = fs::read(&quarantine)
-        .with_context(|| format!("failed to verify quarantined stale {operation} lock"))?;
-    if actual != expected {
-        if !path.exists() {
-            let _ = fs::rename(&quarantine, path);
-        }
-        bail!("{operation} lock changed during stale-lock recovery; refusing to continue");
-    }
-    fs::remove_file(&quarantine)
-        .with_context(|| format!("failed to remove quarantined stale {operation} lock"))
-}
-
-fn process_liveness(pid: u32) -> ProcessLiveness {
-    if pid == std::process::id() {
-        return ProcessLiveness::Live;
-    }
-
-    #[cfg(unix)]
+fn valid_process_start_identity(identity: Option<&ProcessStartIdentity>) -> bool {
+    #[cfg(target_os = "linux")]
     {
-        if pid > i32::MAX as u32 {
-            return ProcessLiveness::Unknown;
-        }
-        let output = Command::new("kill").arg("-0").arg(pid.to_string()).output();
-        return match output {
-            Ok(output) if output.status.success() => ProcessLiveness::Live,
-            Ok(output)
-                if String::from_utf8_lossy(&output.stderr)
-                    .to_ascii_lowercase()
-                    .contains("operation not permitted") =>
-            {
-                ProcessLiveness::Live
-            }
-            Ok(_) => ProcessLiveness::Absent,
-            Err(_) => ProcessLiveness::Unknown,
-        };
+        matches!(identity, Some(ProcessStartIdentity::LinuxProcStartTicks(value)) if *value > 0)
     }
-
     #[cfg(target_os = "windows")]
     {
-        let filter = format!("PID eq {pid}");
-        return match Command::new("tasklist")
-            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let needle = format!("\"{pid}\"");
-                if String::from_utf8_lossy(&output.stdout).contains(&needle) {
-                    ProcessLiveness::Live
-                } else {
-                    ProcessLiveness::Absent
-                }
-            }
-            _ => ProcessLiveness::Unknown,
-        };
+        matches!(identity, Some(ProcessStartIdentity::WindowsCreationFiletime(value)) if *value > 0)
     }
-
-    #[allow(unreachable_code)]
-    ProcessLiveness::Unknown
-}
-
-impl PendingRepoCommonLock {
-    fn commit(mut self, operation: &str) -> Result<RepoCommonLock> {
-        let file = self
-            .file
-            .as_mut()
-            .with_context(|| format!("{operation} lock file was unavailable during acquisition"))?;
-        file.write_all(&self.owner_bytes)
-            .with_context(|| format!("failed to record {operation} lock owner"))?;
-        file.sync_all()
-            .with_context(|| format!("failed to persist {operation} lock owner"))?;
-        let _ = self.file.take();
-        self.committed = true;
-        Ok(RepoCommonLock {
-            path: self.path.clone(),
-            owner_bytes: self.owner_bytes.clone(),
-        })
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        identity.is_none()
     }
 }
 
-impl Drop for PendingRepoCommonLock {
-    fn drop(&mut self) {
-        let _ = self.file.take();
-        if !self.committed {
-            let _ = fs::remove_file(&self.path);
+fn read_lock_record(file: &mut fs::File, path: &Path) -> Result<Vec<u8>> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect repository lock {}", path.display()))?;
+    if metadata.len() == 0 || metadata.len() > MAX_LOCK_RECORD_BYTES {
+        bail!("active repository lock owner record has an invalid size");
+    }
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to seek repository lock {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOCK_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read repository lock {}", path.display()))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_LOCK_RECORD_BYTES {
+        bail!("active repository lock owner record changed size while being read");
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_identity(pid: u32) -> Result<Option<ProcessStartIdentity>> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read process identity {}", path.display()))
         }
+    };
+    let closing_paren = bytes
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .context("Linux process stat did not contain a command terminator")?;
+    let fields = bytes[closing_paren + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let start_ticks = fields
+        .get(19)
+        .context("Linux process stat did not contain starttime")?;
+    let start_ticks = std::str::from_utf8(start_ticks)
+        .context("Linux process starttime was not ASCII")?
+        .parse::<u64>()
+        .context("Linux process starttime was invalid")?;
+    if start_ticks == 0 {
+        bail!("Linux process starttime was zero");
+    }
+    Ok(Some(ProcessStartIdentity::LinuxProcStartTicks(start_ticks)))
+}
+
+#[cfg(target_os = "windows")]
+fn process_start_identity(pid: u32) -> Result<Option<ProcessStartIdentity>> {
+    windows_process_start_identity(pid)
+}
+
+fn lock_owner_process_start_identity() -> Result<Option<ProcessStartIdentity>> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        process_start_identity(std::process::id())?
+            .with_context(|| {
+                "current process start identity disappeared while acquiring repository lock"
+            })
+            .map(Some)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_start_identity(pid: u32) -> Result<Option<ProcessStartIdentity>> {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> Handle;
+        fn GetProcessTimes(
+            process: Handle,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    // SAFETY: The Windows API calls use a PID-sized integer, checked null
+    // handles, initialized FILETIME outputs, and close every acquired handle.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                Ok(None)
+            } else {
+                Err(error).context("failed to open process for creation-time identity")
+            };
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let result = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let times_error = (result == 0).then(std::io::Error::last_os_error);
+        let close_result = CloseHandle(handle);
+        if let Some(error) = times_error {
+            return Err(error).context("failed to read process creation-time identity");
+        }
+        if close_result == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to close process identity handle");
+        }
+        let value = (u64::from(creation.high) << 32) | u64::from(creation.low);
+        if value == 0 {
+            bail!("Windows process creation time was zero");
+        }
+        Ok(Some(ProcessStartIdentity::WindowsCreationFiletime(value)))
     }
 }
 
 impl Drop for RepoCommonLock {
     fn drop(&mut self) {
-        if fs::read(&self.path).ok().as_deref() == Some(self.owner_bytes.as_slice()) {
-            let _ = fs::remove_file(&self.path);
-        }
+        let _ = self.file.unlock();
     }
 }
 
@@ -2707,7 +3433,7 @@ fn run_git_capture_paths(
     args: &[&str],
     path_args: &[&Path],
 ) -> Result<GitCommandOutput> {
-    let mut command = git_command(repo_root, args);
+    let mut command = git_command(repo_root, args)?;
     for path in path_args {
         command.arg(path);
     }
@@ -2723,7 +3449,7 @@ fn run_git_capture_paths(
 }
 
 fn run_git_with_input(repo_root: &Path, args: &[&str], input: &[u8]) -> Result<GitCommandOutput> {
-    let mut child = git_command(repo_root, args)
+    let mut child = git_command(repo_root, args)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2749,36 +3475,464 @@ fn run_git_with_input(repo_root: &Path, args: &[&str], input: &[u8]) -> Result<G
     })
 }
 
-fn git_command(repo_root: &Path, args: &[&str]) -> Command {
-    let mut command = sanitized_git_command(repo_root);
+fn git_command(repo_root: &Path, args: &[&str]) -> Result<Command> {
+    let mut command = sanitized_git_command(repo_root)?;
     command.args(args);
-    command
+    Ok(command)
 }
 
-pub(crate) fn sanitized_git_command(repo_root: &Path) -> Command {
-    let mut command = Command::new("git");
-    sanitize_git_environment(&mut command);
-    command.arg("-C").arg(repo_root);
+pub(crate) fn sanitized_git_command(repo_root: &Path) -> Result<Command> {
+    let mut command = Command::new(resolve_trusted_executable("git")?);
+    let runtime_root = configure_capture_environment(&mut command, repo_root)?;
     command
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.untrackedCache=false"])
+        .arg("-c")
+        .arg(format!(
+            "core.hooksPath={}",
+            disabled_git_path(&runtime_root, "hooks").display()
+        ))
+        .arg("-C")
+        .arg(repo_root);
+    Ok(command)
 }
 
-pub(crate) fn sanitize_git_environment(command: &mut Command) {
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    ] {
-        command.env_remove(key);
-    }
+pub(crate) fn sanitized_git_push_command(repo_root: &Path) -> Result<Command> {
+    let mut command = Command::new(resolve_trusted_executable("git")?);
+    sanitize_network_command_environment(&mut command)?;
+    let runtime_root = trusted_runtime_root(repo_root)?;
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            disabled_git_path(&runtime_root, "network-global-config"),
+        )
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["-c", "core.fsmonitor=false"])
+        .arg("-C")
+        .arg(repo_root);
+    Ok(command)
+}
+
+fn configure_capture_environment(command: &mut Command, repo_root: &Path) -> Result<PathBuf> {
+    let allowed = [
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ];
+    let preserved = allowed
+        .iter()
+        .filter_map(|key| env::var_os(key).map(|value| ((*key).to_string(), value)))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    command.envs(preserved);
+    let runtime_root = trusted_runtime_root(repo_root)?;
+    command
+        .env("PATH", trusted_executable_search_path()?)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            disabled_git_path(&runtime_root, "global-config"),
+        )
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("TMPDIR", &runtime_root)
+        .env("TMP", &runtime_root)
+        .env("TEMP", &runtime_root);
+    Ok(runtime_root)
+}
+
+pub(crate) fn sanitize_validation_command_environment(command: &mut Command) {
+    remove_git_injection_environment(command);
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+}
+
+pub(crate) fn sanitize_network_command_environment(command: &mut Command) -> Result<()> {
+    remove_git_injection_environment(command);
+    remove_dynamic_loader_environment(command);
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("PATH", trusted_executable_search_path()?);
+    Ok(())
+}
+
+fn remove_git_injection_environment(command: &mut Command) {
     for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_CONFIG_") {
+        let key_text = key.to_string_lossy();
+        if is_git_injection_environment_key(&key_text) {
             command.env_remove(key);
         }
     }
-    command.env("GIT_OPTIONAL_LOCKS", "0");
+}
+
+fn remove_dynamic_loader_environment(command: &mut Command) {
+    for (key, _) in env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("LD_") || key_text.starts_with("DYLD_") {
+            command.env_remove(key);
+        }
+    }
+}
+
+fn is_git_injection_environment_key(key: &str) -> bool {
+    matches!(
+        key,
+        "GIT_DIR"
+            | "GIT_WORK_TREE"
+            | "GIT_INDEX_FILE"
+            | "GIT_COMMON_DIR"
+            | "GIT_OBJECT_DIRECTORY"
+            | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+            | "GIT_REDIRECT_STDERR"
+            | "GIT_EXEC_PATH"
+            | "GIT_NAMESPACE"
+            | "GIT_REPLACE_REF_BASE"
+            | "GIT_SHALLOW_FILE"
+            | "GIT_GRAFT_FILE"
+            | "GIT_QUARANTINE_PATH"
+            | "GIT_CEILING_DIRECTORIES"
+            | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+            | "GIT_TEMPLATE_DIR"
+            | "GIT_EXTERNAL_DIFF"
+            | "GIT_SSH"
+            | "GIT_SSH_COMMAND"
+            | "GIT_ASKPASS"
+            | "SSH_ASKPASS"
+            | "SSH_ASKPASS_REQUIRE"
+            | "GIT_PROXY_COMMAND"
+            | "GIT_ALLOW_PROTOCOL"
+            | "GIT_PROTOCOL_FROM_USER"
+            | "GIT_CURL_VERBOSE"
+            | "GIT_SSL_NO_VERIFY"
+    ) || key.starts_with("GIT_CONFIG_")
+        || key.starts_with("GIT_TRACE")
+}
+
+pub(crate) fn resolve_trusted_executable(name: &str) -> Result<PathBuf> {
+    if !matches!(name, "git" | "gh") {
+        bail!("unsupported trusted executable name '{name}'");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = name;
+        bail!(
+            "trusted Windows executable and ACL resolution is not implemented; refusing external command execution"
+        );
+    }
+    #[cfg(unix)]
+    {
+        let mut inspected = BTreeSet::new();
+        for candidate in trusted_executable_entry_candidates(name) {
+            let Ok(canonical) = fs::canonicalize(&candidate) else {
+                continue;
+            };
+            if !inspected.insert(canonical.clone()) {
+                continue;
+            }
+            if validate_trusted_unix_executable(&canonical).is_ok() {
+                return Ok(canonical);
+            }
+        }
+        bail!(
+            "no trusted root-owned, non-writable executable was found for '{name}' through a fixed system entry"
+        );
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = name;
+        bail!("trusted executable resolution is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn trusted_executable_entry_candidates(name: &str) -> [PathBuf; 3] {
+    [
+        Path::new("/run/current-system/sw/bin").join(name),
+        Path::new("/usr/bin").join(name),
+        Path::new("/bin").join(name),
+    ]
+}
+
+#[cfg(unix)]
+fn validate_trusted_unix_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect executable {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("trusted executable candidate is not a regular file");
+    }
+    let mode = metadata.permissions().mode();
+    if metadata.uid() != 0 || mode & 0o022 != 0 || mode & 0o111 == 0 {
+        bail!("trusted executable candidate has unsafe owner or mode");
+    }
+    let mut ancestor = path.parent();
+    while let Some(directory) = ancestor {
+        let directory_metadata = fs::metadata(directory).with_context(|| {
+            format!(
+                "failed to inspect executable ancestor {}",
+                directory.display()
+            )
+        })?;
+        let immutable_nix_store_root = directory == Path::new("/nix/store")
+            && directory_metadata.uid() == 0
+            && directory_metadata.permissions().mode() & 0o1000 != 0;
+        if !directory_metadata.file_type().is_dir()
+            || directory_metadata.uid() != 0
+            || (!immutable_nix_store_root && directory_metadata.permissions().mode() & 0o022 != 0)
+        {
+            bail!("trusted executable candidate has a writable or non-root ancestor");
+        }
+        ancestor = directory.parent();
+    }
+    let mut magic = [0_u8; 4];
+    fs::File::open(path)
+        .with_context(|| format!("failed to open executable {}", path.display()))?
+        .read_exact(&mut magic)
+        .with_context(|| format!("failed to inspect executable header {}", path.display()))?;
+    if !is_native_executable_magic(magic) {
+        if magic[..2] != *b"#!" {
+            bail!("trusted executable candidate has an unsupported executable format");
+        }
+        validate_trusted_shebang(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_trusted_shebang(path: &Path) -> Result<()> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .with_context(|| format!("failed to open executable script {}", path.display()))?
+        .take(4096)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read executable script {}", path.display()))?;
+    let first_line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .context("trusted executable script omitted shebang")?;
+    let interpreter = first_line
+        .strip_prefix(b"#!")
+        .context("trusted executable script omitted shebang marker")?;
+    let interpreter = std::str::from_utf8(interpreter)
+        .context("trusted executable script shebang was not UTF-8")?
+        .trim()
+        .split_ascii_whitespace()
+        .next()
+        .context("trusted executable script shebang omitted interpreter")?;
+    let interpreter = Path::new(interpreter);
+    if !interpreter.is_absolute() {
+        bail!("trusted executable script shebang was not absolute");
+    }
+    let interpreter = fs::canonicalize(interpreter).with_context(|| {
+        format!(
+            "failed to resolve trusted script interpreter {}",
+            interpreter.display()
+        )
+    })?;
+    if interpreter == path {
+        bail!("trusted executable script shebang referenced itself");
+    }
+    validate_trusted_unix_executable(&interpreter)
+        .context("trusted executable script interpreter was unsafe")
+}
+
+fn is_native_executable_magic(magic: [u8; 4]) -> bool {
+    magic == *b"\x7fELF"
+        || matches!(
+            magic,
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+                | [0xca, 0xfe, 0xba, 0xbf]
+                | [0xbf, 0xba, 0xfe, 0xca]
+        )
+        || magic[..2] == *b"MZ"
+}
+
+fn trusted_executable_search_path() -> Result<OsString> {
+    #[cfg(unix)]
+    {
+        let directories = [
+            PathBuf::from("/run/current-system/sw/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ]
+        .into_iter()
+        .filter_map(|path| trusted_unix_search_directory(&path).ok())
+        .collect::<Vec<_>>();
+        if directories.is_empty() {
+            bail!("no trusted system executable directories were available");
+        }
+        env::join_paths(directories).context("failed to build trusted executable PATH")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        bail!("trusted Windows executable PATH is not implemented")
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        bail!("trusted executable PATH is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn trusted_unix_search_directory(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve executable directory {}", path.display()))?;
+    let mut current = Some(canonical.as_path());
+    while let Some(directory) = current {
+        let metadata = fs::metadata(directory).with_context(|| {
+            format!(
+                "failed to inspect executable directory {}",
+                directory.display()
+            )
+        })?;
+        let immutable_nix_store_root = directory == Path::new("/nix/store")
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o1000 != 0;
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != 0
+            || (!immutable_nix_store_root && metadata.permissions().mode() & 0o022 != 0)
+        {
+            bail!("executable search directory has unsafe owner or mode");
+        }
+        current = directory.parent();
+    }
+    Ok(canonical)
+}
+
+fn disabled_git_path(runtime_root: &Path, label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    runtime_root.join(format!(
+        "maco-disabled-{label}-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+fn trusted_runtime_root(repo_root: &Path) -> Result<PathBuf> {
+    #[cfg(unix)]
+    let candidate = private_unix_runtime_root()?;
+    #[cfg(target_os = "windows")]
+    let candidate = windows_temp_path()?;
+    #[cfg(not(any(unix, target_os = "windows")))]
+    let candidate = env::temp_dir();
+
+    let runtime_root = fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "failed to resolve trusted runtime directory {}",
+            candidate.display()
+        )
+    })?;
+    if !runtime_root.is_dir() {
+        bail!(
+            "trusted runtime path {} is not a directory",
+            runtime_root.display()
+        );
+    }
+    let repo_root = fs::canonicalize(repo_root)
+        .with_context(|| format!("failed to resolve repository path {}", repo_root.display()))?;
+    if runtime_root.starts_with(&repo_root) {
+        bail!(
+            "trusted runtime directory {} is inside repository {}; refusing capture-time writes",
+            runtime_root.display(),
+            repo_root.display()
+        );
+    }
+    Ok(runtime_root)
+}
+
+#[cfg(unix)]
+fn private_unix_runtime_root() -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+    let uid = unsafe { libc::geteuid() };
+    let run_user = PathBuf::from(format!("/run/user/{uid}"));
+    let parent = match validate_private_unix_directory(&run_user, uid) {
+        Ok(()) => run_user,
+        Err(_) => {
+            let temporary = PathBuf::from("/tmp");
+            let metadata = fs::symlink_metadata(&temporary)
+                .context("failed to inspect /tmp runtime fallback")?;
+            let mode = metadata.permissions().mode();
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_dir()
+                || metadata.uid() != 0
+                || mode & 0o1000 == 0
+            {
+                bail!("/tmp is not a root-owned sticky directory; refusing runtime fallback");
+            }
+            temporary
+        }
+    };
+    let directory = parent.join(format!("maco-runtime-{uid}"));
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to create private runtime {}", directory.display())
+            })
+        }
+    }
+    validate_private_unix_directory(&directory, uid)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn validate_private_unix_directory(path: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect private runtime {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!(
+            "private runtime {} is not an owner-only real directory",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_temp_path() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetTempPathW(buffer_length: u32, buffer: *mut u16) -> u32;
+    }
+
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: The buffer is writable for its declared length and the returned
+    // length is checked before constructing the Windows path.
+    let length = unsafe { GetTempPathW(buffer.len() as u32, buffer.as_mut_ptr()) };
+    if length == 0 || length as usize >= buffer.len() {
+        bail!("Windows GetTempPathW failed or returned an oversized path");
+    }
+    buffer.truncate(length as usize);
+    Ok(PathBuf::from(OsString::from_wide(&buffer)))
 }
 
 fn shell_command(command_text: &str) -> Command {
@@ -3170,24 +4324,124 @@ mod tests {
     }
 
     #[test]
-    fn pending_merge_apply_lock_removes_created_file_when_not_committed() {
+    fn repo_common_lock_persists_file_and_kernel_unlocks_on_drop() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("repository-mutation.lock");
-        let file = OpenOptions::new()
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let lock = RepoCommonLock::acquire(&repo_path, "merge-apply").expect("acquire lock");
+        let path = repo_path
+            .join(".git/maco/state")
+            .join(REPOSITORY_MUTATION_LOCK_FILE);
+        let contender = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
             .open(&path)
-            .expect("create pending lock");
-        let pending = PendingRepoCommonLock {
-            path: path.clone(),
-            owner_bytes: b"test-owner\n".to_vec(),
-            file: Some(file),
-            committed: false,
-        };
+            .expect("open stable lock file");
+        assert!(matches!(
+            contender.try_lock().expect_err("kernel lock must contend"),
+            fs::TryLockError::WouldBlock
+        ));
 
-        drop(pending);
+        drop(lock);
+        contender.try_lock().expect("kernel lock released on drop");
+        contender.unlock().expect("unlock contender");
 
-        assert!(!path.exists());
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            for directory in [
+                repo_path.join(".git/maco"),
+                repo_path.join(".git/maco/state"),
+            ] {
+                assert_eq!(
+                    fs::metadata(directory)
+                        .expect("managed directory metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initialized_repository_fingerprint_ignores_ignored_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(temp.path()).expect("init repo");
+        fs::write(temp.path().join(".gitignore"), "ignored/\n").expect("write ignore");
+        fs::write(temp.path().join("tracked.txt"), "tracked\n").expect("write tracked");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("add files");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit");
+
+        let before = validation_repository_fingerprint(&repo, temp.path(), None, 0)
+            .expect("baseline fingerprint");
+        fs::create_dir(temp.path().join("ignored")).expect("create ignored output");
+        fs::write(
+            temp.path().join("ignored/build.bin"),
+            vec![7_u8; 1024 * 1024],
+        )
+        .expect("write ignored output");
+        let after = validation_repository_fingerprint(&repo, temp.path(), None, 0)
+            .expect("updated fingerprint");
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn initialized_submodule_marker_directory_is_not_recursively_hashed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join(".git");
+        fs::create_dir(&marker).expect("create marker directory");
+        let large = fs::File::create(marker.join("large-object")).expect("create large object");
+        large
+            .set_len(VALIDATION_RAW_MAX_SINGLE_FILE_BYTES + 1)
+            .expect("size large object");
+
+        let fingerprint = validation_submodule_marker_fingerprint(&marker)
+            .expect("fingerprint marker identity only");
+
+        assert_eq!(fingerprint.entries.len(), 1);
+        assert_eq!(
+            fingerprint.entries[0].kind,
+            ValidationFilesystemEntryKind::Directory
+        );
+    }
+
+    #[test]
+    fn uninitialized_submodule_raw_fingerprint_fails_with_typed_size_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let large = fs::File::create(temp.path().join("large.bin")).expect("create large file");
+        large
+            .set_len(VALIDATION_RAW_MAX_SINGLE_FILE_BYTES + 1)
+            .expect("size large file");
+
+        let error = validation_filesystem_fingerprint(temp.path())
+            .expect_err("oversized raw fallback must fail closed");
+
+        assert!(matches!(
+            error.downcast_ref::<ValidationFilesystemFingerprintError>(),
+            Some(ValidationFilesystemFingerprintError::SingleFileTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -3307,6 +4561,83 @@ mod tests {
         let untruncated = summarize_text("abc", 3);
         assert_eq!(untruncated.text, "abc");
         assert!(!untruncated.truncated);
+    }
+
+    #[test]
+    fn native_executable_magic_accepts_thin_and_fat_macho() {
+        for magic in [
+            [0xfe, 0xed, 0xfa, 0xce],
+            [0xce, 0xfa, 0xed, 0xfe],
+            [0xfe, 0xed, 0xfa, 0xcf],
+            [0xcf, 0xfa, 0xed, 0xfe],
+            [0xca, 0xfe, 0xba, 0xbe],
+            [0xbe, 0xba, 0xfe, 0xca],
+            [0xca, 0xfe, 0xba, 0xbf],
+            [0xbf, 0xba, 0xfe, 0xca],
+        ] {
+            assert!(is_native_executable_magic(magic));
+        }
+        assert!(!is_native_executable_magic(*b"#!/b"));
+    }
+
+    #[test]
+    fn network_environment_classifies_command_execution_overrides_as_injection() {
+        for key in [
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "GIT_CURL_VERBOSE",
+        ] {
+            assert!(is_git_injection_environment_key(key), "missed {key}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_executable_validation_rejects_user_owned_path_shadow() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shadow = temp.path().join("git");
+        fs::write(&shadow, b"\x7fELFfake").expect("write shadow");
+        fs::set_permissions(&shadow, fs::Permissions::from_mode(0o755)).expect("chmod shadow");
+
+        assert!(validate_trusted_unix_executable(&shadow).is_err());
+        assert!(resolve_trusted_executable("git").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_executable_candidates_exclude_direct_nix_store_path_entries() {
+        let candidates = trusted_executable_entry_candidates("git");
+        assert_eq!(
+            candidates,
+            [
+                PathBuf::from("/run/current-system/sw/bin/git"),
+                PathBuf::from("/usr/bin/git"),
+                PathBuf::from("/bin/git"),
+            ]
+        );
+        assert!(candidates
+            .iter()
+            .all(|candidate| !candidate.starts_with("/nix/store")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_runtime_is_owner_only_and_ignores_ambient_temp_paths() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("repo tempdir");
+        let runtime = trusted_runtime_root(temp.path()).expect("trusted runtime");
+        let metadata = fs::symlink_metadata(&runtime).expect("runtime metadata");
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(!runtime.starts_with(temp.path()));
     }
 
     #[test]
