@@ -1589,7 +1589,7 @@ enum LiveSubcommand {
     Status(LiveStatusArgs),
     /// Validate live claim file fields.
     Validate(LiveValidateArgs),
-    /// Atomically create or owner-update a claim from an external Markdown draft.
+    /// Atomically create a new claim from a fresh external Markdown draft.
     Apply(LiveApplyArgs),
     /// Refresh a claim heartbeat timestamp.
     Heartbeat(LiveHeartbeatArgs),

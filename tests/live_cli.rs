@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use multi_agent_coding_orchestrator::live_claim::LiveClock;
 use serde_json::Value;
 use std::{
     fs,
@@ -186,7 +187,13 @@ fn mutation_cli_rejects_public_now_override_without_touching_claim() -> Result<(
     let draft = repo.join("real-clock-only-draft.md");
     fs::write(
         &draft,
-        modern_claim_text("real-clock-only", "blocked", "src/live_claim.rs"),
+        initial_claim_draft_text(
+            "real-clock-only-new",
+            "real-clock-only",
+            "active",
+            LiveClock::now().raw(),
+            "src/live_claim.rs",
+        ),
     )?;
 
     for args in [
@@ -256,9 +263,16 @@ fn apply_and_owner_release_publish_through_the_locked_cli_path() -> Result<()> {
     let repo = temp.path();
     fs::create_dir_all(repo.join(".agents/live/claims"))?;
     let draft = repo.join("draft-claim.md");
+    let initial_timestamp = LiveClock::now().raw().to_string();
     fs::write(
         &draft,
-        modern_claim_text("cli-applied", "active", "src/review.rs"),
+        initial_claim_draft_text(
+            "cli-applied",
+            "cli-applied",
+            "active",
+            &initial_timestamp,
+            "src/live_claim.rs",
+        ),
     )?;
 
     let created = run_success_json(&[
@@ -274,11 +288,18 @@ fn apply_and_owner_release_publish_through_the_locked_cli_path() -> Result<()> {
     assert_eq!(created["created"], true);
     assert_eq!(created["claim"]["status"], "active");
 
+    let created_content = fs::read(claim_path(repo, "cli-applied"))?;
     fs::write(
         &draft,
-        modern_claim_text("cli-applied", "blocked", "src/review.rs"),
+        initial_claim_draft_text(
+            "cli-applied",
+            "cli-applied",
+            "active",
+            LiveClock::now().raw(),
+            "src/changed-scope.rs",
+        ),
     )?;
-    let updated = run_success_json(&[
+    let updated = run_failure_output(&[
         "live",
         "apply",
         path_str(&draft)?,
@@ -288,8 +309,8 @@ fn apply_and_owner_release_publish_through_the_locked_cli_path() -> Result<()> {
         "cli-applied",
         "--json",
     ])?;
-    assert_eq!(updated["created"], false);
-    assert_eq!(updated["claim"]["status"], "blocked");
+    assert!(String::from_utf8_lossy(&updated.stderr).contains("create-only"));
+    assert_eq!(fs::read(claim_path(repo, "cli-applied"))?, created_content);
 
     let before_wrong_owner = fs::read(claim_path(repo, "cli-applied"))?;
     let wrong_owner = run_failure_output(&[
@@ -329,6 +350,29 @@ fn apply_and_owner_release_publish_through_the_locked_cli_path() -> Result<()> {
         .as_str()
         .unwrap_or_default()
         .contains("released claim as `done`"));
+
+    fs::write(
+        &draft,
+        initial_claim_draft_text(
+            "cli-applied-v2",
+            "cli-applied",
+            "active",
+            LiveClock::now().raw(),
+            "src/changed-scope.rs",
+        ),
+    )?;
+    let replacement = run_success_json(&[
+        "live",
+        "apply",
+        path_str(&draft)?,
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "cli-applied",
+        "--json",
+    ])?;
+    assert_eq!(replacement["claim_id"], "cli-applied-v2");
+    assert_eq!(replacement["created"], true);
     Ok(())
 }
 
@@ -561,6 +605,29 @@ fn modern_claim_text(claim_id: &str, status: &str, path: &str) -> String {
 ## Audit log
 
 - `2026-05-20T00:00:00Z` - `{claim_id}` created
+"#
+    )
+}
+
+fn initial_claim_draft_text(
+    claim_id: &str,
+    owner: &str,
+    status: &str,
+    timestamp: &str,
+    path: &str,
+) -> String {
+    format!(
+        r#"# Claim: {claim_id}
+
+- Claim ID: `{claim_id}`
+- Owner: `{owner}`
+- Status: `{status}`
+- Created: `{timestamp}`
+- Updated: `{timestamp}`
+- Heartbeat: `{timestamp}`
+- Stale after minutes: `120`
+- Owned files, regions, devices, or services:
+  - `{path}`: test
 "#
     )
 }

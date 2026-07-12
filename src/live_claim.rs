@@ -8,9 +8,18 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
-    fs,
+    fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     time::{SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+    io::{AsRawFd, FromRawFd},
 };
 
 const CLAIMS_DIR: &str = ".agents/live/claims";
@@ -34,8 +43,13 @@ const MAX_AUDIT_ACTOR_BYTES: usize = 128;
 const MAX_AUDIT_REASON_BYTES: usize = 2 * 1024;
 const MAX_AUDIT_ENTRY_BYTES: usize = 4 * 1024;
 const CLAIM_RELEASE_HEADROOM_BYTES: usize = 8 * 1024;
+const MAX_APPLY_DRAFT_AGE_SECONDS: i64 = 5 * 60;
+const MAX_DRAFT_PARENT_BYTES: usize = 4 * 1024;
+const MAX_DRAFT_LEAF_BYTES: usize = 255;
 const MAX_FUTURE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 const VALID_STATUSES: &[&str] = &["active", "blocked", "ready-for-review", "handoff", "done"];
+
+static CLAIM_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LiveClaimsStatusReport {
@@ -327,19 +341,33 @@ fn apply_with_clock(
     actor: &str,
     now: &LiveClock,
 ) -> Result<LiveClaimApplyReport> {
+    apply_with_clock_and_hooks(repo, draft, actor, now, |_| Ok(()), |_| Ok(()))
+}
+
+fn apply_with_clock_and_hooks<D, P>(
+    repo: &Path,
+    draft: &Path,
+    actor: &str,
+    now: &LiveClock,
+    mut after_draft_bind: D,
+    mut before_publish: P,
+) -> Result<LiveClaimApplyReport>
+where
+    D: FnMut(&Path) -> Result<()>,
+    P: FnMut(&Path) -> Result<()>,
+{
     let claims_path = claims_dir(repo);
     let root = open_claims_root(&claims_path)?.context("claim board does not exist")?;
     let lock = acquire_claim_board_lock(&root)?;
     prepare_claim_board(&root, &lock)?;
-    let canonical_draft = draft
-        .canonicalize()
-        .context("claim draft is missing or inaccessible")?;
-    if canonical_draft.starts_with(root.path()) {
-        bail!("claim drafts must remain outside the live claim board");
-    }
-    let bytes = BoundedRegularReader::read(draft, MAX_CLAIM_BYTES)
-        .map_err(|_| anyhow::anyhow!("claim draft is not a bounded no-follow regular file"))?;
-    let content = std::str::from_utf8(&bytes).context("claim draft is not valid UTF-8")?;
+    let bound_draft = BoundClaimDraft::bind(draft, &root)?;
+    after_draft_bind(bound_draft.path())?;
+    let (mut claims, initial_board) = load_stable_claim_board(&root, &lock)?;
+    ensure_claim_board_valid(&claims)?;
+    bound_draft.verify(&root, &initial_board)?;
+
+    let content = std::str::from_utf8(&bound_draft.generation.bytes)
+        .context("claim draft is not valid UTF-8")?;
     let preliminary = parse_claim_file(PathBuf::from(CLAIMS_DIR).join("draft.md"), content);
     let claim_id = preliminary
         .claim_id
@@ -350,34 +378,16 @@ fn apply_with_clock(
     let file = PathBuf::from(CLAIMS_DIR).join(&file_name);
     let draft_claim = parse_claim_file(file.clone(), content);
     ensure_claim_valid(&draft_claim)?;
-    if draft_claim.owner.as_deref() != Some(actor) {
-        bail!("claim apply actor must exactly match the draft owner");
+    validate_initial_claim_draft(content, &draft_claim, actor, now)?;
+    if initial_board.entries.contains_key(&file_name) {
+        bail!(
+            "claim apply is create-only; release or hand off the existing claim and use a new claim id"
+        );
     }
-    let status = draft_claim
-        .status
-        .as_deref()
-        .context("claim draft status is missing")?;
-    if !matches!(status, "active" | "blocked" | "ready-for-review") {
-        bail!("claim apply accepts only active, blocked, or ready-for-review drafts");
-    }
-    if draft_claim
-        .latest_timestamp_seconds()?
-        .is_some_and(|latest| latest > now.epoch_seconds)
-    {
-        bail!("claim draft contains a future timestamp generation");
-    }
-
-    let (claims, initial_board) = load_stable_claim_board(&root, &lock)?;
-    ensure_claim_board_valid(&claims)?;
-    let existing = claims.iter().find(|claim| claim.display_id() == claim_id);
-    if existing
-        .and_then(|claim| claim.owner.as_deref())
-        .is_some_and(|owner| owner != actor)
-    {
-        bail!("claim apply cannot update a claim owned by another actor");
-    }
-    let created = existing.is_none();
-    let audit_entry = format!("`{}` - `{actor}` applied claim draft", now.raw());
+    let audit_entry = format!(
+        "`{}` - `{actor}` created claim from bounded draft",
+        now.raw()
+    );
     let updated_limit = usize::try_from(MAX_CLAIM_BYTES)
         .unwrap_or(usize::MAX)
         .saturating_sub(CLAIM_RELEASE_HEADROOM_BYTES);
@@ -385,26 +395,21 @@ fn apply_with_clock(
         content,
         &draft_claim,
         now,
-        Some(status),
+        Some("active"),
         &audit_entry,
         updated_limit,
     )?;
     let updated_claim = parse_claim_file(file.clone(), &updated);
     ensure_claim_valid(&updated_claim)?;
-    let mut proposed = claims
-        .into_iter()
-        .filter(|claim| claim.display_id() != claim_id)
-        .collect::<Vec<_>>();
-    proposed.push(updated_claim);
-    ensure_claim_board_valid(&proposed)?;
-    let mut no_hook = no_claim_publish_hook;
+    claims.push(updated_claim);
+    ensure_claim_board_valid(&claims)?;
     let final_claims = atomic_publish_claim(
         &root,
         &lock,
         &initial_board,
         &file_name,
         updated.as_bytes(),
-        &mut no_hook,
+        &mut before_publish,
     )?;
     ensure_claim_board_valid(&final_claims)?;
     let final_claim = final_claims
@@ -416,13 +421,168 @@ fn apply_with_clock(
         claim_id: claim_id.to_string(),
         file,
         actor: actor.to_string(),
-        created,
+        created: true,
         updated: now.raw().to_string(),
         claim: summary,
     })
 }
 
-fn no_claim_publish_hook(_path: &Path) -> Result<()> {
+fn validate_initial_claim_draft(
+    content: &str,
+    claim: &ParsedClaim,
+    actor: &str,
+    now: &LiveClock,
+) -> Result<()> {
+    if claim.owner.as_deref() != Some(actor) {
+        bail!("claim apply actor must exactly match the draft owner");
+    }
+    if claim.status.as_deref() != Some("active") {
+        bail!("claim apply accepts only a new claim with initial status active");
+    }
+    if claim.date.is_some() {
+        bail!("claim apply drafts must use explicit Created, Updated, and Heartbeat fields");
+    }
+    let created = claim
+        .created
+        .as_deref()
+        .context("claim apply draft is missing Created")?;
+    let updated = claim
+        .updated
+        .as_deref()
+        .context("claim apply draft is missing Updated")?;
+    let heartbeat = claim
+        .heartbeat
+        .as_deref()
+        .context("claim apply draft is missing Heartbeat")?;
+    if created != updated || created != heartbeat {
+        bail!("claim apply draft timestamps must be one initial generation");
+    }
+    let created_seconds = parse_timestamp_seconds(created)
+        .context("claim apply draft Created timestamp is malformed")?;
+    if created != format_epoch_seconds(created_seconds) {
+        bail!("claim apply draft Created timestamp must be canonical UTC seconds");
+    }
+    if created_seconds > now.epoch_seconds {
+        bail!("claim apply draft contains a future timestamp generation");
+    }
+    if now.epoch_seconds.saturating_sub(created_seconds) > MAX_APPLY_DRAFT_AGE_SECONDS {
+        bail!("claim apply draft is too old for create-only publication");
+    }
+    let mut claim_id_fields = 0usize;
+    for line in content.lines() {
+        if field_from_line(line.trim()).is_some_and(|(key, _)| key == "claim id") {
+            claim_id_fields = claim_id_fields.saturating_add(1);
+        }
+    }
+    let claim_headers = content
+        .lines()
+        .filter(|line| line.starts_with("# Claim:"))
+        .count();
+    if claim_id_fields != 1 || claim_headers != 1 {
+        bail!("claim apply draft must contain one matching Claim header and Claim ID field");
+    }
+    if content.lines().any(|line| {
+        line.trim()
+            .strip_prefix("##")
+            .is_some_and(|heading| heading.trim().eq_ignore_ascii_case("audit log"))
+    }) {
+        bail!("claim apply draft must not replay or replace audit history");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct BoundClaimDraft {
+    parent: SafeRoot,
+    leaf: OsString,
+    path: PathBuf,
+    generation: ClaimFileGeneration,
+}
+
+impl BoundClaimDraft {
+    fn bind(draft: &Path, board_root: &SafeRoot) -> Result<Self> {
+        let leaf = draft
+            .file_name()
+            .context("claim draft path must end in one file name")?
+            .to_os_string();
+        let leaf_text = leaf
+            .to_str()
+            .context("claim draft file name must be valid UTF-8")?;
+        if leaf_text.is_empty()
+            || leaf_text.len() > MAX_DRAFT_LEAF_BYTES
+            || leaf_text.chars().any(char::is_control)
+        {
+            bail!("claim draft file name is invalid or out of bounds");
+        }
+        let parent_path = draft
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = SafeRoot::open_existing(parent_path)
+            .map_err(|_| anyhow::anyhow!("claim draft parent is unsafe or inaccessible"))?;
+        let parent_text = parent
+            .path()
+            .to_str()
+            .context("claim draft parent must be valid UTF-8")?;
+        if parent_text.len() > MAX_DRAFT_PARENT_BYTES || parent_text.chars().any(char::is_control) {
+            bail!("claim draft parent is invalid or out of bounds");
+        }
+        verify_draft_parent_outside_board(&parent, board_root)?;
+        let generation = read_entry_generation(&parent, &leaf, MAX_CLAIM_BYTES)
+            .map_err(|_| anyhow::anyhow!("claim draft is not a bounded no-follow regular file"))?;
+        parent
+            .verify()
+            .map_err(|_| anyhow::anyhow!("claim draft parent binding changed"))?;
+        board_root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+        let path = parent.direct_child(&leaf)?;
+        Ok(Self {
+            parent,
+            leaf,
+            path,
+            generation,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn verify(&self, board_root: &SafeRoot, board: &ClaimBoardSnapshot) -> Result<()> {
+        verify_draft_parent_outside_board(&self.parent, board_root)?;
+        let observed = read_entry_generation(&self.parent, &self.leaf, MAX_CLAIM_BYTES)
+            .map_err(|_| anyhow::anyhow!("claim draft binding changed"))?;
+        if observed != self.generation {
+            bail!("claim draft identity or content changed after binding");
+        }
+        if board
+            .entries
+            .values()
+            .any(|generation| generation.identity == self.generation.identity)
+        {
+            bail!("claim draft must not alias or hard-link a live claim board entry");
+        }
+        self.parent
+            .verify()
+            .map_err(|_| anyhow::anyhow!("claim draft parent binding changed"))?;
+        board_root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+        Ok(())
+    }
+}
+
+fn verify_draft_parent_outside_board(parent: &SafeRoot, board_root: &SafeRoot) -> Result<()> {
+    parent
+        .verify()
+        .map_err(|_| anyhow::anyhow!("claim draft parent binding changed"))?;
+    board_root
+        .verify()
+        .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+    if parent.identity() == board_root.identity() || parent.path().starts_with(board_root.path()) {
+        bail!("claim drafts must remain outside the live claim board and its aliases");
+    }
     Ok(())
 }
 
@@ -660,37 +820,318 @@ where
     {
         bail!("claim board has no bounded entry capacity for a new claim");
     }
-    let claim_path = root.direct_child(file_name)?;
-    let mut fence_phase = 0u8;
-    AtomicStateWriter::write_direct_fenced(root, file_name, updated, || {
-        lock.verify_direct_binding(root)
-            .map_err(|_| anyhow::anyhow!("claim board mutation lock binding changed"))?;
-        root.verify()
-            .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
-        match fence_phase {
-            0 => {
-                before_first_fence(&claim_path)?;
-                let observed = capture_claim_board_snapshot(root, Some((file_name, updated)))?;
-                if &observed != initial_board {
-                    bail!("claim board generation changed before atomic replacement");
-                }
-            }
-            1 => {
-                let observed = capture_claim_board_snapshot(root, None)?;
-                verify_claim_board_replacement(initial_board, &observed, file_name, updated)?;
-            }
-            _ => bail!("claim mutation fence was invoked unexpectedly"),
-        }
-        fence_phase = fence_phase.saturating_add(1);
-        Ok(())
-    })
+    #[cfg(target_os = "linux")]
+    atomic_publish_claim_linux(
+        root,
+        lock,
+        initial_board,
+        file_name,
+        updated,
+        before_first_fence,
+    )
     .map_err(|_| anyhow::anyhow!("claim atomic mutation was refused"))?;
-    if fence_phase != 2 {
-        bail!("claim atomic mutation did not complete both generation fences");
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (lock, initial_board, file_name, updated, before_first_fence);
+        bail!("claim atomic mutation requires Linux renameat2 CAS support");
     }
 
     let (final_claims, _) = load_stable_claim_board(root, lock)?;
     Ok(final_claims)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct StagedClaimFile {
+    name: OsString,
+    generation: ClaimFileGeneration,
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_publish_claim_linux<F>(
+    root: &SafeRoot,
+    lock: &KernelStateLock,
+    initial_board: &ClaimBoardSnapshot,
+    file_name: &OsStr,
+    updated: &[u8],
+    before_publish: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    let directory = open_claim_board_directory(root)?;
+    let staged = stage_claim_file(&directory, file_name, updated)?;
+    let claim_path = root.direct_child(file_name)?;
+    let publish_result = (|| -> Result<()> {
+        lock.verify_direct_binding(root)
+            .map_err(|_| anyhow::anyhow!("claim board mutation lock binding changed"))?;
+        root.verify()
+            .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+        let observed = capture_claim_board_snapshot(root, Some((file_name, updated)))?;
+        if &observed != initial_board {
+            bail!("claim board generation changed before atomic replacement");
+        }
+        before_publish(&claim_path)?;
+        lock.verify_direct_binding(root)
+            .map_err(|_| anyhow::anyhow!("claim board mutation lock binding changed"))?;
+        root.verify()
+            .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+
+        if let Some(initial_target) = initial_board.entries.get(file_name) {
+            publish_existing_claim_exchange(
+                root,
+                &directory,
+                initial_board,
+                file_name,
+                updated,
+                initial_target,
+                &staged,
+            )
+        } else {
+            publish_new_claim_noreplace(
+                root,
+                &directory,
+                initial_board,
+                file_name,
+                updated,
+                &staged,
+            )
+        }
+    })();
+    if let Err(error) = publish_result {
+        cleanup_claim_temp_if_exact(root, &directory, &staged.name, &staged.generation)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_new_claim_noreplace(
+    root: &SafeRoot,
+    directory: &File,
+    initial_board: &ClaimBoardSnapshot,
+    file_name: &OsStr,
+    updated: &[u8],
+    staged: &StagedClaimFile,
+) -> Result<()> {
+    rename_claim_entry(directory, &staged.name, file_name, libc::RENAME_NOREPLACE)
+        .context("create-only claim target appeared before publication")?;
+    let validation = (|| -> Result<()> {
+        directory
+            .sync_all()
+            .context("failed to flush create-only claim publication")?;
+        let observed = capture_claim_board_snapshot(root, None)?;
+        verify_claim_board_replacement(initial_board, &observed, file_name, updated)
+    })();
+    if let Err(error) = validation {
+        rollback_created_claim(root, directory, file_name, staged)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_existing_claim_exchange(
+    root: &SafeRoot,
+    directory: &File,
+    initial_board: &ClaimBoardSnapshot,
+    file_name: &OsStr,
+    updated: &[u8],
+    initial_target: &ClaimFileGeneration,
+    staged: &StagedClaimFile,
+) -> Result<()> {
+    rename_claim_entry(directory, &staged.name, file_name, libc::RENAME_EXCHANGE)
+        .context("claim compare-and-swap exchange failed")?;
+    let validation = (|| -> Result<()> {
+        directory
+            .sync_all()
+            .context("failed to flush claim compare-and-swap exchange")?;
+        let exchanged_old = read_entry_generation(root, &staged.name, MAX_CLAIM_BYTES)
+            .context("exchanged claim generation is unsafe")?;
+        if exchanged_old != *initial_target {
+            bail!("claim pathname or in-place generation changed before CAS exchange");
+        }
+        let observed =
+            capture_claim_board_snapshot(root, Some((file_name, initial_target.bytes.as_slice())))?;
+        verify_claim_board_replacement(initial_board, &observed, file_name, updated)
+    })();
+    if let Err(error) = validation {
+        rename_claim_entry(directory, &staged.name, file_name, libc::RENAME_EXCHANGE)
+            .context("failed to roll back refused claim compare-and-swap exchange")?;
+        directory
+            .sync_all()
+            .context("failed to flush refused claim CAS rollback")?;
+        return Err(error);
+    }
+    cleanup_claim_temp_if_exact(root, directory, &staged.name, initial_target)?;
+    let observed = capture_claim_board_snapshot(root, None)?;
+    verify_claim_board_replacement(initial_board, &observed, file_name, updated)
+}
+
+#[cfg(target_os = "linux")]
+fn rollback_created_claim(
+    root: &SafeRoot,
+    directory: &File,
+    file_name: &OsStr,
+    staged: &StagedClaimFile,
+) -> Result<()> {
+    let observed = read_entry_generation(root, file_name, MAX_CLAIM_BYTES)
+        .context("created claim changed before rollback")?;
+    if observed != staged.generation {
+        bail!("created claim changed before rollback; preserving it for inspection");
+    }
+    rename_claim_entry(directory, file_name, &staged.name, libc::RENAME_NOREPLACE)
+        .context("failed to roll back create-only claim publication")?;
+    directory
+        .sync_all()
+        .context("failed to flush create-only claim rollback")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_claim_board_directory(root: &SafeRoot) -> Result<File> {
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let directory = options
+        .open(root.path())
+        .context("failed to open claim board directory for CAS")?;
+    let metadata = directory
+        .metadata()
+        .context("failed to inspect claim board CAS directory")?;
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    };
+    if !metadata.is_dir() || &identity != root.identity() {
+        bail!("claim board CAS directory identity changed");
+    }
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn stage_claim_file(
+    directory: &File,
+    file_name: &OsStr,
+    contents: &[u8],
+) -> Result<StagedClaimFile> {
+    let target = file_name
+        .to_str()
+        .context("claim target name is not valid UTF-8")?;
+    for _ in 0..128 {
+        let counter = CLAIM_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let epoch_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let nonce = u64::try_from(epoch_nanos & u128::from(u64::MAX))
+            .unwrap_or_default()
+            .wrapping_add(counter);
+        let name = OsString::from(format!(".{target}.{}-{nonce}.tmp", std::process::id()));
+        let name_c = claim_c_string(&name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error).context("failed to stage claim CAS content");
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to secure staged claim CAS content");
+        }
+        file.write_all(contents)
+            .context("failed to write staged claim CAS content")?;
+        file.sync_all()
+            .context("failed to flush staged claim CAS content")?;
+        let metadata = file
+            .metadata()
+            .context("failed to inspect staged claim CAS content")?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+        {
+            bail!("staged claim CAS metadata is unsafe");
+        }
+        let generation = ClaimFileGeneration {
+            identity: FileIdentity {
+                device: metadata.dev(),
+                file: metadata.ino(),
+            },
+            bytes: contents.to_vec(),
+        };
+        drop(file);
+        directory
+            .sync_all()
+            .context("failed to flush staged claim CAS directory entry")?;
+        return Ok(StagedClaimFile { name, generation });
+    }
+    bail!("failed to reserve a bounded claim CAS temporary file")
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_claim_temp_if_exact(
+    root: &SafeRoot,
+    directory: &File,
+    name: &OsStr,
+    expected: &ClaimFileGeneration,
+) -> Result<()> {
+    if !root.direct_child_exists(name)? {
+        return Ok(());
+    }
+    let observed = read_entry_generation(root, name, MAX_CLAIM_BYTES)
+        .context("claim CAS temporary generation is unsafe")?;
+    if &observed != expected {
+        bail!("claim CAS temporary generation changed; preserving it for inspection");
+    }
+    let name_c = claim_c_string(name)?;
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to remove verified claim CAS temporary generation");
+    }
+    directory
+        .sync_all()
+        .context("failed to flush claim CAS temporary cleanup")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_claim_entry(directory: &File, source: &OsStr, target: &OsStr, flags: u32) -> Result<()> {
+    let source = claim_c_string(source)?;
+    let target = claim_c_string(target)?;
+    if unsafe {
+        libc::renameat2(
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            target.as_ptr(),
+            flags,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("claim renameat2 CAS was refused");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn claim_c_string(value: &OsStr) -> Result<std::ffi::CString> {
+    std::ffi::CString::new(value.as_bytes()).context("claim entry contains a NUL byte")
 }
 
 fn claims_dir(repo: &Path) -> PathBuf {
@@ -1961,6 +2402,18 @@ mod tests {
         )
     }
 
+    fn initial_draft_text(
+        claim_id: &str,
+        owner: &str,
+        status: &str,
+        timestamp: &str,
+        owned_surface: &str,
+    ) -> String {
+        format!(
+            "# Claim: {claim_id}\n\n- Claim ID: {claim_id}\n- Owner: {owner}\n- Status: {status}\n- Created: {timestamp}\n- Updated: {timestamp}\n- Heartbeat: {timestamp}\n- Stale after minutes: 60\n- Owned files, regions, devices, or services:\n  - {owned_surface}: bounded test surface\n"
+        )
+    }
+
     fn write_claim(
         repo: &Path,
         claim_id: &str,
@@ -2132,7 +2585,8 @@ mod tests {
     }
 
     #[test]
-    fn atomic_mutation_fence_rejects_same_inode_content_and_rebound_inode_races() -> Result<()> {
+    fn atomic_mutation_cas_rejects_same_inode_and_replacement_races_for_every_mutator() -> Result<()>
+    {
         let temp = tempfile::tempdir()?;
         let path = write_claim(
             temp.path(),
@@ -2164,36 +2618,62 @@ mod tests {
         assert!(error.to_string().contains("atomic mutation was refused"));
         assert_eq!(std::fs::read_to_string(&path)?, changed);
 
-        let second = tempfile::tempdir()?;
-        let path = write_claim(
-            second.path(),
-            "inode-race",
-            "inode-race",
-            "active",
-            "2026-05-20T00:00:00Z",
-        )?;
-        let replacement = claim_text(
-            "inode-race",
-            "inode-race",
-            "active",
-            "2026-05-20T00:02:00Z",
-            "src/live_claim.rs",
-        );
-        let error = mutate_claim(
-            second.path(),
-            "inode-race",
-            "inode-race",
-            &now,
-            ClaimMutation::Heartbeat,
-            |claim_path| {
-                std::fs::remove_file(claim_path)?;
-                std::fs::write(claim_path, &replacement)?;
-                Ok(())
-            },
-        )
-        .expect_err("inode rebound race must fail");
-        assert!(error.to_string().contains("atomic mutation was refused"));
-        assert_eq!(std::fs::read_to_string(&path)?, replacement);
+        for (claim_id, actor, mutation, mutation_now) in [
+            (
+                "heartbeat-race",
+                "heartbeat-race",
+                ClaimMutation::Heartbeat,
+                "2026-05-20T00:30:00Z",
+            ),
+            (
+                "release-race",
+                "release-race",
+                ClaimMutation::OwnerRelease {
+                    status: "done",
+                    reason: "bounded release race",
+                },
+                "2026-05-20T00:30:00Z",
+            ),
+            (
+                "override-race",
+                "project-owner",
+                ClaimMutation::OverrideRelease {
+                    reason: "bounded override race",
+                },
+                "2026-05-20T02:00:00Z",
+            ),
+        ] {
+            let second = tempfile::tempdir()?;
+            let path = write_claim(
+                second.path(),
+                claim_id,
+                claim_id,
+                "active",
+                "2026-05-20T00:00:00Z",
+            )?;
+            let replacement = claim_text(
+                claim_id,
+                claim_id,
+                "active",
+                "2026-05-20T00:02:00Z",
+                "src/live_claim.rs",
+            );
+            let error = mutate_claim(
+                second.path(),
+                claim_id,
+                actor,
+                &LiveClock::parse(mutation_now)?,
+                mutation,
+                |claim_path| {
+                    std::fs::remove_file(claim_path)?;
+                    std::fs::write(claim_path, &replacement)?;
+                    Ok(())
+                },
+            )
+            .expect_err("pathname replacement race must fail");
+            assert!(error.to_string().contains("atomic mutation was refused"));
+            assert_eq!(std::fs::read_to_string(&path)?, replacement);
+        }
         Ok(())
     }
 
@@ -2351,75 +2831,238 @@ mod tests {
     }
 
     #[test]
-    fn apply_atomically_creates_owner_updates_and_release_uses_the_same_board_path() -> Result<()> {
+    fn apply_is_create_only_and_scope_changes_require_a_new_claim_id() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let directory = claims_dir(temp.path());
         std::fs::create_dir_all(&directory)?;
         let draft = temp.path().join("claim-draft.md");
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
         std::fs::write(
             &draft,
-            claim_text(
+            initial_draft_text(
                 "applied-claim",
                 "applied-owner",
                 "active",
-                "2026-05-20T00:00:00Z",
-                "src/review.rs",
+                now.raw(),
+                "src/live_claim.rs",
             ),
         )?;
-        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
         let created = apply_with_clock(temp.path(), &draft, "applied-owner", &now)?;
         assert!(created.created);
-        assert!(std::fs::read_to_string(directory.join("applied-claim.md"))?
-            .contains("applied claim draft"));
-        assert!(apply_with_clock(
-            temp.path(),
-            &directory.join("applied-claim.md"),
-            "applied-owner",
-            &now,
-        )
-        .expect_err("drafts inside the board must be refused")
-        .to_string()
-        .contains("outside"));
+        let claim_path = directory.join("applied-claim.md");
+        let created_content = std::fs::read_to_string(&claim_path)?;
+        assert!(created_content.contains("created claim from bounded draft"));
 
-        let other_actor = apply_with_clock(temp.path(), &draft, "other-owner", &now)
-            .expect_err("only the exact owner may update a claim");
-        assert!(other_actor.to_string().contains("draft owner"));
-
-        std::fs::write(
-            directory.join("other-claim.md"),
-            claim_text(
-                "other-claim",
-                "other-owner",
-                "active",
-                "2026-05-20T00:00:00Z",
-                "src",
-            ),
-        )?;
         std::fs::write(
             &draft,
-            claim_text(
+            initial_draft_text(
                 "applied-claim",
                 "applied-owner",
-                "blocked",
-                "2026-05-20T00:00:00Z",
-                "src/review.rs",
+                "active",
+                now.raw(),
+                "src/changed-scope.rs",
             ),
         )?;
-        assert!(apply_with_clock(temp.path(), &draft, "applied-owner", &now).is_err());
-        std::fs::remove_file(directory.join("other-claim.md"))?;
-        let updated = apply_with_clock(temp.path(), &draft, "applied-owner", &now)?;
-        assert!(!updated.created);
-        assert_eq!(updated.claim.status.as_deref(), Some("blocked"));
+        let existing = apply_with_clock(temp.path(), &draft, "applied-owner", &now)
+            .expect_err("existing claim updates must be refused even for the exact owner");
+        assert!(existing.to_string().contains("create-only"));
+        assert_eq!(std::fs::read_to_string(&claim_path)?, created_content);
 
-        let released = release(
+        mutate_claim(
             temp.path(),
             "applied-claim",
             "applied-owner",
-            "done",
-            "owner completed the bounded work",
+            &LiveClock::parse("2026-05-20T00:31:00Z")?,
+            ClaimMutation::OwnerRelease {
+                status: "handoff",
+                reason: "scope change requires a new claim id",
+            },
+            |_| Ok(()),
         )?;
-        assert_eq!(released.status.as_deref(), Some("done"));
-        assert!(released.audit_entry.contains("released claim as `done`"));
+        let terminal_replay = apply_with_clock(temp.path(), &draft, "applied-owner", &now)
+            .expect_err("released ids must not be replayed");
+        assert!(terminal_replay.to_string().contains("create-only"));
+
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "applied-claim-v2",
+                "applied-owner",
+                "active",
+                now.raw(),
+                "src/changed-scope.rs",
+            ),
+        )?;
+        let replacement = apply_with_clock(temp.path(), &draft, "applied-owner", &now)?;
+        assert_eq!(replacement.claim_id, "applied-claim-v2");
+        assert!(replacement.created);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_rejects_old_future_terminal_and_audit_replay_drafts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(claims_dir(temp.path()))?;
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let cases = [
+            (
+                "old-draft",
+                "active",
+                "2026-05-20T00:20:00Z",
+                false,
+                "too old",
+            ),
+            (
+                "future-draft",
+                "active",
+                "2026-05-20T00:31:00Z",
+                false,
+                "future",
+            ),
+            (
+                "terminal-draft",
+                "done",
+                "2026-05-20T00:30:00Z",
+                false,
+                "initial status active",
+            ),
+            (
+                "audit-draft",
+                "active",
+                "2026-05-20T00:30:00Z",
+                true,
+                "audit history",
+            ),
+        ];
+        for (claim_id, status, timestamp, with_audit, expected) in cases {
+            let draft = temp.path().join(format!("{claim_id}.draft"));
+            let mut content =
+                initial_draft_text(claim_id, claim_id, status, timestamp, "src/live_claim.rs");
+            if with_audit {
+                content.push_str("\n## Audit log\n\n- forged prior history\n");
+            }
+            std::fs::write(&draft, content)?;
+            let error = apply_with_clock(temp.path(), &draft, claim_id, &now)
+                .expect_err("unsafe initial draft generation must be refused");
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(!claims_dir(temp.path())
+                .join(format!("{claim_id}.md"))
+                .exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_binds_draft_parent_leaf_and_board_aliases_without_following_links() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let directory = claims_dir(temp.path());
+        std::fs::create_dir_all(&directory)?;
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let board_claim = write_claim(
+            temp.path(),
+            "board-source",
+            "board-source",
+            "done",
+            now.raw(),
+        )?;
+
+        let inside = apply_with_clock(temp.path(), &board_claim, "board-source", &now)
+            .expect_err("board-internal drafts must be refused");
+        assert!(inside.to_string().contains("outside"));
+
+        let hardlink = temp.path().join("hardlinked-draft.md");
+        std::fs::hard_link(&board_claim, &hardlink)?;
+        let hardlink_error = apply_with_clock(temp.path(), &hardlink, "board-source", &now)
+            .expect_err("board hard links must be refused");
+        assert!(hardlink_error.to_string().contains("bounded no-follow"));
+        std::fs::remove_file(&hardlink)?;
+
+        let alias = temp.path().join("claim-board-alias");
+        symlink(&directory, &alias)?;
+        let alias_error = apply_with_clock(
+            temp.path(),
+            &alias.join("board-source.md"),
+            "board-source",
+            &now,
+        )
+        .expect_err("board symlink aliases must be refused");
+        assert!(alias_error.to_string().contains("parent"));
+
+        let draft_parent = temp.path().join("draft-parent");
+        let replacement_parent = temp.path().join("replacement-parent");
+        std::fs::create_dir(&draft_parent)?;
+        std::fs::create_dir(&replacement_parent)?;
+        let draft = draft_parent.join("ancestor-race.md");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "ancestor-race",
+                "ancestor-race",
+                "active",
+                now.raw(),
+                "src/live_claim.rs",
+            ),
+        )?;
+        let moved_parent = temp.path().join("draft-parent-original");
+        let race = apply_with_clock_and_hooks(
+            temp.path(),
+            &draft,
+            "ancestor-race",
+            &now,
+            |_| {
+                std::fs::rename(&draft_parent, &moved_parent)?;
+                symlink(&replacement_parent, &draft_parent)?;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect_err("ancestor symlink replacement must invalidate the bound draft");
+        assert!(race.to_string().contains("parent binding changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_create_race_never_replaces_a_concurrently_created_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = claims_dir(temp.path());
+        std::fs::create_dir_all(&directory)?;
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let draft = temp.path().join("create-race.draft");
+        std::fs::write(
+            &draft,
+            initial_draft_text(
+                "create-race",
+                "create-race",
+                "active",
+                now.raw(),
+                "src/live_claim.rs",
+            ),
+        )?;
+        let raced_content = claim_text(
+            "create-race",
+            "racing-owner",
+            "done",
+            now.raw(),
+            "src/raced.rs",
+        );
+        let target = directory.join("create-race.md");
+        let error = apply_with_clock_and_hooks(
+            temp.path(),
+            &draft,
+            "create-race",
+            &now,
+            |_| Ok(()),
+            |_| {
+                std::fs::write(&target, &raced_content)?;
+                Ok(())
+            },
+        )
+        .expect_err("create-only rename must refuse a concurrently appearing target");
+        assert!(error.to_string().contains("atomic mutation was refused"));
+        assert_eq!(std::fs::read_to_string(&target)?, raced_content);
         Ok(())
     }
 

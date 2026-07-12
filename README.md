@@ -771,26 +771,39 @@ claim writer is scavenged under that lock; unknown or malformed residue is
 left in place and refused for manual inspection.
 
 Supported owner mutation flows are `apply`, `heartbeat`, and `release`.
-`apply` takes a bounded no-follow Markdown draft outside the claim board and
-atomically creates a new claim or updates a claim whose recorded owner exactly
-matches `--by`; the proposed whole board must remain valid and free of active
-path overlap. Direct edits below `.agents/live/claims/` are unsupported, and a
-concurrent direct edit invalidates the stable board snapshot instead of being
-silently overwritten. `heartbeat` is limited to `active` or `blocked` claims
-and requires `--by` to exactly match the recorded owner. `override-release` is
-also limited to those states and requires a claim that is provably stale; a
-fresh, future-dated, or otherwise unknown liveness result is refused. Its
-required `--by` value is an audited actor label, not an authentication
-credential, and `--reason` is bounded and rejects control-character injection.
-`release` requires the exact recorded owner and moves the claim to `done` or
-`handoff`; `override-release` is the audited stale-claim administrative
-exception. Mutations run under a stable board lock, fence the complete board
-generation, then use a durable atomic replacement so concurrent name, content,
-or rebound-file changes are refused instead of overwritten. Audit growth is
-compacted into a bounded digest entry, and heartbeat writes reserve release
-headroom. Mutation timestamps always use the process's real system clock and
-refuse future/rollback heartbeat generations; public `--now` injection is
-available only for the observational `status` and `validate` commands.
+`apply` is create-only: an existing claim ID is always refused, including after
+that claim reaches a terminal state. Change scope by releasing or handing off
+the prior claim, then submit a new claim ID. A draft must describe a fresh
+`active` initial generation with one matching Claim header and Claim ID, an
+owner exactly matching `--by`, equal canonical UTC `Created`, `Updated`, and
+`Heartbeat` values no more than five minutes old, and no pre-existing audit
+log. Old, future, terminal-state, and audit-replay drafts fail closed.
+
+The draft parent and leaf are bounded and opened through a no-follow parent
+descriptor. Their identity and content are rebound to the same observation as
+the claim board; drafts inside or aliasing the board, hard links to board
+entries, and ancestor-link replacement are refused. The proposed whole board
+must remain valid and free of active path overlap. `heartbeat` is limited to
+`active` or `blocked` claims and requires `--by` to exactly match the recorded
+owner. `override-release` is also limited to those states and requires a claim
+that is provably stale; a fresh, future-dated, or otherwise unknown liveness
+result is refused. Its required `--by` value is an audited actor label, not an
+authentication credential, and `--reason` is bounded and rejects
+control-character injection. `release` requires the exact recorded owner and
+moves the claim to `done` or `handoff`; `override-release` is the audited
+stale-claim administrative exception.
+
+Supported API operations coordinate through the stable board lock. On Linux,
+create uses `renameat2(RENAME_NOREPLACE)` and existing-claim mutations use an
+exchange CAS that checks the exchanged old inode and bytes and rolls back a
+refused generation. Direct edits below `.agents/live/claims/` are unsupported:
+the lock and CAS narrow cooperating API races, but do not claim complete
+exclusion or detection of a non-cooperating same-UID process holding and
+editing a file descriptor across the operation. Audit growth is compacted into
+a bounded digest entry, and heartbeat writes reserve release headroom. Mutation
+timestamps always use the process's real system clock and refuse
+future/rollback heartbeat generations; public `--now` injection is available
+only for the observational `status` and `validate` commands.
 
 Preview the local LLM boundary without credentials or network access:
 
@@ -1029,12 +1042,17 @@ output is refused, and nested unknown fields or mismatched target, attempt,
 repository-relative paths, reviewer identity, or request binding are rejected.
 The selected program and any script interpreter are opened without following
 links, bounded and hashed, then copied with create-new semantics into an
-owner-private runtime directory. Only the read-only executable copy is run.
-The parent derives the reviewer identity from those copied bytes and bounded
-argv, and binds each request to the pre-run repository snapshot, canonical
-request, effective timeout, and sandbox-policy version; the reviewer must echo
-that binding. A bounded descriptor prewalk rejects oversized or excessive
-ignored/untracked trees before Git status construction. The snapshot covers
+owner-private runtime directory. The materialized copy is selected as the
+launch pathname and the source pathname is not passed to the process runner,
+but execution is not yet descriptor-bound. Until fd-bound execution is added,
+the pre-exec pathname handoff remains an integrity gap against a non-cooperating
+same-UID replacement and must not be described as proof that the kernel ran the
+exact bound bytes. The parent derives the reviewer identity from those copied
+bytes and bounded argv, and binds each request to the pre-run repository
+snapshot, canonical request, effective timeout, and sandbox-policy version;
+the reviewer must echo that binding. A bounded descriptor prewalk rejects
+oversized or excessive ignored/untracked trees before Git status construction.
+The snapshot covers
 tracked, untracked, and ignored content, modes, link targets, file generations,
 Git HEAD/ref/index/packed-ref state, and linked-worktree identities. Hard links,
 special files, external links, and gitlinks fail closed. Concurrent changes to
