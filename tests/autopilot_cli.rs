@@ -267,6 +267,33 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
 }
 
 #[test]
+fn autopilot_prune_deletes_only_finalized_runs() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_file(&repo_path.join("README.md"), "# Smoke\n\nprimary dirty\n")?;
+    for run_id in ["aa-prune", "zz-prune"] {
+        let report = run_autopilot_refusal(&repo_path, temp.path(), run_id)?;
+        assert_eq!(report["status"], "refused");
+    }
+
+    let prune = run_success_json(&[
+        "autopilot",
+        "artifacts",
+        "prune",
+        "--repo",
+        path_str(&repo_path)?,
+        "--keep",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(prune["deleted_count"], 1);
+    assert_eq!(prune["refused_unfinalized_count"], 0);
+    assert!(!repo_path.join(".maco/autopilot/runs/aa-prune").exists());
+    assert!(repo_path.join(".maco/autopilot/runs/zz-prune").exists());
+    Ok(())
+}
+
+#[test]
 fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitignore_entry(
 ) -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
@@ -445,6 +472,15 @@ fn dirty_primary_refusal_emits_public_json() -> Result<()> {
         &repo_path.join(".maco/autopilot/runs/preexisting/state.json"),
         "{}\n",
     )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            repo_path.join(".maco/autopilot/runs"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .context("chmod preexisting artifact root")?;
+    }
     write_file(&repo_path.join(".maco-cache/preflight/state.json"), "{}\n")?;
 
     let report = run_failure_json(&[
@@ -467,6 +503,131 @@ fn dirty_primary_refusal_emits_public_json() -> Result<()> {
     );
     assert_eq!(report["auto_merge_performed"], false);
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn status_and_collect_require_verified_finalization_and_distinguish_active_runs() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+
+    let missing = run_success_json(&[
+        "autopilot",
+        "status",
+        "absent",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert!(missing["final_report"].is_null());
+    assert_eq!(missing["artifacts"]["plan"], false);
+    let missing_collect = run_failure_json(&[
+        "autopilot",
+        "collect",
+        "absent",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(missing_collect["status"], "missing");
+
+    write_file(&repo_path.join("README.md"), "# Smoke\n\nprimary dirty\n")?;
+    for run_id in [
+        "verified",
+        "report-tamper",
+        "hmac-tamper",
+        "marker-malformed",
+    ] {
+        let report = run_autopilot_refusal(&repo_path, temp.path(), run_id)?;
+        assert_eq!(report["status"], "refused");
+    }
+
+    let verified_dir = repo_path.join(".maco/autopilot/runs/verified");
+    let marker: Value = serde_json::from_slice(
+        &fs::read(verified_dir.join(".maco-artifact-final.json")).context("read marker")?,
+    )
+    .context("parse marker")?;
+    assert_eq!(marker["publish_requested"], false);
+    assert_eq!(marker["publishable"], false);
+    assert!(marker["files"]
+        .as_array()
+        .context("marker files")?
+        .iter()
+        .all(|file| file["disposition"] == "private_evidence"));
+    let verified = run_success_json(&[
+        "autopilot",
+        "status",
+        "verified",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(verified["final_report"]["status"], "refused");
+
+    let active_dir = repo_path.join(".maco/autopilot/runs/active");
+    fs::create_dir(&active_dir).context("create active run")?;
+    fs::set_permissions(&active_dir, fs::Permissions::from_mode(0o700))
+        .context("chmod active run")?;
+    write_file(&active_dir.join("plan.json"), "{}\n")?;
+    let active = run_success_json(&[
+        "autopilot",
+        "status",
+        "active",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(active["artifacts"]["plan"], true);
+    assert_eq!(active["artifacts"]["final_report"], false);
+    assert!(active["final_report"].is_null());
+    let active_collect = run_failure_stderr(&[
+        "autopilot",
+        "collect",
+        "active",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert!(active_collect.contains("active or unfinalized"));
+
+    write_file(
+        &repo_path.join(".maco/autopilot/runs/report-tamper/final-report.json"),
+        "{\"status\":\"succeeded\",\"success\":true}\n",
+    )?;
+    assert_corrupt_autopilot_status(&repo_path, "report-tamper")?;
+
+    let hmac_path = repo_path.join(".maco/autopilot/runs/hmac-tamper/.maco-artifact-final.json");
+    let mut hmac_marker: Value =
+        serde_json::from_slice(&fs::read(&hmac_path)?).context("parse hmac marker")?;
+    hmac_marker["hmac_sha256"] = Value::String("00".repeat(32));
+    write_file(
+        &hmac_path,
+        &format!("{}\n", serde_json::to_string_pretty(&hmac_marker)?),
+    )?;
+    assert_corrupt_autopilot_status(&repo_path, "hmac-tamper")?;
+
+    write_file(
+        &repo_path.join(".maco/autopilot/runs/marker-malformed/.maco-artifact-final.json"),
+        "{not json\n",
+    )?;
+    assert_corrupt_autopilot_status(&repo_path, "marker-malformed")?;
+
+    Ok(())
+}
+
+fn assert_corrupt_autopilot_status(repo: &Path, run_id: &str) -> Result<()> {
+    let failure = run_failure_stderr(&[
+        "autopilot",
+        "status",
+        run_id,
+        "--repo",
+        path_str(repo)?,
+        "--json",
+    ])?;
+    assert!(failure.contains("corrupt or unverifiable"));
     Ok(())
 }
 
@@ -744,6 +905,14 @@ fn run_failure_json(args: &[&str]) -> Result<Value> {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn run_failure_stderr(args: &[&str]) -> Result<String> {
+    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    if output.status.success() {
+        anyhow::bail!("maco command unexpectedly succeeded");
+    }
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

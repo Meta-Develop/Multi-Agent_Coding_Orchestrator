@@ -1,9 +1,8 @@
 use crate::{
-    artifacts::{self, RunArtifactFamily},
+    artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
     live_claim::{self, LiveClock},
     merge::{
-        self, ApplyBlocker, ApplyReadinessStatus, SafetyCheckStatus, ValidationReport,
-        ValidationStatus,
+        ApplyBlocker, ApplyReadinessStatus, SafetyCheckStatus, ValidationReport, ValidationStatus,
     },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
@@ -25,16 +24,15 @@ use crate::{
     },
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
-    worktree::WorktreeManager,
+    worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
 use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -43,6 +41,7 @@ const AUTOPILOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
 const VALIDATION_OUTPUT_LIMIT: usize = 8 * 1024;
 const VALIDATION_CAPTURE_LIMIT_BYTES: usize = VALIDATION_OUTPUT_LIMIT * 4;
+const ARTIFACT_FINAL_MARKER: &str = ".maco-artifact-final.json";
 
 #[derive(Debug, Clone)]
 pub struct AutopilotRunOptions {
@@ -363,6 +362,13 @@ struct SkippedStageReport {
     reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct FailedStageReport {
+    status: String,
+    reason: String,
+    message: String,
+}
+
 pub fn autopilot_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -399,21 +405,25 @@ pub fn autopilot_plan_from_task_file(
 
 pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
     let repo = discover_repo_root(&options.repo)?;
-    let run_dir = autopilot_run_dir(&repo, &options.run_id);
-    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Autopilot, &options.run_id)?;
-    fs::create_dir_all(&run_dir)
-        .with_context(|| format!("failed to create autopilot run dir {}", run_dir.display()))?;
     let mut plan = autopilot_plan_from_task_file(&repo, &options.plan_file)?;
     if let Some(command) = options.reviewer_command.clone() {
         plan.reviewer.mode = ReviewerMode::ExternalCommand;
         plan.reviewer.command = Some(command);
     }
     let artifacts = artifact_paths();
-    write_json_file(&run_dir.join(&artifacts.plan), &plan)?;
+    let real_runtime_requested = options.codex_bin.is_some();
+    let mut artifact_writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Autopilot,
+        options.run_id.clone(),
+        "autopilot",
+    )?;
+    let run_dir = artifact_writer.run_dir().to_path_buf();
+    write_private_json(&mut artifact_writer, &artifacts.plan, &plan)?;
 
     let safety = safety_report(&repo, options.allow_dirty_primary, &plan.assigned_paths)?;
     if safety.refused {
-        write_skipped_stage_reports(&run_dir, "safety_refusal")?;
+        write_skipped_stage_reports(&mut artifact_writer, "safety_refusal")?;
         let validation = AutopilotValidationSummary {
             status: AutopilotValidationStatus::Skipped,
             reports: Vec::new(),
@@ -434,7 +444,8 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
                 "resolve the safety refusal, then rerun autopilot; a human reviews and merges manually",
             auto_merge_requested: plan.auto_merge,
         });
-        write_json_file(&run_dir.join("final-report.json"), &report)?;
+        write_private_json(&mut artifact_writer, "final-report.json", &report)?;
+        artifact_writer.finalize("final-report.json", false)?;
         return Ok(report);
     }
 
@@ -458,16 +469,55 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             RunId::new(format!("{}-attempt-{}", options.run_id.as_str(), attempt))?;
         let supervisor_plan =
             supervisor_plan_for_attempt(&plan, &agent_id, attempt, &repair_reasons);
-        let supervisor_plan_path = run_dir.join(format!("supervisor-plan-attempt-{attempt}.json"));
-        write_json_file(&supervisor_plan_path, &supervisor_plan)?;
+        let supervisor_plan_relative =
+            PathBuf::from(format!("supervisor-plan-attempt-{attempt}.json"));
+        write_private_json(
+            &mut artifact_writer,
+            &supervisor_plan_relative,
+            &supervisor_plan,
+        )?;
+        let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
+        let mut attempt_summary = AutopilotAttemptSummary {
+            attempt,
+            supervisor_run_id: supervisor_run_id.as_str().to_string(),
+            agent_id: agent_id.clone(),
+            supervisor_status: "pending".to_string(),
+            validation_status: AutopilotValidationStatus::Skipped,
+            pr_status: None,
+            review_status: None,
+            blocking_findings: 0,
+            repair_reason: None,
+        };
         let (codex_bin, runtime) = match &options.codex_bin {
             Some(path) => (path.clone(), SupervisorRuntime::Codex),
-            None => (
-                write_fake_codex(&run_dir, &plan, attempt)?,
-                SupervisorRuntime::Fake,
-            ),
+            None => match write_fake_codex(&mut artifact_writer, &plan, attempt) {
+                Ok(path) => (path, SupervisorRuntime::Fake),
+                Err(error) => {
+                    write_failed_report(
+                        &mut artifact_writer,
+                        "supervisor-report.json",
+                        "runtime_setup_failed",
+                        &sanitize_text(&repo, &format!("{error:#}")),
+                    )?;
+                    write_skipped_report(
+                        &mut artifact_writer,
+                        "pr-report.json",
+                        "runtime_setup_failed",
+                    )?;
+                    write_skipped_report(
+                        &mut artifact_writer,
+                        "review-report.json",
+                        "runtime_setup_failed",
+                    )?;
+                    attempt_summary.supervisor_status = "failed".to_string();
+                    attempts.push(attempt_summary);
+                    next_action = "repair the local supervisor runtime setup, then rerun autopilot"
+                        .to_string();
+                    break;
+                }
+            },
         };
-        let supervisor = supervise::run_supervisor_plan_file(SupervisorRunOptions {
+        let supervisor = match supervise::run_supervisor_plan_file(SupervisorRunOptions {
             repo: repo.clone(),
             plan_file: supervisor_plan_path,
             run_id: supervisor_run_id.clone(),
@@ -476,28 +526,44 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             // Autopilot already ran the real primary-change preflight; nested
             // supervise should not reject autopilot's own runtime artifacts.
             allow_dirty_primary: true,
-        })?;
+        }) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                write_failed_report(
+                    &mut artifact_writer,
+                    "supervisor-report.json",
+                    "supervisor_failed",
+                    &sanitize_text(&repo, &format!("{error:#}")),
+                )?;
+                write_skipped_report(&mut artifact_writer, "pr-report.json", "supervisor_failed")?;
+                write_skipped_report(
+                    &mut artifact_writer,
+                    "review-report.json",
+                    "supervisor_failed",
+                )?;
+                attempt_summary.supervisor_status = "failed".to_string();
+                attempts.push(attempt_summary);
+                next_action =
+                    "inspect the supervisor failure report, repair the runtime, and rerun autopilot"
+                        .to_string();
+                break;
+            }
+        };
         let sanitized_supervisor = sanitize_supervisor_report(&repo, &supervisor);
-        write_json_file(
-            &run_dir.join("supervisor-report.json"),
+        write_private_json(
+            &mut artifact_writer,
+            "supervisor-report.json",
             &sanitized_supervisor,
         )?;
-
-        let mut attempt_summary = AutopilotAttemptSummary {
-            attempt,
-            supervisor_run_id: supervisor_run_id.as_str().to_string(),
-            agent_id: agent_id.clone(),
-            supervisor_status: review_status_label(supervisor.status).to_string(),
-            validation_status: AutopilotValidationStatus::Skipped,
-            pr_status: None,
-            review_status: None,
-            blocking_findings: 0,
-            repair_reason: None,
-        };
+        attempt_summary.supervisor_status = review_status_label(supervisor.status).to_string();
 
         if !supervisor.success || !supervisor.publishable {
-            write_skipped_report(&run_dir.join("pr-report.json"), "supervisor_failed")?;
-            write_skipped_report(&run_dir.join("review-report.json"), "supervisor_failed")?;
+            write_skipped_report(&mut artifact_writer, "pr-report.json", "supervisor_failed")?;
+            write_skipped_report(
+                &mut artifact_writer,
+                "review-report.json",
+                "supervisor_failed",
+            )?;
             attempts.push(attempt_summary);
             next_action = if supervisor.success {
                 "rerun with the trusted Codex runtime; fake supervisor evidence cannot be merged or published"
@@ -509,13 +575,62 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             break;
         }
 
-        let worktree = merge::find_agent_worktree(&WorktreeManager::new(&repo), &agent_id)?;
-        let validation_reports = run_validation_commands(&worktree.path, &plan)?;
+        let worktree_manager = WorktreeManager::new(&repo);
+        let worktree_lease = match acquire_autopilot_worktree_write_lease(
+            &worktree_manager,
+            &agent_id,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                write_failed_report(
+                    &mut artifact_writer,
+                    "pr-report.json",
+                    "worktree_lease_failed",
+                    &sanitize_text(&repo, &format!("{error:#}")),
+                )?;
+                write_skipped_report(
+                    &mut artifact_writer,
+                    "review-report.json",
+                    "worktree_lease_failed",
+                )?;
+                attempts.push(attempt_summary);
+                next_action = format!(
+                    "release the conflicting managed-worktree lease for '{agent_id}', then rerun autopilot"
+                );
+                break;
+            }
+        };
+        let validation_reports = match run_validation_commands(worktree_lease.path(), &plan) {
+            Ok(reports) => reports,
+            Err(error) => {
+                write_failed_report(
+                    &mut artifact_writer,
+                    "pr-report.json",
+                    "validation_execution_failed",
+                    &sanitize_text(&repo, &format!("{error:#}")),
+                )?;
+                write_skipped_report(
+                    &mut artifact_writer,
+                    "review-report.json",
+                    "validation_execution_failed",
+                )?;
+                attempt_summary.repair_reason = Some("validation execution failed".to_string());
+                attempts.push(attempt_summary);
+                next_action =
+                    "repair the validation runtime, then rerun autopilot before publication"
+                        .to_string();
+                break;
+            }
+        };
         last_validation = validation_summary(validation_reports.clone());
         attempt_summary.validation_status = last_validation.status;
         if last_validation.status == AutopilotValidationStatus::Failed {
-            write_skipped_report(&run_dir.join("pr-report.json"), "validation_failed")?;
-            write_skipped_report(&run_dir.join("review-report.json"), "validation_failed")?;
+            write_skipped_report(&mut artifact_writer, "pr-report.json", "validation_failed")?;
+            write_skipped_report(
+                &mut artifact_writer,
+                "review-report.json",
+                "validation_failed",
+            )?;
             if attempt < max_attempts {
                 let reason = validation_repair_reason(&last_validation);
                 attempt_summary.repair_reason = Some(reason.clone());
@@ -530,21 +645,48 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             break;
         }
 
-        let pr_report = publication::publish_pr(PrPublicationOptions {
-            repo: repo.clone(),
-            agent_id: agent_id.clone(),
-            claimed_paths: plan.assigned_paths.clone(),
-            validations: validation_reports,
-            forge: plan.forge_mode.into_publication_forge(),
-            draft: plan.publish_mode == AutopilotPublishMode::DraftOnly,
-        })?;
+        let pr_report = match publish_pr_holding_write_lease(
+            &worktree_lease,
+            PrPublicationOptions {
+                repo: repo.clone(),
+                agent_id: agent_id.clone(),
+                claimed_paths: plan.assigned_paths.clone(),
+                validations: validation_reports,
+                forge: plan.forge_mode.into_publication_forge(),
+                draft: plan.publish_mode == AutopilotPublishMode::DraftOnly,
+            },
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                write_failed_report(
+                    &mut artifact_writer,
+                    "pr-report.json",
+                    "publication_failed",
+                    &sanitize_text(&repo, &format!("{error:#}")),
+                )?;
+                write_skipped_report(
+                    &mut artifact_writer,
+                    "review-report.json",
+                    "publication_failed",
+                )?;
+                attempts.push(attempt_summary);
+                next_action =
+                    "inspect the publication failure, reconcile any durable receipt, and rerun"
+                        .to_string();
+                break;
+            }
+        };
         let sanitized_pr = sanitize_pr_report(&pr_report);
         attempt_summary.pr_status = Some(sanitized_pr.status.clone());
-        write_json_file(&run_dir.join("pr-report.json"), &sanitized_pr)?;
+        write_private_json(&mut artifact_writer, "pr-report.json", &sanitized_pr)?;
         last_pr = Some(sanitized_pr);
 
         if pr_report.status == PrPublicationStatus::Blocked {
-            write_skipped_report(&run_dir.join("review-report.json"), "pr_safety_blocked")?;
+            write_skipped_report(
+                &mut artifact_writer,
+                "review-report.json",
+                "pr_safety_blocked",
+            )?;
             attempts.push(attempt_summary);
             next_action =
                 "resolve PR safety blockers before review; no automatic merge was performed"
@@ -552,7 +694,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             break;
         }
 
-        let review_report = review::review_pr(ReviewPrOptions {
+        let review_report = match review::review_pr(ReviewPrOptions {
             repo: repo.clone(),
             target: pr_report
                 .pr_url
@@ -564,10 +706,25 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             diff_summary: review::diff_summary_from_text(
                 &pr_report.preview.candidate.diff.summary.text,
             ),
-        })?;
+        }) {
+            Ok(report) => report,
+            Err(error) => {
+                write_failed_report(
+                    &mut artifact_writer,
+                    "review-report.json",
+                    "review_failed",
+                    &sanitize_text(&repo, &format!("{error:#}")),
+                )?;
+                attempts.push(attempt_summary);
+                next_action =
+                    "repair the independent reviewer runtime, then rerun before manual merge"
+                        .to_string();
+                break;
+            }
+        };
         attempt_summary.review_status = Some(review_report.status);
         attempt_summary.blocking_findings = review_report.blocking_finding_count;
-        write_json_file(&run_dir.join("review-report.json"), &review_report)?;
+        write_private_json(&mut artifact_writer, "review-report.json", &review_report)?;
         last_review = Some(review_report.clone());
 
         if review_report.blocking_finding_count > 0 {
@@ -590,6 +747,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
         next_action =
             "human reviews the draft pull request and merges manually; autopilot never auto-merges"
                 .to_string();
+        drop(worktree_lease);
         break;
     }
 
@@ -609,41 +767,46 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
         next_action: &next_action,
         auto_merge_requested: plan.auto_merge,
     });
-    write_json_file(&run_dir.join("final-report.json"), &report)?;
+    write_private_json(&mut artifact_writer, "final-report.json", &report)?;
+    let publish_requested = report.success && real_runtime_requested;
+    artifact_writer.finalize("final-report.json", publish_requested)?;
     Ok(report)
 }
 
 pub fn autopilot_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<AutopilotStatusReport> {
     let repo = discover_repo_root(repo.as_ref())?;
-    let run_dir = autopilot_run_dir(&repo, &run_id);
-    let final_path = run_dir.join("final-report.json");
-    let final_report = if final_path.exists() {
-        Some(read_json_value(&final_path)?)
-    } else {
-        None
+    let (artifacts, final_report) = match autopilot_artifact_run_state(&repo, &run_id)? {
+        ArtifactRunState::Missing => (empty_artifact_status(), None),
+        ArtifactRunState::Active(run_dir) => (unfinalized_artifact_status(&run_dir)?, None),
+        ArtifactRunState::Finalized(reader) => {
+            let final_report = Some(read_artifact_json(&reader, "final-report.json")?);
+            (artifact_status(&reader), final_report)
+        }
     };
     Ok(AutopilotStatusReport {
         run_dir: public_run_dir().join(run_id.as_str()),
         run_id,
-        artifacts: artifact_status(&run_dir),
+        artifacts,
         final_report,
     })
 }
 
 pub fn collect_autopilot_run(repo: impl AsRef<Path>, run_id: RunId) -> Result<Value> {
     let repo = discover_repo_root(repo.as_ref())?;
-    let run_dir = autopilot_run_dir(&repo, &run_id);
-    let final_path = run_dir.join("final-report.json");
-    if final_path.exists() {
-        return read_json_value(&final_path);
+    match autopilot_artifact_run_state(&repo, &run_id)? {
+        ArtifactRunState::Missing => Ok(serde_json::json!({
+            "version": AUTOPILOT_SCHEMA_VERSION,
+            "run_id": run_id,
+            "status": "missing",
+            "success": false,
+            "next_action": "rerun maco autopilot run for this run id"
+        })),
+        ArtifactRunState::Active(_) => bail!(
+            "autopilot run '{}' is active or unfinalized; collect requires a verified finalization marker",
+            run_id.as_str()
+        ),
+        ArtifactRunState::Finalized(reader) => read_artifact_json(&reader, "final-report.json"),
     }
-    Ok(json!({
-        "version": AUTOPILOT_SCHEMA_VERSION,
-        "run_id": run_id,
-        "status": "missing",
-        "success": false,
-        "next_action": "rerun maco autopilot run for this run id"
-    }))
 }
 
 fn validate_autopilot_plan(repo: &Path, mut plan: AutopilotPlan) -> Result<AutopilotPlan> {
@@ -888,6 +1051,28 @@ fn run_validation_commands(worktree: &Path, plan: &AutopilotPlan) -> Result<Vec<
     Ok(reports)
 }
 
+/// Publication mutates and repeatedly snapshots the selected worktree. The
+/// write lease is therefore an explicit argument even while the publication
+/// module migrates to its borrowed-authority entrypoint. The lease must remain
+/// live through publication, independent review, and final quiescence.
+fn publish_pr_holding_write_lease(
+    lease: &ManagedWorktreeWriteLease,
+    options: PrPublicationOptions,
+) -> Result<PrPublicationReport> {
+    publication::publish_pr_with_write_lease(options, lease)
+}
+
+fn acquire_autopilot_worktree_write_lease(
+    manager: &WorktreeManager,
+    agent_id: &str,
+) -> Result<ManagedWorktreeWriteLease> {
+    manager
+        .acquire_write_execution_lease(agent_id)
+        .with_context(|| {
+            format!("failed to acquire exclusive autopilot execution lease for '{agent_id}'")
+        })
+}
+
 fn run_validation_process(
     worktree: &Path,
     command_text: &str,
@@ -968,11 +1153,12 @@ fn summarize_validation_output(output: &CapturedBytes) -> String {
     output.summarize_chars(VALIDATION_OUTPUT_LIMIT).text
 }
 
-fn write_fake_codex(run_dir: &Path, plan: &AutopilotPlan, attempt: usize) -> Result<PathBuf> {
-    let runtime_dir = run_dir.join("runtime");
-    fs::create_dir_all(&runtime_dir)
-        .with_context(|| format!("failed to create runtime dir {}", runtime_dir.display()))?;
-    let path = runtime_dir.join(format!("fake-codex-attempt-{attempt}"));
+fn write_fake_codex(
+    writer: &mut ArtifactRunWriter,
+    plan: &AutopilotPlan,
+    attempt: usize,
+) -> Result<PathBuf> {
+    let relative = PathBuf::from("runtime").join(format!("fake-codex-attempt-{attempt}"));
     let paths_text = plan
         .assigned_paths
         .iter()
@@ -1125,8 +1311,12 @@ JSON
         paths_text = paths_text,
         attempt = attempt
     );
-    fs::write(&path, script)
-        .with_context(|| format!("failed to write fake codex {}", path.display()))?;
+    writer.write_bytes(
+        &relative,
+        script.as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    let path = writer.run_dir().join(&relative);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1340,25 +1530,125 @@ fn artifact_paths() -> AutopilotArtifactPaths {
     }
 }
 
-fn artifact_status(run_dir: &Path) -> AutopilotArtifactStatus {
+fn artifact_status(reader: &ArtifactRunReader) -> AutopilotArtifactStatus {
+    let contains = |path: &str| {
+        reader
+            .finalization()
+            .files
+            .iter()
+            .any(|record| record.path == Path::new(path))
+    };
     AutopilotArtifactStatus {
-        plan: run_dir.join("plan.json").exists(),
-        supervisor_report: run_dir.join("supervisor-report.json").exists(),
-        pr_report: run_dir.join("pr-report.json").exists(),
-        review_report: run_dir.join("review-report.json").exists(),
-        final_report: run_dir.join("final-report.json").exists(),
+        plan: contains("plan.json"),
+        supervisor_report: contains("supervisor-report.json"),
+        pr_report: contains("pr-report.json"),
+        review_report: contains("review-report.json"),
+        final_report: contains("final-report.json"),
     }
 }
 
-fn write_skipped_stage_reports(run_dir: &Path, reason: &str) -> Result<()> {
-    write_skipped_report(&run_dir.join("supervisor-report.json"), reason)?;
-    write_skipped_report(&run_dir.join("pr-report.json"), reason)?;
-    write_skipped_report(&run_dir.join("review-report.json"), reason)
+enum ArtifactRunState {
+    Missing,
+    Active(PathBuf),
+    Finalized(Box<ArtifactRunReader>),
 }
 
-fn write_skipped_report(path: &Path, reason: &str) -> Result<()> {
-    write_json_file(
-        path,
+fn autopilot_artifact_run_state(repo: &Path, run_id: &RunId) -> Result<ArtifactRunState> {
+    let Some(run_dir) =
+        verified_unfinalized_run_dir(repo, &[".maco", "autopilot", "runs", run_id.as_str()])?
+    else {
+        return Ok(ArtifactRunState::Missing);
+    };
+    if !known_regular_file_exists(&run_dir, ARTIFACT_FINAL_MARKER)? {
+        return Ok(ArtifactRunState::Active(run_dir));
+    }
+    let reader =
+        ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, run_id).with_context(|| {
+            format!(
+                "autopilot run '{}' has corrupt or unverifiable finalized artifacts",
+                run_id.as_str()
+            )
+        })?;
+    Ok(ArtifactRunState::Finalized(Box::new(reader)))
+}
+
+fn verified_unfinalized_run_dir(repo: &Path, components: &[&str]) -> Result<Option<PathBuf>> {
+    let mut current = repo.to_path_buf();
+    for component in components {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect artifact directory {}", current.display())
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "artifact directory is not a direct non-link directory: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(Some(current))
+}
+
+fn known_regular_file_exists(run_dir: &Path, name: &str) -> Result<bool> {
+    let path = run_dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!(
+                "artifact entry is not a direct regular file: {}",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect artifact file {}", path.display())),
+    }
+}
+
+fn empty_artifact_status() -> AutopilotArtifactStatus {
+    AutopilotArtifactStatus {
+        plan: false,
+        supervisor_report: false,
+        pr_report: false,
+        review_report: false,
+        final_report: false,
+    }
+}
+
+fn unfinalized_artifact_status(run_dir: &Path) -> Result<AutopilotArtifactStatus> {
+    let status = AutopilotArtifactStatus {
+        plan: known_regular_file_exists(run_dir, "plan.json")?,
+        supervisor_report: known_regular_file_exists(run_dir, "supervisor-report.json")?,
+        pr_report: known_regular_file_exists(run_dir, "pr-report.json")?,
+        review_report: known_regular_file_exists(run_dir, "review-report.json")?,
+        final_report: known_regular_file_exists(run_dir, "final-report.json")?,
+    };
+    if known_regular_file_exists(run_dir, ARTIFACT_FINAL_MARKER)? {
+        bail!("artifact run finalized while active status was being inspected; retry status");
+    }
+    Ok(status)
+}
+
+fn write_skipped_stage_reports(writer: &mut ArtifactRunWriter, reason: &str) -> Result<()> {
+    write_skipped_report(writer, "supervisor-report.json", reason)?;
+    write_skipped_report(writer, "pr-report.json", reason)?;
+    write_skipped_report(writer, "review-report.json", reason)
+}
+
+fn write_skipped_report(
+    writer: &mut ArtifactRunWriter,
+    relative: impl AsRef<Path>,
+    reason: &str,
+) -> Result<()> {
+    write_private_json(
+        writer,
+        relative,
         &SkippedStageReport {
             status: "skipped".to_string(),
             reason: reason.to_string(),
@@ -1366,24 +1656,37 @@ fn write_skipped_report(path: &Path, reason: &str) -> Result<()> {
     )
 }
 
-fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("path must have a parent directory: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    let mut file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, value)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish {}", path.display()))
+fn write_failed_report(
+    writer: &mut ArtifactRunWriter,
+    relative: impl AsRef<Path>,
+    reason: &str,
+    message: &str,
+) -> Result<()> {
+    write_private_json(
+        writer,
+        relative,
+        &FailedStageReport {
+            status: "failed".to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+        },
+    )
 }
 
-fn read_json_value(path: &Path) -> Result<Value> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+fn write_private_json<T: Serialize>(
+    writer: &mut ArtifactRunWriter,
+    relative: impl AsRef<Path>,
+    value: &T,
+) -> Result<()> {
+    writer.write_json(relative, value, ArtifactFileDisposition::PrivateEvidence)?;
+    Ok(())
+}
+
+fn read_artifact_json(reader: &ArtifactRunReader, relative: impl AsRef<Path>) -> Result<Value> {
+    let relative = relative.as_ref();
+    let contents = reader.read(relative)?;
+    serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse finalized artifact {}", relative.display()))
 }
 
 fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
@@ -1460,10 +1763,6 @@ fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
     repo.workdir()
         .map(Path::to_path_buf)
         .context("repository command requires a non-bare repository")
-}
-
-fn autopilot_run_dir(repo: &Path, run_id: &RunId) -> PathBuf {
-    repo.join(public_run_dir()).join(run_id.as_str())
 }
 
 fn public_run_dir() -> PathBuf {
@@ -1583,6 +1882,38 @@ fn finding_severity_label(severity: FindingSeverity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::WorktreeCreateOptions;
+    use std::{sync::mpsc, thread, time::Duration};
+
+    fn create_managed_worktree_fixture(root: &Path, agent_id: &str) -> (PathBuf, WorktreeManager) {
+        let repo_path = root.join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+        let repo = Repository::open(&repo_path).expect("open repository");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        drop(tree);
+        drop(repo);
+        let manager = WorktreeManager::new(&repo_path);
+        manager
+            .create(WorktreeCreateOptions {
+                agent_id: agent_id.to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create managed worktree");
+        (repo_path, manager)
+    }
 
     #[test]
     fn validate_autopilot_plan_refuses_empty_path_proposal() {
@@ -1615,5 +1946,57 @@ mod tests {
 
         let error = result.expect_err("empty proposal must be refused");
         assert!(error.to_string().contains("assigned paths are empty"));
+    }
+
+    #[test]
+    fn injected_autopilot_lease_barrier_blocks_removal_until_quiescence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_repo, manager) = create_managed_worktree_fixture(temp.path(), "barrier-agent");
+        let worker_manager = manager.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let lease = acquire_autopilot_worktree_write_lease(&worker_manager, "barrier-agent")
+                .expect("acquire autopilot write lease");
+            ready_tx.send(()).expect("publish lease barrier");
+            release_rx.recv().expect("release lease barrier");
+            drop(lease);
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("autopilot write lease barrier became ready");
+        let removal_error = manager
+            .remove("barrier-agent", true, false)
+            .expect_err("active autopilot write lease must exclude removal");
+        assert!(removal_error
+            .to_string()
+            .contains("active cooperative execution lease"));
+        let second_writer = acquire_autopilot_worktree_write_lease(&manager, "barrier-agent")
+            .expect_err("active autopilot writer must exclude another writer");
+        assert!(second_writer.to_string().contains("exclusive write lease"));
+
+        release_tx.send(()).expect("release autopilot writer");
+        worker.join().expect("join lease barrier");
+        manager
+            .remove("barrier-agent", true, false)
+            .expect("removal succeeds after final quiescence");
+    }
+
+    #[test]
+    fn injected_autopilot_error_path_releases_write_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_repo, manager) = create_managed_worktree_fixture(temp.path(), "error-agent");
+        let injected_error = (|| -> Result<()> {
+            let _lease = acquire_autopilot_worktree_write_lease(&manager, "error-agent")?;
+            bail!("injected post-acquisition failure")
+        })();
+        assert!(injected_error
+            .expect_err("injected failure must escape")
+            .to_string()
+            .contains("injected post-acquisition failure"));
+        manager
+            .remove("error-agent", true, false)
+            .expect("error return drops autopilot write lease");
     }
 }

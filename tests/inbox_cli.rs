@@ -223,18 +223,23 @@ fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()
         .context("reuse message")?
         .contains("already exists"));
 
+    for finalized_id in ["aa-old", "zz-new"] {
+        let finalized = run_success_json(&[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            finalized_id,
+            "--dry-run",
+            "--max-items",
+            "1",
+            "--json",
+        ])?;
+        assert_eq!(finalized["status"], "dry_run");
+    }
     let old_dir = repo_path.join(".maco/inbox/runs/aa-old");
     let new_dir = repo_path.join(".maco/inbox/runs/zz-new");
-    fs::create_dir_all(&old_dir).context("create old run")?;
-    fs::create_dir_all(&new_dir).context("create new run")?;
-    write_json_file(
-        &old_dir.join("final-report.json"),
-        &json!({"status": "failed", "success": false}),
-    )?;
-    write_json_file(
-        &new_dir.join("final-report.json"),
-        &json!({"status": "succeeded", "success": true}),
-    )?;
 
     let latest = run_success_json(&[
         "inbox",
@@ -245,7 +250,7 @@ fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()
         "--json",
     ])?;
     assert_eq!(latest["run"]["run_id"], "zz-new");
-    assert_eq!(latest["run"]["final_report_status"], "succeeded");
+    assert_eq!(latest["run"]["final_report_status"], "dry_run");
 
     let prune = run_success_json(&[
         "inbox",
@@ -317,6 +322,142 @@ fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
     let serialized = serde_json::to_string(&(status, collected)).context("serialize")?;
     assert_public_json_is_sanitized(&serialized, &repo_path);
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn status_and_collect_fail_closed_across_absent_active_and_tampered_runs() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+
+    let missing = run_success_json(&[
+        "inbox",
+        "status",
+        "absent",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert!(missing["final_report"].is_null());
+    assert_eq!(missing["artifacts"]["scan_report"], false);
+    let missing_collect = run_failure_json(&[
+        "inbox",
+        "collect",
+        "absent",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(missing_collect["status"], "missing");
+
+    for run_id in [
+        "verified",
+        "report-tamper",
+        "hmac-tamper",
+        "marker-malformed",
+    ] {
+        let report = run_success_json(&[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            run_id,
+            "--dry-run",
+            "--max-items",
+            "1",
+            "--json",
+        ])?;
+        assert_eq!(report["status"], "dry_run");
+    }
+
+    let verified_dir = repo_path.join(".maco/inbox/runs/verified");
+    let marker: Value = serde_json::from_slice(
+        &fs::read(verified_dir.join(".maco-artifact-final.json")).context("read marker")?,
+    )
+    .context("parse marker")?;
+    assert_eq!(marker["publish_requested"], false);
+    assert_eq!(marker["publishable"], false);
+    assert!(marker["files"]
+        .as_array()
+        .context("marker files")?
+        .iter()
+        .all(|file| file["disposition"] == "private_evidence"));
+    let verified = run_success_json(&[
+        "inbox",
+        "status",
+        "verified",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(verified["final_report"]["status"], "dry_run");
+    assert_eq!(verified["artifacts"]["item_plan_count"], 1);
+
+    let active_dir = repo_path.join(".maco/inbox/runs/active");
+    fs::create_dir(&active_dir).context("create active run")?;
+    fs::set_permissions(&active_dir, fs::Permissions::from_mode(0o700))
+        .context("chmod active run")?;
+    write_json_file(
+        &active_dir.join("scan-report.json"),
+        &json!({"status": "active"}),
+    )?;
+    let active = run_success_json(&[
+        "inbox",
+        "status",
+        "active",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(active["artifacts"]["scan_report"], true);
+    assert_eq!(active["artifacts"]["item_plan_count"], 0);
+    assert!(active["final_report"].is_null());
+    let active_collect = run_failure_stderr(&[
+        "inbox",
+        "collect",
+        "active",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert!(active_collect.contains("active or unfinalized"));
+
+    write_json_file(
+        &repo_path.join(".maco/inbox/runs/report-tamper/final-report.json"),
+        &json!({"status": "succeeded", "success": true}),
+    )?;
+    assert_corrupt_inbox_status(&repo_path, "report-tamper")?;
+
+    let hmac_path = repo_path.join(".maco/inbox/runs/hmac-tamper/.maco-artifact-final.json");
+    let mut hmac_marker: Value =
+        serde_json::from_slice(&fs::read(&hmac_path)?).context("parse hmac marker")?;
+    hmac_marker["hmac_sha256"] = Value::String("00".repeat(32));
+    write_json_file(&hmac_path, &hmac_marker)?;
+    assert_corrupt_inbox_status(&repo_path, "hmac-tamper")?;
+
+    fs::write(
+        repo_path.join(".maco/inbox/runs/marker-malformed/.maco-artifact-final.json"),
+        "{not json\n",
+    )?;
+    assert_corrupt_inbox_status(&repo_path, "marker-malformed")?;
+
+    Ok(())
+}
+
+fn assert_corrupt_inbox_status(repo: &Path, run_id: &str) -> Result<()> {
+    let failure = run_failure_stderr(&[
+        "inbox",
+        "status",
+        run_id,
+        "--repo",
+        path_str(repo)?,
+        "--json",
+    ])?;
+    assert!(failure.contains("corrupt or unverifiable"));
     Ok(())
 }
 
@@ -2085,6 +2226,7 @@ fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Resu
         "# Smoke\n\nreal dirty change\n",
     )?;
     write_file(&repo_path.join(".maco/inbox/runs/old/state.json"), "{}\n")?;
+    make_inbox_artifact_root_private(&repo_path)?;
     write_file(&repo_path.join(".maco-cache/inbox/state.json"), "{}\n")?;
 
     let report = run_inbox_refusal(&repo_path, "dirty-primary")?;
@@ -2116,6 +2258,7 @@ fn maco_runtime_paths_do_not_self_block() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
     write_file(&repo_path.join(".maco/inbox/runs/old/state.json"), "{}\n")?;
+    make_inbox_artifact_root_private(&repo_path)?;
     write_file(&repo_path.join(".maco-cache/inbox/state.json"), "{}\n")?;
 
     let report = run_success_json(&[
@@ -2220,6 +2363,19 @@ fn run_inbox_refusal(repo: &Path, run_id: &str) -> Result<Value> {
         run_id,
         "--json",
     ])
+}
+
+fn make_inbox_artifact_root_private(repo: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            repo.join(".maco/inbox/runs"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .context("chmod inbox artifact root")?;
+    }
+    Ok(())
 }
 
 fn assert_refusal_kind(report: &Value, kind: &str) -> Result<()> {
@@ -2346,6 +2502,14 @@ fn run_success_json_in_dir_with_path(args: &[&str], cwd: &Path, path_dir: &Path)
 
 fn run_failure_json(args: &[&str]) -> Result<Value> {
     run_json_command(args, None, None, false)
+}
+
+fn run_failure_stderr(args: &[&str]) -> Result<String> {
+    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    if output.status.success() {
+        anyhow::bail!("maco command unexpectedly succeeded");
+    }
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 fn run_failure_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {

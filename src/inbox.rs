@@ -1,5 +1,7 @@
 use crate::{
-    artifacts::{self, RunArtifactFamily},
+    artifacts::{
+        self, ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,
+    },
     autopilot::{
         self, AutopilotForgeMode, AutopilotPlan, AutopilotPublishMode, AutopilotRunOptions,
         AutopilotTask, AutopilotValidationCommand,
@@ -34,6 +36,7 @@ const DEFAULT_BODY_LIMIT: usize = 12 * 1024;
 const GH_OUTPUT_LIMIT: usize = 512 * 1024;
 const GH_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMENT_BODY_LIMIT: usize = 6 * 1024;
+const ARTIFACT_FINAL_MARKER: &str = ".maco-artifact-final.json";
 
 #[derive(Debug, Clone)]
 pub struct InboxScanOptions {
@@ -823,18 +826,26 @@ fn run_inbox_with_overrides(
     mut overrides: InboxConfigOverrides,
 ) -> Result<InboxRunReport> {
     let repo = discover_repo_root(&options.repo)?;
-    let run_dir = inbox_run_dir(&repo, &options.run_id);
-    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &options.run_id)?;
-    fs::create_dir_all(&run_dir)
-        .with_context(|| format!("failed to create inbox run dir {}", run_dir.display()))?;
-    let artifacts = run_artifacts(&options.run_id);
     if options.max_items.is_some() {
         overrides.max_items = options.max_items;
     }
     if options.dry_run {
         overrides.action_policy = Some(InboxActionPolicy::DryRun);
     }
-    let scan = scan_inbox_with_overrides(
+    let loaded = load_config_with_config_overrides(&repo, overrides.clone())?;
+    let preflight_permission_mode =
+        effective_permission_mode(&loaded.config, options.github, options.permission_mode);
+    let preflight_action_policy =
+        effective_action_policy(loaded.config.action_policy, preflight_permission_mode);
+    let artifacts = run_artifacts(&options.run_id);
+    let mut artifact_writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Inbox,
+        options.run_id.clone(),
+        "inbox",
+    )?;
+    let run_dir = artifact_writer.run_dir().to_path_buf();
+    let scan = match scan_inbox_with_overrides(
         InboxScanOptions {
             repo: repo.clone(),
             github: options.github,
@@ -843,8 +854,49 @@ fn run_inbox_with_overrides(
             action_policy_override: None,
         },
         overrides.clone(),
-    )?;
-    write_json_file(&run_dir.join("scan-report.json"), &scan)?;
+    ) {
+        Ok(scan) => scan,
+        Err(error) => {
+            let message =
+                sanitize_public_text(&repo, &format!("{error:#}"), GH_DIAGNOSTIC_LIMIT).text;
+            write_private_artifact_json(
+                &mut artifact_writer,
+                "scan-report.json",
+                &json!({
+                    "version": INBOX_SCHEMA_VERSION,
+                    "status": "failed",
+                    "success": false,
+                    "message": message,
+                }),
+            )?;
+            write_private_artifact_json(
+                &mut artifact_writer,
+                "selected-items.json",
+                &Vec::<InboxItem>::new(),
+            )?;
+            let report = InboxRunReport {
+                version: INBOX_SCHEMA_VERSION,
+                run_id: options.run_id,
+                repo: public_repo_path(),
+                action_policy: preflight_action_policy,
+                permission_mode: preflight_permission_mode,
+                github_enabled: preflight_permission_mode.uses_github_intake(),
+                success: false,
+                status: InboxRunStatus::Failed,
+                refusals: Vec::new(),
+                artifacts,
+                selected_item_count: 0,
+                item_reports: Vec::new(),
+                auto_merge_performed: false,
+                next_action: "repair inbox intake, then rerun with the same bounded configuration"
+                    .to_string(),
+            };
+            write_private_artifact_json(&mut artifact_writer, "final-report.json", &report)?;
+            artifact_writer.finalize("final-report.json", false)?;
+            return Ok(report);
+        }
+    };
+    write_private_artifact_json(&mut artifact_writer, "scan-report.json", &scan)?;
 
     let selected_items = scan
         .items
@@ -852,7 +904,7 @@ fn run_inbox_with_overrides(
         .filter(|item| item.selected)
         .cloned()
         .collect::<Vec<_>>();
-    write_json_file(&run_dir.join("selected-items.json"), &selected_items)?;
+    write_private_artifact_json(&mut artifact_writer, "selected-items.json", &selected_items)?;
 
     if scan.refused {
         let report = InboxRunReport {
@@ -871,7 +923,8 @@ fn run_inbox_with_overrides(
             auto_merge_performed: false,
             next_action: "resolve inbox safety refusals, then rerun".to_string(),
         };
-        write_json_file(&run_dir.join("final-report.json"), &report)?;
+        write_private_artifact_json(&mut artifact_writer, "final-report.json", &report)?;
+        artifact_writer.finalize("final-report.json", false)?;
         return Ok(report);
     }
 
@@ -892,11 +945,12 @@ fn run_inbox_with_overrides(
             auto_merge_performed: false,
             next_action: "no safe non-duplicate inbox items were available".to_string(),
         };
-        write_json_file(&run_dir.join("final-report.json"), &report)?;
+        write_private_artifact_json(&mut artifact_writer, "final-report.json", &report)?;
+        artifact_writer.finalize("final-report.json", false)?;
         return Ok(report);
     }
 
-    let loaded = load_config_with_config_overrides(&repo, overrides)?;
+    let real_runtime_requested = options.codex_bin.is_some() || loaded.config.codex_bin.is_some();
     let action_policy = scan.action_policy;
     let permission_mode = scan.permission_mode;
     let item_context = InboxItemRunContext {
@@ -914,11 +968,14 @@ fn run_inbox_with_overrides(
     let mut item_reports = Vec::new();
     for (zero_index, item) in selected_items.iter().enumerate() {
         let item_index = zero_index.saturating_add(1);
-        let item_report = run_inbox_item(InboxItemRunInput {
-            context: &item_context,
-            item_index,
-            item,
-        })?;
+        let item_report = run_inbox_item(
+            &mut artifact_writer,
+            InboxItemRunInput {
+                context: &item_context,
+                item_index,
+                item,
+            },
+        )?;
         item_reports.push(item_report);
     }
 
@@ -952,40 +1009,47 @@ fn run_inbox_with_overrides(
             "inspect failed item reports and rerun after repair".to_string()
         },
     };
-    write_json_file(&run_dir.join("final-report.json"), &report)?;
+    write_private_artifact_json(&mut artifact_writer, "final-report.json", &report)?;
+    let publish_requested =
+        report.success && real_runtime_requested && permission_mode.publishes_real_branch_or_pr();
+    artifact_writer.finalize("final-report.json", publish_requested)?;
     Ok(report)
 }
 
 pub fn inbox_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<InboxStatusReport> {
     let repo = discover_repo_root(repo.as_ref())?;
-    let run_dir = inbox_run_dir(&repo, &run_id);
-    let final_path = run_dir.join("final-report.json");
-    let final_report = if final_path.exists() {
-        Some(read_json_value(&final_path)?)
-    } else {
-        None
+    let (artifacts, final_report) = match inbox_artifact_run_state(&repo, &run_id)? {
+        ArtifactRunState::Missing => (empty_artifact_status(), None),
+        ArtifactRunState::Active(run_dir) => (unfinalized_artifact_status(&run_dir)?, None),
+        ArtifactRunState::Finalized(reader) => {
+            let final_report = Some(read_artifact_json(&reader, "final-report.json")?);
+            (artifact_status(&reader), final_report)
+        }
     };
     Ok(InboxStatusReport {
         run_dir: public_run_dir().join(run_id.as_str()),
         run_id,
-        artifacts: artifact_status(&run_dir)?,
+        artifacts,
         final_report,
     })
 }
 
 pub fn collect_inbox_run(repo: impl AsRef<Path>, run_id: RunId) -> Result<Value> {
     let repo = discover_repo_root(repo.as_ref())?;
-    let final_path = inbox_run_dir(&repo, &run_id).join("final-report.json");
-    if final_path.exists() {
-        return read_json_value(&final_path);
+    match inbox_artifact_run_state(&repo, &run_id)? {
+        ArtifactRunState::Missing => Ok(json!({
+            "version": INBOX_SCHEMA_VERSION,
+            "run_id": run_id,
+            "status": "missing",
+            "success": false,
+            "next_action": "rerun maco inbox run for this run id"
+        })),
+        ArtifactRunState::Active(_) => bail!(
+            "inbox run '{}' is active or unfinalized; collect requires a verified finalization marker",
+            run_id.as_str()
+        ),
+        ArtifactRunState::Finalized(reader) => read_artifact_json(&reader, "final-report.json"),
     }
-    Ok(json!({
-        "version": INBOX_SCHEMA_VERSION,
-        "run_id": run_id,
-        "status": "missing",
-        "success": false,
-        "next_action": "rerun maco inbox run for this run id"
-    }))
 }
 
 pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
@@ -1661,7 +1725,10 @@ struct InboxItemRunInput<'a> {
     item: &'a InboxItem,
 }
 
-fn run_inbox_item(input: InboxItemRunInput<'_>) -> Result<InboxItemRunReport> {
+fn run_inbox_item(
+    writer: &mut ArtifactRunWriter,
+    input: InboxItemRunInput<'_>,
+) -> Result<InboxItemRunReport> {
     let context = input.context;
     let item_index = input.item_index;
     let item = input.item;
@@ -1671,20 +1738,19 @@ fn run_inbox_item(input: InboxItemRunInput<'_>) -> Result<InboxItemRunReport> {
     let permission_mode = context.permission_mode;
     let config = context.config;
     let plan = autopilot_plan_for_item(item, config, permission_mode)?;
-    let plan_path = context.run_dir.join(format!("item-{item_index}-plan.json"));
-    write_json_file(&plan_path, &plan)?;
-    let autopilot_report_path = context
-        .run_dir
-        .join(format!("item-{item_index}-autopilot-report.json"));
-    let github_report_path = context
-        .run_dir
-        .join(format!("item-{item_index}-github-report.json"));
+    let plan_relative = PathBuf::from(format!("item-{item_index}-plan.json"));
+    write_private_artifact_json(writer, &plan_relative, &plan)?;
+    let plan_path = context.run_dir.join(&plan_relative);
+    let autopilot_report_relative =
+        PathBuf::from(format!("item-{item_index}-autopilot-report.json"));
+    let github_report_relative = PathBuf::from(format!("item-{item_index}-github-report.json"));
     let autopilot_run_id = RunId::new(format!("{}-item-{item_index}", run_id.as_str()))?;
 
     if action_policy == InboxActionPolicy::DryRun || !permission_mode.launches_autopilot() {
         let planned_only = action_policy != InboxActionPolicy::DryRun;
-        write_json_file(
-            &autopilot_report_path,
+        write_private_artifact_json(
+            writer,
+            &autopilot_report_relative,
             &json!({
                 "status": "skipped",
                 "success": true,
@@ -1708,7 +1774,7 @@ fn run_inbox_item(input: InboxItemRunInput<'_>) -> Result<InboxItemRunReport> {
                 "dry_run action policy does not comment or publish".to_string()
             }),
         };
-        write_json_file(&github_report_path, &github_report)?;
+        write_private_artifact_json(writer, &github_report_relative, &github_report)?;
         return Ok(InboxItemRunReport {
             item_index,
             item_id: item.item_id.clone(),
@@ -1752,13 +1818,14 @@ fn run_inbox_item(input: InboxItemRunInput<'_>) -> Result<InboxItemRunReport> {
         Ok(report) => {
             let success = report.success;
             let message = report.next_action.clone();
-            write_json_file(&autopilot_report_path, &report)?;
+            write_private_artifact_json(writer, &autopilot_report_relative, &report)?;
             (success, Some(message))
         }
         Err(error) => {
             let message = sanitize_public_text(repo, &error.to_string(), GH_DIAGNOSTIC_LIMIT).text;
-            write_json_file(
-                &autopilot_report_path,
+            write_private_artifact_json(
+                writer,
+                &autopilot_report_relative,
                 &json!({
                     "status": "failed",
                     "success": false,
@@ -1781,7 +1848,7 @@ fn run_inbox_item(input: InboxItemRunInput<'_>) -> Result<InboxItemRunReport> {
         autopilot_success,
         autopilot_message,
     );
-    write_json_file(&github_report_path, &github_report)?;
+    write_private_artifact_json(writer, &github_report_relative, &github_report)?;
     let success = autopilot_success && github_report.success;
     Ok(InboxItemRunReport {
         item_index,
@@ -2770,46 +2837,42 @@ fn duplicate_result(key: &str, duplicates: &BTreeMap<String, String>) -> Duplica
 }
 
 fn load_duplicate_keys(repo: &Path) -> Result<BTreeMap<String, String>> {
-    let runs_dir = repo.join(public_run_dir());
     let mut duplicates = BTreeMap::new();
-    let entries = match fs::read_dir(&runs_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(duplicates),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read inbox runs {}", runs_dir.display()))
-        }
-    };
-    for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read {}", runs_dir.display()))?;
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
-        if !file_type.is_dir() {
+    let list = artifacts::list_runs(repo, RunArtifactFamily::Inbox)?;
+    for run in list.runs {
+        if !run.finalized {
             continue;
         }
-        let run_id = entry.file_name().to_string_lossy().into_owned();
-        let final_path = entry.path().join("final-report.json");
-        if final_path.exists() {
-            let final_report = read_json_value(&final_path)?;
-            let completed_successfully = final_report
-                .get("success")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let status = final_report.get("status").and_then(Value::as_str);
-            if !completed_successfully || matches!(status, Some("dry_run" | "refused")) {
-                continue;
-            }
-        }
-        let selected_path = entry.path().join("selected-items.json");
-        if !selected_path.exists() {
+        let run_id = RunId::new(&run.run_id)?;
+        let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Inbox, &run_id)
+            .with_context(|| {
+                format!(
+                    "finalized inbox run '{}' changed during duplicate scan",
+                    run.run_id
+                )
+            })?;
+        let final_report = read_artifact_json(&reader, "final-report.json")?;
+        let completed_successfully = final_report
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let status = final_report.get("status").and_then(Value::as_str);
+        if !completed_successfully || matches!(status, Some("dry_run" | "refused")) {
             continue;
         }
-        let value = read_json_value(&selected_path)?;
+        let selected = reader.read("selected-items.json")?;
+        let value: Value = serde_json::from_slice(&selected).with_context(|| {
+            format!(
+                "failed to parse finalized selected-items.json for inbox run '{}'",
+                run.run_id
+            )
+        })?;
         if let Some(items) = value.as_array() {
             for item in items {
                 if let Some(key) = item["source_key"].as_str() {
-                    duplicates.entry(key.to_string()).or_insert(run_id.clone());
+                    duplicates
+                        .entry(key.to_string())
+                        .or_insert(run.run_id.clone());
                 }
             }
         }
@@ -2868,34 +2931,129 @@ fn github_repository_arg(config: &InboxConfig) -> Option<String> {
     }
 }
 
-fn artifact_status(run_dir: &Path) -> Result<InboxArtifactStatus> {
+fn artifact_status(reader: &ArtifactRunReader) -> InboxArtifactStatus {
     let mut item_plan_count = 0usize;
     let mut item_autopilot_report_count = 0usize;
     let mut item_github_report_count = 0usize;
-    if run_dir.exists() {
-        for entry in fs::read_dir(run_dir)
-            .with_context(|| format!("failed to read inbox run dir {}", run_dir.display()))?
-        {
-            let entry =
-                entry.with_context(|| format!("failed to inspect {}", run_dir.display()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("item-") && name.ends_with("-plan.json") {
-                item_plan_count = item_plan_count.saturating_add(1);
-            } else if name.starts_with("item-") && name.ends_with("-autopilot-report.json") {
-                item_autopilot_report_count = item_autopilot_report_count.saturating_add(1);
-            } else if name.starts_with("item-") && name.ends_with("-github-report.json") {
-                item_github_report_count = item_github_report_count.saturating_add(1);
-            }
+    let contains = |path: &str| {
+        reader
+            .finalization()
+            .files
+            .iter()
+            .any(|record| record.path == Path::new(path))
+    };
+    for record in &reader.finalization().files {
+        let Some(name) = record.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("item-") && name.ends_with("-plan.json") {
+            item_plan_count = item_plan_count.saturating_add(1);
+        } else if name.starts_with("item-") && name.ends_with("-autopilot-report.json") {
+            item_autopilot_report_count = item_autopilot_report_count.saturating_add(1);
+        } else if name.starts_with("item-") && name.ends_with("-github-report.json") {
+            item_github_report_count = item_github_report_count.saturating_add(1);
         }
     }
-    Ok(InboxArtifactStatus {
-        scan_report: run_dir.join("scan-report.json").exists(),
-        selected_items: run_dir.join("selected-items.json").exists(),
-        final_report: run_dir.join("final-report.json").exists(),
+    InboxArtifactStatus {
+        scan_report: contains("scan-report.json"),
+        selected_items: contains("selected-items.json"),
+        final_report: contains("final-report.json"),
         item_plan_count,
         item_autopilot_report_count,
         item_github_report_count,
-    })
+    }
+}
+
+enum ArtifactRunState {
+    Missing,
+    Active(PathBuf),
+    Finalized(Box<ArtifactRunReader>),
+}
+
+fn inbox_artifact_run_state(repo: &Path, run_id: &RunId) -> Result<ArtifactRunState> {
+    let Some(run_dir) =
+        verified_unfinalized_run_dir(repo, &[".maco", "inbox", "runs", run_id.as_str()])?
+    else {
+        return Ok(ArtifactRunState::Missing);
+    };
+    if !known_regular_file_exists(&run_dir, ARTIFACT_FINAL_MARKER)? {
+        return Ok(ArtifactRunState::Active(run_dir));
+    }
+    let reader =
+        ArtifactRunReader::open(repo, RunArtifactFamily::Inbox, run_id).with_context(|| {
+            format!(
+                "inbox run '{}' has corrupt or unverifiable finalized artifacts",
+                run_id.as_str()
+            )
+        })?;
+    Ok(ArtifactRunState::Finalized(Box::new(reader)))
+}
+
+fn verified_unfinalized_run_dir(repo: &Path, components: &[&str]) -> Result<Option<PathBuf>> {
+    let mut current = repo.to_path_buf();
+    for component in components {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect artifact directory {}", current.display())
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "artifact directory is not a direct non-link directory: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(Some(current))
+}
+
+fn known_regular_file_exists(run_dir: &Path, name: &str) -> Result<bool> {
+    let path = run_dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!(
+                "artifact entry is not a direct regular file: {}",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect artifact file {}", path.display())),
+    }
+}
+
+fn empty_artifact_status() -> InboxArtifactStatus {
+    InboxArtifactStatus {
+        scan_report: false,
+        selected_items: false,
+        final_report: false,
+        item_plan_count: 0,
+        item_autopilot_report_count: 0,
+        item_github_report_count: 0,
+    }
+}
+
+fn unfinalized_artifact_status(run_dir: &Path) -> Result<InboxArtifactStatus> {
+    let status = InboxArtifactStatus {
+        scan_report: known_regular_file_exists(run_dir, "scan-report.json")?,
+        selected_items: known_regular_file_exists(run_dir, "selected-items.json")?,
+        final_report: known_regular_file_exists(run_dir, "final-report.json")?,
+        // Per-item names are not a bounded known set until the authenticated
+        // manifest exists. Do not enumerate an unfinalized child-writable tree.
+        item_plan_count: 0,
+        item_autopilot_report_count: 0,
+        item_github_report_count: 0,
+    };
+    if known_regular_file_exists(run_dir, ARTIFACT_FINAL_MARKER)? {
+        bail!("artifact run finalized while active status was being inspected; retry status");
+    }
+    Ok(status)
 }
 
 fn run_artifacts(run_id: &RunId) -> InboxRunArtifacts {
@@ -2921,10 +3079,20 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("failed to finish {}", path.display()))
 }
 
-fn read_json_value(path: &Path) -> Result<Value> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+fn write_private_artifact_json<T: Serialize>(
+    writer: &mut ArtifactRunWriter,
+    relative: impl AsRef<Path>,
+    value: &T,
+) -> Result<()> {
+    writer.write_json(relative, value, ArtifactFileDisposition::PrivateEvidence)?;
+    Ok(())
+}
+
+fn read_artifact_json(reader: &ArtifactRunReader, relative: impl AsRef<Path>) -> Result<Value> {
+    let relative = relative.as_ref();
+    let contents = reader.read(relative)?;
+    serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse finalized artifact {}", relative.display()))
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
@@ -2933,10 +3101,6 @@ fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
     repo.workdir()
         .map(Path::to_path_buf)
         .context("repository command requires a non-bare repository")
-}
-
-fn inbox_run_dir(repo: &Path, run_id: &RunId) -> PathBuf {
-    repo.join(public_run_dir()).join(run_id.as_str())
 }
 
 fn public_run_dir() -> PathBuf {
