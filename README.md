@@ -447,8 +447,10 @@ contiguous, previous-MAC-linked records plus an authenticated durable head.
 This detects mutation, truncation, duplication, and reordering relative to the
 current authenticated head. The guarantee depends on the owner-private state
 root remaining secret and being hidden from child processes; without an
-external monotonic anchor it does not claim to detect restoration of an entire
-older valid key, journal, and head snapshot by an attacker who obtained them.
+external monotonic anchor it cannot detect rollback to an older coherent
+record prefix and matching authenticated head under the same key, nor
+restoration of an entire older valid key, journal, and head snapshot by an
+attacker who obtained them.
 
 Resume also requires the filename, repository, primary HEAD, plan snapshot, and
 worktree bindings to match. A `command_started` record without a durable

@@ -1,9 +1,14 @@
 use crate::{
     artifacts::{
-        repository_auth_writer, repository_authenticator,
+        repository_auth_writer, repository_authenticator_key_only,
         state_auth::{
             sensitive_state_root, AuthenticationDomain, AuthenticationTag, RepositoryAuthenticator,
         },
+        validate_repository_authenticated_state,
+    },
+    checkpoint_wire::{
+        decode_agent_checkpoint, decode_run_checkpoint, encode_agent_checkpoint,
+        encode_run_checkpoint, LosslessPath,
     },
     merge::capture_worktree_diff_from_commit,
     process_runner::{
@@ -56,6 +61,18 @@ const COMBINED_CANDIDATE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE: usize = 128;
 const PLAN_MAX_TOTAL_VALIDATION_COMMANDS: usize = 4 * 1024;
 const PLAN_MAX_DEPENDENCY_EDGES: usize = 4 * 1024;
+const PLAN_MAX_BYTES: usize = 4 * 1024 * 1024;
+const PLAN_MAX_COMMAND_BYTES: usize = 1024 * 1024;
+const PLAN_MAX_STRING_BYTES: usize = 256 * 1024;
+const PLAN_MAX_ID_BYTES: usize = 256;
+const PLAN_MAX_ENV_KEY_BYTES: usize = 1024;
+const PLAN_MAX_ENV_ENTRIES_PER_SCOPE: usize = 1024;
+const PLAN_MAX_TOTAL_ENV_ENTRIES: usize = 16 * 1024;
+const PLAN_MAX_TOTAL_PATHS: usize = 16 * 1024;
+const PLAN_MAX_PATH_BYTES: usize = 4 * 1024;
+const PLAN_MAX_PATH_COMPONENTS: usize = 256;
+const PLAN_MAX_TOTAL_SEMANTIC_ITEMS: usize = 16 * 1024;
+const PLAN_MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const CHECKPOINT_REFERENCE_DOMAIN: AuthenticationDomain =
     AuthenticationDomain::new(b"MACO\0orchestration-checkpoint-reference\0v3\0");
 const CHECKPOINT_SNAPSHOT_PHASE_PREFIX: &str = "snapshot_";
@@ -248,7 +265,7 @@ pub struct RunCheckpoint {
 #[serde(deny_unknown_fields)]
 struct AuthenticatedCheckpointReference {
     version: u32,
-    repository_hint: PathBuf,
+    repository_hint: LosslessPath,
     journal: JournalIdentity,
     mac: AuthenticationTag,
 }
@@ -256,7 +273,7 @@ struct AuthenticatedCheckpointReference {
 #[derive(Serialize)]
 struct CheckpointReferenceMacPayload<'a> {
     version: u32,
-    repository_hint: &'a Path,
+    repository_hint: &'a LosslessPath,
     journal: &'a JournalIdentity,
 }
 
@@ -605,12 +622,262 @@ struct RawValidationCommandDetails {
 
 pub fn load_plan(path: impl AsRef<Path>) -> Result<OrchestrationPlan> {
     let path = path.as_ref();
-    let contents = fs::read_to_string(path)
+    let contents = BoundedRegularReader::read_tree_no_follow(path, PLAN_MAX_BYTES as u64)
         .with_context(|| format!("failed to read orchestration plan {}", path.display()))?;
-    let raw: RawPlan = serde_json::from_str(&contents)
+    let raw: RawPlan = serde_json::from_slice(&contents)
         .with_context(|| format!("failed to parse orchestration plan {}", path.display()))?;
-
+    validate_raw_plan_bounds(&raw)?;
     validate_plan(raw)
+}
+
+fn validate_raw_plan_bounds(raw: &RawPlan) -> Result<()> {
+    if raw.agents.len() > COMBINED_CANDIDATE_MAX_PATCHES {
+        bail!(
+            "orchestration plan exceeds the configured {} agent limit",
+            COMBINED_CANDIDATE_MAX_PATCHES
+        );
+    }
+    validate_bounded_timeout(raw.default_timeout_seconds, "default timeout")?;
+
+    let mut total_string_bytes = 0_usize;
+    let mut total_paths = 0_usize;
+    let mut total_env_entries = 0_usize;
+    let mut total_semantic_items = 0_usize;
+    let mut total_dependency_edges = 0_usize;
+    let mut total_validation_commands = raw.repo_validation_commands.len();
+    if total_validation_commands > PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE {
+        bail!(
+            "repo validation exceeds the configured {} command limit",
+            PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE
+        );
+    }
+    for command in &raw.repo_validation_commands {
+        validate_raw_validation_bounds(
+            command,
+            &mut total_string_bytes,
+            &mut total_paths,
+            &mut total_env_entries,
+        )?;
+    }
+
+    for agent in &raw.agents {
+        if agent.validation_commands.len() > PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE {
+            bail!(
+                "agent validation exceeds the configured {} command limit",
+                PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE
+            );
+        }
+        total_validation_commands = total_validation_commands
+            .checked_add(agent.validation_commands.len())
+            .context("orchestration validation command count overflowed")?;
+        account_plan_string(
+            &mut total_string_bytes,
+            &agent.id,
+            PLAN_MAX_ID_BYTES,
+            "agent id",
+        )?;
+        account_plan_string(
+            &mut total_string_bytes,
+            &agent.command,
+            PLAN_MAX_COMMAND_BYTES,
+            "agent command",
+        )?;
+        total_paths = total_paths
+            .checked_add(agent.paths.len())
+            .context("orchestration plan path count overflowed")?;
+        if let Some(path) = &agent.working_directory {
+            total_paths = total_paths
+                .checked_add(1)
+                .context("orchestration plan path count overflowed")?;
+            validate_bounded_plan_path(path, "agent working_directory")?;
+        }
+        for path in &agent.paths {
+            validate_bounded_plan_path(path, "agent path")?;
+        }
+        total_semantic_items = total_semantic_items
+            .checked_add(agent.semantic_symbols.len())
+            .and_then(|total| total.checked_add(agent.semantic_modules.len()))
+            .context("orchestration semantic item count overflowed")?;
+        for item in agent
+            .semantic_symbols
+            .iter()
+            .chain(agent.semantic_modules.iter())
+        {
+            account_plan_string(
+                &mut total_string_bytes,
+                item,
+                PLAN_MAX_STRING_BYTES,
+                "semantic item",
+            )?;
+        }
+        total_dependency_edges = total_dependency_edges
+            .checked_add(agent.depends_on.len())
+            .context("orchestration dependency edge count overflowed")?;
+        for dependency in &agent.depends_on {
+            account_plan_string(
+                &mut total_string_bytes,
+                dependency,
+                PLAN_MAX_ID_BYTES,
+                "dependency id",
+            )?;
+        }
+        validate_bounded_env(&agent.env, &mut total_string_bytes, &mut total_env_entries)?;
+        validate_bounded_timeout(agent.timeout_seconds, "agent timeout")?;
+        for command in &agent.validation_commands {
+            validate_raw_validation_bounds(
+                command,
+                &mut total_string_bytes,
+                &mut total_paths,
+                &mut total_env_entries,
+            )?;
+        }
+    }
+
+    if total_paths > PLAN_MAX_TOTAL_PATHS {
+        bail!(
+            "orchestration plan exceeds the configured {} total path limit",
+            PLAN_MAX_TOTAL_PATHS
+        );
+    }
+    if total_env_entries > PLAN_MAX_TOTAL_ENV_ENTRIES {
+        bail!(
+            "orchestration plan exceeds the configured {} total environment-entry limit",
+            PLAN_MAX_TOTAL_ENV_ENTRIES
+        );
+    }
+    if total_semantic_items > PLAN_MAX_TOTAL_SEMANTIC_ITEMS {
+        bail!(
+            "orchestration plan exceeds the configured {} total semantic-item limit",
+            PLAN_MAX_TOTAL_SEMANTIC_ITEMS
+        );
+    }
+    if total_dependency_edges > PLAN_MAX_DEPENDENCY_EDGES {
+        bail!(
+            "orchestration plan exceeds the configured {} dependency-edge limit",
+            PLAN_MAX_DEPENDENCY_EDGES
+        );
+    }
+    if total_validation_commands > PLAN_MAX_TOTAL_VALIDATION_COMMANDS {
+        bail!(
+            "orchestration plan exceeds the configured {} total validation-command limit",
+            PLAN_MAX_TOTAL_VALIDATION_COMMANDS
+        );
+    }
+    Ok(())
+}
+
+fn validate_raw_validation_bounds(
+    raw: &RawValidationCommand,
+    total_string_bytes: &mut usize,
+    total_paths: &mut usize,
+    total_env_entries: &mut usize,
+) -> Result<()> {
+    match raw {
+        RawValidationCommand::Shell(command) => account_plan_string(
+            total_string_bytes,
+            command,
+            PLAN_MAX_COMMAND_BYTES,
+            "validation command",
+        ),
+        RawValidationCommand::Detailed(details) => {
+            if let Some(name) = &details.name {
+                account_plan_string(
+                    total_string_bytes,
+                    name,
+                    PLAN_MAX_STRING_BYTES,
+                    "validation name",
+                )?;
+            }
+            account_plan_string(
+                total_string_bytes,
+                &details.command,
+                PLAN_MAX_COMMAND_BYTES,
+                "validation command",
+            )?;
+            if let Some(path) = &details.working_directory {
+                *total_paths = total_paths
+                    .checked_add(1)
+                    .context("orchestration plan path count overflowed")?;
+                validate_bounded_plan_path(path, "validation working_directory")?;
+            }
+            validate_bounded_env(&details.env, total_string_bytes, total_env_entries)?;
+            validate_bounded_timeout(details.timeout_seconds, "validation timeout")
+        }
+    }
+}
+
+fn validate_bounded_env(
+    env: &BTreeMap<String, String>,
+    total_string_bytes: &mut usize,
+    total_env_entries: &mut usize,
+) -> Result<()> {
+    if env.len() > PLAN_MAX_ENV_ENTRIES_PER_SCOPE {
+        bail!(
+            "orchestration environment scope exceeds the configured {} entry limit",
+            PLAN_MAX_ENV_ENTRIES_PER_SCOPE
+        );
+    }
+    *total_env_entries = total_env_entries
+        .checked_add(env.len())
+        .context("orchestration environment-entry count overflowed")?;
+    for (key, value) in env {
+        account_plan_string(
+            total_string_bytes,
+            key,
+            PLAN_MAX_ENV_KEY_BYTES,
+            "environment key",
+        )?;
+        account_plan_string(
+            total_string_bytes,
+            value,
+            PLAN_MAX_STRING_BYTES,
+            "environment value",
+        )?;
+    }
+    Ok(())
+}
+
+fn account_plan_string(
+    total: &mut usize,
+    value: &str,
+    per_value_limit: usize,
+    label: &str,
+) -> Result<()> {
+    if value.len() > per_value_limit {
+        bail!("{label} exceeds the configured {per_value_limit} byte limit");
+    }
+    *total = total
+        .checked_add(value.len())
+        .context("orchestration plan total string bytes overflowed")?;
+    if *total > PLAN_MAX_BYTES {
+        bail!(
+            "orchestration plan strings exceed the configured {} byte aggregate limit",
+            PLAN_MAX_BYTES
+        );
+    }
+    Ok(())
+}
+
+fn validate_bounded_plan_path(path: &Path, label: &str) -> Result<()> {
+    if candidate_path_bytes(path).len() > PLAN_MAX_PATH_BYTES
+        || path.components().count() > PLAN_MAX_PATH_COMPONENTS
+    {
+        bail!(
+            "{label} exceeds the configured path byte or component limit: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_bounded_timeout(timeout: Option<u64>, label: &str) -> Result<()> {
+    if timeout.is_some_and(|seconds| seconds == 0 || seconds > PLAN_MAX_TIMEOUT_SECONDS) {
+        bail!(
+            "{label} must be between 1 and {} seconds",
+            PLAN_MAX_TIMEOUT_SECONDS
+        );
+    }
+    Ok(())
 }
 
 pub fn run_plan_file(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
@@ -714,8 +981,7 @@ fn run_plan_with_controls_runtime(
                 None,
                 &serde_json::json!({
                     "repo_head": repo_head.to_string(),
-                    "plan_file": options.plan_file,
-                    "plan": CheckpointPlanSnapshot::from(&plan),
+                    "plan_recorded": true,
                 }),
             )?;
         }
@@ -729,11 +995,7 @@ fn run_plan_with_controls_runtime(
             summary.worktree_reused = worktree.reused;
             summary.worktree = Some(worktree.record().clone());
             if let Some(writer) = checkpoint_writer.as_mut() {
-                writer.event(
-                    PHASE_WORKTREE_PREPARED,
-                    Some(&summary.id),
-                    worktree.record(),
-                )?;
+                writer.event(PHASE_WORKTREE_PREPARED, Some(&summary.id), &true)?;
             }
         }
         write_checkpoint_if_configured(
@@ -765,14 +1027,7 @@ fn run_plan_with_controls_runtime(
                     claim_cleanup.track(claim.token);
                     summaries[index].claim = Some(claim);
                     if let Some(writer) = checkpoint_writer.as_mut() {
-                        writer.event(
-                            PHASE_CLAIM_ACQUIRED,
-                            Some(&agent.id),
-                            summaries[index]
-                                .claim
-                                .as_ref()
-                                .context("acquired claim disappeared before journaling")?,
-                        )?;
+                        writer.event(PHASE_CLAIM_ACQUIRED, Some(&agent.id), &true)?;
                     }
                 }
                 Err(error) => {
@@ -836,10 +1091,7 @@ fn run_plan_with_controls_runtime(
                 writer.event(
                     PHASE_REPO_VALIDATION_STARTED,
                     None,
-                    &summaries
-                        .iter()
-                        .map(AgentCheckpoint::from)
-                        .collect::<Vec<_>>(),
+                    &serde_json::json!({ "agent_count": summaries.len() }),
                 )?;
             }
             let outcome = run_repo_validation_commands(
@@ -858,8 +1110,8 @@ fn run_plan_with_controls_runtime(
                     PHASE_REPO_VALIDATED,
                     None,
                     &serde_json::json!({
-                        "validation": &repo_validation,
-                        "target": &repo_validation_target,
+                        "validation_count": repo_validation.len(),
+                        "has_target": repo_validation_target.is_some(),
                     }),
                 )?;
             }
@@ -904,9 +1156,9 @@ fn run_plan_with_controls_runtime(
                 PHASE_RELEASED,
                 None,
                 &serde_json::json!({
-                    "claims": &released_claims,
+                    "claim_count": released_claims.len(),
                     "claim_errors": &release_errors,
-                    "semantic_intents": &released_semantic_intents,
+                    "semantic_intent_count": released_semantic_intents.len(),
                     "semantic_errors": &semantic_release_errors,
                     "kept": options.keep_claims,
                 }),
@@ -1059,8 +1311,8 @@ fn resume_plan_file_runtime(
         claim_cleanup.set_tokens(acquired_tokens);
         if let Some(writer) = checkpoint_writer.as_mut() {
             for summary in &summaries {
-                if let Some(claim) = &summary.claim {
-                    writer.event(PHASE_CLAIM_ACQUIRED, Some(&summary.id), claim)?;
+                if summary.claim.is_some() {
+                    writer.event(PHASE_CLAIM_ACQUIRED, Some(&summary.id), &true)?;
                 }
             }
         }
@@ -1127,10 +1379,7 @@ fn resume_plan_file_runtime(
                 writer.event(
                     PHASE_REPO_VALIDATION_STARTED,
                     None,
-                    &summaries
-                        .iter()
-                        .map(AgentCheckpoint::from)
-                        .collect::<Vec<_>>(),
+                    &serde_json::json!({ "agent_count": summaries.len() }),
                 )?;
             }
             let outcome = run_repo_validation_commands(
@@ -1147,8 +1396,8 @@ fn resume_plan_file_runtime(
                     PHASE_REPO_VALIDATED,
                     None,
                     &serde_json::json!({
-                        "validation": &outcome.summaries,
-                        "target": &outcome.target,
+                        "validation_count": outcome.summaries.len(),
+                        "has_target": outcome.target.is_some(),
                     }),
                 )?;
             }
@@ -1200,9 +1449,9 @@ fn resume_plan_file_runtime(
                 PHASE_RELEASED,
                 None,
                 &serde_json::json!({
-                    "claims": &released_claims,
+                    "claim_count": released_claims.len(),
                     "claim_errors": &release_errors,
-                    "semantic_intents": &released_semantic_intents,
+                    "semantic_intent_count": released_semantic_intents.len(),
                     "semantic_errors": &semantic_release_errors,
                     "kept": checkpoint.keep_claims,
                 }),
@@ -2283,8 +2532,11 @@ fn validate_optional_name(name: Option<&str>) -> Result<()> {
 }
 
 fn validate_timeout_seconds(seconds: u64) -> Result<u64> {
-    if seconds == 0 {
-        bail!("timeout must be greater than zero seconds");
+    if seconds == 0 || seconds > PLAN_MAX_TIMEOUT_SECONDS {
+        bail!(
+            "timeout must be between 1 and {} seconds",
+            PLAN_MAX_TIMEOUT_SECONDS
+        );
     }
 
     Ok(seconds)
@@ -2796,9 +3048,9 @@ fn run_agent_schedule(
             ),
         }
         if let Some(writer) = checkpoint_writer.as_deref_mut() {
-            writer.event(
+            writer.agent_event(
                 PHASE_VALIDATION_STARTED,
-                Some(&summaries[index].id),
+                &summaries[index].id,
                 &AgentCheckpoint::from(&summaries[index]),
             )?;
         }
@@ -2812,9 +3064,9 @@ fn run_agent_schedule(
             context.runtime,
         );
         if let Some(writer) = checkpoint_writer.as_deref_mut() {
-            writer.event(
+            writer.agent_event(
                 PHASE_VALIDATED,
-                Some(&summaries[index].id),
+                &summaries[index].id,
                 &AgentCheckpoint::from(&summaries[index]),
             )?;
         }
@@ -2861,9 +3113,9 @@ fn run_agent_schedule(
         }
         summaries[index].candidate_binding = Some(captured.binding.clone());
         if let Some(writer) = checkpoint_writer.as_deref_mut() {
-            writer.event(
+            writer.agent_event(
                 PHASE_CANDIDATE_CAPTURED,
-                Some(&summaries[index].id),
+                &summaries[index].id,
                 &AgentCheckpoint::from(&summaries[index]),
             )?;
         }
@@ -2904,9 +3156,9 @@ fn run_agent_schedule(
                 &context.worktrees[*index],
             )?;
             if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                writer.event(
+                writer.agent_event(
                     PHASE_COMMAND_STARTED,
-                    Some(&summaries[*index].id),
+                    &summaries[*index].id,
                     &AgentCheckpoint::from(&summaries[*index]),
                 )?;
             }
@@ -2947,9 +3199,9 @@ fn run_agent_schedule(
                     summaries[index].command_completed_binding =
                         Some(CompletedCommandStateBinding::from_state(&state)?);
                     if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                        writer.event(
+                        writer.agent_event(
                             PHASE_COMMAND_COMPLETED,
-                            Some(&summaries[index].id),
+                            &summaries[index].id,
                             &AgentCheckpoint::from(&summaries[index]),
                         )?;
                     }
@@ -2969,9 +3221,9 @@ fn run_agent_schedule(
             if summaries[index].status == AgentRunStatus::Succeeded {
                 if let Some(expected_state) = expected_state.as_ref() {
                     if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                        writer.event(
+                        writer.agent_event(
                             PHASE_VALIDATION_STARTED,
-                            Some(&summaries[index].id),
+                            &summaries[index].id,
                             &AgentCheckpoint::from(&summaries[index]),
                         )?;
                     }
@@ -2985,9 +3237,9 @@ fn run_agent_schedule(
                         context.runtime,
                     );
                     if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                        writer.event(
+                        writer.agent_event(
                             PHASE_VALIDATED,
-                            Some(&summaries[index].id),
+                            &summaries[index].id,
                             &AgentCheckpoint::from(&summaries[index]),
                         )?;
                     }
@@ -3027,9 +3279,9 @@ fn run_agent_schedule(
                     patch_output,
                 );
                 if let Some(writer) = checkpoint_writer.as_deref_mut() {
-                    writer.event(
+                    writer.agent_event(
                         PHASE_CANDIDATE_CAPTURED,
-                        Some(&summaries[index].id),
+                        &summaries[index].id,
                         &AgentCheckpoint::from(&summaries[index]),
                     )?;
                 }
@@ -3647,6 +3899,7 @@ fn capture_untracked_manifest(
     }
 
     let mut manifest = Vec::new();
+    extend_bounded_candidate_bytes(&mut manifest, b"MACO\0untracked-manifest\0v2\0")?;
     let mut total_content_bytes = 0_usize;
     for raw_path in paths {
         let path = normalize_repo_relative_path(Path::new(&git_path_argument(raw_path)?))?;
@@ -3657,15 +3910,19 @@ fn capture_untracked_manifest(
                 path.display()
             )
         })?;
-        let (kind, content) = if metadata.file_type().is_file() {
+        let (kind, git_mode, content) = if metadata.file_type().is_file() {
             let bytes = BoundedRegularReader::read_relative(
                 worktree_path,
                 &path,
                 CANDIDATE_MAX_SINGLE_FILE_BYTES as u64,
             )?;
-            (b'f', bytes)
+            (b'f', normalized_untracked_git_mode(&metadata)?, bytes)
         } else if metadata.file_type().is_symlink() {
-            (b'l', read_candidate_symlink(&absolute, &metadata)?)
+            (
+                b'l',
+                0o120000_u32,
+                read_candidate_symlink(&absolute, &metadata)?,
+            )
         } else {
             bail!(
                 "candidate untracked path is not a regular file or symlink: {}",
@@ -3693,10 +3950,40 @@ fn capture_untracked_manifest(
         extend_bounded_candidate_bytes(&mut manifest, &(path_bytes.len() as u64).to_le_bytes())?;
         extend_bounded_candidate_bytes(&mut manifest, &path_bytes)?;
         extend_bounded_candidate_bytes(&mut manifest, &[kind])?;
+        extend_bounded_candidate_bytes(&mut manifest, &git_mode.to_le_bytes())?;
         extend_bounded_candidate_bytes(&mut manifest, &(content.len() as u64).to_le_bytes())?;
         extend_bounded_candidate_bytes(&mut manifest, content_oid.as_bytes())?;
     }
     Ok(manifest)
+}
+
+#[cfg(unix)]
+fn normalized_untracked_git_mode(metadata: &fs::Metadata) -> Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.file_type().is_file() {
+        bail!("untracked Git mode is only defined for regular files");
+    }
+    Ok(if metadata.mode() & 0o111 == 0 {
+        0o100644
+    } else {
+        0o100755
+    })
+}
+
+#[cfg(windows)]
+fn normalized_untracked_git_mode(metadata: &fs::Metadata) -> Result<u32> {
+    if !metadata.file_type().is_file() {
+        bail!("untracked Git mode is only defined for regular files");
+    }
+    Ok(0o100644)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn normalized_untracked_git_mode(metadata: &fs::Metadata) -> Result<u32> {
+    if !metadata.file_type().is_file() {
+        bail!("untracked Git mode is only defined for regular files");
+    }
+    Ok(0o100644)
 }
 
 fn read_candidate_symlink(path: &Path, before: &fs::Metadata) -> Result<Vec<u8>> {
@@ -5186,8 +5473,13 @@ impl RunCheckpointWriter {
                 checkpoint_stage_name(checkpoint.stage)
             )
         };
-        self.journal.append(&phase, None, checkpoint)?;
+        self.journal
+            .append(&phase, None, &encode_run_checkpoint(checkpoint)?)?;
         self.verify_external_reference()
+    }
+
+    fn agent_event(&mut self, phase: &str, subject: &str, agent: &AgentCheckpoint) -> Result<()> {
+        self.event(phase, Some(subject), &encode_agent_checkpoint(agent)?)
     }
 
     fn event<T: Serialize>(
@@ -5300,7 +5592,13 @@ fn prepare_run_checkpoint_writer(
         }
     }
     let name = checkpoint_file_name(run_id);
-    let slot = root.open_or_reserve(OsStr::new(&name))?;
+    let slot = root.reserve(OsStr::new(&name)).with_context(|| {
+        format!(
+            "checkpoint '{}' already exists or cannot be reserved for a fresh run; use `maco orchestrate resume --checkpoint {}` for an existing run",
+            run_id.as_str(),
+            root.path().join(&name).display()
+        )
+    })?;
     let mut reservation = CheckpointReferenceReservation::new(slot);
     let result = (|| -> Result<RunCheckpointWriter> {
         let auth = repository_auth_writer(repo)?.into_authenticator()?;
@@ -5407,9 +5705,11 @@ fn open_run_checkpoint(path: &Path, repo_override: Option<&Path>) -> Result<Open
 
     // The repository hint is used only to locate a candidate key. No run id,
     // plan path, journal path, or checkpoint payload is authoritative yet.
-    let repo = discover_repo_root(repo_override.unwrap_or(&reference.repository_hint))?;
-    let authenticator = repository_authenticator(&repo)?;
+    let hinted_repo = reference.repository_hint.to_path_buf()?;
+    let repo = discover_repo_root(repo_override.unwrap_or(&hinted_repo))?;
+    let authenticator = repository_authenticator_key_only(&repo)?;
     verify_checkpoint_reference(&authenticator, &reference)?;
+    validate_repository_authenticated_state(&repo, &authenticator)?;
     let journal = StateJournal::open(authenticator, &reference.journal)?;
     let checkpoint = latest_authenticated_checkpoint(&journal)?;
     if checkpoint.run_id.as_str() != reference.journal.run_id {
@@ -5424,7 +5724,7 @@ fn open_run_checkpoint(path: &Path, repo_override: Option<&Path>) -> Result<Open
             expected_path.display()
         );
     }
-    let signed_repo = discover_repo_root(&reference.repository_hint)?;
+    let signed_repo = discover_repo_root(&hinted_repo)?;
     if signed_repo != repo || checkpoint.repo != repo {
         bail!("authenticated checkpoint belongs to a different repository path");
     }
@@ -5446,7 +5746,7 @@ fn signed_checkpoint_reference(
     repo: &Path,
     journal: &JournalIdentity,
 ) -> Result<AuthenticatedCheckpointReference> {
-    let repository_hint = discover_repo_root(repo)?;
+    let repository_hint = LosslessPath::from_path(&discover_repo_root(repo)?)?;
     let mut reference = AuthenticatedCheckpointReference {
         version: CHECKPOINT_STATE_VERSION,
         repository_hint,
@@ -5488,31 +5788,17 @@ fn checkpoint_reference_mac_payload(
 fn validate_checkpoint_reference_bounds(
     reference: &AuthenticatedCheckpointReference,
 ) -> Result<()> {
-    if reference.version != CHECKPOINT_STATE_VERSION
-        || reference.repository_hint.components().count() > 256
-        || path_storage_bytes(&reference.repository_hint) > 4096
+    if reference.version != CHECKPOINT_STATE_VERSION {
+        bail!("checkpoint reference exceeds its bounded canonical format");
+    }
+    let repository_hint = reference.repository_hint.to_path_buf()?;
+    if reference.repository_hint.storage_bytes() > 4096
+        || repository_hint.components().count() > 256
     {
         bail!("checkpoint reference exceeds its bounded canonical format");
     }
     reference.mac.validate()?;
     crate::state_journal::validate_journal_identity(&reference.journal)
-}
-
-#[cfg(unix)]
-fn path_storage_bytes(path: &Path) -> usize {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes().len()
-}
-
-#[cfg(windows)]
-fn path_storage_bytes(path: &Path) -> usize {
-    use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().count().saturating_mul(2)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn path_storage_bytes(path: &Path) -> usize {
-    path.as_os_str().to_string_lossy().len()
 }
 
 fn latest_authenticated_checkpoint(journal: &StateJournal) -> Result<RunCheckpoint> {
@@ -5527,7 +5813,7 @@ fn latest_authenticated_checkpoint(journal: &StateJournal) -> Result<RunCheckpoi
                 || record.phase.starts_with(CHECKPOINT_SNAPSHOT_PHASE_PREFIX)
         })
         .context("authenticated checkpoint journal has no resumable snapshot; start a new run")?;
-    let mut checkpoint: RunCheckpoint = serde_json::from_value(record.payload.clone())
+    let mut checkpoint = decode_run_checkpoint(record.payload.clone())
         .context("authenticated checkpoint snapshot is malformed")?;
     if checkpoint.version != CHECKPOINT_STATE_VERSION {
         bail!("authenticated checkpoint snapshot is not v3; start a new run");
@@ -5539,7 +5825,7 @@ fn latest_authenticated_checkpoint(journal: &StateJournal) -> Result<RunCheckpoi
         ) {
             continue;
         }
-        let agent: AgentCheckpoint = serde_json::from_value(record.payload.clone())
+        let agent = decode_agent_checkpoint(record.payload.clone())
             .context("authenticated candidate checkpoint payload is malformed")?;
         let slot = checkpoint
             .agents
@@ -5586,7 +5872,7 @@ fn validate_command_phase_history(journal: &StateJournal) -> Result<()> {
                         subject
                     );
                 }
-                let completed: AgentCheckpoint = serde_json::from_value(record.payload.clone())
+                let completed = decode_agent_checkpoint(record.payload.clone())
                     .context("authenticated command completion payload is malformed")?;
                 if completed.id != *subject || completed.command_completed_binding.is_none() {
                     bail!(
@@ -6001,14 +6287,23 @@ mod tests {
     }
 
     fn run_candidate_validation_test(command: &str) -> ValidationRunSummary {
+        run_candidate_validation_test_with_setup(command, |_| {})
+    }
+
+    fn run_candidate_validation_test_with_setup(
+        command: &str,
+        setup: impl FnOnce(&Path),
+    ) -> ValidationRunSummary {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        SyncStore::open(&repo_path).expect("create sensitive state root");
         let repo = Repository::open(&repo_path).expect("open repo");
         fs::write(repo_path.join("claimed.txt"), "base\n").expect("write claimed");
         fs::write(repo_path.join("other.txt"), "base\n").expect("write other");
         let base_oid = commit_all(&repo, "initial commit").expect("commit");
         fs::write(repo_path.join("claimed.txt"), "candidate\n").expect("write candidate");
+        setup(&repo_path);
         let expected = capture_consistent_candidate_state(
             &repo_path,
             &base_oid,
@@ -6171,6 +6466,74 @@ mod tests {
             .contains("4096 dependency-edge limit"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_plan_refuses_symlink_leaf_and_ancestor_components() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let real = temp.path().join("real");
+        fs::create_dir(&real).expect("create real directory");
+        let plan = real.join("plan.json");
+        fs::write(
+            &plan,
+            r#"{"agents":[{"id":"agent-a","paths":["a.txt"],"command":"true"}]}"#,
+        )
+        .expect("write plan");
+        let leaf_link = temp.path().join("plan-link.json");
+        symlink(&plan, &leaf_link).expect("link plan leaf");
+        let leaf_error = load_plan(&leaf_link).expect_err("plan leaf symlink must fail");
+        assert!(format!("{leaf_error:#}").contains("without following links"));
+
+        let ancestor_link = temp.path().join("linked-directory");
+        symlink(&real, &ancestor_link).expect("link plan ancestor");
+        let ancestor_error = load_plan(ancestor_link.join("plan.json"))
+            .expect_err("plan ancestor symlink must fail");
+        assert!(format!("{ancestor_error:#}").contains("without following links"));
+    }
+
+    #[test]
+    fn load_plan_bounds_file_env_and_timeout_before_execution() {
+        let temp = TempDir::new().expect("tempdir");
+        let oversized = temp.path().join("oversized.json");
+        fs::write(&oversized, vec![b' '; PLAN_MAX_BYTES + 1]).expect("write oversized plan");
+        let oversized_error =
+            load_plan(&oversized).expect_err("oversized plan must fail bounded read");
+        assert!(format!("{oversized_error:#}").contains("bounded read limit"));
+
+        let env_plan = temp.path().join("env.json");
+        let env = (0..=PLAN_MAX_ENV_ENTRIES_PER_SCOPE)
+            .map(|index| (format!("KEY_{index}"), "value".to_string()))
+            .collect::<BTreeMap<_, _>>();
+        fs::write(
+            &env_plan,
+            serde_json::to_vec(&serde_json::json!({
+                "agents": [{"id": "agent-a", "paths": ["a.txt"], "command": "true", "env": env}]
+            }))
+            .expect("encode env plan"),
+        )
+        .expect("write env plan");
+        assert!(load_plan(&env_plan)
+            .expect_err("nested env count must be bounded")
+            .to_string()
+            .contains("environment scope"));
+
+        let timeout_plan = temp.path().join("timeout.json");
+        fs::write(
+            &timeout_plan,
+            serde_json::to_vec(&serde_json::json!({
+                "default_timeout_seconds": PLAN_MAX_TIMEOUT_SECONDS + 1,
+                "agents": [{"id": "agent-a", "paths": ["a.txt"], "command": "true"}]
+            }))
+            .expect("encode timeout plan"),
+        )
+        .expect("write timeout plan");
+        assert!(load_plan(&timeout_plan)
+            .expect_err("timeout upper bound must be enforced")
+            .to_string()
+            .contains("must be between 1"));
+    }
+
     #[test]
     fn scheduler_failure_propagation_preserves_independent_fork_and_join_branch() {
         let plan = schedule_test_plan(vec![
@@ -6313,6 +6676,30 @@ mod tests {
         assert!(summary.error.as_deref().is_some_and(|error| {
             error.contains("untracked content") && error.contains("changed paths/status")
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_validation_rejects_untracked_executable_mode_mutation() {
+        let summary =
+            run_candidate_validation_test_with_setup("chmod 755 scratch.sh", |repo_path| {
+                fs::write(repo_path.join("scratch.sh"), "#!/bin/sh\n")
+                    .expect("write untracked script");
+                fs::set_permissions(
+                    repo_path.join("scratch.sh"),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .expect("set initial untracked mode");
+            });
+        assert_eq!(summary.status, AgentRunStatus::Failed);
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("untracked content")),
+            "{:?}",
+            summary.error
+        );
     }
 
     #[test]
@@ -8590,6 +8977,63 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resume_rejects_untracked_executable_mode_drift_after_command_completion() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{"agents":[{"id":"mode-drift","paths":["scratch.sh"],"command":"printf '#!/bin/sh\\n' > scratch.sh; chmod 644 scratch.sh"}]}"#,
+        )
+        .expect("write plan");
+        let run_id = RunId::new("resume-untracked-mode-drift").expect("run id");
+        install_checkpoint_event_failure(run_id.as_str(), PHASE_VALIDATION_STARTED);
+        run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file: plan_file.clone(),
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: Some(run_id.clone()),
+                checkpoint_dir: Some(checkpoint_dir.clone()),
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Off,
+            },
+        )
+        .expect_err("stop after durable command completion");
+        let worktree = WorktreeManager::new(&repo_path)
+            .list()
+            .expect("list worktrees")
+            .into_iter()
+            .find(|record| record.name == "mode-drift")
+            .expect("mode-drift worktree");
+        fs::set_permissions(
+            worktree.path.join("scratch.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("change executable mode");
+
+        let error = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file: checkpoint_path(&checkpoint_dir, &run_id),
+            repo: Some(repo_path),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("mode-only drift must invalidate authenticated binding");
+        assert!(error.to_string().contains("command state binding drifted"));
+    }
+
     #[test]
     fn started_only_checkpoint_is_uncertain_and_never_runs_or_retries() {
         let temp = TempDir::new().expect("tempdir");
@@ -8647,6 +9091,7 @@ mod tests {
         assert!(error.to_string().contains("execution outcome is uncertain"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn authenticated_checkpoint_reference_tamper_is_rejected() {
         let temp = TempDir::new().expect("tempdir");
@@ -8676,6 +9121,23 @@ mod tests {
         };
         let checkpoint_dir = temp.path().join("checkpoints");
         let path = write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+        let malformed_run = temp
+            .path()
+            .join("repo/.maco/autopilot/runs/malformed-marker");
+        fs::create_dir_all(&malformed_run).expect("create malformed marker run");
+        for directory in [
+            temp.path().join("repo/.maco"),
+            temp.path().join("repo/.maco/autopilot"),
+            temp.path().join("repo/.maco/autopilot/runs"),
+            malformed_run.clone(),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("private artifact directory");
+        }
+        let malformed_marker = malformed_run.join(".maco-artifact-final.json");
+        fs::write(&malformed_marker, b"not-json").expect("write malformed marker");
+        fs::set_permissions(&malformed_marker, fs::Permissions::from_mode(0o600))
+            .expect("private malformed marker");
         let mut envelope: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("read envelope"))
                 .expect("parse envelope");
@@ -8686,9 +9148,26 @@ mod tests {
         assert!(error
             .to_string()
             .contains("authentication tag verification failed"));
+        assert!(!error.to_string().contains("finalization marker"));
         assert!(!error
             .to_string()
             .contains("untrusted-plan-must-not-be-read"));
+
+        let missing_plan = temp.path().join("resume-must-not-read-this-plan.json");
+        let resume_error = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file: path,
+            repo: Some(temp.path().join("repo")),
+            plan_file: Some(missing_plan.clone()),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("resume must authenticate before loading a plan");
+        assert!(resume_error
+            .to_string()
+            .contains("authentication tag verification failed"));
+        assert!(!resume_error
+            .to_string()
+            .contains(&missing_plan.display().to_string()));
     }
 
     #[test]
@@ -8818,9 +9297,7 @@ mod tests {
         let checkpoint_dir = temp.path().join("checkpoints");
         let error = write_run_checkpoint(&checkpoint_dir, &checkpoint)
             .expect_err("existing marker must block key creation");
-        assert!(error
-            .to_string()
-            .contains("existing artifact finalization marker"));
+        assert!(error.to_string().contains("existing final marker"));
         assert!(!checkpoint_path(&checkpoint_dir, &checkpoint.run_id).exists());
         let repo = Repository::open(&repo_path).expect("open repo");
         assert!(!repo
@@ -8828,6 +9305,94 @@ mod tests {
             .join("maco/state")
             .join(crate::artifacts::state_auth::authentication_key_file_name())
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_writer_refuses_first_key_when_checkpoint_journals_exist() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let maco = repo.commondir().join("maco");
+        let state = maco.join("state");
+        let journals = state.join(crate::state_journal::JOURNAL_ROOT_NAME);
+        fs::create_dir_all(&journals).expect("create prior journal root");
+        for directory in [&maco, &state, &journals] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("private journal directory");
+        }
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: RunId::new("must-not-rekey-journal").expect("run id"),
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: repo_path,
+            repo_head: None,
+            plan_file: PathBuf::from("plan.json"),
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: Vec::new(),
+            repo_validation: Vec::new(),
+            repo_validation_target: None,
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let error = write_run_checkpoint(&checkpoint_dir, &checkpoint)
+            .expect_err("prior checkpoint journals must block first key");
+        assert!(error.to_string().contains("checkpoint journals exist"));
+        assert!(!checkpoint_path(&checkpoint_dir, &checkpoint.run_id).exists());
+        assert!(!state
+            .join(crate::artifacts::state_auth::authentication_key_file_name())
+            .exists());
+    }
+
+    #[test]
+    fn missing_key_for_existing_epoch_is_never_regenerated() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let checkpoint = |run_id: &str| RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: RunId::new(run_id).expect("run id"),
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: repo_path.clone(),
+            repo_head: None,
+            plan_file: PathBuf::from("plan.json"),
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: Vec::new(),
+            repo_validation: Vec::new(),
+            repo_validation_target: None,
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        drop(repository_auth_writer(&repo_path).expect("establish auth epoch"));
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let key = repo
+            .commondir()
+            .join("maco/state")
+            .join(crate::artifacts::state_auth::authentication_key_file_name());
+        fs::remove_file(&key).expect("remove key to simulate loss");
+        let second = checkpoint("epoch-second");
+        let error = write_run_checkpoint(&checkpoint_dir, &second)
+            .expect_err("existing epoch must not be rekeyed");
+        assert!(error.to_string().contains("existing authentication epoch"));
+        assert!(!key.exists());
+        assert!(!checkpoint_path(&checkpoint_dir, &second.run_id).exists());
     }
 
     #[test]
@@ -8912,6 +9477,196 @@ mod tests {
         assert_eq!(path, checkpoint_path(&checkpoint_dir, &run_id));
         let loaded = read_run_checkpoint(&path).expect("read checkpoint");
         assert_eq!(loaded, checkpoint);
+    }
+
+    #[test]
+    fn fresh_same_run_id_preserves_existing_checkpoint_and_guides_resume() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let run_id = RunId::new("fresh-collision").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: run_id.clone(),
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: repo_path,
+            repo_head: None,
+            plan_file: PathBuf::from("plan.json"),
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: Vec::new(),
+            repo_validation: Vec::new(),
+            repo_validation_target: None,
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let path = write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("first checkpoint");
+        let before = fs::read(&path).expect("read existing checkpoint");
+
+        let error = write_run_checkpoint(&checkpoint_dir, &checkpoint)
+            .expect_err("fresh run id collision must be refused");
+        assert!(error.to_string().contains("orchestrate resume"));
+        assert_eq!(fs::read(&path).expect("re-read checkpoint"), before);
+        assert_eq!(
+            read_run_checkpoint(&path).expect("existing remains valid"),
+            checkpoint
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_round_trips_non_utf8_repo_and_completed_candidate_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"repo-\xff".to_vec()));
+        Repository::init(&repo_path).expect("init non-UTF-8 repo");
+        let candidate_path =
+            PathBuf::from(std::ffi::OsString::from_vec(b"candidate-\xfe.sh".to_vec()));
+        let plan_file = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"plan-\xfd.json".to_vec()));
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: RunId::new("lossless-command-completion").expect("run id"),
+            stage: RunCheckpointStage::AgentsCompleted,
+            repo: repo_path.clone(),
+            repo_head: None,
+            plan_file,
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: vec![AgentCheckpoint {
+                id: "lossless".to_string(),
+                status: AgentRunStatus::Succeeded,
+                worktree: Some(CheckpointWorktreeRecord {
+                    name: "lossless".to_string(),
+                    path: repo_path.join(std::ffi::OsString::from_vec(b"worktree-\xfc".to_vec())),
+                    branch: "maco/lossless".to_string(),
+                }),
+                claim: None,
+                semantic_intent: None,
+                semantic_conflicts: Vec::new(),
+                changed_paths: vec![candidate_path.clone()],
+                unclaimed_changed_paths: Vec::new(),
+                validation: Vec::new(),
+                candidate_binding: None,
+                command_completed_binding: Some(CompletedCommandStateBinding {
+                    version: CANDIDATE_BINDING_VERSION,
+                    base_oid: "0123456789012345678901234567890123456789".to_string(),
+                    head_oid: "0123456789012345678901234567890123456789".to_string(),
+                    state_oid: "1111111111111111111111111111111111111111".to_string(),
+                    changed_paths: vec![candidate_path],
+                }),
+                error: None,
+            }],
+            repo_validation: Vec::new(),
+            repo_validation_target: None,
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let path = write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+        let loaded = read_run_checkpoint(&path).expect("read checkpoint");
+        assert_eq!(loaded, checkpoint);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_command_completed_wal_round_trips_through_resume() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec(&serde_json::json!({
+                "agents": [{
+                    "id": "lossless-wal",
+                    "paths": ["out"],
+                    "command": r#"mkdir -p out; name=$(printf 'raw-\377.txt'); printf 'once\n' > "out/$name""#
+                }]
+            }))
+            .expect("encode plan"),
+        )
+        .expect("write plan");
+        let run_id = RunId::new("lossless-command-completed-wal").expect("run id");
+        install_checkpoint_event_failure(run_id.as_str(), PHASE_VALIDATION_STARTED);
+        let first_error = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file: plan_file.clone(),
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: Some(run_id.clone()),
+                checkpoint_dir: Some(checkpoint_dir.clone()),
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Off,
+            },
+        )
+        .expect_err("stop after command_completed WAL append");
+        assert!(
+            first_error
+                .to_string()
+                .contains("injected checkpoint event failure"),
+            "{first_error:#}"
+        );
+
+        let raw_path =
+            PathBuf::from("out").join(std::ffi::OsString::from_vec(b"raw-\xff.txt".to_vec()));
+        let checkpoint_file = checkpoint_path(&checkpoint_dir, &run_id);
+        let recovered = read_run_checkpoint(&checkpoint_file).expect("decode command WAL");
+        assert_eq!(recovered.repo, repo_path);
+        assert!(recovered.agents[0]
+            .command_completed_binding
+            .as_ref()
+            .expect("command completion binding")
+            .changed_paths
+            .contains(&raw_path));
+
+        let summary = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file,
+            repo: Some(repo_path.clone()),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("resume non-UTF-8 completed command");
+        assert!(summary.success);
+        assert!(summary.agents[0].changed_paths.contains(&raw_path));
+        let worktree = WorktreeManager::new(&repo_path)
+            .list()
+            .expect("list worktrees")
+            .into_iter()
+            .find(|record| record.name == "lossless-wal")
+            .expect("lossless worktree");
+        assert_eq!(
+            fs::read(worktree.path.join(raw_path)).expect("read non-UTF-8 candidate"),
+            b"once\n"
+        );
     }
 
     #[test]

@@ -19,7 +19,9 @@ use std::os::unix::{
 
 const AUTH_KEY_FILE: &str = "artifact_finalization_hmac_v1.key";
 const AUTH_KEY_LOCK: &str = "artifact_finalization_hmac_v1.lock";
+const AUTH_EPOCH_FILE: &str = "repository_auth_epoch_v1";
 const AUTH_KEY_BYTES: usize = 32;
+const AUTH_EPOCH_BYTES: usize = 32;
 const AUTH_BINDING_VERSION: u32 = 1;
 const MAX_AUTH_DOMAIN_BYTES: usize = 256;
 const MAX_AUTH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -126,8 +128,7 @@ struct SecretKey([u8; AUTH_KEY_BYTES]);
 
 impl Drop for SecretKey {
     fn drop(&mut self) {
-        self.0.fill(0);
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        zeroize(&mut self.0);
     }
 }
 
@@ -202,7 +203,7 @@ impl RepositoryAuthenticator {
         common_root.verify()?;
         state_root.verify()?;
         if !state_root.direct_child_exists(AUTH_KEY_FILE)? {
-            bail!("repository authentication key is missing");
+            bail!("repository authentication MAC key is missing");
         }
         let key_path = state_root.direct_child(AUTH_KEY_FILE)?;
         let key_identity = ensure_private_auth_file(&key_path)?;
@@ -341,12 +342,42 @@ impl RepositoryAuthenticator {
         }
         Ok(())
     }
+
+    /// Validates the durable epoch sentinel after caller-controlled state has
+    /// been authenticated. Key-only open deliberately does not inspect this
+    /// repository-global state so checkpoint locators can be MAC-checked first.
+    pub(crate) fn verify_epoch(&self) -> Result<()> {
+        self.verify()?;
+        if !self.state_root.direct_child_exists(AUTH_EPOCH_FILE)? {
+            bail!(
+                "repository authentication epoch sentinel is missing; refusing ambiguous key state"
+            );
+        }
+        let path = self.state_root.direct_child(AUTH_EPOCH_FILE)?;
+        ensure_private_auth_file(&path)?;
+        let mut epoch = BoundedRegularReader::read_direct(
+            &self.state_root,
+            AUTH_EPOCH_FILE,
+            AUTH_EPOCH_BYTES as u64,
+        )?;
+        if epoch.len() != AUTH_EPOCH_BYTES {
+            let observed = epoch.len();
+            zeroize(&mut epoch);
+            bail!(
+                "repository authentication epoch sentinel has invalid length {} (expected {})",
+                observed,
+                AUTH_EPOCH_BYTES
+            );
+        }
+        zeroize(&mut epoch);
+        self.verify()
+    }
 }
 
 impl RepositoryAuthWriter {
     pub(super) fn open_or_create<F>(common_dir: &Path, before_first_key: F) -> Result<Self>
     where
-        F: FnOnce() -> Result<()>,
+        F: FnOnce(&SafeRoot) -> Result<()>,
     {
         let common_root = SafeRoot::open_existing(common_dir)
             .context("Git common directory is not safely reachable for authentication")?;
@@ -363,12 +394,38 @@ impl RepositoryAuthWriter {
         };
         let lock = BoundStateLock::acquire(&state_root, AUTH_KEY_LOCK)?;
         lock.verify(&state_root)?;
-        if !state_root.direct_child_exists(AUTH_KEY_FILE)? {
-            before_first_key()?;
+        let key_exists = state_root.direct_child_exists(AUTH_KEY_FILE)?;
+        let epoch_exists = state_root.direct_child_exists(AUTH_EPOCH_FILE)?;
+        if !key_exists {
+            // Scan every registered legacy consumer before considering a new
+            // key. This preserves precise diagnostics for existing markers or
+            // journals while the epoch sentinel remains the final fail-closed
+            // backstop for otherwise unregistered authenticated state.
+            before_first_key(&state_root)?;
+            if epoch_exists {
+                bail!(
+                    "repository authentication key is missing for an existing authentication epoch; refusing to generate a replacement key"
+                );
+            }
+            let mut epoch = SecretKey([0_u8; AUTH_EPOCH_BYTES]);
+            fill_os_random(&mut epoch.0)?;
+            AtomicStateWriter::scavenge_direct_temps(&state_root, AUTH_EPOCH_FILE)?;
+            AtomicStateWriter::write_direct_fenced(&state_root, AUTH_EPOCH_FILE, &epoch.0, || {
+                lock.verify(&state_root)
+            })?;
             let mut key = SecretKey([0_u8; AUTH_KEY_BYTES]);
             fill_os_random(&mut key.0)?;
             AtomicStateWriter::scavenge_direct_temps(&state_root, AUTH_KEY_FILE)?;
             AtomicStateWriter::write_direct_fenced(&state_root, AUTH_KEY_FILE, &key.0, || {
+                lock.verify(&state_root)
+            })?;
+        } else if !epoch_exists {
+            // One-time migration for repositories whose key predates the
+            // epoch sentinel. The existing key remains authoritative.
+            let mut epoch = SecretKey([0_u8; AUTH_EPOCH_BYTES]);
+            fill_os_random(&mut epoch.0)?;
+            AtomicStateWriter::scavenge_direct_temps(&state_root, AUTH_EPOCH_FILE)?;
+            AtomicStateWriter::write_direct_fenced(&state_root, AUTH_EPOCH_FILE, &epoch.0, || {
                 lock.verify(&state_root)
             })?;
         }
@@ -393,6 +450,7 @@ impl RepositoryAuthWriter {
     pub(crate) fn verify(&self) -> Result<()> {
         self.lock.verify(&self.authenticator.state_root)?;
         self.authenticator.verify()?;
+        self.authenticator.verify_epoch()?;
         self.lock.verify(&self.authenticator.state_root)
     }
 
@@ -643,8 +701,7 @@ fn sha256_bytes(input: &[u8]) -> [u8; 32] {
         hash[5] = hash[5].wrapping_add(f);
         hash[6] = hash[6].wrapping_add(g);
         hash[7] = hash[7].wrapping_add(h);
-        words.fill(0);
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        zeroize(&mut words);
     }
     let mut output = [0_u8; 32];
     for (index, word) in hash.iter().enumerate() {
@@ -652,8 +709,7 @@ fn sha256_bytes(input: &[u8]) -> [u8; 32] {
         output[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
     }
     zeroize(&mut message);
-    hash.fill(0);
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    zeroize(&mut hash);
     output
 }
 
@@ -690,8 +746,12 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     output
 }
 
-fn zeroize(bytes: &mut [u8]) {
-    bytes.fill(0);
+fn zeroize<T: Copy + Default>(values: &mut [T]) {
+    for value in values {
+        // Volatile stores keep the wipe observable to the abstract machine so
+        // it is not optimized away after the last secret use.
+        unsafe { std::ptr::write_volatile(value, T::default()) };
+    }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -777,5 +837,7 @@ mod tests {
                 "secret API exposed forbidden surface: {forbidden}"
             );
         }
+        assert!(production.contains("std::ptr::write_volatile"));
+        assert!(!production.contains(".fill(0)"));
     }
 }

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod artifacts;
 pub mod autopilot;
+pub(crate) mod checkpoint_wire;
 pub mod cli;
 pub mod consult;
 pub mod external_agent;

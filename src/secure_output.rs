@@ -329,11 +329,6 @@ impl SecureOutputRoot {
         self.reserve_impl(name, false, true, false)
     }
 
-    /// Opens a previously secured leaf or creates it. Intended for resumable state only.
-    pub(crate) fn open_or_reserve(&self, name: &OsStr) -> Result<ReservedOutputFile> {
-        self.reserve_impl(name, true, true, false)
-    }
-
     /// Opens an existing private regular leaf without creating a missing target.
     pub(crate) fn open_existing_leaf(&self, name: &OsStr) -> Result<ReservedOutputFile> {
         self.reserve_impl(name, true, false, false)
@@ -1588,7 +1583,7 @@ mod tests {
             return Err(std::io::Error::last_os_error()).context("failed to create test FIFO");
         }
         let started = Instant::now();
-        assert!(root.open_or_reserve(OsStr::new("state.json")).is_err());
+        assert!(root.open_existing_leaf(OsStr::new("state.json")).is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
         let metadata = std::fs::symlink_metadata(root.path().join("state.json"))?;
         assert!(metadata.file_type().is_fifo());

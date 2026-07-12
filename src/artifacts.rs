@@ -382,19 +382,49 @@ pub(crate) fn repository_auth_writer(repo: &Path) -> Result<RepositoryAuthWriter
     open_artifact_auth_writer(&repository)
 }
 
-pub(crate) fn repository_authenticator(repo: &Path) -> Result<RepositoryAuthenticator> {
+/// Opens only the repository-bound key and binding. Callers using an
+/// unauthenticated external locator must verify its MAC before invoking the
+/// repository-global state preflight.
+pub(crate) fn repository_authenticator_key_only(repo: &Path) -> Result<RepositoryAuthenticator> {
     let repository = discover_artifact_repository(repo)?;
+    repository_authenticator_key_only_for(&repository)
+}
+
+pub(crate) fn validate_repository_authenticated_state(
+    repo: &Path,
+    authenticator: &RepositoryAuthenticator,
+) -> Result<()> {
+    let repository = discover_artifact_repository(repo)?;
+    validate_repository_authenticated_state_for(&repository, authenticator)
+}
+
+fn repository_authenticator_key_only_for(
+    repository: &ArtifactRepository,
+) -> Result<RepositoryAuthenticator> {
     let authenticator = RepositoryAuthenticator::open_existing(&repository.common_dir)?;
-    scan_registered_finalization_markers(&repository, Some(&authenticator))?;
     authenticator.verify()?;
     Ok(authenticator)
 }
 
+fn validate_repository_authenticated_state_for(
+    repository: &ArtifactRepository,
+    authenticator: &RepositoryAuthenticator,
+) -> Result<()> {
+    authenticator.verify_epoch()?;
+    scan_registered_finalization_markers(repository, Some(authenticator))?;
+    authenticator.verify_epoch()
+}
+
 fn open_artifact_auth_writer(repository: &ArtifactRepository) -> Result<RepositoryAuthWriter> {
-    let writer = RepositoryAuthWriter::open_or_create(&repository.common_dir, || {
+    let writer = RepositoryAuthWriter::open_or_create(&repository.common_dir, |state_root| {
         if scan_registered_finalization_markers(repository, None)? > 0 {
             bail!(
-                "repository authentication key is missing while an existing artifact finalization marker is present; refusing to establish a replacement key epoch"
+                "repository authentication key is missing while an existing final marker is present; refusing to establish a replacement key epoch"
+            );
+        }
+        if state_root.direct_child_exists(crate::state_journal::JOURNAL_ROOT_NAME)? {
+            bail!(
+                "repository authentication key is missing while checkpoint journals exist; refusing to establish a replacement key epoch"
             );
         }
         Ok(())
@@ -819,7 +849,7 @@ impl ArtifactRunReader {
         }
         validate_finalization(&finalization)?;
         let mac_key = RepositoryAuthenticator::open_existing(&repository.common_dir)?;
-        mac_key.verify()?;
+        mac_key.verify_epoch()?;
         if finalization.mac_key_id != mac_key.binding().repository_id
             || finalization.mac_key_identity != mac_key.binding().key_identity
         {
@@ -832,7 +862,7 @@ impl ArtifactRunReader {
         verify_manifest_contents(&run, finalization.files.iter())?;
         run.verify()?;
         run_root.verify()?;
-        mac_key.verify()?;
+        mac_key.verify_epoch()?;
         Ok(Self { run, finalization })
     }
 

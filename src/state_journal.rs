@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const JOURNAL_FORMAT_VERSION: u32 = 3;
-const JOURNAL_ROOT_NAME: &str = "orchestration-checkpoints-v3";
+pub(crate) const JOURNAL_ROOT_NAME: &str = "orchestration-checkpoints-v3";
 const JOURNAL_ROOT_LOCK: &str = ".journals.lock";
 const RUN_LOCK_NAME: &str = ".resume.lock";
 const HEAD_FILE_NAME: &str = ".head.json";
@@ -93,7 +93,7 @@ pub(crate) struct StateJournal {
 impl StateJournal {
     pub(crate) fn create(authenticator: RepositoryAuthenticator, run_id: &str) -> Result<Self> {
         validate_run_id(run_id)?;
-        authenticator.verify()?;
+        authenticator.verify_epoch()?;
         let journal_root = open_or_create_journal_root(&authenticator)?;
         let root_lock = BoundStateLock::acquire(&journal_root, JOURNAL_ROOT_LOCK)?;
         root_lock.verify(&journal_root)?;
@@ -134,6 +134,7 @@ impl StateJournal {
         expected: &JournalIdentity,
     ) -> Result<Self> {
         validate_identity(expected)?;
+        authenticator.verify_epoch()?;
         authenticator.verify_repository_binding(&expected.repository)?;
         let journal_root = open_existing_journal_root(&authenticator)?;
         let reserved = journal_root
@@ -370,7 +371,7 @@ impl StateJournal {
     }
 
     fn verify_boundaries(&self) -> Result<()> {
-        self.authenticator.verify()?;
+        self.authenticator.verify_epoch()?;
         self.authenticator
             .verify_repository_binding(&self.identity.repository)?;
         self.journal_root.verify()?;

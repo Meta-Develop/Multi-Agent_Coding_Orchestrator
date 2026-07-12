@@ -477,6 +477,26 @@ impl BoundedRegularReader {
             .with_context(|| format!("file is not valid UTF-8: {}", path.display()))
     }
 
+    /// Reads an arbitrary filesystem path component-by-component while
+    /// refusing symbolic links in both ancestors and the final leaf. The
+    /// opened descriptor is identity-stable for the full bounded read.
+    pub fn read_tree_no_follow(path: impl AsRef<Path>, max_bytes: u64) -> Result<Vec<u8>> {
+        let absolute = absolute_normalized(path.as_ref())?;
+        #[cfg(unix)]
+        {
+            let root = Path::new(std::path::MAIN_SEPARATOR_STR);
+            let relative = absolute.strip_prefix(root).with_context(|| {
+                format!("failed to make path root-relative: {}", absolute.display())
+            })?;
+            Self::read_relative(root, relative, max_bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (absolute, max_bytes);
+            bail!("component-wise no-follow reads are unsupported on this platform")
+        }
+    }
+
     pub fn read_direct(
         root: &SafeRoot,
         file_name: impl AsRef<OsStr>,
