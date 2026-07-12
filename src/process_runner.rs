@@ -4637,6 +4637,12 @@ fn verify_systemd_sandbox_properties(
 }
 
 #[cfg(target_os = "linux")]
+fn is_exact_isolated_host_view_property(value: &str) -> bool {
+    let mut entries = value.split_whitespace();
+    entries.next() == Some("/:ro") && entries.next().is_none()
+}
+
+#[cfg(target_os = "linux")]
 fn verify_isolated_host_view_property(
     sandbox: &ResolvedSystemdSandbox,
     properties: &BTreeMap<String, String>,
@@ -4652,17 +4658,12 @@ fn verify_isolated_host_view_property(
             ))
         };
     }
-    let exact_root = value.split_whitespace().any(|entry| {
-        let mut parts = entry.split(':');
-        parts.next() == Some("/")
-            && parts.any(|option| option.split(',').any(|value| value == "ro"))
-    });
-    if exact_root {
+    if is_exact_isolated_host_view_property(value) {
         Ok(())
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "effective TemporaryFileSystem omitted the isolated read-only root",
+            "effective TemporaryFileSystem did not exactly match the isolated read-only root",
         ))
     }
 }
@@ -7918,6 +7919,36 @@ mod tests {
         assert!(command
             .get_args()
             .any(|arg| arg == OsStr::new("--property=TemporaryFileSystem=/:ro")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_root_property_requires_exact_single_read_only_root() {
+        for value in ["/:ro", "  /:ro\n"] {
+            assert!(
+                is_exact_isolated_host_view_property(value),
+                "expected exact isolated root property: {value:?}"
+            );
+        }
+
+        for value in [
+            "",
+            "/tmp:ro",
+            "/:ro /etc:ro",
+            "/:ro /etc:rw",
+            "/:ro /:ro",
+            "/:rw",
+            "/:ro,rw",
+            "/:rw,ro",
+            "/:ro,nodev",
+            "/:",
+            "/",
+        ] {
+            assert!(
+                !is_exact_isolated_host_view_property(value),
+                "unexpectedly accepted isolated root property: {value:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
