@@ -90,6 +90,15 @@ impl SecureOutputRoot {
 
     /// Creates a private direct child and returns it as another descriptor-held root.
     pub(crate) fn create_child(&self, name: &OsStr) -> Result<Self> {
+        self.create_child_impl(name, false)
+    }
+
+    #[cfg(test)]
+    fn create_child_failing_after_open(&self, name: &OsStr) -> Result<Self> {
+        self.create_child_impl(name, true)
+    }
+
+    fn create_child_impl(&self, name: &OsStr, fail_after_open: bool) -> Result<Self> {
         #[cfg(unix)]
         {
             self.verify_path_identity()?;
@@ -105,22 +114,56 @@ impl SecureOutputRoot {
                     )
                 });
             }
-            let directory =
-                openat_directory(self.directory.as_raw_fd(), &name_c).with_context(|| {
-                    format!(
-                        "failed to open secure output child {}",
-                        self.path.join(name).display()
-                    )
-                })?;
-            let metadata = directory.metadata()?;
+            self.directory.sync_all().with_context(|| {
+                format!(
+                    "failed to flush secure output parent {}",
+                    self.path.display()
+                )
+            })?;
+            let directory = match openat_directory(self.directory.as_raw_fd(), &name_c) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to open secure output child {}",
+                            self.path.join(name).display()
+                        )
+                    })
+                }
+            };
+            let prepared = (|| -> Result<(u64, u64)> {
+                if fail_after_open {
+                    bail!("synthetic secure child setup failure after open");
+                }
+                let metadata = directory.metadata()?;
+                let path = self.path.join(name);
+                validate_private_directory(&metadata, &path)?;
+                use std::os::unix::fs::MetadataExt;
+                Ok((metadata.dev(), metadata.ino()))
+            })();
+            let (device, inode) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    cleanup_created_directory(
+                        &self.directory,
+                        &name_c,
+                        &directory,
+                        &self.path.join(name),
+                    )?;
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to finish secure output child {}",
+                            self.path.join(name).display()
+                        )
+                    });
+                }
+            };
             let path = self.path.join(name);
-            validate_private_directory(&metadata, &path)?;
-            use std::os::unix::fs::MetadataExt;
             return Ok(Self {
                 path,
                 directory,
-                device: metadata.dev(),
-                inode: metadata.ino(),
+                device,
+                inode,
             });
         }
         #[cfg(not(unix))]
@@ -149,9 +192,9 @@ impl SecureOutputRoot {
                 self.path.display()
             )
         })?;
-        if root == workspace || root.starts_with(&workspace) {
+        if root == workspace || root.starts_with(&workspace) || workspace.starts_with(&root) {
             bail!(
-                "secure output root {} may not be inside child-writable workspace {}",
+                "secure output root {} may not overlap child-writable workspace {}",
                 root.display(),
                 workspace.display()
             );
@@ -195,6 +238,18 @@ impl SecureOutputRoot {
             let file = unsafe { File::from_raw_fd(fd) };
             let metadata = file.metadata()?;
             validate_private_file(&metadata, &self.path.join(name))?;
+            file.sync_all().with_context(|| {
+                format!(
+                    "failed to flush reserved secure output {}",
+                    self.path.join(name).display()
+                )
+            })?;
+            self.directory.sync_all().with_context(|| {
+                format!(
+                    "failed to flush secure output directory {}",
+                    self.path.display()
+                )
+            })?;
             use std::os::unix::fs::MetadataExt;
             let slot = ReservedOutputFile {
                 path: self.path.join(name),
@@ -241,7 +296,7 @@ impl ReservedOutputFile {
 
     /// Reads from the descriptor captured before child execution. No pathname is reopened.
     pub(crate) fn read_bounded(&self, max_bytes: usize) -> Result<Vec<u8>> {
-        self.verify_held_file()?;
+        self.verify_path_identity()?;
         let metadata = self.file.metadata()?;
         if metadata.len() > max_bytes as u64 {
             bail!(
@@ -261,7 +316,7 @@ impl ReservedOutputFile {
                 self.path.display()
             );
         }
-        self.verify_held_file()?;
+        self.verify_path_identity()?;
         Ok(bytes)
     }
 
@@ -475,6 +530,12 @@ fn walk_directory_tree(path: &Path, create_final: bool) -> Result<File> {
                         format!("failed to create secure output root {}", absolute.display())
                     });
                 }
+                current.sync_all().with_context(|| {
+                    format!(
+                        "failed to flush parent after creating secure output root {}",
+                        absolute.display()
+                    )
+                })?;
                 current = openat_directory(current.as_raw_fd(), &name)?;
             }
             Err(error) => {
@@ -503,6 +564,55 @@ fn openat_directory(parent: RawFd, name: &CString) -> std::io::Result<File> {
         // SAFETY: `openat` returned an owned descriptor.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
+}
+
+#[cfg(unix)]
+fn cleanup_created_directory(
+    parent: &File,
+    name: &CString,
+    directory: &File,
+    display_path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let expected = directory.metadata()?;
+    // SAFETY: storage is initialized and the descriptor/name are valid.
+    let mut actual = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut actual,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to inspect failed secure child {}",
+                display_path.display()
+            )
+        });
+    }
+    if actual.st_dev as u64 != expected.dev()
+        || actual.st_ino as u64 != expected.ino()
+        || (actual.st_mode & libc::S_IFMT) != libc::S_IFDIR
+    {
+        bail!(
+            "refusing to clean up rebound secure child {}",
+            display_path.display()
+        );
+    }
+    // SAFETY: `AT_REMOVEDIR` removes only an empty directory and never follows a symlink.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to clean up incomplete secure child {}",
+                display_path.display()
+            )
+        });
+    }
+    parent.sync_all()?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -617,6 +727,45 @@ mod tests {
         let slot = root.reserve(OsStr::new("child.json"))?;
         std::fs::hard_link(slot.path(), root.path().join("extra-link"))?;
         assert!(slot.read_bounded(1024).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn held_fd_read_rejects_renamed_leaf_and_same_name_rebind() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        let slot = root.reserve(OsStr::new("child.json"))?;
+        std::fs::rename(slot.path(), root.path().join("moved.json"))?;
+        std::fs::write(slot.path(), "attacker replacement")?;
+        std::fs::set_permissions(slot.path(), std::fs::Permissions::from_mode(0o600))?;
+        assert!(slot.read_bounded(1024).is_err());
+        assert_eq!(std::fs::read(slot.path())?, b"attacker replacement");
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_workspace_contained_by_output_root() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        let workspace = root.path().join("child-workspace");
+        std::fs::create_dir(&workspace)?;
+        assert!(root.reject_inside(&workspace).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_child_setup_cleans_identity_bound_directory_for_retry() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        assert!(root
+            .create_child_failing_after_open(OsStr::new("incoming"))
+            .is_err());
+        assert!(!root.path().join("incoming").exists());
+        let child = root.create_child(OsStr::new("incoming"))?;
+        assert!(child.path().is_dir());
         Ok(())
     }
 
