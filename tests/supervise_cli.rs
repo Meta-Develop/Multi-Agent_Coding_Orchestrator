@@ -164,6 +164,12 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
     let final_report =
         repo_path.join(".maco/o2/runs/deterministic-shape/reports/supervisor-final.json");
     assert!(final_report.exists());
+    let run_root = repo_path.join(".maco/o2/runs/deterministic-shape");
+    assert!(run_root.join(".maco-artifact-final.json").exists());
+    assert!(!run_root.join("incoming").exists());
+    assert!(!run_root.join("capture").exists());
+    assert!(run_root.join("evidence/incoming/child-a.json").exists());
+    assert!(run_root.join("evidence/incoming/child-b.json").exists());
 
     let claims = run_success_json(&["sync", "status", "--repo", path_str(&repo_path)?, "--json"])?;
     assert!(claims.as_array().context("claim status")?.is_empty());
@@ -324,6 +330,14 @@ fn supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable() -> Resul
     ])?;
     assert_eq!(status["final_report_exists"], true);
     assert_eq!(status["final_report"]["publishable"], false);
+    assert_eq!(status["repo"], ".");
+    assert_eq!(status["run_dir"], ".maco/o2/runs/artifact-run");
+    assert_eq!(status["final_report"]["repo"], ".");
+    assert_eq!(status["final_report"]["plan_file"], "<external-plan>");
+    assert_eq!(
+        status["final_report"]["run_dir"],
+        ".maco/o2/runs/artifact-run"
+    );
     Ok(())
 }
 
@@ -409,6 +423,10 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
     assert_eq!(listed["runs"][0]["run_id"], run_id);
     assert_eq!(listed["runs"][0]["final_report_status"], "succeeded");
     assert_eq!(listed["runs"][0]["final_report_success"], true);
+    assert_eq!(listed["runs"][0]["finalized"], true);
+    assert_eq!(listed["runs"][0]["publishable"], false);
+    assert_eq!(listed["runs"][0]["provenance_valid"], true);
+    assert_eq!(listed["runs"][0]["artifact_digests_verified"], true);
 
     let reused = run_failure_json(&[
         "supervise",
@@ -427,6 +445,62 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
         .as_str()
         .context("reuse message")?
         .contains("already exists"));
+    Ok(())
+}
+
+#[test]
+fn supervise_prune_deletes_only_finalized_old_runs() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("prune-plan.json");
+    write_simple_plan(&plan_path, "prune-child")?;
+    for run_id in ["prune-old", "prune-new"] {
+        let report = run_success_json(&[
+            "supervise",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            run_id,
+            "--runtime",
+            "fake",
+            "--json",
+        ])?;
+        assert_eq!(report["success"], true);
+        assert!(repo_path
+            .join(".maco/o2/runs")
+            .join(run_id)
+            .join(".maco-artifact-final.json")
+            .exists());
+    }
+
+    let prune = run_success_json(&[
+        "supervise",
+        "artifacts",
+        "prune",
+        "--repo",
+        path_str(&repo_path)?,
+        "--keep",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(prune["delete_candidate_count"], 1);
+    assert_eq!(prune["deleted_count"], 1);
+    assert_eq!(prune["refused_unfinalized_count"], 0);
+
+    let listed = run_success_json(&[
+        "supervise",
+        "artifacts",
+        "list",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let runs = listed["runs"].as_array().context("listed supervise runs")?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["finalized"], true);
+    assert_eq!(runs[0]["publishable"], false);
     Ok(())
 }
 
@@ -585,7 +659,10 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
             .as_str()
             .is_some_and(|message| message.contains("refusing to reuse stale child worktree"))));
     assert!(!repo_path
-        .join(".maco/o2/runs/clean-stale/incoming/child-clean.json")
+        .join(".maco/o2/runs/clean-stale/evidence/incoming/child-clean.json")
+        .exists());
+    assert!(repo_path
+        .join(".maco/o2/runs/clean-stale/.maco-artifact-final.json")
         .exists());
     Ok(())
 }

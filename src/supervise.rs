@@ -1030,6 +1030,16 @@ struct ChildAttemptArtifacts {
     command_record_relative: PathBuf,
 }
 
+struct ExternalAttemptEvidenceContext<'a> {
+    incoming_scratch: &'a ArtifactScratchDirectory,
+    capture_scratch: &'a ArtifactScratchDirectory,
+    artifacts: &'a ChildAttemptArtifacts,
+    external_run: &'a ExternalAgentRun,
+    external_command: &'a ExternalAgentCommand,
+    raw_report_validated: bool,
+    runtime: SupervisorRuntime,
+}
+
 #[derive(Debug, Clone)]
 struct ChildAttemptHistory {
     attempt: usize,
@@ -1143,8 +1153,8 @@ fn run_supervisor_plan_with_runner(
     let run_dir = artifact_writer.run_dir().to_path_buf();
     let dirs = RunDirs::for_writer(&artifact_writer);
     let manager = WorktreeManager::new(&repo);
-    let sync_store = SyncStore::open(&repo)?;
-    let semantic_store = SemanticIntentStore::open(&repo)?;
+    let mut sync_store_slot = None;
+    let mut semantic_store_slot = None;
     let mut acquired_claim_tokens = Vec::new();
     let mut acquired_semantic_tokens = Vec::new();
     let mut planned_semantic_intents = Vec::new();
@@ -1185,6 +1195,14 @@ fn run_supervisor_plan_with_runner(
             &mut artifact_writer,
             Path::new("schemas/auditor-report.schema.json"),
         )?;
+        sync_store_slot = Some(SyncStore::open(&repo)?);
+        semantic_store_slot = Some(SemanticIntentStore::open(&repo)?);
+        let sync_store = sync_store_slot
+            .as_ref()
+            .context("supervisor sync store was not initialized")?;
+        let semantic_store = semantic_store_slot
+            .as_ref()
+            .context("supervisor semantic store was not initialized")?;
 
         let baseline = primary_worktree_snapshot(&repo, execution_runtime)?;
         if let Some(error) = baseline.inspection_problem() {
@@ -1235,7 +1253,7 @@ fn run_supervisor_plan_with_runner(
             {
                 Ok(claim) => claim,
                 Err(error) => {
-                    findings.push(claim_failure_finding(&sync_store, assignment, &error));
+                    findings.push(claim_failure_finding(sync_store, assignment, &error));
                     return Err(error)
                         .with_context(|| format!("failed to claim paths for '{}'", assignment.id));
                 }
@@ -1243,7 +1261,7 @@ fn run_supervisor_plan_with_runner(
             acquired_claim_tokens.push(claim.token);
 
             let semantic_token = coordinate_semantic_assignment(
-                &semantic_store,
+                semantic_store,
                 assignment,
                 plan.semantic_coordination,
                 &mut acquired_semantic_tokens,
@@ -1418,13 +1436,15 @@ fn run_supervisor_plan_with_runner(
                 .is_ok();
                 import_external_attempt_evidence(
                     &mut artifact_writer,
-                    &incoming_scratch,
-                    &capture_scratch,
-                    &attempt_artifacts,
-                    &external_run,
-                    &command,
-                    raw_report_validated,
-                    runtime,
+                    ExternalAttemptEvidenceContext {
+                        incoming_scratch: &incoming_scratch,
+                        capture_scratch: &capture_scratch,
+                        artifacts: &attempt_artifacts,
+                        external_run: &external_run,
+                        external_command: &command,
+                        raw_report_validated,
+                        runtime,
+                    },
                 )?;
                 let primary_after = primary_worktree_snapshot(&repo, execution_runtime)?;
                 let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
@@ -1663,13 +1683,15 @@ fn run_supervisor_plan_with_runner(
                 .is_ok();
                 import_external_attempt_evidence(
                     &mut artifact_writer,
-                    &auditor_incoming_scratch,
-                    &auditor_capture_scratch,
-                    &auditor_artifacts,
-                    &auditor_run,
-                    &auditor_command,
-                    raw_auditor_validated,
-                    runtime,
+                    ExternalAttemptEvidenceContext {
+                        incoming_scratch: &auditor_incoming_scratch,
+                        capture_scratch: &auditor_capture_scratch,
+                        artifacts: &auditor_artifacts,
+                        external_run: &auditor_run,
+                        external_command: &auditor_command,
+                        raw_report_validated: raw_auditor_validated,
+                        runtime,
+                    },
                 )?;
                 let primary_after_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
                 let primary_auditor_changes =
@@ -1736,9 +1758,14 @@ fn run_supervisor_plan_with_runner(
         });
     }
 
-    let (released_claims, release_errors) = release_claims(&sync_store, acquired_claim_tokens);
-    let (released_semantic_intents, semantic_release_errors) =
-        release_semantic_intents(&semantic_store, acquired_semantic_tokens);
+    let (released_claims, release_errors) = match sync_store_slot.as_ref() {
+        Some(store) => release_claims(store, acquired_claim_tokens),
+        None => (Vec::new(), Vec::new()),
+    };
+    let (released_semantic_intents, semantic_release_errors) = match semantic_store_slot.as_ref() {
+        Some(store) => release_semantic_intents(store, acquired_semantic_tokens),
+        None => (Vec::new(), Vec::new()),
+    };
     let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
         Some(baseline) => match primary_worktree_snapshot(&repo, execution_runtime) {
             Ok(final_snapshot) => {
@@ -3932,14 +3959,17 @@ fn read_auditor_report(
 
 fn import_external_attempt_evidence(
     writer: &mut ArtifactRunWriter,
-    incoming_scratch: &ArtifactScratchDirectory,
-    capture_scratch: &ArtifactScratchDirectory,
-    artifacts: &ChildAttemptArtifacts,
-    external_run: &ExternalAgentRun,
-    external_command: &ExternalAgentCommand,
-    raw_report_validated: bool,
-    runtime: SupervisorRuntime,
+    context: ExternalAttemptEvidenceContext<'_>,
 ) -> Result<()> {
+    let ExternalAttemptEvidenceContext {
+        incoming_scratch,
+        capture_scratch,
+        artifacts,
+        external_run,
+        external_command,
+        raw_report_validated,
+        runtime,
+    } = context;
     let import_result = (|| -> Result<()> {
         if raw_report_validated {
             if let Some(contents) = external_run.output_last_message() {
@@ -4033,9 +4063,7 @@ fn external_process_quiescent_for_scratch(
     runtime: SupervisorRuntime,
 ) -> bool {
     match runtime {
-        SupervisorRuntime::Codex => run
-            .process_tree
-            .is_some_and(ProcessTreeEvidence::is_verified_empty),
+        SupervisorRuntime::Codex => run.scratch_quiescence_verified(),
         // Fake mode is an in-process serializer and never launches a child.
         SupervisorRuntime::Fake => true,
     }
@@ -5305,13 +5333,15 @@ mod tests {
         let external_run = deterministic_fake_run(&command, child_bytes.clone());
         import_external_attempt_evidence(
             &mut writer,
-            &incoming,
-            &capture,
-            &artifacts,
-            &external_run,
-            &command,
-            true,
-            SupervisorRuntime::Fake,
+            ExternalAttemptEvidenceContext {
+                incoming_scratch: &incoming,
+                capture_scratch: &capture,
+                artifacts: &artifacts,
+                external_run: &external_run,
+                external_command: &command,
+                raw_report_validated: true,
+                runtime: SupervisorRuntime::Fake,
+            },
         )
         .expect("import held evidence and discard scratches");
 
@@ -5339,6 +5369,67 @@ mod tests {
             .expect("open finalized supervise artifacts");
         let restored = read_supervisor_final_report(&reader).expect("read finalized report");
         assert_eq!(restored.run_id, run_id);
+    }
+
+    #[test]
+    fn attempted_unverified_target_preserves_both_scratches_and_has_no_marker() {
+        let (_temp, repo_path) = injected_repository();
+        let run_id = RunId::new("artifact-unverified-target").expect("valid run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            run_id,
+            "supervise-test",
+        )
+        .expect("reserve supervise artifact run");
+        let dirs = RunDirs::for_writer(&writer);
+        let (incoming, capture) =
+            create_invocation_scratches(&mut writer).expect("reserve invocation scratches");
+        let artifacts = child_attempt_artifacts(
+            &dirs,
+            incoming.path(),
+            capture.path(),
+            "child-unverified",
+            1,
+            false,
+        );
+        let command = ExternalAgentCommand::codex(
+            "unused-codex",
+            &repo_path,
+            &artifacts.prompt_path,
+            &artifacts.log_path,
+            &artifacts.report_path,
+            Duration::from_secs(1),
+        );
+        let assignment = injected_assignment(false);
+        let child_bytes =
+            serde_json::to_vec(&injected_child_report(&assignment)).expect("serialize report");
+        fs::write(&artifacts.report_path, &child_bytes).expect("write incoming report");
+        fs::write(&artifacts.log_path, b"unverified capture\n").expect("write capture");
+        let mut run = deterministic_fake_run(&command, child_bytes);
+        run.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+        run.process_tree = Some(ProcessTreeEvidence::Unverified(
+            ContainmentBackend::SystemdUserService,
+        ));
+        let run = injected_target_attempted(run);
+
+        let error = import_external_attempt_evidence(
+            &mut writer,
+            ExternalAttemptEvidenceContext {
+                incoming_scratch: &incoming,
+                capture_scratch: &capture,
+                artifacts: &artifacts,
+                external_run: &run,
+                external_command: &command,
+                raw_report_validated: true,
+                runtime: SupervisorRuntime::Codex,
+            },
+        )
+        .expect_err("unverified launched target must keep scratch evidence");
+        assert!(error.to_string().contains("verified process quiescence"));
+        assert!(incoming.path().exists());
+        assert!(capture.path().exists());
+        assert!(!dirs.run_dir.join(ARTIFACT_FINALIZATION_MARKER).exists());
     }
 
     #[cfg(unix)]
@@ -5586,7 +5677,7 @@ mod tests {
                     serde_json::to_vec(&child_report(id)).expect("serialize child report")
                 };
                 fs::write(&command.output_last_message, &contents).expect("write injected report");
-                ExternalAgentRun {
+                let run = ExternalAgentRun {
                     command: vec!["injected-runner".to_string()],
                     cwd: command.cwd.clone(),
                     timeout_seconds: command.timeout.as_secs(),
@@ -5616,7 +5707,8 @@ mod tests {
                     stderr: CapturedOutput::default(),
                     error: None,
                     output_last_message: Some(contents),
-                }
+                };
+                injected_target_attempted(run)
             };
 
             run_supervisor_plan_with_runner(
@@ -7075,6 +7167,16 @@ mod tests {
             )]),
             inspection_error: None,
         }
+    }
+
+    fn injected_target_attempted(run: ExternalAgentRun) -> ExternalAgentRun {
+        let output_last_message = run.output_last_message.clone();
+        let mut launched: ExternalAgentRun = serde_json::from_value(
+            serde_json::to_value(&run).expect("serialize injected launched run"),
+        )
+        .expect("restore injected launched run");
+        launched.output_last_message = output_last_message;
+        launched
     }
 
     fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
