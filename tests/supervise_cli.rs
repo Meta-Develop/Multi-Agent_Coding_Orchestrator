@@ -1777,6 +1777,340 @@ fn supervise_run_rejects_split_index_storage_transition() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn supervise_run_accepts_stable_preexisting_split_index_and_detects_its_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_git(&repo_path, &["update-index", "--split-index"])?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let stable = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-no-mutation",
+        "supervise-primary-split-index-stable",
+        false,
+        true,
+    )?;
+    assert_eq!(stable["success"], true);
+
+    let mutated = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-split-index-mutation",
+        "supervise-primary-split-index-mutated",
+        false,
+        false,
+    )?;
+    assert_finding(
+        &mutated["orchestrator_reports"][0]["findings"],
+        "error",
+        "raw worktree index or split-index storage changed",
+        ".git/index",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn supervise_run_accepts_stable_sparse_index_and_detects_sparse_directory_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::create_dir_all(repo_path.join("other")).context("create sparse-only directory")?;
+    fs::write(repo_path.join("other/hidden.txt"), "sparse baseline\n")
+        .context("write sparse-only file")?;
+    let repo = Repository::open(&repo_path).context("open sparse repo")?;
+    commit_all(&repo, "add sparse-only content")?;
+    run_git(
+        &repo_path,
+        &["sparse-checkout", "init", "--cone", "--sparse-index"],
+    )?;
+    run_git(&repo_path, &["sparse-checkout", "set", "src"])?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let stable = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-no-mutation",
+        "supervise-primary-sparse-index-stable",
+        false,
+        true,
+    )?;
+    assert_eq!(stable["success"], true);
+
+    let mutated = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-sparse-directory",
+        "supervise-primary-sparse-directory-mutated",
+        false,
+        false,
+    )?;
+    assert_finding(
+        &mutated["orchestrator_reports"][0]["findings"],
+        "error",
+        "other",
+        "other/",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_nested_repository_gitdir_cycle_before_child_launch() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::create_dir(repo_path.join("cycle")).context("create cyclic gitlink directory")?;
+    fs::write(repo_path.join("cycle/.git"), "gitdir: ../.git\n")
+        .context("point nested Git directory at primary Git directory")?;
+    let repo = Repository::open(&repo_path).context("open cyclic repo")?;
+    let head = repo
+        .head()
+        .context("read cyclic repo head")?
+        .peel_to_commit()
+        .context("peel cyclic repo head")?
+        .id()
+        .to_string();
+    run_git(
+        &repo_path,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},cycle"),
+        ],
+    )?;
+    run_git(
+        &repo_path,
+        &[
+            "-c",
+            "user.name=maco test",
+            "-c",
+            "user.email=maco-test@example.invalid",
+            "commit",
+            "-m",
+            "add cyclic gitlink",
+        ],
+    )?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-no-mutation",
+        "supervise-primary-gitdir-cycle",
+        true,
+        false,
+    )?;
+    let found = report["findings"]
+        .as_array()
+        .context("cycle findings")?
+        .iter()
+        .any(|finding| {
+            finding["severity"] == "error"
+                && finding["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("nested repository cycle")
+        });
+    if !found {
+        anyhow::bail!("missing nested repository cycle finding: {report}");
+    }
+    assert!(!repo_path
+        .join(".maco/o2/runs/supervise-primary-gitdir-cycle/logs/child-primary-no-mutation.jsonl")
+        .exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let decoy_path = temp.path().join("decoy");
+    Repository::init(&decoy_path).context("init decoy repository")?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("ambient-git-plan.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "ignore ambient Git repository redirects",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-no-mutation", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+    let output = Command::new(BIN)
+        .args(["supervise", "run"])
+        .arg(&plan_path)
+        .arg("--repo")
+        .arg(&repo_path)
+        .args(["--run-id", "supervise-ambient-git-env", "--codex-bin"])
+        .arg(&fake_codex)
+        .arg("--json")
+        .env("GIT_DIR", decoy_path.join(".git"))
+        .env("GIT_WORK_TREE", &decoy_path)
+        .env("GIT_INDEX_FILE", temp.path().join("ambient-index"))
+        .env("GIT_COMMON_DIR", decoy_path.join(".git"))
+        .output()
+        .context("run supervise with ambient Git redirects")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ambient Git redirect run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let report: Value = serde_json::from_slice(&output.stdout).context("parse ambient report")?;
+    assert_eq!(report["success"], true);
+    Ok(())
+}
+
+#[test]
+fn supervise_run_protects_primary_during_parent_auditor_invocation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-auditor-primary-mutation",
+        "supervise-auditor-primary-mutation",
+        false,
+        false,
+    )?;
+    assert_finding(
+        &report["orchestrator_reports"][0]["audit_reports"][0]["findings"],
+        "error",
+        "primary worktree integrity changed during parent review auditor",
+        "README.md",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn supervise_run_final_quiescence_detects_delayed_background_primary_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+    let plan_path = temp.path().join("supervise-primary-delayed-mutation.json");
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "detect a delayed primary mutation or tear down its producer",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "child_timeout_seconds": 10,
+          "assignments": [
+            {"id": "child-primary-delayed-mutation", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+    let output = Command::new(BIN)
+        .args(["supervise", "run"])
+        .arg(&plan_path)
+        .arg("--repo")
+        .arg(&repo_path)
+        .args([
+            "--run-id",
+            "supervise-primary-delayed-mutation",
+            "--codex-bin",
+        ])
+        .arg(&fake_codex)
+        .arg("--json")
+        .output()
+        .context("run delayed primary mutation case")?;
+    let report: Value =
+        serde_json::from_slice(&output.stdout).context("parse delayed primary mutation report")?;
+    let primary_mutated = fs::read_to_string(repo_path.join("README.md"))
+        .context("read primary after delayed mutation case")?
+        .contains("delayed primary mutation");
+    if primary_mutated {
+        assert!(!output.status.success());
+        assert_eq!(report["success"], false);
+        assert_finding(
+            &report["findings"],
+            "error",
+            "final acceptance",
+            "README.md",
+        )?;
+    } else {
+        assert!(output.status.success());
+        assert_eq!(report["success"], true);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn supervise_run_serializes_non_utf8_repo_root_in_final_json() -> Result<()> {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = temp.path().join(OsString::from_vec(b"repo-\x80".to_vec()));
+    fs::create_dir_all(repo_path.join("src")).context("create non-UTF-8 repo")?;
+    let repo = Repository::init(&repo_path).context("init non-UTF-8 repo")?;
+    fs::write(repo_path.join(".gitignore"), ".maco/\n").context("write gitignore")?;
+    fs::write(repo_path.join("README.md"), "# Smoke\n").context("write readme")?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub fn ok() -> bool { true }\n",
+    )
+    .context("write lib")?;
+    commit_all(&repo, "initial commit")?;
+    let plan_path = temp.path().join("non-utf8-root-plan.json");
+    let fake_codex = write_fake_codex(temp.path())?;
+    write_plan(
+        &plan_path,
+        r#"{
+          "version": 1,
+          "task": "serialize a non-UTF-8 repository root",
+          "max_depth": 2,
+          "max_child_processes": 1,
+          "assignments": [
+            {"id": "child-primary-no-mutation", "assigned_paths": ["README.md"]}
+          ]
+        }"#,
+    )?;
+
+    let output = Command::new(BIN)
+        .args(["supervise", "run"])
+        .arg(&plan_path)
+        .arg("--repo")
+        .arg(&repo_path)
+        .args(["--run-id", "supervise-non-utf8-root", "--codex-bin"])
+        .arg(&fake_codex)
+        .arg("--json")
+        .output()
+        .context("run supervise in non-UTF-8 repo")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "non-UTF-8 root run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = std::str::from_utf8(&output.stdout).context("final JSON must be UTF-8")?;
+    assert!(stdout.is_ascii());
+    assert!(!stdout.contains('\u{fffd}'));
+    let report: Value = serde_json::from_str(stdout).context("parse non-UTF-8 root report")?;
+    assert_eq!(report["success"], true);
+    assert!(report["repo"]
+        .as_str()
+        .context("serialized repo path")?
+        .starts_with("<non-utf8-git-path>/"));
+    assert!(report["run_dir"]
+        .as_str()
+        .context("serialized run directory")?
+        .starts_with("<non-utf8-git-path>/"));
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn supervise_run_rejects_preexisting_dirty_submodule_content_mutation() -> Result<()> {
@@ -3323,6 +3657,16 @@ case "$prompt_body" in
     prompt_from_stdin=false
     ;;
 esac
+common_dir="$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)"
+primary_from_worktree="${common_dir%/.git}"
+case "$report" in
+  "$primary_from_worktree"/*)
+    ;;
+  */.maco/o2/runs/*)
+    run_relative="${report#*/.maco/o2/runs/}"
+    report="$primary_from_worktree/.maco/o2/runs/$run_relative"
+    ;;
+esac
 name="$(basename "$report" .json)"
 logical_name="$name"
 case "$logical_name" in
@@ -3486,6 +3830,10 @@ JSON
       path="README.md"
       worker="child-primary-mid-commit"
       ;;
+    child-auditor-primary-mutation)
+      path="README.md"
+      worker="child-auditor-primary-mutation"
+      ;;
     *)
       path="README.md"
       worker="worker-a"
@@ -3493,6 +3841,10 @@ JSON
   esac
   if [ -z "${reviewed_paths_json:-}" ]; then
     reviewed_paths_json='["'"$path"'"]'
+  fi
+  if [ "$name" = "child-auditor-primary-mutation-review-auditor" ]; then
+    primary="${report%%/.maco/o2/runs/*}"
+    printf '\nprimary mutation from parent auditor %s\n' "$name" >> "$primary/README.md"
   fi
   if [ "$name" = "child-auditor-missing-review-auditor" ]; then
     exit 0
@@ -3662,7 +4014,7 @@ case "$logical_name" in
     files_changed_json='[]'
     worker_reports_json='[]'
     ;;
-  child-primary-assume-unchanged|child-primary-skip-worktree|child-primary-index-metadata|child-primary-split-index|child-primary-dirty-submodule|child-primary-non-utf8)
+  child-primary-assume-unchanged|child-primary-skip-worktree|child-primary-index-metadata|child-primary-split-index|child-primary-split-index-mutation|child-primary-sparse-directory|child-primary-delayed-mutation|child-primary-dirty-submodule|child-primary-non-utf8)
     path="README.md"
     edit_path="README.md"
     worker="worker-$logical_name"
@@ -3723,6 +4075,12 @@ case "$logical_name" in
     path="README.md"
     edit_path="README.md"
     worker="worker-primary-mid-commit"
+    worker_reports_json='[]'
+    ;;
+  child-auditor-primary-mutation)
+    path="README.md"
+    edit_path="README.md"
+    worker="child-auditor-primary-mutation"
     worker_reports_json='[]'
     ;;
   child-clean)
@@ -3796,6 +4154,19 @@ fi
 if [ "$logical_name" = "child-primary-split-index" ]; then
   primary="${report%%/.maco/o2/runs/*}"
   git -C "$primary" update-index --split-index
+fi
+if [ "$logical_name" = "child-primary-split-index-mutation" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  git -C "$primary" update-index --no-split-index
+fi
+if [ "$logical_name" = "child-primary-sparse-directory" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  mkdir -p "$primary/other"
+  printf 'vivified sparse content from %s\n' "$name" > "$primary/other/hidden.txt"
+fi
+if [ "$logical_name" = "child-primary-delayed-mutation" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  (sleep 0.1; printf '\ndelayed primary mutation from %s\n' "$name" >> "$primary/README.md") >/dev/null 2>&1 &
 fi
 if [ "$logical_name" = "child-primary-dirty-submodule" ]; then
   primary="${report%%/.maco/o2/runs/*}"

@@ -9,17 +9,20 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{
-    Delta, DiffFindOptions, DiffOptions, ErrorCode, IndexEntryExtendedFlag, IndexEntryFlag,
-    ObjectType, Oid, Repository, Status, StatusOptions,
+    Delta, DiffFindOptions, DiffOptions, ErrorCode, ObjectType, Oid, Repository, Status,
+    StatusOptions,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::OsStr,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,7 +33,9 @@ const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
-const MAX_NESTED_REPOSITORY_DEPTH: usize = 8;
+const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
+const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
+const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".maco",
     b".maco-cache",
@@ -54,7 +59,11 @@ pub struct SupervisorPlan {
     pub version: u32,
     #[serde(default)]
     pub task: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_path"
+    )]
     pub task_file: Option<PathBuf>,
     #[serde(default = "default_max_depth")]
     pub max_depth: u8,
@@ -110,7 +119,7 @@ pub struct OrchestratorAssignment {
     pub id: String,
     #[serde(default = "child_orchestrator_role")]
     pub role: AgentRole,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
     pub semantic_symbols: Vec<String>,
@@ -129,7 +138,7 @@ pub struct WorkerAssignment {
     pub id: String,
     #[serde(default = "worker_role")]
     pub role: AgentRole,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
     pub semantic_symbols: Vec<String>,
@@ -137,7 +146,11 @@ pub struct WorkerAssignment {
     pub semantic_modules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_path"
+    )]
     pub report_path: Option<PathBuf>,
 }
 
@@ -154,7 +167,7 @@ pub enum AgentRole {
 pub struct WorkerReport {
     pub id: String,
     pub role: AgentRole,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
     pub semantic_symbols: Vec<String>,
@@ -166,7 +179,7 @@ pub struct WorkerReport {
     pub semantic_intent_token: Option<u64>,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub files_changed: Vec<PathBuf>,
     #[serde(default)]
     pub validation_results: Vec<ValidationResult>,
@@ -189,7 +202,7 @@ pub struct AuditorReport {
     pub role: AgentRole,
     #[serde(default)]
     pub reviewed_worker_ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub reviewed_paths: Vec<PathBuf>,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
@@ -214,7 +227,7 @@ pub struct AuditorReport {
 pub struct OrchestratorReviewReport {
     pub id: String,
     pub role: AgentRole,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
     pub semantic_symbols: Vec<String>,
@@ -226,7 +239,7 @@ pub struct OrchestratorReviewReport {
     pub semantic_intent_token: Option<u64>,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub files_changed: Vec<PathBuf>,
     #[serde(default)]
     pub validation_results: Vec<ValidationResult>,
@@ -250,14 +263,17 @@ pub struct SupervisorFinalReport {
     pub version: u32,
     pub run_id: RunId,
     pub role: AgentRole,
+    #[serde(serialize_with = "serialize_path")]
     pub repo: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
     pub plan_file: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
     pub run_dir: PathBuf,
     pub success: bool,
     pub accepted: bool,
     pub rejected: bool,
     pub status: ReviewStatus,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
     pub semantic_symbols: Vec<String>,
@@ -269,7 +285,7 @@ pub struct SupervisorFinalReport {
     pub semantic_intent_tokens: Vec<u64>,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub files_changed: Vec<PathBuf>,
     #[serde(default)]
     pub validation_results: Vec<ValidationResult>,
@@ -292,6 +308,7 @@ pub struct SupervisorFinalReport {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CommandRunRecord {
     pub command: Vec<String>,
+    #[serde(serialize_with = "serialize_path")]
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -321,7 +338,7 @@ pub struct ValidationResult {
 pub struct Finding {
     pub severity: FindingSeverity,
     pub message: String,
-    #[serde(default, serialize_with = "serialize_finding_paths")]
+    #[serde(default, serialize_with = "serialize_paths")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -346,8 +363,11 @@ pub enum ReviewStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SupervisorStatusReport {
     pub run_id: RunId,
+    #[serde(serialize_with = "serialize_path")]
     pub repo: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
     pub run_dir: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
     pub final_report_path: PathBuf,
     pub final_report_exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1059,6 +1079,7 @@ fn run_supervisor_plan(
     let mut command_records = Vec::new();
     let mut orchestrator_reports = Vec::new();
     let mut findings = Vec::new();
+    let mut primary_run_baseline = None;
 
     let run_result = (|| -> Result<()> {
         write_plan_snapshot(
@@ -1069,6 +1090,14 @@ fn run_supervisor_plan(
         write_orchestrator_schema(&dirs.schemas.join("orchestrator-review-report.schema.json"))?;
         write_worker_schema(&dirs.schemas.join("worker-report.schema.json"))?;
         write_auditor_schema(&dirs.schemas.join("auditor-report.schema.json"))?;
+
+        let baseline = primary_worktree_snapshot(&repo)?;
+        if let Some(error) = baseline.inspection_problem() {
+            bail!(
+                "refusing to launch supervised work without a complete primary integrity snapshot: {error}"
+            );
+        }
+        primary_run_baseline = Some(baseline);
 
         let existing = manager
             .list()?
@@ -1179,13 +1208,14 @@ fn run_supervisor_plan(
                 command.output_schema = Some(schema_path.clone());
 
                 let external_run = run_external_agent(&command);
-                command_records.push(command_record_from_external(&external_run));
+                command_records.push(command_record_from_external(&external_run, &command));
                 let primary_after = primary_worktree_snapshot(&repo)?;
                 let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
                 let (mut attempt_report, report_shape_problems) = collect_child_report(
                     assignment,
                     &attempt_artifacts.report_path,
                     &external_run,
+                    &command,
                     &worktree.path,
                     &child_base_head,
                 );
@@ -1272,12 +1302,33 @@ fn run_supervisor_plan(
                 auditor_command.output_schema = Some(auditor_schema_path);
                 auditor_command.sandbox_mode = "read-only".to_string();
 
+                let primary_before_auditor = primary_worktree_snapshot(&repo)?;
+                if let Some(error) = primary_before_auditor.inspection_problem() {
+                    bail!(
+                        "refusing to launch parent review auditor without a complete primary integrity snapshot: {error}"
+                    );
+                }
                 let auditor_run = run_external_agent(&auditor_command);
-                let auditor_command_record = command_record_from_external(&auditor_run);
+                let auditor_command_record =
+                    command_record_from_external(&auditor_run, &auditor_command);
                 command_records.push(auditor_command_record.clone());
                 child_report.commands_run.push(auditor_command_record);
-                let auditor_report =
-                    collect_parent_auditor_report(assignment, &auditor_report_path, &auditor_run);
+                let primary_after_auditor = primary_worktree_snapshot(&repo)?;
+                let primary_auditor_changes =
+                    primary_integrity_changes(&primary_before_auditor, &primary_after_auditor);
+                let mut auditor_report = collect_parent_auditor_report(
+                    assignment,
+                    &auditor_report_path,
+                    &auditor_run,
+                    &auditor_command,
+                );
+                if !primary_auditor_changes.is_empty() {
+                    mark_auditor_primary_integrity_violation(
+                        assignment,
+                        &primary_auditor_changes,
+                        &mut auditor_report,
+                    );
+                }
                 child_report.audit_reports.push(auditor_report);
             }
             validate_auditor_reports(assignment, &final_report_path, &mut child_report);
@@ -1317,7 +1368,7 @@ fn run_supervisor_plan(
     if let Err(error) = &run_result {
         findings.push(Finding {
             severity: FindingSeverity::Error,
-            message: error.to_string(),
+            message: format!("{error:#}"),
             paths: Vec::new(),
         });
     }
@@ -1325,9 +1376,52 @@ fn run_supervisor_plan(
     let (released_claims, release_errors) = release_claims(&sync_store, acquired_claim_tokens);
     let (released_semantic_intents, semantic_release_errors) =
         release_semantic_intents(&semantic_store, acquired_semantic_tokens);
+    let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
+        Some(baseline) => match primary_worktree_quiescence_snapshot(&repo) {
+            Ok(final_quiescence) => {
+                let mut integrity_failed = false;
+                if !final_quiescence.interval_changes.is_empty() {
+                    findings.push(Finding {
+                        severity: FindingSeverity::Error,
+                        message: format!(
+                            "primary worktree did not remain quiescent during final acceptance: {}",
+                            final_quiescence.interval_changes.details.join("; ")
+                        ),
+                        paths: final_quiescence.interval_changes.paths,
+                    });
+                    integrity_failed = true;
+                }
+                let changes = primary_integrity_changes(baseline, &final_quiescence.snapshot);
+                if !changes.is_empty() {
+                    findings.push(Finding {
+                        severity: FindingSeverity::Error,
+                        message: format!(
+                            "primary worktree integrity differed from the supervise-run baseline during final acceptance: {}",
+                            changes.details.join("; ")
+                        ),
+                        paths: changes.paths,
+                    });
+                    integrity_failed = true;
+                }
+                integrity_failed
+            }
+            Err(error) => {
+                findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: format!(
+                        "primary worktree final integrity/quiescence check failed: {error}"
+                    ),
+                    paths: Vec::new(),
+                });
+                true
+            }
+        },
+        None => true,
+    };
     let failed = run_result.is_err()
         || !release_errors.is_empty()
         || !semantic_release_errors.is_empty()
+        || final_primary_integrity_failed
         || orchestrator_reports.iter().any(report_failed);
     let success = !failed;
     let final_report = SupervisorFinalReport {
@@ -1394,12 +1488,16 @@ fn run_supervisor_plan(
         remaining_risk: if success {
             "no failed child orchestrator reports; worker changes remain isolated in child worktrees"
                 .to_string()
+        } else if final_primary_integrity_failed {
+            "primary worktree integrity or final quiescence could not be established".to_string()
         } else {
             "one or more child or worker reports failed, were rejected, or were missing".to_string()
         },
         next_safe_action: if success {
             "review child worktree diffs before any separate merge preview or apply step"
                 .to_string()
+        } else if final_primary_integrity_failed {
+            "inspect and restore the primary worktree before rerunning supervise".to_string()
         } else {
             "inspect run reports and rerun failed child scopes after correcting the issue"
                 .to_string()
@@ -1618,6 +1716,7 @@ fn collect_child_report(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
     external_run: &ExternalAgentRun,
+    external_command: &ExternalAgentCommand,
     worktree_path: &Path,
     child_base_head: &Oid,
 ) -> (OrchestratorReviewReport, Vec<String>) {
@@ -1674,7 +1773,13 @@ fn collect_child_report(
         Err(error) => {
             let message = format!("required child report is missing or invalid: {error}");
             report_shape_problems.push(message);
-            missing_child_report(assignment, report_path, external_run, error.to_string())
+            missing_child_report(
+                assignment,
+                report_path,
+                external_run,
+                external_command,
+                error.to_string(),
+            )
         }
     };
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
@@ -1687,6 +1792,7 @@ fn collect_parent_auditor_report(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
     external_run: &ExternalAgentRun,
+    external_command: &ExternalAgentCommand,
 ) -> AuditorReport {
     let expected_id = parent_auditor_id(assignment);
     let mut report = match read_auditor_report(report_path) {
@@ -1729,7 +1835,7 @@ fn collect_parent_auditor_report(
     };
     report
         .commands_run
-        .push(command_record_from_external(external_run));
+        .push(command_record_from_external(external_run, external_command));
     report
 }
 
@@ -2374,12 +2480,37 @@ fn mark_primary_integrity_violation(
         "inspect and restore the primary worktree before rerunning supervise".to_string();
 }
 
+fn mark_auditor_primary_integrity_violation(
+    assignment: &OrchestratorAssignment,
+    changes: &PrimaryIntegrityChanges,
+    report: &mut AuditorReport,
+) {
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    report.read_only = false;
+    report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: format!(
+            "primary worktree integrity changed during parent review auditor '{}' run: {}",
+            parent_auditor_id(assignment),
+            changes.details.join("; ")
+        ),
+        paths: changes.paths.clone(),
+    });
+    report.remaining_risk =
+        "parent auditor invocation mutated primary HEAD/ref, index, tracked content, or non-runtime untracked content"
+            .to_string();
+    report.next_safe_action =
+        "inspect and restore the primary worktree before rerunning supervise".to_string();
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrimaryWorktreeSnapshot {
     head: PrimaryHeadSnapshot,
     index: BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>,
     index_storage: PrimaryIndexStorageSnapshot,
-    status: BTreeMap<Vec<u8>, Status>,
+    status: BTreeMap<Vec<u8>, PrimaryStatusState>,
     worktree: BTreeMap<Vec<u8>, PrimaryPathState>,
     inspection_error: Option<String>,
 }
@@ -2402,14 +2533,25 @@ struct PrimaryIndexEntryKey {
 struct PrimaryIndexEntryState {
     id: Oid,
     mode: u32,
-    flags: u16,
-    flags_extended: u16,
+    tag: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryStatusState {
+    code: [u8; 2],
+    original_path: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrimaryIndexStorageSnapshot {
     worktree_index: IndexFileSnapshot,
-    shared_index: Option<IndexFileSnapshot>,
+    shared_index: Option<SharedIndexFileSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedIndexFileSnapshot {
+    path: PathBuf,
+    storage: IndexFileSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2431,6 +2573,7 @@ enum PrimaryPathState {
     },
     Directory {
         nested_repository: Option<Box<PrimaryWorktreeSnapshot>>,
+        contents_digest: Option<Oid>,
         mode: u32,
     },
     Other {
@@ -2474,75 +2617,130 @@ impl PrimaryWorktreeSnapshot {
 }
 
 fn primary_worktree_snapshot(repo_path: &Path) -> Result<PrimaryWorktreeSnapshot> {
-    primary_worktree_snapshot_at_depth(repo_path, 0)
+    let mut visited_gitdirs = BTreeSet::new();
+    primary_worktree_snapshot_at_depth(repo_path, 0, &mut visited_gitdirs)
+}
+
+struct PrimaryQuiescenceSnapshot {
+    snapshot: PrimaryWorktreeSnapshot,
+    interval_changes: PrimaryIntegrityChanges,
+}
+
+fn primary_worktree_quiescence_snapshot(repo_path: &Path) -> Result<PrimaryQuiescenceSnapshot> {
+    let first = primary_worktree_snapshot(repo_path)?;
+    if let Some(error) = first.inspection_problem() {
+        bail!("initial final-quiescence snapshot was incomplete: {error}");
+    }
+    thread::sleep(Duration::from_millis(200));
+    let second = primary_worktree_snapshot(repo_path)?;
+    if let Some(error) = second.inspection_problem() {
+        bail!("final final-quiescence snapshot was incomplete: {error}");
+    }
+    let interval_changes = primary_integrity_changes(&first, &second);
+    Ok(PrimaryQuiescenceSnapshot {
+        snapshot: second,
+        interval_changes,
+    })
 }
 
 fn primary_worktree_snapshot_at_depth(
     repo_path: &Path,
     depth: usize,
+    visited_gitdirs: &mut BTreeSet<PathBuf>,
 ) -> Result<PrimaryWorktreeSnapshot> {
     if depth > MAX_NESTED_REPOSITORY_DEPTH {
         bail!(
-            "primary integrity snapshot exceeded nested repository depth {} at {}",
+            "primary integrity snapshot exceeded the nested-repository safety limit of {} at {}",
             MAX_NESTED_REPOSITORY_DEPTH,
             repo_path.display()
         );
     }
     let repo = Repository::open(repo_path)
         .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
-    let workdir = repo
-        .workdir()
-        .context("primary integrity snapshot requires a non-bare repository")?;
-    let head = primary_head_snapshot(&repo)?;
-    let (status, index, inspection_error) =
-        match repository_status_snapshot(&repo, "failed to inspect primary worktree status") {
-            Ok(status) => match primary_index_snapshot(&repo) {
-                Ok(index) => (status, index, None),
-                Err(error) => (status, BTreeMap::new(), Some(error.to_string())),
-            },
-            Err(error) => (BTreeMap::new(), BTreeMap::new(), Some(error.to_string())),
-        };
-    let index_storage = primary_index_storage_snapshot(&repo)?;
-
-    let gitlink_paths = index
-        .iter()
-        .filter(|(_, state)| state.mode == GITLINK_MODE)
-        .map(|(key, _)| key.path.clone())
-        .collect::<BTreeSet<_>>();
-    let mut fingerprint_paths = status.keys().cloned().collect::<BTreeSet<_>>();
-    fingerprint_paths.extend(gitlink_paths.iter().cloned());
-    fingerprint_paths.extend(
-        index
-            .iter()
-            .filter(|(_, state)| index_entry_requires_fingerprint(state))
-            .map(|(key, _)| key.path.clone()),
-    );
-
-    let mut worktree = BTreeMap::new();
-    for path in fingerprint_paths {
-        let relative_path = repo_relative_path_from_git_bytes(&path);
-        let state = primary_path_state(
-            &workdir.join(&relative_path),
-            gitlink_paths.contains(&path),
-            depth,
+    let gitdir_identity = fs::canonicalize(repo.path()).with_context(|| {
+        format!(
+            "failed to resolve canonical Git directory identity {}",
+            repo.path().display()
         )
-        .with_context(|| {
-            format!(
-                "failed to fingerprint primary worktree path {}",
-                relative_path.display()
-            )
-        })?;
-        worktree.insert(path, state);
+    })?;
+    if !visited_gitdirs.insert(gitdir_identity.clone()) {
+        bail!(
+            "primary integrity snapshot detected a nested repository cycle at {} (Git directory {})",
+            repo_path.display(),
+            gitdir_identity.display()
+        );
     }
 
-    Ok(PrimaryWorktreeSnapshot {
-        head,
-        index,
-        index_storage,
-        status,
-        worktree,
-        inspection_error,
-    })
+    let result = (|| {
+        let workdir = repo
+            .workdir()
+            .context("primary integrity snapshot requires a non-bare repository")?
+            .to_path_buf();
+        let head = primary_head_snapshot(&repo)?;
+        let index_storage_before = primary_index_storage_snapshot(&repo)?;
+        let status = primary_status_snapshot(&workdir)?;
+        let index = primary_index_snapshot(&workdir)?;
+        let index_storage = primary_index_storage_snapshot(&repo)?;
+        let inspection_error = (index_storage_before != index_storage).then(|| {
+            "primary index storage changed while the Git CLI integrity snapshot was being captured"
+                .to_string()
+        });
+
+        let gitlink_paths = index
+            .iter()
+            .filter(|(_, state)| state.mode == GITLINK_MODE)
+            .map(|(key, _)| key.path.clone())
+            .collect::<BTreeSet<_>>();
+        let sparse_directory_paths = index
+            .iter()
+            .filter(|(_, state)| state.mode == SPARSE_DIRECTORY_MODE)
+            .map(|(key, _)| key.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut fingerprint_paths = status.keys().cloned().collect::<BTreeSet<_>>();
+        fingerprint_paths.extend(
+            status
+                .values()
+                .filter_map(|state| state.original_path.clone()),
+        );
+        fingerprint_paths.extend(gitlink_paths.iter().cloned());
+        fingerprint_paths.extend(sparse_directory_paths.iter().cloned());
+        fingerprint_paths.extend(
+            index
+                .iter()
+                .filter(|(_, state)| index_entry_requires_fingerprint(state))
+                .map(|(key, _)| key.path.clone()),
+        );
+
+        let mut worktree = BTreeMap::new();
+        for path in fingerprint_paths {
+            let relative_path = repo_relative_path_from_git_bytes(&path);
+            let state = primary_path_state(
+                &workdir.join(&relative_path),
+                gitlink_paths.contains(&path),
+                sparse_directory_paths.contains(&path),
+                depth,
+                visited_gitdirs,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to fingerprint primary worktree path {}",
+                    relative_path.display()
+                )
+            })?;
+            worktree.insert(path, state);
+        }
+
+        Ok(PrimaryWorktreeSnapshot {
+            head,
+            index,
+            index_storage,
+            status,
+            worktree,
+            inspection_error,
+        })
+    })();
+    visited_gitdirs.remove(&gitdir_identity);
+    result
 }
 
 fn primary_head_snapshot(repo: &Repository) -> Result<PrimaryHeadSnapshot> {
@@ -2566,37 +2764,137 @@ fn primary_head_snapshot(repo: &Repository) -> Result<PrimaryHeadSnapshot> {
     }
 }
 
-fn primary_index_snapshot(
-    repo: &Repository,
-) -> Result<BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>> {
-    let index = repo.index().context("failed to inspect primary index")?;
+fn primary_status_snapshot(workdir: &Path) -> Result<BTreeMap<Vec<u8>, PrimaryStatusState>> {
+    let output = sanitized_git_output(
+        workdir,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .context("failed to run Git CLI primary status snapshot")?;
+    if !output.status.success() {
+        bail!(
+            "Git CLI primary status snapshot failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let records = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
     let mut entries = BTreeMap::new();
-    for entry in index.iter() {
+    let mut index = 0usize;
+    while index < records.len() {
+        let record = records[index];
+        index = index.saturating_add(1);
+        if record.is_empty() {
+            continue;
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            bail!("Git CLI primary status returned a malformed porcelain record");
+        }
+        let code = [record[0], record[1]];
+        let path = record[3..].to_vec();
+        let renamed_or_copied = code.iter().any(|status| matches!(status, b'R' | b'C'));
+        let original_path = if renamed_or_copied {
+            let original = records
+                .get(index)
+                .filter(|path| !path.is_empty())
+                .context("Git CLI primary status omitted a rename/copy source path")?;
+            index = index.saturating_add(1);
+            Some((*original).to_vec())
+        } else {
+            None
+        };
+        if code == *b"??" && is_untracked_runtime_artifact_bytes(&path) {
+            continue;
+        }
+        entries.insert(
+            path,
+            PrimaryStatusState {
+                code,
+                original_path,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn primary_index_snapshot(
+    workdir: &Path,
+) -> Result<BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>> {
+    let output = sanitized_git_output(workdir, &["ls-files", "--stage", "-v", "-z", "--sparse"])
+        .context("failed to run Git CLI primary index snapshot")?;
+    if !output.status.success() {
+        bail!(
+            "Git CLI primary index snapshot failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut entries = BTreeMap::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("Git CLI primary index returned a malformed entry without a path")?;
+        let (header, path_with_separator) = record.split_at(separator);
+        let path = &path_with_separator[1..];
+        if header.len() < 3 || header[1] != b' ' {
+            bail!("Git CLI primary index returned a malformed entry header");
+        }
+        let tag = header[0];
+        let header = std::str::from_utf8(&header[2..])
+            .context("Git CLI primary index returned a non-ASCII entry header")?;
+        let mut fields = header.split_ascii_whitespace();
+        let mode = u32::from_str_radix(
+            fields.next().context("primary index entry omitted mode")?,
+            8,
+        )
+        .context("primary index entry has invalid mode")?;
+        let id = Oid::from_str(
+            fields
+                .next()
+                .context("primary index entry omitted object id")?,
+        )
+        .context("primary index entry has invalid object id")?;
+        let stage = fields
+            .next()
+            .context("primary index entry omitted stage")?
+            .parse::<u16>()
+            .context("primary index entry has invalid stage")?;
+        if fields.next().is_some() {
+            bail!("primary index entry has unexpected header fields");
+        }
         let key = PrimaryIndexEntryKey {
-            path: entry.path,
-            stage: (entry.flags >> 12) & 0x3,
+            path: path.to_vec(),
+            stage,
         };
-        let state = PrimaryIndexEntryState {
-            id: entry.id,
-            mode: entry.mode,
-            flags: entry.flags,
-            flags_extended: entry.flags_extended,
-        };
+        let state = PrimaryIndexEntryState { id, mode, tag };
         entries.insert(key, state);
     }
     Ok(entries)
 }
 
 fn index_entry_requires_fingerprint(state: &PrimaryIndexEntryState) -> bool {
-    IndexEntryFlag::from_bits_truncate(state.flags).contains(IndexEntryFlag::VALID)
-        || IndexEntryExtendedFlag::from_bits_truncate(state.flags_extended)
-            .contains(IndexEntryExtendedFlag::SKIP_WORKTREE)
+    state.tag == b'S'
+        || state.tag.is_ascii_lowercase()
+        || matches!(state.mode, GITLINK_MODE | SPARSE_DIRECTORY_MODE)
 }
 
 fn primary_index_storage_snapshot(repo: &Repository) -> Result<PrimaryIndexStorageSnapshot> {
     let worktree_index = index_file_snapshot(&repo.path().join("index"))?;
     let shared_index = shared_index_path(repo)?
-        .map(|path| index_file_snapshot(&path))
+        .map(|path| {
+            let storage = index_file_snapshot(&path)?;
+            if storage == IndexFileSnapshot::Missing {
+                bail!(
+                    "Git reported split-index dependency {} but the file is missing",
+                    path.display()
+                );
+            }
+            Ok(SharedIndexFileSnapshot { path, storage })
+        })
         .transpose()?;
     Ok(PrimaryIndexStorageSnapshot {
         worktree_index,
@@ -2626,12 +2924,11 @@ fn shared_index_path(repo: &Repository) -> Result<Option<PathBuf>> {
     let workdir = repo
         .workdir()
         .context("shared-index discovery requires a non-bare repository")?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .args(["rev-parse", "--shared-index-path"])
-        .output()
-        .context("failed to inspect split-index dependency")?;
+    let output = sanitized_git_output(
+        workdir,
+        &["rev-parse", "--path-format=absolute", "--shared-index-path"],
+    )
+    .context("failed to inspect split-index dependency")?;
     if !output.status.success() {
         bail!(
             "failed to inspect split-index dependency: {}",
@@ -2652,14 +2949,55 @@ fn shared_index_path(repo: &Repository) -> Result<Option<PathBuf>> {
     Ok(Some(if path.is_absolute() {
         path
     } else {
-        workdir.join(path)
+        repo.path().join(path)
     }))
+}
+
+fn sanitized_git_output(workdir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    const AMBIENT_GIT_ENV: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_PREFIX",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_EXEC_PATH",
+    ];
+    let mut command = Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(workdir)
+        .args(args);
+    for name in AMBIENT_GIT_ENV {
+        command.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        let name_text = name.to_string_lossy();
+        if name_text.starts_with("GIT_CONFIG_KEY_") || name_text.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(name);
+        }
+    }
+    command.env("LC_ALL", "C").output().map_err(Into::into)
 }
 
 fn primary_path_state(
     path: &Path,
     capture_nested_repository: bool,
+    fingerprint_directory_contents: bool,
     depth: usize,
+    visited_gitdirs: &mut BTreeSet<PathBuf>,
 ) -> Result<PrimaryPathState> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2688,6 +3026,7 @@ fn primary_path_state(
                 Ok(_) => Some(Box::new(primary_worktree_snapshot_at_depth(
                     path,
                     depth.saturating_add(1),
+                    visited_gitdirs,
                 )?)),
                 Err(error) if error.code() == ErrorCode::NotFound => None,
                 Err(error) => {
@@ -2699,12 +3038,92 @@ fn primary_path_state(
         } else {
             None
         };
+        let contents_digest = fingerprint_directory_contents
+            .then(|| directory_content_digest(path, 0))
+            .transpose()?;
         return Ok(PrimaryPathState::Directory {
             nested_repository,
+            contents_digest,
             mode,
         });
     }
     Ok(PrimaryPathState::Other { mode })
+}
+
+fn directory_content_digest(path: &Path, depth: usize) -> Result<Oid> {
+    if depth > MAX_DIRECTORY_FINGERPRINT_DEPTH {
+        bail!(
+            "directory fingerprint exceeded the safety limit of {} at {}",
+            MAX_DIRECTORY_FINGERPRINT_DEPTH,
+            path.display()
+        );
+    }
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("failed to read sparse directory {}", path.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| snapshot_os_str_bytes(&entry.file_name()));
+
+    let mut fingerprint = Vec::new();
+    for entry in entries {
+        let name = entry.file_name();
+        let name_bytes = snapshot_os_str_bytes(&name);
+        append_fingerprint_bytes(&mut fingerprint, &name_bytes);
+        let entry_path = entry.path();
+        let metadata = fs::symlink_metadata(&entry_path).with_context(|| {
+            format!(
+                "failed to inspect sparse directory entry {}",
+                entry_path.display()
+            )
+        })?;
+        fingerprint.extend_from_slice(&primary_path_mode(&metadata).to_le_bytes());
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            fingerprint.push(b'l');
+            let target = fs::read_link(&entry_path)?;
+            append_fingerprint_bytes(&mut fingerprint, &snapshot_os_str_bytes(target.as_os_str()));
+        } else if file_type.is_file() {
+            fingerprint.push(b'f');
+            let id = Oid::hash_file(ObjectType::Blob, &entry_path)?;
+            fingerprint.extend_from_slice(id.as_bytes());
+        } else if file_type.is_dir() {
+            fingerprint.push(b'd');
+            if name == OsStr::new(".git") {
+                fingerprint.extend_from_slice(b"git-metadata-directory");
+            } else {
+                let id = directory_content_digest(&entry_path, depth.saturating_add(1))?;
+                fingerprint.extend_from_slice(id.as_bytes());
+            }
+        } else {
+            fingerprint.push(b'o');
+        }
+    }
+    Oid::hash_object(ObjectType::Blob, &fingerprint)
+        .context("failed to digest sparse directory contents")
+}
+
+fn append_fingerprint_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+#[cfg(unix)]
+fn snapshot_os_str_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(target_os = "windows")]
+fn snapshot_os_str_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn snapshot_os_str_bytes(value: &OsStr) -> Vec<u8> {
+    value.to_string_lossy().as_bytes().to_vec()
 }
 
 #[cfg(unix)]
@@ -2847,7 +3266,21 @@ fn finding_path_from_git_bytes(path: &[u8]) -> PathBuf {
     }
 }
 
-fn serialize_finding_paths<S>(paths: &[PathBuf], serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_path<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&serializable_path(path))
+}
+
+fn serialize_optional_path<S>(path: &Option<PathBuf>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    path.as_deref().map(serializable_path).serialize(serializer)
+}
+
+fn serialize_paths<S>(paths: &[PathBuf], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -3104,6 +3537,7 @@ fn missing_child_report(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
     external_run: &ExternalAgentRun,
+    external_command: &ExternalAgentCommand,
     error: String,
 ) -> OrchestratorReviewReport {
     OrchestratorReviewReport {
@@ -3114,7 +3548,7 @@ fn missing_child_report(
         semantic_modules: assignment.semantic_modules.clone(),
         claim_token: None,
         semantic_intent_token: None,
-        commands_run: vec![command_record_from_external(external_run)],
+        commands_run: vec![command_record_from_external(external_run, external_command)],
         files_changed: Vec::new(),
         validation_results: Vec::new(),
         findings: vec![Finding {
@@ -3215,9 +3649,12 @@ impl ReportStatus for AuditorReport {
     }
 }
 
-fn command_record_from_external(run: &ExternalAgentRun) -> CommandRunRecord {
+fn command_record_from_external(
+    run: &ExternalAgentRun,
+    command: &ExternalAgentCommand,
+) -> CommandRunRecord {
     CommandRunRecord {
-        command: run.command.clone(),
+        command: serializable_external_command(&run.command, command),
         cwd: run.cwd.clone(),
         exit_code: run.exit_code,
         status: if run.succeeded() {
@@ -3234,12 +3671,41 @@ fn command_record_from_external(run: &ExternalAgentRun) -> CommandRunRecord {
     }
 }
 
+fn serializable_external_command(
+    rendered: &[String],
+    command: &ExternalAgentCommand,
+) -> Vec<String> {
+    let path_replacements = [
+        &command.program,
+        &command.cwd,
+        &command.output_last_message,
+        &command.json_log,
+        &command.prompt,
+    ]
+    .into_iter()
+    .chain(command.output_schema.iter())
+    .map(|path| (path.display().to_string(), serializable_path(path)))
+    .collect::<BTreeMap<_, _>>();
+    rendered
+        .iter()
+        .map(|argument| {
+            path_replacements
+                .get(argument)
+                .cloned()
+                .unwrap_or_else(|| argument.clone())
+        })
+        .collect()
+}
+
 fn release_claims(store: &SyncStore, tokens: Vec<ClaimToken>) -> (Vec<PathClaim>, Vec<String>) {
     let mut released = Vec::new();
     let mut errors = Vec::new();
     for token in tokens {
         match store.release(token) {
-            Ok(claim) => released.push(claim),
+            Ok(mut claim) => {
+                sanitize_serialized_paths(&mut claim.paths);
+                released.push(claim);
+            }
             Err(error) => errors.push(format!("failed to release claim {}: {error}", token.get())),
         }
     }
@@ -3254,7 +3720,14 @@ fn release_semantic_intents(
     let mut errors = Vec::new();
     for token in tokens {
         match store.release(token) {
-            Ok(intent) => released.push(intent),
+            Ok(mut intent) => {
+                sanitize_serialized_paths(&mut intent.paths);
+                sanitize_serialized_paths(&mut intent.impacted_files);
+                for symbol in &mut intent.symbols {
+                    symbol.file = serializable_path_buf(&symbol.file);
+                }
+                released.push(intent);
+            }
             Err(error) => errors.push(format!(
                 "failed to release semantic intent {}: {error}",
                 token.get()
@@ -3262,6 +3735,16 @@ fn release_semantic_intents(
         }
     }
     (released, errors)
+}
+
+fn sanitize_serialized_paths(paths: &mut [PathBuf]) {
+    for path in paths {
+        *path = serializable_path_buf(path);
+    }
+}
+
+fn serializable_path_buf(path: &Path) -> PathBuf {
+    PathBuf::from(serializable_path(path))
 }
 
 fn ensure_clean_primary(repo: &Path) -> Result<()> {
@@ -3272,9 +3755,7 @@ fn ensure_clean_primary(repo: &Path) -> Result<()> {
 }
 
 fn primary_is_dirty(repo: &Path) -> Result<bool> {
-    let repo = Repository::open(repo)
-        .with_context(|| format!("failed to open repository {}", repo.display()))?;
-    repository_is_dirty(&repo, "failed to inspect primary worktree status")
+    Ok(!primary_status_snapshot(repo)?.is_empty())
 }
 
 fn ensure_reusable_child_worktree(record: &WorktreeRecord, primary_head: &Oid) -> Result<()> {
@@ -3346,10 +3827,13 @@ fn repository_status_snapshot(
 }
 
 fn is_untracked_runtime_artifact(path: &[u8], status: Status) -> bool {
-    status == Status::WT_NEW
-        && LOCAL_RUNTIME_ROOTS
-            .iter()
-            .any(|root| path_is_at_or_below(path, root))
+    status == Status::WT_NEW && is_untracked_runtime_artifact_bytes(path)
+}
+
+fn is_untracked_runtime_artifact_bytes(path: &[u8]) -> bool {
+    LOCAL_RUNTIME_ROOTS
+        .iter()
+        .any(|root| path_is_at_or_below(path, root))
 }
 
 fn path_is_at_or_below(path: &[u8], root: &[u8]) -> bool {
@@ -3929,6 +4413,65 @@ mod tests {
 
         let value = serde_json::to_value(finding).expect("serialize finding");
         assert_eq!(value["paths"][0], "<non-utf8-git-path>/6261642d80");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_required_optional_and_vector_paths_share_reversible_serialization() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'r', b'o', b'o', b't', 0x80]));
+        let encoded = "<non-utf8-git-path>/726f6f7480";
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "path serialization".to_string(),
+            task_file: Some(path.clone()),
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            child_timeout_seconds: 1,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            assignments: vec![OrchestratorAssignment {
+                id: "child-a".to_string(),
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: vec![path.clone()],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: None,
+                worker_assignments: vec![WorkerAssignment {
+                    id: "worker-a".to_string(),
+                    role: AgentRole::Worker,
+                    assigned_paths: vec![path.clone()],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    task: None,
+                    report_path: Some(path.clone()),
+                }],
+                notes: None,
+            }],
+        };
+        let value = serde_json::to_value(plan).expect("serialize plan paths");
+        assert_eq!(value["task_file"], encoded);
+        assert_eq!(value["assignments"][0]["assigned_paths"][0], encoded);
+        assert_eq!(
+            value["assignments"][0]["worker_assignments"][0]["report_path"],
+            encoded
+        );
+
+        let record = CommandRunRecord {
+            command: Vec::new(),
+            cwd: path,
+            exit_code: Some(0),
+            status: ReviewStatus::Succeeded,
+            timeout_seconds: 1,
+            duration_ms: 0,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+        };
+        let value = serde_json::to_value(record).expect("serialize command cwd");
+        assert_eq!(value["cwd"], encoded);
     }
 
     #[test]
