@@ -5293,7 +5293,13 @@ pub(crate) fn run_required_direct(
 }
 
 fn require_verified_process_output(label: &str, output: &ProcessOutput) -> Result<()> {
-    require_verified_containment(label, output.containment)?;
+    require_verified_containment(label, output.process_tree)?;
+    if !output.side_effects.is_verified() {
+        bail!(
+            "{label} returned without verified side-effect confinement: {:?}",
+            output.side_effects
+        );
+    }
     if output.timed_out {
         bail!("{label} exceeded its total operation deadline");
     }
@@ -5855,6 +5861,31 @@ mod tests {
     use std::sync::Mutex;
 
     static VALIDATION_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn required_process_output_rejects_unverified_side_effect_evidence() {
+        let output = ProcessOutput {
+            status: None,
+            duration: Duration::ZERO,
+            timed_out: false,
+            process_tree: ContainmentEvidence::VerifiedEmpty(
+                crate::process_runner::ContainmentBackend::DirectChild,
+            ),
+            side_effects: crate::process_runner::SideEffectConfinementEvidence::Unverified(
+                crate::process_runner::SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            ),
+            stdout: crate::process_runner::CapturedBytes::default(),
+            stderr: crate::process_runner::CapturedBytes::default(),
+            process_error: None,
+            stdin_error: None,
+        };
+
+        let error = require_verified_process_output("test command", &output).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("without verified side-effect confinement"));
+    }
 
     fn private_runtime_test_root(temp: &tempfile::TempDir) -> PathBuf {
         let root = temp.path().join("runtime");

@@ -2336,10 +2336,6 @@ fn run_success_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
     run_json_command(args, None, Some(path_dir), true)
 }
 
-fn run_failure_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
-    run_json_command(args, None, Some(path_dir), false)
-}
-
 fn run_success_json_in_dir(args: &[&str], cwd: &Path) -> Result<Value> {
     run_json_command(args, Some(cwd), None, true)
 }

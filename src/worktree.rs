@@ -1,7 +1,9 @@
 #[cfg(test)]
 use crate::safe_state::scavenge_private_random_directories;
 use crate::{
-    process_runner::{run_process, ContainmentPolicy, EnvironmentMode, ProcessSpec, StdinMode},
+    process_runner::{
+        run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessSpec, StdinMode,
+    },
     safe_state::{
         identity_for_path, quarantine_direct_child_directory, remove_direct_child_tree,
         remove_quarantined_direct_child_tree, replace_reserved_directory_from,
@@ -3209,12 +3211,7 @@ fn run_bounded_git_records<const N: usize>(
     if output.stdout.is_truncated() || output.stderr.is_truncated() {
         bail!("worktree status exceeded its {max_output_bytes}-byte output budget");
     }
-    if output.process_error.is_some() || output.stdin_error.is_some() {
-        bail!("worktree status process cleanup was not verified");
-    }
-    if !output.containment.is_verified_empty() {
-        bail!("worktree status process subtree was not verified empty");
-    }
+    require_verified_worktree_status_process(&output)?;
     let status = output
         .status
         .context("worktree status command returned no exit status")?;
@@ -3233,11 +3230,46 @@ fn run_bounded_git_records<const N: usize>(
     Ok(bytes.to_vec())
 }
 
+fn require_verified_worktree_status_process(output: &ProcessOutput) -> Result<()> {
+    if output.process_error.is_some() || output.stdin_error.is_some() {
+        bail!("worktree status process cleanup was not verified");
+    }
+    if !output.safety_evidence_verified() {
+        bail!("worktree status process safety evidence was not verified");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use git2::{Oid, Signature};
     use tempfile::TempDir;
+
+    #[test]
+    fn bounded_status_rejects_unverified_side_effect_evidence() {
+        let output = ProcessOutput {
+            status: None,
+            duration: Duration::ZERO,
+            timed_out: false,
+            process_tree: crate::process_runner::ProcessTreeEvidence::VerifiedEmpty(
+                crate::process_runner::ContainmentBackend::DirectChild,
+            ),
+            side_effects: crate::process_runner::SideEffectConfinementEvidence::Unverified(
+                crate::process_runner::SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            ),
+            stdout: crate::process_runner::CapturedBytes::default(),
+            stderr: crate::process_runner::CapturedBytes::default(),
+            process_error: None,
+            stdin_error: None,
+        };
+
+        let error = require_verified_worktree_status_process(&output).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("safety evidence was not verified"));
+    }
 
     #[test]
     fn initializes_repository_with_requested_initial_branch() {

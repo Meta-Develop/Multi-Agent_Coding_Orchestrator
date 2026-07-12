@@ -13,7 +13,7 @@ use serde::Serialize;
 use std::{
     ffi::OsStr,
     fs::File,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -28,6 +28,9 @@ use std::{
 };
 
 #[cfg(unix)]
+use std::path::Component;
+
+#[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,19 @@ enum ChildSetupFault {
     BeforeOpen,
     #[cfg(test)]
     AfterOpen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AtomicWriteFault {
+    None,
+    #[cfg(test)]
+    RebindTempBeforeRename {
+        sentinel: PathBuf,
+    },
+    #[cfg(test)]
+    RebindDestinationAfterRename {
+        sentinel: PathBuf,
+    },
 }
 
 /// A private directory held open independently of its potentially tainted pathname.
@@ -502,28 +518,36 @@ impl ReservedOutputFile {
 
     /// Reads from the descriptor captured before child execution. No pathname is reopened.
     pub(crate) fn read_bounded(&self, max_bytes: usize) -> Result<Vec<u8>> {
-        self.verify_path_identity()?;
-        let metadata = self.file.metadata()?;
-        if metadata.len() > max_bytes as u64 {
-            bail!(
-                "secure output {} exceeds the configured {max_bytes} byte limit",
-                self.path.display()
-            );
+        #[cfg(unix)]
+        {
+            self.verify_path_identity()?;
+            let metadata = self.file.metadata()?;
+            if metadata.len() > max_bytes as u64 {
+                bail!(
+                    "secure output {} exceeds the configured {max_bytes} byte limit",
+                    self.path.display()
+                );
+            }
+            let mut file = self.file.try_clone()?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            Read::by_ref(&mut file)
+                .take(max_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > max_bytes {
+                bail!(
+                    "secure output {} grew beyond the configured {max_bytes} byte limit",
+                    self.path.display()
+                );
+            }
+            self.verify_path_identity()?;
+            Ok(bytes)
         }
-        let mut file = self.file.try_clone()?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        Read::by_ref(&mut file)
-            .take(max_bytes.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > max_bytes {
-            bail!(
-                "secure output {} grew beyond the configured {max_bytes} byte limit",
-                self.path.display()
-            );
+        #[cfg(not(unix))]
+        {
+            let _ = max_bytes;
+            bail!("secure output capabilities are not implemented on this host")
         }
-        self.verify_path_identity()?;
-        Ok(bytes)
     }
 
     pub(crate) fn write_json_atomic<T: Serialize>(
@@ -539,6 +563,47 @@ impl ReservedOutputFile {
 
     /// Atomically replaces the reserved leaf using only the held directory descriptor.
     pub(crate) fn write_bytes_atomic(&mut self, bytes: &[u8], max_bytes: usize) -> Result<()> {
+        self.write_bytes_atomic_impl(bytes, max_bytes, AtomicWriteFault::None)
+    }
+
+    #[cfg(all(test, unix))]
+    fn write_bytes_atomic_with_temp_rebind(
+        &mut self,
+        bytes: &[u8],
+        max_bytes: usize,
+        sentinel: &Path,
+    ) -> Result<()> {
+        self.write_bytes_atomic_impl(
+            bytes,
+            max_bytes,
+            AtomicWriteFault::RebindTempBeforeRename {
+                sentinel: sentinel.to_path_buf(),
+            },
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    fn write_bytes_atomic_with_destination_rebind(
+        &mut self,
+        bytes: &[u8],
+        max_bytes: usize,
+        sentinel: &Path,
+    ) -> Result<()> {
+        self.write_bytes_atomic_impl(
+            bytes,
+            max_bytes,
+            AtomicWriteFault::RebindDestinationAfterRename {
+                sentinel: sentinel.to_path_buf(),
+            },
+        )
+    }
+
+    fn write_bytes_atomic_impl(
+        &mut self,
+        bytes: &[u8],
+        max_bytes: usize,
+        fault: AtomicWriteFault,
+    ) -> Result<()> {
         if bytes.len() > max_bytes {
             bail!(
                 "secure output {} exceeds the configured {max_bytes} byte limit",
@@ -547,6 +612,8 @@ impl ReservedOutputFile {
         }
         #[cfg(unix)]
         {
+            #[cfg(not(test))]
+            let _ = fault;
             self.verify_path_identity()?;
             let temp_name = std::ffi::OsString::from(format!(
                 ".maco-secure-{}-{}-{}.tmp",
@@ -578,12 +645,33 @@ impl ReservedOutputFile {
             }
             // SAFETY: `openat` returned an owned descriptor.
             let mut temp = unsafe { File::from_raw_fd(fd) };
+            let temp_metadata = temp.metadata().with_context(|| {
+                format!(
+                    "failed to inspect secure temporary output for {}",
+                    self.path.display()
+                )
+            })?;
+            use std::os::unix::fs::MetadataExt;
+            let temp_identity = (temp_metadata.dev(), temp_metadata.ino());
+            let mut renamed = false;
+            let name_c = leaf_cstring(&self.name)?;
             let result = (|| -> Result<()> {
                 temp.write_all(bytes)?;
                 temp.sync_all()?;
-                validate_private_file(&temp.metadata()?, &self.path)?;
+                let metadata = temp.metadata()?;
+                validate_private_file(&metadata, &self.path)?;
+                if (metadata.dev(), metadata.ino()) != temp_identity {
+                    bail!(
+                        "secure temporary output descriptor identity changed for {}",
+                        self.path.display()
+                    );
+                }
+                #[cfg(test)]
+                if let AtomicWriteFault::RebindTempBeforeRename { sentinel } = &fault {
+                    rebind_name_to_sentinel_for_test(&self.directory, &temp_c, sentinel)?;
+                }
                 self.verify_path_identity()?;
-                let name_c = leaf_cstring(&self.name)?;
+                verify_named_private_file(&self.directory, &temp_c, temp_identity, &self.path)?;
                 // SAFETY: source and destination names are relative to the same held directory.
                 if unsafe {
                     libc::renameat(
@@ -597,41 +685,77 @@ impl ReservedOutputFile {
                     return Err(std::io::Error::last_os_error())
                         .context("failed to atomically replace secure output");
                 }
-                let metadata = temp.metadata()?;
-                use std::os::unix::fs::MetadataExt;
-                self.device = metadata.dev();
-                self.inode = metadata.ino();
+                renamed = true;
+                #[cfg(test)]
+                if let AtomicWriteFault::RebindDestinationAfterRename { sentinel } = &fault {
+                    rebind_name_to_sentinel_for_test(&self.directory, &name_c, sentinel)?;
+                }
+                if let Err(error) =
+                    verify_named_private_file(&self.directory, &name_c, temp_identity, &self.path)
+                {
+                    let destination_error =
+                        error.context("secure output destination changed immediately after rename");
+                    if let Err(recovery_error) = restore_reserved_leaf(self, &name_c, max_bytes) {
+                        return Err(destination_error.context(format!(
+                            "failed to restore reserved output after destination rebind for {}: {recovery_error:#}",
+                            self.path.display()
+                        )));
+                    }
+                    return Err(destination_error);
+                }
+                self.device = temp_identity.0;
+                self.inode = temp_identity.1;
                 self.file = temp.try_clone()?;
                 self.verify_path_identity()?;
                 self.directory.sync_all()?;
                 Ok(())
             })();
-            if result.is_err() {
-                // SAFETY: unlinking this unpredictable, O_EXCL-created leaf cannot follow a link.
-                unsafe {
-                    libc::unlinkat(self.directory.as_raw_fd(), temp_c.as_ptr(), 0);
+            match result {
+                Ok(()) => Ok(()),
+                Err(mut operation_error) => {
+                    if let Err(cleanup_error) = cleanup_failed_temp_leaf(
+                        &self.directory,
+                        &temp_c,
+                        temp_identity,
+                        &self.path,
+                    ) {
+                        operation_error = operation_error.context(format!(
+                            "secure temporary output cleanup also failed: {cleanup_error:#}"
+                        ));
+                    }
+                    if renamed {
+                        if let Err(sync_error) = self.directory.sync_all() {
+                            operation_error = operation_error.context(format!(
+                                "secure output directory recovery flush also failed: {sync_error:#}"
+                            ));
+                        }
+                    }
+                    Err(operation_error)
                 }
             }
-            result
         }
         #[cfg(not(unix))]
         {
-            let _ = bytes;
+            let _ = (bytes, fault);
             bail!("secure output capabilities are not implemented on this host")
         }
     }
 
     fn verify_held_file(&self) -> Result<()> {
-        let metadata = self.file.metadata()?;
-        validate_private_file(&metadata, &self.path)?;
         #[cfg(unix)]
         {
+            let metadata = self.file.metadata()?;
+            validate_private_file(&metadata, &self.path)?;
             use std::os::unix::fs::MetadataExt;
             if metadata.dev() != self.device || metadata.ino() != self.inode {
                 bail!("secure output held inode changed: {}", self.path.display());
             }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            bail!("secure output capabilities are not implemented on this host")
+        }
     }
 
     #[cfg(unix)]
@@ -670,6 +794,11 @@ impl ReservedOutputFile {
             );
         }
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn verify_path_identity(&self) -> Result<()> {
+        bail!("secure output capabilities are not implemented on this host")
     }
 }
 
@@ -812,6 +941,360 @@ fn created_directory_identity(parent: &File, name: &CString) -> Result<(u64, u64
         bail!("created secure output child was rebound to a non-directory");
     }
     Ok(stat_identity(&metadata))
+}
+
+#[cfg(unix)]
+fn named_leaf_stat(parent: &File, name: &CString) -> std::io::Result<libc::stat> {
+    // SAFETY: storage is initialized and the descriptor/name are valid.
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(stat)
+    }
+}
+
+#[cfg(unix)]
+fn verify_named_private_file(
+    parent: &File,
+    name: &CString,
+    expected: (u64, u64),
+    display_path: &Path,
+) -> Result<()> {
+    let stat = named_leaf_stat(parent, name).with_context(|| {
+        format!(
+            "failed to inspect secure output leaf {}",
+            display_path.display()
+        )
+    })?;
+    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if stat_identity(&stat) != expected
+        || (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || stat.st_nlink != 1
+        || stat.st_uid != effective_uid
+        || (stat.st_mode & 0o777) != 0o600
+    {
+        bail!(
+            "secure output leaf no longer names its held private file: {}",
+            display_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cleanup_failed_temp_leaf(
+    parent: &File,
+    name: &CString,
+    expected: (u64, u64),
+    display_path: &Path,
+) -> Result<()> {
+    let actual = match named_leaf_stat(parent, name) {
+        Ok(actual) => actual,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect secure temporary output for {}",
+                    display_path.display()
+                )
+            })
+        }
+    };
+    if stat_identity(&actual) == expected
+        && (actual.st_mode & libc::S_IFMT) == libc::S_IFREG
+        && actual.st_nlink == 1
+    {
+        return cleanup_created_file(parent, name, expected, display_path);
+    }
+    quarantine_and_remove_rebound_leaf(parent, name, &actual, display_path)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_and_remove_rebound_leaf(
+    parent: &File,
+    name: &CString,
+    observed: &libc::stat,
+    display_path: &Path,
+) -> Result<()> {
+    let mut renamed = None;
+    for _ in 0..16 {
+        let quarantine = std::ffi::OsString::from(format!(
+            ".maco-secure-quarantine-{}-{}.tmp",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let quarantine_c = leaf_cstring(&quarantine)?;
+        // SAFETY: both names are descriptor-relative and NUL-terminated. RENAME_NOREPLACE keeps
+        // an attacker-controlled pre-existing quarantine name from being overwritten.
+        let result = unsafe {
+            libc::renameat2(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                parent.as_raw_fd(),
+                quarantine_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            renamed = Some(quarantine_c);
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to quarantine rebound secure output {}",
+                    display_path.display()
+                )
+            });
+        }
+    }
+    let quarantine = renamed.context("secure output quarantine name budget was exhausted")?;
+    parent.sync_all()?;
+    let moved = named_leaf_stat(parent, &quarantine)
+        .context("failed to inspect quarantined secure output replacement")?;
+    if stat_identity(&moved) != stat_identity(observed)
+        || (moved.st_mode & libc::S_IFMT) != (observed.st_mode & libc::S_IFMT)
+    {
+        bail!("secure output replacement changed while it was quarantined");
+    }
+    let flags = if (moved.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+        libc::AT_REMOVEDIR
+    } else {
+        0
+    };
+    // SAFETY: unlinkat removes the quarantined directory entry without following it.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), quarantine.as_ptr(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to remove quarantined secure output replacement");
+    }
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn quarantine_and_remove_rebound_leaf(
+    parent: &File,
+    name: &CString,
+    observed: &libc::stat,
+    display_path: &Path,
+) -> Result<()> {
+    let mut quarantine = None;
+    for _ in 0..16 {
+        let quarantine_name = std::ffi::OsString::from(format!(
+            ".maco-secure-quarantine-{}-{}.tmp",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let quarantine_c = leaf_cstring(&quarantine_name)?;
+        // Reserve the quarantine name before using portable renameat, which otherwise replaces an
+        // existing destination. The placeholder is never opened from an attacker-controlled path.
+        // SAFETY: descriptor and NUL-terminated name remain valid for the call.
+        let placeholder_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                quarantine_c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if placeholder_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return Err(error).context("failed to reserve secure output quarantine");
+        }
+        // SAFETY: openat returned an owned descriptor.
+        let placeholder = unsafe { File::from_raw_fd(placeholder_fd) };
+        let placeholder_metadata = placeholder.metadata()?;
+        use std::os::unix::fs::MetadataExt;
+        let placeholder_identity = (placeholder_metadata.dev(), placeholder_metadata.ino());
+        // SAFETY: both names are descriptor-relative and NUL-terminated. Replacing the exact
+        // O_EXCL-created placeholder moves the rebound leaf away from its sensitive final name.
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                parent.as_raw_fd(),
+                quarantine_c.as_ptr(),
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            cleanup_created_file(parent, &quarantine_c, placeholder_identity, display_path)?;
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to quarantine rebound secure output {}",
+                    display_path.display()
+                )
+            });
+        }
+        quarantine = Some(quarantine_c);
+        break;
+    }
+    let quarantine = quarantine.context("secure output quarantine name budget was exhausted")?;
+    parent.sync_all()?;
+    let moved = named_leaf_stat(parent, &quarantine)
+        .context("failed to inspect quarantined secure output replacement")?;
+    if stat_identity(&moved) != stat_identity(observed)
+        || (moved.st_mode & libc::S_IFMT) != (observed.st_mode & libc::S_IFMT)
+    {
+        bail!("secure output replacement changed while it was quarantined");
+    }
+    let flags = if (moved.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+        libc::AT_REMOVEDIR
+    } else {
+        0
+    };
+    // SAFETY: unlinkat removes the quarantined entry without following it.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), quarantine.as_ptr(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to remove quarantined secure output replacement");
+    }
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn quarantine_named_leaf_if_present(
+    parent: &File,
+    name: &CString,
+    display_path: &Path,
+) -> Result<()> {
+    match named_leaf_stat(parent, name) {
+        Ok(observed) => quarantine_and_remove_rebound_leaf(parent, name, &observed, display_path),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect rebound secure output {}",
+                display_path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn create_recovery_leaf(parent: &File, name: &CString, display_path: &Path) -> Result<File> {
+    for _ in 0..16 {
+        quarantine_named_leaf_if_present(parent, name, display_path)?;
+        // SAFETY: O_EXCL reserves the final name only when it is still absent.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat returned an owned descriptor.
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error).context("failed to restore reserved secure output leaf");
+        }
+    }
+    // Leave no observed attacker entry at the sensitive final name when the retry budget is
+    // exhausted. A continuously racing same-UID peer can still recreate it after this syscall.
+    quarantine_named_leaf_if_present(parent, name, display_path)?;
+    bail!("secure output recovery retry budget was exhausted")
+}
+
+#[cfg(unix)]
+fn restore_reserved_leaf(
+    slot: &mut ReservedOutputFile,
+    name: &CString,
+    max_bytes: usize,
+) -> Result<()> {
+    // Remove the observed post-rename replacement before inspecting recovery material. Even if
+    // the prior held reservation can no longer be restored, the sensitive final name must not
+    // retain the attacker-controlled entry that triggered this path.
+    quarantine_named_leaf_if_present(&slot.directory, name, &slot.path)?;
+    let old_metadata = slot.file.metadata()?;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // The prior rename may have unlinked the reserved destination, so nlink=0 is expected here.
+    // All other held-file properties and the original identity must still match.
+    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !old_metadata.is_file()
+        || old_metadata.uid() != effective_uid
+        || old_metadata.permissions().mode() & 0o777 != 0o600
+        || old_metadata.nlink() != 0
+        || old_metadata.dev() != slot.device
+        || old_metadata.ino() != slot.inode
+    {
+        bail!("held reservation changed before secure output recovery");
+    }
+    if old_metadata.len() > max_bytes as u64 {
+        bail!("held reservation exceeds its recovery byte limit");
+    }
+    let mut old = slot.file.try_clone()?;
+    old.seek(SeekFrom::Start(0))?;
+    let mut old_bytes = Vec::with_capacity(old_metadata.len() as usize);
+    Read::by_ref(&mut old)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut old_bytes)?;
+    if old_bytes.len() > max_bytes {
+        bail!("held reservation grew beyond its recovery byte limit");
+    }
+
+    let mut restored = create_recovery_leaf(&slot.directory, name, &slot.path)?;
+    let restored_metadata = match restored.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            quarantine_named_leaf_if_present(&slot.directory, name, &slot.path)?;
+            return Err(error).context("failed to inspect restored secure output leaf");
+        }
+    };
+    let restored_identity = (restored_metadata.dev(), restored_metadata.ino());
+    let restored_result = (|| -> Result<()> {
+        validate_private_file(&restored_metadata, &slot.path)?;
+        restored.write_all(&old_bytes)?;
+        restored.sync_all()?;
+        verify_named_private_file(&slot.directory, name, restored_identity, &slot.path)?;
+        slot.directory.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = restored_result {
+        cleanup_failed_temp_leaf(&slot.directory, name, restored_identity, &slot.path)?;
+        return Err(error);
+    }
+    slot.device = restored_identity.0;
+    slot.inode = restored_identity.1;
+    slot.file = restored;
+    slot.verify_path_identity()
+}
+
+#[cfg(all(test, unix))]
+fn rebind_name_to_sentinel_for_test(parent: &File, name: &CString, sentinel: &Path) -> Result<()> {
+    // SAFETY: unlinkat unlinks only the descriptor-relative name. Its original held descriptor
+    // remains open, deterministically emulating a same-UID name rebind.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to remove test secure output name");
+    }
+    let target = CString::new(sentinel.as_os_str().as_bytes())
+        .context("test sentinel path contains a NUL byte")?;
+    // SAFETY: both target and link name are NUL-terminated; symlinkat creates only the
+    // descriptor-relative attacker replacement and never opens the sentinel target.
+    if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create test secure output replacement");
+    }
+    parent.sync_all()?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1146,6 +1629,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn atomic_replace_rejects_temp_name_rebind_without_accepting_attacker_output() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        let mut slot = root.reserve(OsStr::new("report.json"))?;
+        slot.write_bytes_atomic(b"trusted-old", 1024)?;
+        let sentinel = temp.path().join("sentinel");
+        std::fs::write(&sentinel, "sentinel-untouched")?;
+
+        let error = slot
+            .write_bytes_atomic_with_temp_rebind(b"untrusted-new", 1024, &sentinel)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("no longer names its held private file"));
+        assert_eq!(slot.read_bounded(1024)?, b"trusted-old");
+        assert_eq!(std::fs::read(slot.path())?, b"trusted-old");
+        assert_eq!(std::fs::read(&sentinel)?, b"sentinel-untouched");
+        assert_no_secure_transient_entries(root.path())?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn atomic_replace_recovers_reservation_after_destination_rebind() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        let mut slot = root.reserve(OsStr::new("report.json"))?;
+        slot.write_bytes_atomic(b"trusted-old", 1024)?;
+        let sentinel = temp.path().join("sentinel");
+        std::fs::write(&sentinel, "sentinel-untouched")?;
+
+        let error = slot
+            .write_bytes_atomic_with_destination_rebind(b"untrusted-new", 1024, &sentinel)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("destination changed immediately after rename"));
+        assert_eq!(slot.read_bounded(1024)?, b"trusted-old");
+        assert_eq!(std::fs::read(slot.path())?, b"trusted-old");
+        assert_eq!(std::fs::read(&sentinel)?, b"sentinel-untouched");
+        assert_no_secure_transient_entries(root.path())?;
+        Ok(())
+    }
+
+    #[test]
     #[cfg(unix)]
     fn atomic_json_write_is_private_and_bounded() -> Result<()> {
         let temp = tempdir()?;
@@ -1158,6 +1685,17 @@ mod tests {
         );
         assert_eq!(slot.read_bounded(1024)?, b"{\n  \"ok\": true\n}\n");
         assert!(slot.write_bytes_atomic(&[0; 9], 8).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_secure_transient_entries(root: &Path) -> Result<()> {
+        let names = std::fs::read_dir(root)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert!(names
+            .iter()
+            .all(|name| !name.to_string_lossy().starts_with(".maco-secure-")));
         Ok(())
     }
 }
