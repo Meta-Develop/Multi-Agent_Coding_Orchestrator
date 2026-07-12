@@ -35,6 +35,7 @@ const MAX_MANAGED_RECORDS: usize = 4096;
 const MAX_MANAGED_OPERATIONS: usize = 4096;
 const MAX_WORKTREE_STATUS_ENTRIES: usize = 100_000;
 const MAX_WORKTREE_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WORKTREE_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 
@@ -2389,36 +2390,101 @@ fn bounded_worktree_is_clean(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<bool> {
+    let repository = Repository::open(path).with_context(|| {
+        format!(
+            "failed to open bounded-status repository {}",
+            path.display()
+        )
+    })?;
+    let head = repository
+        .head()
+        .context("failed to inspect bounded-status HEAD")?
+        .target()
+        .context("bounded-status HEAD has no direct target")?;
+    let index_path = repository.path().join("index");
+    let index = BoundedRegularReader::read(&index_path, MAX_WORKTREE_INDEX_BYTES)
+        .context("failed to capture bounded-status index")?;
+    let common_objects = SafeRoot::open_existing(repository.commondir().join("objects"))?;
+    let state_root = SafeRoot::open_or_create(repository.commondir().join("maco").join("state"))?;
+    let runtime = state_root.reserve_random_direct_child_directory("git-status")?;
+    let runtime_root = SafeRoot::open_existing(runtime.path())?;
+    let home = runtime_root.reserve_direct_child_directory("home")?;
+    let temporary = runtime_root.reserve_direct_child_directory("tmp")?;
+    let git_dir = runtime_root.reserve_direct_child_directory("git")?;
+    AtomicStateWriter::write_direct(&runtime_root, "index", &index)?;
+    let git_root = SafeRoot::open_existing(git_dir.path())?;
+    git_root.reserve_direct_child_directory("objects")?;
+    git_root.reserve_direct_child_directory("refs")?;
+    AtomicStateWriter::write_direct(&git_root, "HEAD", format!("{head}\n").as_bytes())?;
+    let git_context = BoundedGitContext {
+        worktree: path,
+        runtime_root: &runtime_root,
+        home: home.path(),
+        temporary: temporary.path(),
+        git_dir: git_dir.path(),
+        object_directory: common_objects.path(),
+    };
+
     let deadline = Instant::now()
         .checked_add(timeout)
         .context("worktree status time budget overflowed")?;
-    run_bounded_git_records(
-        path,
-        ["ls-files", "-z", "--cached"],
-        max_entries,
-        max_output_bytes,
-        deadline,
-        "bounded managed-worktree index listing",
-    )?;
-    let bytes = run_bounded_git_records(
-        path,
-        [
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--no-renames",
-        ],
-        max_entries,
-        max_output_bytes,
-        deadline,
-        "bounded managed-worktree status",
-    )?;
-    Ok(bytes.is_empty())
+    let result = (|| -> Result<bool> {
+        run_bounded_git_records(
+            &git_context,
+            ["--no-optional-locks", "ls-files", "-z", "--cached"],
+            max_entries,
+            max_output_bytes,
+            deadline,
+            "bounded managed-worktree index listing",
+        )?;
+        let bytes = run_bounded_git_records(
+            &git_context,
+            [
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+            ],
+            max_entries,
+            max_output_bytes,
+            deadline,
+            "bounded managed-worktree status",
+        )?;
+        Ok(bytes.is_empty())
+    })();
+    let cleanup = remove_direct_child_tree(
+        &state_root,
+        runtime
+            .path()
+            .file_name()
+            .context("bounded-status runtime has no final component")?,
+        Some(runtime.identity()),
+        TreeLinkPolicy::RejectLinksAndSpecialFiles,
+    )
+    .context("failed to remove bounded-status private runtime");
+    match (result, cleanup) {
+        (Ok(clean), Ok(())) => Ok(clean),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "bounded-status runtime cleanup also failed: {cleanup_error:#}"
+        ))),
+    }
+}
+
+struct BoundedGitContext<'a> {
+    worktree: &'a Path,
+    runtime_root: &'a SafeRoot,
+    home: &'a Path,
+    temporary: &'a Path,
+    git_dir: &'a Path,
+    object_directory: &'a Path,
 }
 
 fn run_bounded_git_records<const N: usize>(
-    path: &Path,
+    context: &BoundedGitContext<'_>,
     args: [&str; N],
     max_entries: usize,
     max_output_bytes: usize,
@@ -2431,12 +2497,65 @@ fn run_bounded_git_records<const N: usize>(
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .context("worktree status exhausted its total time budget")?;
+    context.runtime_root.verify()?;
+    let path_text = |name: &str, path: &Path| {
+        path.to_str()
+            .map(ToOwned::to_owned)
+            .with_context(|| format!("{name} is not valid UTF-8: {}", path.display()))
+    };
     let mut environment = BTreeMap::new();
+    environment.insert("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
+    environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert(
+        "GIT_DIR".to_string(),
+        path_text("private Git directory", context.git_dir)?,
+    );
+    environment.insert(
+        "GIT_INDEX_FILE".to_string(),
+        path_text(
+            "private Git index",
+            &context.runtime_root.path().join("index"),
+        )?,
+    );
+    environment.insert(
+        "GIT_OBJECT_DIRECTORY".to_string(),
+        path_text("validated Git object directory", context.object_directory)?,
+    );
     environment.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
+    environment.insert("GIT_PAGER".to_string(), "cat".to_string());
+    environment.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+    environment.insert(
+        "GIT_WORK_TREE".to_string(),
+        path_text("worktree", context.worktree)?,
+    );
+    environment.insert("HOME".to_string(), path_text("private HOME", context.home)?);
+    environment.insert("LANG".to_string(), "C".to_string());
     environment.insert("LC_ALL".to_string(), "C".to_string());
-    let spec = ProcessSpec::direct(label, git, args, path, max_output_bytes)
-        .with_environment(EnvironmentMode::InheritAndSet(environment))
-        .with_containment(ContainmentPolicy::TrustedBestEffort)
+    environment.insert("PAGER".to_string(), "cat".to_string());
+    environment.insert(
+        "TEMP".to_string(),
+        path_text("private TEMP", context.temporary)?,
+    );
+    environment.insert(
+        "TMP".to_string(),
+        path_text("private TMP", context.temporary)?,
+    );
+    environment.insert(
+        "TMPDIR".to_string(),
+        path_text("private TMPDIR", context.temporary)?,
+    );
+    environment.insert(
+        "XDG_CACHE_HOME".to_string(),
+        path_text("private XDG cache", context.home)?,
+    );
+    environment.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        path_text("private XDG config", context.home)?,
+    );
+    let spec = ProcessSpec::direct(label, git, args, context.worktree, max_output_bytes)
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_containment(ContainmentPolicy::Required)
         .with_stdin(StdinMode::Null)
         .with_timeout(Some(remaining));
     let output = run_process(spec).context("bounded worktree status command failed")?;
@@ -2451,6 +2570,9 @@ fn run_bounded_git_records<const N: usize>(
     }
     if output.process_error.is_some() || output.stdin_error.is_some() {
         bail!("worktree status process cleanup was not verified");
+    }
+    if !output.containment.is_verified_empty() {
+        bail!("worktree status process subtree was not verified empty");
     }
     let status = output
         .status
@@ -2660,7 +2782,10 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect_err("tracked index entry budget must fail");
-        assert!(index_entries.to_string().contains("entries"));
+        assert!(
+            index_entries.to_string().contains("entries"),
+            "unexpected bounded index error: {index_entries:#}"
+        );
 
         let entries = bounded_worktree_is_clean(
             &repo_path,
@@ -2669,7 +2794,10 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect_err("entry budget must fail");
-        assert!(entries.to_string().contains("entries"));
+        assert!(
+            entries.to_string().contains("entries"),
+            "unexpected bounded status error: {entries:#}"
+        );
 
         let output = bounded_worktree_is_clean(&repo_path, 10, 1, Duration::from_secs(2))
             .expect_err("output budget must fail");
@@ -2682,6 +2810,98 @@ mod tests {
             Duration::ZERO,
         )
         .expect_err("zero time budget must fail before unbounded traversal");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_ignores_ambient_and_repository_process_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+        impl EnvGuard {
+            fn set(values: &[(&'static str, &str)]) -> Self {
+                let prior = values
+                    .iter()
+                    .map(|(name, value)| {
+                        let prior = std::env::var_os(name);
+                        std::env::set_var(name, value);
+                        (*name, prior)
+                    })
+                    .collect();
+                Self(prior)
+            }
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (name, prior) in self.0.drain(..) {
+                    match prior {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+
+        let marker = temp.path().join("helper-ran");
+        let helper = temp.path().join("malicious-fsmonitor");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\ntouch '{}'\n/usr/bin/setsid /bin/true\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .expect("write malicious helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))
+            .expect("chmod malicious helper");
+        let mut config = repo.config().expect("open local config");
+        config
+            .set_str("core.fsmonitor", helper.to_str().expect("UTF-8 helper"))
+            .expect("configure fsmonitor helper");
+        config
+            .set_str(
+                "filter.evil.clean",
+                &format!(
+                    "sh -c \"touch '{}'; /usr/bin/setsid /bin/true; cat\"",
+                    marker.display()
+                ),
+            )
+            .expect("configure filter helper");
+        fs::write(repo_path.join(".gitattributes"), "README.md filter=evil\n")
+            .expect("write malicious attributes");
+        fs::write(repo_path.join("README.md"), "changed\n").expect("change filtered file");
+
+        let count = "1";
+        let key = "core.fsmonitor";
+        let value = helper.to_str().expect("UTF-8 helper");
+        let _ambient = EnvGuard::set(&[
+            ("GIT_CONFIG_COUNT", count),
+            ("GIT_CONFIG_KEY_0", key),
+            ("GIT_CONFIG_VALUE_0", value),
+            ("GIT_DIR", "/definitely/not/the/repository"),
+        ]);
+        assert!(
+            !bounded_worktree_is_clean(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+            )
+            .expect("bounded private status"),
+            "changed worktree must remain dirty"
+        );
+        assert!(
+            !marker.exists(),
+            "ambient or repository-configured helper executed"
+        );
     }
 
     #[test]
