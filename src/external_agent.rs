@@ -385,7 +385,7 @@ printf '\n{"type":"done"}\n'
 
     #[cfg(unix)]
     #[test]
-    fn run_external_agent_times_out_when_descendant_holds_output_pipes_open() -> Result<()> {
+    fn run_external_agent_finalizes_descendant_holding_output_pipes() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
@@ -429,12 +429,14 @@ exit 0
 
         assert!(
             started.elapsed() < Duration::from_secs(3),
-            "timeout path should return promptly instead of hanging: {report:?}"
+            "process-tree finalization should return promptly instead of hanging: {report:?}"
         );
         assert!(
-            report.timed_out,
-            "descendant-held output pipes should be treated as timeout: {report:?}"
+            !report.timed_out,
+            "a normally exited parent should remain successful after descendant teardown: {report:?}"
         );
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.error, None);
         assert!(report.stdout.text.contains("parent exiting"));
         assert!(report.stdout.text.contains("descendant started"));
         assert!(report.stderr.text.contains("descendant stderr started"));

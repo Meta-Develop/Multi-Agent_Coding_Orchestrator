@@ -1,11 +1,16 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fs::File,
-    io::{Read, Write},
-    path::PathBuf,
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -16,9 +21,11 @@ const PIPE_CHANNEL_CAPACITY: usize = 8;
 const MAX_PIPE_EVENTS_PER_POLL: usize = PIPE_CHANNEL_CAPACITY * 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THREAD_JOIN_GRACE: Duration = Duration::from_millis(50);
+const IO_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(unix)]
 const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
+static NEXT_TEE_BACKUP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
@@ -260,6 +267,36 @@ pub struct ProcessOutput {
     pub stdin_error: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct ProcessFailureEvidence {
+    pub stdout: CapturedBytes,
+    pub stderr: CapturedBytes,
+    pub process_error: Option<String>,
+    pub stdin_error: Option<String>,
+}
+
+impl fmt::Display for ProcessFailureEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stdout = self.stdout.summarize_chars(512);
+        let stderr = self.stderr.summarize_chars(512);
+        write!(
+            formatter,
+            "stdout={:?}{}; stderr={:?}{}",
+            stdout.text,
+            if stdout.truncated { " (truncated)" } else { "" },
+            stderr.text,
+            if stderr.truncated { " (truncated)" } else { "" }
+        )?;
+        if let Some(error) = &self.process_error {
+            write!(formatter, "; process cleanup: {error}")?;
+        }
+        if let Some(error) = &self.stdin_error {
+            write!(formatter, "; stdin: {error}")?;
+        }
+        Ok(())
+    }
+}
+
 impl ProcessOutput {
     pub fn duration_ms(&self) -> u64 {
         duration_millis(self.duration)
@@ -276,6 +313,14 @@ pub enum ProcessRunError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "stdout and stderr tee paths for {label} refer to the same file: {stdout} and {stderr}"
+    )]
+    TeeConflict {
+        label: String,
+        stdout: PathBuf,
+        stderr: PathBuf,
+    },
     #[error("failed to spawn {label} ({command}) in {current_dir}: {source}")]
     Spawn {
         label: String,
@@ -284,10 +329,11 @@ pub enum ProcessRunError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to query {label} ({command}) status: {source}")]
+    #[error("failed to query {label} ({command}) status: {source}; retained evidence: {evidence}")]
     Wait {
         label: String,
         command: String,
+        evidence: Box<ProcessFailureEvidence>,
         #[source]
         source: std::io::Error,
     },
@@ -298,13 +344,19 @@ pub enum ProcessRunError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to prepare cancellable child I/O for {label} ({command}): {source}")]
+    IoSetup {
+        label: String,
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
     let command_display = spec.command.display();
-    let stdout_tee = open_tee(&spec.label, "stdout", &spec.stdout)?;
-    let stderr_tee = open_tee(&spec.label, "stderr", &spec.stderr)?;
+    let (stdout_tee, stderr_tee) = prepare_tees(&spec.label, &spec.stdout, &spec.stderr)?;
     let mut command = spec.command.build();
     configure_process_tree(&mut command);
     command.current_dir(&spec.current_dir);
@@ -318,17 +370,29 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         current_dir: spec.current_dir.clone(),
         source,
     })?;
-    let process_tree = match ProcessTree::attach(&child, &spec.label, &command_display) {
-        Ok(process_tree) => process_tree,
-        Err(error) => {
-            terminate_unowned_child(&mut child);
-            return Err(error);
+    let process_tree =
+        match ProcessTree::attach_and_start(&mut child, &spec.label, &command_display) {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                terminate_unowned_child(&mut child);
+                return Err(error);
+            }
+        };
+    let prepared_io = match PreparedChildIo::take(&mut child, &spec.stdin) {
+        Ok(prepared_io) => prepared_io,
+        Err(source) => {
+            let _ = process_tree.terminate(&mut child, false, &spec.label);
+            let _ = wait_for_exit_until(&mut child, Instant::now() + EXIT_AND_DRAIN_GRACE);
+            return Err(ProcessRunError::IoSetup {
+                label: spec.label.clone(),
+                command: command_display,
+                source,
+            });
         }
     };
-    let mut input_writer = InputWriter::start(&mut child, &spec.label, spec.stdin);
-    let mut output_drainers = OutputDrainers::start(
-        &mut child,
+    let (mut input_writer, mut output_drainers) = prepared_io.start(
         &spec.label,
+        spec.stdin,
         spec.stdout.max_bytes,
         spec.stderr.max_bytes,
         stdout_tee,
@@ -346,7 +410,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
             status = match child.try_wait() {
                 Ok(status) => status,
                 Err(source) => {
-                    let cleanup_error = cleanup_after_wait_error(
+                    let evidence = cleanup_after_wait_error(
                         &mut child,
                         &process_tree,
                         &spec.label,
@@ -356,7 +420,8 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                     return Err(ProcessRunError::Wait {
                         label: spec.label.clone(),
                         command: command_display.clone(),
-                        source: with_cleanup_error(source, cleanup_error),
+                        evidence: Box::new(evidence),
+                        source,
                     });
                 }
             };
@@ -377,7 +442,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                 status = match wait_for_exit_until(&mut child, exit_deadline) {
                     Ok(status) => status,
                     Err(source) => {
-                        let cleanup_error = cleanup_after_wait_error(
+                        let evidence = cleanup_after_wait_error(
                             &mut child,
                             &process_tree,
                             &spec.label,
@@ -387,7 +452,8 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                         return Err(ProcessRunError::Wait {
                             label: spec.label.clone(),
                             command: command_display.clone(),
-                            source: with_cleanup_error(source, cleanup_error),
+                            evidence: Box::new(evidence),
+                            source,
                         });
                     }
                 };
@@ -403,31 +469,28 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                 }
             }
 
-            let drain_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
-            if !output_drainers.finish_until(drain_deadline) {
-                process_error = append_error(
-                    process_error,
-                    Some(format!(
-                        "{} timed out and output pipes did not close within {} ms",
-                        spec.label,
-                        EXIT_AND_DRAIN_GRACE.as_millis()
-                    )),
-                );
-            }
-            if !input_writer.finish_until(drain_deadline) {
-                process_error = append_error(
-                    process_error,
-                    Some(format!(
-                        "{} timed out and stdin writer did not finish within {} ms",
-                        spec.label,
-                        EXIT_AND_DRAIN_GRACE.as_millis()
-                    )),
-                );
-            }
+            finish_child_io(
+                &spec.label,
+                "after timeout termination",
+                &mut output_drainers,
+                &mut input_writer,
+                &mut process_error,
+            );
             break;
         }
 
-        if status.is_some() && output_drainers.is_complete() && input_writer.is_complete() {
+        if status.is_some() {
+            process_error = append_error(
+                process_error,
+                process_tree.finalize(&mut child, &spec.label),
+            );
+            finish_child_io(
+                &spec.label,
+                "after normal process exit",
+                &mut output_drainers,
+                &mut input_writer,
+                &mut process_error,
+            );
             break;
         }
 
@@ -465,14 +528,14 @@ fn cleanup_after_wait_error(
     label: &str,
     mut output_drainers: OutputDrainers,
     mut input_writer: InputWriter,
-) -> Option<String> {
-    let mut cleanup_error = process_tree.terminate(child, false, label);
+) -> ProcessFailureEvidence {
+    let mut process_error = process_tree.terminate(child, false, label);
     let exit_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
     match wait_for_exit_until(child, exit_deadline) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            cleanup_error = append_error(
-                cleanup_error,
+            process_error = append_error(
+                process_error,
                 Some(format!(
                     "{label} did not exit within {} ms during error cleanup",
                     EXIT_AND_DRAIN_GRACE.as_millis()
@@ -480,73 +543,379 @@ fn cleanup_after_wait_error(
             );
         }
         Err(error) => {
-            cleanup_error = append_error(
-                cleanup_error,
+            process_error = append_error(
+                process_error,
                 Some(format!(
                     "failed to wait for {label} during error cleanup: {error}"
                 )),
             );
         }
     }
-
-    let drain_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
-    if !output_drainers.finish_until(drain_deadline) {
-        cleanup_error = append_error(
-            cleanup_error,
-            Some(format!(
-                "{label} output pipes did not close within {} ms during error cleanup",
-                EXIT_AND_DRAIN_GRACE.as_millis()
-            )),
-        );
-    }
-    if !input_writer.finish_until(drain_deadline) {
-        cleanup_error = append_error(
-            cleanup_error,
-            Some(format!(
-                "{label} stdin writer did not finish within {} ms during error cleanup",
-                EXIT_AND_DRAIN_GRACE.as_millis()
-            )),
-        );
-    }
-    let (_, _, output_error) = output_drainers.into_outputs();
-    cleanup_error = append_error(cleanup_error, output_error);
+    finish_child_io(
+        label,
+        "during wait-error cleanup",
+        &mut output_drainers,
+        &mut input_writer,
+        &mut process_error,
+    );
+    let (stdout, stderr, output_error) = output_drainers.into_outputs();
+    process_error = append_error(process_error, output_error);
     let (stdin_error, input_cleanup_error) = input_writer.into_result(label);
-    cleanup_error = append_error(cleanup_error, stdin_error);
-    append_error(cleanup_error, input_cleanup_error)
-}
-
-fn with_cleanup_error(source: std::io::Error, cleanup_error: Option<String>) -> std::io::Error {
-    match cleanup_error {
-        Some(cleanup_error) => std::io::Error::new(
-            source.kind(),
-            format!("{source}; process cleanup also reported: {cleanup_error}"),
-        ),
-        None => source,
+    process_error = append_error(process_error, input_cleanup_error);
+    ProcessFailureEvidence {
+        stdout,
+        stderr,
+        process_error,
+        stdin_error,
     }
 }
 
-fn open_tee(
+fn finish_child_io(
+    label: &str,
+    context: &str,
+    output_drainers: &mut OutputDrainers,
+    input_writer: &mut InputWriter,
+    process_error: &mut Option<String>,
+) {
+    let output_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
+    if !output_drainers.finish_until(output_deadline) {
+        *process_error = append_error(
+            process_error.take(),
+            Some(format!(
+                "{label} output pipes did not close within {} ms {context}",
+                EXIT_AND_DRAIN_GRACE.as_millis()
+            )),
+        );
+        *process_error = append_error(
+            process_error.take(),
+            output_drainers.cancel_incomplete(label),
+        );
+    }
+    let input_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
+    if !input_writer.finish_until(input_deadline) {
+        *process_error = append_error(
+            process_error.take(),
+            Some(format!(
+                "{label} stdin writer did not finish within {} ms {context}",
+                EXIT_AND_DRAIN_GRACE.as_millis()
+            )),
+        );
+        *process_error = append_error(process_error.take(), input_writer.cancel_incomplete(label));
+    }
+}
+
+fn prepare_tees(
+    label: &str,
+    stdout: &StreamCapture,
+    stderr: &StreamCapture,
+) -> Result<(Option<TeeWriter>, Option<TeeWriter>), ProcessRunError> {
+    if let (Some(stdout), Some(stderr)) = (&stdout.tee_path, &stderr.tee_path) {
+        if stdout == stderr {
+            return Err(ProcessRunError::TeeConflict {
+                label: label.to_string(),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            });
+        }
+    }
+
+    let mut stdout = match stdout.tee_path.as_ref() {
+        Some(path) => Some(preflight_tee(label, "stdout", path)?),
+        None => None,
+    };
+    let mut stderr = match stderr.tee_path.as_ref() {
+        Some(path) => match preflight_tee(label, "stderr", path) {
+            Ok(tee) => Some(tee),
+            Err(error) => {
+                rollback_created_tee(stdout.take());
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+
+    if let (Some(stdout_tee), Some(stderr_tee)) = (&stdout, &stderr) {
+        let same_file = match tee_files_are_same(stdout_tee, stderr_tee) {
+            Ok(same_file) => same_file,
+            Err(source) => {
+                let path = stdout_tee.path.clone();
+                rollback_created_tee(stdout.take());
+                rollback_created_tee(stderr.take());
+                return Err(ProcessRunError::OpenTee {
+                    label: label.to_string(),
+                    stream: "stdout/stderr",
+                    path,
+                    source,
+                });
+            }
+        };
+        if same_file {
+            let stdout_path = stdout_tee.path.clone();
+            let stderr_path = stderr_tee.path.clone();
+            rollback_created_tee(stdout.take());
+            rollback_created_tee(stderr.take());
+            return Err(ProcessRunError::TeeConflict {
+                label: label.to_string(),
+                stdout: stdout_path,
+                stderr: stderr_path,
+            });
+        }
+    }
+
+    let stdout_backup = match stdout.as_ref().filter(|tee| !tee.created) {
+        Some(tee) if stderr.is_some() => match TeeBackup::create(&tee.path) {
+            Ok(backup) => Some(backup),
+            Err(source) => {
+                let path = tee.path.clone();
+                rollback_created_tee(stdout.take());
+                rollback_created_tee(stderr.take());
+                return Err(ProcessRunError::OpenTee {
+                    label: label.to_string(),
+                    stream: "stdout",
+                    path,
+                    source,
+                });
+            }
+        },
+        _ => None,
+    };
+
+    if let Some(tee) = stdout.as_mut() {
+        if let Err(source) = tee.file.set_len(0) {
+            let path = tee.path.clone();
+            rollback_created_tee(stdout.take());
+            rollback_created_tee(stderr.take());
+            return Err(ProcessRunError::OpenTee {
+                label: label.to_string(),
+                stream: "stdout",
+                path,
+                source,
+            });
+        }
+    }
+    if let Some(tee) = stderr.as_mut() {
+        if let Err(source) = tee.file.set_len(0) {
+            let path = tee.path.clone();
+            let rollback_error = match (&mut stdout, stdout_backup.as_ref()) {
+                (Some(stdout), Some(backup)) => backup.restore(&mut stdout.file).err(),
+                _ => None,
+            };
+            rollback_created_tee(stdout.take());
+            rollback_created_tee(stderr.take());
+            let source = match rollback_error {
+                Some(rollback_error) => std::io::Error::other(format!(
+                    "{source}; failed to restore stdout tee after transactional truncate failure: {rollback_error}"
+                )),
+                None => source,
+            };
+            return Err(ProcessRunError::OpenTee {
+                label: label.to_string(),
+                stream: "stderr",
+                path,
+                source,
+            });
+        }
+    }
+
+    Ok((
+        stdout.map(TeePreflight::commit),
+        stderr.map(TeePreflight::commit),
+    ))
+}
+
+struct TeePreflight {
+    file: File,
+    path: PathBuf,
+    created: bool,
+}
+
+impl TeePreflight {
+    fn commit(self) -> TeeWriter {
+        TeeWriter {
+            file: self.file,
+            path: self.path,
+        }
+    }
+}
+
+fn preflight_tee(
     label: &str,
     stream: &'static str,
-    capture: &StreamCapture,
-) -> Result<Option<TeeWriter>, ProcessRunError> {
-    capture
-        .tee_path
-        .as_ref()
-        .map(|path| {
-            File::create(path)
-                .map(|file| TeeWriter {
-                    file,
-                    path: path.clone(),
-                })
+    path: &Path,
+) -> Result<TeePreflight, ProcessRunError> {
+    let create_result = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path);
+    let (file, created) = match create_result {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
                 .map_err(|source| ProcessRunError::OpenTee {
                     label: label.to_string(),
                     stream,
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     source,
-                })
-        })
-        .transpose()
+                })?;
+            (file, false)
+        }
+        Err(source) => {
+            return Err(ProcessRunError::OpenTee {
+                label: label.to_string(),
+                stream,
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let regular = fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+        && file
+            .metadata()
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false);
+    if !regular {
+        drop(file);
+        if created {
+            let _ = fs::remove_file(path);
+        }
+        return Err(ProcessRunError::OpenTee {
+            label: label.to_string(),
+            stream,
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "tee target must be a regular file and may not be a symlink",
+            ),
+        });
+    }
+
+    Ok(TeePreflight {
+        file,
+        path: path.to_path_buf(),
+        created,
+    })
+}
+
+fn rollback_created_tee(tee: Option<TeePreflight>) {
+    let Some(tee) = tee else {
+        return;
+    };
+    let created = tee.created;
+    let path = tee.path.clone();
+    drop(tee);
+    if created {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(unix)]
+fn tee_files_are_same(left: &TeePreflight, right: &TeePreflight) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let left = left.file.metadata()?;
+    let right = right.file.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(target_os = "windows")]
+fn tee_files_are_same(left: &TeePreflight, right: &TeePreflight) -> std::io::Result<bool> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn identity(file: &File) -> std::io::Result<(u32, u64)> {
+        let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `information` points to writable storage and the borrowed file handle remains
+        // valid for the duration of this call.
+        if unsafe {
+            GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a successful call initialized the complete structure.
+        let information = unsafe { information.assume_init() };
+        let index =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        Ok((information.dwVolumeSerialNumber, index))
+    }
+
+    Ok(identity(&left.file)? == identity(&right.file)?)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn tee_files_are_same(left: &TeePreflight, right: &TeePreflight) -> std::io::Result<bool> {
+    Ok(left.path.canonicalize()? == right.path.canonicalize()?)
+}
+
+struct TeeBackup {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl TeeBackup {
+    fn create(source_path: &Path) -> std::io::Result<Self> {
+        let mut source = File::open(source_path)?;
+        for _ in 0..32 {
+            let id = NEXT_TEE_BACKUP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("maco-tee-backup-{}-{id}.tmp", std::process::id()));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let prepared = std::io::copy(&mut source, &mut file)
+                        .and_then(|_| file.seek(SeekFrom::Start(0)))
+                        .map(|_| ());
+                    if let Err(error) = prepared {
+                        drop(file);
+                        let _ = fs::remove_file(&path);
+                        return Err(error);
+                    }
+                    return Ok(Self {
+                        file: Some(file),
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to allocate a unique tee rollback file",
+        ))
+    }
+
+    fn restore(&self, destination: &mut File) -> std::io::Result<()> {
+        let mut source = self
+            .file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("tee rollback file was already closed"))?
+            .try_clone()?;
+        source.seek(SeekFrom::Start(0))?;
+        destination.set_len(0)?;
+        destination.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut source, destination)?;
+        Ok(())
+    }
+}
+
+impl Drop for TeeBackup {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 struct TeeWriter {
@@ -590,10 +959,12 @@ fn configure_process_tree(command: &mut Command) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(WINDOWS_PROCESS_CREATION_FLAGS);
     }
 }
+
+#[cfg(target_os = "windows")]
+const WINDOWS_PROCESS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
 
 struct ProcessTree {
     #[cfg(target_os = "windows")]
@@ -601,7 +972,11 @@ struct ProcessTree {
 }
 
 impl ProcessTree {
-    fn attach(child: &Child, label: &str, command: &str) -> Result<Self, ProcessRunError> {
+    fn attach_and_start(
+        child: &mut Child,
+        label: &str,
+        command: &str,
+    ) -> Result<Self, ProcessRunError> {
         #[cfg(target_os = "windows")]
         {
             let job = WindowsJob::create_and_assign(child).map_err(|source| {
@@ -611,6 +986,23 @@ impl ProcessTree {
                     source,
                 }
             })?;
+            if let Err(source) = resume_suspended_child(child) {
+                let termination_error = job.terminate(label, "startup rollback");
+                let wait_error = wait_for_exit_until(child, Instant::now() + EXIT_AND_DRAIN_GRACE)
+                    .err()
+                    .map(|error| format!("failed to wait for suspended child rollback: {error}"));
+                let source = append_error(
+                    Some(source.to_string()),
+                    append_error(termination_error, wait_error),
+                )
+                .map(std::io::Error::other)
+                .unwrap_or(source);
+                return Err(ProcessRunError::ProcessOwnership {
+                    label: label.to_string(),
+                    command: command.to_string(),
+                    source,
+                });
+            }
             Ok(Self { job })
         }
 
@@ -618,6 +1010,27 @@ impl ProcessTree {
         {
             let _ = (child, label, command);
             Ok(Self {})
+        }
+    }
+
+    fn finalize(&self, child: &mut Child, label: &str) -> Option<String> {
+        #[cfg(unix)]
+        {
+            let _ = self;
+            finalize_unix_process_group(child.id(), label)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = child;
+            self.job
+                .terminate(label, "normal process-tree finalization")
+        }
+
+        #[cfg(not(any(unix, target_os = "windows")))]
+        {
+            let _ = (self, child, label);
+            None
         }
     }
 
@@ -635,7 +1048,7 @@ impl ProcessTree {
 
         #[cfg(target_os = "windows")]
         {
-            match self.job.terminate(label) {
+            match self.job.terminate(label, "process termination") {
                 None => None,
                 Some(job_error) if child_already_exited => Some(job_error),
                 Some(job_error) => match child.kill() {
@@ -667,44 +1080,104 @@ fn terminate_unix_process_group(
     label: &str,
 ) -> Option<String> {
     let pid = child.id();
-    let _ = send_unix_process_group_signal(pid, "TERM");
-    thread::sleep(TERMINATE_GRACE);
-    match send_unix_process_group_signal(pid, "KILL") {
-        Ok(()) => None,
-        Err(_) if child_already_exited => None,
-        Err(_) if matches!(child.try_wait(), Ok(Some(_))) => None,
-        Err(group_error) => match child.kill() {
-            Ok(()) => Some(format!(
-                "{label} timed out; process group kill failed: {group_error}; direct child was killed"
-            )),
-            Err(child_error) => Some(format!(
-                "{label} timed out; process group kill failed: {group_error}; direct process kill failed: {child_error}"
-            )),
-        },
+    match send_unix_process_group_signal(pid, libc::SIGTERM) {
+        Ok(GroupSignalResult::Sent) => {
+            thread::sleep(TERMINATE_GRACE);
+            match send_unix_process_group_signal(pid, libc::SIGKILL) {
+                Ok(GroupSignalResult::Sent | GroupSignalResult::Missing) => None,
+                Err(group_error) => direct_child_kill_after_group_error(
+                    child,
+                    child_already_exited,
+                    label,
+                    group_error,
+                ),
+            }
+        }
+        Ok(GroupSignalResult::Missing) if child_already_exited => None,
+        Ok(GroupSignalResult::Missing) if matches!(child.try_wait(), Ok(Some(_))) => None,
+        Ok(GroupSignalResult::Missing) => child.kill().err().map(|error| {
+            format!("{label} process group was missing and direct process kill failed: {error}")
+        }),
+        Err(group_error) => {
+            direct_child_kill_after_group_error(child, child_already_exited, label, group_error)
+        }
     }
 }
 
 #[cfg(unix)]
-fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let target = format!("-{pid}");
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(&target)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
+fn direct_child_kill_after_group_error(
+    child: &mut Child,
+    child_already_exited: bool,
+    label: &str,
+    group_error: std::io::Error,
+) -> Option<String> {
+    if child_already_exited || matches!(child.try_wait(), Ok(Some(_))) {
+        return Some(format!(
+            "{label} process group termination failed: {group_error}"
+        ));
+    }
+    match child.kill() {
+        Ok(()) => Some(format!(
+            "{label} process group termination failed: {group_error}; direct child was killed"
+        )),
+        Err(child_error) => Some(format!(
+            "{label} process group termination failed: {group_error}; direct process kill failed: {child_error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn finalize_unix_process_group(pid: u32, label: &str) -> Option<String> {
+    match send_unix_process_group_signal(pid, libc::SIGTERM) {
+        Ok(GroupSignalResult::Missing) => None,
+        Ok(GroupSignalResult::Sent) => {
+            thread::sleep(TERMINATE_GRACE);
+            match send_unix_process_group_signal(pid, libc::SIGKILL) {
+                Ok(GroupSignalResult::Sent | GroupSignalResult::Missing) => None,
+                Err(error) => Some(format!(
+                    "{label} failed to kill remaining process-group descendants: {error}"
+                )),
+            }
+        }
+        Err(error) => Some(format!(
+            "{label} failed to terminate remaining process-group descendants: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+enum GroupSignalResult {
+    Sent,
+    Missing,
+}
+
+#[cfg(unix)]
+fn send_unix_process_group_signal(
+    pid: u32,
+    signal: libc::c_int,
+) -> std::io::Result<GroupSignalResult> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("process id {pid} cannot be represented as a Unix process group"),
+        )
+    })?;
+    // SAFETY: a negative nonzero pid addresses the child-created process group; no Rust memory is
+    // accessed and `signal` is a valid libc signal constant supplied by the caller.
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(GroupSignalResult::Sent);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(GroupSignalResult::Missing)
     } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} {target} exited with {status}"
-        )))
+        Err(error)
     }
 }
 
 #[cfg(target_os = "windows")]
 struct WindowsJob {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    handle: WindowsOwnedHandle,
 }
 
 #[cfg(target_os = "windows")]
@@ -728,14 +1201,16 @@ impl WindowsJob {
                 std::io::Error::last_os_error()
             )));
         }
-        let job = Self { handle };
+        let job = Self {
+            handle: WindowsOwnedHandle { handle },
+        };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: `limits` is initialized for the requested information class and valid for the
         // duration of the call; `job.handle` remains owned by `job`.
         let configured = unsafe {
             SetInformationJobObject(
-                job.handle,
+                job.handle.raw(),
                 JobObjectExtendedLimitInformation,
                 ptr::from_ref(&limits).cast(),
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -750,7 +1225,7 @@ impl WindowsJob {
 
         let process_handle = child.as_raw_handle() as HANDLE;
         // SAFETY: `process_handle` is borrowed from the live child and `job.handle` is valid.
-        if unsafe { AssignProcessToJobObject(job.handle, process_handle) } == 0 {
+        if unsafe { AssignProcessToJobObject(job.handle.raw(), process_handle) } == 0 {
             return Err(std::io::Error::other(format!(
                 "AssignProcessToJobObject failed: {}",
                 std::io::Error::last_os_error()
@@ -759,15 +1234,15 @@ impl WindowsJob {
         Ok(job)
     }
 
-    fn terminate(&self, label: &str) -> Option<String> {
+    fn terminate(&self, label: &str, context: &str) -> Option<String> {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
         // SAFETY: the handle is valid while `self` is alive. The exit code is diagnostic only.
-        if unsafe { TerminateJobObject(self.handle, 1) } != 0 {
+        if unsafe { TerminateJobObject(self.handle.raw(), 1) } != 0 {
             None
         } else {
             Some(format!(
-                "{label} timed out but TerminateJobObject failed: {}",
+                "{label} {context} failed in TerminateJobObject: {}",
                 std::io::Error::last_os_error()
             ))
         }
@@ -775,14 +1250,114 @@ impl WindowsJob {
 }
 
 #[cfg(target_os = "windows")]
-impl Drop for WindowsJob {
+struct WindowsOwnedHandle {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsOwnedHandle {
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsOwnedHandle {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::CloseHandle;
 
-        // SAFETY: this RAII owner closes its handle exactly once. KILL_ON_JOB_CLOSE ensures any
-        // surviving assigned descendants are terminated when ownership ends.
+        // SAFETY: this RAII owner closes its valid handle exactly once.
         let _ = unsafe { CloseHandle(self.handle) };
     }
+}
+
+#[cfg(target_os = "windows")]
+fn resume_suspended_child(child: &Child) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+
+    // SAFETY: the snapshot API has no borrowed pointer inputs and returns an owned handle.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::other(format!(
+            "CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let snapshot = WindowsOwnedHandle { handle: snapshot };
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..THREADENTRY32::default()
+    };
+    // SAFETY: `entry` is correctly sized writable storage and the snapshot handle is valid.
+    if unsafe { Thread32First(snapshot.raw(), &mut entry) } == 0 {
+        return Err(std::io::Error::other(format!(
+            "Thread32First failed while locating suspended child thread: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut thread_ids = Vec::new();
+    loop {
+        if entry.th32OwnerProcessID == child.id() {
+            thread_ids.push(entry.th32ThreadID);
+        }
+        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+        // SAFETY: the same valid snapshot and writable entry storage are reused for iteration.
+        if unsafe { Thread32Next(snapshot.raw(), &mut entry) } != 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+            return Err(std::io::Error::other(format!(
+                "Thread32Next failed while locating suspended child thread: {error}"
+            )));
+        }
+        break;
+    }
+    if thread_ids.len() != 1 {
+        return Err(std::io::Error::other(format!(
+            "expected exactly one suspended primary thread for child {}, found {}",
+            child.id(),
+            thread_ids.len()
+        )));
+    }
+
+    // SAFETY: the enumerated thread id belongs to the still-suspended child process; the returned
+    // handle is owned locally and is not inheritable.
+    let thread_handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_ids[0]) };
+    if thread_handle.is_null() {
+        return Err(std::io::Error::other(format!(
+            "OpenThread(THREAD_SUSPEND_RESUME) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let thread_handle = WindowsOwnedHandle {
+        handle: thread_handle,
+    };
+    // SAFETY: the handle identifies the unique suspended primary thread owned by the child.
+    let previous_suspend_count = unsafe { ResumeThread(thread_handle.raw()) };
+    if previous_suspend_count == u32::MAX {
+        return Err(std::io::Error::other(format!(
+            "ResumeThread failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if previous_suspend_count != 1 {
+        return Err(std::io::Error::other(format!(
+            "ResumeThread observed unexpected suspend count {previous_suspend_count}; refusing to run child"
+        )));
+    }
+    Ok(())
 }
 
 fn wait_for_exit_until(
@@ -809,33 +1384,186 @@ fn append_error(existing: Option<String>, next: Option<String>) -> Option<String
     }
 }
 
-fn finish_owned_thread(
-    handle: thread::JoinHandle<()>,
-    completion_observed: bool,
-    label: &str,
-) -> Option<String> {
-    if completion_observed {
-        return handle
-            .join()
-            .err()
-            .map(|_| format!("{label} thread panicked during cleanup"));
+struct PreparedChildIo {
+    stdin: Option<ChildStdin>,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+}
+
+impl PreparedChildIo {
+    fn take(child: &mut Child, stdin_mode: &StdinMode) -> std::io::Result<Self> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to open child stdout pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to open child stderr pipe"))?;
+        let stdin = if matches!(stdin_mode, StdinMode::Bytes(_)) {
+            Some(
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("failed to open child stdin pipe"))?,
+            )
+        } else {
+            None
+        };
+
+        configure_cancellable_io(&stdout)?;
+        configure_cancellable_io(&stderr)?;
+        if let Some(stdin) = &stdin {
+            configure_cancellable_io(stdin)?;
+        }
+        Ok(Self {
+            stdin,
+            stdout,
+            stderr,
+        })
     }
 
-    let deadline = Instant::now() + THREAD_JOIN_GRACE;
-    while !handle.is_finished() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(1));
+    fn start(
+        self,
+        label: &str,
+        stdin_mode: StdinMode,
+        stdout_limit: usize,
+        stderr_limit: usize,
+        stdout_tee: Option<TeeWriter>,
+        stderr_tee: Option<TeeWriter>,
+    ) -> (InputWriter, OutputDrainers) {
+        let input_writer = InputWriter::start(self.stdin, label, stdin_mode);
+        let output_drainers = OutputDrainers::start(
+            self.stdout,
+            self.stderr,
+            label,
+            stdout_limit,
+            stderr_limit,
+            stdout_tee,
+            stderr_tee,
+        );
+        (input_writer, output_drainers)
     }
-    if handle.is_finished() {
-        return handle
-            .join()
+}
+
+#[cfg(unix)]
+fn configure_cancellable_io<T: std::os::fd::AsRawFd>(io: &T) -> std::io::Result<()> {
+    let fd = io.as_raw_fd();
+    // SAFETY: `fd` is borrowed from a live child pipe and both fcntl operations preserve ownership.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the same live descriptor is updated only to add nonblocking mode.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_cancellable_io<T>(_io: &T) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+enum IoThreadCleanupError {
+    #[error("{label} synchronous I/O cancellation failed: {source}")]
+    Cancellation {
+        label: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{label} did not stop within {} ms after cancellation; joined after the cleanup deadline", THREAD_JOIN_GRACE.as_millis())]
+    Deadline { label: String },
+    #[error("{label} thread panicked during cleanup")]
+    Panicked { label: String },
+}
+
+struct OwnedIoThread {
+    handle: thread::JoinHandle<()>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl OwnedIoThread {
+    fn request_cancel(&self, label: &str) -> Option<IoThreadCleanupError> {
+        self.cancel.store(true, Ordering::Release);
+        cancel_synchronous_io(&self.handle)
             .err()
-            .map(|_| format!("{label} thread panicked during cleanup"));
+            .map(|source| IoThreadCleanupError::Cancellation {
+                label: label.to_string(),
+                source,
+            })
     }
-    drop(handle);
-    Some(format!(
-        "{label} remained active without reporting completion for more than {} ms during bounded cleanup and was detached",
-        THREAD_JOIN_GRACE.as_millis()
-    ))
+
+    fn finish(self, completion_observed: bool, label: &str) -> Vec<IoThreadCleanupError> {
+        let mut errors = Vec::new();
+        if !completion_observed {
+            if let Some(error) = self.request_cancel(label) {
+                errors.push(error);
+            }
+        }
+        let Self { handle, .. } = self;
+        if !completion_observed {
+            let deadline = Instant::now() + THREAD_JOIN_GRACE;
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(IO_CANCEL_POLL_INTERVAL);
+            }
+            if !handle.is_finished() {
+                errors.push(IoThreadCleanupError::Deadline {
+                    label: label.to_string(),
+                });
+            }
+        }
+        if handle.join().is_err() {
+            errors.push(IoThreadCleanupError::Panicked {
+                label: label.to_string(),
+            });
+        }
+        errors
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_synchronous_io(handle: &thread::JoinHandle<()>) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{Foundation::ERROR_NOT_FOUND, System::IO::CancelSynchronousIo};
+
+    let deadline = Instant::now() + THREAD_JOIN_GRACE;
+    loop {
+        if handle.is_finished() {
+            return Ok(());
+        }
+        // SAFETY: the raw handle is borrowed from the live owned JoinHandle and identifies the
+        // exact thread whose synchronous pipe operation must be cancelled.
+        if unsafe { CancelSynchronousIo(handle.as_raw_handle().cast()) } != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "thread never exposed a cancellable synchronous I/O operation",
+            ));
+        }
+        thread::sleep(IO_CANCEL_POLL_INTERVAL);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cancel_synchronous_io(_handle: &thread::JoinHandle<()>) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn cleanup_errors(errors: Vec<IoThreadCleanupError>) -> Option<String> {
+    let errors = errors
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 struct InputWriter {
@@ -849,20 +1577,20 @@ enum InputWriterState {
     },
     Thread {
         receiver: Receiver<Option<String>>,
-        handle: thread::JoinHandle<()>,
+        thread: OwnedIoThread,
         error: Option<String>,
         complete: bool,
     },
 }
 
 impl InputWriter {
-    fn start(child: &mut Child, label: &str, stdin: StdinMode) -> Self {
+    fn start(child_stdin: Option<ChildStdin>, label: &str, stdin: StdinMode) -> Self {
         let StdinMode::Bytes(input) = stdin else {
             return Self {
                 state: InputWriterState::None,
             };
         };
-        let Some(mut child_stdin) = child.stdin.take() else {
+        let Some(mut child_stdin) = child_stdin else {
             return Self {
                 state: InputWriterState::Complete {
                     error: Some(format!("failed to open {label} stdin")),
@@ -871,17 +1599,16 @@ impl InputWriter {
         };
         let (sender, receiver) = mpsc::channel();
         let label = label.to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = Arc::clone(&cancel);
         let handle = thread::spawn(move || {
-            let error = child_stdin
-                .write_all(&input)
-                .err()
-                .map(|error| format!("failed to write {label} stdin: {error}"));
+            let error = write_stdin_cancellable(&mut child_stdin, &input, &thread_cancel, &label);
             let _ = sender.send(error);
         });
         Self {
             state: InputWriterState::Thread {
                 receiver,
-                handle,
+                thread: OwnedIoThread { handle, cancel },
                 error: None,
                 complete: false,
             },
@@ -934,23 +1661,84 @@ impl InputWriter {
         }
     }
 
+    fn cancel_incomplete(&mut self, label: &str) -> Option<String> {
+        let InputWriterState::Thread {
+            thread, complete, ..
+        } = &self.state
+        else {
+            return None;
+        };
+        if *complete {
+            None
+        } else {
+            cleanup_errors(
+                thread
+                    .request_cancel(&format!("{label} stdin writer"))
+                    .into_iter()
+                    .collect(),
+            )
+        }
+    }
+
     fn into_result(self, label: &str) -> (Option<String>, Option<String>) {
         match self.state {
             InputWriterState::None => (None, None),
             InputWriterState::Complete { error } => (error, None),
             InputWriterState::Thread {
                 receiver,
-                handle,
-                error,
+                thread,
+                mut error,
                 complete,
             } => {
-                drop(receiver);
                 let cleanup_error =
-                    finish_owned_thread(handle, complete, &format!("{label} stdin writer"));
+                    cleanup_errors(thread.finish(complete, &format!("{label} stdin writer")));
+                if !complete {
+                    match receiver.try_recv() {
+                        Ok(next_error) => error = next_error,
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+                    }
+                }
                 (error, cleanup_error)
             }
         }
     }
+}
+
+fn write_stdin_cancellable(
+    child_stdin: &mut ChildStdin,
+    input: &[u8],
+    cancel: &AtomicBool,
+    label: &str,
+) -> Option<String> {
+    let mut written = 0;
+    while written < input.len() {
+        if cancel.load(Ordering::Acquire) {
+            return Some(format!(
+                "cancelled {label} stdin after writing {written} of {} bytes",
+                input.len()
+            ));
+        }
+        match child_stdin.write(&input[written..]) {
+            Ok(0) => {
+                return Some(format!(
+                    "failed to write {label} stdin: write returned zero after {written} bytes"
+                ));
+            }
+            Ok(bytes) => written += bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(IO_CANCEL_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if cancel.load(Ordering::Acquire) => {
+                return Some(format!(
+                    "cancelled {label} stdin after writing {written} of {} bytes: {error}",
+                    input.len()
+                ));
+            }
+            Err(error) => return Some(format!("failed to write {label} stdin: {error}")),
+        }
+    }
+    None
 }
 
 struct OutputDrainers {
@@ -961,7 +1749,8 @@ struct OutputDrainers {
 
 impl OutputDrainers {
     fn start(
-        child: &mut Child,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
         label: &str,
         stdout_limit: usize,
         stderr_limit: usize,
@@ -969,16 +1758,8 @@ impl OutputDrainers {
         stderr_tee: Option<TeeWriter>,
     ) -> Self {
         Self {
-            stdout: child
-                .stdout
-                .take()
-                .map(|stdout| start_pipe_reader("stdout", stdout, stdout_tee, label, stdout_limit))
-                .unwrap_or_else(|| PipeReader::missing(stdout_limit, "stdout")),
-            stderr: child
-                .stderr
-                .take()
-                .map(|stderr| start_pipe_reader("stderr", stderr, stderr_tee, label, stderr_limit))
-                .unwrap_or_else(|| PipeReader::missing(stderr_limit, "stderr")),
+            stdout: start_pipe_reader("stdout", stdout, stdout_tee, label, stdout_limit),
+            stderr: start_pipe_reader("stderr", stderr, stderr_tee, label, stderr_limit),
             label: label.to_string(),
         }
     }
@@ -1008,6 +1789,13 @@ impl OutputDrainers {
         }
     }
 
+    fn cancel_incomplete(&mut self, label: &str) -> Option<String> {
+        append_error(
+            self.stdout.cancel_incomplete(label),
+            self.stderr.cancel_incomplete(label),
+        )
+    }
+
     fn into_outputs(self) -> (CapturedBytes, CapturedBytes, Option<String>) {
         let (stdout, stdout_error) = self.stdout.into_output(&self.label);
         let (stderr, stderr_error) = self.stderr.into_output(&self.label);
@@ -1018,22 +1806,25 @@ impl OutputDrainers {
 struct PipeReader {
     stream: &'static str,
     receiver: Option<Receiver<PipeReadEvent>>,
-    handle: Option<thread::JoinHandle<()>>,
+    thread: Option<OwnedIoThread>,
     capture: BoundedBuffer,
     complete: bool,
     error: Option<String>,
 }
 
 impl PipeReader {
-    fn missing(limit: usize, stream: &'static str) -> Self {
-        Self {
-            stream,
-            receiver: None,
-            handle: None,
-            capture: BoundedBuffer::new(limit),
-            complete: true,
-            error: Some(format!("failed to open child {stream} pipe")),
+    fn cancel_incomplete(&mut self, label: &str) -> Option<String> {
+        if self.complete {
+            return None;
         }
+        self.thread.as_ref().and_then(|thread| {
+            cleanup_errors(
+                thread
+                    .request_cancel(&format!("{label} {} reader", self.stream))
+                    .into_iter()
+                    .collect(),
+            )
+        })
     }
 
     fn drain_ready(&mut self, label: &str) -> bool {
@@ -1069,20 +1860,32 @@ impl PipeReader {
         !self.complete && processed == MAX_PIPE_EVENTS_PER_POLL
     }
 
-    fn into_output(self, label: &str) -> (CapturedBytes, Option<String>) {
-        let Self {
-            stream,
-            receiver,
-            handle,
-            capture,
-            complete,
-            error,
-        } = self;
-        drop(receiver);
-        let cleanup_error = handle.and_then(|handle| {
-            finish_owned_thread(handle, complete, &format!("{label} {stream} reader"))
+    fn into_output(mut self, label: &str) -> (CapturedBytes, Option<String>) {
+        let cleanup_error = self.thread.take().and_then(|thread| {
+            cleanup_errors(thread.finish(self.complete, &format!("{label} {} reader", self.stream)))
         });
-        (capture.into_captured(), append_error(error, cleanup_error))
+        self.drain_after_join();
+        (
+            self.capture.into_captured(),
+            append_error(self.error, cleanup_error),
+        )
+    }
+
+    fn drain_after_join(&mut self) {
+        let Some(receiver) = &self.receiver else {
+            return;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok(PipeReadEvent::Chunk(chunk)) => self.capture.push(&chunk),
+                Ok(PipeReadEvent::Finished) => self.complete = true,
+                Ok(PipeReadEvent::Error(error)) => {
+                    self.error = Some(error);
+                    self.complete = true;
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
     }
 }
 
@@ -1104,34 +1907,52 @@ where
 {
     let (sender, receiver) = mpsc::sync_channel(PIPE_CHANNEL_CAPACITY);
     let label = label.to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
     let handle = thread::spawn(move || loop {
         let mut buffer = vec![0_u8; PIPE_READ_CHUNK_SIZE];
+        if thread_cancel.load(Ordering::Acquire) {
+            break;
+        }
         match reader.read(&mut buffer) {
             Ok(0) => {
-                let _ = sender.send(PipeReadEvent::Finished);
+                let _ = send_pipe_event(&sender, &thread_cancel, PipeReadEvent::Finished);
                 break;
             }
             Ok(bytes_read) => {
                 buffer.truncate(bytes_read);
                 if let Some(tee) = tee.as_mut() {
                     if let Err(error) = tee.file.write_all(&buffer) {
-                        if send_chunk(&sender, buffer).is_ok() {
-                            let _ = sender.send(PipeReadEvent::Error(format!(
-                                "failed to write {label} {stream} tee {}: {error}",
-                                tee.path.display()
-                            )));
+                        if send_pipe_event(&sender, &thread_cancel, PipeReadEvent::Chunk(buffer))
+                            .is_ok()
+                        {
+                            let _ = send_pipe_event(
+                                &sender,
+                                &thread_cancel,
+                                PipeReadEvent::Error(format!(
+                                    "failed to write {label} {stream} tee {}: {error}",
+                                    tee.path.display()
+                                )),
+                            );
                         }
                         break;
                     }
                 }
-                if send_chunk(&sender, buffer).is_err() {
+                if send_pipe_event(&sender, &thread_cancel, PipeReadEvent::Chunk(buffer)).is_err() {
                     break;
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(IO_CANCEL_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_error) if thread_cancel.load(Ordering::Acquire) => break,
             Err(error) => {
-                let _ = sender.send(PipeReadEvent::Error(format!(
-                    "failed to read {label} {stream}: {error}"
-                )));
+                let _ = send_pipe_event(
+                    &sender,
+                    &thread_cancel,
+                    PipeReadEvent::Error(format!("failed to read {label} {stream}: {error}")),
+                );
                 break;
             }
         }
@@ -1140,15 +1961,31 @@ where
     PipeReader {
         stream,
         receiver: Some(receiver),
-        handle: Some(handle),
+        thread: Some(OwnedIoThread { handle, cancel }),
         capture: BoundedBuffer::new(capture_limit),
         complete: false,
         error: None,
     }
 }
 
-fn send_chunk(sender: &SyncSender<PipeReadEvent>, chunk: Vec<u8>) -> Result<(), ()> {
-    sender.send(PipeReadEvent::Chunk(chunk)).map_err(|_| ())
+fn send_pipe_event(
+    sender: &SyncSender<PipeReadEvent>,
+    cancel: &AtomicBool,
+    mut event: PipeReadEvent,
+) -> Result<(), ()> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(());
+        }
+        match sender.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(next)) => {
+                event = next;
+                thread::sleep(IO_CANCEL_POLL_INTERVAL);
+            }
+            Err(TrySendError::Disconnected(_)) => return Err(()),
+        }
+    }
 }
 
 struct BoundedBuffer {
@@ -1269,7 +2106,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn true_timeout_terminates_descendants_holding_pipes() {
+    fn normal_exit_terminates_descendants_holding_pipes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let descendant_pid = temp.path().join("descendant.pid");
         let command = format!(
@@ -1286,9 +2123,10 @@ mod tests {
         .with_timeout(Some(Duration::from_millis(200)));
         let started = Instant::now();
 
-        let output = run_process(spec).expect("run hung command");
+        let output = run_process(spec).expect("run descendant-spawning command");
 
-        assert!(output.timed_out);
+        assert!(!output.timed_out);
+        assert!(output.status.is_some_and(|status| status.success()));
         assert_eq!(output.process_error, None);
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(output
@@ -1318,6 +2156,102 @@ mod tests {
             );
             thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_exit_kills_delayed_background_mutation_before_return() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("delayed-mutation");
+        let command = format!(
+            "(sleep 0.3; touch '{}') >/dev/null 2>&1 &",
+            marker.display()
+        );
+        let spec = ProcessSpec::shell(
+            "delayed descendant command",
+            Shell::UnixSh,
+            command,
+            temp.path(),
+            1024,
+        )
+        .with_timeout(Some(Duration::from_secs(2)));
+
+        let output = run_process(spec).expect("run delayed descendant command");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(!output.timed_out);
+        thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_process_group_skips_termination_grace() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        configure_process_tree(&mut command);
+        let mut child = command.spawn().expect("spawn short-lived child");
+        child.wait().expect("wait for short-lived child");
+        let started = Instant::now();
+
+        let error = finalize_unix_process_group(child.id(), "short-lived child");
+
+        assert_eq!(error, None);
+        assert!(
+            started.elapsed() < TERMINATE_GRACE,
+            "missing process group should not incur TERM grace: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_pipe_and_stdin_holders_are_cancelled_without_detaching_threads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let escaped_pid_path = temp.path().join("escaped.pid");
+        let command = format!(
+            "exec 3<&0; setsid sh -c 'echo $$ > \"{}\"; sleep 30' <&3 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done",
+            escaped_pid_path.display(),
+            escaped_pid_path.display(),
+        );
+        let spec = ProcessSpec::shell(
+            "escaped pipe holder",
+            Shell::UnixSh,
+            command,
+            temp.path(),
+            1024,
+        )
+        .with_stdin(StdinMode::Bytes(vec![b'x'; 4 * 1024 * 1024]))
+        .with_timeout(Some(Duration::from_secs(3)));
+        let started = Instant::now();
+
+        let output = run_process(spec).expect("run escaped pipe holder");
+
+        let escaped_pid = std::fs::read_to_string(&escaped_pid_path)
+            .expect("escaped process pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric escaped process pid");
+        let _ = send_unix_process_group_signal(escaped_pid, libc::SIGKILL);
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(!output.timed_out);
+        assert!(
+            output
+                .process_error
+                .as_deref()
+                .is_some_and(|error| error.contains("output pipes did not close")),
+            "expected bounded output cleanup evidence: {:?}",
+            output.process_error
+        );
+        assert!(
+            output
+                .stdin_error
+                .as_deref()
+                .is_some_and(|error| error.contains("cancelled")),
+            "expected stdin cancellation evidence: {:?}",
+            output.stdin_error
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]
@@ -1398,6 +2332,179 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn same_tee_file_is_rejected_before_child_spawn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tee_path = temp.path().join("combined.log");
+        let marker = temp.path().join("child-ran");
+        std::fs::write(&tee_path, "preserve me").expect("write existing tee");
+        let command = format!("touch '{}'", marker.display());
+        let spec = ProcessSpec::shell("same tee command", Shell::UnixSh, command, temp.path(), 128)
+            .with_stdout(StreamCapture::bounded(128).tee_to(&tee_path))
+            .with_stderr(StreamCapture::bounded(128).tee_to(&tee_path));
+
+        let error = run_process(spec).expect_err("same tee must be rejected");
+
+        assert!(matches!(error, ProcessRunError::TeeConflict { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&tee_path).expect("read preserved tee"),
+            "preserve me"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_tee_files_are_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stdout_path = temp.path().join("stdout.log");
+        let stderr_path = temp.path().join("stderr.log");
+        std::fs::write(&stdout_path, "preserve me").expect("write stdout tee");
+        std::fs::hard_link(&stdout_path, &stderr_path).expect("hard link stderr tee");
+        let spec = ProcessSpec::shell(
+            "hard-linked tee command",
+            Shell::UnixSh,
+            ":",
+            temp.path(),
+            128,
+        )
+        .with_stdout(StreamCapture::bounded(128).tee_to(&stdout_path))
+        .with_stderr(StreamCapture::bounded(128).tee_to(&stderr_path));
+
+        let error = run_process(spec).expect_err("hard-linked tees must be rejected");
+
+        assert!(matches!(error, ProcessRunError::TeeConflict { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&stdout_path).expect("read preserved tee"),
+            "preserve me"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_tee_preflight_failure_preserves_first_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stdout_path = temp.path().join("stdout.log");
+        let invalid_stderr_path = temp.path().join("stderr-directory");
+        let marker = temp.path().join("child-ran");
+        std::fs::write(&stdout_path, "preserve me").expect("write stdout tee");
+        std::fs::create_dir(&invalid_stderr_path).expect("create invalid stderr directory");
+        let command = format!("touch '{}'", marker.display());
+        let spec = ProcessSpec::shell(
+            "transactional tee command",
+            Shell::UnixSh,
+            command,
+            temp.path(),
+            128,
+        )
+        .with_stdout(StreamCapture::bounded(128).tee_to(&stdout_path))
+        .with_stderr(StreamCapture::bounded(128).tee_to(&invalid_stderr_path));
+
+        let error = run_process(spec).expect_err("invalid second tee must fail preflight");
+
+        assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&stdout_path).expect("read preserved stdout tee"),
+            "preserve me"
+        );
+        assert!(!marker.exists());
+
+        let new_stdout_path = temp.path().join("new-stdout.log");
+        let second_spec = ProcessSpec::shell(
+            "new tee rollback command",
+            Shell::UnixSh,
+            ":",
+            temp.path(),
+            128,
+        )
+        .with_stdout(StreamCapture::bounded(128).tee_to(&new_stdout_path))
+        .with_stderr(StreamCapture::bounded(128).tee_to(&invalid_stderr_path));
+        let second_error =
+            run_process(second_spec).expect_err("new first tee must roll back on second failure");
+        assert!(matches!(second_error, ProcessRunError::OpenTee { .. }));
+        assert!(!new_stdout_path.exists());
+    }
+
+    #[test]
+    fn tee_backup_restores_content_and_removes_temporary_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tee.log");
+        std::fs::write(&path, "original tee contents").expect("write tee source");
+        let backup = TeeBackup::create(&path).expect("create tee backup");
+        let backup_path = backup.path.clone();
+        let mut destination = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open tee destination");
+        destination.set_len(0).expect("truncate destination");
+        destination
+            .write_all(b"partial")
+            .expect("write partial tee");
+
+        backup
+            .restore(&mut destination)
+            .expect("restore tee backup");
+        drop(destination);
+        drop(backup);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read restored tee"),
+            "original tee contents"
+        );
+        assert!(!backup_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_error_evidence_retains_captured_output_and_cleanup_diagnostics() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf retained-stdout; printf retained-stderr >&2; sleep 30",
+        ]);
+        configure_process_tree(&mut command);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn evidence child");
+        let process_tree = ProcessTree::attach_and_start(&mut child, "evidence child", "sh")
+            .expect("attach evidence child");
+        let prepared = PreparedChildIo::take(&mut child, &StdinMode::Null)
+            .expect("prepare evidence child I/O");
+        let (input_writer, mut output_drainers) =
+            prepared.start("evidence child", StdinMode::Null, 1024, 1024, None, None);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while output_drainers.stdout.capture.bytes.is_empty()
+            || output_drainers.stderr.capture.bytes.is_empty()
+        {
+            output_drainers.drain_ready();
+            assert!(Instant::now() < deadline, "child output was not captured");
+            thread::sleep(IO_CANCEL_POLL_INTERVAL);
+        }
+
+        let evidence = cleanup_after_wait_error(
+            &mut child,
+            &process_tree,
+            "evidence child",
+            output_drainers,
+            input_writer,
+        );
+
+        assert_eq!(evidence.stdout.as_bytes(), b"retained-stdout");
+        assert_eq!(evidence.stderr.as_bytes(), b"retained-stderr");
+        let error = ProcessRunError::Wait {
+            label: "evidence child".to_string(),
+            command: "sh".to_string(),
+            evidence: Box::new(evidence),
+            source: std::io::Error::other("synthetic wait failure"),
+        };
+        assert!(error.to_string().contains("retained-stdout"));
+        assert!(error.to_string().contains("retained-stderr"));
+    }
+
     #[test]
     fn platform_shell_is_concrete() {
         #[cfg(target_os = "windows")]
@@ -1405,6 +2512,15 @@ mod tests {
 
         #[cfg(not(target_os = "windows"))]
         assert_eq!(Shell::for_current_platform(), Shell::UnixSh);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_children_start_suspended_in_a_new_process_group() {
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        assert_ne!(WINDOWS_PROCESS_CREATION_FLAGS & CREATE_SUSPENDED, 0);
+        assert_ne!(WINDOWS_PROCESS_CREATION_FLAGS & CREATE_NEW_PROCESS_GROUP, 0);
     }
 
     #[test]
