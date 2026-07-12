@@ -4,6 +4,7 @@ use crate::{
         EnvironmentMode, ProcessRunError, ProcessSpec, Shell, SideEffectConfinementProfile,
         StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
+    secure_output::{ReservedOutputFile, SecureOutputRoot},
     semantic_coord::{
         SemanticConflict, SemanticCoordinationReport, SemanticIntent, SemanticIntentRequest,
         SemanticIntentStore, SemanticIntentToken,
@@ -17,9 +18,8 @@ use git2::{Delta, DiffOptions, Oid, Repository, ResetType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
-    fs::{self, File},
-    io::Write,
+    ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
     process::{self, ExitStatus},
     thread,
@@ -33,6 +33,8 @@ const GIT_COMMAND_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_ADMIN_SNAPSHOT_MAX_ENTRIES: usize = 4096;
 const GIT_ADMIN_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PATCH_OUTPUT_MAX_BYTES: usize = 64 * 1024 * 1024;
+const CHECKPOINT_OUTPUT_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitAdminSnapshotEntry {
@@ -570,10 +572,13 @@ fn run_plan_with_controls_runtime(
         summary.worktree_reused = worktree.reused;
         summary.worktree = Some(worktree.record);
     }
+    let mut checkpoint_writer =
+        prepare_run_checkpoint_writer(&controls, &run_id, &summaries, false)?;
     write_checkpoint_if_configured(
         &controls,
         RunCheckpointStage::WorktreesSelected,
         &run_id,
+        checkpoint_writer.as_mut(),
         CheckpointView {
             repo: &repo,
             repo_head: &repo_head,
@@ -620,6 +625,7 @@ fn run_plan_with_controls_runtime(
                     &controls,
                     RunCheckpointStage::Final,
                     &run_id,
+                    checkpoint_writer.as_mut(),
                     CheckpointView {
                         repo: &repo,
                         repo_head: &repo_head,
@@ -687,6 +693,7 @@ fn run_plan_with_controls_runtime(
                 &controls,
                 RunCheckpointStage::Final,
                 &run_id,
+                checkpoint_writer.as_mut(),
                 CheckpointView {
                     repo: &repo,
                     repo_head: &repo_head,
@@ -724,6 +731,7 @@ fn run_plan_with_controls_runtime(
         &controls,
         RunCheckpointStage::ClaimsAcquired,
         &run_id,
+        checkpoint_writer.as_mut(),
         CheckpointView {
             repo: &repo,
             repo_head: &repo_head,
@@ -741,7 +749,7 @@ fn run_plan_with_controls_runtime(
         },
     )?;
 
-    run_agent_schedule(
+    run_agent_schedule_with_patch_dir(
         &plan,
         &mut summaries,
         options.jobs,
@@ -759,6 +767,7 @@ fn run_plan_with_controls_runtime(
         &controls,
         RunCheckpointStage::AgentsCompleted,
         &run_id,
+        checkpoint_writer.as_mut(),
         CheckpointView {
             repo: &repo,
             repo_head: &repo_head,
@@ -798,6 +807,7 @@ fn run_plan_with_controls_runtime(
         &controls,
         RunCheckpointStage::Final,
         &run_id,
+        checkpoint_writer.as_mut(),
         CheckpointView {
             repo: &repo,
             repo_head: &repo_head,
@@ -921,13 +931,19 @@ fn resume_plan_file_runtime(
         }));
     }
 
-    let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries)?;
     let controls = OrchestrationRunControls {
         run_id: Some(checkpoint.run_id.clone()),
         checkpoint_dir: Some(checkpoint_dir),
         worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
         semantic_coordination: checkpoint.semantic_coordination,
     };
+    let mut checkpoint_writer = prepare_run_checkpoint_writer(
+        &controls,
+        &Some(checkpoint.run_id.clone()),
+        &summaries,
+        true,
+    )?;
+    let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries)?;
     let mut acquired_semantic_tokens =
         active_checkpoint_semantic_tokens(&semantic_store, &summaries)?;
     let had_pending_agents = summaries
@@ -970,6 +986,7 @@ fn resume_plan_file_runtime(
                 &controls,
                 RunCheckpointStage::Final,
                 &Some(checkpoint.run_id.clone()),
+                checkpoint_writer.as_mut(),
                 CheckpointView {
                     repo: &repo,
                     repo_head: &repo_head,
@@ -1008,6 +1025,7 @@ fn resume_plan_file_runtime(
         &controls,
         RunCheckpointStage::ClaimsAcquired,
         &Some(checkpoint.run_id.clone()),
+        checkpoint_writer.as_mut(),
         CheckpointView {
             repo: &repo,
             repo_head: &repo_head,
@@ -1025,7 +1043,7 @@ fn resume_plan_file_runtime(
         },
     )?;
 
-    run_agent_schedule(
+    run_agent_schedule_with_patch_dir(
         &plan,
         &mut summaries,
         options.jobs,
@@ -1050,6 +1068,7 @@ fn resume_plan_file_runtime(
         &controls,
         RunCheckpointStage::AgentsCompleted,
         &Some(checkpoint.run_id.clone()),
+        checkpoint_writer.as_mut(),
         CheckpointView {
             repo: &repo,
             repo_head: &repo_head,
@@ -1090,6 +1109,7 @@ fn resume_plan_file_runtime(
         &controls,
         RunCheckpointStage::Final,
         &Some(checkpoint.run_id.clone()),
+        checkpoint_writer.as_mut(),
         CheckpointView {
             repo: &repo,
             repo_head: &repo_head,
@@ -2063,11 +2083,111 @@ fn ensure_no_active_reset_claims(store: &SyncStore, agent: &AgentPlan) -> Result
     Ok(())
 }
 
-fn run_agent_schedule(
+fn prepare_patch_outputs(
+    patch_dir: Option<&Path>,
+    plan: &OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+) -> Result<Vec<Option<ReservedOutputFile>>> {
+    let mut outputs = (0..summaries.len()).map(|_| None).collect::<Vec<_>>();
+    let Some(patch_dir) = patch_dir else {
+        return Ok(outputs);
+    };
+    let root = SecureOutputRoot::open_or_create(patch_dir)?;
+    for summary in summaries {
+        if let Some(worktree) = &summary.worktree {
+            root.reject_inside(&worktree.path)?;
+        }
+    }
+    for (index, (agent, summary)) in plan.agents.iter().zip(summaries).enumerate() {
+        if summary.status != AgentRunStatus::Pending {
+            continue;
+        }
+        match root.reserve(OsString::from(format!("{}.patch", agent.id)).as_os_str()) {
+            Ok(output) => outputs[index] = Some(output),
+            Err(error) => {
+                let cleanup = cleanup_unused_patch_outputs(outputs);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "also failed to clean partially reserved patch outputs: {cleanup:#}"
+                    ))),
+                };
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+fn cleanup_unused_patch_outputs(outputs: Vec<Option<ReservedOutputFile>>) -> Result<()> {
+    let mut errors = Vec::new();
+    for output in outputs.into_iter().flatten() {
+        let path = output.path().to_path_buf();
+        if let Err(error) = output.remove() {
+            errors.push(format!(
+                "failed to clean unused patch {}: {error:#}",
+                path.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
+}
+
+#[derive(Debug)]
+struct PatchOutputGuard {
+    output: Option<ReservedOutputFile>,
+}
+
+impl PatchOutputGuard {
+    fn new(output: ReservedOutputFile) -> Self {
+        Self {
+            output: Some(output),
+        }
+    }
+
+    fn take(&mut self) -> Option<ReservedOutputFile> {
+        self.output.take()
+    }
+}
+
+impl Drop for PatchOutputGuard {
+    fn drop(&mut self) {
+        if let Some(output) = self.output.take() {
+            let _ = output.remove();
+        }
+    }
+}
+
+fn run_agent_schedule_with_patch_dir(
     plan: &OrchestrationPlan,
     summaries: &mut [AgentRunSummary],
     jobs: usize,
     patch_dir: Option<&Path>,
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<()> {
+    let mut patch_outputs = prepare_patch_outputs(patch_dir, plan, summaries)?;
+    let schedule_result =
+        run_agent_schedule(plan, summaries, jobs, &mut patch_outputs, base_oid, runtime);
+    let cleanup_result = cleanup_unused_patch_outputs(patch_outputs);
+    match (schedule_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(schedule), Ok(())) => Err(schedule),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(schedule), Err(cleanup)) => Err(schedule.context(format!(
+            "also failed to clean unused patch reservations: {cleanup:#}"
+        ))),
+    }
+}
+
+fn run_agent_schedule(
+    plan: &OrchestrationPlan,
+    summaries: &mut [AgentRunSummary],
+    jobs: usize,
+    patch_outputs: &mut [Option<ReservedOutputFile>],
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<()> {
@@ -2129,7 +2249,7 @@ fn run_agent_schedule(
             inspect_agent_changes(
                 &plan.agents[index],
                 &mut summaries[index],
-                patch_dir,
+                patch_outputs[index].take(),
                 base_oid,
                 runtime,
             );
@@ -2202,10 +2322,11 @@ fn run_ready_agents(
 fn inspect_agent_changes(
     agent: &AgentPlan,
     summary: &mut AgentRunSummary,
-    patch_dir: Option<&Path>,
+    patch_output: Option<ReservedOutputFile>,
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
 ) {
+    let mut patch_output = patch_output.map(PatchOutputGuard::new);
     let Some(worktree) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree");
         return;
@@ -2260,8 +2381,8 @@ fn inspect_agent_changes(
         );
     }
 
-    if let Some(patch_dir) = patch_dir {
-        match write_agent_patch(&worktree_path, &agent.id, patch_dir, base_oid, runtime) {
+    if let Some(patch_output) = patch_output.as_mut().and_then(PatchOutputGuard::take) {
+        match write_agent_patch(&worktree_path, patch_output, base_oid, runtime) {
             Ok(Some(path)) => summary.patch_path = Some(path),
             Ok(None) => {}
             Err(error) => fail_summary(summary, format!("failed to write patch: {error}")),
@@ -2355,42 +2476,84 @@ fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
 
 fn write_agent_patch(
     worktree_path: &Path,
-    agent_id: &str,
-    patch_dir: &Path,
+    mut patch_output: ReservedOutputFile,
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<Option<PathBuf>> {
-    fs::create_dir_all(patch_dir)
-        .with_context(|| format!("failed to create patch directory {}", patch_dir.display()))?;
-    mark_untracked_intent_to_add(worktree_path, runtime)?;
+    let result = (|| -> Result<Option<Vec<u8>>> {
+        mark_untracked_intent_to_add(worktree_path, runtime)?;
+        let output = run_fixed_git(
+            worktree_path,
+            [
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                &base_oid.to_string(),
+            ],
+            WorkspaceAccess::ReadOnly,
+            runtime,
+        )
+        .with_context(|| format!("failed to run git diff in {}", worktree_path.display()))?;
+        if !output.status.success() {
+            bail!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok((!output.stdout.is_empty()).then_some(output.stdout))
+    })();
+    match result {
+        Ok(Some(bytes)) => {
+            if let Err(error) = validate_patch_output_size(bytes.len()) {
+                let patch_path = patch_output.path().to_path_buf();
+                let cleanup = patch_output.remove();
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "also failed to clean reserved patch {}: {cleanup:#}",
+                        patch_path.display()
+                    ))),
+                };
+            }
+            let patch_path = patch_output.path().to_path_buf();
+            if let Err(error) = patch_output.write_bytes_atomic(&bytes, PATCH_OUTPUT_MAX_BYTES) {
+                let cleanup = patch_output.remove();
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "also failed to clean reserved patch {}: {cleanup:#}",
+                        patch_path.display()
+                    ))),
+                };
+            }
+            Ok(Some(patch_path))
+        }
+        Ok(None) => {
+            patch_output.remove()?;
+            Ok(None)
+        }
+        Err(error) => {
+            let patch_path = patch_output.path().to_path_buf();
+            match patch_output.remove() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "also failed to clean reserved patch {}: {cleanup:#}",
+                    patch_path.display()
+                ))),
+            }
+        }
+    }
+}
 
-    let output = run_fixed_git(
-        worktree_path,
-        [
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--binary",
-            &base_oid.to_string(),
-        ],
-        WorkspaceAccess::ReadOnly,
-        runtime,
-    )
-    .with_context(|| format!("failed to run git diff in {}", worktree_path.display()))?;
-    if !output.status.success() {
+fn validate_patch_output_size(bytes: usize) -> Result<()> {
+    if bytes >= PATCH_OUTPUT_MAX_BYTES {
         bail!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "patch output reached the configured {} byte capture boundary",
+            PATCH_OUTPUT_MAX_BYTES
         );
     }
-    if output.stdout.is_empty() {
-        return Ok(None);
-    }
-
-    let patch_path = patch_dir.join(format!("{agent_id}.patch"));
-    fs::write(&patch_path, output.stdout)
-        .with_context(|| format!("failed to write patch {}", patch_path.display()))?;
-    Ok(Some(patch_path))
+    Ok(())
 }
 
 fn mark_untracked_intent_to_add(
@@ -3099,27 +3262,73 @@ struct CheckpointView<'a> {
     semantic_release_errors: &'a [String],
 }
 
-pub fn write_run_checkpoint(directory: &Path, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
-    fs::create_dir_all(directory).with_context(|| {
-        format!(
-            "failed to create checkpoint directory {}",
-            directory.display()
-        )
-    })?;
-    let path = checkpoint_path(directory, &checkpoint.run_id);
-    let temp_path = temp_checkpoint_path(&path);
-    let result = write_checkpoint_file(&temp_path, &path, checkpoint);
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+#[derive(Debug)]
+struct RunCheckpointWriter {
+    slot: ReservedOutputFile,
+}
+
+impl RunCheckpointWriter {
+    fn write(&mut self, checkpoint: &RunCheckpoint) -> Result<()> {
+        self.slot
+            .write_json_atomic(checkpoint, CHECKPOINT_OUTPUT_MAX_BYTES)
+            .with_context(|| format!("failed to write checkpoint {}", self.slot.path().display()))
     }
-    result?;
-    Ok(path)
+}
+
+fn prepare_run_checkpoint_writer(
+    controls: &OrchestrationRunControls,
+    run_id: &Option<RunId>,
+    summaries: &[AgentRunSummary],
+    existing_only: bool,
+) -> Result<Option<RunCheckpointWriter>> {
+    let Some(directory) = controls.checkpoint_dir.as_deref() else {
+        return Ok(None);
+    };
+    let run_id = run_id
+        .as_ref()
+        .context("checkpoint directory requires a resolved run id")?;
+    let root = if existing_only {
+        SecureOutputRoot::open_private(directory)?
+    } else {
+        SecureOutputRoot::open_or_create(directory)?
+    };
+    for summary in summaries {
+        if let Some(worktree) = &summary.worktree {
+            root.reject_inside(&worktree.path)?;
+        }
+    }
+    let name = checkpoint_file_name(run_id);
+    let slot = if existing_only {
+        root.open_existing_leaf(OsStr::new(&name))?
+    } else {
+        root.open_or_reserve(OsStr::new(&name))?
+    };
+    Ok(Some(RunCheckpointWriter { slot }))
+}
+
+pub fn write_run_checkpoint(directory: &Path, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
+    let root = SecureOutputRoot::open_or_create(directory)?;
+    let name = checkpoint_file_name(&checkpoint.run_id);
+    let mut writer = RunCheckpointWriter {
+        slot: root.open_or_reserve(OsStr::new(&name))?,
+    };
+    writer.write(checkpoint)?;
+    Ok(writer.slot.path().to_path_buf())
 }
 
 pub fn read_run_checkpoint(path: &Path) -> Result<RunCheckpoint> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read checkpoint {}", path.display()))?;
-    let checkpoint: RunCheckpoint = serde_json::from_str(&contents)
+    let parent = path
+        .parent()
+        .with_context(|| format!("checkpoint must have a parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .with_context(|| format!("checkpoint must have a file name: {}", path.display()))?;
+    let root = SecureOutputRoot::open_private(parent)?;
+    let slot = root.open_existing_leaf(name)?;
+    let contents = slot.read_bounded(CHECKPOINT_OUTPUT_MAX_BYTES)?;
+    let contents = std::str::from_utf8(&contents)
+        .with_context(|| format!("checkpoint is not UTF-8: {}", path.display()))?;
+    let checkpoint: RunCheckpoint = serde_json::from_str(contents)
         .with_context(|| format!("failed to parse checkpoint {}", path.display()))?;
     if checkpoint.version != CHECKPOINT_STATE_VERSION {
         bail!(
@@ -3132,21 +3341,27 @@ pub fn read_run_checkpoint(path: &Path) -> Result<RunCheckpoint> {
 }
 
 pub fn checkpoint_path(directory: &Path, run_id: &RunId) -> PathBuf {
-    directory.join(format!("{}.json", run_id.as_str()))
+    directory.join(checkpoint_file_name(run_id))
+}
+
+fn checkpoint_file_name(run_id: &RunId) -> String {
+    format!("{}.json", run_id.as_str())
 }
 
 fn write_checkpoint_if_configured(
     controls: &OrchestrationRunControls,
     stage: RunCheckpointStage,
     run_id: &Option<RunId>,
+    writer: Option<&mut RunCheckpointWriter>,
     view: CheckpointView<'_>,
 ) -> Result<()> {
-    let Some(directory) = controls.checkpoint_dir.as_deref() else {
+    if controls.checkpoint_dir.is_none() {
         return Ok(());
-    };
+    }
     let Some(run_id) = run_id.clone() else {
         return Ok(());
     };
+    let writer = writer.context("checkpoint controls omitted a prepared secure writer")?;
 
     let checkpoint = RunCheckpoint {
         version: CHECKPOINT_STATE_VERSION,
@@ -3168,8 +3383,7 @@ fn write_checkpoint_if_configured(
         semantic_release_errors: view.semantic_release_errors.to_vec(),
         updated_unix_ms: unix_time_millis(),
     };
-    write_run_checkpoint(directory, &checkpoint)?;
-    Ok(())
+    writer.write(&checkpoint)
 }
 
 impl From<&AgentRunSummary> for AgentCheckpoint {
@@ -3210,53 +3424,6 @@ impl From<&CheckpointWorktreeRecord> for WorktreeRecord {
             branch: record.branch.clone(),
         }
     }
-}
-
-fn write_checkpoint_file(
-    temp_path: &Path,
-    checkpoint_path: &Path,
-    checkpoint: &RunCheckpoint,
-) -> Result<()> {
-    let mut file = File::create(temp_path).with_context(|| {
-        format!(
-            "failed to create temporary checkpoint {}",
-            temp_path.display()
-        )
-    })?;
-    serde_json::to_writer_pretty(&mut file, checkpoint).with_context(|| {
-        format!(
-            "failed to write temporary checkpoint {}",
-            temp_path.display()
-        )
-    })?;
-    file.write_all(b"\n").with_context(|| {
-        format!(
-            "failed to finish temporary checkpoint {}",
-            temp_path.display()
-        )
-    })?;
-    file.sync_all().with_context(|| {
-        format!(
-            "failed to flush temporary checkpoint {}",
-            temp_path.display()
-        )
-    })?;
-    drop(file);
-    fs::rename(temp_path, checkpoint_path).with_context(|| {
-        format!(
-            "failed to replace checkpoint {} with {}",
-            checkpoint_path.display(),
-            temp_path.display()
-        )
-    })
-}
-
-fn temp_checkpoint_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("checkpoint.json");
-    path.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
 }
 
 fn resolve_run_id(controls: &OrchestrationRunControls) -> Result<Option<RunId>> {
@@ -4985,8 +5152,9 @@ mod tests {
             updated_unix_ms: 1,
         };
 
-        let path = write_run_checkpoint(temp.path(), &checkpoint).expect("write checkpoint");
-        assert_eq!(path, checkpoint_path(temp.path(), &run_id));
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let path = write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+        assert_eq!(path, checkpoint_path(&checkpoint_dir, &run_id));
         let loaded = read_run_checkpoint(&path).expect("read checkpoint");
         assert_eq!(loaded, checkpoint);
     }
@@ -5129,6 +5297,90 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(indexed.contains(&raw));
         assert!(indexed.contains(replacement.as_bytes()));
+    }
+
+    #[test]
+    fn patch_guard_cleans_early_inspection_failure_and_rejects_exact_capture_boundary() {
+        let temp = TempDir::new().expect("tempdir");
+        let root =
+            SecureOutputRoot::create_new(&temp.path().join("patches")).expect("create patch root");
+        let slot = root
+            .reserve(OsStr::new("agent-a.patch"))
+            .expect("reserve patch");
+        let path = slot.path().to_path_buf();
+        let agent = AgentPlan {
+            id: "agent-a".to_string(),
+            paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            env: BTreeMap::new(),
+            timeout: None,
+            command: "true".to_string(),
+            depends_on: Vec::new(),
+            working_directory: None,
+            validation_commands: Vec::new(),
+        };
+        let mut summary = AgentRunSummary::pending(&agent);
+
+        inspect_agent_changes(
+            &agent,
+            &mut summary,
+            Some(slot),
+            &Oid::zero(),
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        );
+
+        assert_eq!(summary.status, AgentRunStatus::Failed);
+        assert!(!path.exists(), "early return left a reserved patch leaf");
+        assert!(validate_patch_output_size(PATCH_OUTPUT_MAX_BYTES - 1).is_ok());
+        assert!(validate_patch_output_size(PATCH_OUTPUT_MAX_BYTES).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retained_checkpoint_writer_rejects_leaf_rebinding_without_clobbering_sentinel() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let root = SecureOutputRoot::create_new(&temp.path().join("checkpoints"))
+            .expect("create checkpoint root");
+        let run_id = RunId::new("secure-checkpoint").expect("run id");
+        let slot = root
+            .reserve(OsStr::new("secure-checkpoint.json"))
+            .expect("reserve checkpoint");
+        let path = slot.path().to_path_buf();
+        let mut writer = RunCheckpointWriter { slot };
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id,
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: PathBuf::from("repo"),
+            repo_head: None,
+            plan_file: PathBuf::from("plan.json"),
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: Vec::new(),
+            repo_validation: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        writer.write(&checkpoint).expect("initial checkpoint write");
+        let sentinel = temp.path().join("sentinel");
+        fs::write(&sentinel, "untouched").expect("write sentinel");
+        fs::remove_file(&path).expect("remove checkpoint leaf");
+        symlink(&sentinel, &path).expect("rebind checkpoint leaf");
+
+        assert!(writer.write(&checkpoint).is_err());
+        assert_eq!(
+            fs::read_to_string(&sentinel).expect("read sentinel"),
+            "untouched"
+        );
     }
 
     fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {

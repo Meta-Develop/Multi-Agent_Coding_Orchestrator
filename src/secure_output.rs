@@ -68,6 +68,34 @@ pub(crate) struct ReservedOutputFile {
 }
 
 impl SecureOutputRoot {
+    /// Opens an existing private directory without creating any path component.
+    pub(crate) fn open_private(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let absolute = absolute_normalized(path)?;
+            let directory = open_existing_directory_tree(&absolute)?;
+            let metadata = directory.metadata().with_context(|| {
+                format!(
+                    "failed to inspect secure output root {}",
+                    absolute.display()
+                )
+            })?;
+            validate_private_directory(&metadata, &absolute)?;
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                path: absolute,
+                directory,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            bail!("secure output capabilities are not implemented on this host")
+        }
+    }
+
     /// Creates a new private final directory. Existing final paths are refused even when safe.
     pub(crate) fn create_new(path: &Path) -> Result<Self> {
         #[cfg(unix)]
@@ -298,23 +326,29 @@ impl SecureOutputRoot {
 
     /// Reserves a new `0600` regular file before releasing less-trusted execution.
     pub(crate) fn reserve(&self, name: &OsStr) -> Result<ReservedOutputFile> {
-        self.reserve_impl(name, false, false)
+        self.reserve_impl(name, false, true, false)
     }
 
     /// Opens a previously secured leaf or creates it. Intended for resumable state only.
     pub(crate) fn open_or_reserve(&self, name: &OsStr) -> Result<ReservedOutputFile> {
-        self.reserve_impl(name, true, false)
+        self.reserve_impl(name, true, true, false)
+    }
+
+    /// Opens an existing private regular leaf without creating a missing target.
+    pub(crate) fn open_existing_leaf(&self, name: &OsStr) -> Result<ReservedOutputFile> {
+        self.reserve_impl(name, true, false, false)
     }
 
     #[cfg(test)]
     fn reserve_failing_after_open(&self, name: &OsStr) -> Result<ReservedOutputFile> {
-        self.reserve_impl(name, false, true)
+        self.reserve_impl(name, false, true, true)
     }
 
     fn reserve_impl(
         &self,
         name: &OsStr,
         allow_existing: bool,
+        create_if_missing: bool,
         fail_after_open: bool,
     ) -> Result<ReservedOutputFile> {
         #[cfg(unix)]
@@ -331,7 +365,9 @@ impl SecureOutputRoot {
                 };
                 if existing >= 0 {
                     (existing, false)
-                } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                } else if create_if_missing
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+                {
                     // SAFETY: the descriptor and name are valid; O_EXCL prevents raced reuse.
                     let created = unsafe {
                         libc::openat(
@@ -443,6 +479,25 @@ impl SecureOutputRoot {
 impl ReservedOutputFile {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Removes an unused reserved leaf only while its held and path identities still match.
+    pub(crate) fn remove(self) -> Result<()> {
+        self.verify_path_identity()?;
+        #[cfg(unix)]
+        {
+            cleanup_created_file(
+                &self.directory,
+                &leaf_cstring(&self.name)?,
+                (self.device, self.inode),
+                &self.path,
+            )?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("secure output capabilities are not implemented on this host")
+        }
     }
 
     /// Reads from the descriptor captured before child execution. No pathname is reopened.
