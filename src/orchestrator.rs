@@ -1,4 +1,7 @@
 use crate::{
+    process_runner::{
+        run_process, CapturedBytes, EnvironmentMode, ProcessRunError, ProcessSpec, Shell,
+    },
     semantic_coord::{
         SemanticConflict, SemanticCoordinationReport, SemanticIntent, SemanticIntentRequest,
         SemanticIntentStore, SemanticIntentToken,
@@ -15,12 +18,13 @@ use std::{
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    process::{self, Child, Command, ExitStatus, Stdio},
+    process::{self, Command, ExitStatus},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
+const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const CHECKPOINT_STATE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2064,7 +2068,7 @@ fn run_ready_agents(
     plan: &OrchestrationPlan,
     summaries: &[AgentRunSummary],
     ready: &[usize],
-) -> Result<Vec<(usize, std::io::Result<CommandRunResult>)>> {
+) -> Result<Vec<(usize, Result<CommandRunResult, ProcessRunError>)>> {
     if ready.len() == 1 {
         let index = ready[0];
         let spec = command_spec(&plan.agents[index], &summaries[index])?;
@@ -2422,7 +2426,7 @@ fn run_validation_command(validation: &ValidationCommandPlan, root: &Path) -> Va
 
 fn validation_summary_from_result(
     validation: &ValidationCommandPlan,
-    result: std::io::Result<CommandRunResult>,
+    result: Result<CommandRunResult, ProcessRunError>,
 ) -> ValidationRunSummary {
     let mut summary = ValidationRunSummary {
         name: validation.name.clone(),
@@ -2492,157 +2496,27 @@ struct CommandRunSpec {
     timeout: Option<Duration>,
 }
 
-fn run_agent_command(spec: CommandRunSpec) -> std::io::Result<CommandRunResult> {
-    let started = Instant::now();
-    let mut command = shell_command(&spec.command);
-    configure_timeout_process_control(&mut command);
-    let mut child = command
-        .current_dir(&spec.working_directory)
-        .envs(&spec.env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let output = if let Some(timeout) = spec.timeout {
-        loop {
-            if child.try_wait()?.is_some() {
-                let output = child.wait_with_output()?;
-                break TimedOutput {
-                    status: Some(output.status),
-                    timed_out: false,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error: None,
-                };
-            }
-
-            if command_timed_out(started, timeout) {
-                let process_error = terminate_child_on_timeout(&mut child);
-                let output = child.wait_with_output()?;
-                break TimedOutput {
-                    status: Some(output.status),
-                    timed_out: true,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error,
-                };
-            }
-
-            thread::sleep(Duration::from_millis(25));
-        }
-    } else {
-        let output = child.wait_with_output()?;
-        TimedOutput {
-            status: Some(output.status),
-            timed_out: false,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            process_error: None,
-        }
-    };
+fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRunError> {
+    let output = run_process(
+        ProcessSpec::shell(
+            "agent command",
+            Shell::for_current_platform(),
+            spec.command,
+            spec.working_directory,
+            OUTPUT_CAPTURE_LIMIT_BYTES,
+        )
+        .with_environment(EnvironmentMode::InheritAndSet(spec.env))
+        .with_timeout(spec.timeout),
+    )?;
 
     Ok(CommandRunResult {
         status: output.status,
-        duration_ms: duration_millis(started.elapsed()),
+        duration_ms: output.duration_ms(),
         timed_out: output.timed_out,
         stdout: summarize_output(&output.stdout),
         stderr: summarize_output(&output.stderr),
         process_error: output.process_error,
     })
-}
-
-fn command_timed_out(started: Instant, timeout: Duration) -> bool {
-    started.elapsed() >= timeout
-}
-
-fn configure_timeout_process_control(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
-}
-
-fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
-    #[cfg(unix)]
-    {
-        terminate_unix_process_group(child)
-    }
-
-    #[cfg(not(unix))]
-    {
-        child
-            .kill()
-            .err()
-            .map(|error| format!("command timed out but process kill failed: {error}"))
-    }
-}
-
-#[cfg(unix)]
-fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
-    let pid = child.id();
-    let term_error = send_unix_process_group_signal(pid, "TERM").err();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Some(format!("command timed out but wait failed: {error}")),
-        }
-    }
-
-    let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
-    kill_result.err().map(|error| {
-        if let Some(term_error) = term_error {
-            format!(
-                "command timed out but process group termination failed: {term_error}; kill failed: {error}"
-            )
-        } else {
-            format!("command timed out but process group kill failed: {error}")
-        }
-    })
-}
-
-#[cfg(unix)]
-fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(unix_process_group_target(pid))
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} {} exited with {status}",
-            unix_process_group_target(pid)
-        )))
-    }
-}
-
-#[cfg(unix)]
-fn unix_process_group_target(pid: u32) -> String {
-    format!("-{pid}")
-}
-
-fn shell_command(command: &str) -> Command {
-    #[cfg(target_os = "windows")]
-    {
-        let mut shell = Command::new("cmd");
-        shell.arg("/C").arg(command);
-        shell
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut shell = Command::new("sh");
-        shell.arg("-c").arg(command);
-        shell
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -2655,16 +2529,10 @@ struct CommandRunResult {
     process_error: Option<String>,
 }
 
-#[derive(Debug)]
-struct TimedOutput {
-    status: Option<ExitStatus>,
-    timed_out: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    process_error: Option<String>,
-}
-
-fn apply_command_result(summary: &mut AgentRunSummary, result: std::io::Result<CommandRunResult>) {
+fn apply_command_result(
+    summary: &mut AgentRunSummary,
+    result: Result<CommandRunResult, ProcessRunError>,
+) {
     match result {
         Ok(result) => {
             summary.exit_code = result.status.and_then(|status| status.code());
@@ -2708,13 +2576,11 @@ fn duration_millis(duration: Duration) -> u64 {
     }
 }
 
-fn summarize_output(output: &[u8]) -> OutputSummary {
-    let text = String::from_utf8_lossy(output);
-    let mut chars = text.chars();
-    let value = chars.by_ref().take(OUTPUT_CHAR_LIMIT).collect::<String>();
+fn summarize_output(output: &CapturedBytes) -> OutputSummary {
+    let summary = output.summarize_chars(OUTPUT_CHAR_LIMIT);
     OutputSummary {
-        text: value,
-        truncated: chars.next().is_some(),
+        text: summary.text,
+        truncated: summary.truncated,
     }
 }
 
@@ -4653,13 +4519,23 @@ mod tests {
         assert_eq!(checkpoint.agents[0].id, "agent-a");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn process_control_helpers_are_deterministic() {
-        let started = Instant::now() - Duration::from_millis(5);
-        assert!(command_timed_out(started, Duration::from_millis(1)));
+    fn agent_command_drains_large_output_before_timeout() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_agent_command(CommandRunSpec {
+            command: "i=0; while [ \"$i\" -lt 128 ]; do printf '%4096s' O; printf '%4096s' E >&2; i=$((i + 1)); done".to_string(),
+            working_directory: temp.path().to_path_buf(),
+            env: BTreeMap::new(),
+            timeout: Some(Duration::from_secs(3)),
+        })
+        .expect("run large-output agent command");
 
-        #[cfg(unix)]
-        assert_eq!(unix_process_group_target(42), "-42");
+        assert!(result.status.is_some_and(|status| status.success()));
+        assert!(!result.timed_out);
+        assert!(result.stdout.truncated);
+        assert!(result.stderr.truncated);
+        assert_eq!(result.process_error, None);
     }
 
     fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {

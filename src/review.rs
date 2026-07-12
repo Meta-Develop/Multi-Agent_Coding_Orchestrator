@@ -1,15 +1,16 @@
-use crate::llm::Redactor;
+use crate::{
+    llm::Redactor,
+    process_runner::{run_process, ProcessOutput, ProcessSpec, Shell, StdinMode},
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const REVIEW_OUTPUT_LIMIT: usize = 8 * 1024;
+const REVIEW_CAPTURE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ReviewPrOptions {
@@ -197,24 +198,22 @@ fn external_review(options: ReviewPrOptions) -> Result<ReviewReport> {
         diff_summary: options.diff_summary.as_deref(),
     })
     .context("failed to serialize external review input")?;
-    let mut command_process = Command::new("sh");
-    command_process.arg("-c").arg(command);
-    configure_timeout_process_control(&mut command_process);
-    let mut child = command_process
-        .current_dir(&options.repo)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn external reviewer command")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&input)
-            .context("failed to write external review input")?;
-    }
     let timeout = options.reviewer.timeout_seconds.map(Duration::from_secs);
-    let output = wait_for_external_review(child, timeout)
-        .context("failed to wait for external reviewer command")?;
+    let output = run_process(
+        ProcessSpec::shell(
+            "external reviewer command",
+            Shell::for_current_platform(),
+            command,
+            &options.repo,
+            REVIEW_CAPTURE_LIMIT_BYTES,
+        )
+        .with_stdin(StdinMode::Bytes(input))
+        .with_timeout(timeout),
+    )
+    .context("failed to run external reviewer command")?;
+    if let Some(error) = &output.stdin_error {
+        bail!(error.clone());
+    }
     let diagnostics =
         diagnostics_from_output(&options.repo, &output, options.reviewer.timeout_seconds);
     if output.timed_out {
@@ -224,14 +223,20 @@ fn external_review(options: ReviewPrOptions) -> Result<ReviewReport> {
             diagnostics,
         ));
     }
-    if !output.status.is_some_and(|status| status.success()) {
+    if output.process_error.is_some() || !output.status.is_some_and(|status| status.success()) {
         return Ok(failed_external_review(
             options,
             "external reviewer command failed",
             diagnostics,
         ));
     }
-    let mut report: ReviewReport = serde_json::from_slice(&output.stdout)
+    if output.stdout.is_truncated() {
+        bail!(
+            "external reviewer command output exceeded the {} byte capture limit",
+            REVIEW_CAPTURE_LIMIT_BYTES
+        );
+    }
+    let mut report: ReviewReport = serde_json::from_slice(output.stdout.as_bytes())
         .context("external reviewer command must emit a review report JSON object")?;
     report.reviewer.mode = ReviewerMode::ExternalCommand;
     report.ci_reaction_supported = false;
@@ -276,70 +281,17 @@ fn failed_external_review(
     }
 }
 
-fn wait_for_external_review(
-    mut child: Child,
-    timeout: Option<Duration>,
-) -> std::io::Result<ExternalTimedOutput> {
-    let started = Instant::now();
-    if let Some(timeout) = timeout {
-        loop {
-            if child.try_wait()?.is_some() {
-                let output = child.wait_with_output()?;
-                return Ok(ExternalTimedOutput {
-                    status: Some(output.status),
-                    timed_out: false,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error: None,
-                });
-            }
-
-            if started.elapsed() >= timeout {
-                let process_error = terminate_child_on_timeout(&mut child);
-                let output = child.wait_with_output()?;
-                return Ok(ExternalTimedOutput {
-                    status: Some(output.status),
-                    timed_out: true,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error,
-                });
-            }
-
-            thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    let output = child.wait_with_output()?;
-    Ok(ExternalTimedOutput {
-        status: Some(output.status),
-        timed_out: false,
-        stdout: output.stdout,
-        stderr: output.stderr,
-        process_error: None,
-    })
-}
-
-#[derive(Debug)]
-struct ExternalTimedOutput {
-    status: Option<ExitStatus>,
-    timed_out: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    process_error: Option<String>,
-}
-
 fn diagnostics_from_output(
     repo: &Path,
-    output: &ExternalTimedOutput,
+    output: &ProcessOutput,
     timeout_seconds: Option<u64>,
 ) -> ReviewCommandDiagnostics {
     ReviewCommandDiagnostics {
         timed_out: output.timed_out,
         timeout_seconds,
         exit_code: output.status.and_then(|status| status.code()),
-        stdout: sanitize_review_output(repo, &output.stdout),
-        stderr: sanitize_review_output(repo, &output.stderr),
+        stdout: sanitize_review_output(repo, output.stdout.as_bytes()),
+        stderr: sanitize_review_output(repo, output.stderr.as_bytes()),
         process_error: output.process_error.clone(),
     }
 }
@@ -387,79 +339,6 @@ fn push_redacted_token(output: &mut String, token: &str) {
         output.push_str("<redacted:token>");
     } else {
         output.push_str(token);
-    }
-}
-
-fn configure_timeout_process_control(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
-}
-
-fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
-    #[cfg(unix)]
-    {
-        terminate_unix_process_group(child)
-    }
-
-    #[cfg(not(unix))]
-    {
-        child
-            .kill()
-            .err()
-            .map(|error| format!("external reviewer timed out but process kill failed: {error}"))
-    }
-}
-
-#[cfg(unix)]
-fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
-    let pid = child.id();
-    let term_error = send_unix_process_group_signal(pid, "TERM").err();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                return Some(format!(
-                    "external reviewer timed out but process wait failed: {error}"
-                ))
-            }
-        }
-    }
-
-    let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
-    kill_result.err().map(|error| {
-        if let Some(term_error) = term_error {
-            format!(
-                "external reviewer timed out but process group termination failed: {term_error}; kill failed: {error}"
-            )
-        } else {
-            format!("external reviewer timed out but process group kill failed: {error}")
-        }
-    })
-}
-
-#[cfg(unix)]
-fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let target = format!("-{pid}");
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(&target)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} {target} exited with {status}"
-        )))
     }
 }
 
@@ -614,5 +493,44 @@ mod tests {
             }]
         );
         assert!(!report.ci_reaction_supported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_review_drains_large_output_before_timeout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let report_path = temp.path().join("review.json");
+        let expected = fake_review(ReviewPrOptions {
+            repo: temp.path().to_path_buf(),
+            target: "#44".to_string(),
+            reviewer: ReviewerConfig::default(),
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("src/review.rs")],
+            diff_summary: None,
+        });
+        std::fs::write(&report_path, serde_json::to_vec(&expected)?)?;
+        let command = format!(
+            "cat >/dev/null; i=0; while [ \"$i\" -lt 256 ]; do printf '%4096s' ' '; i=$((i + 1)); done; cat '{}'",
+            report_path.display()
+        );
+
+        let report = external_review(ReviewPrOptions {
+            repo: temp.path().to_path_buf(),
+            target: "#44".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some(command),
+                timeout_seconds: Some(3),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("src/review.rs")],
+            diff_summary: None,
+        })?;
+
+        assert_eq!(report.status, ReviewReportStatus::Passed);
+        assert!(report.success);
+        assert_eq!(report.reviewer.mode, ReviewerMode::ExternalCommand);
+        Ok(())
     }
 }

@@ -7,6 +7,7 @@ use crate::{
         self, MergeApplyPreview, MergeCandidate, MergeCollectOptions, MergeForceOptions,
         MergePreviewOptions, ValidationReport, ValidationStatus,
     },
+    process_runner::{run_process, CapturedBytes, ProcessSpec, Shell, StdinMode},
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
     worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
@@ -17,15 +18,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    thread,
+    process::ExitStatus,
     time::{Duration, Instant},
 };
 
 const DEFAULT_MODEL: &str = "deterministic-fake";
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
+const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
@@ -799,15 +799,18 @@ fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionRepor
         .map(|path| worktree_path.join(path))
         .unwrap_or_else(|| worktree_path.to_path_buf());
     let started = Instant::now();
-    let mut command = shell_command(&spec.command);
-    configure_timeout_process_control(&mut command);
-    let spawn_result = command
-        .current_dir(&full_cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    let result = run_process(
+        ProcessSpec::shell(
+            "agent command",
+            Shell::for_current_platform(),
+            spec.command.clone(),
+            full_cwd,
+            OUTPUT_CAPTURE_LIMIT_BYTES,
+        )
+        .with_timeout(Some(spec.timeout)),
+    );
 
-    match spawn_result.and_then(|child| wait_for_command(child, started, spec.timeout)) {
+    match result {
         Ok(output) => {
             let success = output.status.is_some_and(|status| status.success())
                 && !output.timed_out
@@ -818,11 +821,11 @@ fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionRepor
                 working_directory: normalized_cwd,
                 success,
                 exit_code: output.status.and_then(|status| status.code()),
-                duration_ms: output.duration_ms,
+                duration_ms: output.duration_ms(),
                 timed_out: output.timed_out,
                 timeout_seconds: spec.timeout.as_secs(),
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout: summarize_output(&output.stdout),
+                stderr: summarize_output(&output.stderr),
                 error: if success {
                     None
                 } else if let Some(error) = output.process_error {
@@ -856,125 +859,6 @@ fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionRepor
     }
 }
 
-fn wait_for_command(
-    mut child: Child,
-    started: Instant,
-    timeout: Duration,
-) -> std::io::Result<TimedCommandOutput> {
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            return Ok(TimedCommandOutput {
-                status: Some(output.status),
-                duration_ms: duration_millis(started.elapsed()),
-                timed_out: false,
-                stdout: summarize_output(&output.stdout),
-                stderr: summarize_output(&output.stderr),
-                process_error: None,
-            });
-        }
-
-        if started.elapsed() >= timeout {
-            let process_error = terminate_child_on_timeout(&mut child);
-            let output = child.wait_with_output()?;
-            return Ok(TimedCommandOutput {
-                status: Some(output.status),
-                duration_ms: duration_millis(started.elapsed()),
-                timed_out: true,
-                stdout: summarize_output(&output.stdout),
-                stderr: summarize_output(&output.stderr),
-                process_error,
-            });
-        }
-
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TimedCommandOutput {
-    status: Option<ExitStatus>,
-    duration_ms: u64,
-    timed_out: bool,
-    stdout: OutputSummary,
-    stderr: OutputSummary,
-    process_error: Option<String>,
-}
-
-fn configure_timeout_process_control(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
-}
-
-fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
-    #[cfg(unix)]
-    {
-        terminate_unix_process_group(child)
-    }
-
-    #[cfg(not(unix))]
-    {
-        child
-            .kill()
-            .err()
-            .map(|error| format!("command timed out but process kill failed: {error}"))
-    }
-}
-
-#[cfg(unix)]
-fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
-    let pid = child.id();
-    let term_error = send_unix_process_group_signal(pid, "TERM").err();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Some(format!("command timed out but wait failed: {error}")),
-        }
-    }
-
-    let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
-    kill_result.err().map(|error| {
-        if let Some(term_error) = term_error {
-            format!(
-                "command timed out but process group termination failed: {term_error}; kill failed: {error}"
-            )
-        } else {
-            format!("command timed out but process group kill failed: {error}")
-        }
-    })
-}
-
-#[cfg(unix)]
-fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(unix_process_group_target(pid))
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} {} exited with {status}",
-            unix_process_group_target(pid)
-        )))
-    }
-}
-
-#[cfg(unix)]
-fn unix_process_group_target(pid: u32) -> String {
-    format!("-{pid}")
-}
-
 fn normalize_optional_working_directory(path: Option<&PathBuf>) -> Result<Option<PathBuf>> {
     let Some(path) = path else {
         return Ok(None);
@@ -1001,34 +885,25 @@ fn validation_report_for_command(result: &CommandExecutionReport) -> ValidationR
 }
 
 fn run_git_apply(worktree_path: &Path, patch: &str) -> Result<ProcessOutput> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("apply")
-        .arg("--whitespace=nowarn")
-        .arg("--binary")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start git apply in {}", worktree_path.display()))?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("failed to open git apply stdin")?;
-        stdin
-            .write_all(patch.as_bytes())
-            .context("failed to write provider patch to git apply")?;
+    let output = run_process(
+        ProcessSpec::direct(
+            "git apply",
+            "git",
+            ["apply", "--whitespace=nowarn", "--binary", "-"],
+            worktree_path,
+            OUTPUT_CAPTURE_LIMIT_BYTES,
+        )
+        .with_stdin(StdinMode::Bytes(patch.as_bytes().to_vec())),
+    )
+    .with_context(|| format!("failed to run git apply in {}", worktree_path.display()))?;
+    if let Some(error) = output.stdin_error {
+        bail!(error);
     }
-
-    let output = child
-        .wait_with_output()
-        .context("failed to wait for git apply")?;
+    if let Some(error) = output.process_error {
+        bail!(error);
+    }
     Ok(ProcessOutput {
-        status: Some(output.status),
+        status: output.status,
         stdout: summarize_output(&output.stdout),
         stderr: summarize_output(&output.stderr),
     })
@@ -1041,29 +916,11 @@ struct ProcessOutput {
     stderr: OutputSummary,
 }
 
-fn shell_command(command: &str) -> Command {
-    #[cfg(target_os = "windows")]
-    {
-        let mut shell = Command::new("cmd");
-        shell.arg("/C").arg(command);
-        shell
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut shell = Command::new("sh");
-        shell.arg("-c").arg(command);
-        shell
-    }
-}
-
-fn summarize_output(output: &[u8]) -> OutputSummary {
-    let text = String::from_utf8_lossy(output);
-    let mut chars = text.chars();
-    let value = chars.by_ref().take(OUTPUT_CHAR_LIMIT).collect::<String>();
+fn summarize_output(output: &CapturedBytes) -> OutputSummary {
+    let summary = output.summarize_chars(OUTPUT_CHAR_LIMIT);
     OutputSummary {
-        text: value,
-        truncated: chars.next().is_some(),
+        text: summary.text,
+        truncated: summary.truncated,
     }
 }
 

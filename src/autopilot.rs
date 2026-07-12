@@ -7,6 +7,9 @@ use crate::{
     },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
+    process_runner::{
+        run_process, CapturedBytes, ProcessOutput, ProcessRunError, ProcessSpec, Shell,
+    },
     publication::{
         self, ForgeKind, PrPublicationOptions, PrPublicationReport, PrPublicationStatus,
     },
@@ -32,14 +35,13 @@ use std::{
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const AUTOPILOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
 const VALIDATION_OUTPUT_LIMIT: usize = 8 * 1024;
+const VALIDATION_CAPTURE_LIMIT_BYTES: usize = VALIDATION_OUTPUT_LIMIT * 4;
 
 #[derive(Debug, Clone)]
 pub struct AutopilotRunOptions {
@@ -881,79 +883,28 @@ fn run_validation_process(
     worktree: &Path,
     command_text: &str,
     timeout: Option<Duration>,
-) -> std::io::Result<ValidationCommandOutput> {
-    let started = Instant::now();
-    let mut command = shell_command(command_text);
-    configure_timeout_process_control(&mut command);
-    let mut child = command
-        .current_dir(worktree)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(timeout) = timeout {
-        loop {
-            if child.try_wait()?.is_some() {
-                let output = child.wait_with_output()?;
-                return Ok(ValidationCommandOutput {
-                    status: Some(output.status),
-                    timed_out: false,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error: None,
-                });
-            }
-
-            if started.elapsed() >= timeout {
-                let process_error = terminate_child_on_timeout(&mut child);
-                let output = child.wait_with_output()?;
-                return Ok(ValidationCommandOutput {
-                    status: Some(output.status),
-                    timed_out: true,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    process_error,
-                });
-            }
-
-            thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    let output = child.wait_with_output()?;
-    Ok(ValidationCommandOutput {
-        status: Some(output.status),
-        timed_out: false,
-        stdout: output.stdout,
-        stderr: output.stderr,
-        process_error: None,
-    })
-}
-
-#[derive(Debug)]
-struct ValidationCommandOutput {
-    status: Option<ExitStatus>,
-    timed_out: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    process_error: Option<String>,
+) -> Result<ProcessOutput, ProcessRunError> {
+    run_process(
+        ProcessSpec::shell(
+            "validation command",
+            Shell::for_current_platform(),
+            command_text,
+            worktree,
+            VALIDATION_CAPTURE_LIMIT_BYTES,
+        )
+        .with_timeout(timeout),
+    )
 }
 
 fn validation_failure_message(
-    output: &ValidationCommandOutput,
+    output: &ProcessOutput,
     timeout_seconds: Option<u64>,
 ) -> Option<String> {
     if let Some(error) = &output.process_error {
         return Some(format!(
             "{error}; stdout: {}; stderr: {}",
-            summarize_text(
-                &String::from_utf8_lossy(&output.stdout),
-                VALIDATION_OUTPUT_LIMIT
-            ),
-            summarize_text(
-                &String::from_utf8_lossy(&output.stderr),
-                VALIDATION_OUTPUT_LIMIT
-            )
+            summarize_validation_output(&output.stdout),
+            summarize_validation_output(&output.stderr)
         ));
     }
     if output.timed_out {
@@ -962,14 +913,8 @@ fn validation_failure_message(
             .unwrap_or_default();
         return Some(format!(
             "validation timed out{timeout}; stdout: {}; stderr: {}",
-            summarize_text(
-                &String::from_utf8_lossy(&output.stdout),
-                VALIDATION_OUTPUT_LIMIT
-            ),
-            summarize_text(
-                &String::from_utf8_lossy(&output.stderr),
-                VALIDATION_OUTPUT_LIMIT
-            )
+            summarize_validation_output(&output.stdout),
+            summarize_validation_output(&output.stderr)
         ));
     }
     if output.status.is_some_and(|status| status.success()) {
@@ -982,100 +927,13 @@ fn validation_failure_message(
             .and_then(|status| status.code())
             .map(|code| code.to_string())
             .unwrap_or_else(|| "signal".to_string()),
-        summarize_text(
-            &String::from_utf8_lossy(&output.stdout),
-            VALIDATION_OUTPUT_LIMIT
-        ),
-        summarize_text(
-            &String::from_utf8_lossy(&output.stderr),
-            VALIDATION_OUTPUT_LIMIT
-        )
+        summarize_validation_output(&output.stdout),
+        summarize_validation_output(&output.stderr)
     ))
 }
 
-fn configure_timeout_process_control(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
-}
-
-fn terminate_child_on_timeout(child: &mut Child) -> Option<String> {
-    #[cfg(unix)]
-    {
-        terminate_unix_process_group(child)
-    }
-
-    #[cfg(not(unix))]
-    {
-        child
-            .kill()
-            .err()
-            .map(|error| format!("validation timed out but process kill failed: {error}"))
-    }
-}
-
-#[cfg(unix)]
-fn terminate_unix_process_group(child: &mut Child) -> Option<String> {
-    let pid = child.id();
-    let term_error = send_unix_process_group_signal(pid, "TERM").err();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return term_error.map(|error| error.to_string()),
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Some(format!("validation timed out but wait failed: {error}")),
-        }
-    }
-
-    let kill_result = send_unix_process_group_signal(pid, "KILL").or_else(|_| child.kill());
-    kill_result.err().map(|error| {
-        if let Some(term_error) = term_error {
-            format!(
-                "validation timed out but process group termination failed: {term_error}; kill failed: {error}"
-            )
-        } else {
-            format!("validation timed out but process group kill failed: {error}")
-        }
-    })
-}
-
-#[cfg(unix)]
-fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    let target = format!("-{pid}");
-    let status = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(&target)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "kill -{signal} {target} exited with {status}"
-        )))
-    }
-}
-
-fn shell_command(command: &str) -> Command {
-    #[cfg(target_os = "windows")]
-    {
-        let mut shell = Command::new("cmd");
-        shell.arg("/C").arg(command);
-        shell
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut shell = Command::new("sh");
-        shell.arg("-c").arg(command);
-        shell
-    }
+fn summarize_validation_output(output: &CapturedBytes) -> String {
+    output.summarize_chars(VALIDATION_OUTPUT_LIMIT).text
 }
 
 fn write_fake_codex(run_dir: &Path, plan: &AutopilotPlan, attempt: usize) -> Result<PathBuf> {
@@ -1601,10 +1459,6 @@ fn sanitize_text(repo: &Path, text: &str) -> String {
 
 fn sanitize_validation_message(text: &str) -> String {
     text.replace('\0', "")
-}
-
-fn summarize_text(text: &str, limit: usize) -> String {
-    text.chars().take(limit).collect()
 }
 
 fn default_autopilot_schema_version() -> u32 {
