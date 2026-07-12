@@ -1,5 +1,8 @@
 use crate::{
-    artifacts::{self, RunArtifactFamily},
+    artifacts::{
+        ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory,
+        RunArtifactFamily,
+    },
     external_agent::{
         run_external_agent, ExternalAgentCommand, ExternalAgentRun, ExternalProgramTrust,
     },
@@ -9,7 +12,7 @@ use crate::{
         EnvironmentMode, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
-    secure_output::{ReservedOutputFile, SecureOutputRoot},
+    secure_output::SecureOutputRoot,
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
@@ -25,8 +28,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs::{self, File},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -42,6 +44,7 @@ const PRIMARY_INDEX_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SUPERVISOR_PROMPT_BYTES: usize = 1024 * 1024;
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
@@ -526,17 +529,19 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
     let repo = discover_repo_root(repo.as_ref())?;
     let run_dir = run_dir(&repo, &run_id);
     let final_report_path = supervisor_final_report_path(&run_dir);
-    let final_report = if final_report_path.exists() {
-        Some(read_supervisor_final_report(&final_report_path)?)
-    } else {
-        None
-    };
+    let final_report = read_finalized_supervisor_report(&repo, &run_id, &run_dir)?;
     Ok(SupervisorStatusReport {
         run_id,
-        repo,
-        run_dir,
+        repo: PathBuf::from("."),
+        run_dir: run_dir
+            .strip_prefix(&repo)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| RunArtifactFamily::Supervise.run_root()),
         final_report_exists: final_report.is_some(),
-        final_report_path,
+        final_report_path: final_report_path
+            .strip_prefix(&repo)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| RunArtifactFamily::Supervise.final_report_relative_path()),
         final_report,
     })
 }
@@ -548,17 +553,20 @@ pub fn collect_supervisor_run(
     let repo = discover_repo_root(repo.as_ref())?;
     let run_dir = run_dir(&repo, &run_id);
     let final_report_path = supervisor_final_report_path(&run_dir);
-    if final_report_path.exists() {
-        return read_supervisor_final_report(&final_report_path);
+    if let Some(report) = read_finalized_supervisor_report(&repo, &run_id, &run_dir)? {
+        return Ok(report);
     }
 
     Ok(SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id,
         role: AgentRole::Supervisor,
-        repo,
+        repo: PathBuf::from("."),
         plan_file: PathBuf::new(),
-        run_dir,
+        run_dir: run_dir
+            .strip_prefix(&repo)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| RunArtifactFamily::Supervise.run_root()),
         runtime: SupervisorRuntime::Codex,
         publishable: false,
         success: false,
@@ -1016,6 +1024,8 @@ struct ChildAttemptArtifacts {
     prompt_path: PathBuf,
     report_path: PathBuf,
     log_path: PathBuf,
+    raw_report_relative: PathBuf,
+    command_record_relative: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -1028,6 +1038,8 @@ struct ChildAttemptHistory {
 
 fn child_attempt_artifacts(
     dirs: &RunDirs,
+    incoming_path: &Path,
+    capture_path: &Path,
     assignment_id: &str,
     attempt: usize,
     attempt_numbered: bool,
@@ -1039,8 +1051,12 @@ fn child_attempt_artifacts(
     };
     ChildAttemptArtifacts {
         prompt_path: dirs.assignments.join(format!("{stem}.prompt.md")),
-        report_path: dirs.incoming.join(format!("{stem}.json")),
-        log_path: dirs.logs.join(format!("{stem}.jsonl")),
+        report_path: incoming_path.join(format!("{stem}.json")),
+        log_path: capture_path.join(format!("{stem}.jsonl")),
+        raw_report_relative: PathBuf::from("evidence")
+            .join("incoming")
+            .join(format!("{stem}.json")),
+        command_record_relative: PathBuf::from("logs").join(format!("{stem}.json")),
     }
 }
 
@@ -1114,16 +1130,15 @@ fn run_supervisor_plan_with_runner(
 ) -> Result<SupervisorFinalReport> {
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
-    if !options.allow_dirty_primary {
-        ensure_clean_primary(&repo, execution_runtime)?;
-    }
 
-    let run_dir = run_dir(&repo, &options.run_id);
-    artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Supervise, &options.run_id)?;
-    let dirs = RunDirs::create(&run_dir)?;
-    let mut supervisor_final_slot = dirs
-        .reports_root
-        .reserve(OsStr::new("supervisor-final.json"))?;
+    let mut artifact_writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        options.run_id.clone(),
+        "maco-supervise",
+    )?;
+    let run_dir = artifact_writer.run_dir().to_path_buf();
+    let dirs = RunDirs::for_writer(&artifact_writer);
     let manager = WorktreeManager::new(&repo);
     let sync_store = SyncStore::open(&repo)?;
     let semantic_store = SemanticIntentStore::open(&repo)?;
@@ -1146,14 +1161,27 @@ fn run_supervisor_plan_with_runner(
     let mut external_containment_failed = false;
 
     let run_result = (|| -> Result<()> {
+        if !options.allow_dirty_primary {
+            ensure_clean_primary(&repo, execution_runtime)?;
+        }
         write_plan_snapshot(
-            &dirs.assignments.join("supervisor-plan.json"),
+            &mut artifact_writer,
+            Path::new("assignments/supervisor-plan.json"),
             &plan,
             &consultant,
         )?;
-        write_orchestrator_schema(&dirs.schemas.join("orchestrator-review-report.schema.json"))?;
-        write_worker_schema(&dirs.schemas.join("worker-report.schema.json"))?;
-        write_auditor_schema(&dirs.schemas.join("auditor-report.schema.json"))?;
+        write_orchestrator_schema(
+            &mut artifact_writer,
+            Path::new("schemas/orchestrator-review-report.schema.json"),
+        )?;
+        write_worker_schema(
+            &mut artifact_writer,
+            Path::new("schemas/worker-report.schema.json"),
+        )?;
+        write_auditor_schema(
+            &mut artifact_writer,
+            Path::new("schemas/auditor-report.schema.json"),
+        )?;
 
         let baseline = primary_worktree_snapshot(&repo, execution_runtime)?;
         if let Some(error) = baseline.inspection_problem() {
@@ -1171,18 +1199,27 @@ fn run_supervisor_plan_with_runner(
 
         for assignment in &plan.assignments {
             let current_primary_head = current_head_oid(&repo)?;
-            let worktree = match existing.get(&assignment.id) {
-                Some(record) => {
-                    ensure_reusable_child_worktree(record, &current_primary_head)?;
-                    record.clone()
-                }
-                None => manager.create(WorktreeCreateOptions {
+            let reused = existing.contains_key(&assignment.id);
+            if !reused {
+                manager.create(WorktreeCreateOptions {
                     agent_id: assignment.id.clone(),
                     branch: None,
                     base: None,
                     worktree_root: None,
-                })?,
-            };
+                })?;
+            }
+            let worktree_write_lease = manager
+                .acquire_write_execution_lease(&assignment.id)
+                .with_context(|| {
+                    format!(
+                        "failed to acquire exclusive execution lease for child worktree '{}'",
+                        assignment.id
+                    )
+                })?;
+            let worktree = worktree_write_lease.record().clone();
+            if reused {
+                ensure_reusable_child_worktree(&worktree, &current_primary_head)?;
+            }
             let child_base_head = current_head_oid(&worktree.path).with_context(|| {
                 format!(
                     "failed to capture base HEAD for child worktree '{}' at {}",
@@ -1190,8 +1227,6 @@ fn run_supervisor_plan_with_runner(
                     worktree.path.display()
                 )
             })?;
-            dirs.reports_root.reject_inside(&worktree.path)?;
-
             let claim = match sync_store
                 .claim_paths(&assignment.id, assignment.assigned_paths.iter())
             {
@@ -1214,33 +1249,11 @@ fn run_supervisor_plan_with_runner(
             )?;
 
             let final_report_name = format!("{}.json", assignment.id);
-            let mut final_report_slot =
-                dirs.reports_root.reserve(OsStr::new(&final_report_name))?;
-            let final_report_path = final_report_slot.path().to_path_buf();
-            let final_prompt_path = dirs
-                .assignments
-                .join(format!("{}.prompt.md", assignment.id));
+            let final_report_relative = PathBuf::from("reports").join(&final_report_name);
+            let final_report_path = dirs.reports.join(&final_report_name);
             let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
             let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
             let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
-            let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
-                plan: &plan,
-                assignment,
-                run_dir: &run_dir,
-                worktree: &worktree,
-                report_path: &final_report_path,
-                schema_path: &schema_path,
-                worker_schema_path: &worker_schema_path,
-                auditor_schema_path: &auditor_schema_path,
-                consultant: &consultant,
-                claim_context: ChildPromptClaimContext {
-                    claim: &claim,
-                    semantic_intent_token: semantic_token,
-                },
-            })?;
-            fs::write(&final_prompt_path, &prompt).with_context(|| {
-                format!("failed to write prompt {}", final_prompt_path.display())
-            })?;
 
             let mut child_report = None;
             let mut child_containment_verified = false;
@@ -1248,23 +1261,102 @@ fn run_supervisor_plan_with_runner(
             let mut attempt_history = Vec::new();
             let max_attempts = usize::from(plan.max_child_retries).saturating_add(1);
             for attempt in 1..=max_attempts {
-                let attempt_artifacts =
-                    child_attempt_artifacts(&dirs, &assignment.id, attempt, max_attempts > 1);
+                let incoming_path = run_dir.join("incoming");
+                let capture_path = run_dir.join("capture");
+                let attempt_artifacts = child_attempt_artifacts(
+                    &dirs,
+                    &incoming_path,
+                    &capture_path,
+                    &assignment.id,
+                    attempt,
+                    max_attempts > 1,
+                );
                 let corrective_retry_used = retry_feedback.is_some();
+                let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
+                    plan: &plan,
+                    assignment,
+                    run_dir: &run_dir,
+                    worktree: &worktree,
+                    report_path: &attempt_artifacts.report_path,
+                    schema_path: &schema_path,
+                    worker_schema_path: &worker_schema_path,
+                    auditor_schema_path: &auditor_schema_path,
+                    consultant: &consultant,
+                    claim_context: ChildPromptClaimContext {
+                        claim: &claim,
+                        semantic_intent_token: semantic_token,
+                    },
+                })?;
                 let attempt_prompt = match &retry_feedback {
                     Some(problems) => prompt_with_corrective_feedback(&prompt, problems),
-                    None => prompt.clone(),
+                    None => prompt,
                 };
-                fs::write(&attempt_artifacts.prompt_path, attempt_prompt).with_context(|| {
-                    format!(
-                        "failed to write prompt {}",
-                        attempt_artifacts.prompt_path.display()
-                    )
-                })?;
+                let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
+                if let Err(error) =
+                    write_private_prompt(&mut artifact_writer, &prompt_relative, &attempt_prompt)
+                {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to write prompt {}",
+                            attempt_artifacts.prompt_path.display()
+                        )
+                    });
+                }
 
                 let primary_before = primary_worktree_snapshot(&repo, execution_runtime)?;
                 if let Some(error) = primary_before.inspection_problem() {
                     bail!("refusing to launch child without a complete primary integrity snapshot: {error}");
+                }
+                let (incoming_scratch, capture_scratch) =
+                    create_invocation_scratches(&mut artifact_writer)?;
+                if incoming_scratch.path() != incoming_path
+                    || capture_scratch.path() != capture_path
+                {
+                    discard_invocation_scratches(
+                        &mut artifact_writer,
+                        &incoming_scratch,
+                        &capture_scratch,
+                    )?;
+                    bail!("artifact scratch paths changed during child setup");
+                }
+                let incoming_output_root =
+                    match SecureOutputRoot::open_private(incoming_scratch.path()) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            discard_invocation_scratches(
+                                &mut artifact_writer,
+                                &incoming_scratch,
+                                &capture_scratch,
+                            )?;
+                            return Err(error)
+                                .context("failed to bind child incoming scratch root");
+                        }
+                    };
+                let capture_output_root =
+                    match SecureOutputRoot::open_private(capture_scratch.path()) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            drop(incoming_output_root);
+                            discard_invocation_scratches(
+                                &mut artifact_writer,
+                                &incoming_scratch,
+                                &capture_scratch,
+                            )?;
+                            return Err(error)
+                                .context("failed to bind parent capture scratch root");
+                        }
+                    };
+                if incoming_output_root.path() != incoming_scratch.path()
+                    || capture_output_root.path() != capture_scratch.path()
+                {
+                    drop(incoming_output_root);
+                    drop(capture_output_root);
+                    discard_invocation_scratches(
+                        &mut artifact_writer,
+                        &incoming_scratch,
+                        &capture_scratch,
+                    )?;
+                    bail!("descriptor-held invocation scratch roots changed during setup");
                 }
                 let mut command = ExternalAgentCommand::codex(
                     &options.codex_bin,
@@ -1277,15 +1369,30 @@ fn run_supervisor_plan_with_runner(
                 command.output_schema = Some(schema_path.clone());
                 command = command.with_hidden_root(&repo);
 
-                let external_run = match runtime {
-                    SupervisorRuntime::Codex => external_runner(&command),
+                let external_run_result = match runtime {
+                    SupervisorRuntime::Codex => Ok(external_runner(&command)),
                     SupervisorRuntime::Fake => deterministic_fake_child_run(
                         &command,
                         assignment,
                         claim.token.get(),
                         semantic_token,
-                    )?,
+                    ),
                 };
+                let external_run = match external_run_result {
+                    Ok(run) => run,
+                    Err(error) => {
+                        drop(incoming_output_root);
+                        drop(capture_output_root);
+                        discard_invocation_scratches(
+                            &mut artifact_writer,
+                            &incoming_scratch,
+                            &capture_scratch,
+                        )?;
+                        return Err(error).context("failed to produce deterministic child output");
+                    }
+                };
+                drop(incoming_output_root);
+                drop(capture_output_root);
                 let attempt_containment_verified = external_safety_verified(&external_run, runtime);
                 if !attempt_containment_verified {
                     external_containment_failed = true;
@@ -1295,17 +1402,32 @@ fn run_supervisor_plan_with_runner(
                             "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
                             assignment.id,
                             (external_run.process_tree, external_run.side_effects),
-                            attempt_artifacts.report_path.display()
+                            attempt_artifacts.raw_report_relative.display()
                         ),
-                        paths: vec![attempt_artifacts.report_path.clone()],
+                        paths: vec![attempt_artifacts.raw_report_relative.clone()],
                     });
                 }
                 command_records.push(command_record_from_external(&external_run, &command));
+                let raw_report_validated = read_child_report(
+                    external_run.output_last_message(),
+                    &attempt_artifacts.raw_report_relative,
+                )
+                .is_ok();
+                import_external_attempt_evidence(
+                    &mut artifact_writer,
+                    &incoming_scratch,
+                    &capture_scratch,
+                    &attempt_artifacts,
+                    &external_run,
+                    &command,
+                    raw_report_validated,
+                    runtime,
+                )?;
                 let primary_after = primary_worktree_snapshot(&repo, execution_runtime)?;
                 let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
                 let (mut attempt_report, report_shape_problems) = collect_child_report(
                     assignment,
-                    &attempt_artifacts.report_path,
+                    &attempt_artifacts.raw_report_relative,
                     &external_run,
                     &command,
                     &worktree.path,
@@ -1321,14 +1443,14 @@ fn run_supervisor_plan_with_runner(
                 if !attempt_containment_verified {
                     mark_child_containment_violation(
                         assignment,
-                        &attempt_artifacts.report_path,
+                        &attempt_artifacts.raw_report_relative,
                         external_run.process_tree,
                         external_run.side_effects,
                         &mut attempt_report,
                     );
                     attempt_history.push(ChildAttemptHistory {
                         attempt,
-                        report_path: attempt_artifacts.report_path.clone(),
+                        report_path: attempt_artifacts.raw_report_relative.clone(),
                         structural_problems: report_shape_problems,
                         corrective_retry_used,
                     });
@@ -1343,7 +1465,7 @@ fn run_supervisor_plan_with_runner(
                 );
                 attempt_history.push(ChildAttemptHistory {
                     attempt,
-                    report_path: attempt_artifacts.report_path.clone(),
+                    report_path: attempt_artifacts.raw_report_relative.clone(),
                     structural_problems: report_shape_problems.clone(),
                     corrective_retry_used,
                 });
@@ -1357,7 +1479,7 @@ fn run_supervisor_plan_with_runner(
                         message: format!(
                             "child report accepted after corrective retry attempt {attempt}"
                         ),
-                        paths: vec![attempt_artifacts.report_path.clone()],
+                        paths: vec![attempt_artifacts.raw_report_relative.clone()],
                     });
                 }
                 child_containment_verified = true;
@@ -1375,14 +1497,26 @@ fn run_supervisor_plan_with_runner(
             if plan.max_child_retries > 0 {
                 append_child_attempt_history(&mut child_report, &attempt_history);
             }
-            write_child_report(&mut final_report_slot, &child_report)?;
+            write_child_report(&mut artifact_writer, &final_report_relative, &child_report)?;
 
             let mut assignment_containment_verified = child_containment_verified;
             if child_containment_verified && parent_auditor_required(assignment, &child_report) {
                 let auditor_id = parent_auditor_id(assignment);
                 let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
-                let auditor_report_path = dirs.incoming.join(format!("{auditor_id}.json"));
-                let auditor_log_path = dirs.logs.join(format!("{auditor_id}.jsonl"));
+                let auditor_incoming_path = run_dir.join("incoming");
+                let auditor_capture_path = run_dir.join("capture");
+                let auditor_report_path = auditor_incoming_path.join(format!("{auditor_id}.json"));
+                let auditor_log_path = auditor_capture_path.join(format!("{auditor_id}.jsonl"));
+                let auditor_artifacts = ChildAttemptArtifacts {
+                    prompt_path: auditor_prompt_path.clone(),
+                    report_path: auditor_report_path.clone(),
+                    log_path: auditor_log_path.clone(),
+                    raw_report_relative: PathBuf::from("evidence")
+                        .join("incoming")
+                        .join(format!("{auditor_id}.json")),
+                    command_record_relative: PathBuf::from("logs")
+                        .join(format!("{auditor_id}.json")),
+                };
                 let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
                 let auditor_prompt =
                     parent_review_auditor_prompt(ParentReviewAuditorPromptContext {
@@ -1395,12 +1529,75 @@ fn run_supervisor_plan_with_runner(
                         schema_path: &auditor_schema_path,
                         child_report: &child_report,
                     })?;
-                fs::write(&auditor_prompt_path, auditor_prompt).with_context(|| {
+                write_private_prompt(
+                    &mut artifact_writer,
+                    &dirs.relative(&auditor_prompt_path)?,
+                    &auditor_prompt,
+                )
+                .with_context(|| {
                     format!(
                         "failed to write auditor prompt {}",
                         auditor_prompt_path.display()
                     )
                 })?;
+
+                let primary_before_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
+                if let Some(error) = primary_before_auditor.inspection_problem() {
+                    bail!(
+                        "refusing to launch parent review auditor without a complete primary integrity snapshot: {error}"
+                    );
+                }
+                let (auditor_incoming_scratch, auditor_capture_scratch) =
+                    create_invocation_scratches(&mut artifact_writer)?;
+                if auditor_incoming_scratch.path() != auditor_incoming_path
+                    || auditor_capture_scratch.path() != auditor_capture_path
+                {
+                    discard_invocation_scratches(
+                        &mut artifact_writer,
+                        &auditor_incoming_scratch,
+                        &auditor_capture_scratch,
+                    )?;
+                    bail!("artifact scratch paths changed during parent auditor setup");
+                }
+                let auditor_incoming_root =
+                    match SecureOutputRoot::open_private(auditor_incoming_scratch.path()) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            discard_invocation_scratches(
+                                &mut artifact_writer,
+                                &auditor_incoming_scratch,
+                                &auditor_capture_scratch,
+                            )?;
+                            return Err(error)
+                                .context("failed to bind parent auditor incoming scratch root");
+                        }
+                    };
+                let auditor_capture_root =
+                    match SecureOutputRoot::open_private(auditor_capture_scratch.path()) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            drop(auditor_incoming_root);
+                            discard_invocation_scratches(
+                                &mut artifact_writer,
+                                &auditor_incoming_scratch,
+                                &auditor_capture_scratch,
+                            )?;
+                            return Err(error)
+                                .context("failed to bind parent auditor capture scratch root");
+                        }
+                    };
+                if auditor_incoming_root.path() != auditor_incoming_scratch.path()
+                    || auditor_capture_root.path() != auditor_capture_scratch.path()
+                {
+                    drop(auditor_incoming_root);
+                    drop(auditor_capture_root);
+                    discard_invocation_scratches(
+                        &mut artifact_writer,
+                        &auditor_incoming_scratch,
+                        &auditor_capture_scratch,
+                    )?;
+                    bail!("descriptor-held auditor scratch roots changed during setup");
+                }
 
                 let mut auditor_command = ExternalAgentCommand::codex(
                     &options.codex_bin,
@@ -1414,19 +1611,28 @@ fn run_supervisor_plan_with_runner(
                 auditor_command = auditor_command
                     .with_workspace_access(WorkspaceAccess::ReadOnly)
                     .with_hidden_root(&repo);
-
-                let primary_before_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
-                if let Some(error) = primary_before_auditor.inspection_problem() {
-                    bail!(
-                        "refusing to launch parent review auditor without a complete primary integrity snapshot: {error}"
-                    );
-                }
-                let auditor_run = match runtime {
-                    SupervisorRuntime::Codex => external_runner(&auditor_command),
+                let auditor_run_result = match runtime {
+                    SupervisorRuntime::Codex => Ok(external_runner(&auditor_command)),
                     SupervisorRuntime::Fake => {
-                        deterministic_fake_auditor_run(&auditor_command, assignment, &child_report)?
+                        deterministic_fake_auditor_run(&auditor_command, assignment, &child_report)
                     }
                 };
+                let auditor_run = match auditor_run_result {
+                    Ok(run) => run,
+                    Err(error) => {
+                        drop(auditor_incoming_root);
+                        drop(auditor_capture_root);
+                        discard_invocation_scratches(
+                            &mut artifact_writer,
+                            &auditor_incoming_scratch,
+                            &auditor_capture_scratch,
+                        )?;
+                        return Err(error)
+                            .context("failed to produce deterministic parent auditor output");
+                    }
+                };
+                drop(auditor_incoming_root);
+                drop(auditor_capture_root);
                 let auditor_containment_verified = external_safety_verified(&auditor_run, runtime);
                 if !auditor_containment_verified {
                     assignment_containment_verified = false;
@@ -1437,21 +1643,36 @@ fn run_supervisor_plan_with_runner(
                             "external parent auditor process containment was not verified empty for '{}'; evidence: {:?}; report: {}",
                             auditor_id,
                             (auditor_run.process_tree, auditor_run.side_effects),
-                            auditor_report_path.display()
+                            auditor_artifacts.raw_report_relative.display()
                         ),
-                        paths: vec![auditor_report_path.clone()],
+                        paths: vec![auditor_artifacts.raw_report_relative.clone()],
                     });
                 }
                 let auditor_command_record =
                     command_record_from_external(&auditor_run, &auditor_command);
                 command_records.push(auditor_command_record.clone());
                 child_report.commands_run.push(auditor_command_record);
+                let raw_auditor_validated = read_auditor_report(
+                    auditor_run.output_last_message(),
+                    &auditor_artifacts.raw_report_relative,
+                )
+                .is_ok();
+                import_external_attempt_evidence(
+                    &mut artifact_writer,
+                    &auditor_incoming_scratch,
+                    &auditor_capture_scratch,
+                    &auditor_artifacts,
+                    &auditor_run,
+                    &auditor_command,
+                    raw_auditor_validated,
+                    runtime,
+                )?;
                 let primary_after_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
                 let primary_auditor_changes =
                     primary_integrity_changes(&primary_before_auditor, &primary_after_auditor);
                 let mut auditor_report = collect_parent_auditor_report(
                     assignment,
-                    &auditor_report_path,
+                    &auditor_artifacts.raw_report_relative,
                     &auditor_run,
                     &auditor_command,
                 );
@@ -1467,7 +1688,7 @@ fn run_supervisor_plan_with_runner(
             if child_containment_verified {
                 validate_auditor_reports(assignment, &final_report_path, &mut child_report);
             }
-            write_child_report(&mut final_report_slot, &child_report)?;
+            write_child_report(&mut artifact_writer, &final_report_relative, &child_report)?;
             if child_report.status != ReviewStatus::Succeeded {
                 findings.push(Finding {
                     severity: FindingSeverity::Error,
@@ -1561,13 +1782,26 @@ fn run_supervisor_plan_with_runner(
         || orchestrator_reports.iter().any(report_failed);
     let success = !failed;
     let publishable = success && runtime == SupervisorRuntime::Codex;
+    let report_plan_file = options
+        .plan_file
+        .strip_prefix(&repo)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| PathBuf::from("<external-plan>"));
+    let report_run_dir = run_dir
+        .strip_prefix(&repo)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| {
+            RunArtifactFamily::Supervise
+                .run_root()
+                .join(options.run_id.as_str())
+        });
     let final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
         role: AgentRole::Supervisor,
-        repo: repo.clone(),
-        plan_file: options.plan_file,
-        run_dir: run_dir.clone(),
+        repo: PathBuf::from("."),
+        plan_file: report_plan_file,
+        run_dir: report_run_dir,
         runtime,
         publishable,
         success,
@@ -1654,7 +1888,11 @@ fn run_supervisor_plan_with_runner(
                 .to_string()
         },
     };
-    write_final_report(&mut supervisor_final_slot, &final_report)?;
+    write_final_report(&mut artifact_writer, &final_report)?;
+    artifact_writer.finalize(
+        RunArtifactFamily::Supervise.final_report_relative_path(),
+        publishable,
+    )?;
     Ok(final_report)
 }
 
@@ -3653,11 +3891,23 @@ fn read_child_report(
 }
 
 fn write_child_report(
-    slot: &mut ReservedOutputFile,
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
     report: &OrchestratorReviewReport,
 ) -> Result<()> {
-    slot.write_json_atomic(report, MAX_SUPERVISOR_REPORT_BYTES)
-        .with_context(|| format!("failed to update child report {}", slot.path().display()))
+    write_artifact_json(
+        writer,
+        relative,
+        report,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| {
+        format!(
+            "failed to update normalized child report {}",
+            relative.display()
+        )
+    })
 }
 
 fn read_auditor_report(
@@ -3674,6 +3924,105 @@ fn read_auditor_report(
     })?;
     parse_report_json(contents)
         .with_context(|| format!("failed to parse auditor report {}", display_path.display()))
+}
+
+fn import_external_attempt_evidence(
+    writer: &mut ArtifactRunWriter,
+    incoming_scratch: &ArtifactScratchDirectory,
+    capture_scratch: &ArtifactScratchDirectory,
+    artifacts: &ChildAttemptArtifacts,
+    external_run: &ExternalAgentRun,
+    external_command: &ExternalAgentCommand,
+    raw_report_validated: bool,
+    runtime: SupervisorRuntime,
+) -> Result<()> {
+    let import_result = (|| -> Result<()> {
+        if raw_report_validated {
+            if let Some(contents) = external_run.output_last_message() {
+                if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
+                    bail!(
+                        "descriptor-held external report exceeds its configured {} byte limit",
+                        MAX_SUPERVISOR_REPORT_BYTES
+                    );
+                }
+                writer.write_bytes(
+                    &artifacts.raw_report_relative,
+                    contents,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )?;
+            }
+        }
+        let command_record = command_record_from_external(external_run, external_command);
+        write_artifact_json(
+            writer,
+            &artifacts.command_record_relative,
+            &command_record,
+            MAX_SUPERVISOR_REPORT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        Ok(())
+    })();
+
+    let discard_result = if external_process_quiescent_for_scratch(external_run, runtime) {
+        discard_invocation_scratches(writer, incoming_scratch, capture_scratch)
+    } else {
+        bail!(
+            "refusing to discard invocation artifact scratches without verified process quiescence: {}, {}",
+            incoming_scratch.path().display(),
+            capture_scratch.path().display()
+        )
+    };
+
+    match (import_result, discard_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(discard_error)) => Err(error.context(format!(
+            "artifact scratch cleanup also failed: {discard_error:#}"
+        ))),
+    }
+}
+
+fn create_invocation_scratches(
+    writer: &mut ArtifactRunWriter,
+) -> Result<(ArtifactScratchDirectory, ArtifactScratchDirectory)> {
+    let incoming = writer.create_scratch_dir("incoming")?;
+    match writer.create_scratch_dir("capture") {
+        Ok(capture) => Ok((incoming, capture)),
+        Err(error) => {
+            writer.discard_scratch(&incoming)?;
+            Err(error).context("failed to reserve parent capture scratch")
+        }
+    }
+}
+
+fn discard_invocation_scratches(
+    writer: &mut ArtifactRunWriter,
+    incoming: &ArtifactScratchDirectory,
+    capture: &ArtifactScratchDirectory,
+) -> Result<()> {
+    let incoming_result = writer.discard_scratch(incoming);
+    let capture_result = writer.discard_scratch(capture);
+    match (incoming_result, capture_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(capture_error)) => Err(error.context(format!(
+            "capture scratch cleanup also failed: {capture_error:#}"
+        ))),
+    }
+}
+
+fn external_process_quiescent_for_scratch(
+    run: &ExternalAgentRun,
+    runtime: SupervisorRuntime,
+) -> bool {
+    match runtime {
+        SupervisorRuntime::Codex => run
+            .process_tree
+            .is_some_and(ProcessTreeEvidence::is_verified_empty),
+        // Fake mode is an in-process serializer and never launches a child.
+        SupervisorRuntime::Fake => true,
+    }
 }
 
 fn parse_report_json<T>(contents: &str) -> Result<ParsedReport<T>>
@@ -4034,7 +4383,7 @@ fn command_record_from_external(
 ) -> CommandRunRecord {
     CommandRunRecord {
         command: serializable_external_command(&run.command, command),
-        cwd: run.cwd.clone(),
+        cwd: PathBuf::from("<child-worktree>"),
         exit_code: run.exit_code,
         status: if external_process_completed(run) {
             ReviewStatus::Succeeded
@@ -4055,15 +4404,20 @@ fn serializable_external_command(
     command: &ExternalAgentCommand,
 ) -> Vec<String> {
     let path_replacements = [
-        &command.program,
-        &command.cwd,
-        &command.output_last_message,
-        &command.json_log,
-        &command.prompt,
+        (&command.program, "<codex-executable>"),
+        (&command.cwd, "<child-worktree>"),
+        (&command.output_last_message, "<incoming-report>"),
+        (&command.json_log, "<parent-capture>"),
+        (&command.prompt, "<supervisor-prompt>"),
     ]
     .into_iter()
-    .chain(command.output_schema.iter())
-    .map(|path| (path.display().to_string(), serializable_path(path)))
+    .chain(
+        command
+            .output_schema
+            .iter()
+            .map(|path| (path, "<report-schema>")),
+    )
+    .map(|(path, replacement)| (path.display().to_string(), replacement.to_string()))
     .collect::<BTreeMap<_, _>>();
     rendered
         .iter()
@@ -4313,21 +4667,24 @@ fn union_paths(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn write_plan_snapshot(
-    path: &Path,
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
     plan: &SupervisorPlan,
     consultant: &SupervisorConsultantPlan,
 ) -> Result<()> {
-    let mut file = File::create(path)
-        .with_context(|| format!("failed to create plan snapshot {}", path.display()))?;
     let value = supervisor_plan_value(plan, consultant)?;
-    serde_json::to_writer_pretty(&mut file, &value)
-        .with_context(|| format!("failed to write plan snapshot {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish plan snapshot {}", path.display()))
+    write_artifact_json(
+        writer,
+        relative,
+        &value,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| format!("failed to write plan snapshot {}", relative.display()))
 }
 
-fn write_orchestrator_schema(path: &Path) -> Result<()> {
-    write_schema(path, orchestrator_report_schema_value())
+fn write_orchestrator_schema(writer: &mut ArtifactRunWriter, relative: &Path) -> Result<()> {
+    write_schema(writer, relative, orchestrator_report_schema_value())
 }
 
 fn orchestrator_report_schema_value() -> serde_json::Value {
@@ -4379,12 +4736,12 @@ fn orchestrator_report_schema_value() -> serde_json::Value {
     })
 }
 
-fn write_worker_schema(path: &Path) -> Result<()> {
-    write_schema(path, worker_report_schema_value())
+fn write_worker_schema(writer: &mut ArtifactRunWriter, relative: &Path) -> Result<()> {
+    write_schema(writer, relative, worker_report_schema_value())
 }
 
-fn write_auditor_schema(path: &Path) -> Result<()> {
-    write_schema(path, auditor_report_schema_value())
+fn write_auditor_schema(writer: &mut ArtifactRunWriter, relative: &Path) -> Result<()> {
+    write_schema(writer, relative, auditor_report_schema_value())
 }
 
 fn auditor_report_schema_value() -> serde_json::Value {
@@ -4533,25 +4890,119 @@ fn finding_schema_value() -> serde_json::Value {
     })
 }
 
-fn write_schema(path: &Path, schema: serde_json::Value) -> Result<()> {
-    let mut file = File::create(path)
-        .with_context(|| format!("failed to create schema {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, &schema)
-        .with_context(|| format!("failed to write schema {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish schema {}", path.display()))
+fn write_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    schema: serde_json::Value,
+) -> Result<()> {
+    write_artifact_json(
+        writer,
+        relative,
+        &schema,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| format!("failed to write schema {}", relative.display()))
 }
 
-fn write_final_report(slot: &mut ReservedOutputFile, report: &SupervisorFinalReport) -> Result<()> {
-    slot.write_json_atomic(report, MAX_SUPERVISOR_REPORT_BYTES)
-        .with_context(|| format!("failed to write final report {}", slot.path().display()))
+fn write_final_report(
+    writer: &mut ArtifactRunWriter,
+    report: &SupervisorFinalReport,
+) -> Result<()> {
+    write_artifact_json(
+        writer,
+        &RunArtifactFamily::Supervise.final_report_relative_path(),
+        report,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .context("failed to write normalized supervisor final report")
 }
 
-fn read_supervisor_final_report(path: &Path) -> Result<SupervisorFinalReport> {
-    let contents = read_bounded_regular_file_nofollow(path, MAX_SUPERVISOR_REPORT_BYTES)
-        .with_context(|| format!("failed to read supervisor final report {}", path.display()))?;
-    serde_json::from_slice(&contents)
-        .with_context(|| format!("failed to parse supervisor final report {}", path.display()))
+fn read_supervisor_final_report(reader: &ArtifactRunReader) -> Result<SupervisorFinalReport> {
+    let relative = RunArtifactFamily::Supervise.final_report_relative_path();
+    let contents = reader.read(&relative).with_context(|| {
+        format!(
+            "failed to read supervisor final report {}",
+            relative.display()
+        )
+    })?;
+    if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
+        bail!("supervisor final report exceeds its bounded size");
+    }
+    serde_json::from_slice(&contents).with_context(|| {
+        format!(
+            "failed to parse supervisor final report {}",
+            relative.display()
+        )
+    })
+}
+
+fn read_finalized_supervisor_report(
+    repo: &Path,
+    run_id: &RunId,
+    run_dir: &Path,
+) -> Result<Option<SupervisorFinalReport>> {
+    match fs::symlink_metadata(run_dir) {
+        Ok(_) => {
+            let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, run_id)
+                .with_context(|| {
+                    format!(
+                        "supervisor run '{}' is not a verified finalized artifact",
+                        run_id.as_str()
+                    )
+                })?;
+            Ok(Some(read_supervisor_final_report(&reader)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect supervisor run directory {}",
+                run_dir.display()
+            )
+        }),
+    }
+}
+
+fn write_artifact_json<T: Serialize>(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    value: &T,
+    max_bytes: usize,
+    disposition: ArtifactFileDisposition,
+) -> Result<()> {
+    let mut bytes =
+        serde_json::to_vec_pretty(value).context("failed to serialize supervise artifact JSON")?;
+    bytes.push(b'\n');
+    if bytes.len() > max_bytes {
+        bail!(
+            "supervise artifact {} exceeds its configured {} byte limit",
+            relative.display(),
+            max_bytes
+        );
+    }
+    writer.write_bytes(relative, &bytes, disposition)?;
+    Ok(())
+}
+
+fn write_private_prompt(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    prompt: &str,
+) -> Result<()> {
+    if prompt.len() > MAX_SUPERVISOR_PROMPT_BYTES {
+        bail!(
+            "supervise prompt {} exceeds its configured {} byte limit",
+            relative.display(),
+            MAX_SUPERVISOR_PROMPT_BYTES
+        );
+    }
+    writer.write_bytes(
+        relative,
+        prompt.as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    Ok(())
 }
 
 fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
@@ -4575,29 +5026,33 @@ fn supervisor_final_report_path(run_dir: &Path) -> PathBuf {
 
 #[derive(Debug)]
 struct RunDirs {
+    run_dir: PathBuf,
     assignments: PathBuf,
-    incoming: PathBuf,
-    logs: PathBuf,
     schemas: PathBuf,
-    reports_root: SecureOutputRoot,
+    reports: PathBuf,
 }
 
 impl RunDirs {
-    fn create(run_dir: &Path) -> Result<Self> {
-        let run_container = SecureOutputRoot::create_new(run_dir)?;
-        let assignments_root = run_container.create_child(OsStr::new("assignments"))?;
-        let reports_root = run_container.create_child(OsStr::new("reports"))?;
-        let incoming_root = run_container.create_child(OsStr::new("incoming"))?;
-        reports_root.reject_overlap(&incoming_root)?;
-        let logs_root = run_container.create_child(OsStr::new("logs"))?;
-        let schemas_root = run_container.create_child(OsStr::new("schemas"))?;
-        Ok(Self {
-            assignments: assignments_root.path().to_path_buf(),
-            incoming: incoming_root.path().to_path_buf(),
-            logs: logs_root.path().to_path_buf(),
-            schemas: schemas_root.path().to_path_buf(),
-            reports_root,
-        })
+    fn for_writer(writer: &ArtifactRunWriter) -> Self {
+        let run_dir = writer.run_dir().to_path_buf();
+        Self {
+            assignments: run_dir.join("assignments"),
+            schemas: run_dir.join("schemas"),
+            reports: run_dir.join("reports"),
+            run_dir,
+        }
+    }
+
+    fn relative(&self, path: &Path) -> Result<PathBuf> {
+        path.strip_prefix(&self.run_dir)
+            .map(Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "artifact path {} is outside supervise run {}",
+                    path.display(),
+                    self.run_dir.display()
+                )
+            })
     }
 }
 
@@ -5068,7 +5523,7 @@ mod tests {
         )
         .expect("run injected retry");
 
-        assert!(report.success);
+        assert!(report.success, "unexpected failed report: {report:#?}");
         assert_eq!(invocations.len(), 3);
         assert!(invocations
             .iter()
