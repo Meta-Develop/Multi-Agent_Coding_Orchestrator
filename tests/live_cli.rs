@@ -126,20 +126,20 @@ fn heartbeat_updates_timestamp_and_audit_log() -> Result<()> {
         "--repo",
         repo_str(repo)?,
         "--by",
-        "worker-a",
+        "heartbeat-me",
         "--now",
         "2026-05-20T03:04:05Z",
         "--json",
     ])?;
 
     assert_eq!(report["claim_id"], "heartbeat-me");
-    assert_eq!(report["actor"], "worker-a");
+    assert_eq!(report["actor"], "heartbeat-me");
     assert_eq!(report["status"], "active");
     assert_eq!(report["claim"]["heartbeat"], "2026-05-20T03:04:05Z");
     let claim_text = fs::read_to_string(claim_path(repo, "heartbeat-me")).context("read claim")?;
     assert!(claim_text.contains("- Updated: `2026-05-20T03:04:05Z`"));
     assert!(claim_text.contains("- Heartbeat: `2026-05-20T03:04:05Z`"));
-    assert!(claim_text.contains("`worker-a` heartbeat"));
+    assert!(claim_text.contains("`heartbeat-me` heartbeat"));
 
     Ok(())
 }
@@ -242,7 +242,7 @@ fn validate_reports_missing_and_malformed_fields() -> Result<()> {
         && issue["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("waiting")));
+            .contains("unsupported")));
     assert!(issues.iter().any(|issue| issue["field"] == "owned_files"));
 
     Ok(())
@@ -271,7 +271,7 @@ fn json_output_shape_is_stable() -> Result<()> {
     assert!(status.get("claim_count").is_some());
     assert!(status.get("lock_count").is_some());
     assert!(claim.get("claim_id").is_some());
-    assert!(claim.get("file").is_some());
+    assert_eq!(claim["file"], ".agents/live/claims/shape.md");
     assert!(claim.get("owner").is_some());
     assert!(claim.get("status").is_some());
     assert!(claim.get("is_lock").is_some());
@@ -280,6 +280,65 @@ fn json_output_shape_is_stable() -> Result<()> {
     assert!(claim["liveness"].get("state").is_some());
     assert!(claim["liveness"].get("age_minutes").is_some());
 
+    Ok(())
+}
+
+#[test]
+fn mutation_cli_refuses_wrong_owner_fresh_override_and_markdown_injection() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo = temp.path();
+    write_modern_claim(repo, "owned-claim", "active", "src/live_claim.rs")?;
+    let path = claim_path(repo, "owned-claim");
+    let original = fs::read(&path).context("read original claim")?;
+
+    let wrong_owner = run_failure_output(&[
+        "live",
+        "heartbeat",
+        "owned-claim",
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "other-owner",
+        "--now",
+        "2026-05-20T00:30:00Z",
+        "--json",
+    ])?;
+    assert!(String::from_utf8_lossy(&wrong_owner.stderr).contains("exactly match"));
+    assert_eq!(fs::read(&path)?, original);
+
+    let fresh = run_failure_output(&[
+        "live",
+        "override-release",
+        "owned-claim",
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "project-owner",
+        "--reason",
+        "fresh claim remains owned",
+        "--now",
+        "2026-05-20T00:30:00Z",
+        "--json",
+    ])?;
+    assert!(String::from_utf8_lossy(&fresh.stderr).contains("provably stale"));
+    assert_eq!(fs::read(&path)?, original);
+
+    let injected = run_failure_output(&[
+        "live",
+        "override-release",
+        "owned-claim",
+        "--repo",
+        repo_str(repo)?,
+        "--by",
+        "project-owner",
+        "--reason",
+        "unsafe\n## injected",
+        "--now",
+        "2026-05-20T03:00:00Z",
+        "--json",
+    ])?;
+    assert!(String::from_utf8_lossy(&injected.stderr).contains("unsafe"));
+    assert_eq!(fs::read(&path)?, original);
     Ok(())
 }
 

@@ -1,20 +1,53 @@
 use crate::{
     llm::Redactor,
     process_runner::{
-        read_bounded_regular_file_nofollow, run_process, EnvironmentMode, ProcessOutput,
-        ProcessSpec, Shell, SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
+        run_process, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
+        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
     },
+    safe_state::{FileIdentity, SafeRoot},
 };
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::{
+    ffi::{OsStrExt, OsStringExt},
+    fs::{MetadataExt, OpenOptionsExt},
+    io::{AsRawFd, FromRawFd},
+};
+
 const REVIEW_OUTPUT_LIMIT: usize = 8 * 1024;
 const REVIEW_CAPTURE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const REVIEW_JSON_LIMIT_BYTES: usize = 256 * 1024;
+const REVIEW_INPUT_LIMIT_BYTES: usize = 256 * 1024;
+const REVIEW_CONFIG_LIMIT_BYTES: usize = 64 * 1024;
+const REVIEW_COMMAND_LIMIT_BYTES: usize = 16 * 1024;
+const REVIEW_TIMEOUT_LIMIT_SECONDS: u64 = 24 * 60 * 60;
+const REVIEW_DEFAULT_TIMEOUT_SECONDS: u64 = 300;
+const REVIEW_ATTEMPT_LIMIT: usize = 64;
+const REVIEW_BLOCKING_ATTEMPTS_LIMIT: usize = 64;
+const REVIEW_CHANGED_PATH_LIMIT: usize = 512;
+const REVIEW_FINDING_LIMIT: usize = 128;
+const REVIEW_PATH_LIMIT_BYTES: usize = 4 * 1024;
+const REVIEW_TARGET_LIMIT_BYTES: usize = 512;
+const REVIEW_SHORT_TEXT_LIMIT_BYTES: usize = 256;
+const REVIEW_LONG_TEXT_LIMIT_BYTES: usize = 32 * 1024;
+const REVIEW_SNAPSHOT_ENTRY_LIMIT: usize = 32 * 1024;
+const REVIEW_SNAPSHOT_FILE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+const REVIEW_SYMLINK_LIMIT_BYTES: usize = 4 * 1024;
+const REVIEW_SCHEMA_VERSION: u32 = 1;
+const EXTERNAL_REVIEWER_BINDING_DOMAIN: &[u8] = b"MACO\0external-reviewer-binding\0v1\0";
+const EXTERNAL_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0external-review-request\0v1\0";
+const FAKE_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0fake-review-request\0v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewExecutionRuntime {
@@ -33,18 +66,68 @@ pub struct ReviewPrOptions {
     pub diff_summary: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewerConfig {
-    #[serde(default)]
     pub mode: ReviewerMode,
-    #[serde(default)]
     pub blocking_attempts: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finding: Option<FakeReviewFindingTemplate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewerConfigWire {
+    #[serde(default = "review_schema_version")]
+    version: u32,
+    #[serde(default)]
+    mode: ReviewerMode,
+    #[serde(default)]
+    blocking_attempts: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finding: Option<FakeReviewFindingTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
+}
+
+impl Serialize for ReviewerConfig {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ReviewerConfigWire {
+            version: REVIEW_SCHEMA_VERSION,
+            mode: self.mode,
+            blocking_attempts: self.blocking_attempts,
+            finding: self.finding.clone(),
+            command: self.command.clone(),
+            timeout_seconds: self.timeout_seconds,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewerConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ReviewerConfigWire::deserialize(deserializer)?;
+        if wire.version != REVIEW_SCHEMA_VERSION {
+            return Err(D::Error::custom(
+                "reviewer config version is unsupported; expected version 1",
+            ));
+        }
+        Ok(Self {
+            mode: wire.mode,
+            blocking_attempts: wire.blocking_attempts,
+            finding: wire.finding,
+            command: wire.command,
+            timeout_seconds: wire.timeout_seconds,
+        })
+    }
 }
 
 impl Default for ReviewerConfig {
@@ -68,25 +151,74 @@ pub enum ReviewerMode {
     ExternalCommand,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeReviewFindingTemplate {
-    #[serde(default = "default_review_severity")]
     pub severity: String,
-    #[serde(default)]
     pub path: Option<PathBuf>,
-    #[serde(default = "default_review_summary")]
     pub summary: String,
-    #[serde(default = "default_suggested_fix")]
     pub suggested_fix: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FakeReviewFindingTemplateWire {
+    #[serde(default = "review_schema_version")]
+    version: u32,
+    #[serde(default = "default_review_severity")]
+    severity: String,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default = "default_review_summary")]
+    summary: String,
+    #[serde(default = "default_suggested_fix")]
+    suggested_fix: String,
+}
+
+impl Serialize for FakeReviewFindingTemplate {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        FakeReviewFindingTemplateWire {
+            version: REVIEW_SCHEMA_VERSION,
+            severity: self.severity.clone(),
+            path: self.path.clone(),
+            summary: self.summary.clone(),
+            suggested_fix: self.suggested_fix.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FakeReviewFindingTemplate {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FakeReviewFindingTemplateWire::deserialize(deserializer)?;
+        if wire.version != REVIEW_SCHEMA_VERSION {
+            return Err(D::Error::custom(
+                "fake review finding version is unsupported; expected version 1",
+            ));
+        }
+        Ok(Self {
+            severity: wire.severity,
+            path: wire.path,
+            summary: wire.summary,
+            suggested_fix: wire.suggested_fix,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ReviewReport {
+    pub version: u32,
     pub status: ReviewReportStatus,
     pub success: bool,
     pub target: String,
     pub reviewer: ReviewerIdentity,
     pub attempt: usize,
+    pub request_binding: String,
     pub findings: Vec<ReviewFinding>,
     pub blocking_finding_count: usize,
     pub changed_paths: Vec<PathBuf>,
@@ -143,13 +275,232 @@ pub struct ReviewFinding {
 }
 
 pub fn review_pr(options: ReviewPrOptions) -> Result<ReviewReport> {
+    validate_review_options(&options)?;
     match options.reviewer.mode {
         ReviewerMode::Fake => Ok(fake_review(options)),
         ReviewerMode::ExternalCommand => external_review(options),
     }
 }
 
-pub fn fake_review(options: ReviewPrOptions) -> ReviewReport {
+fn validate_review_options(options: &ReviewPrOptions) -> Result<()> {
+    validate_bounded_scalar(
+        &options.target,
+        "review target",
+        REVIEW_TARGET_LIMIT_BYTES,
+        false,
+    )?;
+    if contains_private_key_material(&options.target)
+        || Redactor::new()
+            .redact(&options.target)
+            .summary
+            .total_replacements
+            > 0
+        || contains_external_absolute_path(&options.target)
+    {
+        bail!("review target contains unsafe private or external evidence");
+    }
+    if options.attempt == 0 || options.attempt > REVIEW_ATTEMPT_LIMIT {
+        bail!(
+            "review attempt must be between 1 and {}",
+            REVIEW_ATTEMPT_LIMIT
+        );
+    }
+    if options.changed_paths.len() > REVIEW_CHANGED_PATH_LIMIT {
+        bail!(
+            "review changed_paths exceeds its {} item limit",
+            REVIEW_CHANGED_PATH_LIMIT
+        );
+    }
+    let mut unique_paths = BTreeSet::new();
+    for path in &options.changed_paths {
+        validate_repo_relative_path(path, "review changed path")?;
+        if !unique_paths.insert(path.clone()) {
+            bail!("review changed_paths contains a duplicate path");
+        }
+    }
+    if let Some(diff_summary) = &options.diff_summary {
+        validate_bounded_scalar(
+            diff_summary,
+            "review diff summary",
+            REVIEW_LONG_TEXT_LIMIT_BYTES,
+            true,
+        )?;
+        if contains_private_key_material(diff_summary)
+            || Redactor::new()
+                .redact(diff_summary)
+                .summary
+                .total_replacements
+                > 0
+            || contains_external_absolute_path(diff_summary)
+        {
+            bail!("review diff summary contains unsafe private or external evidence");
+        }
+    }
+
+    let serialized = serde_json::to_vec(&options.reviewer)
+        .context("failed to serialize reviewer config for validation")?;
+    if serialized.len() > REVIEW_CONFIG_LIMIT_BYTES {
+        bail!(
+            "reviewer config exceeds its {} byte serialized limit",
+            REVIEW_CONFIG_LIMIT_BYTES
+        );
+    }
+    if options.reviewer.blocking_attempts > REVIEW_BLOCKING_ATTEMPTS_LIMIT {
+        bail!(
+            "reviewer blocking_attempts exceeds its {} attempt limit",
+            REVIEW_BLOCKING_ATTEMPTS_LIMIT
+        );
+    }
+
+    match options.reviewer.mode {
+        ReviewerMode::Fake => {
+            if options.reviewer.command.is_some() || options.reviewer.timeout_seconds.is_some() {
+                bail!("fake reviewer mode must not set command or timeout_seconds");
+            }
+            if let Some(finding) = &options.reviewer.finding {
+                validate_fake_finding_template(finding)?;
+            }
+        }
+        ReviewerMode::ExternalCommand => {
+            if options.reviewer.blocking_attempts != 0 || options.reviewer.finding.is_some() {
+                bail!(
+                    "external reviewer mode must not set fake blocking_attempts or finding fields"
+                );
+            }
+            let command = options
+                .reviewer
+                .command
+                .as_deref()
+                .context("external reviewer mode requires a reviewer command")?;
+            validate_bounded_scalar(
+                command,
+                "external reviewer command",
+                REVIEW_COMMAND_LIMIT_BYTES,
+                false,
+            )?;
+            if command.trim() != command {
+                bail!("external reviewer command must not have leading or trailing whitespace");
+            }
+            if let Some(timeout_seconds) = options.reviewer.timeout_seconds {
+                if timeout_seconds == 0 || timeout_seconds > REVIEW_TIMEOUT_LIMIT_SECONDS {
+                    bail!(
+                        "external reviewer timeout_seconds must be between 1 and {}",
+                        REVIEW_TIMEOUT_LIMIT_SECONDS
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_fake_finding_template(finding: &FakeReviewFindingTemplate) -> Result<()> {
+    validate_bounded_scalar(
+        &finding.severity,
+        "fake review severity",
+        REVIEW_SHORT_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    validate_review_severity(&finding.severity)?;
+    validate_bounded_scalar(
+        &finding.summary,
+        "fake review summary",
+        REVIEW_LONG_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    validate_bounded_scalar(
+        &finding.suggested_fix,
+        "fake review suggested_fix",
+        REVIEW_LONG_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    if let Some(path) = &finding.path {
+        validate_repo_relative_path(path, "fake review finding path")?;
+    }
+    for value in [
+        finding.severity.as_str(),
+        finding.summary.as_str(),
+        finding.suggested_fix.as_str(),
+    ] {
+        if contains_private_key_material(value)
+            || Redactor::new().redact(value).summary.total_replacements > 0
+            || contains_external_absolute_path(value)
+        {
+            bail!("fake review finding contains unsafe private or external evidence");
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_severity(severity: &str) -> Result<bool> {
+    match severity {
+        "info" | "warning" => Ok(false),
+        "error" | "critical" => Ok(true),
+        _ => bail!("review finding severity is not canonical"),
+    }
+}
+
+fn validate_bounded_scalar(
+    value: &str,
+    label: &str,
+    max_bytes: usize,
+    allow_newlines: bool,
+) -> Result<()> {
+    if value.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    if value.len() > max_bytes {
+        bail!("{label} exceeds its {max_bytes} byte limit");
+    }
+    if value.chars().any(|character| {
+        character.is_control() && !(allow_newlines && matches!(character, '\n' | '\r' | '\t'))
+    }) {
+        bail!("{label} contains an unsupported control character");
+    }
+    Ok(())
+}
+
+fn validate_repo_relative_path(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!("{label} must be a non-empty repository-relative path");
+    }
+    let encoded = path
+        .to_str()
+        .context("review public path must be valid UTF-8")?;
+    if encoded.len() > REVIEW_PATH_LIMIT_BYTES {
+        bail!("{label} exceeds its {} byte limit", REVIEW_PATH_LIMIT_BYTES);
+    }
+    if encoded.chars().any(char::is_control) {
+        bail!("{label} contains an unsupported control character");
+    }
+    if encoded
+        .split('/')
+        .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        bail!("{label} is not canonical repository-relative form");
+    }
+    let mut normal_components = 0usize;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => {
+                normal_components = normal_components.saturating_add(1)
+            }
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                bail!("{label} is not canonical repository-relative form")
+            }
+        }
+    }
+    if normal_components == 0 {
+        bail!("{label} must contain a normal path component");
+    }
+    Ok(())
+}
+
+fn fake_review(options: ReviewPrOptions) -> ReviewReport {
+    let request_binding = fake_review_request_binding(&options);
     let should_block = options.reviewer.blocking_attempts > 0
         && options.attempt <= options.reviewer.blocking_attempts;
     let findings = if should_block {
@@ -164,6 +515,7 @@ pub fn fake_review(options: ReviewPrOptions) -> ReviewReport {
         ReviewReportStatus::Blocked
     };
     ReviewReport {
+        version: REVIEW_SCHEMA_VERSION,
         status,
         success: status == ReviewReportStatus::Passed,
         target: options.target,
@@ -173,6 +525,7 @@ pub fn fake_review(options: ReviewPrOptions) -> ReviewReport {
             model: "deterministic-local-reviewer".to_string(),
         },
         attempt: options.attempt,
+        request_binding,
         findings,
         blocking_finding_count,
         changed_paths: options.changed_paths,
@@ -209,20 +562,34 @@ fn external_review_runtime(
         .reviewer
         .command
         .as_deref()
-        .filter(|command| !command.trim().is_empty())
         .context("external reviewer mode requires a reviewer command")?;
-    if matches!(options.reviewer.timeout_seconds, Some(0)) {
-        bail!("external reviewer timeout_seconds must be greater than zero when set");
-    }
+    let repository = ReviewRepositoryBinding::bind(&options.repo)?;
+    let before = repository.snapshot()?;
+    let reviewer_identity = bound_external_reviewer_identity(command);
+    let request_binding =
+        external_review_request_binding(&options, &before, &reviewer_identity, command)?;
     let input = serde_json::to_vec(&ExternalReviewInput {
+        version: REVIEW_SCHEMA_VERSION,
         target: &options.target,
         attempt: options.attempt,
         changed_paths: &options.changed_paths,
         diff_summary: options.diff_summary.as_deref(),
+        reviewer: &reviewer_identity,
+        request_binding: &request_binding,
     })
     .context("failed to serialize external review input")?;
-    let timeout = options.reviewer.timeout_seconds.map(Duration::from_secs);
-    let before = review_repo_snapshot(&options.repo)?;
+    if input.len() > REVIEW_INPUT_LIMIT_BYTES {
+        bail!(
+            "external review input exceeds its {} byte limit",
+            REVIEW_INPUT_LIMIT_BYTES
+        );
+    }
+    let effective_timeout_seconds = options
+        .reviewer
+        .timeout_seconds
+        .unwrap_or(REVIEW_DEFAULT_TIMEOUT_SECONDS);
+    let timeout = Some(Duration::from_secs(effective_timeout_seconds));
+    let confinement = repository.confinement_profile()?;
     let process_spec = ProcessSpec::shell(
         "external reviewer command",
         Shell::for_current_platform(),
@@ -237,22 +604,29 @@ fn external_review_runtime(
         ReviewExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                StrictOfflineWorkspaceProfile::read_only(&options.repo),
+                confinement,
             )),
         #[cfg(test)]
         ReviewExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })
     .context("failed to run external reviewer command")?;
-    let after = review_repo_snapshot(&options.repo)?;
+    repository.verify()?;
+    let after = repository.snapshot()?;
     if let Some(error) = &output.stdin_error {
         bail!(error.clone());
     }
     let diagnostics =
-        diagnostics_from_output(&options.repo, &output, options.reviewer.timeout_seconds);
+        diagnostics_from_output(&options.repo, &output, Some(effective_timeout_seconds));
+    let diagnostics_contain_unsafe_evidence =
+        review_diagnostic_contains_unsafe_evidence(&options.repo, output.stderr.as_bytes())
+            || output.process_error.as_deref().is_some_and(|error| {
+                review_diagnostic_contains_unsafe_evidence(&options.repo, error.as_bytes())
+            });
     if after != before {
         return Ok(failed_external_review(
             options,
+            &request_binding,
             "external reviewer changed repository state despite its read-only contract",
             diagnostics,
         ));
@@ -260,6 +634,7 @@ fn external_review_runtime(
     if output.timed_out {
         return Ok(failed_external_review(
             options,
+            &request_binding,
             "external reviewer command timed out",
             diagnostics,
         ));
@@ -277,63 +652,1362 @@ fn external_review_runtime(
     if !command_succeeded {
         return Ok(failed_external_review(
             options,
+            &request_binding,
             "external reviewer command failed",
             diagnostics,
         ));
     }
-    if output.stdout.is_truncated() {
+    if output.stdout.is_truncated() || output.stderr.is_truncated() {
         bail!(
-            "external reviewer command output exceeded the {} byte capture limit",
+            "external reviewer command output exceeded the {} byte capture limit on stdout or stderr",
             REVIEW_CAPTURE_LIMIT_BYTES
         );
     }
-    let mut report: ReviewReport = serde_json::from_slice(output.stdout.as_bytes())
-        .context("external reviewer command must emit a review report JSON object")?;
-    report.reviewer.mode = ReviewerMode::ExternalCommand;
-    report.ci_reaction_supported = false;
-    report.ci_reaction = "unsupported".to_string();
-    Ok(report)
+    if diagnostics_contain_unsafe_evidence {
+        return Ok(failed_external_review(
+            options,
+            &request_binding,
+            "external reviewer diagnostics contained unsafe evidence",
+            redact_untrusted_report_diagnostics(diagnostics),
+        ));
+    }
+    match parse_external_review_report(
+        output.stdout.as_bytes(),
+        &options,
+        &reviewer_identity,
+        &request_binding,
+    )? {
+        ParsedExternalReview::Accepted(mut report) => {
+            // External diagnostics are parsed and bounded but are never
+            // accepted as authorization evidence. Process-owned diagnostics
+            // are the only diagnostics that can cross this boundary.
+            report.diagnostics = Some(accepted_external_diagnostics(diagnostics));
+            Ok(*report)
+        }
+        ParsedExternalReview::RejectedSensitive => Ok(failed_external_review(
+            options,
+            &request_binding,
+            "external reviewer report contained unsafe authorization evidence",
+            redact_untrusted_report_diagnostics(diagnostics),
+        )),
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ReviewRepoSnapshot {
-    head: Option<git2::Oid>,
-    index_digest: Option<git2::Oid>,
-    statuses: Vec<(PathBuf, u32)>,
+    head: Option<String>,
+    head_name: Option<String>,
+    head_symbolic_target: Option<String>,
+    head_admin_sha256: String,
+    head_ref_sha256: Option<String>,
+    packed_refs_sha256: Option<String>,
+    index_sha256: Option<String>,
+    status_sha256: String,
+    worktree_sha256: String,
+    entry_count: usize,
+    total_content_bytes: u64,
+    worktree_identity: FileIdentity,
+    git_dir_identity: FileIdentity,
+    common_dir_identity: FileIdentity,
+    git_backlink: GitBacklinkSnapshot,
+    state_identity: Option<FileIdentity>,
 }
 
-fn review_repo_snapshot(path: &Path) -> Result<ReviewRepoSnapshot> {
-    let repo = git2::Repository::open(path)
-        .with_context(|| format!("failed to snapshot review repository {}", path.display()))?;
-    let head = repo.head().ok().and_then(|head| head.target());
-    let index_path = repo.path().join("index");
-    let index_digest = match read_bounded_regular_file_nofollow(&index_path, 64 * 1024 * 1024) {
-        Ok(bytes) => Some(
-            git2::Oid::hash_object(git2::ObjectType::Blob, &bytes)
-                .context("failed to hash review index")?,
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("failed to read bounded review index"),
-    };
-    let mut options = git2::StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_ignored(false);
-    let statuses = repo
-        .statuses(Some(&mut options))?
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .path()
-                .map(|path| (PathBuf::from(path), entry.status().bits()))
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GitBacklinkSnapshot {
+    kind: String,
+    mode: u32,
+    identity: FileIdentity,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    content_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct ReviewRepositoryBinding {
+    worktree_root: SafeRoot,
+    git_dir_root: SafeRoot,
+    common_dir_root: SafeRoot,
+    state: ReviewStateBinding,
+}
+
+#[derive(Debug)]
+enum ReviewStateBinding {
+    MissingMaco,
+    MissingState {
+        maco_root: SafeRoot,
+    },
+    Bound {
+        maco_root: SafeRoot,
+        state_root: SafeRoot,
+    },
+}
+
+impl ReviewRepositoryBinding {
+    fn bind(path: &Path) -> Result<Self> {
+        let repository =
+            git2::Repository::open(path).context("failed to bind review repository")?;
+        let worktree = repository
+            .workdir()
+            .context("review requires a non-bare repository")?;
+        let worktree_root = SafeRoot::open_existing(worktree)
+            .map_err(|_| anyhow::anyhow!("review worktree binding is unsafe"))?;
+        let git_dir_root = SafeRoot::open_existing(repository.path())
+            .map_err(|_| anyhow::anyhow!("review Git directory binding is unsafe"))?;
+        let common_dir_root = SafeRoot::open_existing(repository.commondir())
+            .map_err(|_| anyhow::anyhow!("review Git common directory binding is unsafe"))?;
+        let state = bind_review_state(&common_dir_root)?;
+        let binding = Self {
+            worktree_root,
+            git_dir_root,
+            common_dir_root,
+            state,
+        };
+        binding.verify()?;
+        Ok(binding)
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.worktree_root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("review worktree identity changed"))?;
+        self.git_dir_root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("review Git directory identity changed"))?;
+        self.common_dir_root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("review Git common directory identity changed"))?;
+        self.state.verify(&self.common_dir_root)?;
+
+        let rebound = git2::Repository::open(self.worktree_root.path())
+            .context("review repository could not be rebound")?;
+        let rebound_git = SafeRoot::open_existing(rebound.path())
+            .map_err(|_| anyhow::anyhow!("review Git directory rebound is unsafe"))?;
+        let rebound_common = SafeRoot::open_existing(rebound.commondir())
+            .map_err(|_| anyhow::anyhow!("review Git common directory rebound is unsafe"))?;
+        if rebound_git.identity() != self.git_dir_root.identity()
+            || rebound_common.identity() != self.common_dir_root.identity()
+        {
+            bail!("review Git administrative binding changed");
+        }
+        Ok(())
+    }
+
+    fn confinement_profile(&self) -> Result<StrictOfflineWorkspaceProfile> {
+        self.verify()?;
+        let profile = StrictOfflineWorkspaceProfile::read_only(self.worktree_root.path());
+        Ok(match &self.state {
+            ReviewStateBinding::Bound { state_root, .. } => {
+                profile.with_hidden_root(state_root.path())
+            }
+            ReviewStateBinding::MissingMaco | ReviewStateBinding::MissingState { .. } => profile,
         })
-        .collect();
-    Ok(ReviewRepoSnapshot {
-        head,
-        index_digest,
-        statuses,
+    }
+
+    fn snapshot(&self) -> Result<ReviewRepoSnapshot> {
+        self.verify()?;
+        let repository = git2::Repository::open(self.worktree_root.path())
+            .context("failed to open bound review repository")?;
+        let (head, head_name) = match repository.head() {
+            Ok(head) => (
+                head.target().map(|oid| oid.to_string()),
+                head.name().map(ToString::to_string),
+            ),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
+                ) =>
+            {
+                (None, None)
+            }
+            Err(error) => return Err(error).context("failed to read review HEAD"),
+        };
+        let head_symbolic_target = match repository.find_reference("HEAD") {
+            Ok(reference) => reference.symbolic_target().map(ToString::to_string),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+            Err(error) => return Err(error).context("failed to read review HEAD backlink"),
+        };
+        let git_admin_reader = ReviewTreeReader::bind(&self.git_dir_root)?;
+        let common_admin_reader = ReviewTreeReader::bind(&self.common_dir_root)?;
+        let mut admin_content_bytes = 0u64;
+        let head_admin_sha256 = snapshot_regular_entry_digest(
+            &git_admin_reader,
+            Path::new("HEAD"),
+            &mut admin_content_bytes,
+            REVIEW_PATH_LIMIT_BYTES as u64,
+            true,
+            "review HEAD state",
+        )?
+        .context("review HEAD state is missing")?;
+        let current_ref_name = head_symbolic_target.as_deref().or(head_name.as_deref());
+        let head_ref_sha256 = if let Some(reference) = current_ref_name {
+            validate_git_reference_path(reference)?;
+            snapshot_regular_entry_digest(
+                &common_admin_reader,
+                Path::new(reference),
+                &mut admin_content_bytes,
+                REVIEW_PATH_LIMIT_BYTES as u64,
+                false,
+                "review HEAD reference",
+            )?
+        } else {
+            None
+        };
+        let packed_refs_sha256 = snapshot_regular_entry_digest(
+            &common_admin_reader,
+            Path::new("packed-refs"),
+            &mut admin_content_bytes,
+            REVIEW_SNAPSHOT_FILE_LIMIT_BYTES,
+            false,
+            "review packed-refs",
+        )?;
+        let index_sha256 = snapshot_regular_entry_digest(
+            &git_admin_reader,
+            Path::new("index"),
+            &mut admin_content_bytes,
+            REVIEW_SNAPSHOT_FILE_LIMIT_BYTES,
+            false,
+            "review index",
+        )?;
+        git_admin_reader.verify(&self.git_dir_root)?;
+        common_admin_reader.verify(&self.common_dir_root)?;
+
+        let mut origins = BTreeMap::<PathBuf, SnapshotPathOrigin>::new();
+        let index = repository.index().context("failed to read review index")?;
+        for entry in index.iter() {
+            if entry.mode & 0o170000 == 0o160000 {
+                bail!(
+                    "review repository contains a gitlink/submodule; exact submodule snapshots are unsupported"
+                );
+            }
+            let path = path_from_git_bytes(&entry.path)?;
+            validate_snapshot_relative_path(&path)?;
+            origins.entry(path).or_default().tracked = true;
+            if origins.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+                bail!(
+                    "review repository exceeds its {} entry snapshot limit",
+                    REVIEW_SNAPSHOT_ENTRY_LIMIT
+                );
+            }
+        }
+
+        let mut status_options = git2::StatusOptions::new();
+        status_options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(true)
+            .recurse_ignored_dirs(true);
+        let statuses = repository
+            .statuses(Some(&mut status_options))
+            .context("failed to enumerate review repository status")?;
+        if statuses.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+            bail!(
+                "review status exceeds its {} entry limit",
+                REVIEW_SNAPSHOT_ENTRY_LIMIT
+            );
+        }
+        let mut status_material = Vec::new();
+        for entry in statuses.iter() {
+            let path = path_from_git_bytes(entry.path_bytes())?;
+            validate_snapshot_relative_path(&path)?;
+            append_snapshot_bytes(&mut status_material, &path_bytes(&path))?;
+            status_material.extend_from_slice(&entry.status().bits().to_be_bytes());
+            if entry.status().contains(git2::Status::WT_NEW) {
+                origins.entry(path).or_default().untracked = true;
+                if origins.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+                    bail!(
+                        "review repository exceeds its {} entry snapshot limit",
+                        REVIEW_SNAPSHOT_ENTRY_LIMIT
+                    );
+                }
+            } else if entry.status().contains(git2::Status::IGNORED) {
+                origins.entry(path).or_default().ignored = true;
+                if origins.len() > REVIEW_SNAPSHOT_ENTRY_LIMIT {
+                    bail!(
+                        "review repository exceeds its {} entry snapshot limit",
+                        REVIEW_SNAPSHOT_ENTRY_LIMIT
+                    );
+                }
+            }
+        }
+
+        let reader = ReviewTreeReader::bind(&self.worktree_root)?;
+        let mut worktree_material = Vec::new();
+        let mut total_content_bytes = 0u64;
+        for (path, origin) in &origins {
+            append_snapshot_bytes(&mut worktree_material, &path_bytes(path))?;
+            worktree_material.push(u8::from(origin.tracked));
+            worktree_material.push(u8::from(origin.untracked));
+            worktree_material.push(u8::from(origin.ignored));
+            let entry = reader.snapshot_entry(path, &mut total_content_bytes)?;
+            entry.append_canonical(&mut worktree_material);
+        }
+        reader.verify(&self.worktree_root)?;
+        let git_backlink = reader.snapshot_git_backlink()?;
+        self.verify()?;
+
+        Ok(ReviewRepoSnapshot {
+            head,
+            head_name,
+            head_symbolic_target,
+            head_admin_sha256,
+            head_ref_sha256,
+            packed_refs_sha256,
+            index_sha256,
+            status_sha256: sha256_hex(&status_material),
+            worktree_sha256: sha256_hex(&worktree_material),
+            entry_count: origins.len(),
+            total_content_bytes,
+            worktree_identity: self.worktree_root.identity().clone(),
+            git_dir_identity: self.git_dir_root.identity().clone(),
+            common_dir_identity: self.common_dir_root.identity().clone(),
+            git_backlink,
+            state_identity: self.state.identity(),
+        })
+    }
+}
+
+impl ReviewStateBinding {
+    fn verify(&self, common_root: &SafeRoot) -> Result<()> {
+        match self {
+            Self::MissingMaco => {
+                if common_root.direct_child_exists("maco")? {
+                    bail!("review Git state root appeared during review");
+                }
+            }
+            Self::MissingState { maco_root } => {
+                maco_root
+                    .verify()
+                    .map_err(|_| anyhow::anyhow!("review Git state parent changed"))?;
+                if maco_root.direct_child_exists("state")? {
+                    bail!("review Git state root appeared during review");
+                }
+            }
+            Self::Bound {
+                maco_root,
+                state_root,
+            } => {
+                maco_root
+                    .verify()
+                    .map_err(|_| anyhow::anyhow!("review Git state parent changed"))?;
+                state_root
+                    .verify()
+                    .map_err(|_| anyhow::anyhow!("review Git state root changed"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn identity(&self) -> Option<FileIdentity> {
+        match self {
+            Self::Bound { state_root, .. } => Some(state_root.identity().clone()),
+            Self::MissingMaco | Self::MissingState { .. } => None,
+        }
+    }
+}
+
+fn bind_review_state(common_root: &SafeRoot) -> Result<ReviewStateBinding> {
+    if !common_root.direct_child_exists("maco")? {
+        return Ok(ReviewStateBinding::MissingMaco);
+    }
+    let maco = common_root
+        .bind_existing_managed_direct_child_directory("maco")
+        .map_err(|_| anyhow::anyhow!("review Git state parent is unsafe"))?;
+    let maco_root = SafeRoot::open_existing(maco.path())
+        .map_err(|_| anyhow::anyhow!("review Git state parent binding is unsafe"))?;
+    if !maco_root.direct_child_exists("state")? {
+        return Ok(ReviewStateBinding::MissingState { maco_root });
+    }
+    let state = maco_root
+        .bind_existing_managed_direct_child_directory("state")
+        .map_err(|_| anyhow::anyhow!("review Git state root is unsafe"))?;
+    let state_root = SafeRoot::open_existing(state.path())
+        .map_err(|_| anyhow::anyhow!("review Git state root binding is unsafe"))?;
+    Ok(ReviewStateBinding::Bound {
+        maco_root,
+        state_root,
     })
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SnapshotPathOrigin {
+    tracked: bool,
+    untracked: bool,
+    ignored: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+enum SnapshotTreeEntry {
+    Missing,
+    Regular {
+        mode: u32,
+        length: u64,
+        sha256: [u8; 32],
+        identity: FileIdentity,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    },
+    Symlink {
+        mode: u32,
+        target: Vec<u8>,
+        identity: FileIdentity,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    },
+}
+
+impl SnapshotTreeEntry {
+    fn append_canonical(&self, output: &mut Vec<u8>) {
+        match self {
+            Self::Missing => output.push(0),
+            Self::Regular {
+                mode,
+                length,
+                sha256,
+                identity,
+                modified_seconds,
+                modified_nanoseconds,
+                changed_seconds,
+                changed_nanoseconds,
+            } => {
+                output.push(1);
+                output.extend_from_slice(&mode.to_be_bytes());
+                output.extend_from_slice(&length.to_be_bytes());
+                output.extend_from_slice(sha256);
+                append_file_generation(
+                    output,
+                    identity,
+                    *modified_seconds,
+                    *modified_nanoseconds,
+                    *changed_seconds,
+                    *changed_nanoseconds,
+                );
+            }
+            Self::Symlink {
+                mode,
+                target,
+                identity,
+                modified_seconds,
+                modified_nanoseconds,
+                changed_seconds,
+                changed_nanoseconds,
+            } => {
+                output.push(2);
+                output.extend_from_slice(&mode.to_be_bytes());
+                output.extend_from_slice(
+                    &u64::try_from(target.len())
+                        .unwrap_or(u64::MAX)
+                        .to_be_bytes(),
+                );
+                output.extend_from_slice(target);
+                append_file_generation(
+                    output,
+                    identity,
+                    *modified_seconds,
+                    *modified_nanoseconds,
+                    *changed_seconds,
+                    *changed_nanoseconds,
+                );
+            }
+        }
+    }
+}
+
+fn append_file_generation(
+    output: &mut Vec<u8>,
+    identity: &FileIdentity,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+) {
+    output.extend_from_slice(&identity.device.to_be_bytes());
+    output.extend_from_slice(&identity.file.to_be_bytes());
+    output.extend_from_slice(&modified_seconds.to_be_bytes());
+    output.extend_from_slice(&modified_nanoseconds.to_be_bytes());
+    output.extend_from_slice(&changed_seconds.to_be_bytes());
+    output.extend_from_slice(&changed_nanoseconds.to_be_bytes());
+}
+
+#[derive(Debug)]
+struct ReviewTreeReader {
+    #[cfg(unix)]
+    root: File,
+    identity: FileIdentity,
+}
+
+impl ReviewTreeReader {
+    fn bind(root: &SafeRoot) -> Result<Self> {
+        root.verify()
+            .map_err(|_| anyhow::anyhow!("review worktree root is unsafe"))?;
+        #[cfg(unix)]
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let file = options
+                .open(root.path())
+                .context("failed to open bound review worktree")?;
+            let metadata = file
+                .metadata()
+                .context("failed to inspect bound review worktree")?;
+            let identity = file_identity_from_metadata(&metadata);
+            if &identity != root.identity() {
+                bail!("review worktree descriptor does not match its safe root");
+            }
+            Ok(Self {
+                root: file,
+                identity,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            bail!("exact no-follow review snapshots are unsupported on this platform")
+        }
+    }
+
+    fn verify(&self, root: &SafeRoot) -> Result<()> {
+        root.verify()
+            .map_err(|_| anyhow::anyhow!("review worktree root changed"))?;
+        if &self.identity != root.identity() {
+            bail!("review worktree root identity changed");
+        }
+        #[cfg(unix)]
+        {
+            let metadata = self
+                .root
+                .metadata()
+                .context("failed to revalidate review worktree descriptor")?;
+            if file_identity_from_metadata(&metadata) != self.identity {
+                bail!("review worktree descriptor identity changed");
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        bail!("exact no-follow review snapshots are unsupported on this platform")
+    }
+
+    fn snapshot_entry(
+        &self,
+        path: &Path,
+        total_content_bytes: &mut u64,
+    ) -> Result<SnapshotTreeEntry> {
+        validate_snapshot_relative_path(path)?;
+        #[cfg(unix)]
+        {
+            let Some((parent, name)) = self.open_parent(path)? else {
+                return Ok(SnapshotTreeEntry::Missing);
+            };
+            let name_c = c_string(&name)?;
+            let before = match stat_at_nofollow(&parent, &name_c) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(SnapshotTreeEntry::Missing)
+                }
+                Err(error) => return Err(error).context("failed to inspect review worktree entry"),
+            };
+            validate_snapshot_entry_owner_and_links(&before)?;
+            let file_type = before.st_mode & libc::S_IFMT;
+            let mode = before.st_mode;
+            if file_type == libc::S_IFREG {
+                let length = u64::try_from(before.st_size)
+                    .context("review worktree file has a negative length")?;
+                if length > REVIEW_SNAPSHOT_FILE_LIMIT_BYTES {
+                    bail!(
+                        "review worktree file exceeds its {} byte limit",
+                        REVIEW_SNAPSHOT_FILE_LIMIT_BYTES
+                    );
+                }
+                let next_total = total_content_bytes
+                    .checked_add(length)
+                    .context("review snapshot content-byte total overflow")?;
+                if next_total > REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES {
+                    bail!(
+                        "review worktree exceeds its {} byte total snapshot limit",
+                        REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES
+                    );
+                }
+                let fd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to open review worktree file without following links");
+                }
+                let mut file = unsafe { File::from_raw_fd(fd) };
+                let opened = fstat_file(&file)?;
+                if !same_stat_generation(&before, &opened) {
+                    bail!("review worktree file changed before bounded read");
+                }
+                let capacity = usize::try_from(length)
+                    .context("review worktree file length does not fit memory")?;
+                let mut contents = Vec::with_capacity(capacity);
+                (&mut file)
+                    .take(REVIEW_SNAPSHOT_FILE_LIMIT_BYTES.saturating_add(1))
+                    .read_to_end(&mut contents)
+                    .context("failed to read review worktree file")?;
+                if u64::try_from(contents.len()).unwrap_or(u64::MAX) != length {
+                    bail!("review worktree file changed during bounded read");
+                }
+                let after = fstat_file(&file)?;
+                if !same_stat_generation(&opened, &after) {
+                    bail!("review worktree file changed during bounded read");
+                }
+                *total_content_bytes = next_total;
+                Ok(SnapshotTreeEntry::Regular {
+                    mode,
+                    length,
+                    sha256: sha256_bytes(&contents),
+                    identity: file_identity_from_stat(&opened),
+                    modified_seconds: opened.st_mtime,
+                    modified_nanoseconds: stat_modified_nanoseconds(&opened),
+                    changed_seconds: opened.st_ctime,
+                    changed_nanoseconds: stat_changed_nanoseconds(&opened),
+                })
+            } else if file_type == libc::S_IFLNK {
+                let mut target = vec![0u8; REVIEW_SYMLINK_LIMIT_BYTES.saturating_add(1)];
+                let read = unsafe {
+                    libc::readlinkat(
+                        parent.as_raw_fd(),
+                        name_c.as_ptr(),
+                        target.as_mut_ptr().cast(),
+                        target.len(),
+                    )
+                };
+                if read < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("failed to read review worktree symlink without following it");
+                }
+                let read = usize::try_from(read).context("review symlink length overflow")?;
+                if read > REVIEW_SYMLINK_LIMIT_BYTES {
+                    bail!(
+                        "review worktree symlink exceeds its {} byte target limit",
+                        REVIEW_SYMLINK_LIMIT_BYTES
+                    );
+                }
+                target.truncate(read);
+                let after = stat_at_nofollow(&parent, &name_c)
+                    .context("failed to revalidate review worktree symlink")?;
+                if !same_stat_generation(&before, &after) {
+                    bail!("review worktree symlink changed during snapshot");
+                }
+                validate_internal_symlink_target(path, &target)?;
+                Ok(SnapshotTreeEntry::Symlink {
+                    mode,
+                    target,
+                    identity: file_identity_from_stat(&before),
+                    modified_seconds: before.st_mtime,
+                    modified_nanoseconds: stat_modified_nanoseconds(&before),
+                    changed_seconds: before.st_ctime,
+                    changed_nanoseconds: stat_changed_nanoseconds(&before),
+                })
+            } else {
+                bail!("review worktree contains an unsupported special or directory entry");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = total_content_bytes;
+            bail!("exact no-follow review snapshots are unsupported on this platform")
+        }
+    }
+
+    fn snapshot_git_backlink(&self) -> Result<GitBacklinkSnapshot> {
+        #[cfg(unix)]
+        {
+            let name = c_string(OsStr::new(".git"))?;
+            let before = stat_at_nofollow(&self.root, &name)
+                .context("review worktree Git backlink is missing or unsafe")?;
+            if before.st_uid != unsafe { libc::geteuid() } {
+                bail!("review worktree Git backlink ownership is unsafe");
+            }
+            let identity = file_identity_from_stat(&before);
+            let file_type = before.st_mode & libc::S_IFMT;
+            if file_type == libc::S_IFDIR {
+                return Ok(GitBacklinkSnapshot {
+                    kind: "directory".to_string(),
+                    mode: before.st_mode,
+                    identity,
+                    modified_seconds: before.st_mtime,
+                    modified_nanoseconds: stat_modified_nanoseconds(&before),
+                    changed_seconds: before.st_ctime,
+                    changed_nanoseconds: stat_changed_nanoseconds(&before),
+                    content_sha256: None,
+                });
+            }
+            if file_type != libc::S_IFREG {
+                bail!("review worktree Git backlink has an unsupported file type");
+            }
+            if before.st_nlink != 1 {
+                bail!("review worktree Git backlink link count is unsafe");
+            }
+            let fd = unsafe {
+                libc::openat(
+                    self.root.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to open review worktree Git backlink safely");
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let opened = fstat_file(&file)?;
+            if !same_stat_generation(&before, &opened) {
+                bail!("review worktree Git backlink changed before read");
+            }
+            let length = u64::try_from(opened.st_size)
+                .context("review worktree Git backlink has a negative length")?;
+            if length > REVIEW_PATH_LIMIT_BYTES as u64 {
+                bail!("review worktree Git backlink exceeds its bounded length");
+            }
+            let mut contents = Vec::with_capacity(usize::try_from(length).unwrap_or_default());
+            (&mut file)
+                .take((REVIEW_PATH_LIMIT_BYTES as u64).saturating_add(1))
+                .read_to_end(&mut contents)
+                .context("failed to read review worktree Git backlink")?;
+            let after = fstat_file(&file)?;
+            if u64::try_from(contents.len()).unwrap_or(u64::MAX) != length
+                || !same_stat_generation(&opened, &after)
+            {
+                bail!("review worktree Git backlink changed during read");
+            }
+            Ok(GitBacklinkSnapshot {
+                kind: "file".to_string(),
+                mode: before.st_mode,
+                identity,
+                modified_seconds: before.st_mtime,
+                modified_nanoseconds: stat_modified_nanoseconds(&before),
+                changed_seconds: before.st_ctime,
+                changed_nanoseconds: stat_changed_nanoseconds(&before),
+                content_sha256: Some(sha256_hex(&contents)),
+            })
+        }
+        #[cfg(not(unix))]
+        bail!("exact no-follow review snapshots are unsupported on this platform")
+    }
+
+    #[cfg(unix)]
+    fn open_parent(&self, path: &Path) -> Result<Option<(File, OsString)>> {
+        let components = path
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(value) => Ok(value.to_os_string()),
+                _ => bail!("review snapshot path is not canonical repository-relative form"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (name, parents) = components
+            .split_last()
+            .context("review snapshot path has no final component")?;
+        let mut directory = self
+            .root
+            .try_clone()
+            .context("failed to clone review worktree descriptor")?;
+        for component in parents {
+            let component_c = c_string(component)?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                return Err(error).context("review snapshot parent component is missing or unsafe");
+            }
+            directory = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(Some((directory, name.clone())))
+    }
+}
+
+fn validate_snapshot_relative_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!("review snapshot path is not repository-relative");
+    }
+    if path_bytes(path).len() > REVIEW_PATH_LIMIT_BYTES {
+        bail!(
+            "review snapshot path exceeds its {} byte limit",
+            REVIEW_PATH_LIMIT_BYTES
+        );
+    }
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        bail!("review snapshot path is not canonical");
+    };
+    if first == OsStr::new(".git") {
+        bail!("review snapshot path must not enter Git administrative state");
+    }
+    for component in components {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            bail!("review snapshot path is not canonical");
+        }
+    }
+    Ok(())
+}
+
+fn validate_git_reference_path(reference: &str) -> Result<()> {
+    if reference.len() > REVIEW_PATH_LIMIT_BYTES || !reference.starts_with("refs/") {
+        bail!("review HEAD reference path is not canonical");
+    }
+    validate_snapshot_relative_path(Path::new(reference))
+        .context("review HEAD reference path is not canonical")
+}
+
+fn snapshot_regular_entry_digest(
+    reader: &ReviewTreeReader,
+    path: &Path,
+    total_content_bytes: &mut u64,
+    max_bytes: u64,
+    required: bool,
+    label: &str,
+) -> Result<Option<String>> {
+    match reader.snapshot_entry(path, total_content_bytes)? {
+        SnapshotTreeEntry::Missing if required => bail!("{label} is missing"),
+        SnapshotTreeEntry::Missing => Ok(None),
+        entry @ SnapshotTreeEntry::Regular { length, .. } => {
+            if length > max_bytes {
+                bail!("{label} exceeds its bounded size");
+            }
+            let mut canonical = Vec::new();
+            entry.append_canonical(&mut canonical);
+            Ok(Some(sha256_hex(&canonical)))
+        }
+        SnapshotTreeEntry::Symlink { .. } => {
+            bail!("{label} must be a regular no-follow file")
+        }
+    }
+}
+
+fn append_snapshot_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let length = u32::try_from(bytes.len()).context("review snapshot field length overflow")?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    if bytes.contains(&0) {
+        bail!("review Git path contains a NUL byte");
+    }
+    Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    let path = std::str::from_utf8(bytes).context("review Git path is not valid UTF-8")?;
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    match path.to_str() {
+        Some(value) => value.as_bytes().to_vec(),
+        None => Vec::new(),
+    }
+}
+
+#[cfg(unix)]
+fn c_string(value: &OsStr) -> Result<std::ffi::CString> {
+    std::ffi::CString::new(value.as_bytes()).context("review path contains a NUL byte")
+}
+
+#[cfg(unix)]
+fn stat_at_nofollow(directory: &File, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat)
+}
+
+#[cfg(unix)]
+fn fstat_file(file: &File) -> Result<libc::stat> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect review snapshot file descriptor");
+    }
+    Ok(stat)
+}
+
+#[cfg(unix)]
+fn file_identity_from_stat(stat: &libc::stat) -> FileIdentity {
+    FileIdentity {
+        device: stat.st_dev,
+        file: stat.st_ino,
+    }
+}
+
+#[cfg(unix)]
+fn file_identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    }
+}
+
+#[cfg(unix)]
+fn same_stat_generation(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_nlink == right.st_nlink
+        && left.st_uid == right.st_uid
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && stat_modified_nanoseconds(left) == stat_modified_nanoseconds(right)
+        && left.st_ctime == right.st_ctime
+        && stat_changed_nanoseconds(left) == stat_changed_nanoseconds(right)
+}
+
+#[cfg(target_os = "linux")]
+fn stat_modified_nanoseconds(stat: &libc::stat) -> i64 {
+    stat.st_mtime_nsec
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stat_modified_nanoseconds(_stat: &libc::stat) -> i64 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn stat_changed_nanoseconds(stat: &libc::stat) -> i64 {
+    stat.st_ctime_nsec
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stat_changed_nanoseconds(_stat: &libc::stat) -> i64 {
+    0
+}
+
+#[cfg(unix)]
+fn validate_snapshot_entry_owner_and_links(stat: &libc::stat) -> Result<()> {
+    if stat.st_uid != unsafe { libc::geteuid() } {
+        bail!("review worktree entry is not owned by the current user");
+    }
+    if stat.st_nlink != 1 {
+        bail!("review worktree entry must have exactly one hard link");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_internal_symlink_target(path: &Path, target: &[u8]) -> Result<()> {
+    if target.is_empty() {
+        bail!("review worktree symlink target cannot be empty");
+    }
+    let target_path = PathBuf::from(OsString::from_vec(target.to_vec()));
+    if target_path.is_absolute() {
+        bail!("review worktree symlink must not target an external absolute path");
+    }
+    let mut resolved = Vec::new();
+    for component in path.parent().unwrap_or_else(|| Path::new("")).components() {
+        let std::path::Component::Normal(value) = component else {
+            bail!("review worktree symlink parent is not canonical");
+        };
+        resolved.push(value.to_os_string());
+    }
+    for component in target_path.components() {
+        match component {
+            std::path::Component::Normal(value) => resolved.push(value.to_os_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if resolved.pop().is_none() {
+                    bail!("review worktree symlink escapes the repository root");
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!("review worktree symlink escapes the repository root")
+            }
+        }
+    }
+    if resolved
+        .first()
+        .is_some_and(|component| component == ".git")
+    {
+        bail!("review worktree symlink must not enter Git administrative state");
+    }
+    Ok(())
+}
+
+enum ParsedExternalReview {
+    Accepted(Box<ReviewReport>),
+    RejectedSensitive,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReviewReportWire {
+    version: u32,
+    status: ReviewReportStatus,
+    success: bool,
+    target: String,
+    reviewer: ExternalReviewerIdentityWire,
+    attempt: usize,
+    request_binding: String,
+    findings: Vec<ExternalReviewFindingWire>,
+    blocking_finding_count: usize,
+    changed_paths: Vec<PathBuf>,
+    diff_source: String,
+    ci_reaction_supported: bool,
+    ci_reaction: String,
+    #[serde(default)]
+    diagnostics: Option<ExternalReviewDiagnosticsWire>,
+    next_action: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReviewerIdentityWire {
+    mode: String,
+    reviewer_id: String,
+    model: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReviewFindingWire {
+    severity: String,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    summary: String,
+    suggested_fix: String,
+    blocking: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReviewDiagnosticsWire {
+    timed_out: bool,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    stdout: ExternalReviewOutputWire,
+    stderr: ExternalReviewOutputWire,
+    #[serde(default)]
+    process_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReviewOutputWire {
+    text: String,
+    truncated: bool,
+}
+
+fn parse_external_review_report(
+    bytes: &[u8],
+    options: &ReviewPrOptions,
+    expected_reviewer: &ReviewerIdentity,
+    expected_request_binding: &str,
+) -> Result<ParsedExternalReview> {
+    if bytes.len() > REVIEW_JSON_LIMIT_BYTES {
+        bail!(
+            "external reviewer JSON exceeds its {} byte limit",
+            REVIEW_JSON_LIMIT_BYTES
+        );
+    }
+    let text = std::str::from_utf8(bytes)
+        .context("external reviewer command output must be strict UTF-8 JSON")?;
+    let wire: ExternalReviewReportWire = serde_json::from_str(text)
+        .context("external reviewer command must emit a strict review report JSON object")?;
+
+    if wire.version != REVIEW_SCHEMA_VERSION {
+        bail!("external reviewer report version is unsupported");
+    }
+    if wire.target != options.target {
+        bail!("external reviewer report target does not match the requested target");
+    }
+    if wire.attempt != options.attempt {
+        bail!("external reviewer report attempt does not match the requested attempt");
+    }
+    if wire.changed_paths != options.changed_paths {
+        bail!("external reviewer report changed_paths do not exactly match the review input");
+    }
+    if wire.changed_paths.len() > REVIEW_CHANGED_PATH_LIMIT {
+        bail!("external reviewer report changed_paths exceeds its item limit");
+    }
+    for path in &wire.changed_paths {
+        validate_repo_relative_path(path, "external reviewer changed path")?;
+    }
+    if wire.findings.len() > REVIEW_FINDING_LIMIT {
+        bail!(
+            "external reviewer report exceeds its {} finding limit",
+            REVIEW_FINDING_LIMIT
+        );
+    }
+    if wire.request_binding != expected_request_binding {
+        bail!("external reviewer request_binding does not match the bound review request");
+    }
+    if wire.reviewer.mode != "external_command"
+        || wire.reviewer.reviewer_id != expected_reviewer.reviewer_id
+        || wire.reviewer.model != expected_reviewer.model
+    {
+        bail!("external reviewer identity does not match the parent-bound reviewer");
+    }
+    if wire.ci_reaction_supported || wire.ci_reaction != "unsupported" {
+        bail!("external reviewer report must preserve unsupported CI reaction semantics");
+    }
+    let expected_diff_source = if options.diff_summary.is_some() {
+        "sanitized_merge_candidate_summary"
+    } else {
+        "pr_target_only"
+    };
+    if wire.diff_source != expected_diff_source {
+        bail!("external reviewer report diff_source does not match the review input");
+    }
+
+    let mut sensitive = false;
+    sensitive |= external_text_is_sensitive(
+        &wire.reviewer.reviewer_id,
+        "external reviewer id",
+        REVIEW_SHORT_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    sensitive |= external_text_is_sensitive(
+        &wire.reviewer.model,
+        "external reviewer model",
+        REVIEW_SHORT_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    sensitive |= external_text_is_sensitive(
+        &wire.diff_source,
+        "external reviewer diff_source",
+        REVIEW_SHORT_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    sensitive |= external_text_is_sensitive(
+        &wire.ci_reaction,
+        "external reviewer ci_reaction",
+        REVIEW_SHORT_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    sensitive |= external_text_is_sensitive(
+        &wire.next_action,
+        "external reviewer next_action",
+        REVIEW_LONG_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+
+    let mut findings = Vec::with_capacity(wire.findings.len());
+    for finding in wire.findings {
+        if let Some(path) = &finding.path {
+            if validate_repo_relative_path(path, "external reviewer finding path").is_err() {
+                sensitive = true;
+            }
+        }
+        sensitive |= external_text_is_sensitive(
+            &finding.severity,
+            "external reviewer finding severity",
+            REVIEW_SHORT_TEXT_LIMIT_BYTES,
+            false,
+        )?;
+        let severity_requires_blocking = validate_review_severity(&finding.severity)?;
+        if severity_requires_blocking && !finding.blocking {
+            bail!("external reviewer finding severity and blocking flag are inconsistent");
+        }
+        sensitive |= external_text_is_sensitive(
+            &finding.summary,
+            "external reviewer finding summary",
+            REVIEW_LONG_TEXT_LIMIT_BYTES,
+            false,
+        )?;
+        sensitive |= external_text_is_sensitive(
+            &finding.suggested_fix,
+            "external reviewer finding suggested_fix",
+            REVIEW_LONG_TEXT_LIMIT_BYTES,
+            false,
+        )?;
+        findings.push(ReviewFinding {
+            severity: finding.severity,
+            path: finding.path,
+            summary: finding.summary,
+            suggested_fix: finding.suggested_fix,
+            blocking: finding.blocking,
+        });
+    }
+    if let Some(diagnostics) = &wire.diagnostics {
+        if diagnostics
+            .timeout_seconds
+            .is_some_and(|timeout| timeout == 0 || timeout > REVIEW_TIMEOUT_LIMIT_SECONDS)
+        {
+            bail!("external reviewer diagnostics timeout_seconds is out of bounds");
+        }
+        sensitive |= external_text_is_sensitive(
+            &diagnostics.stdout.text,
+            "external reviewer diagnostics stdout",
+            REVIEW_OUTPUT_LIMIT,
+            true,
+        )?;
+        sensitive |= external_text_is_sensitive(
+            &diagnostics.stderr.text,
+            "external reviewer diagnostics stderr",
+            REVIEW_OUTPUT_LIMIT,
+            true,
+        )?;
+        if let Some(process_error) = &diagnostics.process_error {
+            sensitive |= external_text_is_sensitive(
+                process_error,
+                "external reviewer diagnostics process_error",
+                REVIEW_LONG_TEXT_LIMIT_BYTES,
+                true,
+            )?;
+        }
+        let _ = (
+            diagnostics.timed_out,
+            diagnostics.exit_code,
+            diagnostics.stdout.truncated,
+            diagnostics.stderr.truncated,
+        );
+    }
+
+    let blocking_count = findings.iter().filter(|finding| finding.blocking).count();
+    if wire.blocking_finding_count != blocking_count {
+        bail!("external reviewer blocking_finding_count is inconsistent with findings");
+    }
+    match wire.status {
+        ReviewReportStatus::Passed if wire.success && blocking_count == 0 => {}
+        ReviewReportStatus::Blocked | ReviewReportStatus::Failed
+            if !wire.success && blocking_count > 0 => {}
+        _ => bail!("external reviewer status, success, and blocking findings are inconsistent"),
+    }
+
+    if sensitive {
+        return Ok(ParsedExternalReview::RejectedSensitive);
+    }
+    Ok(ParsedExternalReview::Accepted(Box::new(ReviewReport {
+        version: wire.version,
+        status: wire.status,
+        success: wire.success,
+        target: wire.target,
+        reviewer: ReviewerIdentity {
+            mode: ReviewerMode::ExternalCommand,
+            reviewer_id: wire.reviewer.reviewer_id,
+            model: wire.reviewer.model,
+        },
+        attempt: wire.attempt,
+        request_binding: wire.request_binding,
+        findings,
+        blocking_finding_count: wire.blocking_finding_count,
+        changed_paths: wire.changed_paths,
+        diff_source: wire.diff_source,
+        ci_reaction_supported: wire.ci_reaction_supported,
+        ci_reaction: wire.ci_reaction,
+        diagnostics: None,
+        next_action: wire.next_action,
+    })))
+}
+
+fn external_text_is_sensitive(
+    value: &str,
+    label: &str,
+    max_bytes: usize,
+    allow_newlines: bool,
+) -> Result<bool> {
+    if value.len() > max_bytes {
+        bail!("{label} exceeds its {max_bytes} byte limit");
+    }
+    if value.is_empty() && !label.contains("diagnostics") {
+        bail!("{label} cannot be empty");
+    }
+    let contains_control = value.chars().any(|character| {
+        character.is_control() && !(allow_newlines && matches!(character, '\n' | '\r' | '\t'))
+    });
+    Ok(contains_control
+        || contains_private_key_material(value)
+        || Redactor::new().redact(value).summary.total_replacements > 0
+        || contains_external_absolute_path(value))
+}
+
+fn contains_private_key_material(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    upper.contains("PRIVATE KEY") && (upper.contains("-----BEGIN") || upper.contains("BEGIN "))
+}
+
+fn contains_external_absolute_path(text: &str) -> bool {
+    text.split(|character: char| {
+        character.is_whitespace()
+            || character == char::from(96)
+            || matches!(
+                character,
+                '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    })
+    .map(|token| token.trim_end_matches([':', '.']))
+    .filter(|token| !token.is_empty())
+    .any(|token| {
+        token.starts_with('/')
+            || token.starts_with("\\\\")
+            || token
+                .as_bytes()
+                .get(1)
+                .is_some_and(|separator| *separator == b':')
+                && token
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphabetic)
+    })
+}
+
+fn accepted_external_diagnostics(
+    mut diagnostics: ReviewCommandDiagnostics,
+) -> ReviewCommandDiagnostics {
+    diagnostics.stdout = ReviewOutputSummary {
+        text: "<validated:external-review-report>".to_string(),
+        truncated: false,
+    };
+    diagnostics
+}
+
+fn redact_untrusted_report_diagnostics(
+    mut diagnostics: ReviewCommandDiagnostics,
+) -> ReviewCommandDiagnostics {
+    diagnostics.stdout = ReviewOutputSummary {
+        text: "<redacted:unsafe-external-review-report>".to_string(),
+        truncated: true,
+    };
+    diagnostics.stderr = ReviewOutputSummary {
+        text: "<redacted:unsafe-external-review-diagnostics>".to_string(),
+        truncated: true,
+    };
+    if diagnostics.process_error.is_some() {
+        diagnostics.process_error = Some("<redacted:unsafe-process-diagnostic>".to_string());
+    }
+    diagnostics
 }
 
 fn sandbox_environment() -> BTreeMap<String, String> {
@@ -350,19 +2024,28 @@ fn sandbox_environment() -> BTreeMap<String, String> {
 
 fn failed_external_review(
     options: ReviewPrOptions,
+    request_binding: &str,
     reason: &str,
     diagnostics: ReviewCommandDiagnostics,
 ) -> ReviewReport {
+    let reviewer = options
+        .reviewer
+        .command
+        .as_deref()
+        .map(bound_external_reviewer_identity)
+        .unwrap_or(ReviewerIdentity {
+            mode: ReviewerMode::ExternalCommand,
+            reviewer_id: "external-command-unbound".to_string(),
+            model: "parent-bound-external-command-v1".to_string(),
+        });
     ReviewReport {
+        version: REVIEW_SCHEMA_VERSION,
         status: ReviewReportStatus::Failed,
         success: false,
         target: options.target,
-        reviewer: ReviewerIdentity {
-            mode: ReviewerMode::ExternalCommand,
-            reviewer_id: "external-reviewer".to_string(),
-            model: "external-command".to_string(),
-        },
+        reviewer,
         attempt: options.attempt,
+        request_binding: request_binding.to_string(),
         findings: vec![ReviewFinding {
             severity: "error".to_string(),
             path: options.changed_paths.first().cloned(),
@@ -396,25 +2079,66 @@ fn diagnostics_from_output(
         exit_code: output.status.and_then(|status| status.code()),
         stdout: sanitize_review_output(repo, output.stdout.as_bytes()),
         stderr: sanitize_review_output(repo, output.stderr.as_bytes()),
-        process_error: output.process_error.clone(),
+        process_error: output
+            .process_error
+            .as_deref()
+            .map(|error| sanitize_review_output(repo, error.as_bytes()).text),
     }
 }
 
 fn sanitize_review_output(repo: &Path, output: &[u8]) -> ReviewOutputSummary {
     let text = String::from_utf8_lossy(output);
-    let mut sanitized = Redactor::new().redact(&text).text;
-
-    if let Ok(canonical_repo) = repo.canonicalize() {
-        replace_nonempty_path(&mut sanitized, &canonical_repo, ".");
-        if let Some(parent) = canonical_repo.parent() {
-            replace_nonempty_path(&mut sanitized, parent, "<repo-parent>");
-        }
+    if contains_private_key_material(&text) {
+        return ReviewOutputSummary {
+            text: "<redacted:private-key-material>".to_string(),
+            truncated: true,
+        };
     }
-    replace_nonempty_path(&mut sanitized, repo, ".");
-    if let Some(parent) = repo.parent() {
-        replace_nonempty_path(&mut sanitized, parent, "<repo-parent>");
+    if text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return ReviewOutputSummary {
+            text: "<redacted:control-character-diagnostic>".to_string(),
+            truncated: true,
+        };
+    }
+    let mut sanitized = Redactor::new().redact(&text).text;
+    redact_known_repository_paths(repo, &mut sanitized);
+    if contains_external_absolute_path(&sanitized) {
+        sanitized = "<redacted:absolute-path-diagnostic>".to_string();
     }
     summarize_review_text(&redact_token_like_words(&sanitized), REVIEW_OUTPUT_LIMIT)
+}
+
+fn review_diagnostic_contains_unsafe_evidence(repo: &Path, output: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(output) else {
+        return true;
+    };
+    if contains_private_key_material(text)
+        || text
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        || Redactor::new().redact(text).summary.total_replacements > 0
+    {
+        return true;
+    }
+    let mut sanitized = text.to_string();
+    redact_known_repository_paths(repo, &mut sanitized);
+    contains_external_absolute_path(&sanitized) || contains_token_like_word(&sanitized)
+}
+
+fn redact_known_repository_paths(repo: &Path, text: &mut String) {
+    if let Ok(canonical_repo) = repo.canonicalize() {
+        replace_nonempty_path(text, &canonical_repo, ".");
+        if let Some(parent) = canonical_repo.parent() {
+            replace_nonempty_path(text, parent, "<repo-parent>");
+        }
+    }
+    replace_nonempty_path(text, repo, ".");
+    if let Some(parent) = repo.parent() {
+        replace_nonempty_path(text, parent, "<repo-parent>");
+    }
 }
 
 fn replace_nonempty_path(text: &mut String, path: &Path, replacement: &str) {
@@ -447,6 +2171,19 @@ fn redact_token_like_words(text: &str) -> String {
     }
     push_redacted_token(&mut output, &token);
     output
+}
+
+fn contains_token_like_word(text: &str) -> bool {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    })
+    .any(|token| {
+        token.len() >= 32
+            && token
+                .chars()
+                .any(|character| character.is_ascii_alphabetic())
+            && token.chars().any(|character| character.is_ascii_digit())
+    })
 }
 
 fn push_redacted_token(output: &mut String, token: &str) {
@@ -487,11 +2224,215 @@ fn fake_finding(options: &ReviewPrOptions) -> ReviewFinding {
 
 #[derive(Serialize)]
 struct ExternalReviewInput<'a> {
+    version: u32,
     target: &'a str,
     attempt: usize,
     changed_paths: &'a [PathBuf],
     #[serde(skip_serializing_if = "Option::is_none")]
     diff_summary: Option<&'a str>,
+    reviewer: &'a ReviewerIdentity,
+    request_binding: &'a str,
+}
+
+#[derive(Serialize)]
+struct ExternalReviewRequestBindingPayload<'a> {
+    version: u32,
+    target: &'a str,
+    attempt: usize,
+    changed_paths: &'a [PathBuf],
+    diff_summary: Option<&'a str>,
+    reviewer: &'a ReviewerIdentity,
+    command_sha256: String,
+    repository_snapshot: &'a ReviewRepoSnapshot,
+}
+
+fn bound_external_reviewer_identity(command: &str) -> ReviewerIdentity {
+    let command_binding = domain_sha256(EXTERNAL_REVIEWER_BINDING_DOMAIN, command.as_bytes());
+    ReviewerIdentity {
+        mode: ReviewerMode::ExternalCommand,
+        reviewer_id: format!("external-command-{}", &command_binding[..32]),
+        model: "parent-bound-external-command-v1".to_string(),
+    }
+}
+
+fn external_review_request_binding(
+    options: &ReviewPrOptions,
+    snapshot: &ReviewRepoSnapshot,
+    reviewer: &ReviewerIdentity,
+    command: &str,
+) -> Result<String> {
+    let payload = serde_json::to_vec(&ExternalReviewRequestBindingPayload {
+        version: REVIEW_SCHEMA_VERSION,
+        target: &options.target,
+        attempt: options.attempt,
+        changed_paths: &options.changed_paths,
+        diff_summary: options.diff_summary.as_deref(),
+        reviewer,
+        command_sha256: domain_sha256(EXTERNAL_REVIEWER_BINDING_DOMAIN, command.as_bytes()),
+        repository_snapshot: snapshot,
+    })
+    .context("failed to serialize external review request binding")?;
+    Ok(domain_sha256(EXTERNAL_REVIEW_REQUEST_DOMAIN, &payload))
+}
+
+fn fake_review_request_binding(options: &ReviewPrOptions) -> String {
+    let mut payload = Vec::new();
+    payload.push(REVIEW_SCHEMA_VERSION as u8);
+    payload.push(1);
+    payload.extend_from_slice(
+        &u64::try_from(options.attempt)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    payload.push(2);
+    append_binding_field(&mut payload, options.target.as_bytes());
+    payload.push(3);
+    payload.extend_from_slice(
+        &u64::try_from(options.changed_paths.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for path in &options.changed_paths {
+        payload.push(4);
+        append_binding_field(&mut payload, &path_bytes(path));
+    }
+    match &options.diff_summary {
+        Some(diff_summary) => {
+            payload.push(5);
+            append_binding_field(&mut payload, diff_summary.as_bytes());
+        }
+        None => payload.push(6),
+    }
+    payload.push(7);
+    payload.extend_from_slice(
+        &u64::try_from(options.reviewer.blocking_attempts)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    match &options.reviewer.finding {
+        Some(finding) => {
+            payload.push(8);
+            append_binding_field(&mut payload, finding.severity.as_bytes());
+            match &finding.path {
+                Some(path) => {
+                    payload.push(9);
+                    append_binding_field(&mut payload, &path_bytes(path));
+                }
+                None => payload.push(10),
+            }
+            append_binding_field(&mut payload, finding.summary.as_bytes());
+            append_binding_field(&mut payload, finding.suggested_fix.as_bytes());
+        }
+        None => payload.push(11),
+    }
+    domain_sha256(FAKE_REVIEW_REQUEST_DOMAIN, &payload)
+}
+
+fn append_binding_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+fn domain_sha256(domain: &[u8], payload: &[u8]) -> String {
+    let mut input = Vec::with_capacity(domain.len().saturating_add(payload.len()));
+    input.extend_from_slice(domain);
+    input.extend_from_slice(payload);
+    sha256_hex(&input)
+}
+
+fn review_schema_version() -> u32 {
+    REVIEW_SCHEMA_VERSION
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in sha256_bytes(input) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn sha256_bytes(input: &[u8]) -> [u8; 32] {
+    const INITIAL: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const ROUND: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let bit_len = u64::try_from(input.len())
+        .unwrap_or(u64::MAX)
+        .wrapping_mul(8);
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+    let mut hash = INITIAL;
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0u32; 64];
+        for (index, bytes) in chunk.chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        for index in 16..64 {
+            let small_zero = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let small_one = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(small_zero)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(small_one);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = hash;
+        for index in 0..64 {
+            let sum_one = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ ((!e) & g);
+            let temp_one = h
+                .wrapping_add(sum_one)
+                .wrapping_add(choice)
+                .wrapping_add(ROUND[index])
+                .wrapping_add(words[index]);
+            let sum_zero = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp_two = sum_zero.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp_one);
+            d = c;
+            c = b;
+            b = a;
+            a = temp_one.wrapping_add(temp_two);
+        }
+        hash[0] = hash[0].wrapping_add(a);
+        hash[1] = hash[1].wrapping_add(b);
+        hash[2] = hash[2].wrapping_add(c);
+        hash[3] = hash[3].wrapping_add(d);
+        hash[4] = hash[4].wrapping_add(e);
+        hash[5] = hash[5].wrapping_add(f);
+        hash[6] = hash[6].wrapping_add(g);
+        hash[7] = hash[7].wrapping_add(h);
+    }
+    let mut output = [0u8; 32];
+    for (index, word) in hash.iter().enumerate() {
+        let offset = index.saturating_mul(4);
+        output[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    output
 }
 
 fn default_review_severity() -> String {
@@ -594,6 +2535,16 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_review_output_rejects_control_and_external_path_diagnostics() {
+        let control = sanitize_review_output(Path::new("."), b"unsafe\x1bdiagnostic");
+        assert_eq!(control.text, "<redacted:control-character-diagnostic>");
+        assert!(control.truncated);
+
+        let external = sanitize_review_output(Path::new("."), b"failure in /private/sibling");
+        assert_eq!(external.text, "<redacted:absolute-path-diagnostic>");
+    }
+
+    #[test]
     fn fake_review_constructs_blocking_template_finding() {
         let report = fake_review(ReviewPrOptions {
             repo: PathBuf::from("."),
@@ -637,19 +2588,12 @@ mod tests {
     fn external_review_drains_large_output_before_timeout() -> Result<()> {
         let temp = tempfile::tempdir()?;
         git2::Repository::init(temp.path())?;
-        let report_path = temp.path().join("review.json");
-        let expected = fake_review(ReviewPrOptions {
-            repo: temp.path().to_path_buf(),
-            target: "#44".to_string(),
-            reviewer: ReviewerConfig::default(),
-            attempt: 1,
-            changed_paths: vec![PathBuf::from("src/review.rs")],
-            diff_summary: None,
-        });
-        std::fs::write(&report_path, serde_json::to_vec(&expected)?)?;
-        let command = format!(
-            "cat >/dev/null; i=0; while [ \"$i\" -lt 256 ]; do printf '%4096s' ' '; i=$((i + 1)); done; cat '{}'",
-            report_path.display()
+        let command = external_echo_command(
+            "#44",
+            1,
+            r#"["src/review.rs"]"#,
+            "pr_target_only",
+            "i=0; while [ \"$i\" -lt 256 ]; do printf '%4096s' ' ' >&2; i=$((i + 1)); done;",
         );
 
         let report = external_review_simulation(ReviewPrOptions {
@@ -669,6 +2613,630 @@ mod tests {
         assert_eq!(report.status, ReviewReportStatus::Passed);
         assert!(report.success);
         assert_eq!(report.reviewer.mode, ReviewerMode::ExternalCommand);
+        assert_eq!(
+            report
+                .diagnostics
+                .as_ref()
+                .and_then(|diagnostics| diagnostics.timeout_seconds),
+            Some(3)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reviewer_config_wires_are_versioned_strict_and_omission_compatible() -> Result<()> {
+        let config: ReviewerConfig = serde_json::from_str(
+            r#"{
+                "mode": "fake",
+                "blocking_attempts": 1,
+                "finding": {
+                    "severity": "warning",
+                    "summary": "bounded finding",
+                    "suggested_fix": "bounded fix"
+                }
+            }"#,
+        )?;
+        let serialized = serde_json::to_value(&config)?;
+        assert_eq!(serialized["version"], REVIEW_SCHEMA_VERSION);
+        assert_eq!(serialized["finding"]["version"], REVIEW_SCHEMA_VERSION);
+
+        assert!(serde_json::from_str::<ReviewerConfig>(r#"{"version":2,"mode":"fake"}"#).is_err());
+        assert!(
+            serde_json::from_str::<ReviewerConfig>(r#"{"mode":"fake","unknown":true}"#).is_err()
+        );
+        assert!(serde_json::from_str::<ReviewerConfig>(
+            r#"{"mode":"fake","finding":{"summary":"x","suggested_fix":"y","unknown":true}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ReviewerConfig>(
+            r#"{"mode":"fake","finding":{"version":2,"summary":"x","suggested_fix":"y"}}"#
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn review_entry_rejects_invalid_mode_combinations_and_bounds_before_repo_access() {
+        let invalid_fake = review_pr(ReviewPrOptions {
+            repo: PathBuf::from("/repository/does/not/exist"),
+            target: "#1".to_string(),
+            reviewer: ReviewerConfig {
+                command: Some("true".to_string()),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })
+        .expect_err("fake command must be rejected");
+        assert!(invalid_fake.to_string().contains("fake reviewer mode"));
+
+        let invalid_external = review_pr(ReviewPrOptions {
+            repo: PathBuf::from("/repository/does/not/exist"),
+            target: "#1".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                blocking_attempts: 1,
+                command: Some("true".to_string()),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })
+        .expect_err("external fake fields must be rejected");
+        assert!(invalid_external
+            .to_string()
+            .contains("fake blocking_attempts"));
+
+        let invalid_timeout = review_pr(ReviewPrOptions {
+            repo: PathBuf::from("/repository/does/not/exist"),
+            target: "#1".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some("true".to_string()),
+                timeout_seconds: Some(REVIEW_TIMEOUT_LIMIT_SECONDS.saturating_add(1)),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })
+        .expect_err("oversized timeout must be rejected");
+        assert!(invalid_timeout.to_string().contains("timeout_seconds"));
+
+        let noncanonical_path = review_pr(ReviewPrOptions {
+            repo: PathBuf::from("/repository/does/not/exist"),
+            target: "#1".to_string(),
+            reviewer: ReviewerConfig::default(),
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("src//review.rs")],
+            diff_summary: None,
+        })
+        .expect_err("noncanonical public paths must be rejected before repository access");
+        assert!(noncanonical_path.to_string().contains("canonical"));
+    }
+
+    #[test]
+    fn fake_request_binding_frames_path_count_diff_presence_and_reviewer_config() {
+        let base = ReviewPrOptions {
+            repo: PathBuf::from("."),
+            target: "#binding".to_string(),
+            reviewer: ReviewerConfig::default(),
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("a"), PathBuf::from("b")],
+            diff_summary: None,
+        };
+        let ambiguous_without_framing = ReviewPrOptions {
+            changed_paths: vec![PathBuf::from("a")],
+            diff_summary: Some("b".to_string()),
+            ..base.clone()
+        };
+        assert_ne!(
+            fake_review_request_binding(&base),
+            fake_review_request_binding(&ambiguous_without_framing)
+        );
+        let configured = ReviewPrOptions {
+            reviewer: ReviewerConfig {
+                blocking_attempts: 1,
+                finding: Some(FakeReviewFindingTemplate {
+                    severity: "warning".to_string(),
+                    path: Some(PathBuf::from("a")),
+                    summary: "bounded".to_string(),
+                    suggested_fix: "repair".to_string(),
+                }),
+                ..ReviewerConfig::default()
+            },
+            ..base.clone()
+        };
+        assert_ne!(
+            fake_review_request_binding(&base),
+            fake_review_request_binding(&configured)
+        );
+    }
+
+    #[test]
+    fn external_report_wire_is_strict_exact_bounded_and_sensitive_fail_closed() -> Result<()> {
+        let options = ReviewPrOptions {
+            repo: PathBuf::from("."),
+            target: "#77".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some("true".to_string()),
+                ..ReviewerConfig::default()
+            },
+            attempt: 2,
+            changed_paths: vec![PathBuf::from("src/review.rs")],
+            diff_summary: Some("bounded diff".to_string()),
+        };
+        let mut report = fake_review(ReviewPrOptions {
+            repo: options.repo.clone(),
+            target: options.target.clone(),
+            reviewer: ReviewerConfig::default(),
+            attempt: options.attempt,
+            changed_paths: options.changed_paths.clone(),
+            diff_summary: options.diff_summary.clone(),
+        });
+        let expected_reviewer = bound_external_reviewer_identity("true");
+        let expected_binding = "a".repeat(64);
+        report.reviewer = expected_reviewer.clone();
+        report.request_binding = expected_binding.clone();
+        let accepted = serde_json::to_vec(&report)?;
+        assert!(matches!(
+            parse_external_review_report(
+                &accepted,
+                &options,
+                &expected_reviewer,
+                &expected_binding
+            )?,
+            ParsedExternalReview::Accepted(_)
+        ));
+
+        let mut unknown = serde_json::to_value(&report)?;
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&unknown)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+
+        let mut nested_unknown = serde_json::to_value(&report)?;
+        nested_unknown["reviewer"]["unexpected"] = serde_json::json!(true);
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&nested_unknown)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+
+        let mut legacy_mode = serde_json::to_value(&report)?;
+        legacy_mode["reviewer"]["mode"] = serde_json::json!("external");
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&legacy_mode)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+        let mut missing_version = serde_json::to_value(&report)?;
+        missing_version
+            .as_object_mut()
+            .context("report object")?
+            .remove("version");
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&missing_version)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+
+        let mut mismatched = serde_json::to_value(&report)?;
+        mismatched["attempt"] = serde_json::json!(3);
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&mismatched)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+
+        let mut critical_nonblocking = serde_json::to_value(&report)?;
+        critical_nonblocking["findings"] = serde_json::json!([{
+            "severity": "critical",
+            "summary": "critical issue",
+            "suggested_fix": "repair it",
+            "blocking": false
+        }]);
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&critical_nonblocking)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+        let mut unknown_severity = critical_nonblocking.clone();
+        unknown_severity["findings"][0]["severity"] = serde_json::json!("urgent");
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&unknown_severity)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+
+        let mut absolute_path = serde_json::to_value(&report)?;
+        absolute_path["changed_paths"] = serde_json::json!(["/external/path"]);
+        assert!(parse_external_review_report(
+            &serde_json::to_vec(&absolute_path)?,
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+
+        let mut sensitive_path = serde_json::to_value(&report)?;
+        sensitive_path["status"] = serde_json::json!("blocked");
+        sensitive_path["success"] = serde_json::json!(false);
+        sensitive_path["findings"] = serde_json::json!([{
+            "severity": "error",
+            "path": "/external/private/path",
+            "summary": "bounded issue",
+            "suggested_fix": "repair it",
+            "blocking": true
+        }]);
+        sensitive_path["blocking_finding_count"] = serde_json::json!(1);
+        assert!(matches!(
+            parse_external_review_report(
+                &serde_json::to_vec(&sensitive_path)?,
+                &options,
+                &expected_reviewer,
+                &expected_binding
+            )?,
+            ParsedExternalReview::RejectedSensitive
+        ));
+
+        for unsafe_summary in [
+            "API_TOKEN=top-secret",
+            "-----BEGIN PRIVATE KEY-----",
+            "/external/private/path",
+            "control\u{0001}value",
+        ] {
+            let mut sensitive = serde_json::to_value(&report)?;
+            sensitive["next_action"] = serde_json::json!(unsafe_summary);
+            assert!(matches!(
+                parse_external_review_report(
+                    &serde_json::to_vec(&sensitive)?,
+                    &options,
+                    &expected_reviewer,
+                    &expected_binding
+                )?,
+                ParsedExternalReview::RejectedSensitive
+            ));
+        }
+        assert!(parse_external_review_report(
+            &vec![b' '; REVIEW_JSON_LIMIT_BYTES + 1],
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+        assert!(parse_external_review_report(
+            &[0xff, 0xfe],
+            &options,
+            &expected_reviewer,
+            &expected_binding
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_snapshot_detects_tracked_untracked_ignored_mode_symlink_and_head_changes() -> Result<()>
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        std::fs::write(temp.path().join(".gitignore"), "ignored/\n")?;
+        std::fs::write(temp.path().join("tracked.txt"), "tracked-a")?;
+        std::fs::write(temp.path().join("target-a.txt"), "target-a")?;
+        std::fs::write(temp.path().join("target-b.txt"), "target-b")?;
+        let mut index = repository.index()?;
+        for path in [
+            Path::new(".gitignore"),
+            Path::new("tracked.txt"),
+            Path::new("target-a.txt"),
+            Path::new("target-b.txt"),
+        ] {
+            index.add_path(path)?;
+        }
+        index.write()?;
+        let tree_id = index.write_tree()?;
+        let tree = repository.find_tree(tree_id)?;
+        let signature = git2::Signature::now("Review Test", "review@example.invalid")?;
+        let commit = repository.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "snapshot baseline",
+            &tree,
+            &[],
+        )?;
+        drop(tree);
+        std::fs::write(temp.path().join("untracked.txt"), "untracked-a")?;
+        std::fs::create_dir(temp.path().join("ignored"))?;
+        std::fs::write(temp.path().join("ignored/secret.txt"), "ignored-a")?;
+        symlink("target-a.txt", temp.path().join("link.txt"))?;
+
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        let baseline = binding.snapshot()?;
+
+        std::fs::write(temp.path().join("tracked.txt"), "tracked-b")?;
+        let changed_content = binding.snapshot()?;
+        assert_ne!(baseline, changed_content);
+        let request = ReviewPrOptions {
+            repo: temp.path().to_path_buf(),
+            target: "#snapshot".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some("true".to_string()),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("tracked.txt")],
+            diff_summary: Some("same labels".to_string()),
+        };
+        let identity = bound_external_reviewer_identity("true");
+        assert_ne!(
+            external_review_request_binding(&request, &baseline, &identity, "true")?,
+            external_review_request_binding(&request, &changed_content, &identity, "true")?
+        );
+        std::fs::write(temp.path().join("tracked.txt"), "tracked-a")?;
+        let restored_content = binding.snapshot()?;
+        assert_ne!(baseline, restored_content);
+        assert_ne!(
+            external_review_request_binding(&request, &baseline, &identity, "true")?,
+            external_review_request_binding(&request, &restored_content, &identity, "true")?
+        );
+
+        let mut permissions = std::fs::metadata(temp.path().join("tracked.txt"))?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(temp.path().join("tracked.txt"), permissions)?;
+        assert_ne!(restored_content, binding.snapshot()?);
+        let mut permissions = std::fs::metadata(temp.path().join("tracked.txt"))?.permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(temp.path().join("tracked.txt"), permissions)?;
+        let restored_mode = binding.snapshot()?;
+        assert_ne!(restored_content, restored_mode);
+
+        std::fs::write(temp.path().join("untracked.txt"), "untracked-b")?;
+        assert_ne!(restored_mode, binding.snapshot()?);
+        std::fs::write(temp.path().join("untracked.txt"), "untracked-a")?;
+        let restored_untracked = binding.snapshot()?;
+        assert_ne!(restored_mode, restored_untracked);
+        std::fs::write(temp.path().join("ignored/secret.txt"), "ignored-b")?;
+        assert_ne!(restored_untracked, binding.snapshot()?);
+        std::fs::write(temp.path().join("ignored/secret.txt"), "ignored-a")?;
+        let restored_ignored = binding.snapshot()?;
+        assert_ne!(restored_untracked, restored_ignored);
+
+        std::fs::remove_file(temp.path().join("link.txt"))?;
+        symlink("target-b.txt", temp.path().join("link.txt"))?;
+        assert_ne!(restored_ignored, binding.snapshot()?);
+        std::fs::remove_file(temp.path().join("link.txt"))?;
+        symlink("target-a.txt", temp.path().join("link.txt"))?;
+        assert_ne!(restored_ignored, binding.snapshot()?);
+
+        repository.reference("refs/heads/same-commit", commit, true, "test")?;
+        std::fs::write(
+            repository.path().join("HEAD"),
+            "ref: refs/heads/same-commit\n",
+        )?;
+        let rebound = binding.snapshot()?;
+        assert_eq!(rebound.head, baseline.head);
+        assert_ne!(rebound.head_admin_sha256, baseline.head_admin_sha256);
+        assert_ne!(rebound.head_symbolic_target, baseline.head_symbolic_target);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_hardlinks_special_entries_external_symlinks_and_gitlinks() -> Result<()> {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+
+        let temp = tempfile::tempdir()?;
+        let root = SafeRoot::open_existing(temp.path())?;
+        let reader = ReviewTreeReader::bind(&root)?;
+        std::fs::write(temp.path().join("hard-a"), "same")?;
+        std::fs::hard_link(temp.path().join("hard-a"), temp.path().join("hard-b"))?;
+        assert!(reader.snapshot_entry(Path::new("hard-a"), &mut 0).is_err());
+
+        symlink("/external/path", temp.path().join("escape-link"))?;
+        assert!(reader
+            .snapshot_entry(Path::new("escape-link"), &mut 0)
+            .is_err());
+
+        let fifo = std::ffi::CString::new(temp.path().join("fifo").as_os_str().as_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(reader.snapshot_entry(Path::new("fifo"), &mut 0).is_err());
+
+        let repo_dir = tempfile::tempdir()?;
+        let repository = git2::Repository::init(repo_dir.path())?;
+        let mut index = repository.index()?;
+        index.add(&git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o160000,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: git2::Oid::zero(),
+            flags: 0,
+            flags_extended: 0,
+            path: b"submodule".to_vec(),
+        })?;
+        index.write()?;
+        let binding = ReviewRepositoryBinding::bind(repo_dir.path())?;
+        let error = binding.snapshot().expect_err("gitlink must fail closed");
+        assert!(error.to_string().contains("gitlink/submodule"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_profile_hides_bound_common_state_without_reading_keys() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        let state = repository.path().join("maco/state");
+        std::fs::create_dir_all(&state)?;
+        std::fs::set_permissions(
+            repository.path().join("maco"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(state.join("private.key"), "must-not-be-read-by-snapshot")?;
+
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        assert_eq!(
+            binding.confinement_profile()?,
+            StrictOfflineWorkspaceProfile::read_only(temp.path()).with_hidden_root(&state)
+        );
+        let snapshot = binding.snapshot()?;
+        assert_eq!(snapshot.state_identity, binding.state.identity());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_simulation_rejects_truncated_stderr_and_applies_default_timeout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
+        let report = external_review_simulation(ReviewPrOptions {
+            repo: temp.path().to_path_buf(),
+            target: "#88".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some(
+                    "cat >/dev/null; i=0; while [ \"$i\" -lt 1100 ]; do printf '%4096s' ' ' >&2; i=$((i + 1)); done"
+                        .to_string(),
+                ),
+                timeout_seconds: None,
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })
+        .expect_err("truncated stderr must be rejected");
+        assert!(report.to_string().contains("stdout or stderr"));
+
+        let command = external_echo_command("#89", 1, "[]", "pr_target_only", "");
+        let accepted = external_review_simulation(ReviewPrOptions {
+            repo: temp.path().to_path_buf(),
+            target: "#89".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some(command),
+                timeout_seconds: None,
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })?;
+        assert_eq!(
+            accepted
+                .diagnostics
+                .and_then(|diagnostics| diagnostics.timeout_seconds),
+            Some(REVIEW_DEFAULT_TIMEOUT_SECONDS)
+        );
+
+        let unsafe_diagnostics = external_review_simulation(ReviewPrOptions {
+            repo: temp.path().to_path_buf(),
+            target: "#90".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some(external_echo_command(
+                    "#90",
+                    1,
+                    "[]",
+                    "pr_target_only",
+                    "printf 'API_TOKEN=top-secret' >&2;",
+                )),
+                timeout_seconds: Some(30),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })?;
+        assert_eq!(unsafe_diagnostics.status, ReviewReportStatus::Failed);
+        assert!(!unsafe_diagnostics.success);
+        let diagnostics = unsafe_diagnostics
+            .diagnostics
+            .context("failed review diagnostics")?;
+        assert_eq!(
+            diagnostics.stderr.text,
+            "<redacted:unsafe-external-review-diagnostics>"
+        );
+        assert!(!diagnostics.stderr.text.contains("top-secret"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn external_echo_command(
+        target: &str,
+        attempt: usize,
+        changed_paths_json: &str,
+        diff_source: &str,
+        stderr_prefix: &str,
+    ) -> String {
+        format!(
+            r#"input=$(cat); request_binding=$(printf '%s' "$input" | sed -n 's/.*"request_binding":"\([^"]*\)".*/\1/p'); reviewer_id=$(printf '%s' "$input" | sed -n 's/.*"reviewer_id":"\([^"]*\)".*/\1/p'); model=$(printf '%s' "$input" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p'); {stderr_prefix} printf '{{"version":1,"status":"passed","success":true,"target":"{target}","reviewer":{{"mode":"external_command","reviewer_id":"%s","model":"%s"}},"attempt":{attempt},"request_binding":"%s","findings":[],"blocking_finding_count":0,"changed_paths":{changed_paths_json},"diff_source":"{diff_source}","ci_reaction_supported":false,"ci_reaction":"unsupported","next_action":"human review"}}\n' "$reviewer_id" "$model" "$request_binding""#
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires exclusive strict-systemd runtime validation"]
+    fn strict_external_reviewer_cannot_read_hidden_common_state() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        let state = repository.path().join("maco/state");
+        std::fs::create_dir_all(&state)?;
+        std::fs::set_permissions(
+            repository.path().join("maco"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(state.join("private.key"), "hidden")?;
+        let report = external_review(ReviewPrOptions {
+            repo: temp.path().to_path_buf(),
+            target: "#90".to_string(),
+            reviewer: ReviewerConfig {
+                mode: ReviewerMode::ExternalCommand,
+                command: Some(
+                    "set -e; cat .git/maco/state/private.key >/dev/null; exit 99".to_string(),
+                ),
+                timeout_seconds: Some(30),
+                ..ReviewerConfig::default()
+            },
+            attempt: 1,
+            changed_paths: Vec::new(),
+            diff_summary: None,
+        })?;
+        assert_eq!(report.status, ReviewReportStatus::Failed);
         Ok(())
     }
 }

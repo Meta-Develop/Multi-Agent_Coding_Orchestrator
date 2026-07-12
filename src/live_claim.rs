@@ -1,7 +1,12 @@
+use crate::safe_state::{
+    AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock, SafeRoot,
+};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::{
     cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -9,7 +14,24 @@ use std::{
 
 const CLAIMS_DIR: &str = ".agents/live/claims";
 const TEMPLATE_FILE: &str = "CLAIM_TEMPLATE.md";
+const BOARD_LOCK_FILE: &str = ".maco-live-claims.lock";
 const DEFAULT_STALE_AFTER_MINUTES: u64 = 720;
+const MAX_STALE_AFTER_MINUTES: u64 = 525_600;
+const MAX_CLAIM_ENTRIES: usize = 256;
+const MAX_CLAIM_BYTES: u64 = 64 * 1024;
+const MAX_CLAIM_LINES: usize = 1_024;
+const MAX_CLAIM_LINE_BYTES: usize = 4 * 1024;
+const MAX_CLAIM_FIELDS: usize = 64;
+const MAX_CLAIM_ISSUES: usize = 128;
+const MAX_CLAIM_ID_BYTES: usize = 128;
+const MAX_OWNER_BYTES: usize = 128;
+const MAX_TIMESTAMP_BYTES: usize = 64;
+const MAX_OWNED_FILES: usize = 128;
+const MAX_OWNED_PATH_BYTES: usize = 4 * 1024;
+const MAX_AUDIT_ACTOR_BYTES: usize = 128;
+const MAX_AUDIT_REASON_BYTES: usize = 2 * 1024;
+const MAX_AUDIT_ENTRY_BYTES: usize = 4 * 1024;
+const MAX_FUTURE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 const VALID_STATUSES: &[&str] = &["active", "blocked", "ready-for-review", "handoff", "done"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -92,8 +114,11 @@ pub struct LiveClock {
 impl LiveClock {
     pub fn parse(value: &str) -> Result<Self> {
         let raw = clean_scalar(value);
-        let epoch_seconds = parse_timestamp_seconds(&raw)
-            .with_context(|| format!("failed to parse timestamp '{raw}'"))?;
+        if raw.len() > MAX_TIMESTAMP_BYTES || raw.chars().any(char::is_control) {
+            bail!("live timestamp is malformed or exceeds its bounded length");
+        }
+        let epoch_seconds =
+            parse_timestamp_seconds(&raw).context("failed to parse live timestamp")?;
         Ok(Self { raw, epoch_seconds })
     }
 
@@ -134,36 +159,26 @@ pub fn validate(repo: impl AsRef<Path>, now: &LiveClock) -> Result<LiveClaimsVal
     let claims = load_parsed_claims(&claims_dir)?;
     let mut validations = Vec::with_capacity(claims.len());
     let mut issue_count = 0usize;
+    let mut id_counts = BTreeMap::<String, usize>::new();
+    for claim in &claims {
+        id_counts
+            .entry(claim.display_id())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
 
     for claim in claims {
-        let mut issues = Vec::new();
-        push_required_issue(&mut issues, "claim_id", claim.claim_id.as_deref());
-        push_required_issue(&mut issues, "owner", claim.owner.as_deref());
-        push_required_issue(&mut issues, "status", claim.status.as_deref());
-        if let Some(status) = &claim.status {
-            if !VALID_STATUSES.contains(&status.as_str()) {
-                issues.push(LiveClaimIssue {
-                    severity: "error".to_string(),
-                    field: "status".to_string(),
-                    message: format!(
-                        "status '{status}' is not one of {}",
-                        VALID_STATUSES.join(", ")
-                    ),
-                });
-            }
-        }
-        if claim.owned_files.is_empty() {
+        let mut issues = claim.issues.clone();
+        if id_counts
+            .get(&claim.display_id())
+            .copied()
+            .unwrap_or_default()
+            > 1
+        {
             issues.push(LiveClaimIssue {
                 severity: "error".to_string(),
-                field: "owned_files".to_string(),
-                message: "claim must list at least one owned file or surface".to_string(),
-            });
-        }
-        if claim.reference_timestamp().is_none() {
-            issues.push(LiveClaimIssue {
-                severity: "warning".to_string(),
-                field: "heartbeat".to_string(),
-                message: "claim has no heartbeat, updated, created, or date timestamp".to_string(),
+                field: "claim_id".to_string(),
+                message: "claim id is duplicated across claim files".to_string(),
             });
         }
         if claim.stale_after_minutes.is_none() {
@@ -208,26 +223,14 @@ pub fn heartbeat(
     actor: &str,
     now: &LiveClock,
 ) -> Result<LiveClaimMutationReport> {
-    if actor.trim().is_empty() {
-        bail!("heartbeat requires --by");
-    }
-
-    let claims_dir = claims_dir(repo.as_ref());
-    let claim = find_claim(&claims_dir, claim_id)?;
-    let previous_status = claim.status.clone();
-    let audit_entry = format!("`{}` - `{}` heartbeat", now.raw(), actor);
-    let content = fs::read_to_string(&claim.path)
-        .with_context(|| format!("failed to read claim {}", claim.path.display()))?;
-    let updated = update_claim_content(&content, &claim, now, None, &audit_entry)?;
-    fs::write(&claim.path, updated)
-        .with_context(|| format!("failed to write claim {}", claim.path.display()))?;
-    mutation_report(
+    validate_actor(actor, "heartbeat")?;
+    mutate_claim(
         repo.as_ref(),
         claim_id,
         actor,
-        previous_status,
         now,
-        audit_entry,
+        ClaimMutation::Heartbeat,
+        |_| Ok(()),
     )
 }
 
@@ -238,52 +241,154 @@ pub fn override_release(
     reason: &str,
     now: &LiveClock,
 ) -> Result<LiveClaimMutationReport> {
-    if actor.trim().is_empty() {
-        bail!("override-release requires --by");
-    }
-    if reason.trim().is_empty() {
-        bail!("override-release requires --reason");
-    }
-
-    let claims_dir = claims_dir(repo.as_ref());
-    let claim = find_claim(&claims_dir, claim_id)?;
-    let previous_status = claim.status.clone();
-    let previous = previous_status
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    let audit_entry = format!(
-        "`{}` - `{}` override-release; previous status `{}`; reason: {}",
-        now.raw(),
-        actor,
-        previous,
-        reason.trim()
-    );
-    let content = fs::read_to_string(&claim.path)
-        .with_context(|| format!("failed to read claim {}", claim.path.display()))?;
-    let updated = update_claim_content(&content, &claim, now, Some("handoff"), &audit_entry)?;
-    fs::write(&claim.path, updated)
-        .with_context(|| format!("failed to write claim {}", claim.path.display()))?;
-    mutation_report(
+    validate_actor(actor, "override-release")?;
+    validate_audit_reason(reason)?;
+    mutate_claim(
         repo.as_ref(),
         claim_id,
         actor,
-        previous_status,
         now,
-        audit_entry,
+        ClaimMutation::OverrideRelease {
+            reason: reason.trim(),
+        },
+        |_| Ok(()),
     )
 }
 
-fn mutation_report(
+enum ClaimMutation<'a> {
+    Heartbeat,
+    OverrideRelease { reason: &'a str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimFileGeneration {
+    identity: FileIdentity,
+    bytes: Vec<u8>,
+}
+
+fn mutate_claim<F>(
     repo: &Path,
     claim_id: &str,
     actor: &str,
-    previous_status: Option<String>,
     now: &LiveClock,
-    audit_entry: String,
-) -> Result<LiveClaimMutationReport> {
-    let claims_dir = claims_dir(repo);
-    let claim = find_claim(&claims_dir, claim_id)?;
-    let summary = summary_from_parsed(&claim, now);
+    mutation: ClaimMutation<'_>,
+    mut before_first_fence: F,
+) -> Result<LiveClaimMutationReport>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    validate_claim_id(claim_id, "requested claim id")?;
+    let claims_path = claims_dir(repo);
+    let root = open_claims_root(&claims_path)?.context("claim board does not exist")?;
+    let lock = KernelStateLock::acquire_direct(&root, BOARD_LOCK_FILE)
+        .map_err(|_| anyhow::anyhow!("claim board mutation lock is unsafe or unavailable"))?;
+    lock.verify_direct_binding(&root)
+        .map_err(|_| anyhow::anyhow!("claim board mutation lock binding changed"))?;
+    let claims = load_parsed_claims_from_root(&root)?;
+    ensure_claim_board_valid(&claims)?;
+    let claim = claims
+        .into_iter()
+        .find(|claim| claim.display_id() == claim_id)
+        .context("requested claim was not found")?;
+    let previous_status = claim.status.clone();
+    let owner = claim.owner.as_deref().context("claim owner is missing")?;
+    let status = claim.status.as_deref().context("claim status is missing")?;
+    let (next_status, audit_entry) = match mutation {
+        ClaimMutation::Heartbeat => {
+            if actor != owner {
+                bail!("heartbeat actor must exactly match the claim owner");
+            }
+            if !matches!(status, "active" | "blocked") {
+                bail!("heartbeat is allowed only for active or blocked claims");
+            }
+            (None, format!("`{}` - `{}` heartbeat", now.raw(), actor))
+        }
+        ClaimMutation::OverrideRelease { reason } => {
+            if !matches!(status, "active" | "blocked") {
+                bail!("override-release is allowed only for active or blocked claims");
+            }
+            let liveness = summary_from_parsed(&claim, now).liveness;
+            if liveness.state != "stale" {
+                bail!("override-release requires a claim that is provably stale");
+            }
+            (
+                Some("handoff"),
+                format!(
+                    "`{}` - `{}` override-release; previous status `{}`; reason: {}",
+                    now.raw(),
+                    actor,
+                    status,
+                    reason
+                ),
+            )
+        }
+    };
+    if audit_entry.len() > MAX_AUDIT_ENTRY_BYTES {
+        bail!("claim audit entry exceeds its bounded length");
+    }
+
+    let file_name = claim
+        .file
+        .file_name()
+        .context("claim file name is missing")?
+        .to_os_string();
+    let initial = read_claim_generation(&root, &file_name)?;
+    let content = std::str::from_utf8(&initial.bytes).context("claim file is not valid UTF-8")?;
+    let current = parse_claim_file(claim.file.clone(), content);
+    ensure_claim_valid(&current)?;
+    if current.display_id() != claim.display_id()
+        || current.owner != claim.owner
+        || current.status != claim.status
+    {
+        bail!("claim identity changed before mutation");
+    }
+    let updated = update_claim_content(content, &current, now, next_status, &audit_entry)?;
+    if updated.len() > usize::try_from(MAX_CLAIM_BYTES).unwrap_or(usize::MAX) {
+        bail!("updated claim exceeds its bounded file size");
+    }
+    let updated_claim = parse_claim_file(claim.file.clone(), &updated);
+    ensure_claim_valid(&updated_claim)?;
+    if updated_claim.display_id() != claim_id || updated_claim.owner.as_deref() != Some(owner) {
+        bail!("updated claim identity or owner changed unexpectedly");
+    }
+
+    let claim_path = root.direct_child(&file_name)?;
+    let mut fence_phase = 0u8;
+    AtomicStateWriter::write_direct_fenced(&root, &file_name, updated.as_bytes(), || {
+        lock.verify_direct_binding(&root)
+            .map_err(|_| anyhow::anyhow!("claim board mutation lock binding changed"))?;
+        root.verify()
+            .map_err(|_| anyhow::anyhow!("claim board root binding changed"))?;
+        match fence_phase {
+            0 => {
+                before_first_fence(&claim_path)?;
+                let observed = read_claim_generation(&root, &file_name)?;
+                if observed != initial {
+                    bail!("claim file generation changed before atomic replacement");
+                }
+            }
+            1 => {
+                let observed = read_claim_generation(&root, &file_name)?;
+                if observed.bytes != updated.as_bytes() {
+                    bail!("claim file generation changed after atomic replacement");
+                }
+            }
+            _ => bail!("claim mutation fence was invoked unexpectedly"),
+        }
+        fence_phase = fence_phase.saturating_add(1);
+        Ok(())
+    })
+    .map_err(|_| anyhow::anyhow!("claim atomic mutation was refused"))?;
+    if fence_phase != 2 {
+        bail!("claim atomic mutation did not complete both generation fences");
+    }
+
+    let final_generation = read_claim_generation(&root, &file_name)?;
+    let final_content = std::str::from_utf8(&final_generation.bytes)
+        .context("updated claim file is not valid UTF-8")?;
+    let final_claim = parse_claim_file(claim.file.clone(), final_content);
+    ensure_claim_valid(&final_claim)?;
+    let summary = summary_from_parsed(&final_claim, now);
     Ok(LiveClaimMutationReport {
         claim_id: summary.claim_id.clone(),
         file: summary.file.clone(),
@@ -301,58 +406,146 @@ fn claims_dir(repo: &Path) -> PathBuf {
 }
 
 fn load_claims(claims_dir: &Path, now: &LiveClock) -> Result<Vec<LiveClaimSummary>> {
-    Ok(load_parsed_claims(claims_dir)?
+    let claims = load_parsed_claims(claims_dir)?;
+    ensure_claim_board_valid(&claims)?;
+    Ok(claims
         .iter()
         .map(|claim| summary_from_parsed(claim, now))
         .collect())
 }
 
 fn load_parsed_claims(claims_dir: &Path) -> Result<Vec<ParsedClaim>> {
-    let mut claims = Vec::new();
-    let entries = match fs::read_dir(claims_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(claims),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read claims dir {}", claims_dir.display()));
-        }
+    let Some(root) = open_claims_root(claims_dir)? else {
+        return Ok(Vec::new());
     };
+    load_parsed_claims_from_root(&root)
+}
 
-    for entry in entries {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to read an entry from claims dir {}",
-                claims_dir.display()
-            )
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+fn open_claims_root(claims_dir: &Path) -> Result<Option<SafeRoot>> {
+    match SafeRoot::open_existing(claims_dir) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error_chain_has_kind(&error, std::io::ErrorKind::NotFound) => Ok(None),
+        Err(_) => bail!("claim board directory is unsafe or inaccessible"),
+    }
+}
+
+fn load_parsed_claims_from_root(root: &SafeRoot) -> Result<Vec<ParsedClaim>> {
+    let mut claims = Vec::new();
+    for file_name in bounded_claim_entry_names(root)? {
+        if file_name == OsStr::new(TEMPLATE_FILE) {
+            let bytes = BoundedRegularReader::read_direct(root, &file_name, MAX_CLAIM_BYTES)
+                .map_err(|_| anyhow::anyhow!("claim template is not a bounded regular file"))?;
+            std::str::from_utf8(&bytes)
+                .map_err(|_| anyhow::anyhow!("claim template is not valid UTF-8"))?;
             continue;
         }
-        if path.file_name().and_then(|name| name.to_str()) == Some(TEMPLATE_FILE) {
+        if file_name == OsStr::new(BOARD_LOCK_FILE) {
+            let bytes = BoundedRegularReader::read_direct(root, &file_name, 0)
+                .map_err(|_| anyhow::anyhow!("claim board lock file is unsafe"))?;
+            if !bytes.is_empty() {
+                bail!("claim board lock file must remain empty");
+            }
             continue;
         }
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read claim {}", path.display()))?;
-        claims.push(parse_claim_file(path, &content));
+        let bytes = BoundedRegularReader::read_direct(root, &file_name, MAX_CLAIM_BYTES)
+            .map_err(|_| anyhow::anyhow!("claim board entry is not a bounded regular file"))?;
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|_| anyhow::anyhow!("claim board entry is not valid UTF-8"))?;
+        claims.push(parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join(file_name),
+            content,
+        ));
     }
     claims.sort_by_key(|claim| claim.display_id());
     Ok(claims)
 }
 
-fn find_claim(claims_dir: &Path, claim_id: &str) -> Result<ParsedClaim> {
-    let requested = clean_scalar(claim_id);
-    for claim in load_parsed_claims(claims_dir)? {
-        if claim.display_id() == requested {
-            return Ok(claim);
+fn bounded_claim_entry_names(root: &SafeRoot) -> Result<Vec<OsString>> {
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board directory binding changed"))?;
+    let entries =
+        fs::read_dir(root.path()).map_err(|_| anyhow::anyhow!("claim board cannot be listed"))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| anyhow::anyhow!("claim board entry cannot be listed"))?;
+        names.push(entry.file_name());
+        if names.len() > MAX_CLAIM_ENTRIES {
+            bail!("claim board exceeds its {} entry limit", MAX_CLAIM_ENTRIES);
         }
     }
-    bail!("claim '{requested}' not found in {}", claims_dir.display())
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board directory binding changed"))?;
+    for name in &names {
+        if name == OsStr::new(TEMPLATE_FILE) || name == OsStr::new(BOARD_LOCK_FILE) {
+            continue;
+        }
+        let text = name
+            .to_str()
+            .context("claim board contains a non-UTF-8 entry name")?;
+        validate_claim_file_name(text)?;
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn validate_claim_file_name(file_name: &str) -> Result<()> {
+    let stem = file_name
+        .strip_suffix(".md")
+        .context("claim board contains an unsupported non-claim entry")?;
+    validate_claim_id(stem, "claim file name")
+}
+
+fn read_claim_generation(root: &SafeRoot, file_name: &OsStr) -> Result<ClaimFileGeneration> {
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board directory binding changed"))?;
+    let path = root.direct_child(file_name)?;
+    let before = BoundedRegularReader::identity(&path)
+        .map_err(|_| anyhow::anyhow!("claim file identity is unsafe"))?;
+    let bytes = BoundedRegularReader::read_direct(root, file_name, MAX_CLAIM_BYTES)
+        .map_err(|_| anyhow::anyhow!("claim file is not a bounded regular file"))?;
+    let after = BoundedRegularReader::identity(&path)
+        .map_err(|_| anyhow::anyhow!("claim file identity is unsafe"))?;
+    if before != after {
+        bail!("claim file identity changed during bounded read");
+    }
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board directory binding changed"))?;
+    Ok(ClaimFileGeneration {
+        identity: before,
+        bytes,
+    })
+}
+
+fn ensure_claim_board_valid(claims: &[ParsedClaim]) -> Result<()> {
+    if claims
+        .iter()
+        .any(|claim| claim.issues.iter().any(|issue| issue.severity == "error"))
+    {
+        bail!("claim board contains an invalid entry; run live validate for bounded diagnostics");
+    }
+    let mut ids = BTreeSet::new();
+    for claim in claims {
+        if !ids.insert(claim.display_id()) {
+            bail!("claim board contains duplicate claim ids");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_claim_valid(claim: &ParsedClaim) -> Result<()> {
+    ensure_claim_board_valid(std::slice::from_ref(claim))
+}
+
+fn error_chain_has_kind(error: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == kind)
+    })
 }
 
 #[derive(Debug, Clone)]
 struct ParsedClaim {
-    path: PathBuf,
     file: PathBuf,
     claim_id: Option<String>,
     owner: Option<String>,
@@ -363,6 +556,7 @@ struct ParsedClaim {
     date: Option<String>,
     stale_after_minutes: Option<u64>,
     owned_files: Vec<PathBuf>,
+    issues: Vec<LiveClaimIssue>,
 }
 
 impl ParsedClaim {
@@ -394,14 +588,9 @@ impl ParsedClaim {
     }
 }
 
-fn parse_claim_file(path: PathBuf, content: &str) -> ParsedClaim {
+fn parse_claim_file(file: PathBuf, content: &str) -> ParsedClaim {
     let mut claim = ParsedClaim {
-        file: PathBuf::from(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(""),
-        ),
-        path,
+        file,
         claim_id: None,
         owner: None,
         status: None,
@@ -411,48 +600,272 @@ fn parse_claim_file(path: PathBuf, content: &str) -> ParsedClaim {
         date: None,
         stale_after_minutes: None,
         owned_files: Vec::new(),
+        issues: Vec::new(),
     };
-    let mut in_owned_files = false;
+    if content.len() > usize::try_from(MAX_CLAIM_BYTES).unwrap_or(usize::MAX) {
+        push_parse_issue(&mut claim, "file", "claim file exceeds its bounded size");
+        return claim;
+    }
 
-    for line in content.lines() {
+    let mut header_values = Vec::new();
+    let mut fields = BTreeMap::<String, Vec<String>>::new();
+    let mut field_count = 0usize;
+    let mut owned_heading_count = 0usize;
+    let mut in_owned_files = false;
+    let mut owned_files = Vec::new();
+
+    for (line_index, line) in content.lines().enumerate() {
+        if line_index >= MAX_CLAIM_LINES {
+            push_parse_issue(&mut claim, "lines", "claim exceeds its bounded line count");
+            break;
+        }
+        if line.len() > MAX_CLAIM_LINE_BYTES {
+            push_parse_issue(
+                &mut claim,
+                "line",
+                "claim contains a line that exceeds its bounded length",
+            );
+            continue;
+        }
+        if line
+            .chars()
+            .any(|character| character.is_control() && character != '\t')
+        {
+            push_parse_issue(
+                &mut claim,
+                "line",
+                "claim contains an unsupported control character",
+            );
+            continue;
+        }
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("# Claim:") {
-            claim.claim_id = Some(clean_scalar(rest));
+        if let Some(rest) = line.strip_prefix("# Claim:") {
+            header_values.push(clean_scalar(rest));
             continue;
         }
 
         let is_outer_bullet = line.starts_with("- ");
-        let lower = trimmed.to_ascii_lowercase();
-        if is_outer_bullet && lower.contains("owned files") {
-            in_owned_files = true;
-            continue;
-        }
         if in_owned_files {
             if is_outer_bullet {
                 in_owned_files = false;
             } else if let Some(path) = owned_file_from_line(trimmed) {
-                claim.owned_files.push(path);
+                owned_files.push(path);
                 continue;
             }
         }
 
-        if let Some((key, value)) = field_from_line(trimmed) {
-            match key.as_str() {
-                "claim id" => claim.claim_id = Some(value),
-                "owner" => claim.owner = Some(value),
-                "status" => claim.status = Some(value),
-                "created" => claim.created = Some(value),
-                "updated" => claim.updated = Some(value),
-                "heartbeat" => claim.heartbeat = Some(value),
-                "date" => claim.date = Some(value),
-                "stale after minutes" => claim.stale_after_minutes = value.parse::<u64>().ok(),
-                _ => {}
+        if is_outer_bullet {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("- owned files")
+                && lower.contains("regions")
+                && lower.ends_with(':')
+            {
+                owned_heading_count = owned_heading_count.saturating_add(1);
+                in_owned_files = true;
+                continue;
+            }
+            if let Some((key, value)) = field_from_line(trimmed) {
+                if matches!(
+                    key.as_str(),
+                    "claim id"
+                        | "owner"
+                        | "status"
+                        | "created"
+                        | "updated"
+                        | "heartbeat"
+                        | "date"
+                        | "stale after minutes"
+                ) {
+                    field_count = field_count.saturating_add(1);
+                    fields.entry(key).or_default().push(value);
+                }
             }
         }
     }
+
+    if field_count > MAX_CLAIM_FIELDS {
+        push_parse_issue(
+            &mut claim,
+            "fields",
+            "claim exceeds its bounded recognized-field count",
+        );
+    }
+    if header_values.len() > 1 {
+        push_parse_issue(
+            &mut claim,
+            "claim_id",
+            "claim contains duplicate Claim headers",
+        );
+    }
+    let header_id = header_values.into_iter().next();
+    let field_id = take_single_field(&mut claim, &mut fields, "claim id");
+    if header_id.is_some() && field_id.is_some() && header_id != field_id {
+        push_parse_issue(
+            &mut claim,
+            "claim_id",
+            "Claim header and Claim ID field do not match",
+        );
+    }
+    claim.claim_id = field_id.or(header_id);
+    claim.owner = take_single_field(&mut claim, &mut fields, "owner");
+    claim.status = take_single_field(&mut claim, &mut fields, "status");
+    claim.created = take_single_field(&mut claim, &mut fields, "created");
+    claim.updated = take_single_field(&mut claim, &mut fields, "updated");
+    claim.heartbeat = take_single_field(&mut claim, &mut fields, "heartbeat");
+    claim.date = take_single_field(&mut claim, &mut fields, "date");
+    let stale = take_single_field(&mut claim, &mut fields, "stale after minutes");
+    if let Some(stale) = stale {
+        match stale.parse::<u64>() {
+            Ok(value) if (1..=MAX_STALE_AFTER_MINUTES).contains(&value) => {
+                claim.stale_after_minutes = Some(value)
+            }
+            _ => push_parse_issue(
+                &mut claim,
+                "stale_after_minutes",
+                "stale-after value is malformed or out of bounds",
+            ),
+        }
+    }
+
+    if owned_heading_count != 1 {
+        push_parse_issue(
+            &mut claim,
+            "owned_files",
+            "claim must contain exactly one owned-files section",
+        );
+    }
+    if owned_files.len() > MAX_OWNED_FILES {
+        push_parse_issue(
+            &mut claim,
+            "owned_files",
+            "claim exceeds its bounded owned-file count",
+        );
+        owned_files.truncate(MAX_OWNED_FILES);
+    }
+    let mut unique_owned = BTreeSet::new();
+    for path in owned_files {
+        if validate_owned_path(&path).is_err() {
+            push_parse_issue(
+                &mut claim,
+                "owned_files",
+                "claim contains an invalid or out-of-bounds owned path",
+            );
+            continue;
+        }
+        if !unique_owned.insert(path.clone()) {
+            push_parse_issue(
+                &mut claim,
+                "owned_files",
+                "claim contains a duplicate owned path",
+            );
+            continue;
+        }
+        claim.owned_files.push(path);
+    }
     claim.owned_files.sort();
-    claim.owned_files.dedup();
+
+    if let Some(claim_id) = claim.claim_id.as_deref() {
+        if validate_claim_id(claim_id, "claim id").is_err() {
+            push_parse_issue(
+                &mut claim,
+                "claim_id",
+                "claim id is not canonical or is out of bounds",
+            );
+        }
+    } else {
+        push_parse_issue(&mut claim, "claim_id", "missing required field 'claim_id'");
+    }
+    if let Some(owner) = claim.owner.as_deref() {
+        if validate_owner(owner).is_err() {
+            push_parse_issue(
+                &mut claim,
+                "owner",
+                "claim owner is not canonical or is out of bounds",
+            );
+        }
+    } else {
+        push_parse_issue(&mut claim, "owner", "missing required field 'owner'");
+    }
+    if let Some(status) = claim.status.as_deref() {
+        if !VALID_STATUSES.contains(&status) {
+            push_parse_issue(&mut claim, "status", "claim status is unsupported");
+        }
+    } else {
+        push_parse_issue(&mut claim, "status", "missing required field 'status'");
+    }
+    if claim.owned_files.is_empty() {
+        push_parse_issue(
+            &mut claim,
+            "owned_files",
+            "claim must list at least one owned file or surface",
+        );
+    }
+    for (field, timestamp) in [
+        ("created", claim.created.clone()),
+        ("updated", claim.updated.clone()),
+        ("heartbeat", claim.heartbeat.clone()),
+        ("date", claim.date.clone()),
+    ] {
+        if let Some(timestamp) = timestamp {
+            if timestamp.len() > MAX_TIMESTAMP_BYTES
+                || timestamp.chars().any(char::is_control)
+                || parse_timestamp_seconds(&timestamp).is_err()
+            {
+                push_parse_issue(
+                    &mut claim,
+                    field,
+                    "claim timestamp is malformed or out of bounds",
+                );
+            }
+        }
+    }
+    if claim.reference_timestamp().is_none() {
+        push_parse_issue(
+            &mut claim,
+            "heartbeat",
+            "claim has no heartbeat, updated, created, or date timestamp",
+        );
+    }
+    if let (Some(file_stem), Some(claim_id)) = (
+        claim.file.file_stem().and_then(|stem| stem.to_str()),
+        claim.claim_id.as_deref(),
+    ) {
+        if file_stem != claim_id {
+            push_parse_issue(
+                &mut claim,
+                "claim_id",
+                "claim id does not match its canonical file name",
+            );
+        }
+    }
     claim
+}
+
+fn take_single_field(
+    claim: &mut ParsedClaim,
+    fields: &mut BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Option<String> {
+    let values = fields.remove(key).unwrap_or_default();
+    if values.len() > 1 {
+        push_parse_issue(
+            claim,
+            &key.replace(' ', "_"),
+            "claim contains a duplicate recognized field",
+        );
+    }
+    values.into_iter().next()
+}
+
+fn push_parse_issue(claim: &mut ParsedClaim, field: &str, message: &str) {
+    if claim.issues.len() >= MAX_CLAIM_ISSUES {
+        return;
+    }
+    claim.issues.push(LiveClaimIssue {
+        severity: "error".to_string(),
+        field: field.to_string(),
+        message: message.to_string(),
+    });
 }
 
 fn field_from_line(line: &str) -> Option<(String, String)> {
@@ -475,6 +888,85 @@ fn owned_file_from_line(line: &str) -> Option<PathBuf> {
     }
 }
 
+fn validate_claim_id(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_CLAIM_ID_BYTES {
+        bail!("{label} is empty or exceeds its bounded length");
+    }
+    let bytes = value.as_bytes();
+    if !bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || bytes.iter().any(|byte| {
+            !(byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(*byte, b'-' | b'_' | b'.'))
+        })
+        || value.contains("..")
+    {
+        bail!("{label} is not canonical");
+    }
+    Ok(())
+}
+
+fn validate_owner(value: &str) -> Result<()> {
+    if value.len() > MAX_OWNER_BYTES {
+        bail!("claim owner exceeds its bounded length");
+    }
+    validate_claim_id(value, "claim owner")
+}
+
+fn validate_actor(actor: &str, operation: &str) -> Result<()> {
+    let actor = actor.trim();
+    if actor.is_empty() {
+        bail!("{operation} requires --by");
+    }
+    if actor.len() > MAX_AUDIT_ACTOR_BYTES || actor != clean_scalar(actor) {
+        bail!("{operation} actor is not canonical or exceeds its bounded length");
+    }
+    validate_owner(actor).map_err(|_| {
+        anyhow::anyhow!("{operation} actor is not canonical or exceeds its bounded length")
+    })
+}
+
+fn validate_audit_reason(reason: &str) -> Result<()> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("override-release requires --reason");
+    }
+    if reason.len() > MAX_AUDIT_REASON_BYTES
+        || reason.chars().any(char::is_control)
+        || reason.chars().any(|character| {
+            character == char::from(96)
+                || matches!(character, '#' | '[' | ']' | '<' | '>' | '*' | '|' | '\\')
+        })
+    {
+        bail!("override-release reason is unsafe for a bounded Markdown audit entry");
+    }
+    Ok(())
+}
+
+fn validate_owned_path(path: &Path) -> Result<()> {
+    let value = path
+        .to_str()
+        .context("claim owned path must be valid UTF-8")?;
+    if value.is_empty()
+        || value.len() > MAX_OWNED_PATH_BYTES
+        || path.is_absolute()
+        || value.chars().any(char::is_control)
+    {
+        bail!("claim owned path is invalid or out of bounds");
+    }
+    for component in path.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            bail!("claim owned path is not canonical relative form");
+        }
+    }
+    Ok(())
+}
+
 fn summary_from_parsed(claim: &ParsedClaim, now: &LiveClock) -> LiveClaimSummary {
     let mut warnings = Vec::new();
     let stale_after_minutes = claim
@@ -483,22 +975,39 @@ fn summary_from_parsed(claim: &ParsedClaim, now: &LiveClock) -> LiveClaimSummary
     let liveness = if let Some((field, timestamp)) = claim.reference_timestamp() {
         match parse_timestamp_seconds(timestamp) {
             Ok(reference_seconds) => {
-                let age_minutes = (now.epoch_seconds - reference_seconds) / 60;
-                let stale_after_i64 = i64::try_from(stale_after_minutes).unwrap_or(i64::MAX);
-                let state = match age_minutes.cmp(&stale_after_i64) {
-                    Ordering::Greater => "stale",
-                    Ordering::Equal | Ordering::Less => "fresh",
-                };
-                LiveClaimLiveness {
-                    state: state.to_string(),
-                    reference_field: Some(field.to_string()),
-                    reference_timestamp: Some(timestamp.to_string()),
-                    age_minutes: Some(age_minutes),
-                    stale_after_minutes: Some(stale_after_minutes),
+                if reference_seconds
+                    > now
+                        .epoch_seconds
+                        .saturating_add(MAX_FUTURE_CLOCK_SKEW_SECONDS)
+                {
+                    warnings.push(format!(
+                        "{field} timestamp is unreasonably far in the future"
+                    ));
+                    LiveClaimLiveness {
+                        state: "unknown".to_string(),
+                        reference_field: Some(field.to_string()),
+                        reference_timestamp: Some(timestamp.to_string()),
+                        age_minutes: None,
+                        stale_after_minutes: claim.stale_after_minutes,
+                    }
+                } else {
+                    let age_minutes = (now.epoch_seconds - reference_seconds) / 60;
+                    let stale_after_i64 = i64::try_from(stale_after_minutes).unwrap_or(i64::MAX);
+                    let state = match age_minutes.cmp(&stale_after_i64) {
+                        Ordering::Greater => "stale",
+                        Ordering::Equal | Ordering::Less => "fresh",
+                    };
+                    LiveClaimLiveness {
+                        state: state.to_string(),
+                        reference_field: Some(field.to_string()),
+                        reference_timestamp: Some(timestamp.to_string()),
+                        age_minutes: Some(age_minutes),
+                        stale_after_minutes: Some(stale_after_minutes),
+                    }
                 }
             }
-            Err(error) => {
-                warnings.push(format!("{field} timestamp is malformed: {error}"));
+            Err(_) => {
+                warnings.push(format!("{field} timestamp is malformed"));
                 LiveClaimLiveness {
                     state: "unknown".to_string(),
                     reference_field: Some(field.to_string()),
@@ -539,20 +1048,6 @@ fn summary_from_parsed(claim: &ParsedClaim, now: &LiveClock) -> LiveClaimSummary
         owned_files: claim.owned_files.clone(),
         liveness,
         warnings,
-    }
-}
-
-fn push_required_issue(issues: &mut Vec<LiveClaimIssue>, field: &str, value: Option<&str>) {
-    if value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        issues.push(LiveClaimIssue {
-            severity: "error".to_string(),
-            field: field.to_string(),
-            message: format!("missing required field '{field}'"),
-        });
     }
 }
 
@@ -748,17 +1243,12 @@ fn split_time_offset(value: &str) -> Result<(&str, i32)> {
     if let Some(time) = value.strip_suffix('Z') {
         return Ok((time, 0));
     }
-    let offset_index = value
-        .char_indices()
-        .skip(1)
-        .filter_map(|(index, character)| {
-            if matches!(character, '+' | '-') {
-                Some(index)
-            } else {
-                None
-            }
-        })
-        .last();
+    let mut offset_index = None;
+    for (index, character) in value.char_indices().skip(1) {
+        if matches!(character, '+' | '-') {
+            offset_index = Some(index);
+        }
+    }
     if let Some(index) = offset_index {
         let (time, offset) = value.split_at(index);
         let sign = if offset.starts_with('-') { -1 } else { 1 };
@@ -846,4 +1336,441 @@ fn format_epoch_seconds(epoch_seconds: i64) -> String {
     let minute = (seconds % 3_600) / 60;
     let second = seconds % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn claim_text(
+        claim_id: &str,
+        owner: &str,
+        status: &str,
+        timestamp: &str,
+        owned_surface: &str,
+    ) -> String {
+        format!(
+            "# Claim: {claim_id}\n\n- Claim ID: {claim_id}\n- Owner: {owner}\n- Status: {status}\n- Created: {timestamp}\n- Updated: {timestamp}\n- Heartbeat: {timestamp}\n- Stale after minutes: 60\n- Owned files, regions, devices, or services:\n  - {owned_surface}: bounded test surface\n\n## Audit log\n\n- {timestamp} - {owner} created\n"
+        )
+    }
+
+    fn write_claim(
+        repo: &Path,
+        claim_id: &str,
+        owner: &str,
+        status: &str,
+        timestamp: &str,
+    ) -> Result<PathBuf> {
+        let directory = repo.join(CLAIMS_DIR);
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{claim_id}.md"));
+        std::fs::write(
+            &path,
+            claim_text(
+                claim_id,
+                owner,
+                status,
+                timestamp,
+                "Host-global transient service and runtime coordination",
+            ),
+        )?;
+        Ok(path)
+    }
+
+    #[test]
+    fn parser_accepts_legacy_and_nonfilesystem_surfaces_but_rejects_strict_grammar_errors() {
+        let legacy = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join("legacy.md"),
+            "# Claim: legacy\n\n- Owner: worker-a\n- Date: 2026-05-19\n- Status: active\n- Owned files, regions, devices, or services:\n  - Host-global transient service coordination: test\n",
+        );
+        assert!(legacy.issues.is_empty(), "{:?}", legacy.issues);
+        assert_eq!(
+            legacy.owned_files,
+            vec![PathBuf::from("Host-global transient service coordination")]
+        );
+
+        let completed = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join("completed.md"),
+            &claim_text(
+                "completed",
+                "worker-a",
+                "completed",
+                "2026-05-19T00:00:00Z",
+                "src/live_claim.rs",
+            ),
+        );
+        assert!(completed.issues.iter().any(|issue| issue.field == "status"));
+
+        let duplicate_owner = claim_text(
+            "duplicate",
+            "worker-a",
+            "active",
+            "2026-05-19T00:00:00Z",
+            "src/live_claim.rs",
+        )
+        .replace("- Status:", "- Owner: worker-b\n- Status:");
+        let duplicate = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join("duplicate.md"),
+            &duplicate_owner,
+        );
+        assert!(duplicate
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("duplicate recognized field")));
+
+        let mismatch = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join("mismatch.md"),
+            &claim_text(
+                "different",
+                "worker-a",
+                "active",
+                "2026-05-19T00:00:00Z",
+                "src/live_claim.rs",
+            ),
+        );
+        assert!(mismatch
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("file name")));
+    }
+
+    #[test]
+    fn future_timestamps_are_unknown_and_cannot_be_override_released() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        write_claim(
+            temp.path(),
+            "future-claim",
+            "future-claim",
+            "active",
+            "2026-05-21T00:00:00Z",
+        )?;
+        let now = LiveClock::parse("2026-05-20T00:00:00Z")?;
+        let report = status(temp.path(), &now)?;
+        assert_eq!(report.claims[0].liveness.state, "unknown");
+        assert!(report.claims[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("future")));
+        let error = override_release(
+            temp.path(),
+            "future-claim",
+            "project-owner",
+            "owner unavailable and bounded files are blocked",
+            &now,
+        )
+        .expect_err("future claim must not be adopted as stale");
+        assert!(error.to_string().contains("provably stale"));
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_requires_exact_owner_and_override_requires_stale_safe_input() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = write_claim(
+            temp.path(),
+            "owner-claim",
+            "owner-claim",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let original = std::fs::read(&path)?;
+        let fresh = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        assert!(heartbeat(temp.path(), "owner-claim", "other-owner", &fresh).is_err());
+        assert_eq!(std::fs::read(&path)?, original);
+        assert!(override_release(
+            temp.path(),
+            "owner-claim",
+            "project-owner",
+            "fresh claim must remain owned",
+            &fresh,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path)?, original);
+
+        let stale = LiveClock::parse("2026-05-20T02:00:00Z")?;
+        assert!(override_release(
+            temp.path(),
+            "owner-claim",
+            "project-owner",
+            "line one\nline two",
+            &stale,
+        )
+        .is_err());
+        assert!(override_release(
+            temp.path(),
+            "owner-claim",
+            "project-owner",
+            &format!("unsafe {} inline", char::from(96)),
+            &stale,
+        )
+        .is_err());
+        let report = heartbeat(temp.path(), "owner-claim", "owner-claim", &fresh)?;
+        assert_eq!(report.actor, "owner-claim");
+        assert_eq!(
+            report.file,
+            PathBuf::from(CLAIMS_DIR).join("owner-claim.md")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_mutation_fence_rejects_same_inode_content_and_rebound_inode_races() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = write_claim(
+            temp.path(),
+            "content-race",
+            "content-race",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        let changed = claim_text(
+            "content-race",
+            "content-race",
+            "active",
+            "2026-05-20T00:01:00Z",
+            "src/live_claim.rs",
+        );
+        let error = mutate_claim(
+            temp.path(),
+            "content-race",
+            "content-race",
+            &now,
+            ClaimMutation::Heartbeat,
+            |claim_path| {
+                std::fs::write(claim_path, &changed)?;
+                Ok(())
+            },
+        )
+        .expect_err("same-inode content race must fail");
+        assert!(error.to_string().contains("atomic mutation was refused"));
+        assert_eq!(std::fs::read_to_string(&path)?, changed);
+
+        let second = tempfile::tempdir()?;
+        let path = write_claim(
+            second.path(),
+            "inode-race",
+            "inode-race",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let replacement = claim_text(
+            "inode-race",
+            "inode-race",
+            "active",
+            "2026-05-20T00:02:00Z",
+            "src/live_claim.rs",
+        );
+        let error = mutate_claim(
+            second.path(),
+            "inode-race",
+            "inode-race",
+            &now,
+            ClaimMutation::Heartbeat,
+            |claim_path| {
+                std::fs::remove_file(claim_path)?;
+                std::fs::write(claim_path, &replacement)?;
+                Ok(())
+            },
+        )
+        .expect_err("inode rebound race must fail");
+        assert!(error.to_string().contains("atomic mutation was refused"));
+        assert_eq!(std::fs::read_to_string(&path)?, replacement);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_heartbeats_preserve_both_audit_entries_under_board_lock() -> Result<()> {
+        let temp = Arc::new(tempfile::tempdir()?);
+        let path = write_claim(
+            temp.path(),
+            "locked-claim",
+            "locked-claim",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let mut threads = Vec::new();
+        for timestamp in ["2026-05-20T00:10:00Z", "2026-05-20T00:11:00Z"] {
+            let temp = Arc::clone(&temp);
+            threads.push(std::thread::spawn(move || -> Result<()> {
+                heartbeat(
+                    temp.path(),
+                    "locked-claim",
+                    "locked-claim",
+                    &LiveClock::parse(timestamp)?,
+                )?;
+                Ok(())
+            }));
+        }
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("heartbeat thread panicked"))??;
+        }
+        let content = std::fs::read_to_string(path)?;
+        assert_eq!(content.matches(" heartbeat").count(), 2);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn board_loader_rejects_links_special_files_unsafe_extras_and_bounds_without_path_leaks(
+    ) -> Result<()> {
+        use std::os::unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::symlink,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join(CLAIMS_DIR);
+        std::fs::create_dir_all(&directory)?;
+        let external = temp.path().join("external-secret");
+        std::fs::write(
+            &external,
+            claim_text(
+                "linked",
+                "linked",
+                "active",
+                "2026-05-20T00:00:00Z",
+                "src/live_claim.rs",
+            ),
+        )?;
+        symlink(&external, directory.join("linked.md"))?;
+        let error = status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?)
+            .expect_err("claim symlink must fail closed");
+        assert!(!error.to_string().contains(&external.display().to_string()));
+        std::fs::remove_file(directory.join("linked.md"))?;
+
+        std::fs::hard_link(&external, directory.join("hardlinked.md"))?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_file(directory.join("hardlinked.md"))?;
+
+        let fifo_path = directory.join("fifo.md");
+        let fifo = std::ffi::CString::new(fifo_path.as_os_str().as_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_file(&fifo_path)?;
+
+        std::fs::create_dir(directory.join("directory.md"))?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_dir(directory.join("directory.md"))?;
+
+        std::fs::write(
+            directory.join("oversized.md"),
+            vec![b'x'; MAX_CLAIM_BYTES as usize + 1],
+        )?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_file(directory.join("oversized.md"))?;
+
+        std::fs::write(directory.join("nonutf.md"), [0xff, 0xfe])?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_file(directory.join("nonutf.md"))?;
+
+        let non_utf_name = OsString::from_vec(b"nonutf-\xff.md".to_vec());
+        std::fs::write(directory.join(&non_utf_name), b"bounded")?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_file(directory.join(&non_utf_name))?;
+
+        std::fs::write(directory.join("unexpected.bin"), b"unexpected")?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_file(directory.join("unexpected.bin"))?;
+
+        symlink(&external, directory.join(TEMPLATE_FILE))?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+        std::fs::remove_file(directory.join(TEMPLATE_FILE))?;
+
+        symlink(&external, directory.join(BOARD_LOCK_FILE))?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?).is_err());
+
+        let linked_root = tempfile::tempdir()?;
+        std::fs::create_dir_all(linked_root.path().join(".agents/live"))?;
+        symlink(&directory, linked_root.path().join(CLAIMS_DIR))?;
+        assert!(status(
+            linked_root.path(),
+            &LiveClock::parse("2026-05-20T00:30:00Z")?
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn board_entry_count_is_bounded_before_claim_contents_are_parsed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join(CLAIMS_DIR);
+        std::fs::create_dir_all(&directory)?;
+        for index in 0..=MAX_CLAIM_ENTRIES {
+            std::fs::write(directory.join(format!("claim-{index}.md")), b"")?;
+        }
+        let error = status(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?)
+            .expect_err("entry count must be bounded");
+        assert!(error.to_string().contains("entry limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn real_board_style_surfaces_load_until_legacy_completed_status_fails_closed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join(CLAIMS_DIR);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("global-validation.md"),
+            claim_text(
+                "global-validation",
+                "global-validation",
+                "active",
+                "2026-05-20T00:00:00Z",
+                "Host-global transient service units, cgroups, and runtime directories",
+            ),
+        )?;
+        let now = LiveClock::parse("2026-05-20T00:30:00Z")?;
+        assert_eq!(status(temp.path(), &now)?.claim_count, 1);
+        std::fs::write(
+            directory.join("legacy-completed.md"),
+            claim_text(
+                "legacy-completed",
+                "legacy-completed",
+                "completed",
+                "2026-05-20T00:00:00Z",
+                "src/live_claim.rs",
+            ),
+        )?;
+        assert!(status(temp.path(), &now).is_err());
+        assert!(!validate(temp.path(), &now)?.valid);
+        Ok(())
+    }
+
+    #[test]
+    fn validation_includes_parser_errors_and_duplicate_claim_ids_without_raw_values() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join(CLAIMS_DIR);
+        std::fs::create_dir_all(&directory)?;
+        let first = claim_text(
+            "first",
+            "first",
+            "waiting-secret-value",
+            "malformed-secret-timestamp",
+            "src/live_claim.rs",
+        )
+        .replace("- Owner: first", "- Owner: first\n- Owner: duplicate-owner");
+        std::fs::write(directory.join("first.md"), first)?;
+        let second = claim_text(
+            "first",
+            "second",
+            "active",
+            "2026-05-20T00:00:00Z",
+            "src/live_claim.rs",
+        );
+        std::fs::write(directory.join("second.md"), second)?;
+
+        let report = validate(temp.path(), &LiveClock::parse("2026-05-20T00:30:00Z")?)?;
+        assert!(!report.valid);
+        let serialized = serde_json::to_string(&report)?;
+        assert!(serialized.contains("duplicate recognized field"));
+        assert!(serialized.contains("duplicated across claim files"));
+        assert!(!serialized.contains("waiting-secret-value"));
+        assert!(!serialized.contains("malformed-secret-timestamp"));
+        Ok(())
+    }
 }

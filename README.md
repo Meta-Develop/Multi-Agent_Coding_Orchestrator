@@ -753,10 +753,24 @@ cargo run -- live override-release claim-id --repo . --by project-owner --reason
 and liveness. `active` and `blocked` claims are treated as locks. A claim is
 stale when its heartbeat, updated timestamp, or date fallback is older than its
 configured stale-after window. `maco live validate` reports missing or malformed
-claim fields. `heartbeat` refreshes the heartbeat and updated timestamp and
-adds an audit entry. `override-release` requires both `--by` and `--reason`,
-moves the claim to `handoff`, and records the previous status and reason.
-`--now` is available on live subcommands for deterministic test runs.
+claim fields. The existing claim directory is bound without changing its
+permissions. It accepts at most 256 entries: canonical `.md` claim files plus
+the optional `CLAIM_TEMPLATE.md` and empty `.maco-live-claims.lock` control
+files. Every entry is read without following links, with a 64 KiB per-file
+limit, strict UTF-8 and bounded filename, line, field, timestamp, owner, path,
+and item-count grammar. Links, hard links, special files, nested directories,
+unsupported extras, and any invalid claim make the board fail closed.
+
+`heartbeat` is limited to `active` or `blocked` claims and requires `--by` to
+exactly match the recorded owner. `override-release` is also limited to those
+states and requires a claim that is provably stale; a fresh, future-dated, or
+otherwise unknown liveness result is refused. Its required `--by` value is an
+audited actor label, not an authentication credential, and `--reason` is
+bounded and rejects control-character injection. Mutations run under a stable
+board lock, compare the exact file identity and content generation, then use a
+fenced, durable atomic replacement so concurrent or rebound-file changes are
+refused instead of overwriting them. `--now` is available on live subcommands
+for deterministic test runs.
 
 Preview the local LLM boundary without credentials or network access:
 
@@ -975,7 +989,32 @@ into `git push` and `gh pr create`; fake remains the default. Passing
 `--reviewer-command` opts into an external reviewer command. The independent
 review report uses a separate reviewer identity from the child worker, includes
 structured findings with `blocking`, and currently reports
-`ci_reaction_supported=false`.
+`ci_reaction_supported=false`. Reviewer configuration serializes as version 1;
+an omitted config version remains accepted for compatibility, while unknown
+fields are rejected recursively. Fake mode rejects external-command fields,
+and external-command mode requires a bounded command, rejects fake-only fields,
+and uses a 300-second timeout unless an explicit 1-to-86400-second value is
+provided.
+
+An external reviewer receives strict version-1 JSON on standard input and must
+return one strict UTF-8 JSON object on standard output. The JSON result is
+limited to 256 KiB, process capture is limited to 4 MiB per stream, truncated
+output is refused, and nested unknown fields or mismatched target, attempt,
+repository-relative paths, reviewer identity, or request binding are rejected.
+The parent derives the reviewer identity from the full command and binds each
+request to the exact pre-run repository snapshot, canonical request, and
+command digest; the reviewer must echo that binding. The snapshot covers
+tracked, untracked, and ignored content, modes, link targets, file generations,
+Git HEAD/ref/index/packed-ref state, and linked-worktree identities. Hard links,
+special files, external links, and gitlinks fail closed, and any concurrent
+repository or administrative-state mutation invalidates the result. Sensitive
+output is redacted and converted into a blocking failed review.
+
+The verified external-review runtime enforces the integrity boundary with a
+read-only workspace and no network access. This is not yet a confidentiality
+boundary: the reviewer still sees the source worktree, including ignored
+files, and host-readable sibling roots may remain visible. A sanitized reviewer
+view and global read isolation remain integration follow-up work.
 
 Autopilot refuses to launch when the primary worktree is dirty unless
 `--allow-dirty-primary` is supplied, when active sync claims overlap its target
