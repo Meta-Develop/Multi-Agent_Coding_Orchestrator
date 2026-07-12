@@ -9,6 +9,7 @@ use crate::{
         EnvironmentMode, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
+    secure_output::{ReservedOutputFile, SecureOutputRoot},
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
@@ -40,6 +41,7 @@ const GITLINK_MODE: u32 = 0o160000;
 const PRIMARY_INDEX_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
@@ -1037,7 +1039,7 @@ fn child_attempt_artifacts(
     };
     ChildAttemptArtifacts {
         prompt_path: dirs.assignments.join(format!("{stem}.prompt.md")),
-        report_path: dirs.reports.join(format!("{stem}.json")),
+        report_path: dirs.incoming.join(format!("{stem}.json")),
         log_path: dirs.logs.join(format!("{stem}.jsonl")),
     }
 }
@@ -1119,6 +1121,9 @@ fn run_supervisor_plan_with_runner(
     let run_dir = run_dir(&repo, &options.run_id);
     artifacts::ensure_run_dir_available(&repo, RunArtifactFamily::Supervise, &options.run_id)?;
     let dirs = RunDirs::create(&run_dir)?;
+    let mut supervisor_final_slot = dirs
+        .reports_root
+        .reserve(OsStr::new("supervisor-final.json"))?;
     let manager = WorktreeManager::new(&repo);
     let sync_store = SyncStore::open(&repo)?;
     let semantic_store = SemanticIntentStore::open(&repo)?;
@@ -1185,6 +1190,7 @@ fn run_supervisor_plan_with_runner(
                     worktree.path.display()
                 )
             })?;
+            dirs.reports_root.reject_inside(&worktree.path)?;
 
             let claim = match sync_store
                 .claim_paths(&assignment.id, assignment.assigned_paths.iter())
@@ -1207,7 +1213,10 @@ fn run_supervisor_plan_with_runner(
                 &mut findings,
             )?;
 
-            let final_report_path = dirs.reports.join(format!("{}.json", assignment.id));
+            let final_report_name = format!("{}.json", assignment.id);
+            let mut final_report_slot =
+                dirs.reports_root.reserve(OsStr::new(&final_report_name))?;
+            let final_report_path = final_report_slot.path().to_path_buf();
             let final_prompt_path = dirs
                 .assignments
                 .join(format!("{}.prompt.md", assignment.id));
@@ -1366,13 +1375,13 @@ fn run_supervisor_plan_with_runner(
             if plan.max_child_retries > 0 {
                 append_child_attempt_history(&mut child_report, &attempt_history);
             }
-            write_child_report(&final_report_path, &child_report)?;
+            write_child_report(&mut final_report_slot, &child_report)?;
 
             let mut assignment_containment_verified = child_containment_verified;
             if child_containment_verified && parent_auditor_required(assignment, &child_report) {
                 let auditor_id = parent_auditor_id(assignment);
                 let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
-                let auditor_report_path = dirs.reports.join(format!("{auditor_id}.json"));
+                let auditor_report_path = dirs.incoming.join(format!("{auditor_id}.json"));
                 let auditor_log_path = dirs.logs.join(format!("{auditor_id}.jsonl"));
                 let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
                 let auditor_prompt =
@@ -1458,7 +1467,7 @@ fn run_supervisor_plan_with_runner(
             if child_containment_verified {
                 validate_auditor_reports(assignment, &final_report_path, &mut child_report);
             }
-            write_child_report(&final_report_path, &child_report)?;
+            write_child_report(&mut final_report_slot, &child_report)?;
             if child_report.status != ReviewStatus::Succeeded {
                 findings.push(Finding {
                     severity: FindingSeverity::Error,
@@ -1645,7 +1654,7 @@ fn run_supervisor_plan_with_runner(
                 .to_string()
         },
     };
-    write_final_report(&run_dir, &final_report)?;
+    write_final_report(&mut supervisor_final_slot, &final_report)?;
     Ok(final_report)
 }
 
@@ -1863,7 +1872,7 @@ fn collect_child_report(
     child_base_head: &Oid,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     let mut report_shape_problems = Vec::new();
-    let mut report = match read_child_report(report_path) {
+    let mut report = match read_child_report(external_run.output_last_message(), report_path) {
         Ok(parsed) => {
             let mut report = parsed.report;
             if parsed.recovered {
@@ -1938,7 +1947,7 @@ fn collect_parent_auditor_report(
     external_command: &ExternalAgentCommand,
 ) -> AuditorReport {
     let expected_id = parent_auditor_id(assignment);
-    let mut report = match read_auditor_report(report_path) {
+    let mut report = match read_auditor_report(external_run.output_last_message(), report_path) {
         Ok(parsed) => {
             let mut report = parsed.report;
             if parsed.recovered {
@@ -3627,27 +3636,44 @@ struct ParsedReport<T> {
     recovered: bool,
 }
 
-fn read_child_report(path: &Path) -> Result<ParsedReport<OrchestratorReviewReport>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read child report {}", path.display()))?;
-    parse_report_json(&contents)
-        .with_context(|| format!("failed to parse child report {}", path.display()))
+fn read_child_report(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<ParsedReport<OrchestratorReviewReport>> {
+    let contents =
+        contents.context("external run did not capture a descriptor-held child report")?;
+    let contents = std::str::from_utf8(contents).with_context(|| {
+        format!(
+            "descriptor-held child report is not UTF-8: {}",
+            display_path.display()
+        )
+    })?;
+    parse_report_json(contents)
+        .with_context(|| format!("failed to parse child report {}", display_path.display()))
 }
 
-fn write_child_report(path: &Path, report: &OrchestratorReviewReport) -> Result<()> {
-    let mut file = File::create(path)
-        .with_context(|| format!("failed to update child report {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, report)
-        .with_context(|| format!("failed to write updated child report {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish updated child report {}", path.display()))
+fn write_child_report(
+    slot: &mut ReservedOutputFile,
+    report: &OrchestratorReviewReport,
+) -> Result<()> {
+    slot.write_json_atomic(report, MAX_SUPERVISOR_REPORT_BYTES)
+        .with_context(|| format!("failed to update child report {}", slot.path().display()))
 }
 
-fn read_auditor_report(path: &Path) -> Result<ParsedReport<AuditorReport>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read auditor report {}", path.display()))?;
-    parse_report_json(&contents)
-        .with_context(|| format!("failed to parse auditor report {}", path.display()))
+fn read_auditor_report(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<ParsedReport<AuditorReport>> {
+    let contents =
+        contents.context("external run did not capture a descriptor-held auditor report")?;
+    let contents = std::str::from_utf8(contents).with_context(|| {
+        format!(
+            "descriptor-held auditor report is not UTF-8: {}",
+            display_path.display()
+        )
+    })?;
+    parse_report_json(contents)
+        .with_context(|| format!("failed to parse auditor report {}", display_path.display()))
 }
 
 fn parse_report_json<T>(contents: &str) -> Result<ParsedReport<T>>
@@ -3932,8 +3958,9 @@ fn deterministic_fake_child_run(
         remaining_risk: "simulation-only evidence".to_string(),
         next_safe_action: "rerun with the verified Codex runtime".to_string(),
     };
-    write_child_report(&command.output_last_message, &report)?;
-    Ok(deterministic_fake_run(command))
+    let mut output = serde_json::to_vec_pretty(&report)?;
+    output.push(b'\n');
+    Ok(deterministic_fake_run(command, output))
 }
 
 fn deterministic_fake_auditor_run(
@@ -3962,28 +3989,12 @@ fn deterministic_fake_auditor_run(
         remaining_risk: "simulation-only evidence".to_string(),
         next_safe_action: "rerun with the verified Codex runtime".to_string(),
     };
-    let mut file = File::create(&command.output_last_message).with_context(|| {
-        format!(
-            "failed to create deterministic fake auditor report {}",
-            command.output_last_message.display()
-        )
-    })?;
-    serde_json::to_writer_pretty(&mut file, &report).with_context(|| {
-        format!(
-            "failed to write deterministic fake auditor report {}",
-            command.output_last_message.display()
-        )
-    })?;
-    file.write_all(b"\n").with_context(|| {
-        format!(
-            "failed to finish deterministic fake auditor report {}",
-            command.output_last_message.display()
-        )
-    })?;
-    Ok(deterministic_fake_run(command))
+    let mut output = serde_json::to_vec_pretty(&report)?;
+    output.push(b'\n');
+    Ok(deterministic_fake_run(command, output))
 }
 
-fn deterministic_fake_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
+fn deterministic_fake_run(command: &ExternalAgentCommand, output: Vec<u8>) -> ExternalAgentRun {
     ExternalAgentRun {
         command: vec!["maco-internal-deterministic-fake".to_string()],
         cwd: command.cwd.clone(),
@@ -3999,7 +4010,7 @@ fn deterministic_fake_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
         stdout: crate::external_agent::CapturedOutput::default(),
         stderr: crate::external_agent::CapturedOutput::default(),
         error: None,
-        output_last_message: fs::read(&command.output_last_message).ok(),
+        output_last_message: Some(output),
     }
 }
 
@@ -4531,14 +4542,9 @@ fn write_schema(path: &Path, schema: serde_json::Value) -> Result<()> {
         .with_context(|| format!("failed to finish schema {}", path.display()))
 }
 
-fn write_final_report(run_dir: &Path, report: &SupervisorFinalReport) -> Result<()> {
-    let path = supervisor_final_report_path(run_dir);
-    let mut file = File::create(&path)
-        .with_context(|| format!("failed to create final report {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, report)
-        .with_context(|| format!("failed to write final report {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish final report {}", path.display()))
+fn write_final_report(slot: &mut ReservedOutputFile, report: &SupervisorFinalReport) -> Result<()> {
+    slot.write_json_atomic(report, MAX_SUPERVISOR_REPORT_BYTES)
+        .with_context(|| format!("failed to write final report {}", slot.path().display()))
 }
 
 fn read_supervisor_final_report(path: &Path) -> Result<SupervisorFinalReport> {
@@ -4570,24 +4576,28 @@ fn supervisor_final_report_path(run_dir: &Path) -> PathBuf {
 #[derive(Debug)]
 struct RunDirs {
     assignments: PathBuf,
-    reports: PathBuf,
+    incoming: PathBuf,
     logs: PathBuf,
     schemas: PathBuf,
+    reports_root: SecureOutputRoot,
 }
 
 impl RunDirs {
     fn create(run_dir: &Path) -> Result<Self> {
-        let dirs = Self {
-            assignments: run_dir.join("assignments"),
-            reports: run_dir.join("reports"),
-            logs: run_dir.join("logs"),
-            schemas: run_dir.join("schemas"),
-        };
-        for dir in [&dirs.assignments, &dirs.reports, &dirs.logs, &dirs.schemas] {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create run directory {}", dir.display()))?;
-        }
-        Ok(dirs)
+        let run_container = SecureOutputRoot::create_new(run_dir)?;
+        let assignments_root = run_container.create_child(OsStr::new("assignments"))?;
+        let reports_root = run_container.create_child(OsStr::new("reports"))?;
+        let incoming_root = run_container.create_child(OsStr::new("incoming"))?;
+        reports_root.reject_overlap(&incoming_root)?;
+        let logs_root = run_container.create_child(OsStr::new("logs"))?;
+        let schemas_root = run_container.create_child(OsStr::new("schemas"))?;
+        Ok(Self {
+            assignments: assignments_root.path().to_path_buf(),
+            incoming: incoming_root.path().to_path_buf(),
+            logs: logs_root.path().to_path_buf(),
+            schemas: schemas_root.path().to_path_buf(),
+            reports_root,
+        })
     }
 }
 
@@ -5073,8 +5083,8 @@ mod tests {
         for relative in [
             "assignments/child-a.attempt-1.prompt.md",
             "assignments/child-a.attempt-2.prompt.md",
-            "reports/child-a.attempt-1.json",
-            "reports/child-a.attempt-2.json",
+            "incoming/child-a.attempt-1.json",
+            "incoming/child-a.attempt-2.json",
             "reports/child-a.json",
             "reports/supervisor-final.json",
         ] {
@@ -5179,6 +5189,59 @@ mod tests {
                 .any(|finding| finding.message.contains("primary")));
             assert!(report.release_errors.is_empty());
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_report_slots_reject_child_time_symlink_rebinding_without_clobbering_sentinels() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(false);
+        let plan = injected_plan(assignment.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "parent-report-rebind");
+        let child_sentinel = temp.path().join("child-sentinel");
+        let final_sentinel = temp.path().join("final-sentinel");
+        fs::write(&child_sentinel, "child untouched").expect("write child sentinel");
+        fs::write(&final_sentinel, "final untouched").expect("write final sentinel");
+
+        let mut runner = |command: &ExternalAgentCommand| {
+            let run_root = command
+                .output_last_message
+                .parent()
+                .and_then(Path::parent)
+                .expect("incoming path under run root");
+            let normalized = run_root.join("reports/child-a.json");
+            let supervisor_final = run_root.join("reports/supervisor-final.json");
+            fs::remove_file(&normalized).expect("remove reserved normalized report");
+            symlink(&child_sentinel, &normalized).expect("rebind normalized report");
+            fs::remove_file(&supervisor_final).expect("remove reserved final report");
+            symlink(&final_sentinel, &supervisor_final).expect("rebind final report");
+            write_injected_json(
+                &command.output_last_message,
+                &injected_child_report(&assignment),
+            );
+            injected_verified_run(command)
+        };
+
+        let error = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect_err("rebound supervisor final slot must fail closed");
+
+        assert!(error.to_string().contains("failed to write final report"));
+        assert_eq!(
+            fs::read_to_string(&child_sentinel).expect("read child sentinel"),
+            "child untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(&final_sentinel).expect("read final sentinel"),
+            "final untouched"
+        );
     }
 
     #[test]

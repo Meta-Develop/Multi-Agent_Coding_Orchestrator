@@ -13,7 +13,6 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
-    fs,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -158,6 +157,10 @@ pub fn ask_consultant(options: ConsultAskOptions) -> Result<ConsultantReport> {
     let mut schema = schema_root.reserve(OsStr::new("consultant-report.schema.json"))?;
     let mut question = trusted_root.reserve(OsStr::new("question.md"))?;
     let mut final_report = trusted_root.reserve(OsStr::new("consultant-report.json"))?;
+    let mut fake_raw_log = match options.runtime {
+        ConsultantRuntime::Fake => Some(trusted_root.reserve(OsStr::new("raw.log"))?),
+        ConsultantRuntime::Codex | ConsultantRuntime::Claude => None,
+    };
     write_consultant_schema(&mut schema)?;
     let prompt = consultant_prompt(
         &options.run_id,
@@ -174,7 +177,9 @@ pub fn ask_consultant(options: ConsultAskOptions) -> Result<ConsultantReport> {
             &options.run_id,
             prepared_question.summary,
             &context_paths,
-            &artifacts.raw_log_path,
+            fake_raw_log
+                .as_mut()
+                .context("fake consult raw log slot was not reserved")?,
         )?,
         ConsultantRuntime::Codex => {
             let consultant_bin = required_consultant_bin(&options)?;
@@ -288,11 +293,11 @@ fn fake_consultant_report(
     run_id: &RunId,
     question_summary: String,
     context_paths: &[PathBuf],
-    raw_log_path: &Path,
+    raw_log: &mut ReservedOutputFile,
 ) -> Result<ConsultantReport> {
-    write_text_file(
-        raw_log_path,
-        "fake consultant runtime: no subprocess launched\n",
+    raw_log.write_bytes_atomic(
+        b"fake consultant runtime: no subprocess launched\n",
+        MAX_CONSULT_ARTIFACT_BYTES,
     )?;
     Ok(ConsultantReport {
         version: CONSULTANT_REPORT_VERSION,
@@ -711,15 +716,6 @@ fn write_consultant_schema(slot: &mut ReservedOutputFile) -> Result<()> {
     )
 }
 
-fn write_text_file(path: &Path, text: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("path must have a parent directory: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
-}
-
 #[derive(Debug, Clone)]
 struct BoundedText {
     text: String,
@@ -922,17 +918,21 @@ mod tests {
     fn fake_adapter_report_is_deterministic() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let run_id = RunId::new("consult-fake")?;
+        let first_root = SecureOutputRoot::create_new(&temp.path().join("first"))?;
+        let second_root = SecureOutputRoot::create_new(&temp.path().join("second"))?;
+        let mut first_log = first_root.reserve(OsStr::new("raw.log"))?;
+        let mut second_log = second_root.reserve(OsStr::new("raw.log"))?;
         let first = fake_consultant_report(
             &run_id,
             "question".to_string(),
             &[PathBuf::from("README.md")],
-            &temp.path().join("first.log"),
+            &mut first_log,
         )?;
         let second = fake_consultant_report(
             &run_id,
             "question".to_string(),
             &[PathBuf::from("README.md")],
-            &temp.path().join("second.log"),
+            &mut second_log,
         )?;
         assert_eq!(first, second);
         assert_eq!(first.runtime, ConsultantRuntime::Fake);
