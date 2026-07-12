@@ -13,7 +13,9 @@ use thiserror::Error;
 
 const PIPE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const PIPE_CHANNEL_CAPACITY: usize = 8;
+const MAX_PIPE_EVENTS_PER_POLL: usize = PIPE_CHANNEL_CAPACITY * 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const THREAD_JOIN_GRACE: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
@@ -289,11 +291,20 @@ pub enum ProcessRunError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to establish process-tree ownership for {label} ({command}): {source}")]
+    ProcessOwnership {
+        label: String,
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
     let command_display = spec.command.display();
+    let stdout_tee = open_tee(&spec.label, "stdout", &spec.stdout)?;
+    let stderr_tee = open_tee(&spec.label, "stderr", &spec.stderr)?;
     let mut command = spec.command.build();
     configure_process_tree(&mut command);
     command.current_dir(&spec.current_dir);
@@ -307,17 +318,10 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         current_dir: spec.current_dir.clone(),
         source,
     })?;
-    let stdout_tee = match open_tee(&spec.label, "stdout", &spec.stdout) {
-        Ok(tee) => tee,
+    let process_tree = match ProcessTree::attach(&child, &spec.label, &command_display) {
+        Ok(process_tree) => process_tree,
         Err(error) => {
-            terminate_after_setup_error(&mut child, &spec.label);
-            return Err(error);
-        }
-    };
-    let stderr_tee = match open_tee(&spec.label, "stderr", &spec.stderr) {
-        Ok(tee) => tee,
-        Err(error) => {
-            terminate_after_setup_error(&mut child, &spec.label);
+            terminate_unowned_child(&mut child);
             return Err(error);
         }
     };
@@ -335,25 +339,27 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
     let mut process_error = None;
 
     loop {
-        output_drainers.drain_ready();
+        let output_backlog = output_drainers.drain_ready();
         input_writer.drain_ready();
 
         if status.is_none() {
             status = match child.try_wait() {
                 Ok(status) => status,
                 Err(source) => {
-                    let _ = terminate_process_tree(&mut child, false, &spec.label);
+                    let cleanup_error = cleanup_after_wait_error(
+                        &mut child,
+                        &process_tree,
+                        &spec.label,
+                        output_drainers,
+                        input_writer,
+                    );
                     return Err(ProcessRunError::Wait {
                         label: spec.label.clone(),
                         command: command_display.clone(),
-                        source,
+                        source: with_cleanup_error(source, cleanup_error),
                     });
                 }
             };
-        }
-
-        if status.is_some() && output_drainers.is_complete() && input_writer.is_complete() {
-            break;
         }
 
         if spec
@@ -363,18 +369,28 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
             timed_out = true;
             process_error = append_error(
                 process_error,
-                terminate_process_tree(&mut child, status.is_some(), &spec.label),
+                process_tree.terminate(&mut child, status.is_some(), &spec.label),
             );
 
             let exit_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
             if status.is_none() {
-                status = wait_for_exit_until(&mut child, exit_deadline).map_err(|source| {
-                    ProcessRunError::Wait {
-                        label: spec.label.clone(),
-                        command: command_display.clone(),
-                        source,
+                status = match wait_for_exit_until(&mut child, exit_deadline) {
+                    Ok(status) => status,
+                    Err(source) => {
+                        let cleanup_error = cleanup_after_wait_error(
+                            &mut child,
+                            &process_tree,
+                            &spec.label,
+                            output_drainers,
+                            input_writer,
+                        );
+                        return Err(ProcessRunError::Wait {
+                            label: spec.label.clone(),
+                            command: command_display.clone(),
+                            source: with_cleanup_error(source, cleanup_error),
+                        });
                     }
-                })?;
+                };
                 if status.is_none() {
                     process_error = append_error(
                         process_error,
@@ -411,14 +427,21 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
             break;
         }
 
-        thread::sleep(POLL_INTERVAL);
+        if status.is_some() && output_drainers.is_complete() && input_writer.is_complete() {
+            break;
+        }
+
+        if !output_backlog {
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 
     output_drainers.drain_ready();
     input_writer.drain_ready();
     let (stdout, stderr, output_error) = output_drainers.into_outputs();
     process_error = append_error(process_error, output_error);
-    let stdin_error = input_writer.into_error();
+    let (stdin_error, input_cleanup_error) = input_writer.into_result(&spec.label);
+    process_error = append_error(process_error, input_cleanup_error);
 
     Ok(ProcessOutput {
         status,
@@ -431,9 +454,75 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
     })
 }
 
-fn terminate_after_setup_error(child: &mut Child, label: &str) {
-    let _ = terminate_process_tree(child, false, label);
+fn terminate_unowned_child(child: &mut Child) {
+    let _ = child.kill();
     let _ = wait_for_exit_until(child, Instant::now() + EXIT_AND_DRAIN_GRACE);
+}
+
+fn cleanup_after_wait_error(
+    child: &mut Child,
+    process_tree: &ProcessTree,
+    label: &str,
+    mut output_drainers: OutputDrainers,
+    mut input_writer: InputWriter,
+) -> Option<String> {
+    let mut cleanup_error = process_tree.terminate(child, false, label);
+    let exit_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
+    match wait_for_exit_until(child, exit_deadline) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            cleanup_error = append_error(
+                cleanup_error,
+                Some(format!(
+                    "{label} did not exit within {} ms during error cleanup",
+                    EXIT_AND_DRAIN_GRACE.as_millis()
+                )),
+            );
+        }
+        Err(error) => {
+            cleanup_error = append_error(
+                cleanup_error,
+                Some(format!(
+                    "failed to wait for {label} during error cleanup: {error}"
+                )),
+            );
+        }
+    }
+
+    let drain_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
+    if !output_drainers.finish_until(drain_deadline) {
+        cleanup_error = append_error(
+            cleanup_error,
+            Some(format!(
+                "{label} output pipes did not close within {} ms during error cleanup",
+                EXIT_AND_DRAIN_GRACE.as_millis()
+            )),
+        );
+    }
+    if !input_writer.finish_until(drain_deadline) {
+        cleanup_error = append_error(
+            cleanup_error,
+            Some(format!(
+                "{label} stdin writer did not finish within {} ms during error cleanup",
+                EXIT_AND_DRAIN_GRACE.as_millis()
+            )),
+        );
+    }
+    let (_, _, output_error) = output_drainers.into_outputs();
+    cleanup_error = append_error(cleanup_error, output_error);
+    let (stdin_error, input_cleanup_error) = input_writer.into_result(label);
+    cleanup_error = append_error(cleanup_error, stdin_error);
+    append_error(cleanup_error, input_cleanup_error)
+}
+
+fn with_cleanup_error(source: std::io::Error, cleanup_error: Option<String>) -> std::io::Error {
+    match cleanup_error {
+        Some(cleanup_error) => std::io::Error::new(
+            source.kind(),
+            format!("{source}; process cleanup also reported: {cleanup_error}"),
+        ),
+        None => source,
+    }
 }
 
 fn open_tee(
@@ -506,30 +595,67 @@ fn configure_process_tree(command: &mut Command) {
     }
 }
 
-fn terminate_process_tree(
-    child: &mut Child,
-    child_already_exited: bool,
-    label: &str,
-) -> Option<String> {
-    #[cfg(unix)]
-    {
-        terminate_unix_process_group(child, child_already_exited, label)
-    }
-
+struct ProcessTree {
     #[cfg(target_os = "windows")]
-    {
-        terminate_windows_process_tree(child, child_already_exited, label)
+    job: WindowsJob,
+}
+
+impl ProcessTree {
+    fn attach(child: &Child, label: &str, command: &str) -> Result<Self, ProcessRunError> {
+        #[cfg(target_os = "windows")]
+        {
+            let job = WindowsJob::create_and_assign(child).map_err(|source| {
+                ProcessRunError::ProcessOwnership {
+                    label: label.to_string(),
+                    command: command.to_string(),
+                    source,
+                }
+            })?;
+            Ok(Self { job })
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (child, label, command);
+            Ok(Self {})
+        }
     }
 
-    #[cfg(not(any(unix, target_os = "windows")))]
-    {
-        if child_already_exited {
-            None
-        } else {
-            child
-                .kill()
-                .err()
-                .map(|error| format!("{label} timed out but process kill failed: {error}"))
+    fn terminate(
+        &self,
+        child: &mut Child,
+        child_already_exited: bool,
+        label: &str,
+    ) -> Option<String> {
+        #[cfg(unix)]
+        {
+            let _ = self;
+            terminate_unix_process_group(child, child_already_exited, label)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            match self.job.terminate(label) {
+                None => None,
+                Some(job_error) if child_already_exited => Some(job_error),
+                Some(job_error) => match child.kill() {
+                    Ok(()) => Some(format!("{job_error}; direct child was killed")),
+                    Err(error) => Some(format!("{job_error}; direct process kill failed: {error}")),
+                },
+            }
+        }
+
+        #[cfg(not(any(unix, target_os = "windows")))]
+        {
+            let _ = self;
+            if child_already_exited {
+                None
+            } else {
+                child
+                    .kill()
+                    .err()
+                    .map(|error| format!("{label} timed out but process kill failed: {error}"))
+            }
         }
     }
 }
@@ -577,36 +703,85 @@ fn send_unix_process_group_signal(pid: u32, signal: &str) -> std::io::Result<()>
 }
 
 #[cfg(target_os = "windows")]
-fn terminate_windows_process_tree(
-    child: &mut Child,
-    child_already_exited: bool,
-    label: &str,
-) -> Option<String> {
-    let pid = child.id().to_string();
-    let result = Command::new("taskkill")
-        .args(["/PID", &pid, "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match result {
-        Ok(status) if status.success() => None,
-        Ok(_) | Err(_) if child_already_exited => None,
-        Ok(status) => match child.kill() {
-            Ok(()) => Some(format!(
-                "{label} timed out; taskkill /T exited with {status}; direct child was killed"
-            )),
-            Err(child_error) => Some(format!(
-                "{label} timed out; taskkill /T exited with {status}; direct process kill failed: {child_error}"
-            )),
-        },
-        Err(taskkill_error) => match child.kill() {
-            Ok(()) => Some(format!(
-                "{label} timed out; failed to start taskkill /T: {taskkill_error}; direct child was killed"
-            )),
-            Err(child_error) => Some(format!(
-                "{label} timed out; failed to start taskkill /T: {taskkill_error}; direct process kill failed: {child_error}"
-            )),
-        },
+struct WindowsJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsJob {
+    fn create_and_assign(child: &Child) -> std::io::Result<Self> {
+        use std::{mem::size_of, os::windows::io::AsRawHandle, ptr};
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+
+        // SAFETY: null security attributes/name request an unnamed job owned by this process.
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::other(format!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let job = Self { handle };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` is initialized for the requested information class and valid for the
+        // duration of the call; `job.handle` remains owned by `job`.
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                ptr::from_ref(&limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(std::io::Error::other(format!(
+                "SetInformationJobObject(KILL_ON_JOB_CLOSE) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let process_handle = child.as_raw_handle() as HANDLE;
+        // SAFETY: `process_handle` is borrowed from the live child and `job.handle` is valid.
+        if unsafe { AssignProcessToJobObject(job.handle, process_handle) } == 0 {
+            return Err(std::io::Error::other(format!(
+                "AssignProcessToJobObject failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(job)
+    }
+
+    fn terminate(&self, label: &str) -> Option<String> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        // SAFETY: the handle is valid while `self` is alive. The exit code is diagnostic only.
+        if unsafe { TerminateJobObject(self.handle, 1) } != 0 {
+            None
+        } else {
+            Some(format!(
+                "{label} timed out but TerminateJobObject failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        // SAFETY: this RAII owner closes its handle exactly once. KILL_ON_JOB_CLOSE ensures any
+        // surviving assigned descendants are terminated when ownership ends.
+        let _ = unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -634,14 +809,47 @@ fn append_error(existing: Option<String>, next: Option<String>) -> Option<String
     }
 }
 
+fn finish_owned_thread(
+    handle: thread::JoinHandle<()>,
+    completion_observed: bool,
+    label: &str,
+) -> Option<String> {
+    if completion_observed {
+        return handle
+            .join()
+            .err()
+            .map(|_| format!("{label} thread panicked during cleanup"));
+    }
+
+    let deadline = Instant::now() + THREAD_JOIN_GRACE;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if handle.is_finished() {
+        return handle
+            .join()
+            .err()
+            .map(|_| format!("{label} thread panicked during cleanup"));
+    }
+    drop(handle);
+    Some(format!(
+        "{label} remained active without reporting completion for more than {} ms during bounded cleanup and was detached",
+        THREAD_JOIN_GRACE.as_millis()
+    ))
+}
+
 struct InputWriter {
     state: InputWriterState,
 }
 
 enum InputWriterState {
     None,
+    Complete {
+        error: Option<String>,
+    },
     Thread {
         receiver: Receiver<Option<String>>,
+        handle: thread::JoinHandle<()>,
         error: Option<String>,
         complete: bool,
     },
@@ -656,16 +864,14 @@ impl InputWriter {
         };
         let Some(mut child_stdin) = child.stdin.take() else {
             return Self {
-                state: InputWriterState::Thread {
-                    receiver: mpsc::channel().1,
+                state: InputWriterState::Complete {
                     error: Some(format!("failed to open {label} stdin")),
-                    complete: true,
                 },
             };
         };
         let (sender, receiver) = mpsc::channel();
         let label = label.to_string();
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let error = child_stdin
                 .write_all(&input)
                 .err()
@@ -675,6 +881,7 @@ impl InputWriter {
         Self {
             state: InputWriterState::Thread {
                 receiver,
+                handle,
                 error: None,
                 complete: false,
             },
@@ -686,6 +893,7 @@ impl InputWriter {
             receiver,
             error,
             complete,
+            ..
         } = &mut self.state
         else {
             return;
@@ -708,7 +916,7 @@ impl InputWriter {
 
     fn is_complete(&self) -> bool {
         match &self.state {
-            InputWriterState::None => true,
+            InputWriterState::None | InputWriterState::Complete { .. } => true,
             InputWriterState::Thread { complete, .. } => *complete,
         }
     }
@@ -726,10 +934,21 @@ impl InputWriter {
         }
     }
 
-    fn into_error(self) -> Option<String> {
+    fn into_result(self, label: &str) -> (Option<String>, Option<String>) {
         match self.state {
-            InputWriterState::None => None,
-            InputWriterState::Thread { error, .. } => error,
+            InputWriterState::None => (None, None),
+            InputWriterState::Complete { error } => (error, None),
+            InputWriterState::Thread {
+                receiver,
+                handle,
+                error,
+                complete,
+            } => {
+                drop(receiver);
+                let cleanup_error =
+                    finish_owned_thread(handle, complete, &format!("{label} stdin writer"));
+                (error, cleanup_error)
+            }
         }
     }
 }
@@ -764,9 +983,10 @@ impl OutputDrainers {
         }
     }
 
-    fn drain_ready(&mut self) {
-        self.stdout.drain_ready(&self.label);
-        self.stderr.drain_ready(&self.label);
+    fn drain_ready(&mut self) -> bool {
+        let stdout_backlog = self.stdout.drain_ready(&self.label);
+        let stderr_backlog = self.stderr.drain_ready(&self.label);
+        stdout_backlog || stderr_backlog
     }
 
     fn is_complete(&self) -> bool {
@@ -775,30 +995,30 @@ impl OutputDrainers {
 
     fn finish_until(&mut self, deadline: Instant) -> bool {
         loop {
-            self.drain_ready();
+            let backlog = self.drain_ready();
             if self.is_complete() {
                 return true;
             }
             if Instant::now() >= deadline {
                 return false;
             }
-            thread::sleep(POLL_INTERVAL);
+            if !backlog {
+                thread::sleep(POLL_INTERVAL);
+            }
         }
     }
 
     fn into_outputs(self) -> (CapturedBytes, CapturedBytes, Option<String>) {
-        let error = append_error(self.stdout.error, self.stderr.error);
-        (
-            self.stdout.capture.into_captured(),
-            self.stderr.capture.into_captured(),
-            error,
-        )
+        let (stdout, stdout_error) = self.stdout.into_output(&self.label);
+        let (stderr, stderr_error) = self.stderr.into_output(&self.label);
+        (stdout, stderr, append_error(stdout_error, stderr_error))
     }
 }
 
 struct PipeReader {
     stream: &'static str,
     receiver: Option<Receiver<PipeReadEvent>>,
+    handle: Option<thread::JoinHandle<()>>,
     capture: BoundedBuffer,
     complete: bool,
     error: Option<String>,
@@ -809,25 +1029,34 @@ impl PipeReader {
         Self {
             stream,
             receiver: None,
+            handle: None,
             capture: BoundedBuffer::new(limit),
             complete: true,
             error: Some(format!("failed to open child {stream} pipe")),
         }
     }
 
-    fn drain_ready(&mut self, label: &str) {
+    fn drain_ready(&mut self, label: &str) -> bool {
         let Some(receiver) = &self.receiver else {
-            return;
+            return false;
         };
-        while !self.complete {
+        let mut processed = 0;
+        while !self.complete && processed < MAX_PIPE_EVENTS_PER_POLL {
             match receiver.try_recv() {
-                Ok(PipeReadEvent::Chunk(chunk)) => self.capture.push(&chunk),
-                Ok(PipeReadEvent::Finished) => self.complete = true,
+                Ok(PipeReadEvent::Chunk(chunk)) => {
+                    processed += 1;
+                    self.capture.push(&chunk);
+                }
+                Ok(PipeReadEvent::Finished) => {
+                    processed += 1;
+                    self.complete = true;
+                }
                 Ok(PipeReadEvent::Error(error)) => {
+                    processed += 1;
                     self.error = Some(error);
                     self.complete = true;
                 }
-                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.error = Some(format!(
                         "{label} {} reader thread stopped unexpectedly",
@@ -837,6 +1066,23 @@ impl PipeReader {
                 }
             }
         }
+        !self.complete && processed == MAX_PIPE_EVENTS_PER_POLL
+    }
+
+    fn into_output(self, label: &str) -> (CapturedBytes, Option<String>) {
+        let Self {
+            stream,
+            receiver,
+            handle,
+            capture,
+            complete,
+            error,
+        } = self;
+        drop(receiver);
+        let cleanup_error = handle.and_then(|handle| {
+            finish_owned_thread(handle, complete, &format!("{label} {stream} reader"))
+        });
+        (capture.into_captured(), append_error(error, cleanup_error))
     }
 }
 
@@ -858,7 +1104,7 @@ where
 {
     let (sender, receiver) = mpsc::sync_channel(PIPE_CHANNEL_CAPACITY);
     let label = label.to_string();
-    thread::spawn(move || loop {
+    let handle = thread::spawn(move || loop {
         let mut buffer = vec![0_u8; PIPE_READ_CHUNK_SIZE];
         match reader.read(&mut buffer) {
             Ok(0) => {
@@ -894,6 +1140,7 @@ where
     PipeReader {
         stream,
         receiver: Some(receiver),
+        handle: Some(handle),
         capture: BoundedBuffer::new(capture_limit),
         complete: false,
         error: None,
@@ -973,6 +1220,51 @@ mod tests {
                 .len()
                 >= 256 * 4096
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn continuous_output_does_not_starve_timeout_polling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ProcessSpec::shell(
+            "continuous-output command",
+            Shell::UnixSh,
+            "trap '' TERM; while :; do printf '%4096s' O; printf '%4096s' E >&2; done",
+            temp.path(),
+            1024,
+        )
+        .with_timeout(Some(Duration::from_secs(1)));
+        let started = Instant::now();
+
+        let output = run_process(spec).expect("run continuous-output command");
+        let elapsed = started.elapsed();
+
+        assert!(output.timed_out);
+        assert!(output.stdout.is_truncated());
+        assert!(output.stderr.is_truncated());
+        assert!(elapsed >= Duration::from_millis(900));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "continuous output delayed the one-second timeout for {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_first_observed_after_deadline_is_a_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ProcessSpec::shell(
+            "deadline-racing command",
+            Shell::UnixSh,
+            "sleep 0.002",
+            temp.path(),
+            128,
+        )
+        .with_timeout(Some(Duration::from_millis(1)));
+
+        let output = run_process(spec).expect("run deadline-racing command");
+
+        assert!(output.timed_out);
     }
 
     #[cfg(unix)]
@@ -1059,15 +1351,13 @@ mod tests {
     fn spawn_error_identifies_command_label_and_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing_program = temp.path().join("missing-program");
-        let tee_path = temp.path().join("should-not-exist.log");
         let spec = ProcessSpec::direct(
             "missing command",
             &missing_program,
             Vec::<OsString>::new(),
             temp.path(),
             128,
-        )
-        .with_stdout(StreamCapture::bounded(128).tee_to(&tee_path));
+        );
 
         let error = run_process(spec).expect_err("missing command must fail to spawn");
 
@@ -1084,7 +1374,28 @@ mod tests {
             }
             other => panic!("expected spawn error, got {other:?}"),
         }
-        assert!(!tee_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_tee_path_prevents_child_side_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("child-ran");
+        let missing_tee_parent = temp.path().join("missing").join("stdout.log");
+        let command = format!("touch '{}'", marker.display());
+        let spec = ProcessSpec::shell(
+            "command with invalid tee",
+            Shell::UnixSh,
+            command,
+            temp.path(),
+            128,
+        )
+        .with_stdout(StreamCapture::bounded(128).tee_to(missing_tee_parent));
+
+        let error = run_process(spec).expect_err("invalid tee must fail before spawn");
+
+        assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+        assert!(!marker.exists());
     }
 
     #[test]

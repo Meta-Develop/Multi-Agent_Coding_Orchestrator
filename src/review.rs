@@ -299,11 +299,25 @@ fn diagnostics_from_output(
 fn sanitize_review_output(repo: &Path, output: &[u8]) -> ReviewOutputSummary {
     let text = String::from_utf8_lossy(output);
     let mut sanitized = Redactor::new().redact(&text).text;
-    sanitized = sanitized.replace(&repo.display().to_string(), ".");
+
+    if let Ok(canonical_repo) = repo.canonicalize() {
+        replace_nonempty_path(&mut sanitized, &canonical_repo, ".");
+        if let Some(parent) = canonical_repo.parent() {
+            replace_nonempty_path(&mut sanitized, parent, "<repo-parent>");
+        }
+    }
+    replace_nonempty_path(&mut sanitized, repo, ".");
     if let Some(parent) = repo.parent() {
-        sanitized = sanitized.replace(&parent.display().to_string(), "<repo-parent>");
+        replace_nonempty_path(&mut sanitized, parent, "<repo-parent>");
     }
     summarize_review_text(&redact_token_like_words(&sanitized), REVIEW_OUTPUT_LIMIT)
+}
+
+fn replace_nonempty_path(text: &mut String, path: &Path, replacement: &str) {
+    let path = path.display().to_string();
+    if !path.is_empty() {
+        *text = text.replace(&path, replacement);
+    }
 }
 
 fn summarize_review_text(text: &str, limit: usize) -> ReviewOutputSummary {
@@ -454,6 +468,25 @@ mod tests {
         assert_eq!(report.diff_source, "sanitized_merge_candidate_summary");
         assert!(!report.ci_reaction_supported);
         assert_eq!(report.ci_reaction, "unsupported");
+    }
+
+    #[test]
+    fn sanitize_review_output_with_dot_repo_does_not_expand_empty_parent() {
+        let output = sanitize_review_output(Path::new("."), b"plain diagnostics");
+
+        assert_eq!(output.text, "plain diagnostics");
+        assert!(!output.truncated);
+    }
+
+    #[test]
+    fn sanitize_review_output_redacts_canonical_repo_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let diagnostic = format!("failure in {}/src/review.rs", temp.path().display());
+
+        let output = sanitize_review_output(temp.path(), diagnostic.as_bytes());
+
+        assert_eq!(output.text, "failure in ./src/review.rs");
+        Ok(())
     }
 
     #[test]
