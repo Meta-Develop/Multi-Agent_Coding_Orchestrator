@@ -55,6 +55,14 @@ static RESERVATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MAX_RUN_ROOT_ENTRIES: usize = 64;
 #[cfg(not(test))]
 const MAX_RUN_ROOT_ENTRIES: usize = 4_096;
+#[cfg(test)]
+const MAX_REGISTERED_ARTIFACT_WORKTREES: usize = 16;
+#[cfg(not(test))]
+const MAX_REGISTERED_ARTIFACT_WORKTREES: usize = 1_024;
+const MAX_REGISTERED_WORKTREE_NAME_BYTES: usize = 1_024;
+const MAX_REGISTERED_WORKTREE_PATH_BYTES: usize = 32 * 1_024;
+const MAX_REGISTERED_WORKTREE_PATH_COMPONENTS: usize = 256;
+const MAX_MARKER_SCAN_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -433,7 +441,7 @@ impl ArtifactMacKeyWriter {
         lock.verify(&root)?;
         let result = (|| -> Result<ArtifactMacKey> {
             if !root.direct_child_exists(ARTIFACT_MAC_KEY_FILE)? {
-                if bounded_existing_finalization_marker(repository)? {
+                if scan_registered_finalization_markers(repository, None)? > 0 {
                     bail!(
                         "artifact finalization MAC key is missing while an existing final marker is present; refusing to generate a replacement key"
                     );
@@ -444,7 +452,11 @@ impl ArtifactMacKeyWriter {
                 AtomicStateWriter::write_direct(&root, ARTIFACT_MAC_KEY_FILE, &bytes)?;
                 lock.verify(&root)?;
             }
-            ArtifactMacKey::load(&root)
+            let key = ArtifactMacKey::load(&root)?;
+            key.verify()?;
+            scan_registered_finalization_markers(repository, Some(&key))?;
+            key.verify()?;
+            Ok(key)
         })();
         let key = finish_with_artifact_lock_verification(result, lock.verify(&root))?;
         let writer = Self { key, lock };
@@ -1063,6 +1075,10 @@ fn check_run_dir_available(repo: &Path, family: RunArtifactFamily, run_id: &RunI
 fn discover_artifact_repository(repo_path: &Path) -> Result<ArtifactRepository> {
     let repo = Repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
+    artifact_repository_from_open(&repo)
+}
+
+fn artifact_repository_from_open(repo: &Repository) -> Result<ArtifactRepository> {
     let worktree = repo
         .workdir()
         .context("repository command requires a non-bare repository")?;
@@ -1082,56 +1098,77 @@ fn discover_artifact_repository(repo_path: &Path) -> Result<ArtifactRepository> 
     })
 }
 
-fn bounded_existing_finalization_marker(repository: &ArtifactRepository) -> Result<bool> {
+fn scan_registered_finalization_markers(
+    repository: &ArtifactRepository,
+    key: Option<&ArtifactMacKey>,
+) -> Result<usize> {
     let mut entries = 0usize;
-    for family in [
-        RunArtifactFamily::Autopilot,
-        RunArtifactFamily::Consult,
-        RunArtifactFamily::Inbox,
-        RunArtifactFamily::Supervise,
-    ] {
-        let Some(root) = open_optional_run_root(repository, family)? else {
-            continue;
-        };
-        root.verify()?;
-        for entry in fs::read_dir(root.path()).with_context(|| {
-            format!(
-                "failed to scan {} artifacts before MAC-key creation",
-                family.label()
-            )
-        })? {
-            entries = entries
-                .checked_add(1)
-                .context("artifact marker scan entry count overflow")?;
-            if entries > MAX_RUN_ROOT_ENTRIES.saturating_mul(8) {
-                bail!("artifact marker scan exceeded its global entry budget");
-            }
-            let entry = entry.context("failed to inspect artifact marker-scan entry")?;
-            let name = entry.file_name();
-            if name == ROOT_LOCK_FILE {
-                ensure_private_regular_file(&entry.path())?;
+    let mut markers = 0usize;
+    let mut marker_bytes = 0u64;
+    for registered in registered_artifact_repositories(repository)? {
+        for family in [
+            RunArtifactFamily::Autopilot,
+            RunArtifactFamily::Consult,
+            RunArtifactFamily::Inbox,
+            RunArtifactFamily::Supervise,
+        ] {
+            let Some(root) = open_optional_run_root(&registered, family)? else {
                 continue;
-            }
-            if name == QUARANTINE_DIRECTORY {
-                let quarantine = root.bind_existing_direct_child_directory(&name)?;
-                let quarantine = SafeRoot::open_existing(quarantine.path())?;
-                if bounded_marker_in_quarantine(&quarantine, &mut entries)? {
-                    return Ok(true);
+            };
+            root.verify()?;
+            for entry in fs::read_dir(root.path()).with_context(|| {
+                format!(
+                    "failed to scan {} artifacts before MAC-key use",
+                    family.label()
+                )
+            })? {
+                observe_marker_scan_entry(&mut entries)?;
+                let entry = entry.context("failed to inspect artifact marker-scan entry")?;
+                let name = entry.file_name();
+                if name == ROOT_LOCK_FILE {
+                    ensure_private_regular_file(&entry.path())?;
+                    continue;
                 }
-                continue;
+                if name == QUARANTINE_DIRECTORY {
+                    let quarantine = root.bind_existing_direct_child_directory(&name)?;
+                    let quarantine = SafeRoot::open_existing(quarantine.path())?;
+                    scan_markers_in_quarantine(
+                        &registered,
+                        family,
+                        &quarantine,
+                        key,
+                        &mut entries,
+                        &mut markers,
+                        &mut marker_bytes,
+                    )?;
+                    continue;
+                }
+                let run = root.bind_existing_managed_direct_child_directory(&name)?;
+                let run = SafeRoot::open_existing(run.path())?;
+                observe_finalization_marker(
+                    &registered,
+                    family,
+                    &run,
+                    key,
+                    &mut markers,
+                    &mut marker_bytes,
+                )?;
             }
-            let run = root.bind_existing_managed_direct_child_directory(&name)?;
-            let run = SafeRoot::open_existing(run.path())?;
-            if run.direct_child_exists(FINALIZATION_MARKER)? {
-                return Ok(true);
-            }
+            root.verify()?;
         }
-        root.verify()?;
     }
-    Ok(false)
+    Ok(markers)
 }
 
-fn bounded_marker_in_quarantine(quarantine: &SafeRoot, entries: &mut usize) -> Result<bool> {
+fn scan_markers_in_quarantine(
+    repository: &ArtifactRepository,
+    family: RunArtifactFamily,
+    quarantine: &SafeRoot,
+    key: Option<&ArtifactMacKey>,
+    entries: &mut usize,
+    markers: &mut usize,
+    marker_bytes: &mut u64,
+) -> Result<()> {
     quarantine.verify()?;
     for entry in fs::read_dir(quarantine.path()).with_context(|| {
         format!(
@@ -1139,21 +1176,228 @@ fn bounded_marker_in_quarantine(quarantine: &SafeRoot, entries: &mut usize) -> R
             quarantine.path().display()
         )
     })? {
-        *entries = entries
-            .checked_add(1)
-            .context("artifact quarantine marker count overflow")?;
-        if *entries > MAX_RUN_ROOT_ENTRIES.saturating_mul(8) {
-            bail!("artifact marker scan exceeded its global entry budget");
-        }
+        observe_marker_scan_entry(entries)?;
         let entry = entry.context("failed to inspect quarantined artifact run")?;
         let run = quarantine.bind_existing_managed_direct_child_directory(entry.file_name())?;
         let run = SafeRoot::open_existing(run.path())?;
-        if run.direct_child_exists(FINALIZATION_MARKER)? {
-            return Ok(true);
-        }
+        observe_finalization_marker(repository, family, &run, key, markers, marker_bytes)?;
     }
     quarantine.verify()?;
-    Ok(false)
+    Ok(())
+}
+
+fn observe_marker_scan_entry(entries: &mut usize) -> Result<()> {
+    *entries = entries
+        .checked_add(1)
+        .context("artifact marker scan entry count overflow")?;
+    if *entries > MAX_RUN_ROOT_ENTRIES.saturating_mul(8) {
+        bail!("artifact marker scan exceeded its global entry budget");
+    }
+    Ok(())
+}
+
+fn observe_finalization_marker(
+    repository: &ArtifactRepository,
+    family: RunArtifactFamily,
+    run: &SafeRoot,
+    key: Option<&ArtifactMacKey>,
+    markers: &mut usize,
+    marker_bytes: &mut u64,
+) -> Result<()> {
+    if !run.direct_child_exists(FINALIZATION_MARKER)? {
+        return Ok(());
+    }
+    *markers = markers
+        .checked_add(1)
+        .context("artifact finalization marker count overflow")?;
+    if let Some(key) = key {
+        verify_finalization_marker_key_binding(repository, family, run, key, marker_bytes)?;
+    }
+    Ok(())
+}
+
+fn verify_finalization_marker_key_binding(
+    repository: &ArtifactRepository,
+    family: RunArtifactFamily,
+    run: &SafeRoot,
+    key: &ArtifactMacKey,
+    marker_bytes: &mut u64,
+) -> Result<()> {
+    ensure_private_regular_file(&run.path().join(FINALIZATION_MARKER))?;
+    let marker =
+        BoundedRegularReader::read_direct(run, FINALIZATION_MARKER, MAX_FINALIZATION_BYTES)?;
+    *marker_bytes = marker_bytes
+        .checked_add(u64::try_from(marker.len()).context("marker length overflow")?)
+        .context("artifact marker scan byte count overflow")?;
+    if *marker_bytes > MAX_MARKER_SCAN_TOTAL_BYTES {
+        bail!(
+            "artifact marker scan exceeds its {} byte aggregate budget",
+            MAX_MARKER_SCAN_TOTAL_BYTES
+        );
+    }
+    let finalization: ArtifactFinalization = serde_json::from_slice(&marker)
+        .context("failed to parse existing artifact finalization marker during key validation")?;
+    if finalization.version != ARTIFACT_FORMAT_VERSION {
+        bail!(
+            "existing artifact finalization marker has unsupported version {}",
+            finalization.version
+        );
+    }
+    if finalization.repository != repository.binding || finalization.family != family {
+        bail!("existing artifact finalization marker has the wrong repository/family binding");
+    }
+    if finalization.checksum != finalization_checksum(&finalization)? {
+        bail!("existing artifact finalization marker checksum mismatch");
+    }
+    validate_finalization(&finalization)?;
+    if finalization.mac_key_id != key.key_id || finalization.mac_key_identity != key.identity {
+        bail!("artifact finalization MAC key does not match existing marker binding");
+    }
+    let expected_mac = finalization_hmac(&key.bytes, &finalization)?;
+    if !constant_time_eq(expected_mac.as_bytes(), finalization.hmac_sha256.as_bytes()) {
+        bail!("existing artifact finalization marker HMAC verification failed");
+    }
+    run.verify()
+}
+
+fn registered_artifact_repositories(
+    repository: &ArtifactRepository,
+) -> Result<Vec<ArtifactRepository>> {
+    let common_repo = Repository::open(&repository.common_dir).with_context(|| {
+        format!(
+            "failed to open common repository while scanning artifact key scope {}",
+            repository.common_dir.display()
+        )
+    })?;
+    let common_root = SafeRoot::open_existing(&repository.common_dir)?;
+    let registered_names = bounded_registered_worktree_names(&common_root)?;
+    let listed = common_repo
+        .worktrees()
+        .context("failed to enumerate registered linked worktrees for artifact key validation")?;
+    if listed.len() > MAX_REGISTERED_ARTIFACT_WORKTREES {
+        bail!(
+            "registered linked worktree count exceeds its {} entry budget",
+            MAX_REGISTERED_ARTIFACT_WORKTREES
+        );
+    }
+    let mut listed_names = BTreeSet::new();
+    for name in listed.iter() {
+        let name = name.context("registered linked worktree name is not valid UTF-8")?;
+        if name.is_empty() || name.len() > MAX_REGISTERED_WORKTREE_NAME_BYTES {
+            bail!("registered linked worktree name exceeds its bounded format");
+        }
+        if !listed_names.insert(name.to_string()) {
+            bail!("duplicate registered linked worktree name: {name}");
+        }
+    }
+    if listed_names != registered_names {
+        bail!("Git linked-worktree registry changed or contains unreadable/stale entries");
+    }
+
+    let main = artifact_repository_from_open(&common_repo)
+        .context("failed to bind the main worktree for artifact key validation")?;
+    verify_common_artifact_repository(repository, &main)?;
+    let mut repositories = vec![main];
+    let mut paths = BTreeSet::from([repositories[0].worktree.clone()]);
+    let mut identities = BTreeSet::from([(
+        repositories[0].binding.worktree_identity.device,
+        repositories[0].binding.worktree_identity.file,
+    )]);
+
+    for name in listed_names {
+        let worktree = common_repo
+            .find_worktree(&name)
+            .with_context(|| format!("failed to open registered linked worktree '{name}'"))?;
+        worktree
+            .validate()
+            .with_context(|| format!("registered linked worktree '{name}' is stale or invalid"))?;
+        validate_registered_worktree_path(worktree.path())?;
+        let worktree_root = SafeRoot::open_existing(worktree.path()).with_context(|| {
+            format!("registered linked worktree '{name}' is not safely reachable without links")
+        })?;
+        let linked_repo = Repository::open(worktree_root.path())
+            .with_context(|| format!("failed to open registered linked worktree '{name}'"))?;
+        let linked = artifact_repository_from_open(&linked_repo)
+            .with_context(|| format!("failed to bind registered linked worktree '{name}'"))?;
+        verify_common_artifact_repository(repository, &linked)?;
+        if linked.binding.worktree_identity != *worktree_root.identity() {
+            bail!("registered linked worktree '{name}' changed identity while opening");
+        }
+        if !paths.insert(linked.worktree.clone())
+            || !identities.insert((
+                linked.binding.worktree_identity.device,
+                linked.binding.worktree_identity.file,
+            ))
+        {
+            bail!("registered linked worktree '{name}' aliases another worktree");
+        }
+        repositories.push(linked);
+    }
+    if !repositories.iter().any(|candidate| {
+        candidate.worktree == repository.worktree
+            && candidate.binding.worktree_identity == repository.binding.worktree_identity
+    }) {
+        bail!("calling artifact worktree is not the main or a valid registered linked worktree");
+    }
+    common_root.verify()?;
+    Ok(repositories)
+}
+
+fn bounded_registered_worktree_names(common_root: &SafeRoot) -> Result<BTreeSet<String>> {
+    if !common_root.direct_child_exists("worktrees")? {
+        return Ok(BTreeSet::new());
+    }
+    let registry = common_root.bind_existing_managed_direct_child_directory("worktrees")?;
+    let registry = SafeRoot::open_existing(registry.path())?;
+    let mut names = BTreeSet::new();
+    for entry in
+        fs::read_dir(registry.path()).context("failed to preflight Git linked-worktree registry")?
+    {
+        if names.len() >= MAX_REGISTERED_ARTIFACT_WORKTREES {
+            bail!(
+                "registered linked worktree count exceeds its {} entry budget",
+                MAX_REGISTERED_ARTIFACT_WORKTREES
+            );
+        }
+        let entry = entry.context("failed to inspect Git linked-worktree registry entry")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("registered linked worktree name is not valid UTF-8"))?;
+        if name.is_empty() || name.len() > MAX_REGISTERED_WORKTREE_NAME_BYTES {
+            bail!("registered linked worktree name exceeds its bounded format");
+        }
+        registry.bind_existing_managed_direct_child_directory(&name)?;
+        if !names.insert(name.clone()) {
+            bail!("duplicate registered linked worktree name: {name}");
+        }
+    }
+    registry.verify()?;
+    Ok(names)
+}
+
+fn verify_common_artifact_repository(
+    expected: &ArtifactRepository,
+    observed: &ArtifactRepository,
+) -> Result<()> {
+    if observed.common_dir != expected.common_dir
+        || observed.binding.common_dir_identity != expected.binding.common_dir_identity
+        || observed.binding.common_dir_path_checksum != expected.binding.common_dir_path_checksum
+    {
+        bail!("registered worktree does not belong to the expected Git common directory");
+    }
+    Ok(())
+}
+
+fn validate_registered_worktree_path(path: &Path) -> Result<()> {
+    let bytes = filesystem_path_bytes(path).len();
+    if !path.is_absolute() || bytes == 0 || bytes > MAX_REGISTERED_WORKTREE_PATH_BYTES {
+        bail!("registered linked worktree path exceeds its bounded format");
+    }
+    if path.components().count() > MAX_REGISTERED_WORKTREE_PATH_COMPONENTS {
+        bail!("registered linked worktree path exceeds its component budget");
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2253,7 +2497,7 @@ fn is_canonical_lower_hex_64(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worktree::WorktreeManager;
+    use crate::worktree::{WorktreeCreateOptions, WorktreeManager};
     use git2::{Oid, Signature};
     use tempfile::TempDir;
 
@@ -2435,6 +2679,137 @@ mod tests {
             .err()
             .expect("writer evidence");
         assert!(evidence_error.to_string().contains("lock identity"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_marker_refuses_replaced_key_for_new_finalization() {
+        let (_temp, repo) = committed_repo();
+        let first_run = RunId::new("key-anchor-run").expect("run id");
+        finalize_private_test_run(&repo, RunArtifactFamily::Autopilot, &first_run, "autopilot");
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let key_path = repository
+            .common_dir
+            .join("maco/state")
+            .join(ARTIFACT_MAC_KEY_FILE);
+        let original_key = key_path.with_file_name("artifact-key.pre-replacement");
+        fs::rename(&key_path, &original_key).expect("move original key");
+        write_private(&key_path, &[0xa5; ARTIFACT_MAC_KEY_BYTES]);
+
+        let second_run = RunId::new("replacement-key-run").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Autopilot,
+            second_run.clone(),
+            "autopilot",
+        )
+        .expect("reserve second writer");
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write second report");
+        let error = writer
+            .finalize("final-report.json", false)
+            .expect_err("replacement key must not establish a new signing epoch");
+        assert!(error
+            .to_string()
+            .contains("does not match existing marker binding"));
+        assert!(!run_dir(&repo, RunArtifactFamily::Autopilot, &second_run)
+            .join(FINALIZATION_MARKER)
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_common_key_scans_main_and_every_registered_linked_worktree() {
+        let (temp, repo) = committed_repo();
+        let linked = WorktreeManager::new(&repo)
+            .create(WorktreeCreateOptions {
+                agent_id: "artifact-linked".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(temp.path().join("worktrees")),
+            })
+            .expect("create linked worktree");
+        let first_run = RunId::new("main-key-anchor").expect("run id");
+        finalize_private_test_run(&repo, RunArtifactFamily::Inbox, &first_run, "inbox");
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let key_path = repository
+            .common_dir
+            .join("maco/state")
+            .join(ARTIFACT_MAC_KEY_FILE);
+        let original_key = key_path.with_file_name("artifact-key.missing-linked-test");
+        fs::rename(&key_path, &original_key).expect("remove shared key");
+
+        let linked_run = RunId::new("linked-rekey-attempt").expect("run id");
+        let mut writer =
+            ArtifactRunWriter::reserve(&linked.path, RunArtifactFamily::Inbox, linked_run, "inbox")
+                .expect("reserve linked writer");
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write linked report");
+        let error = writer
+            .finalize("final-report.json", false)
+            .expect_err("marker in main worktree must prevent linked-worktree rekey");
+        assert!(error
+            .to_string()
+            .contains("existing final marker is present"));
+        assert!(!key_path.exists(), "refused rekey must not create a key");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_registered_worktree_refuses_first_key_creation() {
+        let (temp, repo) = committed_repo();
+        let linked = WorktreeManager::new(&repo)
+            .create(WorktreeCreateOptions {
+                agent_id: "artifact-stale".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(temp.path().join("worktrees")),
+            })
+            .expect("create linked worktree");
+        fs::remove_dir_all(&linked.path).expect("make registration stale");
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let key_path = repository
+            .common_dir
+            .join("maco/state")
+            .join(ARTIFACT_MAC_KEY_FILE);
+
+        let error = ArtifactMacKeyWriter::open(&repository)
+            .err()
+            .expect("stale worktree registration must fail closed");
+        assert!(error.to_string().contains("stale or invalid"));
+        assert!(!key_path.exists());
+    }
+
+    #[test]
+    fn first_key_marker_scan_has_a_global_entry_budget() {
+        let (_temp, repo) = committed_repo();
+        let repository = discover_artifact_repository(&repo).expect("repository");
+        let root = open_or_create_run_root(&repository, RunArtifactFamily::Consult)
+            .expect("artifact root");
+        for index in 0..=MAX_RUN_ROOT_ENTRIES.saturating_mul(8) {
+            fs::create_dir(root.path().join(format!("scan-budget-{index}")))
+                .expect("marker-scan entry");
+        }
+        let key_path = repository
+            .common_dir
+            .join("maco/state")
+            .join(ARTIFACT_MAC_KEY_FILE);
+
+        let error = ArtifactMacKeyWriter::open(&repository)
+            .err()
+            .expect("marker scan budget must fail closed");
+        assert!(error.to_string().contains("global entry budget"));
+        assert!(!key_path.exists());
     }
 
     #[test]
@@ -2740,6 +3115,26 @@ mod tests {
         assert!(!run_dir(&repo, RunArtifactFamily::Autopilot, &run_id).exists());
         let quarantine = run_root(&repo, RunArtifactFamily::Autopilot).join(QUARANTINE_DIRECTORY);
         assert_eq!(fs::read_dir(quarantine).expect("quarantine").count(), 0);
+    }
+
+    fn finalize_private_test_run(
+        repo: &Path,
+        family: RunArtifactFamily,
+        run_id: &RunId,
+        producer: &str,
+    ) {
+        let mut writer = ArtifactRunWriter::reserve(repo, family, run_id.clone(), producer)
+            .expect("reserve test writer");
+        writer
+            .write_json(
+                family.final_report_relative_path(),
+                &serde_json::json!({"status":"done"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write test report");
+        writer
+            .finalize(&family.final_report_relative_path(), false)
+            .expect("finalize test run");
     }
 
     fn committed_repo() -> (TempDir, PathBuf) {
