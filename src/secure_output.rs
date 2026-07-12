@@ -30,6 +30,15 @@ use std::{
 #[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildSetupFault {
+    None,
+    #[cfg(test)]
+    BeforeOpen,
+    #[cfg(test)]
+    AfterOpen,
+}
+
 /// A private directory held open independently of its potentially tainted pathname.
 #[derive(Debug)]
 pub(crate) struct SecureOutputRoot {
@@ -90,15 +99,20 @@ impl SecureOutputRoot {
 
     /// Creates a private direct child and returns it as another descriptor-held root.
     pub(crate) fn create_child(&self, name: &OsStr) -> Result<Self> {
-        self.create_child_impl(name, false)
+        self.create_child_impl(name, ChildSetupFault::None)
+    }
+
+    #[cfg(test)]
+    fn create_child_failing_before_open(&self, name: &OsStr) -> Result<Self> {
+        self.create_child_impl(name, ChildSetupFault::BeforeOpen)
     }
 
     #[cfg(test)]
     fn create_child_failing_after_open(&self, name: &OsStr) -> Result<Self> {
-        self.create_child_impl(name, true)
+        self.create_child_impl(name, ChildSetupFault::AfterOpen)
     }
 
-    fn create_child_impl(&self, name: &OsStr, fail_after_open: bool) -> Result<Self> {
+    fn create_child_impl(&self, name: &OsStr, fault: ChildSetupFault) -> Result<Self> {
         #[cfg(unix)]
         {
             self.verify_path_identity()?;
@@ -114,25 +128,57 @@ impl SecureOutputRoot {
                     )
                 });
             }
-            self.directory.sync_all().with_context(|| {
-                format!(
-                    "failed to flush secure output parent {}",
-                    self.path.display()
-                )
-            })?;
+            let created_identity = created_directory_identity(&self.directory, &name_c)
+                .with_context(|| {
+                    format!(
+                        "failed to bind newly created secure child {}",
+                        self.path.join(name).display()
+                    )
+                })?;
+            if let Err(error) = self.directory.sync_all() {
+                cleanup_created_directory(
+                    &self.directory,
+                    &name_c,
+                    created_identity,
+                    &self.path.join(name),
+                )?;
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to flush secure output parent {}",
+                        self.path.display()
+                    )
+                });
+            }
+            #[cfg(test)]
+            if fault == ChildSetupFault::BeforeOpen {
+                cleanup_created_directory(
+                    &self.directory,
+                    &name_c,
+                    created_identity,
+                    &self.path.join(name),
+                )?;
+                bail!("synthetic secure child setup failure before open");
+            }
             let directory = match openat_directory(self.directory.as_raw_fd(), &name_c) {
                 Ok(directory) => directory,
                 Err(error) => {
+                    cleanup_created_directory(
+                        &self.directory,
+                        &name_c,
+                        created_identity,
+                        &self.path.join(name),
+                    )?;
                     return Err(error).with_context(|| {
                         format!(
                             "failed to open secure output child {}",
                             self.path.join(name).display()
                         )
-                    })
+                    });
                 }
             };
             let prepared = (|| -> Result<(u64, u64)> {
-                if fail_after_open {
+                #[cfg(test)]
+                if fault == ChildSetupFault::AfterOpen {
                     bail!("synthetic secure child setup failure after open");
                 }
                 let metadata = directory.metadata()?;
@@ -147,7 +193,7 @@ impl SecureOutputRoot {
                     cleanup_created_directory(
                         &self.directory,
                         &name_c,
-                        &directory,
+                        created_identity,
                         &self.path.join(name),
                     )?;
                     return Err(error).with_context(|| {
@@ -204,28 +250,65 @@ impl SecureOutputRoot {
 
     /// Reserves a new `0600` regular file before releasing less-trusted execution.
     pub(crate) fn reserve(&self, name: &OsStr) -> Result<ReservedOutputFile> {
-        self.reserve_impl(name, false)
+        self.reserve_impl(name, false, false)
     }
 
     /// Opens a previously secured leaf or creates it. Intended for resumable state only.
     pub(crate) fn open_or_reserve(&self, name: &OsStr) -> Result<ReservedOutputFile> {
-        self.reserve_impl(name, true)
+        self.reserve_impl(name, true, false)
     }
 
-    fn reserve_impl(&self, name: &OsStr, allow_existing: bool) -> Result<ReservedOutputFile> {
+    #[cfg(test)]
+    fn reserve_failing_after_open(&self, name: &OsStr) -> Result<ReservedOutputFile> {
+        self.reserve_impl(name, false, true)
+    }
+
+    fn reserve_impl(
+        &self,
+        name: &OsStr,
+        allow_existing: bool,
+        fail_after_open: bool,
+    ) -> Result<ReservedOutputFile> {
         #[cfg(unix)]
         {
             self.verify_path_identity()?;
             let name_c = leaf_cstring(name)?;
-            let mut flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-            if allow_existing {
-                flags |= libc::O_CREAT;
+            let base_flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            let (fd, created) = if allow_existing {
+                // SAFETY: the held directory fd and NUL-terminated leaf name remain valid.
+                let existing = unsafe {
+                    libc::openat(self.directory.as_raw_fd(), name_c.as_ptr(), base_flags)
+                };
+                if existing >= 0 {
+                    (existing, false)
+                } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                    // SAFETY: the descriptor and name are valid; O_EXCL prevents raced reuse.
+                    let created = unsafe {
+                        libc::openat(
+                            self.directory.as_raw_fd(),
+                            name_c.as_ptr(),
+                            base_flags | libc::O_CREAT | libc::O_EXCL,
+                            0o600,
+                        )
+                    };
+                    (created, true)
+                } else {
+                    (-1, false)
+                }
             } else {
-                flags |= libc::O_CREAT | libc::O_EXCL;
-            }
-            // SAFETY: the held directory fd and NUL-terminated leaf name remain valid.
-            let fd =
-                unsafe { libc::openat(self.directory.as_raw_fd(), name_c.as_ptr(), flags, 0o600) };
+                // SAFETY: the descriptor and name are valid; O_EXCL prevents existing reuse.
+                (
+                    unsafe {
+                        libc::openat(
+                            self.directory.as_raw_fd(),
+                            name_c.as_ptr(),
+                            base_flags | libc::O_CREAT | libc::O_EXCL,
+                            0o600,
+                        )
+                    },
+                    true,
+                )
+            };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error()).with_context(|| {
                     format!(
@@ -237,20 +320,38 @@ impl SecureOutputRoot {
             // SAFETY: `openat` returned an owned descriptor.
             let file = unsafe { File::from_raw_fd(fd) };
             let metadata = file.metadata()?;
-            validate_private_file(&metadata, &self.path.join(name))?;
-            file.sync_all().with_context(|| {
-                format!(
-                    "failed to flush reserved secure output {}",
-                    self.path.join(name).display()
-                )
-            })?;
-            self.directory.sync_all().with_context(|| {
-                format!(
-                    "failed to flush secure output directory {}",
-                    self.path.display()
-                )
-            })?;
             use std::os::unix::fs::MetadataExt;
+            let identity = (metadata.dev(), metadata.ino());
+            let prepared = (|| -> Result<()> {
+                if fail_after_open {
+                    bail!("synthetic secure output setup failure after open");
+                }
+                validate_private_file(&metadata, &self.path.join(name))?;
+                file.sync_all().with_context(|| {
+                    format!(
+                        "failed to flush reserved secure output {}",
+                        self.path.join(name).display()
+                    )
+                })?;
+                self.directory.sync_all().with_context(|| {
+                    format!(
+                        "failed to flush secure output directory {}",
+                        self.path.display()
+                    )
+                })?;
+                Ok(())
+            })();
+            if let Err(error) = prepared {
+                if created {
+                    cleanup_created_file(
+                        &self.directory,
+                        &name_c,
+                        identity,
+                        &self.path.join(name),
+                    )?;
+                }
+                return Err(error);
+            }
             let slot = ReservedOutputFile {
                 path: self.path.join(name),
                 directory: self.directory.try_clone()?,
@@ -258,8 +359,8 @@ impl SecureOutputRoot {
                 name: name.to_os_string(),
                 root_device: self.device,
                 root_inode: self.inode,
-                device: metadata.dev(),
-                inode: metadata.ino(),
+                device: identity.0,
+                inode: identity.1,
             };
             slot.verify_path_identity()?;
             return Ok(slot);
@@ -567,14 +668,33 @@ fn openat_directory(parent: RawFd, name: &CString) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
+fn created_directory_identity(parent: &File, name: &CString) -> Result<(u64, u64)> {
+    // SAFETY: storage is initialized and the descriptor/name are valid.
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut metadata,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("failed to stat created directory");
+    }
+    if (metadata.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        bail!("created secure output child was rebound to a non-directory");
+    }
+    Ok((metadata.st_dev as u64, metadata.st_ino as u64))
+}
+
+#[cfg(unix)]
 fn cleanup_created_directory(
     parent: &File,
     name: &CString,
-    directory: &File,
+    expected: (u64, u64),
     display_path: &Path,
 ) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let expected = directory.metadata()?;
     // SAFETY: storage is initialized and the descriptor/name are valid.
     let mut actual = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe {
@@ -593,8 +713,8 @@ fn cleanup_created_directory(
             )
         });
     }
-    if actual.st_dev as u64 != expected.dev()
-        || actual.st_ino as u64 != expected.ino()
+    if actual.st_dev as u64 != expected.0
+        || actual.st_ino as u64 != expected.1
         || (actual.st_mode & libc::S_IFMT) != libc::S_IFDIR
     {
         bail!(
@@ -607,6 +727,53 @@ fn cleanup_created_directory(
         return Err(std::io::Error::last_os_error()).with_context(|| {
             format!(
                 "failed to clean up incomplete secure child {}",
+                display_path.display()
+            )
+        });
+    }
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cleanup_created_file(
+    parent: &File,
+    name: &CString,
+    expected: (u64, u64),
+    display_path: &Path,
+) -> Result<()> {
+    // SAFETY: storage is initialized and the descriptor/name are valid.
+    let mut actual = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut actual,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to inspect failed secure output {}",
+                display_path.display()
+            )
+        });
+    }
+    if actual.st_dev as u64 != expected.0
+        || actual.st_ino as u64 != expected.1
+        || (actual.st_mode & libc::S_IFMT) != libc::S_IFREG
+    {
+        bail!(
+            "refusing to clean up rebound secure output {}",
+            display_path.display()
+        );
+    }
+    // SAFETY: unlinkat never follows the final component.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to clean up incomplete secure output {}",
                 display_path.display()
             )
         });
@@ -761,11 +928,29 @@ mod tests {
         let temp = tempdir()?;
         let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
         assert!(root
+            .create_child_failing_before_open(OsStr::new("incoming"))
+            .is_err());
+        assert!(!root.path().join("incoming").exists());
+        assert!(root
             .create_child_failing_after_open(OsStr::new("incoming"))
             .is_err());
         assert!(!root.path().join("incoming").exists());
         let child = root.create_child(OsStr::new("incoming"))?;
         assert!(child.path().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_new_leaf_setup_cleans_identity_bound_file_for_retry() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        assert!(root
+            .reserve_failing_after_open(OsStr::new("report.json"))
+            .is_err());
+        assert!(!root.path().join("report.json").exists());
+        let slot = root.reserve(OsStr::new("report.json"))?;
+        assert!(slot.path().is_file());
         Ok(())
     }
 
