@@ -30,6 +30,8 @@ const GH_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
 const PUBLICATION_JOURNAL_MAX_DIRECTORY_ENTRIES: usize = 96;
 const PUBLICATION_JOURNAL_MAX_RECORDS: usize = 64;
 const PUBLICATION_JOURNAL_MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
+const SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES: [&str; 2] =
+    ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationRemoteTransport {
@@ -200,6 +202,7 @@ struct PublicationGitContext {
     directory: PathBuf,
     _runtime_directory: merge::PrivateRuntimeDirectory,
     environment: BTreeMap<String, String>,
+    trusted_global_known_hosts: Option<PathBuf>,
 }
 
 struct GhCommandContext {
@@ -2382,7 +2385,7 @@ impl PublicationGitContext {
             merge::PrivateRuntimeKind::PublicationGit,
         )?;
         let directory = runtime_directory.path().to_path_buf();
-        let result = (|| -> Result<BTreeMap<String, String>> {
+        let result = (|| -> Result<(BTreeMap<String, String>, Option<PathBuf>)> {
             let objects = directory.join("objects");
             merge::create_private_directory(&objects)?;
             merge::create_private_directory(&directory.join("refs"))?;
@@ -2424,11 +2427,18 @@ impl PublicationGitContext {
                 .context("failed to disable external publication protocol")?;
             let uses_ssh =
                 publication_remote_transport(remote_url)? == PublicationRemoteTransport::Ssh;
-            if uses_ssh {
+            let trusted_global_known_hosts = if uses_ssh {
+                let global_known_hosts = trusted_global_known_hosts_file()?;
                 config
-                    .set_str("core.sshcommand", &fixed_trusted_ssh_command()?)
+                    .set_str(
+                        "core.sshcommand",
+                        &fixed_trusted_ssh_command(&global_known_hosts)?,
+                    )
                     .context("failed to bind trusted publication SSH command")?;
-            }
+                Some(global_known_hosts)
+            } else {
+                None
+            };
             drop(config);
             let global_config = directory.join("disabled-global-config");
             merge::write_private_file(&global_config, b"")?;
@@ -2446,19 +2456,30 @@ impl PublicationGitContext {
                 "remote.maco-publication.url".to_string(),
             );
             environment.insert("GIT_CONFIG_VALUE_0".to_string(), remote_url.to_string());
-            Ok(environment)
+            Ok((environment, trusted_global_known_hosts))
         })();
         match result {
-            Ok(environment) => Ok(Self {
+            Ok((environment, trusted_global_known_hosts)) => Ok(Self {
                 directory,
                 _runtime_directory: runtime_directory,
                 environment,
+                trusted_global_known_hosts,
             }),
             Err(error) => Err(error),
         }
     }
 
     fn run(&self, label: &str, operation: Vec<OsString>) -> Result<merge::RequiredCommandOutput> {
+        if let Some(expected) = &self.trusted_global_known_hosts {
+            let current = trusted_global_known_hosts_file()?;
+            if &current != expected {
+                bail!(
+                    "trusted global SSH known-hosts binding changed from {} to {} before command execution",
+                    expected.display(),
+                    current.display()
+                );
+            }
+        }
         let args = self.command_args(operation);
         merge::run_required_direct(
             label,
@@ -2692,19 +2713,212 @@ fn validate_ssh_port(suffix: &str) -> Result<()> {
     Ok(())
 }
 
-fn fixed_trusted_ssh_command() -> Result<String> {
+fn fixed_trusted_ssh_command(global_known_hosts: &Path) -> Result<String> {
     let ssh = merge::resolve_trusted_executable("ssh")?;
     let ssh = ssh
         .to_str()
         .context("trusted SSH executable path was not UTF-8")?;
-    if !ssh.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.' | b'+')
-    }) {
-        bail!("trusted SSH executable path contained unsafe shell characters");
+    let global_known_hosts = global_known_hosts
+        .to_str()
+        .context("trusted global SSH known-hosts path was not UTF-8")?;
+    if !ssh_shell_token_is_safe(ssh) || !ssh_shell_token_is_safe(global_known_hosts) {
+        bail!("trusted SSH executable or known-hosts path contained unsafe shell characters");
     }
-    Ok(format!(
-        "{ssh} -F /dev/null -o BatchMode=yes -o PermitLocalCommand=no -o ProxyCommand=none -o ClearAllForwardings=yes -o RequestTTY=no"
-    ))
+    let mut command = vec![ssh.to_string()];
+    command.extend(fixed_trusted_ssh_options(global_known_hosts));
+    Ok(command.join(" "))
+}
+
+fn fixed_trusted_ssh_options(global_known_hosts: &str) -> Vec<String> {
+    [
+        "-F".to_string(),
+        "/dev/null".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "IdentityFile=none".to_string(),
+        "-o".to_string(),
+        "CertificateFile=none".to_string(),
+        "-o".to_string(),
+        "PKCS11Provider=none".to_string(),
+        "-o".to_string(),
+        "SecurityKeyProvider=none".to_string(),
+        "-o".to_string(),
+        "PreferredAuthentications=publickey".to_string(),
+        "-o".to_string(),
+        "PubkeyAuthentication=yes".to_string(),
+        "-o".to_string(),
+        "GSSAPIAuthentication=no".to_string(),
+        "-o".to_string(),
+        "HostbasedAuthentication=no".to_string(),
+        "-o".to_string(),
+        "PasswordAuthentication=no".to_string(),
+        "-o".to_string(),
+        "KbdInteractiveAuthentication=no".to_string(),
+        "-o".to_string(),
+        "ForwardAgent=no".to_string(),
+        "-o".to_string(),
+        "AddKeysToAgent=no".to_string(),
+        "-o".to_string(),
+        "PermitLocalCommand=no".to_string(),
+        "-o".to_string(),
+        "ProxyCommand=none".to_string(),
+        "-o".to_string(),
+        "ClearAllForwardings=yes".to_string(),
+        "-o".to_string(),
+        "RequestTTY=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-o".to_string(),
+        format!("GlobalKnownHostsFile={global_known_hosts}"),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        "VerifyHostKeyDNS=no".to_string(),
+        "-o".to_string(),
+        "UpdateHostKeys=no".to_string(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn ssh_shell_token_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.' | b'+')
+        })
+}
+
+#[cfg(unix)]
+fn trusted_global_known_hosts_file() -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for candidate in SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES {
+        let candidate = Path::new(candidate);
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect trusted global SSH known-hosts candidate {}",
+                        candidate.display()
+                    )
+                })
+            }
+        }
+        validate_trusted_ssh_path_ancestors(
+            candidate
+                .parent()
+                .context("global SSH known-hosts candidate omitted its parent")?,
+        )?;
+        let canonical = fs::canonicalize(candidate).with_context(|| {
+            format!(
+                "failed to resolve trusted global SSH known-hosts candidate {}",
+                candidate.display()
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&canonical).with_context(|| {
+            format!(
+                "failed to inspect resolved global SSH known-hosts file {}",
+                canonical.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            bail!(
+                "trusted global SSH known-hosts file {} is not a root-owned, non-writable regular file",
+                canonical.display()
+            );
+        }
+        validate_trusted_ssh_path_ancestors(
+            canonical
+                .parent()
+                .context("resolved global SSH known-hosts file omitted its parent")?,
+        )?;
+        return Ok(canonical);
+    }
+    bail!(
+        "SSH publication requires a root-managed global known-hosts file at {} or {}; configure the target host key there before retrying",
+        SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES[0],
+        SYSTEM_SSH_KNOWN_HOSTS_CANDIDATES[1]
+    )
+}
+
+#[cfg(unix)]
+fn validate_trusted_ssh_path_ancestors(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor).with_context(|| {
+            format!(
+                "failed to inspect global SSH known-hosts ancestor {}",
+                ancestor.display()
+            )
+        })?;
+        let mode = metadata.permissions().mode();
+        let filesystem_read_only = if mode & 0o022 != 0 {
+            ssh_path_filesystem_is_read_only(ancestor)?
+        } else {
+            false
+        };
+        if !trusted_ssh_ancestor_metadata_is_safe(
+            metadata.file_type().is_symlink(),
+            metadata.file_type().is_dir(),
+            metadata.uid(),
+            mode,
+            filesystem_read_only,
+        ) {
+            bail!(
+                "global SSH known-hosts ancestor {} is not a trusted root-owned directory",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn trusted_ssh_ancestor_metadata_is_safe(
+    is_symlink: bool,
+    is_directory: bool,
+    uid: u32,
+    mode: u32,
+    filesystem_read_only: bool,
+) -> bool {
+    !is_symlink && is_directory && uid == 0 && (mode & 0o022 == 0 || filesystem_read_only)
+}
+
+#[cfg(unix)]
+fn ssh_path_filesystem_is_read_only(path: &Path) -> Result<bool> {
+    use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+    let path_bytes = path.as_os_str().as_bytes();
+    let path_c = CString::new(path_bytes).with_context(|| {
+        format!(
+            "global SSH known-hosts path {} contained an interior NUL",
+            path.display()
+        )
+    })?;
+    let mut status = MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path_c.as_ptr(), status.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to inspect filesystem flags for global SSH known-hosts path {}",
+                path.display()
+            )
+        });
+    }
+    let status = unsafe { status.assume_init() };
+    Ok(status.f_flag & libc::ST_RDONLY as libc::c_ulong != 0)
+}
+
+#[cfg(not(unix))]
+fn trusted_global_known_hosts_file() -> Result<PathBuf> {
+    bail!("trusted global SSH known-hosts resolution is unsupported on this platform")
 }
 
 fn ensure_remote_expected_commit(
@@ -4591,6 +4805,21 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_path = temp.path().join("repo");
         Repository::init(&repo_path).expect("init repo");
+        let expected_known_hosts = match trusted_global_known_hosts_file() {
+            Ok(path) => path,
+            Err(expected_error) => {
+                let actual_error = match PublicationGitContext::create(
+                    &repo_path,
+                    "github.example:owner/repo.git",
+                ) {
+                    Ok(_) => panic!("SSH publication context must fail without trusted host keys"),
+                    Err(error) => error,
+                };
+                assert_eq!(actual_error.to_string(), expected_error.to_string());
+                assert!(actual_error.to_string().contains("global SSH known-hosts"));
+                return;
+            }
+        };
         let context = PublicationGitContext::create(&repo_path, "github.example:owner/repo.git")
             .expect("create userless SCP publication context");
         let config = git2::Config::open(&context.directory.join("config"))
@@ -4599,11 +4828,182 @@ mod tests {
             .get_string("core.sshcommand")
             .expect("fixed SSH command must be configured");
         assert!(command.contains(" -F /dev/null "));
-        assert!(command.contains("ProxyCommand=none"));
+        for required in [
+            "BatchMode=yes",
+            "IdentityFile=none",
+            "CertificateFile=none",
+            "PKCS11Provider=none",
+            "SecurityKeyProvider=none",
+            "PreferredAuthentications=publickey",
+            "PubkeyAuthentication=yes",
+            "GSSAPIAuthentication=no",
+            "HostbasedAuthentication=no",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "ForwardAgent=no",
+            "AddKeysToAgent=no",
+            "PermitLocalCommand=no",
+            "ProxyCommand=none",
+            "ClearAllForwardings=yes",
+            "RequestTTY=no",
+            "UserKnownHostsFile=/dev/null",
+            "StrictHostKeyChecking=yes",
+            "VerifyHostKeyDNS=no",
+            "UpdateHostKeys=no",
+        ] {
+            assert!(
+                command.contains(required),
+                "missing SSH control: {required}"
+            );
+        }
+        assert!(command.contains(&format!(
+            "GlobalKnownHostsFile={}",
+            expected_known_hosts.display()
+        )));
+        assert_eq!(
+            context.trusted_global_known_hosts.as_ref(),
+            Some(&expected_known_hosts)
+        );
         assert_eq!(
             context.environment.get("SSH_AUTH_SOCK"),
             env::var("SSH_AUTH_SOCK").ok().as_ref()
         );
+        for key in [
+            "HOME",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ] {
+            assert!(
+                !context.environment.contains_key(key),
+                "unexpected inherited SSH input {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_ssh_options_disable_ambient_auth_and_host_discovery() {
+        let rendered = fixed_trusted_ssh_options("/etc/ssh/ssh_known_hosts").join(" ");
+        for required in [
+            "-F /dev/null",
+            "IdentityFile=none",
+            "CertificateFile=none",
+            "PKCS11Provider=none",
+            "SecurityKeyProvider=none",
+            "PreferredAuthentications=publickey",
+            "GSSAPIAuthentication=no",
+            "HostbasedAuthentication=no",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "ForwardAgent=no",
+            "AddKeysToAgent=no",
+            "ProxyCommand=none",
+            "UserKnownHostsFile=/dev/null",
+            "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts",
+            "StrictHostKeyChecking=yes",
+            "VerifyHostKeyDNS=no",
+            "UpdateHostKeys=no",
+        ] {
+            assert!(
+                rendered.contains(required),
+                "missing SSH control: {required}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_ssh_effective_config_has_only_fixed_auth_and_host_key_inputs() {
+        fn values<'a>(config: &'a str, key: &str) -> Vec<&'a str> {
+            config
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix(key)
+                        .and_then(|line| line.strip_prefix(' '))
+                })
+                .collect()
+        }
+
+        let ssh = merge::resolve_trusted_executable("ssh").expect("resolve trusted ssh");
+        let known_hosts = "/etc/ssh/ssh_known_hosts";
+        let output = Command::new(ssh)
+            .args(fixed_trusted_ssh_options(known_hosts))
+            .args(["-G", "maco-publication.invalid"])
+            .env_clear()
+            .output()
+            .expect("inspect effective trusted SSH configuration");
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective = String::from_utf8(output.stdout).expect("ssh -G output is UTF-8");
+        let assert_disabled = |key: &str| {
+            let actual = values(&effective, key);
+            assert!(
+                actual.len() == 1 && matches!(actual[0], "no" | "false"),
+                "effective {key} was not disabled: {actual:?}"
+            );
+        };
+
+        assert_eq!(values(&effective, "identityfile"), ["none"]);
+        assert_eq!(values(&effective, "certificatefile"), ["none"]);
+        assert_eq!(values(&effective, "userknownhostsfile"), ["/dev/null"]);
+        assert_eq!(values(&effective, "globalknownhostsfile"), [known_hosts]);
+        assert_eq!(values(&effective, "stricthostkeychecking"), ["true"]);
+        assert_disabled("verifyhostkeydns");
+        assert_disabled("updatehostkeys");
+        assert_eq!(
+            values(&effective, "preferredauthentications"),
+            ["publickey"]
+        );
+        assert_eq!(values(&effective, "pubkeyauthentication"), ["true"]);
+        assert_disabled("hostbasedauthentication");
+        assert_disabled("passwordauthentication");
+        assert_disabled("kbdinteractiveauthentication");
+        assert_disabled("forwardagent");
+        assert_disabled("addkeystoagent");
+
+        for key in [
+            "proxycommand",
+            "proxyjump",
+            "pkcs11provider",
+            "securitykeyprovider",
+        ] {
+            assert!(
+                values(&effective, key).iter().all(|value| *value == "none"),
+                "unexpected effective {key}: {:?}",
+                values(&effective, key)
+            );
+        }
+        let gssapi = values(&effective, "gssapiauthentication");
+        assert!(
+            (gssapi.len() == 1 && matches!(gssapi[0], "no" | "false"))
+                || (gssapi.is_empty()
+                    && stderr.contains("unsupported option")
+                    && stderr.contains("gssapiauthentication")),
+            "GSSAPI was not disabled: effective={gssapi:?}, stderr={stderr:?}"
+        );
+        assert!(!effective.contains("/.ssh/"));
+        assert!(!effective.contains(".ssh/id_"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_sticky_ssh_ancestor_requires_read_only_mount_proof() {
+        assert!(!trusted_ssh_ancestor_metadata_is_safe(
+            false, true, 0, 0o17_75, false
+        ));
+        assert!(trusted_ssh_ancestor_metadata_is_safe(
+            false, true, 0, 0o17_75, true
+        ));
+        assert!(!trusted_ssh_ancestor_metadata_is_safe(
+            false, true, 1000, 0o755, true
+        ));
     }
 
     #[cfg(unix)]

@@ -575,9 +575,18 @@ and custom SSH routing variables are absent. `ssh://`, `git+ssh://`,
 `ssh+git://`, and SCP-style origins with an optional user (including userless
 `host:path` and bracketed IPv6 hosts) are structurally classified as SSH. Every
 such origin uses a trusted absolute `ssh` with user config disabled, batch mode,
-`ProxyCommand=none`, and local commands disabled; ambiguous authorities and
-unsupported URL schemes are refused. `SSH_AUTH_SOCK` is the only preserved SSH
-data-auth input. HTTPS Git publication therefore requires credentials in
+`ProxyCommand=none`, and local commands disabled. Default identity and certificate
+files, PKCS#11/security-key providers, GSSAPI, host-based, password, and
+keyboard-interactive authentication are disabled; agent forwarding and adding
+keys to the agent are also disabled. `SSH_AUTH_SOCK` is therefore the only
+preserved SSH data-auth input. Host authentication is separate and fail-closed:
+user known-host files and DNS/update discovery are disabled, strict host-key
+checking is enabled, and `GlobalKnownHostsFile` is bound to the canonical target
+of a root-owned, non-writable `/etc/ssh/ssh_known_hosts` (or
+`ssh_known_hosts2`). If neither system file exists, is trusted, or contains the
+requested host, an administrator must provision it before SSH publication can
+succeed. Ambiguous authorities and unsupported URL schemes are refused. HTTPS
+Git publication therefore requires credentials in
 unencoded URL userinfo or another transport that needs no inherited helper.
 Query, fragment, and percent-encoded credential forms are refused because
 reliable transport and error redaction semantics cannot be guaranteed.
