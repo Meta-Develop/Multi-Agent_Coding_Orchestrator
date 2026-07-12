@@ -207,6 +207,17 @@ impl ExternalAgentRun {
     pub(crate) fn stdout_bytes(&self) -> &[u8] {
         &self.stdout.bytes
     }
+
+    /// Scratch output may be discarded only when the main target was never
+    /// released or its owned process tree is proven empty.
+    #[allow(dead_code)] // Used by artifact producer migrations that may cherry-pick this API first.
+    pub(crate) fn scratch_quiescence_verified(&self) -> bool {
+        !self.stdout.target_launch_attempted
+            || self
+                .process_tree
+                .as_ref()
+                .is_some_and(|evidence| evidence.is_verified_empty())
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -215,6 +226,12 @@ pub struct CapturedOutput {
     pub truncated: bool,
     #[serde(skip, default)]
     bytes: Vec<u8>,
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "default_target_launch_attempted"
+    )]
+    target_launch_attempted: bool,
 }
 
 impl std::fmt::Debug for CapturedOutput {
@@ -227,6 +244,10 @@ impl std::fmt::Debug for CapturedOutput {
             self.bytes.len()
         )
     }
+}
+
+fn default_target_launch_attempted() -> bool {
+    true
 }
 
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
@@ -483,6 +504,7 @@ fn run_external_agent_runtime(
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     };
 
+    report.stdout.target_launch_attempted = true;
     match run_process(process_spec) {
         Ok(output) => {
             let safety_verified = output.safety_evidence_verified();
@@ -500,6 +522,7 @@ fn run_external_agent_runtime(
                 });
             }
             report.stdout = summarize_output(&output.stdout);
+            report.stdout.target_launch_attempted = true;
             report.stderr = summarize_output(&output.stderr);
             report.error = append_external_error(output.stdin_error, output.process_error);
             if output.timed_out {
@@ -1291,6 +1314,7 @@ fn summarize_output(output: &CapturedBytes) -> CapturedOutput {
         text: summary.text,
         truncated: summary.truncated,
         bytes: output.as_bytes().to_vec(),
+        target_launch_attempted: false,
     }
 }
 
@@ -1362,6 +1386,37 @@ mod tests {
             executable_identity: "identity".to_string(),
         });
         assert!(report.succeeded());
+    }
+
+    #[test]
+    fn scratch_quiescence_distinguishes_preflight_refusal_from_unverified_launch() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        );
+        let mut report = failed_external_run(
+            &command,
+            Instant::now(),
+            vec!["codex".to_string()],
+            false,
+            "preflight refused".to_string(),
+        );
+        assert!(report.scratch_quiescence_verified());
+
+        report.stdout.target_launch_attempted = true;
+        assert!(!report.scratch_quiescence_verified());
+        report.process_tree = Some(ProcessTreeEvidence::Unverified(
+            ContainmentBackend::SystemdUserService,
+        ));
+        assert!(!report.scratch_quiescence_verified());
+        report.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        assert!(report.scratch_quiescence_verified());
     }
 
     #[test]
@@ -1449,6 +1504,7 @@ mod tests {
         report.stdout.bytes = b"DO_NOT_DEBUG_private_stdout_bytes\0\xff".to_vec();
         let debug = format!("{report:?}");
         assert!(!debug.contains("DO_NOT_DEBUG_private_stdout_bytes"));
+        assert!(!debug.contains("target_launch_attempted"));
         assert!(debug.contains(&format!(
             "bytes: <redacted:{} bytes>",
             report.stdout.bytes.len()
@@ -1459,9 +1515,14 @@ mod tests {
             .get("stdout")
             .and_then(|stdout| stdout.get("bytes"))
             .is_none());
+        assert!(value
+            .get("stdout")
+            .and_then(|stdout| stdout.get("target_launch_attempted"))
+            .is_none());
         let decoded: ExternalAgentRun = serde_json::from_value(value)?;
         assert_eq!(decoded.output_last_message(), None);
         assert_eq!(decoded.stdout_bytes(), b"");
+        assert!(!decoded.scratch_quiescence_verified());
         Ok(())
     }
 
