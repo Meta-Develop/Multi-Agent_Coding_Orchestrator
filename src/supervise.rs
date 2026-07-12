@@ -9,16 +9,17 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{
-    Delta, DiffFindOptions, DiffOptions, ErrorCode, ObjectType, Oid, Repository, Status,
-    StatusOptions,
+    Delta, DiffFindOptions, DiffOptions, ErrorCode, IndexEntryExtendedFlag, IndexEntryFlag,
+    ObjectType, Oid, Repository, Status, StatusOptions,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
+    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +29,8 @@ const DEFAULT_MAX_CHILD_RETRIES: u8 = 0;
 const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
+const GITLINK_MODE: u32 = 0o160000;
+const MAX_NESTED_REPOSITORY_DEPTH: usize = 8;
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".maco",
     b".maco-cache",
@@ -318,7 +321,7 @@ pub struct ValidationResult {
 pub struct Finding {
     pub severity: FindingSeverity,
     pub message: String,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_finding_paths")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -1162,6 +1165,9 @@ fn run_supervisor_plan(
                 })?;
 
                 let primary_before = primary_worktree_snapshot(&repo)?;
+                if let Some(error) = primary_before.inspection_problem() {
+                    bail!("refusing to launch child without a complete primary integrity snapshot: {error}");
+                }
                 let mut command = ExternalAgentCommand::codex(
                     &options.codex_bin,
                     &worktree.path,
@@ -2372,8 +2378,10 @@ fn mark_primary_integrity_violation(
 struct PrimaryWorktreeSnapshot {
     head: PrimaryHeadSnapshot,
     index: BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>,
+    index_storage: PrimaryIndexStorageSnapshot,
     status: BTreeMap<Vec<u8>, Status>,
     worktree: BTreeMap<Vec<u8>, PrimaryPathState>,
+    inspection_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2399,6 +2407,18 @@ struct PrimaryIndexEntryState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PrimaryIndexStorageSnapshot {
+    worktree_index: IndexFileSnapshot,
+    shared_index: Option<IndexFileSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexFileSnapshot {
+    Missing,
+    Present { bytes: u64, digest: Oid },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PrimaryPathState {
     Missing,
     File {
@@ -2410,7 +2430,7 @@ enum PrimaryPathState {
         mode: u32,
     },
     Directory {
-        repository_head: Option<Oid>,
+        nested_repository: Option<Box<PrimaryWorktreeSnapshot>>,
         mode: u32,
     },
     Other {
@@ -2430,33 +2450,98 @@ impl PrimaryIntegrityChanges {
     }
 }
 
+impl PrimaryWorktreeSnapshot {
+    fn inspection_problem(&self) -> Option<String> {
+        if let Some(error) = &self.inspection_error {
+            return Some(error.clone());
+        }
+        self.worktree.iter().find_map(|(path, state)| {
+            let PrimaryPathState::Directory {
+                nested_repository: Some(nested),
+                ..
+            } = state
+            else {
+                return None;
+            };
+            nested.inspection_problem().map(|error| {
+                format!(
+                    "nested repository {}: {error}",
+                    finding_path_from_git_bytes(path).display()
+                )
+            })
+        })
+    }
+}
+
 fn primary_worktree_snapshot(repo_path: &Path) -> Result<PrimaryWorktreeSnapshot> {
+    primary_worktree_snapshot_at_depth(repo_path, 0)
+}
+
+fn primary_worktree_snapshot_at_depth(
+    repo_path: &Path,
+    depth: usize,
+) -> Result<PrimaryWorktreeSnapshot> {
+    if depth > MAX_NESTED_REPOSITORY_DEPTH {
+        bail!(
+            "primary integrity snapshot exceeded nested repository depth {} at {}",
+            MAX_NESTED_REPOSITORY_DEPTH,
+            repo_path.display()
+        );
+    }
     let repo = Repository::open(repo_path)
         .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
     let workdir = repo
         .workdir()
         .context("primary integrity snapshot requires a non-bare repository")?;
     let head = primary_head_snapshot(&repo)?;
-    let index = primary_index_snapshot(&repo)?;
-    let status = repository_status_snapshot(&repo, "failed to inspect primary worktree status")?;
+    let (status, index, inspection_error) =
+        match repository_status_snapshot(&repo, "failed to inspect primary worktree status") {
+            Ok(status) => match primary_index_snapshot(&repo) {
+                Ok(index) => (status, index, None),
+                Err(error) => (status, BTreeMap::new(), Some(error.to_string())),
+            },
+            Err(error) => (BTreeMap::new(), BTreeMap::new(), Some(error.to_string())),
+        };
+    let index_storage = primary_index_storage_snapshot(&repo)?;
+
+    let gitlink_paths = index
+        .iter()
+        .filter(|(_, state)| state.mode == GITLINK_MODE)
+        .map(|(key, _)| key.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut fingerprint_paths = status.keys().cloned().collect::<BTreeSet<_>>();
+    fingerprint_paths.extend(gitlink_paths.iter().cloned());
+    fingerprint_paths.extend(
+        index
+            .iter()
+            .filter(|(_, state)| index_entry_requires_fingerprint(state))
+            .map(|(key, _)| key.path.clone()),
+    );
 
     let mut worktree = BTreeMap::new();
-    for path in status.keys() {
-        let relative_path = repo_relative_path_from_git_bytes(path);
-        let state = primary_path_state(&workdir.join(&relative_path)).with_context(|| {
+    for path in fingerprint_paths {
+        let relative_path = repo_relative_path_from_git_bytes(&path);
+        let state = primary_path_state(
+            &workdir.join(&relative_path),
+            gitlink_paths.contains(&path),
+            depth,
+        )
+        .with_context(|| {
             format!(
                 "failed to fingerprint primary worktree path {}",
                 relative_path.display()
             )
         })?;
-        worktree.insert(path.clone(), state);
+        worktree.insert(path, state);
     }
 
     Ok(PrimaryWorktreeSnapshot {
         head,
         index,
+        index_storage,
         status,
         worktree,
+        inspection_error,
     })
 }
 
@@ -2502,7 +2587,80 @@ fn primary_index_snapshot(
     Ok(entries)
 }
 
-fn primary_path_state(path: &Path) -> Result<PrimaryPathState> {
+fn index_entry_requires_fingerprint(state: &PrimaryIndexEntryState) -> bool {
+    IndexEntryFlag::from_bits_truncate(state.flags).contains(IndexEntryFlag::VALID)
+        || IndexEntryExtendedFlag::from_bits_truncate(state.flags_extended)
+            .contains(IndexEntryExtendedFlag::SKIP_WORKTREE)
+}
+
+fn primary_index_storage_snapshot(repo: &Repository) -> Result<PrimaryIndexStorageSnapshot> {
+    let worktree_index = index_file_snapshot(&repo.path().join("index"))?;
+    let shared_index = shared_index_path(repo)?
+        .map(|path| index_file_snapshot(&path))
+        .transpose()?;
+    Ok(PrimaryIndexStorageSnapshot {
+        worktree_index,
+        shared_index,
+    })
+}
+
+fn index_file_snapshot(path: &Path) -> Result<IndexFileSnapshot> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(IndexFileSnapshot::Missing);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read index storage {}", path.display()));
+        }
+    };
+    Ok(IndexFileSnapshot::Present {
+        bytes: bytes.len().try_into().unwrap_or(u64::MAX),
+        digest: Oid::hash_object(ObjectType::Blob, &bytes)
+            .context("failed to digest index storage")?,
+    })
+}
+
+fn shared_index_path(repo: &Repository) -> Result<Option<PathBuf>> {
+    let workdir = repo
+        .workdir()
+        .context("shared-index discovery requires a non-bare repository")?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(["rev-parse", "--shared-index-path"])
+        .output()
+        .context("failed to inspect split-index dependency")?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect split-index dependency: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut path = output.stdout;
+    while path
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        path.pop();
+    }
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let path = repo_relative_path_from_git_bytes(&path);
+    Ok(Some(if path.is_absolute() {
+        path
+    } else {
+        workdir.join(path)
+    }))
+}
+
+fn primary_path_state(
+    path: &Path,
+    capture_nested_repository: bool,
+    depth: usize,
+) -> Result<PrimaryPathState> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2525,11 +2683,24 @@ fn primary_path_state(path: &Path) -> Result<PrimaryPathState> {
         });
     }
     if file_type.is_dir() {
-        let repository_head = Repository::open(path)
-            .ok()
-            .and_then(|nested| nested.head().ok().and_then(|head| head.target()));
+        let nested_repository = if capture_nested_repository {
+            match Repository::open(path) {
+                Ok(_) => Some(Box::new(primary_worktree_snapshot_at_depth(
+                    path,
+                    depth.saturating_add(1),
+                )?)),
+                Err(error) if error.code() == ErrorCode::NotFound => None,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect nested repository {}", path.display())
+                    });
+                }
+            }
+        } else {
+            None
+        };
         return Ok(PrimaryPathState::Directory {
-            repository_head,
+            nested_repository,
             mode,
         });
     }
@@ -2572,8 +2743,18 @@ fn primary_integrity_changes(
         paths.extend(
             index_paths
                 .iter()
-                .map(|path| repo_relative_path_from_git_bytes(path)),
+                .map(|path| finding_path_from_git_bytes(path)),
         );
+    }
+
+    if before.index_storage != after.index_storage {
+        details.push("raw worktree index or split-index storage changed".to_string());
+        paths.insert(PathBuf::from(".git/index"));
+    }
+
+    if before.inspection_error != after.inspection_error {
+        details.push("primary index/status inspectability changed".to_string());
+        paths.insert(PathBuf::from(".git/index"));
     }
 
     let status_paths = changed_snapshot_paths(&before.status, &after.status);
@@ -2585,7 +2766,7 @@ fn primary_integrity_changes(
         paths.extend(
             status_paths
                 .iter()
-                .map(|path| repo_relative_path_from_git_bytes(path)),
+                .map(|path| finding_path_from_git_bytes(path)),
         );
     }
 
@@ -2598,7 +2779,7 @@ fn primary_integrity_changes(
         paths.extend(
             worktree_paths
                 .iter()
-                .map(|path| repo_relative_path_from_git_bytes(path)),
+                .map(|path| finding_path_from_git_bytes(path)),
         );
     }
 
@@ -2654,13 +2835,70 @@ fn display_primary_head(head: &PrimaryHeadSnapshot) -> String {
 fn display_git_paths(paths: &BTreeSet<Vec<u8>>) -> String {
     paths
         .iter()
-        .map(|path| {
-            repo_relative_path_from_git_bytes(path)
-                .display()
-                .to_string()
-        })
+        .map(|path| finding_path_from_git_bytes(path).display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn finding_path_from_git_bytes(path: &[u8]) -> PathBuf {
+    match std::str::from_utf8(path) {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => PathBuf::from(format!("<non-utf8-git-path>/{}", hex_encode(path))),
+    }
+}
+
+fn serialize_finding_paths<S>(paths: &[PathBuf], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    paths
+        .iter()
+        .map(|path| serializable_path(path))
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn serializable_path(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return path.to_string();
+    }
+    serializable_non_utf8_path(path)
+}
+
+#[cfg(unix)]
+fn serializable_non_utf8_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    format!(
+        "<non-utf8-git-path>/{}",
+        hex_encode(path.as_os_str().as_bytes())
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn serializable_non_utf8_path(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    format!(
+        "<non-unicode-windows-path>/{}",
+        path.as_os_str()
+            .encode_wide()
+            .map(|unit| format!("{unit:04x}"))
+            .collect::<String>()
+    )
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn serializable_non_utf8_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn claim_failure_finding(
@@ -3674,6 +3912,23 @@ mod tests {
         )
         .expect_err("garbage should not parse");
         assert!(error.to_string().contains("lenient JSON extraction failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finding_serialization_escapes_non_utf8_paths_reversibly() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let finding = Finding {
+            severity: FindingSeverity::Error,
+            message: "non-UTF8 evidence".to_string(),
+            paths: vec![PathBuf::from(OsString::from_vec(vec![
+                b'b', b'a', b'd', b'-', 0x80,
+            ]))],
+        };
+
+        let value = serde_json::to_value(finding).expect("serialize finding");
+        assert_eq!(value["paths"][0], "<non-utf8-git-path>/6261642d80");
     }
 
     #[test]

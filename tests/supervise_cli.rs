@@ -1640,6 +1640,247 @@ fn supervise_run_protects_tracked_content_under_runtime_directory() -> Result<()
 }
 
 #[test]
+fn supervise_run_rejects_assume_unchanged_primary_content_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_git(
+        &repo_path,
+        &["update-index", "--assume-unchanged", "README.md"],
+    )?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-assume-unchanged",
+        "supervise-primary-assume-unchanged",
+        false,
+        false,
+    )?;
+
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worktree content/type changed for README.md",
+        "README.md",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_skip_worktree_primary_content_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_git(
+        &repo_path,
+        &["update-index", "--skip-worktree", "README.md"],
+    )?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-skip-worktree",
+        "supervise-primary-skip-worktree",
+        false,
+        false,
+    )?;
+
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worktree content/type changed for README.md",
+        "README.md",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn supervise_run_allows_unchanged_index_flagged_primary_paths() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    run_git(
+        &repo_path,
+        &["update-index", "--assume-unchanged", "README.md"],
+    )?;
+    run_git(
+        &repo_path,
+        &["update-index", "--skip-worktree", "src/lib.rs"],
+    )?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-no-mutation",
+        "supervise-primary-flags-unchanged",
+        false,
+        true,
+    )?;
+
+    assert_eq!(report["success"], true);
+    assert_eq!(report["orchestrator_reports"][0]["status"], "succeeded");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn supervise_run_rejects_raw_primary_index_metadata_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-index-metadata",
+        "supervise-primary-index-metadata",
+        false,
+        false,
+    )?;
+
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "raw worktree index or split-index storage changed",
+        ".git/index",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_split_index_storage_transition() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-split-index",
+        "supervise-primary-split-index",
+        false,
+        false,
+    )?;
+
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "raw worktree index or split-index storage changed",
+        ".git/index",
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn supervise_run_rejects_preexisting_dirty_submodule_content_mutation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let source_path = temp.path().join("submodule-source");
+    let output = Command::new(BIN)
+        .args([
+            "init",
+            "--repo",
+            source_path.to_str().context("submodule source utf8")?,
+            "--json",
+        ])
+        .output()
+        .context("init submodule source")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "submodule source init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::write(source_path.join("nested.txt"), "nested baseline\n")
+        .context("write submodule source")?;
+    let source_repo = Repository::open(&source_path).context("open submodule source")?;
+    commit_all(&source_repo, "initial submodule content")?;
+
+    run_git(
+        &repo_path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            source_path.to_str().context("submodule path utf8")?,
+            "deps/nested",
+        ],
+    )?;
+    let repo = Repository::open(&repo_path).context("open primary repo")?;
+    commit_all(&repo, "add nested repository")?;
+    fs::write(
+        repo_path.join("deps/nested/nested.txt"),
+        "nested pre-existing dirty content\n",
+    )
+    .context("dirty nested repository")?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let unchanged = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-no-mutation",
+        "supervise-primary-dirty-submodule-unchanged",
+        true,
+        true,
+    )?;
+    assert_eq!(unchanged["success"], true);
+
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-dirty-submodule",
+        "supervise-primary-dirty-submodule",
+        true,
+        false,
+    )?;
+
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        "worktree content/type changed for deps/nested",
+        "deps/nested",
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn supervise_run_reports_non_utf8_primary_path_as_reversible_ascii() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let fake_codex = write_fake_codex(temp.path())?;
+
+    let report = run_primary_integrity_case(
+        temp.path(),
+        &repo_path,
+        &fake_codex,
+        "child-primary-non-utf8",
+        "supervise-primary-non-utf8",
+        false,
+        false,
+    )?;
+
+    let escaped = "<non-utf8-git-path>/6f70657261746f722d802e747874";
+    assert_finding(
+        &report["orchestrator_reports"][0]["findings"],
+        "error",
+        escaped,
+        escaped,
+    )?;
+    Ok(())
+}
+
+#[test]
 fn supervise_run_retries_report_shape_failure_once_with_corrective_feedback() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2976,7 +3217,9 @@ fn assert_finding(
     message_substring: &str,
     path: &str,
 ) -> Result<()> {
-    let findings = findings.as_array().context("findings array")?;
+    let findings = findings
+        .as_array()
+        .with_context(|| format!("findings array: {findings}"))?;
     let found = findings.iter().any(|finding| {
         finding["severity"] == severity
             && finding["message"]
@@ -3419,6 +3662,14 @@ case "$logical_name" in
     files_changed_json='[]'
     worker_reports_json='[]'
     ;;
+  child-primary-assume-unchanged|child-primary-skip-worktree|child-primary-index-metadata|child-primary-split-index|child-primary-dirty-submodule|child-primary-non-utf8)
+    path="README.md"
+    edit_path="README.md"
+    worker="worker-$logical_name"
+    edit=false
+    files_changed_json='[]'
+    worker_reports_json='[]'
+    ;;
   child-retry-shape)
     path="README.md"
     edit_path="README.md"
@@ -3532,6 +3783,28 @@ fi
 if [ "$logical_name" = "child-primary-tracked-runtime" ]; then
   primary="${report%%/.maco/o2/runs/*}"
   printf 'primary mutation from %s\n' "$name" >> "$primary/.maco-cache/tracked.txt"
+fi
+if [ "$logical_name" = "child-primary-assume-unchanged" ] || [ "$logical_name" = "child-primary-skip-worktree" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  printf 'primary mutation from %s\n' "$name" >> "$primary/README.md"
+fi
+if [ "$logical_name" = "child-primary-index-metadata" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  touch -t 200001010000 "$primary/README.md"
+  git -C "$primary" update-index --refresh
+fi
+if [ "$logical_name" = "child-primary-split-index" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  git -C "$primary" update-index --split-index
+fi
+if [ "$logical_name" = "child-primary-dirty-submodule" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  printf 'nested mutation from %s\n' "$name" >> "$primary/deps/nested/nested.txt"
+fi
+if [ "$logical_name" = "child-primary-non-utf8" ]; then
+  primary="${report%%/.maco/o2/runs/*}"
+  non_utf8_name="$(printf 'operator-\200.txt')"
+  printf 'non-utf8 primary mutation from %s\n' "$name" > "$primary/$non_utf8_name"
 fi
 if [ "$logical_name" = "child-primary-mid-commit" ]; then
   primary="${report%%/.maco/o2/runs/*}"
@@ -3683,6 +3956,78 @@ JSON
 
 fn write_plan(path: &Path, contents: &str) -> Result<()> {
     fs::write(path, contents).with_context(|| format!("write plan {}", path.display()))
+}
+
+fn run_primary_integrity_case(
+    root: &Path,
+    repo_path: &Path,
+    fake_codex: &Path,
+    child_id: &str,
+    run_id: &str,
+    allow_dirty_primary: bool,
+    expect_success: bool,
+) -> Result<Value> {
+    let plan_path = root.join(format!("{run_id}.json"));
+    write_plan(
+        &plan_path,
+        &format!(
+            r#"{{
+              "version": 1,
+              "task": "primary integrity regression {child_id}",
+              "max_depth": 2,
+              "max_child_processes": 1,
+              "child_timeout_seconds": 10,
+              "assignments": [
+                {{"id": "{child_id}", "assigned_paths": ["README.md"]}}
+              ]
+            }}"#
+        ),
+    )?;
+
+    let mut args = vec![
+        "supervise".to_string(),
+        "run".to_string(),
+        plan_path.to_string_lossy().into_owned(),
+        "--repo".to_string(),
+        repo_path.to_string_lossy().into_owned(),
+        "--run-id".to_string(),
+        run_id.to_string(),
+        "--codex-bin".to_string(),
+        fake_codex.to_string_lossy().into_owned(),
+    ];
+    if allow_dirty_primary {
+        args.push("--allow-dirty-primary".to_string());
+    }
+    args.push("--json".to_string());
+    let output = Command::new(BIN)
+        .args(&args)
+        .output()
+        .context("run primary integrity supervise case")?;
+    if output.status.success() != expect_success {
+        anyhow::bail!(
+            "primary integrity case {run_id} success mismatch: expected {expect_success}; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse primary integrity case JSON")
+}
+
+fn run_git(repo_path: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .context("run git")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
 }
 
 fn run_success_json_args(args: &[&str]) -> Result<Value> {
