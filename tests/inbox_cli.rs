@@ -862,15 +862,7 @@ fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Resul
 fn github_git_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    let origin_path = init_bare_origin(temp.path(), "github-git-origin.git")?;
-    run_git(&[
-        "-C",
-        path_str(&repo_path)?,
-        "remote",
-        "add",
-        "origin",
-        path_str(&origin_path)?,
-    ])?;
+    add_https_origin(&repo_path, "github-git-origin")?;
     write_json_file(
         &repo_path.join("maco-inbox.json"),
         &json!({
@@ -912,15 +904,7 @@ fn github_git_permission_refuses_without_bound_external_reviewer() -> Result<()>
 fn github_pr_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    let origin_path = init_bare_origin(temp.path(), "github-pr-origin.git")?;
-    run_git(&[
-        "-C",
-        path_str(&repo_path)?,
-        "remote",
-        "add",
-        "origin",
-        path_str(&origin_path)?,
-    ])?;
+    add_https_origin(&repo_path, "github-pr-origin")?;
     write_json_file(
         &repo_path.join("maco-inbox.json"),
         &json!({
@@ -963,19 +947,11 @@ fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()>
     let temp = TempDir::new().context("tempdir")?;
     let success_repo = create_named_committed_repo(temp.path(), "github-full-success")?;
     let fail_repo = create_named_committed_repo(temp.path(), "github-full-fail")?;
-    for (repo_path, origin_name, validation) in [
-        (&success_repo, "github-full-success-origin.git", "true"),
-        (&fail_repo, "github-full-fail-origin.git", "false"),
+    for (repo_path, repository_name, validation) in [
+        (&success_repo, "github-full-success-origin", "true"),
+        (&fail_repo, "github-full-fail-origin", "false"),
     ] {
-        let origin_path = init_bare_origin(temp.path(), origin_name)?;
-        run_git(&[
-            "-C",
-            path_str(repo_path)?,
-            "remote",
-            "add",
-            "origin",
-            path_str(&origin_path)?,
-        ])?;
+        add_https_origin(repo_path, repository_name)?;
         write_json_file(
             &repo_path.join("maco-inbox.json"),
             &json!({
@@ -1807,20 +1783,12 @@ fn workspace_run_refuses_real_publication_modes_without_validation_commands() ->
     let git_repo = create_named_committed_repo(temp.path(), "publish-no-validation-git-repo")?;
     let pr_repo = create_named_committed_repo(temp.path(), "publish-no-validation-pr-repo")?;
     let full_repo = create_named_committed_repo(temp.path(), "publish-no-validation-full-repo")?;
-    for (repo_path, origin_name) in [
-        (&git_repo, "publish-no-validation-git-origin.git"),
-        (&pr_repo, "publish-no-validation-pr-origin.git"),
-        (&full_repo, "publish-no-validation-full-origin.git"),
+    for (repo_path, repository_name) in [
+        (&git_repo, "publish-no-validation-git-origin"),
+        (&pr_repo, "publish-no-validation-pr-origin"),
+        (&full_repo, "publish-no-validation-full-origin"),
     ] {
-        let origin_path = init_bare_origin(temp.path(), origin_name)?;
-        run_git(&[
-            "-C",
-            path_str(repo_path)?,
-            "remote",
-            "add",
-            "origin",
-            path_str(&origin_path)?,
-        ])?;
+        add_https_origin(repo_path, repository_name)?;
     }
     let config_path = temp.path().join("workspace-publish-no-validation.json");
     write_json_file(
@@ -2685,7 +2653,12 @@ JSON
     printf 'https://github.test/acme/demo/comment/1\n'
     ;;
   "pr create")
-    printf 'https://github.test/acme/demo/pull/1\n'
+    printf 'https://github.com/maco-tests/inbox-fixture/pull/1\n'
+    ;;
+  "pr view")
+    cat <<'JSON'
+{{"url":"https://github.com/maco-tests/inbox-fixture/pull/1","headRefOid":"1111111111111111111111111111111111111111","baseRefOid":"2222222222222222222222222222222222222222","number":1,"baseRefName":"main","state":"OPEN","isDraft":true,"title":"Agent inbox fixture changes","body":"Prepared Inbox fixture\n<!-- maco-publication-marker:0000000000000000000000000000000000000000000000000000000000000000 -->\n","headRefName":"maco/autopilot/inbox-fixture","headRepository":{{"name":"inbox-fixture","nameWithOwner":"maco-tests/inbox-fixture"}},"headRepositoryOwner":{{"login":"maco-tests"}},"isCrossRepository":false,"author":{{"login":"maco-test-publisher"}}}}
+JSON
     ;;
   *)
     printf '[]\n'
@@ -2696,6 +2669,33 @@ esac
     );
     write_executable(&script_path, &script)?;
     Ok(FakeGh { path_dir, log_path })
+}
+
+#[test]
+fn fake_gh_receipt_fixture_uses_https_marker_and_exact_provenance_shape() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let fixture = write_fake_gh(temp.path())?;
+    let script = fs::read_to_string(fixture.path_dir.join("gh")).context("read fake gh")?;
+
+    assert!(script.contains("https://github.com/maco-tests/inbox-fixture/pull/1"));
+    assert!(script.contains("maco-publication-marker:"));
+    for field in [
+        "headRefOid",
+        "baseRefOid",
+        "baseRefName",
+        "headRefName",
+        "headRepository",
+        "headRepositoryOwner",
+        "isCrossRepository",
+        "author",
+        "title",
+        "body",
+    ] {
+        assert!(script.contains(field), "missing receipt field {field}");
+    }
+    assert!(script.contains("\"state\":\"OPEN\""));
+    assert!(script.contains("\"isDraft\":true"));
+    Ok(())
 }
 
 fn write_fake_codex(root: &Path) -> Result<FakeCodex> {
@@ -2877,19 +2877,15 @@ fn create_named_committed_repo_with_gitignore(
     Ok(repo_path)
 }
 
-fn init_bare_origin(root: &Path, name: &str) -> Result<PathBuf> {
-    let origin_path = root.join(name);
-    let output = Command::new("git")
-        .args(["init", "--bare", path_str(&origin_path)?])
-        .output()
-        .context("init bare origin")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "init bare origin failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(origin_path)
+fn add_https_origin(repo: &Path, repository_name: &str) -> Result<()> {
+    run_git(&[
+        "-C",
+        path_str(repo)?,
+        "remote",
+        "add",
+        "origin",
+        &format!("https://github.com/maco-tests/{repository_name}.git"),
+    ])
 }
 
 fn run_git(args: &[&str]) -> Result<()> {

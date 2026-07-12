@@ -1085,7 +1085,14 @@ same-UID replacement and must not be described as proof that the kernel ran the
 exact bound bytes. The parent derives the reviewer identity from those copied
 bytes and bounded argv, and binds each request to the pre-run repository
 snapshot, canonical request, effective timeout, and sandbox-policy version;
-the reviewer must echo that binding. A bounded descriptor prewalk rejects
+the reviewer must echo that binding. Report strings alone do not grant real
+publication authority: the Review boundary also returns a non-serializable
+in-process receipt bound to the same repository, direct program and argv,
+target, attempt, changed paths, diff summary, request binding, and derived
+reviewer identity. Autopilot requires that exact receipt together with a
+version-1 successful `Passed` report before Git or GitHub publication. Fake
+review, the legacy shell-string input, and a syntactically plausible but
+unreceipted report remain non-authoritative. A bounded descriptor prewalk rejects
 oversized or excessive ignored/untracked trees before Git status construction.
 The snapshot covers
 tracked, untracked, and ignored content, modes, link targets, file generations,
@@ -1111,6 +1118,10 @@ paths, and lock details such as owner, sync or semantic token, or live claim id
 when available. It also relies on the existing supervise and PR safety gates for
 stale/dirty child worktree reuse and unclaimed edits. Blocking review findings
 or failed validation trigger repair attempts up to `max_repair_attempts`.
+External finding summaries, suggested fixes, next actions, diagnostics, and
+finding paths remain available in bounded review artifacts but are never copied
+into a later supervisor task. Retry prompts contain only a parent-selected
+fixed reason code and validated blocking/severity counts.
 Autopilot never auto-merges: `auto_merge=true` is accepted and reported as
 requested, but `auto_merge_performed` is always `false`.
 

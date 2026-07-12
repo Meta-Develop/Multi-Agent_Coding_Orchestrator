@@ -41,6 +41,11 @@ use std::{
 };
 
 const AUTOPILOT_SCHEMA_VERSION: u32 = 1;
+const REVIEW_REPORT_SCHEMA_VERSION: u32 = 1;
+const REVIEW_REQUEST_BINDING_HEX_LEN: usize = 64;
+const EXTERNAL_REVIEWER_ID_PREFIX: &str = "external-program-";
+const EXTERNAL_REVIEWER_BINDING_HEX_LEN: usize = 32;
+const EXTERNAL_REVIEWER_MODEL: &str = "parent-bound-direct-program-v1";
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
 const VALIDATION_OUTPUT_LIMIT: usize = 8 * 1024;
 const VALIDATION_CAPTURE_LIMIT_BYTES: usize = VALIDATION_OUTPUT_LIMIT * 4;
@@ -473,7 +478,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
 
     let max_attempts = plan.max_repair_attempts.saturating_add(1);
     let mut attempts = Vec::new();
-    let mut repair_reasons = Vec::new();
+    let mut repair_contexts = Vec::new();
     let mut last_pr = None;
     let mut last_review = None;
     let mut last_validation = AutopilotValidationSummary {
@@ -490,7 +495,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
         let supervisor_run_id =
             RunId::new(format!("{}-attempt-{}", options.run_id.as_str(), attempt))?;
         let supervisor_plan =
-            supervisor_plan_for_attempt(&plan, &agent_id, attempt, &repair_reasons);
+            supervisor_plan_for_attempt(&plan, &agent_id, attempt, &repair_contexts);
         let supervisor_plan_relative =
             PathBuf::from(format!("supervisor-plan-attempt-{attempt}.json"));
         write_private_json(
@@ -614,7 +619,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
                 publication::prepare_pr_candidate_with_write_lease(options, &worktree_lease)
             },
             validate: |worktree: PathBuf| run_validation_commands(&worktree, &plan),
-            review: review::review_pr,
+            review: review::review_pr_for_publication,
             publish: |options, evidence| {
                 publication::publish_prepared_pr_with_write_lease(
                     options,
@@ -716,7 +721,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
         let repair_message = sanitize_text(&repo, &outcome.message);
         if outcome.retryable && attempt < max_attempts {
             attempt_summary.repair_reason = Some(repair_message.clone());
-            repair_reasons.push(repair_message);
+            repair_contexts.push(RepairPromptContext::from_outcome(&outcome));
             attempts.push(attempt_summary);
             continue;
         }
@@ -961,9 +966,9 @@ fn supervisor_plan_for_attempt(
     plan: &AutopilotPlan,
     agent_id: &str,
     attempt: usize,
-    repair_reasons: &[String],
+    repair_contexts: &[RepairPromptContext],
 ) -> SupervisorPlan {
-    let task = supervisor_task(plan, attempt, repair_reasons);
+    let task = supervisor_task(plan, attempt, repair_contexts);
     SupervisorPlan {
         version: 1,
         task: task.clone(),
@@ -994,20 +999,113 @@ fn supervisor_plan_for_attempt(
     }
 }
 
-fn supervisor_task(plan: &AutopilotPlan, attempt: usize, repair_reasons: &[String]) -> String {
+fn supervisor_task(
+    plan: &AutopilotPlan,
+    attempt: usize,
+    repair_contexts: &[RepairPromptContext],
+) -> String {
     let mut task = format!(
         "{}\n\n{}\n\nAutopilot attempt: {attempt}\n",
         plan.task.title, plan.task.body
     );
-    if !repair_reasons.is_empty() {
+    if !repair_contexts.is_empty() {
         task.push_str("\nRepair context from prior attempts:\n");
-        for reason in repair_reasons {
-            task.push_str("- ");
-            task.push_str(reason);
-            task.push('\n');
+        for context in repair_contexts {
+            task.push_str(&format!(
+                "- reason_code={} blocking_findings={} severity_counts=critical:{},error:{},warning:{},info:{}\n",
+                context.reason_code,
+                context.blocking_findings,
+                context.severity_counts.critical,
+                context.severity_counts.error,
+                context.severity_counts.warning,
+                context.severity_counts.info,
+            ));
         }
     }
     task
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReviewSeverityCounts {
+    critical: usize,
+    error: usize,
+    warning: usize,
+    info: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairPromptContext {
+    reason_code: &'static str,
+    blocking_findings: usize,
+    severity_counts: ReviewSeverityCounts,
+}
+
+impl RepairPromptContext {
+    fn from_outcome(outcome: &AutopilotPrepublicationOutcome) -> Self {
+        let reason_code = canonical_repair_reason_code(&outcome.reason);
+        let (blocking_findings, severity_counts) =
+            if matches!(reason_code, "review_blocked" | "review_failed") {
+                outcome
+                    .review
+                    .as_ref()
+                    .and_then(validated_review_counts)
+                    .unwrap_or_default()
+            } else {
+                (0, ReviewSeverityCounts::default())
+            };
+        Self {
+            reason_code,
+            blocking_findings,
+            severity_counts,
+        }
+    }
+}
+
+fn canonical_repair_reason_code(reason: &str) -> &'static str {
+    match reason {
+        "preparation_failed" => "preparation_failed",
+        "preparation_blocked" => "preparation_blocked",
+        "preparation_invalid" => "preparation_invalid",
+        "validation_execution_failed" => "validation_execution_failed",
+        "validation_failed" => "validation_failed",
+        "validation_evidence_invalid" => "validation_evidence_invalid",
+        "reviewer_not_authoritative" => "reviewer_not_authoritative",
+        "review_execution_failed" => "review_execution_failed",
+        "review_evidence_invalid" => "review_evidence_invalid",
+        "review_blocked" => "review_blocked",
+        "review_failed" => "review_failed",
+        "candidate_reverification_failed" => "candidate_reverification_failed",
+        "candidate_reverification_blocked" => "candidate_reverification_blocked",
+        "candidate_reverification_invalid" => "candidate_reverification_invalid",
+        "candidate_binding_mismatch" => "candidate_binding_mismatch",
+        "publication_failed" => "publication_failed",
+        "publication_blocked" => "publication_blocked",
+        "publication_receipt_invalid" => "publication_receipt_invalid",
+        _ => "prepublication_gate_failed",
+    }
+}
+
+fn validated_review_counts(review: &ReviewReport) -> Option<(usize, ReviewSeverityCounts)> {
+    let actual_blocking = review
+        .findings
+        .iter()
+        .filter(|finding| finding.blocking)
+        .count();
+    if actual_blocking != review.blocking_finding_count {
+        return None;
+    }
+    let mut counts = ReviewSeverityCounts::default();
+    for finding in &review.findings {
+        let count = match finding.severity.as_str() {
+            "critical" => &mut counts.critical,
+            "error" => &mut counts.error,
+            "warning" => &mut counts.warning,
+            "info" => &mut counts.info,
+            _ => return None,
+        };
+        *count = count.checked_add(1)?;
+    }
+    Some((actual_blocking, counts))
 }
 
 #[derive(Debug, Clone)]
@@ -1090,7 +1188,7 @@ fn run_prepublication_attempt<P, V, R, U>(
 where
     P: FnMut(PrPublicationOptions) -> Result<PrPublicationReport>,
     V: FnMut(PathBuf) -> Result<Vec<ValidationReport>>,
-    R: FnMut(ReviewPrOptions) -> Result<ReviewReport>,
+    R: FnMut(ReviewPrOptions) -> Result<review::PublicationReviewResult>,
     U: FnMut(PrPublicationOptions, BoundValidationEvidenceBundle) -> Result<PrPublicationReport>,
 {
     let skipped_validation = || AutopilotValidationSummary {
@@ -1214,10 +1312,10 @@ where
     }
 
     let real_publication = matches!(forge, ForgeKind::Git | ForgeKind::Github);
-    if !reviewer_mode_may_authorize_publication(forge, plan.reviewer.mode) {
+    if !reviewer_config_may_authorize_publication(forge, &plan.reviewer) {
         return stopped_prepublication(
             "reviewer_not_authoritative",
-            "real Git or GitHub publication requires a successful ExternalCommand reviewer; Fake review is non-authoritative",
+            "real Git or GitHub publication requires a direct parent-bound ExternalCommand reviewer; Fake and legacy shell review are non-authoritative",
             false,
             validation,
             None,
@@ -1229,15 +1327,16 @@ where
 
     let review_target = format!("prepared-candidate:{agent_id}@{}", prepared.head);
     let review_paths = review::normalize_changed_paths(prepared.changed_paths.clone());
-    let review_report = match (hooks.review)(ReviewPrOptions {
+    let review_options = ReviewPrOptions {
         repo: lease.path().to_path_buf(),
         target: review_target.clone(),
         reviewer: plan.reviewer.clone(),
         attempt,
         changed_paths: review_paths.clone(),
         diff_summary: prepared.diff_summary.clone(),
-    }) {
-        Ok(report) => report,
+    };
+    let review_result = match (hooks.review)(review_options.clone()) {
+        Ok(result) => result,
         Err(error) => {
             return stopped_prepublication(
                 "review_execution_failed",
@@ -1251,19 +1350,36 @@ where
             )
         }
     };
-    let reviewer_authoritative = plan.reviewer.mode == ReviewerMode::ExternalCommand
-        && review_report.reviewer.mode == ReviewerMode::ExternalCommand;
-    let reviewed_candidate = AutopilotReviewedCandidate {
-        binding: prepared.binding.clone(),
-        reviewer_mode: review_report.reviewer.mode,
-        authoritative: reviewer_authoritative,
-    };
+    let exact_external_authority = review_result.has_exact_external_authority(&review_options);
+    let review_report = review_result.into_report();
     let actual_blocking = review_report
         .findings
         .iter()
         .filter(|finding| finding.blocking)
         .count();
-    if review_report.target != review_target
+    let canonical_request_binding = is_lower_hex(
+        &review_report.request_binding,
+        REVIEW_REQUEST_BINDING_HEX_LEN,
+    );
+    let reviewer_identity_shape_valid = reviewer_identity_matches_mode(&review_report);
+    let reviewer_binding_authoritative = plan.reviewer.mode == ReviewerMode::ExternalCommand
+        && reviewer_config_has_direct_program_binding(&plan.reviewer)
+        && review_report.reviewer.mode == ReviewerMode::ExternalCommand
+        && reviewer_identity_shape_valid
+        && exact_external_authority;
+    let reviewer_authoritative = reviewer_binding_authoritative
+        && review_report.status == ReviewReportStatus::Passed
+        && review_report.success
+        && actual_blocking == 0;
+    let reviewed_candidate = AutopilotReviewedCandidate {
+        binding: prepared.binding.clone(),
+        reviewer_mode: review_report.reviewer.mode,
+        authoritative: reviewer_authoritative,
+    };
+    if review_report.version != REVIEW_REPORT_SCHEMA_VERSION
+        || !canonical_request_binding
+        || !reviewer_identity_shape_valid
+        || review_report.target != review_target
         || review_report.attempt != attempt
         || review_report.changed_paths != review_paths
         || review_report.blocking_finding_count != actual_blocking
@@ -1271,7 +1387,7 @@ where
     {
         return stopped_prepublication(
             "review_evidence_invalid",
-            "independent reviewer returned evidence for a different candidate, attempt, path set, or reviewer mode",
+            "independent reviewer returned an unsupported report version or unbound evidence for a different candidate, attempt, path set, or reviewer program",
             true,
             validation,
             Some(review_report),
@@ -1310,7 +1426,7 @@ where
     if real_publication && !reviewer_authoritative {
         return stopped_prepublication(
             "reviewer_not_authoritative",
-            "real publication requires authoritative ExternalCommand review evidence",
+            "real publication requires a successful Passed report with an exact request binding from the configured parent-bound external reviewer program",
             false,
             validation,
             Some(review_report),
@@ -2343,8 +2459,38 @@ impl AutopilotForgeMode {
     }
 }
 
-fn reviewer_mode_may_authorize_publication(forge: ForgeKind, reviewer_mode: ReviewerMode) -> bool {
-    matches!(forge, ForgeKind::Fake) || reviewer_mode == ReviewerMode::ExternalCommand
+fn reviewer_config_may_authorize_publication(forge: ForgeKind, reviewer: &ReviewerConfig) -> bool {
+    matches!(forge, ForgeKind::Fake) || reviewer_config_has_direct_program_binding(reviewer)
+}
+
+fn reviewer_config_has_direct_program_binding(reviewer: &ReviewerConfig) -> bool {
+    reviewer.mode == ReviewerMode::ExternalCommand
+        && reviewer.program.is_some()
+        && reviewer.command.is_none()
+}
+
+fn reviewer_identity_matches_mode(report: &ReviewReport) -> bool {
+    match report.reviewer.mode {
+        ReviewerMode::Fake => {
+            report.reviewer.reviewer_id == "autopilot-fake-reviewer"
+                && report.reviewer.model == "deterministic-local-reviewer"
+        }
+        ReviewerMode::ExternalCommand => report
+            .reviewer
+            .reviewer_id
+            .strip_prefix(EXTERNAL_REVIEWER_ID_PREFIX)
+            .is_some_and(|binding| {
+                is_lower_hex(binding, EXTERNAL_REVIEWER_BINDING_HEX_LEN)
+                    && report.reviewer.model == EXTERNAL_REVIEWER_MODEL
+            }),
+    }
+}
+
+fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn publish_requested_for_audit(
@@ -2498,8 +2644,10 @@ mod tests {
                 mode: reviewer_mode,
                 blocking_attempts: 0,
                 finding: None,
-                command: (reviewer_mode == ReviewerMode::ExternalCommand)
-                    .then(|| "injected-review".to_string()),
+                program: (reviewer_mode == ReviewerMode::ExternalCommand)
+                    .then(|| PathBuf::from("/bin/true")),
+                args: Vec::new(),
+                command: None,
                 timeout_seconds: None,
             },
             publish_mode: AutopilotPublishMode::DraftOnly,
@@ -2535,15 +2683,17 @@ mod tests {
             Vec::new()
         };
         ReviewReport {
+            version: REVIEW_REPORT_SCHEMA_VERSION,
             status,
             success: status == ReviewReportStatus::Passed,
             target: options.target,
             reviewer: review::ReviewerIdentity {
                 mode: ReviewerMode::ExternalCommand,
-                reviewer_id: "injected-external-reviewer".to_string(),
-                model: "injected-model".to_string(),
+                reviewer_id: format!("{EXTERNAL_REVIEWER_ID_PREFIX}{}", "b".repeat(32)),
+                model: EXTERNAL_REVIEWER_MODEL.to_string(),
             },
             attempt: options.attempt,
+            request_binding: "a".repeat(REVIEW_REQUEST_BINDING_HEX_LEN),
             blocking_finding_count: findings.len(),
             findings,
             changed_paths: options.changed_paths,
@@ -2553,6 +2703,15 @@ mod tests {
             diagnostics: None,
             next_action: "continue only after the strict gate".to_string(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn injected_external_publication_review(
+        options: ReviewPrOptions,
+        status: ReviewReportStatus,
+    ) -> review::PublicationReviewResult {
+        let report = injected_external_review(options.clone(), status);
+        review::PublicationReviewResult::issue_for_test(options, report, true)
     }
 
     #[cfg(target_os = "linux")]
@@ -2605,22 +2764,125 @@ mod tests {
 
     #[test]
     fn real_forges_require_external_reviewer_authority() {
-        assert!(reviewer_mode_may_authorize_publication(
-            ForgeKind::Fake,
-            ReviewerMode::Fake
-        ));
-        assert!(!reviewer_mode_may_authorize_publication(
+        let direct = ReviewerConfig {
+            mode: ReviewerMode::ExternalCommand,
+            program: Some(PathBuf::from("reviewer")),
+            ..ReviewerConfig::default()
+        };
+        assert!(reviewer_config_may_authorize_publication(
             ForgeKind::Git,
-            ReviewerMode::Fake
+            &direct
         ));
-        assert!(!reviewer_mode_may_authorize_publication(
+        assert!(reviewer_config_may_authorize_publication(
             ForgeKind::Github,
-            ReviewerMode::Fake
+            &direct
         ));
-        assert!(reviewer_mode_may_authorize_publication(
+
+        let legacy = ReviewerConfig {
+            mode: ReviewerMode::ExternalCommand,
+            command: Some("reviewer --legacy-shell".to_string()),
+            ..ReviewerConfig::default()
+        };
+        assert!(!reviewer_config_may_authorize_publication(
             ForgeKind::Git,
-            ReviewerMode::ExternalCommand
+            &legacy
         ));
+        assert!(!reviewer_config_may_authorize_publication(
+            ForgeKind::Github,
+            &ReviewerConfig::default()
+        ));
+        assert!(reviewer_config_may_authorize_publication(
+            ForgeKind::Fake,
+            &ReviewerConfig::default()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retry_prompt_excludes_external_review_text_diagnostics_and_paths() {
+        let plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
+        let options = ReviewPrOptions {
+            repo: PathBuf::from("/private/review-worktree"),
+            target: "prepared-candidate:agent@1111111111111111111111111111111111111111".to_string(),
+            reviewer: plan.reviewer.clone(),
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("private/external-path.rs")],
+            diff_summary: Some("external diff summary sentinel".to_string()),
+        };
+        let mut report = injected_external_review(options, ReviewReportStatus::Blocked);
+        report.findings[0].summary = "external summary sentinel".to_string();
+        report.findings[0].suggested_fix = "external suggested fix sentinel".to_string();
+        report.findings[0].path = Some(PathBuf::from("private/external-path.rs"));
+        report.next_action = "external next action sentinel".to_string();
+        report.diagnostics = Some(review::ReviewCommandDiagnostics {
+            timed_out: false,
+            timeout_seconds: Some(1),
+            exit_code: Some(1),
+            stdout: review::ReviewOutputSummary {
+                text: "external stdout diagnostic sentinel".to_string(),
+                truncated: false,
+            },
+            stderr: review::ReviewOutputSummary {
+                text: "external stderr diagnostic sentinel".to_string(),
+                truncated: false,
+            },
+            process_error: Some("external process diagnostic sentinel".to_string()),
+        });
+        let outcome = stopped_prepublication(
+            "review_blocked",
+            review_repair_reason(&report),
+            true,
+            AutopilotValidationSummary {
+                status: AutopilotValidationStatus::Passed,
+                reports: passed_prepublication_validation(),
+            },
+            Some(report),
+            None,
+            None,
+            None,
+        );
+
+        let prompt = supervisor_task(&plan, 2, &[RepairPromptContext::from_outcome(&outcome)]);
+
+        assert!(prompt.contains("reason_code=review_blocked"));
+        assert!(prompt.contains("blocking_findings=1"));
+        assert!(prompt.contains("severity_counts=critical:0,error:1,warning:0,info:0"));
+        for untrusted in [
+            "external summary sentinel",
+            "external suggested fix sentinel",
+            "external next action sentinel",
+            "external stdout diagnostic sentinel",
+            "external stderr diagnostic sentinel",
+            "external process diagnostic sentinel",
+            "private/external-path.rs",
+            "external diff summary sentinel",
+        ] {
+            assert!(!prompt.contains(untrusted), "prompt leaked {untrusted}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_authority_requires_opaque_exact_review_receipt() {
+        let plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
+        let options = ReviewPrOptions {
+            repo: PathBuf::from("/bound/review-worktree"),
+            target: "prepared-candidate:agent@1111111111111111111111111111111111111111".to_string(),
+            reviewer: plan.reviewer,
+            attempt: 1,
+            changed_paths: vec![PathBuf::from("README.md")],
+            diff_summary: Some("bound summary".to_string()),
+        };
+        let report = injected_external_review(options.clone(), ReviewReportStatus::Passed);
+        let syntactic_only =
+            review::PublicationReviewResult::issue_for_test(options.clone(), report.clone(), false);
+        assert!(!syntactic_only.has_exact_external_authority(&options));
+
+        let exact = review::PublicationReviewResult::issue_for_test(options.clone(), report, true);
+        assert!(exact.has_exact_external_authority(&options));
+        let mut different_args = options;
+        different_args.reviewer.args.push("changed".to_string());
+        assert!(!exact.has_exact_external_authority(&different_args));
     }
 
     #[test]
@@ -2695,7 +2957,7 @@ mod tests {
             },
             review: |options| {
                 trace.borrow_mut().push("review");
-                Ok(injected_external_review(
+                Ok(injected_external_publication_review(
                     options,
                     ReviewReportStatus::Passed,
                 ))
@@ -2739,12 +3001,12 @@ mod tests {
             validate: |_| Ok(passed_prepublication_validation()),
             review: |options: ReviewPrOptions| {
                 review_calls.set(review_calls.get() + 1);
-                let status = match options.reviewer.command.as_deref() {
+                let status = match options.reviewer.args.first().map(String::as_str) {
                     Some("blocked") => ReviewReportStatus::Blocked,
                     Some("failed") => ReviewReportStatus::Failed,
                     _ => ReviewReportStatus::Passed,
                 };
-                Ok(injected_external_review(options, status))
+                Ok(injected_external_publication_review(options, status))
             },
             publish: |_, _| {
                 publish_calls.set(publish_calls.get() + 1);
@@ -2760,14 +3022,14 @@ mod tests {
 
         let mut blocked_plan =
             prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
-        blocked_plan.reviewer.command = Some("blocked".to_string());
+        blocked_plan.reviewer.args = vec!["blocked".to_string()];
         let blocked =
             run_prepublication_attempt(&repo, agent_id, 1, &blocked_plan, &lease, &mut hooks);
         assert_eq!(blocked.reason, "review_blocked");
         assert!(!blocked.publication_attempted);
 
         let mut failed_plan = blocked_plan;
-        failed_plan.reviewer.command = Some("failed".to_string());
+        failed_plan.reviewer.args = vec!["failed".to_string()];
         let failed =
             run_prepublication_attempt(&repo, agent_id, 1, &failed_plan, &lease, &mut hooks);
         assert_eq!(failed.reason, "review_failed");
@@ -2793,7 +3055,7 @@ mod tests {
             validate: |_| Ok(Vec::new()),
             review: |options| {
                 review_calls.set(review_calls.get() + 1);
-                Ok(injected_external_review(
+                Ok(injected_external_publication_review(
                     options,
                     ReviewReportStatus::Passed,
                 ))
@@ -2832,7 +3094,7 @@ mod tests {
                     "# Mutated during independent review\n",
                 )
                 .expect("inject review mutation");
-                Ok(injected_external_review(
+                Ok(injected_external_publication_review(
                     options,
                     ReviewReportStatus::Passed,
                 ))
@@ -2864,7 +3126,7 @@ mod tests {
         let mut hooks = PrepublicationHooks {
             prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
             validate: |_| Ok(passed_prepublication_validation()),
-            review: review::review_pr,
+            review: review::review_pr_for_publication,
             publish: |options, evidence| {
                 publish_calls.set(publish_calls.get() + 1);
                 publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
@@ -2900,7 +3162,7 @@ mod tests {
         let mut hooks = PrepublicationHooks {
             prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
             validate: |_| Ok(passed_prepublication_validation()),
-            review: review::review_pr,
+            review: review::review_pr_for_publication,
             publish: |options, evidence| {
                 publish_calls.set(publish_calls.get() + 1);
                 publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
@@ -2933,7 +3195,7 @@ mod tests {
             prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
             validate: |_| Ok(passed_prepublication_validation()),
             review: |options| {
-                Ok(injected_external_review(
+                Ok(injected_external_publication_review(
                     options,
                     ReviewReportStatus::Passed,
                 ))

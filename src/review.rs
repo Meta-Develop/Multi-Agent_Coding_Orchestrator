@@ -253,6 +253,80 @@ pub struct ReviewReport {
     pub next_action: String,
 }
 
+/// In-process publication evidence issued only by the review boundary that
+/// executed and verified the exact request. The authority fields remain
+/// private so report JSON, test fixtures, and callers cannot manufacture real
+/// publication authority from well-formed strings alone.
+pub(crate) struct PublicationReviewResult {
+    report: ReviewReport,
+    authority: Option<BoundExternalReviewAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundExternalReviewAuthority {
+    repo: PathBuf,
+    target: String,
+    reviewer: ReviewerConfig,
+    attempt: usize,
+    changed_paths: Vec<PathBuf>,
+    diff_summary: Option<String>,
+    report_version: u32,
+    request_binding: String,
+    reviewer_identity: ReviewerIdentity,
+}
+
+impl PublicationReviewResult {
+    pub(crate) fn into_report(self) -> ReviewReport {
+        self.report
+    }
+
+    pub(crate) fn has_exact_external_authority(&self, expected: &ReviewPrOptions) -> bool {
+        let Some(authority) = &self.authority else {
+            return false;
+        };
+        expected.reviewer.mode == ReviewerMode::ExternalCommand
+            && authority.repo == expected.repo
+            && authority.target == expected.target
+            && authority.reviewer == expected.reviewer
+            && authority.attempt == expected.attempt
+            && authority.changed_paths == expected.changed_paths
+            && authority.diff_summary == expected.diff_summary
+            && self.report.version == authority.report_version
+            && self.report.target == authority.target
+            && self.report.attempt == authority.attempt
+            && self.report.changed_paths == authority.changed_paths
+            && self.report.request_binding == authority.request_binding
+            && self.report.reviewer == authority.reviewer_identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_for_test(
+        options: ReviewPrOptions,
+        report: ReviewReport,
+        external_authority: bool,
+    ) -> Self {
+        let authority = external_authority
+            .then(|| BoundExternalReviewAuthority::from_verified(&options, &report));
+        Self { report, authority }
+    }
+}
+
+impl BoundExternalReviewAuthority {
+    fn from_verified(options: &ReviewPrOptions, report: &ReviewReport) -> Self {
+        Self {
+            repo: options.repo.clone(),
+            target: options.target.clone(),
+            reviewer: options.reviewer.clone(),
+            attempt: options.attempt,
+            changed_paths: options.changed_paths.clone(),
+            diff_summary: options.diff_summary.clone(),
+            report_version: report.version,
+            request_binding: report.request_binding.clone(),
+            reviewer_identity: report.reviewer.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ReviewCommandDiagnostics {
     pub timed_out: bool,
@@ -303,6 +377,16 @@ pub fn review_pr(options: ReviewPrOptions) -> Result<ReviewReport> {
         ReviewerMode::Fake => Ok(fake_review(options)),
         ReviewerMode::ExternalCommand => external_review(options),
     }
+}
+
+pub(crate) fn review_pr_for_publication(
+    options: ReviewPrOptions,
+) -> Result<PublicationReviewResult> {
+    let external_authority = options.reviewer.mode == ReviewerMode::ExternalCommand;
+    let report = review_pr(options.clone())?;
+    let authority =
+        external_authority.then(|| BoundExternalReviewAuthority::from_verified(&options, &report));
+    Ok(PublicationReviewResult { report, authority })
 }
 
 fn validate_review_options(options: &ReviewPrOptions) -> Result<()> {
