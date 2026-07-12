@@ -23,10 +23,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 const DEFAULT_BRANCH_PREFIX: &str = "maco";
-const MANAGED_WORKTREE_REGISTRY_VERSION: u32 = 1;
+const MANAGED_WORKTREE_REGISTRY_VERSION: u32 = 2;
 const MAX_WORKTREE_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_ID_BYTES: usize = 64;
 const MAX_BRANCH_NAME_BYTES: usize = 255;
@@ -36,6 +36,7 @@ const MAX_MANAGED_OPERATIONS: usize = 4096;
 const MAX_WORKTREE_STATUS_ENTRIES: usize = 100_000;
 const MAX_WORKTREE_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WORKTREE_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PERSISTED_PATH_BYTES: usize = 16 * 1024;
 const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 
@@ -69,8 +70,10 @@ pub struct WorktreeCreateOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ManagedRepositoryBinding {
+    #[serde(with = "persisted_path")]
     common_dir: PathBuf,
     common_dir_identity: FileIdentity,
+    #[serde(with = "persisted_path")]
     repository_workdir: PathBuf,
     repository_workdir_identity: FileIdentity,
 }
@@ -79,10 +82,13 @@ struct ManagedRepositoryBinding {
 #[serde(deny_unknown_fields)]
 struct ManagedWorktreeBinding {
     name: String,
+    #[serde(with = "persisted_path")]
     root: PathBuf,
     root_identity: FileIdentity,
+    #[serde(with = "persisted_path")]
     path: PathBuf,
     path_identity: FileIdentity,
+    #[serde(with = "persisted_path")]
     metadata_dir: PathBuf,
     metadata_dir_identity: FileIdentity,
     worktree_git_file_identity: FileIdentity,
@@ -146,12 +152,16 @@ struct ManagedWorktreeOperation {
     kind: ManagedWorktreeOperationKind,
     phase: ManagedWorktreeOperationPhase,
     name: String,
+    #[serde(with = "persisted_path")]
     root: PathBuf,
     root_identity: FileIdentity,
+    #[serde(with = "persisted_path")]
     path: PathBuf,
     prepared_path_identity: Option<FileIdentity>,
+    #[serde(default, with = "persisted_optional_path")]
     staging_root: Option<PathBuf>,
     staging_root_identity: Option<FileIdentity>,
+    #[serde(default, with = "persisted_optional_path")]
     staging_path: Option<PathBuf>,
     staged_path_identity: Option<FileIdentity>,
     staged_metadata: Option<StagedWorktreeMetadata>,
@@ -164,11 +174,19 @@ struct ManagedWorktreeOperation {
     delete_branch: bool,
     force: bool,
     expected_branch_oid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "persisted_optional_path",
+        skip_serializing_if = "Option::is_none"
+    )]
     worktree_quarantine_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     worktree_quarantine_identity: Option<FileIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "persisted_optional_path",
+        skip_serializing_if = "Option::is_none"
+    )]
     metadata_quarantine_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metadata_quarantine_identity: Option<FileIdentity>,
@@ -177,11 +195,176 @@ struct ManagedWorktreeOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StagedWorktreeMetadata {
+    #[serde(with = "persisted_path")]
     metadata_dir: PathBuf,
     metadata_dir_identity: FileIdentity,
     worktree_git_file_identity: FileIdentity,
     metadata_gitdir_file_identity: FileIdentity,
     metadata_head_file_identity: FileIdentity,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPathWire {
+    platform: String,
+    encoding: String,
+    data: String,
+}
+
+fn encode_persisted_path(path: &Path) -> std::result::Result<PersistedPathWire, String> {
+    validate_persisted_path(path)?;
+    #[cfg(unix)]
+    {
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() > MAX_PERSISTED_PATH_BYTES {
+            return Err(format!(
+                "persisted path exceeds its {MAX_PERSISTED_PATH_BYTES}-byte limit"
+            ));
+        }
+        let mut data = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(&mut data, "{byte:02x}")
+                .map_err(|_| "failed to encode persisted path".to_string())?;
+        }
+        Ok(PersistedPathWire {
+            platform: std::env::consts::OS.to_string(),
+            encoding: "unix-bytes-hex-v1".to_string(),
+            data,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err("lossless persisted worktree paths are unsupported on this platform".to_string())
+    }
+}
+
+fn decode_persisted_path(wire: PersistedPathWire) -> std::result::Result<PathBuf, String> {
+    #[cfg(unix)]
+    {
+        if wire.platform != std::env::consts::OS {
+            return Err(format!(
+                "persisted path platform '{}' does not match '{}'",
+                wire.platform,
+                std::env::consts::OS
+            ));
+        }
+        if wire.encoding != "unix-bytes-hex-v1" {
+            return Err(format!(
+                "unsupported persisted path encoding '{}'",
+                wire.encoding
+            ));
+        }
+        if wire.data.is_empty()
+            || !wire.data.len().is_multiple_of(2)
+            || wire.data.len() > MAX_PERSISTED_PATH_BYTES.saturating_mul(2)
+            || !wire
+                .data
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(
+                "persisted path hex is empty, malformed, noncanonical, or oversized".to_string(),
+            );
+        }
+        let mut bytes = Vec::with_capacity(wire.data.len() / 2);
+        for pair in wire.data.as_bytes().chunks_exact(2) {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            let high = digit(pair[0]).ok_or_else(|| "invalid high hex digit".to_string())?;
+            let low = digit(pair[1]).ok_or_else(|| "invalid low hex digit".to_string())?;
+            bytes.push((high << 4) | low);
+        }
+        if bytes.contains(&0) {
+            return Err("persisted path contains a NUL byte".to_string());
+        }
+        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        validate_persisted_path(&path)?;
+        Ok(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = wire;
+        Err("lossless persisted worktree paths are unsupported on this platform".to_string())
+    }
+}
+
+fn validate_persisted_path(path: &Path) -> std::result::Result<(), String> {
+    if !path.is_absolute() {
+        return Err("persisted path must be absolute".to_string());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR))
+            }
+            std::path::Component::Normal(segment) => normalized.push(segment),
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err("persisted path is not lexically canonical".to_string())
+            }
+        }
+    }
+    if normalized.as_os_str() != path.as_os_str() {
+        return Err("persisted path is not in canonical component form".to_string());
+    }
+    Ok(())
+}
+
+mod persisted_path {
+    use super::*;
+    use serde::{de::Error as _, ser::Error as _, Deserializer, Serializer};
+
+    pub fn serialize<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        encode_persisted_path(path)
+            .map_err(S::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        decode_persisted_path(PersistedPathWire::deserialize(deserializer)?)
+            .map_err(D::Error::custom)
+    }
+}
+
+mod persisted_optional_path {
+    use super::*;
+    use serde::{de::Error as _, ser::Error as _, Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        path: &Option<PathBuf>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        path.as_deref()
+            .map(encode_persisted_path)
+            .transpose()
+            .map_err(S::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Option<PathBuf>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<PersistedPathWire>::deserialize(deserializer)?
+            .map(decode_persisted_path)
+            .transpose()
+            .map_err(D::Error::custom)
+    }
 }
 
 struct ManagedWorktreeRegistryStore {
@@ -656,26 +839,39 @@ impl ManagedWorktreeRegistryStore {
             "managed_worktrees.json",
             MAX_MANAGED_REGISTRY_BYTES,
         )?;
-        let registry: ManagedWorktreeRegistry =
-            serde_json::from_slice(&contents).with_context(|| {
-                format!(
-                    "failed to parse managed worktree registry {}",
-                    self.state_root
-                        .path()
-                        .join("managed_worktrees.json")
-                        .display()
-                )
-            })?;
-        if registry.version != MANAGED_WORKTREE_REGISTRY_VERSION {
+        let value: serde_json::Value = serde_json::from_slice(&contents).with_context(|| {
+            format!(
+                "failed to parse managed worktree registry {}",
+                self.state_root
+                    .path()
+                    .join("managed_worktrees.json")
+                    .display()
+            )
+        })?;
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .context("managed worktree registry has no valid version")?;
+        if version != u64::from(MANAGED_WORKTREE_REGISTRY_VERSION) {
             bail!(
                 "unsupported managed worktree registry version {} in {}",
-                registry.version,
+                version,
                 self.state_root
                     .path()
                     .join("managed_worktrees.json")
                     .display()
             );
         }
+        let registry: ManagedWorktreeRegistry =
+            serde_json::from_value(value).with_context(|| {
+                format!(
+                    "failed to decode managed worktree registry {}",
+                    self.state_root
+                        .path()
+                        .join("managed_worktrees.json")
+                        .display()
+                )
+            })?;
         if registry.repository != self.repository {
             bail!(
                 "managed worktree registry repository binding does not match the current repository"
@@ -1906,8 +2102,8 @@ fn verify_metadata_binding_after_worktree_removal(
         bail!("managed metadata file identity changed during remove recovery");
     }
     verify_metadata_branch(&head, &binding.branch)?;
-    let backlink = BoundedRegularReader::read_utf8(&gitdir, MAX_WORKTREE_METADATA_BYTES)?;
-    let backlink = resolve_metadata_path(&binding.metadata_dir, Path::new(backlink.trim()));
+    let backlink = read_git_metadata_path(&gitdir, false)?;
+    let backlink = resolve_metadata_path(&binding.metadata_dir, &backlink);
     if backlink != binding.path.join(".git") {
         bail!("managed metadata gitdir backlink changed during remove recovery");
     }
@@ -2188,15 +2384,8 @@ fn verify_gitdir_backlinks(
     metadata_gitdir_file: &Path,
     worktree_path: &Path,
 ) -> Result<()> {
-    let worktree_git =
-        BoundedRegularReader::read_utf8(worktree_git_file, MAX_WORKTREE_METADATA_BYTES)?;
-    let worktree_target = worktree_git
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .context("worktree .git file has no gitdir target")?;
-    let worktree_target = resolve_metadata_path(worktree_path, Path::new(worktree_target));
+    let worktree_target = read_git_metadata_path(worktree_git_file, true)?;
+    let worktree_target = resolve_metadata_path(worktree_path, &worktree_target);
     let worktree_target = fs::canonicalize(&worktree_target).with_context(|| {
         format!(
             "failed to resolve worktree gitdir backlink {}",
@@ -2207,13 +2396,8 @@ fn verify_gitdir_backlinks(
         bail!("worktree .git file does not point to its recorded metadata directory");
     }
 
-    let metadata_gitdir =
-        BoundedRegularReader::read_utf8(metadata_gitdir_file, MAX_WORKTREE_METADATA_BYTES)?;
-    let metadata_target = metadata_gitdir.trim();
-    if metadata_target.is_empty() {
-        bail!("worktree metadata gitdir backlink is empty");
-    }
-    let metadata_target = resolve_metadata_path(metadata_dir, Path::new(metadata_target));
+    let metadata_target = read_git_metadata_path(metadata_gitdir_file, false)?;
+    let metadata_target = resolve_metadata_path(metadata_dir, &metadata_target);
     let metadata_target = fs::canonicalize(&metadata_target).with_context(|| {
         format!(
             "failed to resolve metadata gitdir backlink {}",
@@ -2224,6 +2408,35 @@ fn verify_gitdir_backlinks(
         bail!("worktree metadata gitdir does not point back to the recorded .git file");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn read_git_metadata_path(path: &Path, worktree_git_file: bool) -> Result<PathBuf> {
+    let mut bytes = BoundedRegularReader::read(path, MAX_WORKTREE_METADATA_BYTES)?;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if worktree_git_file {
+        bytes = bytes
+            .strip_prefix(b"gitdir: ")
+            .context("worktree .git file has no canonical gitdir prefix")?
+            .to_vec();
+    }
+    if bytes.is_empty() || bytes.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r')) {
+        bail!("Git metadata path is empty or contains an unrepresentable byte");
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn read_git_metadata_path(path: &Path, _worktree_git_file: bool) -> Result<PathBuf> {
+    bail!(
+        "lossless Git metadata path decoding is unsupported on this platform: {}",
+        path.display()
+    )
 }
 
 fn verify_metadata_branch(head_file: &Path, branch: &str) -> Result<()> {
@@ -2405,24 +2618,22 @@ fn bounded_worktree_is_clean(
     let index = BoundedRegularReader::read(&index_path, MAX_WORKTREE_INDEX_BYTES)
         .context("failed to capture bounded-status index")?;
     let common_objects = SafeRoot::open_existing(repository.commondir().join("objects"))?;
-    let state_root = SafeRoot::open_or_create(repository.commondir().join("maco").join("state"))?;
+    let state_root = bounded_status_runtime_root()?;
     let runtime = state_root.reserve_random_direct_child_directory("git-status")?;
     let runtime_root = SafeRoot::open_existing(runtime.path())?;
-    let home = runtime_root.reserve_direct_child_directory("home")?;
-    let temporary = runtime_root.reserve_direct_child_directory("tmp")?;
+    runtime_root.reserve_direct_child_directory("home")?;
+    runtime_root.reserve_direct_child_directory("tmp")?;
     let git_dir = runtime_root.reserve_direct_child_directory("git")?;
-    AtomicStateWriter::write_direct(&runtime_root, "index", &index)?;
     let git_root = SafeRoot::open_existing(git_dir.path())?;
-    git_root.reserve_direct_child_directory("objects")?;
     git_root.reserve_direct_child_directory("refs")?;
+    AtomicStateWriter::write_direct(&git_root, "index", &index)?;
     AtomicStateWriter::write_direct(&git_root, "HEAD", format!("{head}\n").as_bytes())?;
+    create_validated_object_link(&git_root, common_objects.path())?;
+    let worktree_alias = create_bounded_status_worktree_link(&runtime_root, path)?;
     let git_context = BoundedGitContext {
-        worktree: path,
+        worktree: &worktree_alias,
         runtime_root: &runtime_root,
-        home: home.path(),
-        temporary: temporary.path(),
         git_dir: git_dir.path(),
-        object_directory: common_objects.path(),
     };
 
     let deadline = Instant::now()
@@ -2461,7 +2672,7 @@ fn bounded_worktree_is_clean(
             .file_name()
             .context("bounded-status runtime has no final component")?,
         Some(runtime.identity()),
-        TreeLinkPolicy::RejectLinksAndSpecialFiles,
+        TreeLinkPolicy::UnlinkLinks,
     )
     .context("failed to remove bounded-status private runtime");
     match (result, cleanup) {
@@ -2477,10 +2688,65 @@ fn bounded_worktree_is_clean(
 struct BoundedGitContext<'a> {
     worktree: &'a Path,
     runtime_root: &'a SafeRoot,
-    home: &'a Path,
-    temporary: &'a Path,
     git_dir: &'a Path,
-    object_directory: &'a Path,
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_status_runtime_root() -> Result<SafeRoot> {
+    SafeRoot::open_or_create(PathBuf::from(format!(
+        "/tmp/maco-worktree-status-{}",
+        unsafe { libc::geteuid() }
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bounded_status_runtime_root() -> Result<SafeRoot> {
+    bail!("bounded worktree status requires the verified Linux containment boundary")
+}
+
+#[cfg(unix)]
+fn create_bounded_status_worktree_link(runtime: &SafeRoot, worktree: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::symlink;
+
+    runtime.ensure_direct_child_absent("worktree")?;
+    let alias = runtime.direct_child("worktree")?;
+    symlink(worktree, &alias).with_context(|| {
+        format!(
+            "failed to bind private status context to worktree {}",
+            worktree.display()
+        )
+    })?;
+    Ok(alias)
+}
+
+#[cfg(not(unix))]
+fn create_bounded_status_worktree_link(_runtime: &SafeRoot, worktree: &Path) -> Result<PathBuf> {
+    bail!(
+        "lossless private Git worktree binding is unsupported on this platform: {}",
+        worktree.display()
+    )
+}
+
+#[cfg(unix)]
+fn create_validated_object_link(git_root: &SafeRoot, object_directory: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    git_root.ensure_direct_child_absent("objects")?;
+    symlink(object_directory, git_root.path().join("objects")).with_context(|| {
+        format!(
+            "failed to link private Git context to validated objects {}",
+            object_directory.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_validated_object_link(_git_root: &SafeRoot, object_directory: &Path) -> Result<()> {
+    bail!(
+        "lossless private Git object binding is unsupported on this platform: {}",
+        object_directory.display()
+    )
 }
 
 fn run_bounded_git_records<const N: usize>(
@@ -2498,66 +2764,39 @@ fn run_bounded_git_records<const N: usize>(
         .filter(|remaining| !remaining.is_zero())
         .context("worktree status exhausted its total time budget")?;
     context.runtime_root.verify()?;
-    let path_text = |name: &str, path: &Path| {
-        path.to_str()
-            .map(ToOwned::to_owned)
-            .with_context(|| format!("{name} is not valid UTF-8: {}", path.display()))
-    };
     let mut environment = BTreeMap::new();
     environment.insert("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string());
     environment.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
     environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
-    environment.insert(
-        "GIT_DIR".to_string(),
-        path_text("private Git directory", context.git_dir)?,
-    );
-    environment.insert(
-        "GIT_INDEX_FILE".to_string(),
-        path_text(
-            "private Git index",
-            &context.runtime_root.path().join("index"),
-        )?,
-    );
-    environment.insert(
-        "GIT_OBJECT_DIRECTORY".to_string(),
-        path_text("validated Git object directory", context.object_directory)?,
-    );
     environment.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
     environment.insert("GIT_PAGER".to_string(), "cat".to_string());
     environment.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
-    environment.insert(
-        "GIT_WORK_TREE".to_string(),
-        path_text("worktree", context.worktree)?,
-    );
-    environment.insert("HOME".to_string(), path_text("private HOME", context.home)?);
+    environment.insert("HOME".to_string(), "home".to_string());
     environment.insert("LANG".to_string(), "C".to_string());
     environment.insert("LC_ALL".to_string(), "C".to_string());
     environment.insert("PAGER".to_string(), "cat".to_string());
-    environment.insert(
-        "TEMP".to_string(),
-        path_text("private TEMP", context.temporary)?,
-    );
-    environment.insert(
-        "TMP".to_string(),
-        path_text("private TMP", context.temporary)?,
-    );
-    environment.insert(
-        "TMPDIR".to_string(),
-        path_text("private TMPDIR", context.temporary)?,
-    );
-    environment.insert(
-        "XDG_CACHE_HOME".to_string(),
-        path_text("private XDG cache", context.home)?,
-    );
-    environment.insert(
-        "XDG_CONFIG_HOME".to_string(),
-        path_text("private XDG config", context.home)?,
-    );
-    let spec = ProcessSpec::direct(label, git, args, context.worktree, max_output_bytes)
-        .with_environment(EnvironmentMode::ClearAndSet(environment))
-        .with_containment(ContainmentPolicy::Required)
-        .with_stdin(StdinMode::Null)
-        .with_timeout(Some(remaining));
+    environment.insert("TEMP".to_string(), "tmp".to_string());
+    environment.insert("TMP".to_string(), "tmp".to_string());
+    environment.insert("TMPDIR".to_string(), "tmp".to_string());
+    environment.insert("XDG_CACHE_HOME".to_string(), "home/cache".to_string());
+    environment.insert("XDG_CONFIG_HOME".to_string(), "home/config".to_string());
+    let mut command_args = Vec::with_capacity(args.len().saturating_add(4));
+    command_args.push(std::ffi::OsString::from("--git-dir"));
+    command_args.push(context.git_dir.as_os_str().to_os_string());
+    command_args.push(std::ffi::OsString::from("--work-tree"));
+    command_args.push(context.worktree.as_os_str().to_os_string());
+    command_args.extend(args.into_iter().map(std::ffi::OsString::from));
+    let spec = ProcessSpec::direct(
+        label,
+        git,
+        command_args,
+        context.runtime_root.path(),
+        max_output_bytes,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(environment))
+    .with_containment(ContainmentPolicy::Required)
+    .with_stdin(StdinMode::Null)
+    .with_timeout(Some(remaining));
     let output = run_process(spec).context("bounded worktree status command failed")?;
     if output.timed_out {
         bail!(
@@ -2643,6 +2882,104 @@ mod tests {
         assert_eq!(removed.name, "agent-a");
         assert!(!removed.path.exists());
         assert!(repo.find_branch("maco/agent-a", BranchType::Local).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_paths_round_trip_non_utf8_and_reject_noncanonical_wire_values() {
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/maco-path-\xff".to_vec(),
+        ));
+        let wire = encode_persisted_path(&path).expect("encode non-UTF-8 path");
+        assert_eq!(
+            decode_persisted_path(wire).expect("decode non-UTF-8 path"),
+            path
+        );
+
+        let wrong_platform = PersistedPathWire {
+            platform: "wrong-platform".to_string(),
+            encoding: "unix-bytes-hex-v1".to_string(),
+            data: "2f746d70".to_string(),
+        };
+        assert!(decode_persisted_path(wrong_platform)
+            .expect_err("wrong platform must fail")
+            .contains("does not match"));
+        let uppercase = PersistedPathWire {
+            platform: std::env::consts::OS.to_string(),
+            encoding: "unix-bytes-hex-v1".to_string(),
+            data: "2F746d70".to_string(),
+        };
+        assert!(decode_persisted_path(uppercase)
+            .expect_err("uppercase hex must fail")
+            .contains("noncanonical"));
+        assert!(encode_persisted_path(Path::new("/tmp/../escape"))
+            .expect_err("parent component must fail")
+            .contains("canonical"));
+        let oversized = PathBuf::from(format!(
+            "/{}",
+            "x/".repeat(MAX_PERSISTED_PATH_BYTES).trim_end_matches('/')
+        ));
+        assert!(encode_persisted_path(&oversized)
+            .expect_err("oversized path must fail")
+            .contains("byte limit"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_repository_registry_survives_reopen_recovery_and_remove() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"repo-non-utf8-\xff".to_vec()));
+        let worktree_root = temp.path().join(std::ffi::OsString::from_vec(
+            b"worktrees-non-utf8-\xfe".to_vec(),
+        ));
+        WorktreeManager::init_repository(&repo_path, "main").expect("init non-UTF-8 repo");
+        let repo = Repository::open(&repo_path).expect("open non-UTF-8 repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "non-utf8-agent".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create non-UTF-8 managed worktree");
+
+        {
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("open registry");
+            let _lock = store.lock().expect("registry lock");
+            let mut registry = store.load().expect("load registry");
+            repo.find_worktree("non-utf8-agent")
+                .expect("managed worktree")
+                .lock(Some("simulate crash before lock completion"))
+                .expect("re-lock worktree");
+            registry
+                .records
+                .get_mut("non-utf8-agent")
+                .expect("managed binding")
+                .creation_lock_pending = true;
+            store.save(&mut registry).expect("persist crash fixture");
+            let bytes = BoundedRegularReader::read_direct(
+                &store.state_root,
+                "managed_worktrees.json",
+                MAX_MANAGED_REGISTRY_BYTES,
+            )
+            .expect("read registry bytes");
+            assert!(bytes
+                .windows(b"unix-bytes-hex-v1".len())
+                .any(|window| { window == b"unix-bytes-hex-v1" }));
+            assert!(!bytes.windows(3).any(|window| window == [0xef, 0xbf, 0xbd]));
+        }
+
+        let listed = manager.list().expect("recover and list non-UTF-8 worktree");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, created.path);
+        manager
+            .remove("non-utf8-agent", false, true)
+            .expect("remove non-UTF-8 worktree");
+        assert!(manager.list().expect("empty verified list").is_empty());
     }
 
     #[test]
@@ -3626,11 +3963,15 @@ mod tests {
         assert!(error.to_string().contains("operations"));
 
         let mut oversized = store.empty_registry();
-        let mut oversized_binding = binding;
-        oversized_binding.root = PathBuf::from("x".repeat(MAX_MANAGED_REGISTRY_BYTES as usize));
-        oversized
-            .records
-            .insert(oversized_binding.name.clone(), oversized_binding);
+        let large_path = PathBuf::from(format!("/{}", "x/".repeat(7_000).trim_end_matches('/')));
+        for index in 0..400 {
+            let mut oversized_binding = binding.clone();
+            oversized_binding.name = format!("oversized-{index}");
+            oversized_binding.root = large_path.clone();
+            oversized
+                .records
+                .insert(oversized_binding.name.clone(), oversized_binding);
+        }
         let error = store
             .save(&mut oversized)
             .expect_err("serialized size limit");
