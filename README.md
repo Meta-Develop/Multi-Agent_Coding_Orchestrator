@@ -666,7 +666,8 @@ Validation evidence remains bound to the exact candidate snapshot described
 above. Git and GitHub publication use a unique OID-derived remote ref and push
 the reviewed lowercase object ID with a create-only lease. External publication
 accepts only a bounded, canonical `https://host/repository/path(.git)` origin;
-GitHub mode further requires exactly `owner/repository`.
+GitHub identities and selectors are stored and checked as exact canonical
+`host/owner/repository` values.
 HTTP, SSH, SCP, Git helpers, URL userinfo, query/fragment credentials, escapes,
 and relative paths are refused. Local and `file://` bare remotes also fail
 closed: a concurrent same-UID process could otherwise alter the remote config
@@ -716,10 +717,12 @@ handled by the bounded dead-owner scavenger on the next private-runtime entry.
 GitHub publication requires an explicit expected creator login in
 `GH_EXPECTED_AUTHOR` or `GITHUB_EXPECTED_AUTHOR` before token selection; bot
 logins such as `release-bot[bot]` are accepted when named exactly. Each
-source-backed external effect derives a stable SHA-256 identity from its
-provider, bound repository, source action revision, and operation; source-less
+source-backed external effect derives a stable SHA-256 identity from its effect
+transport provider (`git` or `github`), source provider, exact host-qualified
+repository, source action revision, and operation; source-less
 effects additionally bind their exact target and payload. The PR branch and
-hidden `maco-external-effect` marker are deterministically derived from that identity;
+hidden version-2 `maco-external-effect` marker are deterministically derived
+from that identity;
 run IDs, agent IDs, attempts, and random values do not affect them. Publication
 observes the remote head and exact base OIDs before PR creation, reads the
 resulting PR with `gh pr view`, and requires exact title, marker-bound body,
@@ -731,7 +734,8 @@ as a front-run and rejected. After a recorded create attempt, crash/lost-respons
 reconciliation adopts only a receipt satisfying the same hidden marker and all
 of those provenance fields.
 The HTTPS origin is also parsed into a bound host/owner/repository identity.
-Every `gh pr` and `gh issue create` call receives that explicit `--repo`;
+Every `gh pr` and `gh issue` call receives that explicit host-qualified
+`--repo`;
 `gh` receives a private 0600 `hosts.yml` and an explicit environment allowlist
 containing only OS/locale essentials, fixed PATH, `GH_CONFIG_DIR`, and disabled
 prompts; token variables are not inherited. HOME, Git config, proxy, custom CA,
@@ -739,7 +743,7 @@ ambient repository, debug, pager, and forced-TTY routing are absent. Its current
 directory is that private config runtime, while repo state and source/primary
 worktrees are masked. Config identity and bytes are rechecked around every
 allowlisted PR/issue subcommand. The receipt URL must identify the same bound
-repository and PR number.
+repository and exact PR or issue number.
 Publication observes the remote head and base again after that receipt. A
 mismatch is reported as blocked rather than published.
 
@@ -751,14 +755,21 @@ for exactly one marker-bound receipt; zero, multiple, or failed lookups require
 manual reconciliation and never resend. `observed` and `completed` receipts are
 re-fetched and checked against the exact repository, object ID, URL, operation,
 marker, target, payload, and provider-specific provenance; source-backed effects
-also bind the source action revision. A deleted, closed, or mutated remote object
-therefore blocks without another provider call.
+also bind the source provider, canonical host, repository selector, and source
+action revision separately from the effect transport. A deleted, closed, or
+mutated remote object therefore blocks without another provider call.
 Immediately before a new effect, the complete source freshness snapshot must
 still match. After a source comment changes volatile `updatedAt`, recovery uses
 the stable action revision so the comment can be adopted without weakening
 title/body/label/head/base checks. Comment discovery reads every bounded REST
 page and then exact-views each marker candidate; truncation or bounds failure is
 fail closed.
+
+The effect WAL bounds each record and validates every namespace it opens, but
+the total number of completed effect namespaces and their retention lifetime
+are not yet globally capped. Long-lived repositories should monitor the
+repo-common `maco/state/effects` inventory; a quota and explicit retention or
+pruning policy remain future work.
 
 The new path does not create plaintext records under
 `.git/maco/state/publication-transactions/`. If any legacy plaintext publication
@@ -1327,6 +1338,14 @@ active/blocked live claim locks only when they overlap selected target paths,
 while ignoring its own `.maco/**` and `.maco-cache/**` runtime artifacts.
 Refusal JSON includes paths and lock details. Inbox never performs automatic
 merge; human review remains the next action after a successful reaction.
+Live GitHub intake uses the same pinned trusted `gh` network boundary as
+publication: private host-specific token/config state, a minimal environment,
+bounded capture and timeout, an exact host-qualified `--repo`, and a fixed
+allowlist for issue/PR list arguments. Intake snapshots store the canonical
+source host separately and fail closed if the origin host, owner, or repository
+changes. GitHub source JSON is schema-strict: every requested field must be
+present with its declared type; only `author: null` and PR
+`reviewDecision: null` are accepted as explicit provider nulls.
 Until an external reviewer identity and result are explicitly bound into the
 publication evidence, non-dry-run `github_git`, `github_pr`, and `github_full`
 runs fail closed; their dry-run plans and read-only intake remain available.

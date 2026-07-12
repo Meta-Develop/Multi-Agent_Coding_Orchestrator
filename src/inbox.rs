@@ -26,8 +26,7 @@ use std::{
     fs::{self, File},
     io::Write,
     path::{Component, Path, PathBuf},
-    process::{self, Command},
-    thread,
+    process, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -65,8 +64,9 @@ const MAX_GITHUB_REVIEWS: usize = 512;
 const MAX_GITHUB_REVIEW_BODY_BYTES: usize = 64 * 1024;
 const MAX_GITHUB_STATUS_BYTES: usize = 128;
 const MAX_TIMESTAMP_BYTES: usize = 64;
-const SOURCE_SNAPSHOT_VERSION: u32 = 1;
-const SOURCE_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"MACO\0inbox-source-snapshot\0v1\0";
+const SOURCE_SNAPSHOT_VERSION: u32 = 2;
+const SOURCE_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"MACO\0inbox-source-snapshot\0v2\0";
+#[cfg(test)]
 const GH_OUTPUT_LIMIT: usize = 512 * 1024;
 const GH_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMENT_BODY_LIMIT: usize = 6 * 1024;
@@ -529,6 +529,7 @@ pub enum InboxSourceProvider {
 pub struct InboxSourceSnapshotBinding {
     version: u32,
     provider: InboxSourceProvider,
+    repository_host: String,
     repository_selector: String,
     repository_identity: String,
     kind: InboxItemKind,
@@ -550,6 +551,7 @@ pub struct InboxSourceSnapshotBinding {
 struct InboxSourceSnapshotBindingWire {
     version: u32,
     provider: InboxSourceProvider,
+    repository_host: String,
     repository_selector: String,
     repository_identity: String,
     kind: InboxItemKind,
@@ -570,6 +572,7 @@ struct InboxSourceSnapshotBindingWire {
 struct InboxSourceSnapshotDigestPayload<'a> {
     version: u32,
     provider: InboxSourceProvider,
+    repository_host: &'a str,
     repository_selector: &'a str,
     repository_identity: &'a str,
     kind: InboxItemKind,
@@ -585,6 +588,7 @@ struct InboxSourceSnapshotDigestPayload<'a> {
 
 struct InboxSourceSnapshotObservation {
     provider: InboxSourceProvider,
+    repository_host: String,
     repository_selector: String,
     repository_identity: String,
     kind: InboxItemKind,
@@ -601,6 +605,7 @@ impl InboxSourceSnapshotBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn for_issue(
         provider: InboxSourceProvider,
+        repository_host: impl Into<String>,
         repository_selector: impl Into<String>,
         repository_identity: impl Into<String>,
         number: u64,
@@ -611,6 +616,7 @@ impl InboxSourceSnapshotBinding {
     ) -> Result<Self> {
         Self::from_observation(InboxSourceSnapshotObservation {
             provider,
+            repository_host: repository_host.into(),
             repository_selector: repository_selector.into(),
             repository_identity: repository_identity.into(),
             kind: InboxItemKind::Issue,
@@ -627,6 +633,7 @@ impl InboxSourceSnapshotBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn for_pull_request(
         provider: InboxSourceProvider,
+        repository_host: impl Into<String>,
         repository_selector: impl Into<String>,
         repository_identity: impl Into<String>,
         number: u64,
@@ -639,6 +646,7 @@ impl InboxSourceSnapshotBinding {
     ) -> Result<Self> {
         Self::from_observation(InboxSourceSnapshotObservation {
             provider,
+            repository_host: repository_host.into(),
             repository_selector: repository_selector.into(),
             repository_identity: repository_identity.into(),
             kind: InboxItemKind::PullRequest,
@@ -656,6 +664,7 @@ impl InboxSourceSnapshotBinding {
         let mut binding = Self {
             version: SOURCE_SNAPSHOT_VERSION,
             provider: observation.provider,
+            repository_host: observation.repository_host,
             repository_selector: observation.repository_selector,
             repository_identity: observation.repository_identity,
             kind: observation.kind,
@@ -678,6 +687,7 @@ impl InboxSourceSnapshotBinding {
         let payload = InboxSourceSnapshotDigestPayload {
             version: self.version,
             provider: self.provider,
+            repository_host: &self.repository_host,
             repository_selector: &self.repository_selector,
             repository_identity: &self.repository_identity,
             kind: self.kind,
@@ -699,8 +709,31 @@ impl InboxSourceSnapshotBinding {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_schema_version("inbox source snapshot", self.version)?;
-        validate_repository_selector(&self.repository_selector)?;
+        if self.version != SOURCE_SNAPSHOT_VERSION {
+            bail!(
+                "inbox source snapshot version must be {}; got {}",
+                SOURCE_SNAPSHOT_VERSION,
+                self.version
+            );
+        }
+        match self.provider {
+            InboxSourceProvider::Github => {
+                publication::validate_github_source_repository_binding(
+                    &self.repository_host,
+                    &self.repository_selector,
+                )?;
+            }
+            InboxSourceProvider::Fake => {
+                if self.repository_host == "fake" {
+                    validate_repository_selector(&self.repository_selector)?;
+                } else {
+                    publication::validate_github_source_repository_binding(
+                        &self.repository_host,
+                        &self.repository_selector,
+                    )?;
+                }
+            }
+        }
         validate_bounded_text(
             &self.repository_identity,
             "inbox source snapshot repository_identity",
@@ -764,6 +797,10 @@ impl InboxSourceSnapshotBinding {
         &self.repository_selector
     }
 
+    pub fn repository_host(&self) -> &str {
+        &self.repository_host
+    }
+
     pub fn repository_identity(&self) -> &str {
         &self.repository_identity
     }
@@ -810,6 +847,7 @@ impl InboxSourceSnapshotBinding {
         }
         Ok(Some(ExternalSourceGuard::new(
             "github",
+            self.repository_host.clone(),
             self.repository_selector.clone(),
             self.repository_identity.clone(),
             match self.kind {
@@ -840,6 +878,7 @@ impl<'de> Deserialize<'de> for InboxSourceSnapshotBinding {
         let binding = Self {
             version: wire.version,
             provider: wire.provider,
+            repository_host: wire.repository_host,
             repository_selector: wire.repository_selector,
             repository_identity: wire.repository_identity,
             kind: wire.kind,
@@ -1204,6 +1243,7 @@ struct RawPrCandidate {
 
 #[derive(Debug, Clone)]
 struct SourceRepositoryBindingContext {
+    host: String,
     selector: String,
     identity: String,
 }
@@ -2728,6 +2768,7 @@ fn issue_item(
     )?;
     let source_snapshot = InboxSourceSnapshotBinding::for_issue(
         raw.provider,
+        source_repository.host.clone(),
         source_repository.selector.clone(),
         source_repository.identity.clone(),
         raw.number,
@@ -2799,6 +2840,7 @@ fn pr_item(
     )?;
     let source_snapshot = InboxSourceSnapshotBinding::for_pull_request(
         raw.provider,
+        source_repository.host.clone(),
         source_repository.selector.clone(),
         source_repository.identity.clone(),
         raw.number,
@@ -3035,21 +3077,13 @@ fn github_issue_candidates(
     config: &InboxConfig,
     source_repository: &SourceRepositoryBindingContext,
 ) -> Result<Vec<RawIssueCandidate>> {
-    let mut args = vec![
-        "issue".to_string(),
-        "list".to_string(),
-        "--state".to_string(),
-        "open".to_string(),
-        "--json".to_string(),
-        "number,title,body,labels,author,url,updatedAt,state".to_string(),
-        "--limit".to_string(),
-        config.selection.max_items.to_string(),
-    ];
-    for label in &config.selection.labels {
-        args.push("--label".to_string());
-        args.push(label.clone());
-    }
-    let output = run_gh_json(repo, config, &args, "gh issue list")?;
+    let output = publication::list_github_source_items(
+        repo,
+        &source_repository.selector,
+        ExternalSourceObjectKind::Issue,
+        config.selection.max_items,
+        &config.selection.labels,
+    )?;
     let Some(values) = output.as_array() else {
         bail!("gh issue list did not return a JSON array");
     };
@@ -3069,21 +3103,13 @@ fn github_pr_candidates(
     config: &InboxConfig,
     source_repository: &SourceRepositoryBindingContext,
 ) -> Result<Vec<RawPrCandidate>> {
-    let mut args = vec![
-        "pr".to_string(),
-        "list".to_string(),
-        "--state".to_string(),
-        "open".to_string(),
-        "--json".to_string(),
-        "number,title,body,labels,author,url,updatedAt,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup".to_string(),
-        "--limit".to_string(),
-        config.selection.max_items.to_string(),
-    ];
-    for label in &config.selection.labels {
-        args.push("--label".to_string());
-        args.push(label.clone());
-    }
-    let output = run_gh_json(repo, config, &args, "gh pr list")?;
+    let output = publication::list_github_source_items(
+        repo,
+        &source_repository.selector,
+        ExternalSourceObjectKind::PullRequest,
+        config.selection.max_items,
+        &config.selection.labels,
+    )?;
     let Some(values) = output.as_array() else {
         bail!("gh pr list did not return a JSON array");
     };
@@ -3132,6 +3158,7 @@ fn raw_issue_from_value(
     )?;
     validate_timestamp(&updated_at)?;
     let source_guard = publication::github_source_guard_from_value(
+        &source_repository.host,
         &source_repository.selector,
         &source_repository.identity,
         ExternalSourceObjectKind::Issue,
@@ -3209,6 +3236,7 @@ fn raw_pr_from_value(
     )?;
     validate_timestamp(&updated_at)?;
     let source_guard = publication::github_source_guard_from_value(
+        &source_repository.host,
         &source_repository.selector,
         &source_repository.identity,
         ExternalSourceObjectKind::PullRequest,
@@ -3838,11 +3866,7 @@ fn load_duplicate_keys(repo: &Path) -> Result<BTreeMap<String, String>> {
     Ok(duplicates)
 }
 
-fn run_gh_json(repo: &Path, config: &InboxConfig, args: &[String], label: &str) -> Result<Value> {
-    let bytes = run_gh_bytes(repo, config, args, label)?;
-    parse_gh_json_bytes(bytes, label)
-}
-
+#[cfg(test)]
 fn parse_gh_json_bytes(bytes: Vec<u8>, label: &str) -> Result<Value> {
     if bytes.len() > GH_OUTPUT_LIMIT {
         bail!("{label} exceeded its {GH_OUTPUT_LIMIT} byte JSON limit");
@@ -3854,47 +3878,6 @@ fn parse_gh_json_bytes(bytes: Vec<u8>, label: &str) -> Result<Value> {
         bail!("{label} exceeded its {GH_OUTPUT_LIMIT} character JSON limit");
     }
     serde_json::from_str(&bounded.text).with_context(|| format!("{label} returned invalid JSON"))
-}
-
-fn run_gh_bytes(
-    repo: &Path,
-    config: &InboxConfig,
-    args: &[String],
-    label: &str,
-) -> Result<Vec<u8>> {
-    let mut command = Command::new("gh");
-    command.current_dir(repo).args(args);
-    if let Some(repository) = github_repository_arg(config) {
-        command.arg("-R").arg(repository);
-    }
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run {label}"))?;
-    let stderr = sanitize_public_text(
-        repo,
-        &String::from_utf8_lossy(&output.stderr),
-        GH_DIAGNOSTIC_LIMIT,
-    );
-    if !output.status.success() {
-        bail!(
-            "{label} failed: {}",
-            if stderr.text.trim().is_empty() {
-                "no stderr".to_string()
-            } else {
-                stderr.text
-            }
-        );
-    }
-    Ok(output.stdout)
-}
-
-fn github_repository_arg(config: &InboxConfig) -> Option<String> {
-    match (&config.repository.owner, &config.repository.name) {
-        (Some(owner), Some(name)) if !owner.trim().is_empty() && !name.trim().is_empty() => {
-            Some(format!("{}/{}", owner.trim(), name.trim()))
-        }
-        _ => None,
-    }
 }
 
 fn artifact_status(reader: &ArtifactRunReader) -> InboxArtifactStatus {
@@ -4417,59 +4400,50 @@ fn source_repository_binding_context(
         common.identity().device,
         common.identity().file,
     );
-    let origin_selector = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|remote| remote.url().and_then(remote_repository_selector));
+    let origin_binding = repo.find_remote("origin").ok().and_then(|remote| {
+        remote
+            .url()
+            .and_then(|url| publication::canonical_github_source_repository(url).ok())
+    });
     let configured_selector = match (&config.repository.owner, &config.repository.name) {
         (Some(owner), Some(name)) => Some(format!("{owner}/{name}")),
         _ => None,
     };
     if require_remote_match {
+        let (_, observed) = origin_binding
+            .as_ref()
+            .context("GitHub intake requires a canonical HTTPS origin remote")?;
         if let Some(configured) = &configured_selector {
-            let observed = origin_selector
-                .as_deref()
-                .context("configured GitHub repository requires a canonical origin remote")?;
-            if !configured.eq_ignore_ascii_case(observed) {
+            let observed_owner_name = observed
+                .split_once('/')
+                .and_then(|(_, remainder)| remainder.split_once('/'))
+                .map(|(owner, name)| format!("{owner}/{name}"))
+                .context("canonical GitHub origin selector omitted owner/name")?;
+            if !configured.eq_ignore_ascii_case(&observed_owner_name) {
                 bail!(
                     "configured GitHub repository does not match the execution repository origin"
                 );
             }
         }
     }
-    let selector = configured_selector
-        .or(origin_selector)
-        .unwrap_or_else(|| ".".to_string());
-    validate_repository_selector(&selector)?;
-    common.verify()?;
-    Ok(SourceRepositoryBindingContext { selector, identity })
-}
-
-fn remote_repository_selector(url: &str) -> Option<String> {
-    if url.starts_with('/') || url.starts_with("file:") {
-        return None;
-    }
-    let path = if let Some((_, remainder)) = url.split_once("://") {
-        remainder.split_once('/')?.1
-    } else if let Some((_, remainder)) = url.split_once(':') {
-        remainder
-    } else {
-        return None;
+    let (host, selector) = match origin_binding {
+        Some(binding) => binding,
+        None => (
+            "fake".to_string(),
+            configured_selector.unwrap_or_else(|| ".".to_string()),
+        ),
     };
-    let mut components = path
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    if components.len() < 2 {
-        return None;
+    if host == "fake" {
+        validate_repository_selector(&selector)?;
+    } else {
+        publication::validate_github_source_repository_binding(&host, &selector)?;
     }
-    let name = components.pop()?;
-    let owner = components.pop()?;
-    let selector = format!("{owner}/{name}").to_ascii_lowercase();
-    validate_repository_selector(&selector).ok()?;
-    Some(selector)
+    common.verify()?;
+    Ok(SourceRepositoryBindingContext {
+        host,
+        selector,
+        identity,
+    })
 }
 
 fn validate_candidate_repository_url(
@@ -4483,36 +4457,13 @@ fn validate_candidate_repository_url(
         return Ok(());
     }
     let url = url.context("GitHub candidate requires a canonical URL")?;
-    let (_, remainder) = url
-        .split_once("://")
-        .context("GitHub candidate URL requires a scheme")?;
-    let path = remainder
-        .split_once('/')
-        .map(|(_, path)| path)
-        .context("GitHub candidate URL requires a repository path")?;
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    let components = path
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    if components.len() < 4 {
-        bail!("GitHub candidate URL does not contain owner/name/kind/number");
-    }
-    let tail = components.len();
-    let observed_selector =
-        format!("{}/{}", components[tail - 4], components[tail - 3]).to_ascii_lowercase();
-    validate_repository_selector(&observed_selector)?;
     let expected_kind = match kind {
         InboxItemKind::Issue => "issues",
         InboxItemKind::PullRequest => "pull",
     };
-    if components[tail - 2] != expected_kind
-        || components[tail - 1].parse::<u64>().ok() != Some(number)
-    {
-        bail!("GitHub candidate URL does not match its kind and number");
-    }
-    if repository_selector != "." && observed_selector != repository_selector {
-        bail!("GitHub candidate URL does not match the bound repository selector");
+    let expected_url = format!("https://{repository_selector}/{expected_kind}/{number}");
+    if url != expected_url {
+        bail!("GitHub candidate URL does not match its exact host, repository, kind, and number");
     }
     Ok(())
 }
@@ -5255,7 +5206,8 @@ mod tests {
         let identity = publication::stable_external_digest(b"repository-identity");
         let first = InboxSourceSnapshotBinding::for_pull_request(
             InboxSourceProvider::Github,
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             identity.clone(),
             42,
             "2026-07-08T00:00:00Z",
@@ -5268,7 +5220,8 @@ mod tests {
         .expect("first binding");
         let second = InboxSourceSnapshotBinding::for_pull_request(
             InboxSourceProvider::Github,
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             identity,
             42,
             "2026-07-08T00:00:00Z",
@@ -5296,7 +5249,8 @@ mod tests {
 
         assert!(InboxSourceSnapshotBinding::for_pull_request(
             InboxSourceProvider::Github,
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             publication::stable_external_digest(b"repository-identity"),
             42,
             "2026-07-08T00:00:00Z",
@@ -5307,9 +5261,24 @@ mod tests {
             "4".repeat(64),
         )
         .is_err());
+        assert!(InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Github,
+            "other.example",
+            "github.example/acme/repo",
+            publication::stable_external_digest(b"repository-identity"),
+            42,
+            "2026-07-08T00:00:00Z",
+            "OPEN",
+            "1".repeat(40),
+            "2".repeat(40),
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .is_err());
 
         let config = InboxConfig::default();
         let context = SourceRepositoryBindingContext {
+            host: "fake".to_string(),
             selector: ".".to_string(),
             identity: publication::stable_external_digest(b"fake-repository"),
         };
@@ -5347,7 +5316,8 @@ mod tests {
             .expect("first repository binding");
         let second = source_repository_binding_context(&repo_path, &config, true)
             .expect("second repository binding");
-        assert_eq!(first.selector, "acme/inbox");
+        assert_eq!(first.host, "github.com");
+        assert_eq!(first.selector, "github.com/acme/inbox");
         assert_eq!(first.identity, second.identity);
         assert_eq!(first.identity.len(), 64);
         assert!(first
@@ -5361,12 +5331,25 @@ mod tests {
         let moved = source_repository_binding_context(&moved_repo, &config, true)
             .expect("moved repository binding");
         assert_eq!(first.identity, moved.identity);
+        InboxSourceSnapshotBinding::for_issue(
+            InboxSourceProvider::Fake,
+            moved.host.clone(),
+            moved.selector.clone(),
+            moved.identity.clone(),
+            7,
+            "2026-07-08T00:00:00Z",
+            "OPEN",
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .expect("fake intake snapshot bound to canonical local origin");
 
         let wrong_url = json!({
             "number": 7,
             "title": "wrong repository",
             "body": "body",
             "url": "https://github.com/acme/different/issues/7",
+            "author": null,
             "updatedAt": "2026-07-08T00:00:00Z",
             "state": "OPEN",
             "labels": []
@@ -5374,6 +5357,24 @@ mod tests {
         let raw =
             raw_issue_from_value(&moved_repo, &wrong_url, &config, &moved).expect("raw issue");
         assert!(issue_item(raw, &config, &moved, &BTreeMap::new()).is_err());
+
+        let mut exact_url = wrong_url;
+        exact_url["title"] = json!("exact repository");
+        exact_url["url"] = json!("https://github.com/acme/inbox/issues/7");
+        let raw =
+            raw_issue_from_value(&moved_repo, &exact_url, &config, &moved).expect("raw issue");
+        let exact_item =
+            issue_item(raw, &config, &moved, &BTreeMap::new()).expect("exact bound issue item");
+        let guard = exact_item
+            .source_snapshot
+            .external_source_guard()
+            .expect("source guard conversion")
+            .expect("GitHub source guard");
+        let moved_repository = Repository::open(&moved_repo).expect("open moved repository");
+        moved_repository
+            .remote_set_url("origin", "https://other.example/acme/inbox.git")
+            .expect("swap origin host");
+        assert!(publication::revalidate_external_source(&moved_repo, &guard).is_err());
 
         let mut mismatch = config;
         mismatch.repository.name = Some("different".to_string());
@@ -5884,7 +5885,8 @@ mod tests {
 
     fn test_source_repository_binding() -> SourceRepositoryBindingContext {
         SourceRepositoryBindingContext {
-            selector: "acme/repo".to_string(),
+            host: "github.example".to_string(),
+            selector: "github.example/acme/repo".to_string(),
             identity: publication::stable_external_digest(b"inbox-test-source-repository"),
         }
     }
@@ -5966,6 +5968,7 @@ mod tests {
         match kind {
             InboxItemKind::Issue => InboxSourceSnapshotBinding::for_issue(
                 InboxSourceProvider::Fake,
+                "fake",
                 ".",
                 publication::stable_external_digest(b"inbox-test-repository"),
                 number,
@@ -5976,6 +5979,7 @@ mod tests {
             ),
             InboxItemKind::PullRequest => InboxSourceSnapshotBinding::for_pull_request(
                 InboxSourceProvider::Fake,
+                "fake",
                 ".",
                 publication::stable_external_digest(b"inbox-test-repository"),
                 number,

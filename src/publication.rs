@@ -62,8 +62,8 @@ const GITHUB_PR_RECEIPT_FIELDS: &str = "url,headRefOid,baseRefOid,number,baseRef
 const GITHUB_ISSUE_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state";
 const GITHUB_PR_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup";
 const GITHUB_ISSUE_EFFECT_FIELDS: &str = "number,url,title,body,labels,author,state";
-const EXTERNAL_EFFECT_VERSION: u32 = 1;
-const EXTERNAL_SOURCE_GUARD_VERSION: u32 = 1;
+const EXTERNAL_EFFECT_VERSION: u32 = 2;
+const EXTERNAL_SOURCE_GUARD_VERSION: u32 = 2;
 const EXTERNAL_EFFECT_MARKER_PREFIX: &str = "maco-external-effect";
 const MAX_EXTERNAL_SOURCE_SERIALIZED_BYTES: usize = 512 * 1024;
 const MAX_EXTERNAL_SOURCE_LABELS: usize = 100;
@@ -74,6 +74,8 @@ const MAX_GITHUB_EFFECT_CANDIDATES: usize = 100;
 const GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT: &str = "101";
 const MAX_GITHUB_COMMENT_PAGES: usize = 100;
 const MAX_GITHUB_COMMENT_CANDIDATES: usize = 10_000;
+const MAX_GITHUB_SOURCE_LIST_ITEMS: usize = 100;
+const MAX_GITHUB_SOURCE_LIST_LABELS: usize = 32;
 
 #[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
@@ -120,6 +122,7 @@ pub enum ExternalSourceObjectKind {
 pub struct ExternalSourceGuard {
     pub version: u32,
     pub provider: String,
+    pub repository_host: String,
     pub repository_selector: String,
     pub repository_identity: String,
     pub object_kind: ExternalSourceObjectKind,
@@ -139,6 +142,7 @@ impl ExternalSourceGuard {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: impl Into<String>,
+        repository_host: impl Into<String>,
         repository_selector: impl Into<String>,
         repository_identity: impl Into<String>,
         object_kind: ExternalSourceObjectKind,
@@ -153,6 +157,7 @@ impl ExternalSourceGuard {
         let mut guard = Self {
             version: EXTERNAL_SOURCE_GUARD_VERSION,
             provider: provider.into(),
+            repository_host: repository_host.into(),
             repository_selector: repository_selector.into(),
             repository_identity: repository_identity.into(),
             object_kind,
@@ -173,6 +178,7 @@ impl ExternalSourceGuard {
     pub fn validate(&self) -> Result<()> {
         if self.version != EXTERNAL_SOURCE_GUARD_VERSION
             || self.provider != "github"
+            || self.repository_host.is_empty()
             || self.number == 0
             || self.repository_selector.is_empty()
             || self.repository_identity.is_empty()
@@ -190,15 +196,10 @@ impl ExternalSourceGuard {
             "external source repository selector",
             MAX_PUBLICATION_PATH_BYTES,
         )?;
-        let (owner, name) = self
-            .repository_selector
-            .split_once('/')
-            .context("external source repository selector omitted owner/name")?;
-        if name.contains('/') {
-            bail!("external source repository selector contained extra components");
+        let repository = github_repository_identity_from_selector(&self.repository_selector)?;
+        if repository.host != self.repository_host {
+            bail!("external source repository host did not match its canonical selector");
         }
-        validate_github_slug(owner, "external source repository owner")?;
-        validate_github_slug(name, "external source repository name")?;
         validate_external_source_field(
             &self.updated_at,
             "external source updatedAt",
@@ -254,9 +255,10 @@ impl ExternalSourceGuard {
 
     fn expected_provenance_digest(&self) -> Result<String> {
         stable_json_digest(&(
-            "maco_external_source_guard_v1",
+            "maco_external_source_guard_v2",
             self.version,
             &self.provider,
+            &self.repository_host,
             &self.repository_selector,
             &self.repository_identity,
             self.object_kind,
@@ -285,7 +287,7 @@ enum ExternalEffectOperation {
 #[serde(deny_unknown_fields)]
 struct ExternalEffectRequest {
     version: u32,
-    provider: String,
+    transport_provider: String,
     repository_selector: String,
     repository_identity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,7 +306,7 @@ struct ExternalEffectRequest {
 #[serde(deny_unknown_fields)]
 struct ExternalEffectReceipt {
     version: u32,
-    provider: String,
+    transport_provider: String,
     repository_identity: String,
     repository_selector: String,
     effect_id: String,
@@ -332,7 +334,7 @@ struct ExternalEffectRecord {
 
 impl ExternalEffectRequest {
     fn new(
-        provider: &str,
+        transport_provider: &str,
         repository_selector: &str,
         repository_identity: &str,
         source: Option<ExternalSourceGuard>,
@@ -347,10 +349,12 @@ impl ExternalEffectRequest {
         let payload_digest = stable_json_digest(&payload)?;
         let logical_binding = match &source {
             Some(source) => stable_json_digest(&(
-                "maco_external_effect_logical_v1",
-                provider,
+                "maco_external_effect_logical_v2",
+                transport_provider,
                 repository_selector,
                 repository_identity,
+                &source.provider,
+                &source.repository_host,
                 &source.repository_selector,
                 &source.repository_identity,
                 source.object_kind,
@@ -358,8 +362,8 @@ impl ExternalEffectRequest {
                 &source.action_revision_digest,
             ))?,
             None => stable_json_digest(&(
-                "maco_external_effect_logical_v1",
-                provider,
+                "maco_external_effect_logical_v2",
+                transport_provider,
                 repository_selector,
                 repository_identity,
                 operation,
@@ -369,20 +373,20 @@ impl ExternalEffectRequest {
         };
         let effect_binding = match &source {
             Some(_) => {
-                stable_json_digest(&("maco_external_effect_id_v1", &logical_binding, operation))?
+                stable_json_digest(&("maco_external_effect_id_v2", &logical_binding, operation))?
             }
             None => stable_json_digest(&(
-                "maco_external_effect_id_v1",
+                "maco_external_effect_id_v2",
                 &logical_binding,
                 operation,
                 &target_digest,
                 &payload_digest,
             ))?,
         };
-        let marker = format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:{effect_binding} -->");
+        let marker = format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v2:{effect_binding} -->");
         let request = Self {
             version: EXTERNAL_EFFECT_VERSION,
-            provider: provider.to_string(),
+            transport_provider: transport_provider.to_string(),
             repository_selector: repository_selector.to_string(),
             repository_identity: repository_identity.to_string(),
             source,
@@ -401,11 +405,20 @@ impl ExternalEffectRequest {
 
     fn validate(&self) -> Result<()> {
         if self.version != EXTERNAL_EFFECT_VERSION
-            || self.provider.is_empty()
             || self.repository_selector.is_empty()
             || self.repository_identity.is_empty()
         {
             bail!("external effect request is malformed or unsupported");
+        }
+        let expected_transport_provider = match self.operation {
+            ExternalEffectOperation::GitPush => "git",
+            ExternalEffectOperation::GithubPullRequest
+            | ExternalEffectOperation::GithubIssue
+            | ExternalEffectOperation::GithubIssueComment
+            | ExternalEffectOperation::GithubPullRequestComment => "github",
+        };
+        if self.transport_provider != expected_transport_provider {
+            bail!("external effect operation used the wrong transport provider");
         }
         validate_external_digest(&self.effect_id, "external effect id")?;
         let logical_digest = self
@@ -415,7 +428,7 @@ impl ExternalEffectRequest {
         validate_external_digest(logical_digest, "external effect logical id")?;
         if self.marker
             != format!(
-                "<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:{} -->",
+                "<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v2:{} -->",
                 self.effect_id
             )
         {
@@ -423,10 +436,8 @@ impl ExternalEffectRequest {
         }
         if let Some(source) = &self.source {
             source.validate()?;
-            if source.provider != self.provider
-                || source.repository_selector != self.repository_selector
-            {
-                bail!("external effect source does not match its provider and repository binding");
+            if source.repository_selector != self.repository_selector {
+                bail!("external effect source does not match its repository binding");
             }
         }
         if self.target_digest != stable_json_digest(&self.target)?
@@ -602,6 +613,7 @@ fn same_external_effect_contract(
         (None, None) => true,
         (Some(stored), Some(current)) => {
             stored.provider == current.provider
+                && stored.repository_host == current.repository_host
                 && stored.repository_selector == current.repository_selector
                 && stored.repository_identity == current.repository_identity
                 && stored.object_kind == current.object_kind
@@ -612,7 +624,7 @@ fn same_external_effect_contract(
     };
     same_source_action
         && stored.version == current.version
-        && stored.provider == current.provider
+        && stored.transport_provider == current.transport_provider
         && stored.repository_selector == current.repository_selector
         && stored.repository_identity == current.repository_identity
         && stored.operation == current.operation
@@ -671,7 +683,7 @@ fn validate_external_effect_receipt(
     receipt: &ExternalEffectReceipt,
 ) -> Result<()> {
     if receipt.version != EXTERNAL_EFFECT_VERSION
-        || receipt.provider != request.provider
+        || receipt.transport_provider != request.transport_provider
         || receipt.repository_identity != request.repository_identity
         || receipt.repository_selector != request.repository_selector
         || receipt.repository != request.repository_selector
@@ -747,6 +759,7 @@ pub(crate) fn stable_external_digest(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn github_source_guard_from_value(
+    repository_host: &str,
     repository_selector: &str,
     repository_identity: &str,
     kind: ExternalSourceObjectKind,
@@ -768,18 +781,10 @@ pub(crate) fn github_source_guard_from_value(
     let updated_at = external_source_string(object, "updatedAt")?;
     let state = external_source_string(object, "state")?.to_ascii_uppercase();
     let title = external_source_string(object, "title")?;
-    let body = object
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let body = required_external_source_string_allow_empty(object, "body")?;
     let url = external_source_string(object, "url")?;
-    let author = object
-        .get("author")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|author| author.get("login"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("<unknown>");
-    let label_values = bounded_external_source_array(
+    let author = nullable_external_source_author(object, "author")?;
+    let label_values = required_bounded_external_source_array(
         object.get("labels"),
         "GitHub source labels",
         MAX_EXTERNAL_SOURCE_LABELS,
@@ -833,8 +838,8 @@ pub(crate) fn github_source_guard_from_value(
             let is_draft = object
                 .get("isDraft")
                 .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let file_values = bounded_external_source_array(
+                .context("GitHub source observation omitted boolean isDraft")?;
+            let file_values = required_bounded_external_source_array(
                 object.get("files"),
                 "GitHub source files",
                 MAX_EXTERNAL_SOURCE_FILES,
@@ -855,20 +860,17 @@ pub(crate) fn github_source_guard_from_value(
             }
             files.sort();
             files.dedup();
-            let checks = canonical_external_source_items(
+            let checks = canonical_required_external_source_items(
                 object.get("statusCheckRollup"),
                 "GitHub source checks",
                 MAX_EXTERNAL_SOURCE_CHECKS,
             )?;
-            let reviews = canonical_external_source_items(
+            let reviews = canonical_required_external_source_items(
                 object.get("latestReviews"),
                 "GitHub source reviews",
                 MAX_EXTERNAL_SOURCE_REVIEWS,
             )?;
-            let review_decision = object
-                .get("reviewDecision")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+            let review_decision = nullable_external_source_string(object, "reviewDecision")?;
             let action = stable_json_digest(&(
                 "maco_github_pull_request_action_revision_v1",
                 repository_selector,
@@ -907,6 +909,7 @@ pub(crate) fn github_source_guard_from_value(
     };
     ExternalSourceGuard::new(
         "github",
+        repository_host,
         repository_selector,
         repository_identity,
         kind,
@@ -920,31 +923,32 @@ pub(crate) fn github_source_guard_from_value(
     )
 }
 
-fn bounded_external_source_array<'a>(
+fn required_bounded_external_source_array<'a>(
     value: Option<&'a serde_json::Value>,
     label: &str,
     max: usize,
 ) -> Result<&'a [serde_json::Value]> {
-    let values = match value {
-        None | Some(serde_json::Value::Null) => &[][..],
-        Some(value) => value
-            .as_array()
-            .with_context(|| format!("{label} was not an array"))?,
-    };
+    let values = value
+        .context(format!("{label} was missing"))?
+        .as_array()
+        .with_context(|| format!("{label} was not an array"))?;
     if values.len() > max {
         bail!("{label} exceeded its entry limit");
     }
     Ok(values)
 }
 
-fn canonical_external_source_items(
+fn canonical_required_external_source_items(
     value: Option<&serde_json::Value>,
     label: &str,
     max: usize,
 ) -> Result<Vec<String>> {
-    let values = bounded_external_source_array(value, label, max)?;
+    let values = required_bounded_external_source_array(value, label, max)?;
     let mut canonical = Vec::with_capacity(values.len());
     for item in values {
+        if !item.is_object() {
+            bail!("{label} entry was not an object");
+        }
         let bytes =
             serde_json::to_vec(item).with_context(|| format!("failed to encode {label}"))?;
         if bytes.len() > MAX_GITHUB_RECEIPT_BODY_BYTES {
@@ -955,6 +959,65 @@ fn canonical_external_source_items(
     canonical.sort();
     canonical.dedup();
     Ok(canonical)
+}
+
+fn required_external_source_string_allow_empty<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str> {
+    let value = object
+        .get(field)
+        .with_context(|| format!("GitHub source observation omitted {field}"))?
+        .as_str()
+        .with_context(|| format!("GitHub source observation {field} was not a string"))?;
+    if value.len() > MAX_GITHUB_RECEIPT_BODY_BYTES || value.contains('\0') {
+        bail!("GitHub source observation {field} was malformed or oversized");
+    }
+    Ok(value)
+}
+
+fn nullable_external_source_author<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str> {
+    match object
+        .get(field)
+        .with_context(|| format!("GitHub source observation omitted {field}"))?
+    {
+        serde_json::Value::Null => Ok("<unknown>"),
+        serde_json::Value::Object(author) => {
+            let login = author
+                .get("login")
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| format!("GitHub source observation {field}.login was missing"))?;
+            validate_external_source_field(
+                login,
+                "GitHub source author login",
+                MAX_GITHUB_SLUG_BYTES,
+            )?;
+            Ok(login)
+        }
+        _ => bail!("GitHub source observation {field} was neither null nor an object"),
+    }
+}
+
+fn nullable_external_source_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str> {
+    match object
+        .get(field)
+        .with_context(|| format!("GitHub source observation omitted {field}"))?
+    {
+        serde_json::Value::Null => Ok(""),
+        serde_json::Value::String(value) => {
+            if value.len() > MAX_GITHUB_RECEIPT_STRING_BYTES || value.contains('\0') {
+                bail!("GitHub source observation {field} was malformed or oversized");
+            }
+            Ok(value)
+        }
+        _ => bail!("GitHub source observation {field} was neither null nor a string"),
+    }
 }
 
 fn validate_external_source_field(value: &str, label: &str, max: usize) -> Result<()> {
@@ -1006,8 +1069,10 @@ fn revalidate_external_source_with(
     let remote_url = remote_url(&repository, "origin")
         .context("external source revalidation requires canonical origin")?;
     let github_repository = github_repository_identity(&remote_url)?;
-    let selector = format!("{}/{}", github_repository.owner, github_repository.name);
-    if !selector.eq_ignore_ascii_case(&expected.repository_selector) {
+    let selector = github_repository.selector();
+    if github_repository.host != expected.repository_host
+        || selector != expected.repository_selector
+    {
         bail!("external source guard repository selector changed");
     }
     let common = SafeRoot::open_existing(repository.commondir())
@@ -1024,6 +1089,7 @@ fn revalidate_external_source_with(
         &github_repository,
     )?;
     let observed = github_source_guard_from_value(
+        &github_repository.host,
         &expected.repository_selector,
         &expected.repository_identity,
         expected.object_kind,
@@ -1034,6 +1100,7 @@ fn revalidate_external_source_with(
             bail!("external source changed from its exact freshness snapshot");
         }
     } else if observed.provider != expected.provider
+        || observed.repository_host != expected.repository_host
         || observed.repository_selector != expected.repository_selector
         || observed.repository_identity != expected.repository_identity
         || observed.object_kind != expected.object_kind
@@ -1052,6 +1119,7 @@ pub(crate) fn revalidate_external_source_value(
 ) -> Result<()> {
     expected.validate()?;
     let observed = github_source_guard_from_value(
+        &expected.repository_host,
         &expected.repository_selector,
         &expected.repository_identity,
         expected.object_kind,
@@ -1205,6 +1273,40 @@ impl GithubRepositoryIdentity {
     fn selector(&self) -> String {
         format!("{}/{}/{}", self.host, self.owner, self.name)
     }
+}
+
+fn github_repository_identity_from_selector(selector: &str) -> Result<GithubRepositoryIdentity> {
+    if selector.len() > MAX_PUBLICATION_PATH_BYTES || selector.contains(['\\', '@', '?', '#']) {
+        bail!("GitHub repository selector was malformed or oversized");
+    }
+    let components = selector.split('/').collect::<Vec<_>>();
+    if components.len() != 3 {
+        bail!("GitHub repository selector must be canonical host/owner/name");
+    }
+    let host = normalize_github_host(components[0])?;
+    if host != components[0] {
+        bail!("GitHub repository selector host was not canonical");
+    }
+    validate_github_slug(components[1], "GitHub repository owner")?;
+    validate_github_slug(components[2], "GitHub repository name")?;
+    Ok(GithubRepositoryIdentity {
+        host,
+        owner: components[1].to_ascii_lowercase(),
+        name: components[2].to_ascii_lowercase(),
+    })
+}
+
+pub(crate) fn canonical_github_source_repository(remote_url: &str) -> Result<(String, String)> {
+    let repository = github_repository_identity(remote_url)?;
+    Ok((repository.host.clone(), repository.selector()))
+}
+
+pub(crate) fn validate_github_source_repository_binding(host: &str, selector: &str) -> Result<()> {
+    let repository = github_repository_identity_from_selector(selector)?;
+    if repository.host != host {
+        bail!("GitHub source repository host did not match its canonical selector");
+    }
+    Ok(())
 }
 
 struct PublicationTransaction {
@@ -2833,7 +2935,11 @@ fn validate_github_receipt_url(
 fn validate_github_issue_receipt_url(
     url: &str,
     expected: &GithubRepositoryIdentity,
+    expected_number: u64,
 ) -> Result<String> {
+    if expected_number == 0 {
+        bail!("GitHub issue receipt number was zero");
+    }
     validate_github_receipt_url_text(url)?;
     let (scheme, remainder) = url
         .split_once("://")
@@ -2854,7 +2960,8 @@ fn validate_github_issue_receipt_url(
     if host != authority
         || components.len() != 4
         || components[2] != "issues"
-        || issue_number.is_none_or(|number| components[3] != number.to_string())
+        || issue_number != Some(expected_number)
+        || components[3] != expected_number.to_string()
         || host != expected.host
         || !components[0].eq_ignore_ascii_case(&expected.owner)
         || !components[1].eq_ignore_ascii_case(&expected.name)
@@ -3479,15 +3586,22 @@ impl PublicationTransaction {
         if report.forge == ForgeKind::Github && expected_base_oid.is_none() {
             bail!("GitHub publication requires an exact reviewed base OID");
         }
-        let forge = match report.forge {
-            ForgeKind::Git => "git",
-            ForgeKind::Github => "github",
-            ForgeKind::Fake => "fake",
-        };
         let github_repository = match report.forge {
             ForgeKind::Github => Some(github_repository_identity(remote_url)?),
             ForgeKind::Git | ForgeKind::Fake => None,
         };
+        let source_repository = source_guard
+            .as_ref()
+            .map(|source| -> Result<GithubRepositoryIdentity> {
+                let repository = github_repository_identity(remote_url)?;
+                if repository.host != source.repository_host
+                    || repository.selector() != source.repository_selector
+                {
+                    bail!("publication origin changed from the exact guarded source repository");
+                }
+                Ok(repository)
+            })
+            .transpose()?;
         let expected_pr_author = match report.forge {
             ForgeKind::Github => Some(select_github_expected_author_with(|key| {
                 env::var(key).ok()
@@ -3508,14 +3622,15 @@ impl PublicationTransaction {
             .into_authenticator()
             .context("failed to establish authenticated publication effect ledger")?;
         let repository_identity = auth.binding().repository_id.clone();
-        let repository_selector = github_repository
+        let repository_selector = source_repository
             .as_ref()
+            .or(github_repository.as_ref())
             .map(GithubRepositoryIdentity::selector)
             .unwrap_or_else(|| redact_remote_url(remote_url));
         drop(auth);
         let remote_display = redact_remote_url(remote_url);
         let push_effect_request = ExternalEffectRequest::new(
-            forge,
+            "git",
             &repository_selector,
             &repository_identity,
             source_guard.clone(),
@@ -4087,7 +4202,7 @@ fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Resu
         let canonical_author = canonical_github_author_login(expected_author)
             .context("GitHub publication journal expected author was malformed")?;
         let marker_literal = if is_external_effect_receipt {
-            format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:{marker} -->")
+            format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v2:{marker} -->")
         } else {
             format!("<!-- maco-publication-marker:{marker} -->")
         };
@@ -5652,7 +5767,7 @@ impl GitPushExternalEffectProvider<'_> {
     fn exact_receipt(&self, request: &ExternalEffectRequest) -> ExternalEffectReceipt {
         ExternalEffectReceipt {
             version: EXTERNAL_EFFECT_VERSION,
-            provider: request.provider.clone(),
+            transport_provider: request.transport_provider.clone(),
             repository_identity: request.repository_identity.clone(),
             repository_selector: request.repository_selector.clone(),
             effect_id: request.effect_id.clone(),
@@ -5867,7 +5982,7 @@ impl<A: GithubApi> GithubPrExternalEffectProvider<'_, A> {
     ) -> ExternalEffectReceipt {
         ExternalEffectReceipt {
             version: EXTERNAL_EFFECT_VERSION,
-            provider: request.provider.clone(),
+            transport_provider: request.transport_provider.clone(),
             repository_identity: request.repository_identity.clone(),
             repository_selector: request.repository_selector.clone(),
             effect_id: request.effect_id.clone(),
@@ -6548,6 +6663,13 @@ fn validate_gh_operation(
         {
             validate_gh_positive_number(number, "issue effect number")
         }
+        ["issue", "list", "--repo", bound, "--state", "open", "--json", fields, "--limit", limit, labels @ ..]
+            if *bound == selector
+                && *fields == GITHUB_ISSUE_SOURCE_FIELDS
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_github_source_list_tail(limit, labels)
+        }
         ["issue", "list", "--repo", bound, "--state", "all", "--search", marker, "--limit", limit, "--json", fields]
             if *bound == selector
                 && *limit == GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT
@@ -6562,6 +6684,13 @@ fn validate_gh_operation(
                 && matches!(stdin, StdinMode::Null) =>
         {
             validate_gh_positive_number(number, "pull-request source number")
+        }
+        ["pr", "list", "--repo", bound, "--state", "open", "--json", fields, "--limit", limit, labels @ ..]
+            if *bound == selector
+                && *fields == GITHUB_PR_SOURCE_FIELDS
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_github_source_list_tail(limit, labels)
         }
         ["pr", "list", "--repo", bound, "--head", branch, "--state", "all", "--limit", limit, "--json", fields]
             if *bound == selector
@@ -6619,6 +6748,30 @@ fn validate_gh_operation(
     }
 }
 
+fn validate_github_source_list_tail(limit: &str, labels: &[&str]) -> Result<()> {
+    let parsed_limit = limit
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=MAX_GITHUB_SOURCE_LIST_ITEMS).contains(limit))
+        .context("GitHub source list limit was not canonical and bounded")?;
+    if parsed_limit.to_string() != limit {
+        bail!("GitHub source list limit was not canonical");
+    }
+    if !labels.len().is_multiple_of(2) || labels.len() / 2 > MAX_GITHUB_SOURCE_LIST_LABELS {
+        bail!("GitHub source list labels were malformed or excessive");
+    }
+    for pair in labels.chunks_exact(2) {
+        if pair[0] != "--label" {
+            bail!("GitHub source list contains an unapproved option");
+        }
+        validate_gh_argument_value(pair[1], "GitHub source list label")?;
+        if pair[1].len() > MAX_GITHUB_SLUG_BYTES {
+            bail!("GitHub source list label exceeded its bound");
+        }
+    }
+    Ok(())
+}
+
 fn validate_gh_positive_number(value: &str, label: &str) -> Result<()> {
     if value.len() > 20 || value.parse::<u64>().is_err() || value == "0" {
         bail!("{label} is not a canonical positive integer");
@@ -6639,7 +6792,7 @@ fn validate_gh_argument_value(value: &str, label: &str) -> Result<()> {
 
 fn validate_external_effect_marker_argument(value: &str) -> Result<()> {
     let effect_id = value
-        .strip_prefix(&format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v1:"))
+        .strip_prefix(&format!("<!-- {EXTERNAL_EFFECT_MARKER_PREFIX}:v2:"))
         .and_then(|value| value.strip_suffix(" -->"))
         .context("GitHub effect lookup marker was malformed")?;
     validate_external_digest(effect_id, "GitHub effect lookup marker id")
@@ -6720,6 +6873,68 @@ fn cli_github_source_view(
         serde_json::from_str(&stdout).context("gh exact source view did not return valid JSON")?;
     if serde_json::to_vec(&value)?.len() > MAX_EXTERNAL_SOURCE_SERIALIZED_BYTES {
         bail!("gh exact source view exceeded its JSON byte limit");
+    }
+    Ok(value)
+}
+
+fn github_source_list_args(
+    repository: &GithubRepositoryIdentity,
+    kind: ExternalSourceObjectKind,
+    max_items: usize,
+    labels: &[String],
+) -> Result<Vec<OsString>> {
+    if !(1..=MAX_GITHUB_SOURCE_LIST_ITEMS).contains(&max_items)
+        || labels.len() > MAX_GITHUB_SOURCE_LIST_LABELS
+    {
+        bail!("GitHub source list request exceeded its item or label bound");
+    }
+    let (subcommand, fields) = match kind {
+        ExternalSourceObjectKind::Issue => ("issue", GITHUB_ISSUE_SOURCE_FIELDS),
+        ExternalSourceObjectKind::PullRequest => ("pr", GITHUB_PR_SOURCE_FIELDS),
+    };
+    let selector = repository.selector();
+    let limit = max_items.to_string();
+    let mut args = [
+        subcommand, "list", "--repo", &selector, "--state", "open", "--json", fields, "--limit",
+        &limit,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    for label in labels {
+        validate_gh_argument_value(label, "GitHub source list label")?;
+        if label.len() > MAX_GITHUB_SLUG_BYTES {
+            bail!("GitHub source list label exceeded its bound");
+        }
+        args.push(OsString::from("--label"));
+        args.push(OsString::from(label));
+    }
+    validate_gh_operation(&args, &StdinMode::Null, repository)?;
+    Ok(args)
+}
+
+pub(crate) fn list_github_source_items(
+    repo: &Path,
+    repository_selector: &str,
+    kind: ExternalSourceObjectKind,
+    max_items: usize,
+    labels: &[String],
+) -> Result<serde_json::Value> {
+    let repository = github_repository_identity_from_selector(repository_selector)?;
+    let args = github_source_list_args(&repository, kind, max_items, labels)?;
+    let context = GhCommandContext::create(repo, &repository)?;
+    let output = context.run("gh exact source list", args, StdinMode::Null)?;
+    let stdout = required_command_stdout(output, "gh exact source list")?;
+    if stdout.len() > MAX_EXTERNAL_SOURCE_SERIALIZED_BYTES {
+        bail!("gh exact source list exceeded its JSON byte limit");
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).context("gh exact source list did not return valid JSON")?;
+    let values = value
+        .as_array()
+        .context("gh exact source list did not return a JSON array")?;
+    if values.len() > max_items {
+        bail!("gh exact source list returned more items than requested");
     }
     Ok(value)
 }
@@ -7010,7 +7225,7 @@ impl GithubIssueExternalEffectProvider<'_> {
     }
 
     fn matches_contract(&self, observed: &GithubIssueEffectObserved) -> Result<bool> {
-        validate_github_issue_receipt_url(&observed.url, self.repository)?;
+        validate_github_issue_receipt_url(&observed.url, self.repository, observed.number)?;
         Ok(observed.title == self.title
             && observed.body == self.marked_body
             && observed.labels == self.labels
@@ -7025,7 +7240,7 @@ impl GithubIssueExternalEffectProvider<'_> {
     ) -> ExternalEffectReceipt {
         ExternalEffectReceipt {
             version: EXTERNAL_EFFECT_VERSION,
-            provider: request.provider.clone(),
+            transport_provider: request.transport_provider.clone(),
             repository_identity: request.repository_identity.clone(),
             repository_selector: request.repository_selector.clone(),
             effect_id: request.effect_id.clone(),
@@ -7324,7 +7539,7 @@ impl GithubCommentExternalEffectProvider<'_> {
     ) -> ExternalEffectReceipt {
         ExternalEffectReceipt {
             version: EXTERNAL_EFFECT_VERSION,
-            provider: request.provider.clone(),
+            transport_provider: request.transport_provider.clone(),
             repository_identity: request.repository_identity.clone(),
             repository_selector: request.repository_selector.clone(),
             effect_id: request.effect_id.clone(),
@@ -7705,7 +7920,13 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
         expected_author: &expected_author,
     };
     let receipt = execute_external_effect_exactly_once(repo, request, &mut provider)?;
-    validate_github_issue_receipt_url(&receipt.url, &github_repository)
+    let number = receipt
+        .provider_id
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .context("GitHub issue receipt provider id was malformed")?;
+    validate_github_issue_receipt_url(&receipt.url, &github_repository, number)
 }
 
 fn required_command_stdout(output: merge::RequiredCommandOutput, label: &str) -> Result<String> {
@@ -7864,7 +8085,7 @@ mod tests {
         fn exact_receipt(request: &ExternalEffectRequest) -> ExternalEffectReceipt {
             ExternalEffectReceipt {
                 version: EXTERNAL_EFFECT_VERSION,
-                provider: request.provider.clone(),
+                transport_provider: request.transport_provider.clone(),
                 repository_identity: request.repository_identity.clone(),
                 repository_selector: request.repository_selector.clone(),
                 effect_id: request.effect_id.clone(),
@@ -7947,7 +8168,8 @@ mod tests {
     fn fake_source_guard(updated_at: &str, content: char, action: char) -> ExternalSourceGuard {
         ExternalSourceGuard::new(
             "github",
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             stable_external_digest(b"fake-source-repository"),
             ExternalSourceObjectKind::PullRequest,
             17,
@@ -7974,7 +8196,7 @@ mod tests {
         drop(auth);
         ExternalEffectRequest::new(
             "github",
-            "acme/repo",
+            "github.example/acme/repo",
             &repository_identity,
             Some(source),
             ExternalEffectOperation::GithubPullRequestComment,
@@ -7982,6 +8204,59 @@ mod tests {
             serde_json::json!({"body": body}),
         )
         .expect("fake external effect request")
+    }
+
+    #[test]
+    fn external_effect_production_shapes_bind_source_and_transport_providers_separately() {
+        let source = fake_source_guard("2026-07-13T00:00:00Z", '3', '4');
+        let repository_identity = stable_external_digest(b"production-shape-repository");
+        let git_push = ExternalEffectRequest::new(
+            "git",
+            "github.example/acme/repo",
+            &repository_identity,
+            Some(source.clone()),
+            ExternalEffectOperation::GitPush,
+            serde_json::json!({"remote_ref": "refs/heads/maco/effects/1"}),
+            serde_json::json!({"expected_oid": "1".repeat(40)}),
+        )
+        .expect("source-backed Git transport request");
+        let github_pr = ExternalEffectRequest::new(
+            "github",
+            "github.example/acme/repo",
+            &repository_identity,
+            Some(source.clone()),
+            ExternalEffectOperation::GithubPullRequest,
+            serde_json::json!({"base": "main"}),
+            serde_json::json!({"draft": true}),
+        )
+        .expect("source-backed GitHub PR transport request");
+        let github_comment = ExternalEffectRequest::new(
+            "github",
+            "github.example/acme/repo",
+            &repository_identity,
+            Some(source),
+            ExternalEffectOperation::GithubPullRequestComment,
+            serde_json::json!({"number": 17}),
+            serde_json::json!({"body": "done"}),
+        )
+        .expect("source-backed GitHub comment transport request");
+
+        assert_eq!(git_push.transport_provider, "git");
+        assert_eq!(github_pr.transport_provider, "github");
+        assert_eq!(github_comment.transport_provider, "github");
+        assert_eq!(git_push.source.as_ref().unwrap().provider, "github");
+        assert_eq!(github_pr.source.as_ref().unwrap().provider, "github");
+        assert_ne!(git_push.effect_id, github_pr.effect_id);
+        assert!(ExternalEffectRequest::new(
+            "github",
+            "github.example/acme/repo",
+            &repository_identity,
+            git_push.source,
+            ExternalEffectOperation::GitPush,
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .is_err());
     }
 
     fn seed_effect_phase(
@@ -8247,7 +8522,8 @@ mod tests {
         assert_ne!(identity, external_source_repository_identity(8, 11));
         assert!(ExternalSourceGuard::new(
             "github",
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             "maco-v1-collision-prone-identity",
             ExternalSourceObjectKind::Issue,
             1,
@@ -8261,7 +8537,28 @@ mod tests {
         .is_err());
         assert!(ExternalSourceGuard::new(
             "github",
-            "acme/repo/extra",
+            "other.example",
+            "github.example/acme/repo",
+            identity.clone(),
+            ExternalSourceObjectKind::Issue,
+            1,
+            "2026-07-13T00:00:00Z",
+            "OPEN",
+            None,
+            None,
+            "1".repeat(64),
+            "2".repeat(64),
+        )
+        .is_err());
+        assert!(validate_github_source_repository_binding(
+            "github.example",
+            "other.example/acme/repo"
+        )
+        .is_err());
+        assert!(ExternalSourceGuard::new(
+            "github",
+            "github.example",
+            "github.example/acme/repo/extra",
             identity.clone(),
             ExternalSourceObjectKind::Issue,
             1,
@@ -8275,7 +8572,8 @@ mod tests {
         .is_err());
         assert!(ExternalSourceGuard::new(
             "github",
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             identity.clone(),
             ExternalSourceObjectKind::Issue,
             1,
@@ -8307,7 +8605,8 @@ mod tests {
             "statusCheckRollup": []
         });
         let expected = github_source_guard_from_value(
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             &stable_external_digest(b"source-repo"),
             ExternalSourceObjectKind::PullRequest,
             &original,
@@ -8317,7 +8616,8 @@ mod tests {
         volatile["updatedAt"] = serde_json::json!("2026-07-13T00:01:00Z");
         volatile["statusCheckRollup"] = serde_json::json!([{"name": "maco", "status": "SUCCESS"}]);
         let volatile_guard = github_source_guard_from_value(
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             &stable_external_digest(b"source-repo"),
             ExternalSourceObjectKind::PullRequest,
             &volatile,
@@ -8333,7 +8633,8 @@ mod tests {
         let mut changed = volatile;
         changed["title"] = serde_json::json!("changed title");
         let changed_guard = github_source_guard_from_value(
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             &stable_external_digest(b"source-repo"),
             ExternalSourceObjectKind::PullRequest,
             &changed,
@@ -8343,6 +8644,84 @@ mod tests {
             expected.action_revision_digest,
             changed_guard.action_revision_digest
         );
+    }
+
+    #[test]
+    fn github_source_guard_requires_exact_typed_fields_and_only_documented_nulls() {
+        let valid = serde_json::json!({
+            "number": 7,
+            "title": "title",
+            "body": "",
+            "url": "https://github.example/acme/repo/pull/7",
+            "author": null,
+            "labels": [],
+            "updatedAt": "2026-07-13T00:00:00Z",
+            "state": "OPEN",
+            "headRefName": "feature",
+            "baseRefName": "main",
+            "headRefOid": "1".repeat(40),
+            "baseRefOid": "2".repeat(40),
+            "isDraft": false,
+            "files": [],
+            "reviewDecision": null,
+            "latestReviews": [],
+            "statusCheckRollup": []
+        });
+        let parse = |value: &serde_json::Value| {
+            github_source_guard_from_value(
+                "github.example",
+                "github.example/acme/repo",
+                &stable_external_digest(b"strict-source-repository"),
+                ExternalSourceObjectKind::PullRequest,
+                value,
+            )
+        };
+        parse(&valid).expect("documented explicit nulls");
+
+        for field in [
+            "number",
+            "title",
+            "body",
+            "url",
+            "author",
+            "labels",
+            "updatedAt",
+            "state",
+            "headRefName",
+            "baseRefName",
+            "headRefOid",
+            "baseRefOid",
+            "isDraft",
+            "files",
+            "reviewDecision",
+            "latestReviews",
+            "statusCheckRollup",
+        ] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(parse(&missing).is_err(), "missing {field} was accepted");
+        }
+        for (field, wrong) in [
+            ("body", serde_json::json!(null)),
+            ("author", serde_json::json!("reviewer")),
+            ("labels", serde_json::json!(null)),
+            ("labels", serde_json::json!([null])),
+            ("isDraft", serde_json::json!(null)),
+            ("files", serde_json::json!({})),
+            ("files", serde_json::json!([null])),
+            ("reviewDecision", serde_json::json!(false)),
+            ("latestReviews", serde_json::json!(null)),
+            ("latestReviews", serde_json::json!([null])),
+            ("statusCheckRollup", serde_json::json!({})),
+            ("statusCheckRollup", serde_json::json!([null])),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[field] = wrong;
+            assert!(
+                parse(&malformed).is_err(),
+                "wrong type for {field} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -8356,7 +8735,7 @@ mod tests {
             worktree_path: Path::new("."),
             repository: &repository,
             title: "title",
-            marked_body: "body\n\n<!-- maco-external-effect:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->".to_string(),
+            marked_body: "body\n\n<!-- maco-external-effect:v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->".to_string(),
             labels: &["bug".to_string()],
             expected_author: "publisher",
         };
@@ -8373,6 +8752,9 @@ mod tests {
         let mut closed = exact.clone();
         closed.state = "CLOSED".to_string();
         assert!(!provider.matches_contract(&closed).expect("closed issue"));
+        let mut wrong_url_number = exact.clone();
+        wrong_url_number.url = "https://github.example/acme/repo/issues/8".to_string();
+        assert!(provider.matches_contract(&wrong_url_number).is_err());
         let mut mutated = exact;
         mutated.body.push_str("mutated");
         assert!(!provider.matches_contract(&mutated).expect("mutated issue"));
@@ -8404,7 +8786,8 @@ mod tests {
         };
         let source = ExternalSourceGuard::new(
             "github",
-            "acme/repo",
+            "github.example",
+            "github.example/acme/repo",
             stable_external_digest(b"paginated-comment-source"),
             ExternalSourceObjectKind::Issue,
             7,
@@ -8426,7 +8809,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let marker = "<!-- maco-external-effect:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->";
+        let marker = "<!-- maco-external-effect:v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->";
         let pages = serde_json::json!([
             page_one,
             [{
@@ -9855,6 +10238,7 @@ mod tests {
             validate_github_issue_receipt_url(
                 "https://github.example/owner/repo/issues/9",
                 &repository,
+                9,
             )
             .expect("valid issue receipt"),
             "https://github.example/owner/repo/issues/9"
@@ -9864,13 +10248,14 @@ mod tests {
             "https://github.example/owner/repo/issues",
             "https://github.example/owner/repo/issues/0",
             "https://github.example/owner/repo/issues/009",
+            "https://github.example/owner/repo/issues/8",
             "https://github.example/other/repo/issues/9",
             "https://github.example/owner/repo/issues/9?token=x",
             "https://github.example/owner/repo/issues/9#fragment",
             "http://github.example/owner/repo/issues/9",
         ] {
             assert!(
-                validate_github_issue_receipt_url(invalid, &repository).is_err(),
+                validate_github_issue_receipt_url(invalid, &repository, 9).is_err(),
                 "invalid issue receipt passed: {invalid}"
             );
         }
@@ -10819,6 +11204,89 @@ mod tests {
                 assert!(validate_gh_operation(&args, &stdin, &repository).is_err());
             }
         }
+    }
+
+    #[test]
+    fn github_source_list_argv_is_host_bound_exact_and_bounded() {
+        let repository = GithubRepositoryIdentity {
+            host: "github.example".to_string(),
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        };
+        let args = github_source_list_args(
+            &repository,
+            ExternalSourceObjectKind::PullRequest,
+            17,
+            &["security".to_string(), "ready".to_string()],
+        )
+        .expect("trusted source list argv");
+        let text = args
+            .iter()
+            .map(|argument| argument.to_str().expect("UTF-8 argv"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text,
+            [
+                "pr",
+                "list",
+                "--repo",
+                "github.example/owner/repo",
+                "--state",
+                "open",
+                "--json",
+                GITHUB_PR_SOURCE_FIELDS,
+                "--limit",
+                "17",
+                "--label",
+                "security",
+                "--label",
+                "ready",
+            ]
+        );
+        validate_gh_operation(&args, &StdinMode::Null, &repository)
+            .expect("exact allowlisted source list");
+        let issue_args = github_source_list_args(
+            &repository,
+            ExternalSourceObjectKind::Issue,
+            MAX_GITHUB_SOURCE_LIST_ITEMS,
+            &[],
+        )
+        .expect("trusted issue source list argv");
+        validate_gh_operation(&issue_args, &StdinMode::Null, &repository)
+            .expect("exact allowlisted issue source list");
+        assert_eq!(issue_args[0], "issue");
+        assert_eq!(issue_args[3], "github.example/owner/repo");
+
+        let other_host = GithubRepositoryIdentity {
+            host: "other.example".to_string(),
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        };
+        assert!(validate_gh_operation(&args, &StdinMode::Null, &other_host).is_err());
+        assert!(
+            github_source_list_args(&repository, ExternalSourceObjectKind::Issue, 0, &[]).is_err()
+        );
+        assert!(github_source_list_args(
+            &repository,
+            ExternalSourceObjectKind::Issue,
+            MAX_GITHUB_SOURCE_LIST_ITEMS + 1,
+            &[]
+        )
+        .is_err());
+        assert!(github_source_list_args(
+            &repository,
+            ExternalSourceObjectKind::Issue,
+            1,
+            &vec!["label".to_string(); MAX_GITHUB_SOURCE_LIST_LABELS + 1]
+        )
+        .is_err());
+        assert!(github_source_list_args(
+            &repository,
+            ExternalSourceObjectKind::Issue,
+            1,
+            &["--web".to_string()]
+        )
+        .is_err());
     }
 
     #[test]
