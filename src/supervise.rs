@@ -1025,6 +1025,7 @@ struct ChildAttemptArtifacts {
     report_path: PathBuf,
     log_path: PathBuf,
     raw_report_relative: PathBuf,
+    raw_stdout_relative: PathBuf,
     command_record_relative: PathBuf,
 }
 
@@ -1056,7 +1057,8 @@ fn child_attempt_artifacts(
         raw_report_relative: PathBuf::from("evidence")
             .join("incoming")
             .join(format!("{stem}.json")),
-        command_record_relative: PathBuf::from("logs").join(format!("{stem}.json")),
+        raw_stdout_relative: PathBuf::from("logs").join(format!("{stem}.jsonl")),
+        command_record_relative: PathBuf::from("logs").join(format!("{stem}.summary.json")),
     }
 }
 
@@ -1514,8 +1516,9 @@ fn run_supervisor_plan_with_runner(
                     raw_report_relative: PathBuf::from("evidence")
                         .join("incoming")
                         .join(format!("{auditor_id}.json")),
+                    raw_stdout_relative: PathBuf::from("logs").join(format!("{auditor_id}.jsonl")),
                     command_record_relative: PathBuf::from("logs")
-                        .join(format!("{auditor_id}.json")),
+                        .join(format!("{auditor_id}.summary.json")),
                 };
                 let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
                 let auditor_prompt =
@@ -3952,6 +3955,18 @@ fn import_external_attempt_evidence(
                 )?;
             }
         }
+        let stdout_bytes = external_run.stdout_bytes();
+        if stdout_bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
+            bail!(
+                "descriptor-held external stdout exceeds its configured {} byte limit",
+                MAX_SUPERVISOR_REPORT_BYTES
+            );
+        }
+        writer.write_bytes(
+            &artifacts.raw_stdout_relative,
+            stdout_bytes,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
         let command_record = command_record_from_external(external_run, external_command);
         write_artifact_json(
             writer,
