@@ -104,7 +104,7 @@ impl RunArtifactFamily {
     pub fn final_report_relative_path(self) -> PathBuf {
         match self {
             Self::Autopilot | Self::Inbox => PathBuf::from("final-report.json"),
-            Self::Consult => PathBuf::from("consultant-report.json"),
+            Self::Consult => PathBuf::from("trusted").join("consultant-report.json"),
             Self::Supervise => PathBuf::from("reports").join("supervisor-final.json"),
         }
     }

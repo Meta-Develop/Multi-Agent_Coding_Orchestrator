@@ -38,16 +38,16 @@ fn consult_ask_fake_runtime_writes_report_and_artifacts() -> Result<()> {
         .context("question summary")?
         .contains("<redacted:local-path>"));
     assert!(repo_path
-        .join(".maco/consult/runs/consult-fake/question.md")
+        .join(".maco/consult/runs/consult-fake/trusted/question.md")
         .exists());
     assert!(repo_path
-        .join(".maco/consult/runs/consult-fake/consultant-report.json")
+        .join(".maco/consult/runs/consult-fake/trusted/consultant-report.json")
         .exists());
     assert!(repo_path
-        .join(".maco/consult/runs/consult-fake/raw.log")
+        .join(".maco/consult/runs/consult-fake/trusted/raw.log")
         .exists());
     assert!(repo_path
-        .join(".maco/consult/runs/consult-fake/schemas/consultant-report.schema.json")
+        .join(".maco/consult/runs/consult-fake/trusted/schemas/consultant-report.schema.json")
         .exists());
 
     Ok(())
@@ -211,7 +211,7 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
     assert!(!command.iter().any(|arg| arg == "--enable"));
     if verified_backend_available {
         let raw_log =
-            fs::read_to_string(repo_path.join(".maco/consult/runs/consult-codex/raw.log"))
+            fs::read_to_string(repo_path.join(".maco/consult/runs/consult-codex/trusted/raw.log"))
                 .context("read raw log")?;
         assert!(raw_log.contains(r#""consultant_role_prefix":true"#));
         assert!(raw_log.contains(r#""goals":false"#));
@@ -266,7 +266,7 @@ fn consult_claude_adapter_is_refused_before_launch() -> Result<()> {
         .iter()
         .any(|arg| arg.as_str().is_some_and(|text| text.contains("danger"))));
     assert!(!repo_path
-        .join(".maco/consult/runs/consult-claude/raw.log")
+        .join(".maco/consult/runs/consult-claude/trusted/raw.log")
         .exists());
 
     Ok(())
@@ -301,7 +301,7 @@ fn consult_claude_refusal_precedes_result_envelope_parsing() -> Result<()> {
         .context("external refusal")?
         .contains("no enforceable inner read-only permission contract"));
     assert!(!repo_path
-        .join(".maco/consult/runs/consult-claude-missing-result/raw.log")
+        .join(".maco/consult/runs/consult-claude-missing-result/trusted/raw.log")
         .exists());
 
     Ok(())

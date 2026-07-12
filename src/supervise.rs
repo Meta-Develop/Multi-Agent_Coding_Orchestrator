@@ -3999,6 +3999,7 @@ fn deterministic_fake_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
         stdout: crate::external_agent::CapturedOutput::default(),
         stderr: crate::external_agent::CapturedOutput::default(),
         error: None,
+        output_last_message: fs::read(&command.output_last_message).ok(),
     }
 }
 
@@ -4880,7 +4881,7 @@ mod tests {
                     };
                     serde_json::to_vec(&child_report(id)).expect("serialize child report")
                 };
-                fs::write(&command.output_last_message, contents).expect("write injected report");
+                fs::write(&command.output_last_message, &contents).expect("write injected report");
                 ExternalAgentRun {
                     command: vec!["injected-runner".to_string()],
                     cwd: command.cwd.clone(),
@@ -4910,6 +4911,7 @@ mod tests {
                     stdout: CapturedOutput::default(),
                     stderr: CapturedOutput::default(),
                     error: None,
+                    output_last_message: Some(contents),
                 }
             };
 
@@ -6234,6 +6236,7 @@ mod tests {
             stdout: CapturedOutput::default(),
             stderr: CapturedOutput::default(),
             error: None,
+            output_last_message: fs::read(&command.output_last_message).ok(),
         }
     }
 

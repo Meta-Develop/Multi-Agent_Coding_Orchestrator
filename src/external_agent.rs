@@ -4,6 +4,7 @@ use crate::process_runner::{
     SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode, StreamCapture,
     StrictOfflineWorkspaceProfile, WorkspaceAccess,
 };
+use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,7 +12,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Read,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -168,6 +169,10 @@ pub struct ExternalAgentRun {
     pub stdout: CapturedOutput,
     pub stderr: CapturedOutput,
     pub error: Option<String>,
+    /// Descriptor-captured final output. This is deliberately excluded from the public report
+    /// surface so callers cannot confuse a tainted pathname with the held capability.
+    #[serde(skip, default)]
+    pub(crate) output_last_message: Option<Vec<u8>>,
 }
 
 impl ExternalAgentRun {
@@ -190,6 +195,10 @@ impl ExternalAgentRun {
 
     pub(crate) fn simulation_succeeded(&self) -> bool {
         self.exit_code == Some(0) && !self.timed_out && self.error.is_none() && !self.publishable
+    }
+
+    pub(crate) fn output_last_message(&self) -> Option<&[u8]> {
+        self.output_last_message.as_deref()
     }
 }
 
@@ -272,6 +281,7 @@ fn run_external_agent_runtime(
         stdout: CapturedOutput::default(),
         stderr: CapturedOutput::default(),
         error: None,
+        output_last_message: None,
     };
 
     let codex_version = if runtime == ExternalExecutionRuntime::Verified
@@ -292,6 +302,15 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+
+    if spec.invocation == ExternalAgentInvocation::ClaudeConsultant {
+        report.duration_ms = duration_millis(started.elapsed());
+        report.error = Some(
+            "external Claude runtime is refused because no enforceable inner read-only permission contract is available"
+                .to_string(),
+        );
+        return report;
+    }
 
     // An explicit executable is useful only as a bounded, strict-offline version diagnostic.
     // Never give it repository-write authority, provider network access, ambient API keys, or a
@@ -321,16 +340,7 @@ fn run_external_agent_runtime(
         return report;
     }
 
-    if spec.invocation == ExternalAgentInvocation::ClaudeConsultant {
-        report.duration_ms = duration_millis(started.elapsed());
-        report.error = Some(
-            "external Claude runtime is refused because no enforceable inner read-only permission contract is available"
-                .to_string(),
-        );
-        return report;
-    }
-
-    let output_reservation = match ReservedOutputFile::create(&spec.output_last_message) {
+    let output_reservation = match reserve_external_output(&spec.output_last_message) {
         Ok(reservation) => reservation,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
@@ -486,13 +496,16 @@ fn run_external_agent_runtime(
                 };
                 report.error = append_external_error(report.error.take(), Some(status_error));
             }
-            if let Err(error) = output_reservation.verify_unchanged() {
-                report.error = append_external_error(
-                    report.error.take(),
-                    Some(format!(
-                        "external-agent output reservation changed: {error}"
-                    )),
-                );
+            match output_reservation.read_bounded(OUTPUT_TEE_LIMIT_BYTES) {
+                Ok(bytes) => report.output_last_message = Some(bytes),
+                Err(error) => {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!(
+                            "external-agent output reservation changed: {error}"
+                        )),
+                    );
+                }
             }
             report.publishable = runtime == ExternalExecutionRuntime::Verified
                 && safety_verified
@@ -531,7 +544,17 @@ fn failed_external_run(
         stdout: CapturedOutput::default(),
         stderr: CapturedOutput::default(),
         error: Some(error),
+        output_last_message: None,
     }
+}
+
+fn reserve_external_output(path: &Path) -> Result<ReservedOutputFile> {
+    let parent = required_parent(path)?;
+    let name = path
+        .file_name()
+        .with_context(|| format!("external output must have a file name: {}", path.display()))?;
+    let root = SecureOutputRoot::open_or_create(parent)?;
+    root.reserve(name)
 }
 
 #[derive(Debug)]
@@ -833,10 +856,9 @@ fn external_side_effect_profile(
     let program_parent = program
         .parent()
         .with_context(|| format!("executable has no parent: {}", program.display()))?;
-    let artifact_roots = vec![
-        required_parent(&spec.json_log)?,
-        required_parent(&spec.output_last_message)?,
-    ];
+    // The parent tee owns and holds `json_log`; the child never needs that directory writable.
+    // Only the isolated incoming final-message directory is exposed as a child artifact root.
+    let artifact_roots = [required_parent(&spec.output_last_message)?];
     match spec.invocation {
         ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant => {
             let mut profile = match spec.workspace_access {
@@ -1014,81 +1036,6 @@ fn ensure_safe_read_target(path: &Path) -> Result<()> {
     read_bounded_regular_file_nofollow(path, MAX_PROMPT_BYTES)
         .map(|_| ())
         .with_context(|| format!("unsafe external-agent input {}", path.display()))
-}
-
-#[derive(Debug)]
-struct ReservedOutputFile {
-    path: PathBuf,
-    _file: File,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-impl ReservedOutputFile {
-    fn create(path: &Path) -> Result<Self> {
-        ensure_existing_output_parent(path)?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        }
-        let file = options
-            .open(path)
-            .with_context(|| format!("output target must be newly created: {}", path.display()))?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            bail!(
-                "reserved output target is not a regular file: {}",
-                path.display()
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if metadata.permissions().mode() & 0o777 != 0o600 {
-                bail!(
-                    "reserved output target is not owner-private: {}",
-                    path.display()
-                );
-            }
-            Ok(Self {
-                path: path.to_path_buf(),
-                _file: file,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self {
-                path: path.to_path_buf(),
-                _file: file,
-            })
-        }
-    }
-
-    fn verify_unchanged(&self) -> Result<()> {
-        let metadata = fs::symlink_metadata(&self.path).with_context(|| {
-            format!("failed to inspect reserved output {}", self.path.display())
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("reserved output is no longer a non-symlink regular file");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.dev() != self.device || metadata.ino() != self.inode {
-                bail!("reserved output inode was replaced");
-            }
-        }
-        Ok(())
-    }
 }
 
 fn append_external_error(existing: Option<String>, next: Option<String>) -> Option<String> {
@@ -1364,6 +1311,7 @@ mod tests {
             stdout: CapturedOutput::default(),
             stderr: CapturedOutput::default(),
             error: None,
+            output_last_message: None,
         };
         assert!(!report.succeeded());
         report.process_tree = Some(ProcessTreeEvidence::TrustedBestEffort(
@@ -1425,6 +1373,62 @@ mod tests {
         )
         .expect_err("custom program must not receive provider-network authority");
         assert!(error.to_string().contains("trusted system Codex"));
+    }
+
+    #[test]
+    fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        let container = temp.path().join("run");
+        let trusted = container.join("trusted");
+        let incoming = container.join("incoming");
+        let spec = ExternalAgentCommand::codex(
+            workspace.join("codex"),
+            &workspace,
+            trusted.join("prompt.md"),
+            trusted.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        );
+        let profile = external_side_effect_profile(
+            &spec,
+            &workspace.join("codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+        )?;
+        let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+            bail!("expected external Codex profile");
+        };
+        assert_eq!(profile.writable_artifact_roots(), &[incoming]);
+        assert!(profile
+            .writable_artifact_roots()
+            .iter()
+            .all(|root| !root.starts_with(&trusted)));
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_captured_output_is_never_serialized() -> Result<()> {
+        let mut report = failed_external_run(
+            &ExternalAgentCommand::codex(
+                "codex",
+                ".",
+                "prompt",
+                "log",
+                "output",
+                Duration::from_secs(1),
+            ),
+            Instant::now(),
+            vec!["codex".to_string()],
+            false,
+            "failed".to_string(),
+        );
+        report.output_last_message = Some(b"private descriptor bytes".to_vec());
+        let value = serde_json::to_value(&report)?;
+        assert!(value.get("output_last_message").is_none());
+        let decoded: ExternalAgentRun = serde_json::from_value(value)?;
+        assert_eq!(decoded.output_last_message(), None);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1624,13 +1628,16 @@ printf '\n{"type":"done"}\n'
 
         let prompt = temp.path().join("prompt.txt");
         fs::write(&prompt, "run the fake external agent\n")?;
+        let output_dir = temp.path().join("incoming");
+        fs::create_dir(&output_dir)?;
+        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700))?;
 
         let spec = ExternalAgentCommand::codex(
             &agent,
             temp.path(),
             &prompt,
             temp.path().join("events.jsonl"),
-            temp.path().join("last-message.txt"),
+            output_dir.join("last-message.txt"),
             Duration::from_secs(3),
         );
 
@@ -1684,13 +1691,16 @@ exit 0
 
         let prompt = temp.path().join("prompt.txt");
         fs::write(&prompt, "run the fake external agent\n")?;
+        let output_dir = temp.path().join("incoming");
+        fs::create_dir(&output_dir)?;
+        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700))?;
 
         let spec = ExternalAgentCommand::codex(
             &agent,
             temp.path(),
             &prompt,
             temp.path().join("events.jsonl"),
-            temp.path().join("last-message.txt"),
+            output_dir.join("last-message.txt"),
             Duration::from_secs(1),
         );
 
@@ -1713,6 +1723,61 @@ exit 0
         assert!(report.stdout.text.contains("descendant started"));
         assert!(report.stderr.text.contains("descendant stderr started"));
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_output_rebind_is_rejected_without_following_attacker_symlink() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let sentinel = temp.path().join("sentinel");
+        fs::write(&sentinel, "untouched")?;
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(
+            &agent,
+            format!(
+                r#"#!/bin/sh
+set -eu
+report=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    report=$1
+  fi
+  shift
+done
+printf '{{"ok":true}}\n' > "$report"
+mv "$report" "$report.moved"
+ln -s '{}' "$report"
+"#,
+                sentinel.display()
+            ),
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "test output identity\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(3),
+        );
+
+        let report = run_external_agent_nonpublishable_simulation(&spec);
+
+        assert!(report.output_last_message().is_none());
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("reservation changed")));
+        assert_eq!(fs::read(&sentinel)?, b"untouched");
         Ok(())
     }
 }

@@ -82,12 +82,12 @@ impl SecureOutputRoot {
             })?;
             validate_private_directory(&metadata, &absolute)?;
             use std::os::unix::fs::MetadataExt;
-            return Ok(Self {
+            Ok(Self {
                 path: absolute,
                 directory,
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            });
+            })
         }
         #[cfg(not(unix))]
         {
@@ -111,12 +111,12 @@ impl SecureOutputRoot {
             })?;
             validate_private_directory(&metadata, &absolute)?;
             use std::os::unix::fs::MetadataExt;
-            return Ok(Self {
+            Ok(Self {
                 path: absolute,
                 directory,
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            });
+            })
         }
         #[cfg(not(unix))]
         {
@@ -140,7 +140,7 @@ impl SecureOutputRoot {
         self.create_child_impl(name, ChildSetupFault::AfterOpen)
     }
 
-    fn create_child_impl(&self, name: &OsStr, fault: ChildSetupFault) -> Result<Self> {
+    fn create_child_impl(&self, name: &OsStr, _fault: ChildSetupFault) -> Result<Self> {
         #[cfg(unix)]
         {
             self.verify_path_identity()?;
@@ -178,7 +178,7 @@ impl SecureOutputRoot {
                 });
             }
             #[cfg(test)]
-            if fault == ChildSetupFault::BeforeOpen {
+            if _fault == ChildSetupFault::BeforeOpen {
                 cleanup_created_directory(
                     &self.directory,
                     &name_c,
@@ -206,7 +206,7 @@ impl SecureOutputRoot {
             };
             let prepared = (|| -> Result<(u64, u64)> {
                 #[cfg(test)]
-                if fault == ChildSetupFault::AfterOpen {
+                if _fault == ChildSetupFault::AfterOpen {
                     bail!("synthetic secure child setup failure after open");
                 }
                 let metadata = directory.metadata()?;
@@ -233,12 +233,12 @@ impl SecureOutputRoot {
                 }
             };
             let path = self.path.join(name);
-            return Ok(Self {
+            Ok(Self {
                 path,
                 directory,
                 device,
                 inode,
-            });
+            })
         }
         #[cfg(not(unix))]
         {
@@ -413,7 +413,7 @@ impl SecureOutputRoot {
                 inode: identity.1,
             };
             slot.verify_path_identity()?;
-            return Ok(slot);
+            Ok(slot)
         }
         #[cfg(not(unix))]
         {
@@ -557,7 +557,7 @@ impl ReservedOutputFile {
                     libc::unlinkat(self.directory.as_raw_fd(), temp_c.as_ptr(), 0);
                 }
             }
-            return result;
+            result
         }
         #[cfg(not(unix))]
         {
@@ -603,8 +603,9 @@ impl ReservedOutputFile {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("secure output path changed: {}", self.path.display()));
         }
-        if stat.st_dev as u64 != self.device
-            || stat.st_ino as u64 != self.inode
+        let (path_device, path_inode) = stat_identity(&stat);
+        if path_device != self.device
+            || path_inode != self.inode
             || (stat.st_mode & libc::S_IFMT) != libc::S_IFREG
             || stat.st_nlink != 1
         {
@@ -755,7 +756,7 @@ fn created_directory_identity(parent: &File, name: &CString) -> Result<(u64, u64
     if (metadata.st_mode & libc::S_IFMT) != libc::S_IFDIR {
         bail!("created secure output child was rebound to a non-directory");
     }
-    Ok((metadata.st_dev as u64, metadata.st_ino as u64))
+    Ok(stat_identity(&metadata))
 }
 
 #[cfg(unix)]
@@ -783,8 +784,9 @@ fn cleanup_created_directory(
             )
         });
     }
-    if actual.st_dev as u64 != expected.0
-        || actual.st_ino as u64 != expected.1
+    let actual_identity = stat_identity(&actual);
+    if actual_identity.0 != expected.0
+        || actual_identity.1 != expected.1
         || (actual.st_mode & libc::S_IFMT) != libc::S_IFDIR
     {
         bail!(
@@ -830,8 +832,9 @@ fn cleanup_created_file(
             )
         });
     }
-    if actual.st_dev as u64 != expected.0
-        || actual.st_ino as u64 != expected.1
+    let actual_identity = stat_identity(&actual);
+    if actual_identity.0 != expected.0
+        || actual_identity.1 != expected.1
         || (actual.st_mode & libc::S_IFMT) != libc::S_IFREG
     {
         bail!(
@@ -850,6 +853,13 @@ fn cleanup_created_file(
     }
     parent.sync_all()?;
     Ok(())
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn stat_identity(metadata: &libc::stat) -> (u64, u64) {
+    // `dev_t`/`ino_t` widths differ across Unix targets; normalize them for stored evidence.
+    (metadata.st_dev as u64, metadata.st_ino as u64)
 }
 
 #[cfg(unix)]

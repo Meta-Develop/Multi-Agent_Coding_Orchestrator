@@ -3,7 +3,8 @@ use crate::{
     external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
     llm::Redactor,
     orchestrator::RunId,
-    process_runner::{read_bounded_regular_file_nofollow, resolve_existing_path_without_symlinks},
+    process_runner::resolve_existing_path_without_symlinks,
+    secure_output::{ReservedOutputFile, SecureOutputRoot},
     sync::normalize_repo_relative_path,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -11,8 +12,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
-    fs::{self, File},
-    io::Write,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -26,6 +27,7 @@ const ANSWER_LIMIT: usize = 16 * 1024;
 const REFERENCE_LIMIT: usize = 512;
 const CAVEAT_LIMIT: usize = 1024;
 const CONSULTANT_THREAD_DEPTH: u8 = 2;
+const MAX_CONSULT_ARTIFACT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ConsultAskOptions {
@@ -122,7 +124,7 @@ pub struct ConsultantReport {
 struct ConsultantArtifacts {
     run_dir: PathBuf,
     question_path: PathBuf,
-    report_path: PathBuf,
+    incoming_report_path: PathBuf,
     raw_log_path: PathBuf,
     schema_path: PathBuf,
 }
@@ -148,20 +150,24 @@ pub fn ask_consultant(options: ConsultAskOptions) -> Result<ConsultantReport> {
     let context_paths = validate_context_paths(&repo, &options.context_paths)?;
     let prepared_question = prepare_question(&options.question)?;
     let artifacts = consultant_artifacts(&repo, &options.run_id);
-    fs::create_dir_all(&artifacts.run_dir).with_context(|| {
-        format!(
-            "failed to create consult run dir {}",
-            artifacts.run_dir.display()
-        )
-    })?;
-    write_consultant_schema(&artifacts.schema_path)?;
+    let run_container = SecureOutputRoot::create_new(&artifacts.run_dir)?;
+    let trusted_root = run_container.create_child(OsStr::new("trusted"))?;
+    let incoming_root = run_container.create_child(OsStr::new("incoming"))?;
+    trusted_root.reject_overlap(&incoming_root)?;
+    let schema_root = trusted_root.create_child(OsStr::new("schemas"))?;
+    let mut schema = schema_root.reserve(OsStr::new("consultant-report.schema.json"))?;
+    let mut question = trusted_root.reserve(OsStr::new("question.md"))?;
+    let mut final_report = trusted_root.reserve(OsStr::new("consultant-report.json"))?;
+    write_consultant_schema(&mut schema)?;
     let prompt = consultant_prompt(
         &options.run_id,
         &prepared_question.prompt_body,
         &context_paths,
         &artifacts.schema_path,
     )?;
-    write_text_file(&artifacts.question_path, &prompt)?;
+    question
+        .write_bytes_atomic(prompt.as_bytes(), MAX_CONSULT_ARTIFACT_BYTES)
+        .with_context(|| format!("failed to write {}", question.path().display()))?;
 
     let report = match options.runtime {
         ConsultantRuntime::Fake => fake_consultant_report(
@@ -194,7 +200,7 @@ pub fn ask_consultant(options: ConsultAskOptions) -> Result<ConsultantReport> {
         }
     };
 
-    write_json_file(&artifacts.report_path, &report)?;
+    write_consultant_final_report(&mut final_report, &report)?;
     Ok(report)
 }
 
@@ -330,15 +336,14 @@ fn run_codex_consultant(
         repo,
         &artifacts.question_path,
         &artifacts.raw_log_path,
-        &artifacts.report_path,
+        &artifacts.incoming_report_path,
         timeout,
     );
     let external_run = run_external_agent(&command);
-    let report_text =
-        match read_bounded_regular_file_nofollow(&artifacts.report_path, ANSWER_LIMIT * 8) {
-            Ok(contents) => String::from_utf8_lossy(&contents).into_owned(),
-            Err(error) => format!("failed to read Codex consultant report: {error}"),
-        };
+    let report_text = match external_run.output_last_message() {
+        Some(contents) => String::from_utf8_lossy(contents).into_owned(),
+        None => "failed to capture Codex consultant report from reserved descriptor".to_string(),
+    };
     Ok(report_from_external_text(
         ConsultantRuntime::Codex,
         run_id,
@@ -361,14 +366,11 @@ fn run_claude_consultant(
         repo,
         &artifacts.question_path,
         &artifacts.raw_log_path,
-        &artifacts.report_path,
+        &artifacts.incoming_report_path,
         timeout,
     );
     let external_run = run_external_agent(&command);
-    let raw_log = match fs::read_to_string(&artifacts.raw_log_path) {
-        Ok(contents) => contents,
-        Err(error) => format!("failed to read Claude raw log: {error}"),
-    };
+    let raw_log = external_run.stdout.text.clone();
     match claude_result_text(&raw_log) {
         Ok(report_text) => Ok(report_from_external_text(
             ConsultantRuntime::Claude,
@@ -637,20 +639,28 @@ fn last_top_level_json_object(contents: &str) -> Option<&str> {
 
 fn consultant_artifacts(repo: &Path, run_id: &RunId) -> ConsultantArtifacts {
     let run_dir = artifacts::run_dir(repo, RunArtifactFamily::Consult, run_id);
+    let trusted_dir = run_dir.join("trusted");
     ConsultantArtifacts {
-        question_path: run_dir.join("question.md"),
-        report_path: run_dir.join("consultant-report.json"),
-        raw_log_path: run_dir.join("raw.log"),
-        schema_path: run_dir
+        question_path: trusted_dir.join("question.md"),
+        incoming_report_path: run_dir.join("incoming").join("consultant-report.json"),
+        raw_log_path: trusted_dir.join("raw.log"),
+        schema_path: trusted_dir
             .join("schemas")
             .join("consultant-report.schema.json"),
         run_dir,
     }
 }
 
-fn write_consultant_schema(path: &Path) -> Result<()> {
-    write_json_file(
-        path,
+fn write_consultant_final_report(
+    slot: &mut ReservedOutputFile,
+    report: &ConsultantReport,
+) -> Result<()> {
+    slot.write_json_atomic(report, MAX_CONSULT_ARTIFACT_BYTES)
+        .with_context(|| format!("failed to write {}", slot.path().display()))
+}
+
+fn write_consultant_schema(slot: &mut ReservedOutputFile) -> Result<()> {
+    slot.write_json_atomic(
         &json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "ConsultantReport",
@@ -697,21 +707,8 @@ fn write_consultant_schema(path: &Path) -> Result<()> {
                 "status": {"type": "string", "enum": ["succeeded", "failed"]}
             }
         }),
+        MAX_CONSULT_ARTIFACT_BYTES,
     )
-}
-
-fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("path must have a parent directory: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    let mut file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, value)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("failed to finish {}", path.display()))
 }
 
 fn write_text_file(path: &Path, text: &str) -> Result<()> {

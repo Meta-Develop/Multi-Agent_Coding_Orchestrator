@@ -562,6 +562,11 @@ impl ExternalCodexProfile {
         self.config = self.config.with_hidden_root(root);
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn writable_artifact_roots(&self) -> &[PathBuf] {
+        &self.config.writable_artifact_roots
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
