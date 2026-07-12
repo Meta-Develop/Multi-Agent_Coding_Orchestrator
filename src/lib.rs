@@ -18,6 +18,7 @@ pub mod review;
 pub mod safe_state;
 pub(crate) mod secure_output;
 pub mod semantic_coord;
+pub(crate) mod state_journal;
 pub mod supervise;
 pub mod sync;
 pub mod sync_store;

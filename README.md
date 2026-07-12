@@ -45,7 +45,7 @@ The current implementation covers a local-first command-line slice:
   without automatic task planning.
 - `maco orchestrate validate <plan-file>` validates a local JSON orchestration plan.
 - `maco orchestrate run <plan-file>` creates or reuses agent worktrees, claims paths, runs configured local shell commands, runs per-agent validation commands in agent worktrees, enforces path-claim boundaries, optionally writes patches and checkpoints, releases claims, and emits a run summary.
-- `maco orchestrate resume <checkpoint-file>` validates the checkpoint, repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims before skipping completed agents and running only pending work.
+- `maco orchestrate resume <checkpoint-file>` authenticates the repository-bound v3 journal, validates repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims, then reruns validation/capture for completed commands without rerunning those commands.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
 - `maco merge preview` and `maco merge apply` collect one stable agent snapshot and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, candidate-bound validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report`; `--require-validation` accepts passed reports only when their envelope contains the exact current `candidate.validation_binding` (or a passed `merge apply --validation-command`).
@@ -438,15 +438,26 @@ are `0600`, single-link regular files. Roots overlapping a child worktree are
 refused, and patch/checkpoint writes retain descriptor capabilities instead of
 reopening post-child paths.
 
-`maco orchestrate resume <checkpoint-file>` only resumes checkpoints whose run
-id matches the checkpoint filename, whose recorded repository matches the
-requested repository, whose primary HEAD and plan snapshot still match, and
-whose recorded worktrees still exist at the expected paths and branches.
-Completed agents are validated against their recorded changed paths and skipped;
-pending agents must have clean worktrees before they are run.
-Checkpoint v1 is path-safe but not authenticated: it has no signature/MAC or
-external authority binding. Treat checkpoint files as current-user trusted
-input until the planned authenticated v2/WAL format exists.
+`maco orchestrate resume <checkpoint-file>` treats the external JSON file only
+as a bounded repository-locator/reference envelope. Its repository binding and
+MAC are verified before the journal run id, plan path, or saved state becomes
+authoritative. The owner-private v3 journal lives under the repository common
+directory, holds a full-lifecycle exclusive run lock, and uses immutable,
+contiguous, previous-MAC-linked records plus an authenticated durable head.
+This detects mutation, truncation, duplication, and reordering relative to the
+current authenticated head. The guarantee depends on the owner-private state
+root remaining secret and being hidden from child processes; without an
+external monotonic anchor it does not claim to detect restoration of an entire
+older valid key, journal, and head snapshot by an attacker who obtained them.
+
+Resume also requires the filename, repository, primary HEAD, plan snapshot, and
+worktree bindings to match. A `command_started` record without a durable
+completion is an uncertain outcome and is never retried automatically. A
+completed command carries an exact worktree-state binding; resume compares the
+live state to it, reruns validation, and recaptures the candidate without
+rerunning the command. Completed candidates and repo validation are recaptured
+and rerun before success is restored. Unauthenticated checkpoint v1/v2 files
+are refused with guidance to start a new v3 run.
 
 Collect and preview agent output:
 

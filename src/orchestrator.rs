@@ -1,4 +1,10 @@
 use crate::{
+    artifacts::{
+        repository_auth_writer, repository_authenticator,
+        state_auth::{
+            sensitive_state_root, AuthenticationDomain, AuthenticationTag, RepositoryAuthenticator,
+        },
+    },
     merge::capture_worktree_diff_from_commit,
     process_runner::{
         run_process, trusted_system_executable, CapturedBytes, EnvironmentMode, ProcessRunError,
@@ -11,6 +17,7 @@ use crate::{
         SemanticConflict, SemanticCoordinationReport, SemanticIntent, SemanticIntentRequest,
         SemanticIntentStore, SemanticIntentToken,
     },
+    state_journal::{JournalIdentity, StateJournal},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
     worktree::{
@@ -34,11 +41,11 @@ use std::{
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
-const CHECKPOINT_STATE_VERSION: u32 = 2;
+const CHECKPOINT_STATE_VERSION: u32 = 3;
 const GIT_COMMAND_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PATCH_OUTPUT_MAX_BYTES: usize = 64 * 1024 * 1024;
-const CHECKPOINT_OUTPUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const CHECKPOINT_REFERENCE_MAX_BYTES: usize = 64 * 1024;
 const CANDIDATE_BINDING_VERSION: u32 = 1;
 const CANDIDATE_CAPTURE_ATTEMPTS: usize = 3;
 const CANDIDATE_MAX_CHANGED_PATHS: usize = 8 * 1024;
@@ -49,6 +56,21 @@ const COMBINED_CANDIDATE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE: usize = 128;
 const PLAN_MAX_TOTAL_VALIDATION_COMMANDS: usize = 4 * 1024;
 const PLAN_MAX_DEPENDENCY_EDGES: usize = 4 * 1024;
+const CHECKPOINT_REFERENCE_DOMAIN: AuthenticationDomain =
+    AuthenticationDomain::new(b"MACO\0orchestration-checkpoint-reference\0v3\0");
+const CHECKPOINT_SNAPSHOT_PHASE_PREFIX: &str = "snapshot_";
+const PHASE_PLANNED: &str = "planned";
+const PHASE_CLAIM_ACQUIRED: &str = "claim_acquired";
+const PHASE_WORKTREE_PREPARED: &str = "worktree_prepared";
+const PHASE_COMMAND_STARTED: &str = "command_started";
+const PHASE_COMMAND_COMPLETED: &str = "command_completed";
+const PHASE_CANDIDATE_CAPTURED: &str = "candidate_captured";
+const PHASE_VALIDATION_STARTED: &str = "validation_started";
+const PHASE_VALIDATED: &str = "validated";
+const PHASE_REPO_VALIDATION_STARTED: &str = "repo_validation_started";
+const PHASE_REPO_VALIDATED: &str = "repo_validated";
+const PHASE_RELEASED: &str = "released";
+const PHASE_FINAL: &str = "final";
 static REPO_VALIDATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -61,6 +83,17 @@ struct CandidateBoundaryFailureHook {
 #[cfg(test)]
 static CANDIDATE_BOUNDARY_FAILURE_HOOK: std::sync::OnceLock<
     std::sync::Mutex<Option<CandidateBoundaryFailureHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct CheckpointEventFailureHook {
+    run_id: String,
+    phase: String,
+}
+
+#[cfg(test)]
+static CHECKPOINT_EVENT_FAILURE_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<CheckpointEventFailureHook>>,
 > = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +245,22 @@ pub struct RunCheckpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedCheckpointReference {
+    version: u32,
+    repository_hint: PathBuf,
+    journal: JournalIdentity,
+    mac: AuthenticationTag,
+}
+
+#[derive(Serialize)]
+struct CheckpointReferenceMacPayload<'a> {
+    version: u32,
+    repository_hint: &'a Path,
+    journal: &'a JournalIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AgentCheckpoint {
     pub id: String,
     pub status: AgentRunStatus,
@@ -226,6 +275,8 @@ pub struct AgentCheckpoint {
     pub validation: Vec<ValidationRunSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_binding: Option<AgentCandidateBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_completed_binding: Option<CompletedCommandStateBinding>,
     pub error: Option<String>,
 }
 
@@ -372,6 +423,8 @@ pub struct AgentRunSummary {
     pub validation: Vec<ValidationRunSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_binding: Option<AgentCandidateBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_completed_binding: Option<CompletedCommandStateBinding>,
     pub error: Option<String>,
 }
 
@@ -400,6 +453,7 @@ impl AgentRunSummary {
             stderr: OutputSummary::default(),
             validation: Vec::new(),
             candidate_binding: None,
+            command_completed_binding: None,
             error: None,
         }
     }
@@ -414,6 +468,16 @@ pub struct AgentCandidateBinding {
     pub diff_oid: String,
     pub changed_paths: Vec<PathBuf>,
     pub patch_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedCommandStateBinding {
+    pub version: u32,
+    pub base_oid: String,
+    pub head_oid: String,
+    pub state_oid: String,
+    pub changed_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -615,211 +679,289 @@ fn run_plan_with_controls_runtime(
         bail!("orchestration jobs must be at least 1");
     }
 
-    let repo = discover_repo_root(&options.repo)?;
-    let run_id = resolve_run_id(&controls)?;
-    let repo_head = current_head_oid(&repo)?;
-    let worktree_reuse_policy = controls
-        .worktree_reuse_policy
-        .unwrap_or(plan.worktree_reuse_policy);
-    let manager = WorktreeManager::new(&repo);
-    let store = SyncStore::open(&repo)?;
-    let semantic_store = SemanticIntentStore::open(&repo)?;
-    let semantic_coordination = controls.semantic_coordination;
-    let mut summaries = plan
-        .agents
-        .iter()
-        .map(AgentRunSummary::pending)
-        .collect::<Vec<_>>();
-    let mut repo_validation = Vec::new();
-    let mut repo_validation_target = None;
-    let mut acquired_tokens = Vec::new();
-    let mut acquired_semantic_tokens = Vec::new();
+    let early_cleanup_errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cleanup_error_sink = early_cleanup_errors.clone();
+    let result = (|| -> Result<OrchestrationSummary> {
+        let repo = discover_repo_root(&options.repo)?;
+        let run_id = resolve_run_id(&controls)?;
+        let repo_head = current_head_oid(&repo)?;
+        let worktree_reuse_policy = controls
+            .worktree_reuse_policy
+            .unwrap_or(plan.worktree_reuse_policy);
+        let manager = WorktreeManager::new(&repo);
+        let store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let semantic_coordination = controls.semantic_coordination;
+        let mut summaries = plan
+            .agents
+            .iter()
+            .map(AgentRunSummary::pending)
+            .collect::<Vec<_>>();
+        let mut repo_validation = Vec::new();
+        let mut repo_validation_target = None;
+        let mut claim_cleanup = ClaimCleanupGuard::new(store.clone(), cleanup_error_sink.clone());
+        let mut semantic_cleanup =
+            SemanticCleanupGuard::new(semantic_store.clone(), cleanup_error_sink.clone());
+        if options.keep_claims {
+            claim_cleanup.disarm_keep();
+            semantic_cleanup.disarm_keep();
+        }
+        let mut checkpoint_writer =
+            prepare_run_checkpoint_writer(&controls, &run_id, &repo, &summaries)?;
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            writer.event(
+                PHASE_PLANNED,
+                None,
+                &serde_json::json!({
+                    "repo_head": repo_head.to_string(),
+                    "plan_file": options.plan_file,
+                    "plan": CheckpointPlanSnapshot::from(&plan),
+                }),
+            )?;
+        }
 
-    let worktrees = select_worktrees(&manager, &store, &repo_head, &plan, worktree_reuse_policy)?;
-    for (summary, worktree) in summaries.iter_mut().zip(&worktrees) {
-        summary.worktree_reused = worktree.reused;
-        summary.worktree = Some(worktree.record().clone());
-    }
-    let mut checkpoint_writer =
-        prepare_run_checkpoint_writer(&controls, &run_id, &summaries, false)?;
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::WorktreesSelected,
-        &run_id,
-        checkpoint_writer.as_mut(),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
-            keep_claims: options.keep_claims,
-            worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            repo_validation_target: repo_validation_target.as_ref(),
-            released_claims: &[],
-            release_errors: &[],
-            released_semantic_intents: &[],
-            semantic_release_errors: &[],
-        },
-    )?;
-
-    for (index, agent) in plan.agents.iter().enumerate() {
-        match store.claim_paths(&agent.id, agent.paths.iter()) {
-            Ok(claim) => {
-                acquired_tokens.push(claim.token);
-                summaries[index].claim = Some(claim);
-            }
-            Err(error) => {
-                fail_summary(
-                    &mut summaries[index],
-                    format!("failed to claim paths for agent '{}': {error}", agent.id),
-                );
+        let worktrees =
+            select_worktrees(&manager, &store, &repo_head, &plan, worktree_reuse_policy)?;
+        if let Some(writer) = checkpoint_writer.as_ref() {
+            writer.reject_inside_worktrees(&worktrees)?;
+        }
+        for (summary, worktree) in summaries.iter_mut().zip(&worktrees) {
+            summary.worktree_reused = worktree.reused;
+            summary.worktree = Some(worktree.record().clone());
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_WORKTREE_PREPARED,
+                    Some(&summary.id),
+                    worktree.record(),
+                )?;
             }
         }
-    }
-    if semantic_coordination != SemanticCoordinationMode::Off {
-        coordinate_semantic_intents(
-            &semantic_store,
-            &plan,
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::WorktreesSelected,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        for (index, agent) in plan.agents.iter().enumerate() {
+            match store.claim_paths(&agent.id, agent.paths.iter()) {
+                Ok(claim) => {
+                    claim_cleanup.track(claim.token);
+                    summaries[index].claim = Some(claim);
+                    if let Some(writer) = checkpoint_writer.as_mut() {
+                        writer.event(
+                            PHASE_CLAIM_ACQUIRED,
+                            Some(&agent.id),
+                            summaries[index]
+                                .claim
+                                .as_ref()
+                                .context("acquired claim disappeared before journaling")?,
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    fail_summary(
+                        &mut summaries[index],
+                        format!("failed to claim paths for agent '{}': {error}", agent.id),
+                    );
+                }
+            }
+        }
+        if semantic_coordination != SemanticCoordinationMode::Off {
+            coordinate_semantic_intents(
+                &semantic_store,
+                &plan,
+                &mut summaries,
+                semantic_coordination,
+                semantic_cleanup.tokens_mut(),
+            );
+        }
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::ClaimsAcquired,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        let captured_candidates = run_agent_schedule_with_patch_dir(
+            &AgentScheduleContext {
+                manager: &manager,
+                plan: &plan,
+                worktrees: &worktrees,
+                jobs: options.jobs,
+                base_oid: &repo_head,
+                runtime,
+            },
             &mut summaries,
-            semantic_coordination,
-            &mut acquired_semantic_tokens,
-        );
-    }
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::ClaimsAcquired,
-        &run_id,
-        checkpoint_writer.as_mut(),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
-            keep_claims: options.keep_claims,
-            worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            repo_validation_target: repo_validation_target.as_ref(),
-            released_claims: &[],
-            release_errors: &[],
-            released_semantic_intents: &[],
-            semantic_release_errors: &[],
-        },
-    )?;
-
-    let captured_candidates = run_agent_schedule_with_patch_dir(
-        &AgentScheduleContext {
-            manager: &manager,
-            plan: &plan,
-            worktrees: &worktrees,
-            jobs: options.jobs,
-            base_oid: &repo_head,
-            runtime,
-        },
-        &mut summaries,
-        options.patch_dir.as_deref(),
-    )?;
-    if summaries
-        .iter()
-        .all(|summary| summary.status == AgentRunStatus::Succeeded)
-    {
-        let outcome = run_repo_validation_commands(
-            &plan,
-            &repo,
-            &manager,
-            &worktrees,
-            &repo_head,
-            &captured_candidates,
-            runtime,
-        );
-        repo_validation = outcome.summaries;
-        repo_validation_target = outcome.target;
-    }
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::AgentsCompleted,
-        &run_id,
-        checkpoint_writer.as_mut(),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
-            keep_claims: options.keep_claims,
-            worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            repo_validation_target: repo_validation_target.as_ref(),
-            released_claims: &[],
-            release_errors: &[],
-            released_semantic_intents: &[],
-            semantic_release_errors: &[],
-        },
-    )?;
-
-    let (released_claims, release_errors) = if options.keep_claims {
-        (Vec::new(), Vec::new())
-    } else {
-        release_claims(&store, acquired_tokens)
-    };
-    let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
-        (Vec::new(), Vec::new())
-    } else {
-        release_semantic_intents(&semantic_store, acquired_semantic_tokens)
-    };
-    let success = release_errors.is_empty()
-        && semantic_release_errors.is_empty()
-        && repo_validation_target.is_some()
-        && summaries
+            options.patch_dir.as_deref(),
+            checkpoint_writer.as_mut(),
+        )?;
+        if summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
-        && repo_validation
-            .iter()
-            .all(|summary| summary.status == AgentRunStatus::Succeeded);
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::Final,
-        &run_id,
-        checkpoint_writer.as_mut(),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &options.plan_file,
-            plan: &plan,
+        {
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATION_STARTED,
+                    None,
+                    &summaries
+                        .iter()
+                        .map(AgentCheckpoint::from)
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+            let outcome = run_repo_validation_commands(
+                &plan,
+                &repo,
+                &manager,
+                &worktrees,
+                &repo_head,
+                &captured_candidates,
+                runtime,
+            );
+            repo_validation = outcome.summaries;
+            repo_validation_target = outcome.target;
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATED,
+                    None,
+                    &serde_json::json!({
+                        "validation": &repo_validation,
+                        "target": &repo_validation_target,
+                    }),
+                )?;
+            }
+        }
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::AgentsCompleted,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        let (released_claims, release_errors) = if options.keep_claims {
+            claim_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            claim_cleanup.release()
+        };
+        let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
+            semantic_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            semantic_cleanup.release()
+        };
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            writer.event(
+                PHASE_RELEASED,
+                None,
+                &serde_json::json!({
+                    "claims": &released_claims,
+                    "claim_errors": &release_errors,
+                    "semantic_intents": &released_semantic_intents,
+                    "semantic_errors": &semantic_release_errors,
+                    "kept": options.keep_claims,
+                }),
+            )?;
+        }
+        let success = release_errors.is_empty()
+            && semantic_release_errors.is_empty()
+            && repo_validation_target.is_some()
+            && summaries
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded)
+            && repo_validation
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded);
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::Final,
+            &run_id,
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &options.plan_file,
+                plan: &plan,
+                keep_claims: options.keep_claims,
+                worktree_reuse_policy,
+                success,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &released_claims,
+                release_errors: &release_errors,
+                released_semantic_intents: &released_semantic_intents,
+                semantic_release_errors: &semantic_release_errors,
+            },
+        )?;
+
+        Ok(OrchestrationSummary {
+            run_id,
+            repo,
+            plan_file: options.plan_file,
             keep_claims: options.keep_claims,
             worktree_reuse_policy,
+            semantic_coordination,
             success,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            repo_validation_target: repo_validation_target.as_ref(),
-            released_claims: &released_claims,
-            release_errors: &release_errors,
-            released_semantic_intents: &released_semantic_intents,
-            semantic_release_errors: &semantic_release_errors,
-        },
-    )?;
-
-    Ok(OrchestrationSummary {
-        run_id,
-        repo,
-        plan_file: options.plan_file,
-        keep_claims: options.keep_claims,
-        worktree_reuse_policy,
-        semantic_coordination,
-        success,
-        agents: summaries,
-        repo_validation,
-        repo_validation_target,
-        released_claims,
-        release_errors,
-        released_semantic_intents,
-        semantic_release_errors,
-    })
+            agents: summaries,
+            repo_validation,
+            repo_validation_target,
+            released_claims,
+            release_errors,
+            released_semantic_intents,
+            semantic_release_errors,
+        })
+    })();
+    finish_with_early_cleanup(result, &early_cleanup_errors)
 }
 
 pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<OrchestrationSummary> {
@@ -844,158 +986,153 @@ fn resume_plan_file_runtime(
         bail!("orchestration jobs must be at least 1");
     }
 
-    let checkpoint = read_run_checkpoint(&options.checkpoint_file)?;
-    let checkpoint_dir = options
-        .checkpoint_file
-        .parent()
-        .map(Path::to_path_buf)
-        .context("checkpoint file must have a parent directory")?;
-    let expected_checkpoint_path = checkpoint_path(&checkpoint_dir, &checkpoint.run_id);
-    if expected_checkpoint_path != options.checkpoint_file {
-        bail!(
-            "checkpoint file {} does not match run id '{}'; expected {}",
-            options.checkpoint_file.display(),
-            checkpoint.run_id.as_str(),
-            expected_checkpoint_path.display()
-        );
-    }
-
-    let checkpoint_repo = discover_repo_root(&checkpoint.repo).with_context(|| {
-        format!(
-            "failed to validate checkpoint repository {}",
-            checkpoint.repo.display()
-        )
-    })?;
-    let repo = match options.repo.as_deref() {
-        Some(repo) => {
-            let repo = discover_repo_root(repo)?;
-            if repo != checkpoint_repo {
-                bail!(
-                    "checkpoint belongs to repository {}, but resume was requested for {}",
-                    checkpoint_repo.display(),
-                    repo.display()
-                );
-            }
-            repo
-        }
-        None => checkpoint_repo,
-    };
-    let repo_head = current_head_oid(&repo)?;
-    let plan_file = options
-        .plan_file
-        .clone()
-        .unwrap_or_else(|| checkpoint.plan_file.clone());
-    let plan = load_plan(&plan_file)?;
-
-    validate_checkpoint_for_resume(&checkpoint, &plan, &repo_head)?;
-    let manager = WorktreeManager::new(&repo);
-    let store = SyncStore::open(&repo)?;
-    let semantic_store = SemanticIntentStore::open(&repo)?;
-    let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
-    let worktrees = validate_resume_worktrees(
-        &manager,
-        &plan,
-        &checkpoint,
-        &mut summaries,
-        &repo_head,
-        runtime,
-    )?;
-
-    if checkpoint.stage == RunCheckpointStage::Final {
-        return Ok(summary_from_parts(SummaryParts {
-            run_id: checkpoint.run_id,
+    let early_cleanup_errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cleanup_error_sink = early_cleanup_errors.clone();
+    let result = (|| -> Result<OrchestrationSummary> {
+        let OpenedRunCheckpoint {
+            checkpoint,
             repo,
-            plan_file,
-            keep_claims: checkpoint.keep_claims,
-            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-            semantic_coordination: checkpoint.semantic_coordination,
-            summaries,
-            repo_validation: checkpoint.repo_validation,
-            repo_validation_target: checkpoint.repo_validation_target,
-            released_claims: checkpoint.released_claims,
-            release_errors: checkpoint.release_errors,
-            released_semantic_intents: checkpoint.released_semantic_intents,
-            semantic_release_errors: checkpoint.semantic_release_errors,
-        }));
-    }
+            writer,
+        } = open_run_checkpoint(&options.checkpoint_file, options.repo.as_deref())?;
+        let mut checkpoint_writer = Some(writer);
+        let checkpoint_dir = options
+            .checkpoint_file
+            .parent()
+            .map(Path::to_path_buf)
+            .context("checkpoint file must have a parent directory")?;
+        let repo_head = current_head_oid(&repo)?;
+        let plan_file = options
+            .plan_file
+            .clone()
+            .unwrap_or_else(|| checkpoint.plan_file.clone());
+        let plan = load_plan(&plan_file)?;
 
-    let controls = OrchestrationRunControls {
-        run_id: Some(checkpoint.run_id.clone()),
-        checkpoint_dir: Some(checkpoint_dir),
-        worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
-        semantic_coordination: checkpoint.semantic_coordination,
-    };
-    let mut checkpoint_writer = prepare_run_checkpoint_writer(
-        &controls,
-        &Some(checkpoint.run_id.clone()),
-        &summaries,
-        true,
-    )?;
-    let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries);
-    let mut acquired_semantic_tokens =
-        active_checkpoint_semantic_tokens(&semantic_store, &summaries)?;
-    let had_pending_agents = summaries
-        .iter()
-        .any(|summary| summary.status == AgentRunStatus::Pending);
-    let has_checkpoint_semantic_reports = summaries
-        .iter()
-        .any(|summary| summary.semantic_intent.is_some() || !summary.semantic_conflicts.is_empty());
-    if checkpoint.semantic_coordination != SemanticCoordinationMode::Off
-        && had_pending_agents
-        && !has_checkpoint_semantic_reports
-    {
-        coordinate_semantic_intents(
-            &semantic_store,
+        validate_checkpoint_for_resume(&checkpoint, &plan, &repo_head)?;
+        let manager = WorktreeManager::new(&repo);
+        let store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
+        let worktrees = validate_resume_worktrees(
+            &manager,
             &plan,
+            &checkpoint,
             &mut summaries,
-            checkpoint.semantic_coordination,
-            &mut acquired_semantic_tokens,
-        );
-    }
-
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::ClaimsAcquired,
-        &Some(checkpoint.run_id.clone()),
-        checkpoint_writer.as_mut(),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &plan_file,
-            plan: &plan,
-            keep_claims: checkpoint.keep_claims,
-            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &checkpoint.repo_validation,
-            repo_validation_target: checkpoint.repo_validation_target.as_ref(),
-            released_claims: &[],
-            release_errors: &[],
-            released_semantic_intents: &[],
-            semantic_release_errors: &[],
-        },
-    )?;
-
-    let captured_candidates = run_agent_schedule_with_patch_dir(
-        &AgentScheduleContext {
-            manager: &manager,
-            plan: &plan,
-            worktrees: &worktrees,
-            jobs: options.jobs,
-            base_oid: &repo_head,
+            &repo_head,
             runtime,
-        },
-        &mut summaries,
-        options.patch_dir.as_deref(),
-    )?;
-    let (repo_validation, repo_validation_target) = if summaries
-        .iter()
-        .all(|summary| summary.status == AgentRunStatus::Succeeded)
-    {
-        if had_pending_agents
-            || checkpoint.repo_validation.is_empty()
-            || checkpoint.repo_validation_target.is_none()
+        )?;
+        if let Some(writer) = checkpoint_writer.as_ref() {
+            writer.reject_inside_worktrees(&worktrees)?;
+        }
+
+        if checkpoint.stage == RunCheckpointStage::Final {
+            return Ok(summary_from_parts(SummaryParts {
+                run_id: checkpoint.run_id,
+                repo,
+                plan_file,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                semantic_coordination: checkpoint.semantic_coordination,
+                summaries,
+                repo_validation: checkpoint.repo_validation,
+                repo_validation_target: checkpoint.repo_validation_target,
+                released_claims: checkpoint.released_claims,
+                release_errors: checkpoint.release_errors,
+                released_semantic_intents: checkpoint.released_semantic_intents,
+                semantic_release_errors: checkpoint.semantic_release_errors,
+            }));
+        }
+
+        let controls = OrchestrationRunControls {
+            run_id: Some(checkpoint.run_id.clone()),
+            checkpoint_dir: Some(checkpoint_dir),
+            worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
+            semantic_coordination: checkpoint.semantic_coordination,
+        };
+        let mut claim_cleanup = ClaimCleanupGuard::new(store.clone(), cleanup_error_sink.clone());
+        let mut semantic_cleanup =
+            SemanticCleanupGuard::new(semantic_store.clone(), cleanup_error_sink.clone());
+        if checkpoint.keep_claims {
+            claim_cleanup.disarm_keep();
+            semantic_cleanup.disarm_keep();
+        }
+        let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries);
+        claim_cleanup.set_tokens(acquired_tokens);
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            for summary in &summaries {
+                if let Some(claim) = &summary.claim {
+                    writer.event(PHASE_CLAIM_ACQUIRED, Some(&summary.id), claim)?;
+                }
+            }
+        }
+        let (active_semantic_tokens, semantic_coordination_needed) =
+            active_checkpoint_semantic_tokens(&semantic_store, &mut summaries)?;
+        semantic_cleanup.set_tokens(active_semantic_tokens);
+        let had_pending_agents = summaries
+            .iter()
+            .any(|summary| summary.status == AgentRunStatus::Pending);
+        if checkpoint.semantic_coordination != SemanticCoordinationMode::Off
+            && had_pending_agents
+            && semantic_coordination_needed
         {
+            coordinate_semantic_intents(
+                &semantic_store,
+                &plan,
+                &mut summaries,
+                checkpoint.semantic_coordination,
+                semantic_cleanup.tokens_mut(),
+            );
+        }
+
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::ClaimsAcquired,
+            &Some(checkpoint.run_id.clone()),
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &plan_file,
+                plan: &plan,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &checkpoint.repo_validation,
+                repo_validation_target: checkpoint.repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        let captured_candidates = run_agent_schedule_with_patch_dir(
+            &AgentScheduleContext {
+                manager: &manager,
+                plan: &plan,
+                worktrees: &worktrees,
+                jobs: options.jobs,
+                base_oid: &repo_head,
+                runtime,
+            },
+            &mut summaries,
+            options.patch_dir.as_deref(),
+            checkpoint_writer.as_mut(),
+        )?;
+        let (repo_validation, repo_validation_target) = if summaries
+            .iter()
+            .all(|summary| summary.status == AgentRunStatus::Succeeded)
+        {
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATION_STARTED,
+                    None,
+                    &summaries
+                        .iter()
+                        .map(AgentCheckpoint::from)
+                        .collect::<Vec<_>>(),
+                )?;
+            }
             let outcome = run_repo_validation_commands(
                 &plan,
                 &repo,
@@ -1005,102 +1142,123 @@ fn resume_plan_file_runtime(
                 &captured_candidates,
                 runtime,
             );
+            if let Some(writer) = checkpoint_writer.as_mut() {
+                writer.event(
+                    PHASE_REPO_VALIDATED,
+                    None,
+                    &serde_json::json!({
+                        "validation": &outcome.summaries,
+                        "target": &outcome.target,
+                    }),
+                )?;
+            }
             (outcome.summaries, outcome.target)
         } else {
             (
                 checkpoint.repo_validation.clone(),
                 checkpoint.repo_validation_target.clone(),
             )
+        };
+
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::AgentsCompleted,
+            &Some(checkpoint.run_id.clone()),
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &plan_file,
+                plan: &plan,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                success: false,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &[],
+                release_errors: &[],
+                released_semantic_intents: &[],
+                semantic_release_errors: &[],
+            },
+        )?;
+
+        let (released_claims, release_errors) = if checkpoint.keep_claims {
+            claim_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            claim_cleanup.release()
+        };
+        let (released_semantic_intents, semantic_release_errors) = if checkpoint.keep_claims {
+            semantic_cleanup.disarm_keep();
+            (Vec::new(), Vec::new())
+        } else {
+            semantic_cleanup.release()
+        };
+        if let Some(writer) = checkpoint_writer.as_mut() {
+            writer.event(
+                PHASE_RELEASED,
+                None,
+                &serde_json::json!({
+                    "claims": &released_claims,
+                    "claim_errors": &release_errors,
+                    "semantic_intents": &released_semantic_intents,
+                    "semantic_errors": &semantic_release_errors,
+                    "kept": checkpoint.keep_claims,
+                }),
+            )?;
         }
-    } else {
-        (
-            checkpoint.repo_validation.clone(),
-            checkpoint.repo_validation_target.clone(),
-        )
-    };
+        let success = release_errors.is_empty()
+            && semantic_release_errors.is_empty()
+            && repo_validation_target.is_some()
+            && summaries
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded)
+            && repo_validation
+                .iter()
+                .all(|summary| summary.status == AgentRunStatus::Succeeded);
 
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::AgentsCompleted,
-        &Some(checkpoint.run_id.clone()),
-        checkpoint_writer.as_mut(),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &plan_file,
-            plan: &plan,
+        write_checkpoint_if_configured(
+            &controls,
+            RunCheckpointStage::Final,
+            &Some(checkpoint.run_id.clone()),
+            checkpoint_writer.as_mut(),
+            CheckpointView {
+                repo: &repo,
+                repo_head: &repo_head,
+                plan_file: &plan_file,
+                plan: &plan,
+                keep_claims: checkpoint.keep_claims,
+                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+                success,
+                agents: &summaries,
+                repo_validation: &repo_validation,
+                repo_validation_target: repo_validation_target.as_ref(),
+                released_claims: &released_claims,
+                release_errors: &release_errors,
+                released_semantic_intents: &released_semantic_intents,
+                semantic_release_errors: &semantic_release_errors,
+            },
+        )?;
+
+        Ok(OrchestrationSummary {
+            run_id: Some(checkpoint.run_id),
+            repo,
+            plan_file,
             keep_claims: checkpoint.keep_claims,
             worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-            success: false,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            repo_validation_target: repo_validation_target.as_ref(),
-            released_claims: &[],
-            release_errors: &[],
-            released_semantic_intents: &[],
-            semantic_release_errors: &[],
-        },
-    )?;
-
-    let (released_claims, release_errors) = if checkpoint.keep_claims {
-        (Vec::new(), Vec::new())
-    } else {
-        release_claims(&store, acquired_tokens)
-    };
-    let (released_semantic_intents, semantic_release_errors) = if checkpoint.keep_claims {
-        (Vec::new(), Vec::new())
-    } else {
-        release_semantic_intents(&semantic_store, acquired_semantic_tokens)
-    };
-    let success = release_errors.is_empty()
-        && semantic_release_errors.is_empty()
-        && repo_validation_target.is_some()
-        && summaries
-            .iter()
-            .all(|summary| summary.status == AgentRunStatus::Succeeded)
-        && repo_validation
-            .iter()
-            .all(|summary| summary.status == AgentRunStatus::Succeeded);
-
-    write_checkpoint_if_configured(
-        &controls,
-        RunCheckpointStage::Final,
-        &Some(checkpoint.run_id.clone()),
-        checkpoint_writer.as_mut(),
-        CheckpointView {
-            repo: &repo,
-            repo_head: &repo_head,
-            plan_file: &plan_file,
-            plan: &plan,
-            keep_claims: checkpoint.keep_claims,
-            worktree_reuse_policy: checkpoint.worktree_reuse_policy,
+            semantic_coordination: checkpoint.semantic_coordination,
             success,
-            agents: &summaries,
-            repo_validation: &repo_validation,
-            repo_validation_target: repo_validation_target.as_ref(),
-            released_claims: &released_claims,
-            release_errors: &release_errors,
-            released_semantic_intents: &released_semantic_intents,
-            semantic_release_errors: &semantic_release_errors,
-        },
-    )?;
-
-    Ok(OrchestrationSummary {
-        run_id: Some(checkpoint.run_id),
-        repo,
-        plan_file,
-        keep_claims: checkpoint.keep_claims,
-        worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-        semantic_coordination: checkpoint.semantic_coordination,
-        success,
-        agents: summaries,
-        repo_validation,
-        repo_validation_target,
-        released_claims,
-        release_errors,
-        released_semantic_intents,
-        semantic_release_errors,
-    })
+            agents: summaries,
+            repo_validation,
+            repo_validation_target,
+            released_claims,
+            release_errors,
+            released_semantic_intents,
+            semantic_release_errors,
+        })
+    })();
+    finish_with_early_cleanup(result, &early_cleanup_errors)
 }
 
 fn validate_checkpoint_for_resume(
@@ -1176,6 +1334,7 @@ fn validate_checkpoint_for_resume(
         }
         if checkpoint_agent.status == AgentRunStatus::Succeeded
             && checkpoint_agent.candidate_binding.is_none()
+            && checkpoint_agent.command_completed_binding.is_none()
         {
             bail!(
                 "checkpoint '{}' completed agent '{}' is missing candidate validation binding metadata; start a new run",
@@ -1188,6 +1347,18 @@ fn validate_checkpoint_for_resume(
             if checkpoint_agent.changed_paths != binding.changed_paths {
                 bail!(
                     "checkpoint '{}' candidate paths for completed agent '{}' do not match its serialized binding",
+                    checkpoint.run_id.as_str(),
+                    checkpoint_agent.id
+                );
+            }
+        }
+        if let Some(binding) = checkpoint_agent.command_completed_binding.as_ref() {
+            validate_serialized_completed_binding(binding, agent, repo_head)?;
+            if checkpoint_agent.candidate_binding.is_none()
+                && checkpoint_agent.changed_paths != binding.changed_paths
+            {
+                bail!(
+                    "checkpoint '{}' completed-command paths for agent '{}' do not match its exact state binding",
                     checkpoint.run_id.as_str(),
                     checkpoint_agent.id
                 );
@@ -1266,6 +1437,52 @@ fn validate_serialized_agent_binding(
     Ok(())
 }
 
+fn validate_serialized_completed_binding(
+    binding: &CompletedCommandStateBinding,
+    agent: &AgentPlan,
+    repo_head: &Oid,
+) -> Result<()> {
+    if binding.version != CANDIDATE_BINDING_VERSION || binding.base_oid != repo_head.to_string() {
+        bail!(
+            "agent '{}' completed command uses an unsupported or stale state binding",
+            agent.id
+        );
+    }
+    for (label, value) in [
+        ("base", binding.base_oid.as_str()),
+        ("head", binding.head_oid.as_str()),
+        ("state", binding.state_oid.as_str()),
+    ] {
+        let oid = Oid::from_str(value).with_context(|| {
+            format!(
+                "agent '{}' completed-command {label} OID is invalid",
+                agent.id
+            )
+        })?;
+        if oid.to_string() != value {
+            bail!(
+                "agent '{}' completed-command {label} OID is not canonical",
+                agent.id
+            );
+        }
+    }
+    if binding.changed_paths.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "agent '{}' completed-command changed-path count exceeded its bound",
+            agent.id
+        );
+    }
+    for path in &binding.changed_paths {
+        if &normalize_repo_relative_path(path)? != path {
+            bail!(
+                "agent '{}' completed-command path is not normalized",
+                agent.id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_serialized_repo_validation_target(
     target: &RepoValidationTargetBinding,
     checkpoint: &RunCheckpoint,
@@ -1338,6 +1555,7 @@ fn summaries_from_checkpoint(
             summary.unclaimed_changed_paths = checkpoint_agent.unclaimed_changed_paths.clone();
             summary.validation = checkpoint_agent.validation.clone();
             summary.candidate_binding = checkpoint_agent.candidate_binding.clone();
+            summary.command_completed_binding = checkpoint_agent.command_completed_binding.clone();
             summary.error = checkpoint_agent.error.clone();
             Ok(summary)
         })
@@ -1494,16 +1712,6 @@ fn validate_resume_worktrees(
                         agent.id
                     );
                 }
-                let binding = checkpoint_agent
-                    .candidate_binding
-                    .as_ref()
-                    .with_context(|| {
-                        format!(
-                            "checkpoint '{}' completed agent '{}' is missing its candidate binding",
-                            checkpoint.run_id.as_str(),
-                            agent.id
-                        )
-                    })?;
                 let state = capture_consistent_candidate_state(&current.path, repo_head, runtime)
                     .with_context(|| {
                         format!(
@@ -1512,13 +1720,34 @@ fn validate_resume_worktrees(
                             agent.id
                         )
                     })?;
-                ensure_candidate_binding_matches_state(binding, &state).with_context(|| {
-                    format!(
-                        "checkpoint '{}' completed agent '{}' candidate binding drifted",
-                        checkpoint.run_id.as_str(),
-                        agent.id
-                    )
-                })?;
+                if let Some(binding) = checkpoint_agent.candidate_binding.as_ref() {
+                    ensure_candidate_binding_matches_state(binding, &state).with_context(|| {
+                        format!(
+                            "checkpoint '{}' completed agent '{}' candidate binding drifted",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                } else {
+                    checkpoint_agent
+                        .command_completed_binding
+                        .as_ref()
+                        .with_context(|| {
+                            format!(
+                                "checkpoint '{}' completed agent '{}' is missing all exact state binding evidence",
+                                checkpoint.run_id.as_str(),
+                                agent.id
+                            )
+                        })?
+                        .verify_state(&state)
+                        .with_context(|| {
+                            format!(
+                                "checkpoint '{}' completed agent '{}' command state binding drifted",
+                                checkpoint.run_id.as_str(),
+                                agent.id
+                            )
+                        })?;
+                }
                 let before_patch_capture = manager
                     .get_managed_verified(&recorded.name)
                     .with_context(|| {
@@ -1535,25 +1764,27 @@ fn validate_resume_worktrees(
                         agent.id
                     );
                 }
-                let captured = capture_bound_candidate(
-                    &current.path,
-                    repo_head,
-                    &state,
-                    runtime,
-                )
-                .with_context(|| {
-                    format!(
-                        "checkpoint '{}' completed agent '{}' exact candidate could not be recaptured",
-                        checkpoint.run_id.as_str(),
-                        agent.id
+                if let Some(binding) = checkpoint_agent.candidate_binding.as_ref() {
+                    let captured = capture_bound_candidate(
+                        &current.path,
+                        repo_head,
+                        &state,
+                        runtime,
                     )
-                })?;
-                if &captured.binding != binding {
-                    bail!(
-                        "checkpoint '{}' completed agent '{}' exact candidate no longer matches its serialized binding",
-                        checkpoint.run_id.as_str(),
-                        agent.id
-                    );
+                    .with_context(|| {
+                        format!(
+                            "checkpoint '{}' completed agent '{}' exact candidate could not be recaptured",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                    if &captured.binding != binding {
+                        bail!(
+                            "checkpoint '{}' completed agent '{}' exact candidate no longer matches its serialized binding",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        );
+                    }
                 }
             }
             AgentRunStatus::Failed | AgentRunStatus::Skipped => {}
@@ -1693,8 +1924,8 @@ fn paths_match(left: &[PathBuf], right: &[PathBuf]) -> bool {
 
 fn active_checkpoint_semantic_tokens(
     store: &SemanticIntentStore,
-    summaries: &[AgentRunSummary],
-) -> Result<Vec<SemanticIntentToken>> {
+    summaries: &mut [AgentRunSummary],
+) -> Result<(Vec<SemanticIntentToken>, bool)> {
     let active_intents = store.snapshot()?;
     let active_keys = active_intents
         .iter()
@@ -1707,8 +1938,23 @@ fn active_checkpoint_semantic_tokens(
         .map(|intent| intent.token)
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect();
-    Ok(tokens)
+        .collect::<Vec<_>>();
+    let mut coordination_needed = false;
+    for summary in summaries {
+        if summary.status != AgentRunStatus::Pending {
+            continue;
+        }
+        let active = summary
+            .semantic_intent
+            .as_ref()
+            .is_some_and(|intent| active_keys.contains(&(intent.token, intent.agent_id.clone())));
+        if !active {
+            summary.semantic_intent = None;
+            summary.semantic_conflicts.clear();
+            coordination_needed = true;
+        }
+    }
+    Ok((tokens, coordination_needed))
 }
 
 fn coordinate_semantic_intents(
@@ -1720,7 +1966,9 @@ fn coordinate_semantic_intents(
 ) {
     let mut planned_preview_intents = Vec::new();
     for (index, agent) in plan.agents.iter().enumerate() {
-        if summaries[index].status != AgentRunStatus::Pending {
+        if summaries[index].status != AgentRunStatus::Pending
+            || summaries[index].semantic_intent.is_some()
+        {
             continue;
         }
         let request = semantic_request_for_agent(agent);
@@ -2465,6 +2713,7 @@ fn run_agent_schedule_with_patch_dir(
     context: &AgentScheduleContext<'_>,
     summaries: &mut [AgentRunSummary],
     patch_dir: Option<&Path>,
+    checkpoint_writer: Option<&mut RunCheckpointWriter>,
 ) -> Result<Vec<Option<CapturedCandidate>>> {
     let mut patch_outputs =
         prepare_patch_outputs(patch_dir, context.plan, summaries, context.worktrees)?;
@@ -2474,6 +2723,7 @@ fn run_agent_schedule_with_patch_dir(
         summaries,
         &mut patch_outputs,
         &mut captured_candidates,
+        checkpoint_writer,
     );
     let cleanup_result = cleanup_unused_patch_outputs(patch_outputs);
     match (schedule_result, cleanup_result) {
@@ -2491,6 +2741,7 @@ fn run_agent_schedule(
     summaries: &mut [AgentRunSummary],
     patch_outputs: &mut [Option<ReservedOutputFile>],
     captured_candidates: &mut [Option<CapturedCandidate>],
+    mut checkpoint_writer: Option<&mut RunCheckpointWriter>,
 ) -> Result<()> {
     if context.worktrees.len() != summaries.len()
         || context.worktrees.len() != context.plan.agents.len()
@@ -2534,16 +2785,45 @@ fn run_agent_schedule(
                 summaries[index].id
             )
         })?;
-        let binding = summaries[index]
-            .candidate_binding
-            .as_ref()
-            .with_context(|| {
-                format!(
-                    "completed agent '{}' is missing its candidate binding",
-                    summaries[index].id
-                )
-            })?;
-        ensure_candidate_binding_matches_state(binding, &expected)?;
+        let candidate_binding = summaries[index].candidate_binding.clone();
+        let completed_binding = summaries[index].command_completed_binding.clone();
+        match (&candidate_binding, &completed_binding) {
+            (Some(binding), _) => ensure_candidate_binding_matches_state(binding, &expected)?,
+            (None, Some(binding)) => binding.verify_state(&expected)?,
+            (None, None) => bail!(
+                "completed agent '{}' is missing exact command or candidate state binding evidence",
+                summaries[index].id
+            ),
+        }
+        if let Some(writer) = checkpoint_writer.as_deref_mut() {
+            writer.event(
+                PHASE_VALIDATION_STARTED,
+                Some(&summaries[index].id),
+                &AgentCheckpoint::from(&summaries[index]),
+            )?;
+        }
+        let state_intact = run_agent_validation_commands(
+            &context.plan.agents[index],
+            &mut summaries[index],
+            &context.worktrees[index],
+            context.manager,
+            &expected,
+            context.base_oid,
+            context.runtime,
+        );
+        if let Some(writer) = checkpoint_writer.as_deref_mut() {
+            writer.event(
+                PHASE_VALIDATED,
+                Some(&summaries[index].id),
+                &AgentCheckpoint::from(&summaries[index]),
+            )?;
+        }
+        if !state_intact || summaries[index].status != AgentRunStatus::Succeeded {
+            bail!(
+                "completed agent '{}' failed mandatory resume validation; start a new run after resolving the validation failure",
+                summaries[index].id
+            );
+        }
         let captured = capture_selected_bound_candidate(
             context.manager,
             &context.plan.agents[index],
@@ -2553,11 +2833,39 @@ fn run_agent_schedule(
             &expected,
             context.runtime,
         )?;
-        if &captured.binding != binding {
+        if let Some(binding) = candidate_binding.as_ref() {
+            if &captured.binding != binding {
+                bail!(
+                    "completed agent '{}' candidate patch no longer matches its checkpoint binding",
+                    summaries[index].id
+                );
+            }
+        }
+        summaries[index].changed_paths = captured.binding.changed_paths.clone();
+        summaries[index].unclaimed_changed_paths = summaries[index]
+            .changed_paths
+            .iter()
+            .filter(|path| {
+                !context.plan.agents[index]
+                    .paths
+                    .iter()
+                    .any(|claim| path_is_covered_by_claim(path, claim))
+            })
+            .cloned()
+            .collect();
+        if !summaries[index].unclaimed_changed_paths.is_empty() {
             bail!(
-                "completed agent '{}' candidate patch no longer matches its checkpoint binding",
+                "completed agent '{}' exact recovery contains unclaimed paths",
                 summaries[index].id
             );
+        }
+        summaries[index].candidate_binding = Some(captured.binding.clone());
+        if let Some(writer) = checkpoint_writer.as_deref_mut() {
+            writer.event(
+                PHASE_CANDIDATE_CAPTURED,
+                Some(&summaries[index].id),
+                &AgentCheckpoint::from(&summaries[index]),
+            )?;
         }
         captured_candidates[index] = Some(captured);
     }
@@ -2588,6 +2896,21 @@ fn run_agent_schedule(
             break;
         }
 
+        for index in &ready {
+            verify_selected_worktree_binding(
+                context.manager,
+                &context.plan.agents[*index],
+                &summaries[*index],
+                &context.worktrees[*index],
+            )?;
+            if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                writer.event(
+                    PHASE_COMMAND_STARTED,
+                    Some(&summaries[*index].id),
+                    &AgentCheckpoint::from(&summaries[*index]),
+                )?;
+            }
+        }
         let outcomes = run_ready_agents(
             context.manager,
             context.plan,
@@ -2608,7 +2931,30 @@ fn run_agent_schedule(
                 context.runtime,
             );
             let expected_state = match expected_state {
-                Ok(state) => Some(state),
+                Ok(state) => {
+                    summaries[index].changed_paths = state.changed_paths.clone();
+                    summaries[index].unclaimed_changed_paths = state
+                        .changed_paths
+                        .iter()
+                        .filter(|path| {
+                            !context.plan.agents[index]
+                                .paths
+                                .iter()
+                                .any(|claim| path_is_covered_by_claim(path, claim))
+                        })
+                        .cloned()
+                        .collect();
+                    summaries[index].command_completed_binding =
+                        Some(CompletedCommandStateBinding::from_state(&state)?);
+                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                        writer.event(
+                            PHASE_COMMAND_COMPLETED,
+                            Some(&summaries[index].id),
+                            &AgentCheckpoint::from(&summaries[index]),
+                        )?;
+                    }
+                    Some(state)
+                }
                 Err(error) => {
                     #[cfg(test)]
                     notify_candidate_boundary_failure(&context.plan.agents[index].id);
@@ -2622,6 +2968,13 @@ fn run_agent_schedule(
             let mut state_intact = expected_state.is_some();
             if summaries[index].status == AgentRunStatus::Succeeded {
                 if let Some(expected_state) = expected_state.as_ref() {
+                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                        writer.event(
+                            PHASE_VALIDATION_STARTED,
+                            Some(&summaries[index].id),
+                            &AgentCheckpoint::from(&summaries[index]),
+                        )?;
+                    }
                     state_intact = run_agent_validation_commands(
                         &context.plan.agents[index],
                         &mut summaries[index],
@@ -2631,6 +2984,13 @@ fn run_agent_schedule(
                         context.base_oid,
                         context.runtime,
                     );
+                    if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                        writer.event(
+                            PHASE_VALIDATED,
+                            Some(&summaries[index].id),
+                            &AgentCheckpoint::from(&summaries[index]),
+                        )?;
+                    }
                 }
             }
             let patch_output = patch_outputs[index].take();
@@ -2666,6 +3026,13 @@ fn run_agent_schedule(
                     &captured,
                     patch_output,
                 );
+                if let Some(writer) = checkpoint_writer.as_deref_mut() {
+                    writer.event(
+                        PHASE_CANDIDATE_CAPTURED,
+                        Some(&summaries[index].id),
+                        &AgentCheckpoint::from(&summaries[index]),
+                    )?;
+                }
                 if summaries[index].status == AgentRunStatus::Succeeded {
                     captured_candidates[index] = Some(captured);
                 }
@@ -3465,6 +3832,30 @@ impl CandidateStateSnapshot {
     }
 }
 
+impl CompletedCommandStateBinding {
+    fn from_state(state: &CandidateStateSnapshot) -> Result<Self> {
+        Ok(Self {
+            version: CANDIDATE_BINDING_VERSION,
+            base_oid: state.base_oid.to_string(),
+            head_oid: state.head_oid.to_string(),
+            state_oid: state.state_oid()?.to_string(),
+            changed_paths: state.changed_paths.clone(),
+        })
+    }
+
+    fn verify_state(&self, state: &CandidateStateSnapshot) -> Result<()> {
+        if self.version != CANDIDATE_BINDING_VERSION
+            || self.base_oid != state.base_oid.to_string()
+            || self.head_oid != state.head_oid.to_string()
+            || self.state_oid != state.state_oid()?.to_string()
+            || self.changed_paths != state.changed_paths
+        {
+            bail!("completed command state no longer matches its authenticated exact binding");
+        }
+        Ok(())
+    }
+}
+
 fn capture_bound_candidate(
     worktree_path: &Path,
     base_oid: &Oid,
@@ -3702,10 +4093,6 @@ fn run_fixed_git_with_stdin(
         ("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string()),
         ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
     ]);
-    let profile = match access {
-        WorkspaceAccess::ReadOnly => StrictOfflineWorkspaceProfile::read_only(worktree_path),
-        WorkspaceAccess::ReadWrite => StrictOfflineWorkspaceProfile::read_write(worktree_path),
-    };
     let mut command_args = vec![
         std::ffi::OsString::from("--no-pager"),
         std::ffi::OsString::from("--no-optional-locks"),
@@ -3732,11 +4119,26 @@ fn run_fixed_git_with_stdin(
     .with_stdin_limit(COMBINED_CANDIDATE_MAX_BYTES)
     .with_timeout(Some(GIT_COMMAND_TIMEOUT));
     let run_result = run_process(match runtime {
-        OrchestrationExecutionRuntime::Verified => process_spec
-            .with_private_runtime_home(true)
-            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                profile,
-            )),
+        OrchestrationExecutionRuntime::Verified => {
+            let profile = match access {
+                WorkspaceAccess::ReadOnly => {
+                    StrictOfflineWorkspaceProfile::read_only(worktree_path)
+                }
+                WorkspaceAccess::ReadWrite => {
+                    StrictOfflineWorkspaceProfile::read_write(worktree_path)
+                }
+            };
+            let repository = Repository::open(worktree_path)
+                .context("failed to resolve Git administration roots for fixed command")?;
+            let profile = profile
+                .with_visible_read_only_root(repository.commondir())
+                .with_hidden_root(sensitive_state_root(repository.commondir())?);
+            process_spec
+                .with_private_runtime_home(true)
+                .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                    profile,
+                ))
+        }
         #[cfg(test)]
         OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
@@ -3798,6 +4200,7 @@ fn command_spec(
         .as_ref()
         .map(|path| worktree.path().join(path))
         .unwrap_or_else(|| worktree.path().to_path_buf());
+    let (git_common_root, sensitive_root) = orchestration_sandbox_roots(worktree.path())?;
 
     Ok(CommandRunSpec {
         command: agent.command.clone(),
@@ -3805,8 +4208,23 @@ fn command_spec(
         working_directory,
         env: agent.env.clone(),
         timeout: agent.timeout,
+        visible_read_only_roots: vec![git_common_root],
+        hidden_roots: vec![sensitive_root],
         runtime,
     })
+}
+
+fn orchestration_sandbox_roots(worktree: &Path) -> Result<(PathBuf, PathBuf)> {
+    let repository = Repository::open(worktree).with_context(|| {
+        format!(
+            "failed to resolve the repository common directory for {}",
+            worktree.display()
+        )
+    })?;
+    let common_dir = repository.commondir().to_path_buf();
+    let sensitive = sensitive_state_root(&common_dir)
+        .context("repository sensitive state could not be bound for child-process masking")?;
+    Ok((common_dir, sensitive))
 }
 
 fn run_agent_validation_commands(
@@ -4451,12 +4869,32 @@ fn run_validation_command(
         .as_ref()
         .map(|path| root.join(path))
         .unwrap_or_else(|| root.to_path_buf());
+    let (visible_read_only_roots, hidden_roots) = match orchestration_sandbox_roots(root) {
+        Ok((common_dir, state_root)) => (vec![common_dir], vec![state_root]),
+        Err(error) => {
+            let mut summary = validation_summary_from_result(
+                validation,
+                Err(ProcessRunError::Spawn {
+                    label: "validation state masking".to_string(),
+                    command: validation.command.clone(),
+                    current_dir: working_directory.clone(),
+                    source: std::io::Error::other(error.to_string()),
+                }),
+            );
+            summary.error = Some(format!(
+                "failed to bind repository sensitive state before validation: {error:#}"
+            ));
+            return summary;
+        }
+    };
     let result = run_agent_command(CommandRunSpec {
         command: validation.command.clone(),
         workspace_root: root.to_path_buf(),
         working_directory,
         env: validation.env.clone(),
         timeout: validation.timeout,
+        visible_read_only_roots,
+        hidden_roots,
         runtime,
     });
     validation_summary_from_result(validation, result)
@@ -4533,10 +4971,23 @@ struct CommandRunSpec {
     working_directory: PathBuf,
     env: BTreeMap<String, String>,
     timeout: Option<Duration>,
+    visible_read_only_roots: Vec<PathBuf>,
+    hidden_roots: Vec<PathBuf>,
     runtime: OrchestrationExecutionRuntime,
 }
 
+fn strict_command_profile(spec: &CommandRunSpec) -> StrictOfflineWorkspaceProfile {
+    let profile = spec.visible_read_only_roots.iter().fold(
+        StrictOfflineWorkspaceProfile::read_write(&spec.workspace_root),
+        |profile, visible| profile.with_visible_read_only_root(visible),
+    );
+    spec.hidden_roots
+        .iter()
+        .fold(profile, |profile, hidden| profile.with_hidden_root(hidden))
+}
+
 fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRunError> {
+    let strict_profile = strict_command_profile(&spec);
     let mut environment = sandbox_environment();
     environment.extend(spec.env);
     let process_spec = ProcessSpec::shell(
@@ -4552,7 +5003,7 @@ fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRu
         OrchestrationExecutionRuntime::Verified => process_spec
             .with_private_runtime_home(true)
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                StrictOfflineWorkspaceProfile::read_write(spec.workspace_root),
+                strict_profile,
             )),
         #[cfg(test)]
         OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
@@ -4683,24 +5134,158 @@ struct CheckpointView<'a> {
     semantic_release_errors: &'a [String],
 }
 
-#[derive(Debug)]
 struct RunCheckpointWriter {
     slot: ReservedOutputFile,
+    reference: AuthenticatedCheckpointReference,
+    journal: StateJournal,
+}
+
+struct CheckpointReferenceReservation {
+    slot: Option<ReservedOutputFile>,
+}
+
+impl CheckpointReferenceReservation {
+    fn new(slot: ReservedOutputFile) -> Self {
+        Self { slot: Some(slot) }
+    }
+
+    fn slot_mut(&mut self) -> Result<&mut ReservedOutputFile> {
+        self.slot
+            .as_mut()
+            .context("checkpoint reference reservation was consumed")
+    }
+
+    fn take(&mut self) -> Result<ReservedOutputFile> {
+        self.slot
+            .take()
+            .context("checkpoint reference reservation was consumed")
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        match self.slot.take() {
+            Some(slot) => slot.remove(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for CheckpointReferenceReservation {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
 }
 
 impl RunCheckpointWriter {
     fn write(&mut self, checkpoint: &RunCheckpoint) -> Result<()> {
-        self.slot
-            .write_json_atomic(checkpoint, CHECKPOINT_OUTPUT_MAX_BYTES)
-            .with_context(|| format!("failed to write checkpoint {}", self.slot.path().display()))
+        self.verify_external_reference()?;
+        let phase = if checkpoint.stage == RunCheckpointStage::Final {
+            PHASE_FINAL.to_string()
+        } else {
+            format!(
+                "{CHECKPOINT_SNAPSHOT_PHASE_PREFIX}{}",
+                checkpoint_stage_name(checkpoint.stage)
+            )
+        };
+        self.journal.append(&phase, None, checkpoint)?;
+        self.verify_external_reference()
+    }
+
+    fn event<T: Serialize>(
+        &mut self,
+        phase: &str,
+        subject: Option<&str>,
+        payload: &T,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if take_checkpoint_event_failure(&self.reference.journal.run_id, phase) {
+            bail!("injected checkpoint event failure at phase '{phase}'");
+        }
+        self.verify_external_reference()?;
+        self.journal.append(phase, subject, payload)?;
+        #[cfg(test)]
+        if take_checkpoint_event_failure(&self.reference.journal.run_id, &format!("after:{phase}"))
+        {
+            bail!("injected post-append checkpoint failure at phase '{phase}'");
+        }
+        self.verify_external_reference()
+    }
+
+    fn verify_external_reference(&self) -> Result<()> {
+        let contents = self.slot.read_bounded(CHECKPOINT_REFERENCE_MAX_BYTES)?;
+        let observed: AuthenticatedCheckpointReference = serde_json::from_slice(&contents)
+            .with_context(|| {
+                format!(
+                    "failed to re-read authenticated checkpoint reference {}",
+                    self.slot.path().display()
+                )
+            })?;
+        if observed != self.reference {
+            bail!("external checkpoint reference changed during the active run");
+        }
+        verify_checkpoint_reference(self.journal.authenticator(), &observed)
+    }
+
+    fn reject_inside_worktrees(&self, worktrees: &[SelectedWorktree]) -> Result<()> {
+        let checkpoint_root = self
+            .slot
+            .path()
+            .parent()
+            .context("checkpoint reference has no parent directory")?
+            .canonicalize()
+            .context("failed to canonicalize checkpoint reference root")?;
+        for worktree in worktrees {
+            let worktree_root = worktree.path().canonicalize().with_context(|| {
+                format!(
+                    "failed to canonicalize selected worktree {}",
+                    worktree.path().display()
+                )
+            })?;
+            if checkpoint_root.starts_with(&worktree_root) {
+                bail!(
+                    "checkpoint reference root {} must not be inside untrusted worktree {}",
+                    checkpoint_root.display(),
+                    worktree_root.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn install_checkpoint_event_failure(run_id: &str, phase: &str) {
+    let hook = CHECKPOINT_EVENT_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        slot.is_none(),
+        "checkpoint event failure hook already installed"
+    );
+    *slot = Some(CheckpointEventFailureHook {
+        run_id: run_id.to_string(),
+        phase: phase.to_string(),
+    });
+}
+
+#[cfg(test)]
+fn take_checkpoint_event_failure(run_id: &str, phase: &str) -> bool {
+    let hook = CHECKPOINT_EVENT_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|hook| hook.run_id == run_id && hook.phase == phase)
+    {
+        slot.take();
+        true
+    } else {
+        false
     }
 }
 
 fn prepare_run_checkpoint_writer(
     controls: &OrchestrationRunControls,
     run_id: &Option<RunId>,
+    repo: &Path,
     summaries: &[AgentRunSummary],
-    existing_only: bool,
 ) -> Result<Option<RunCheckpointWriter>> {
     let Some(directory) = controls.checkpoint_dir.as_deref() else {
         return Ok(None);
@@ -4708,36 +5293,91 @@ fn prepare_run_checkpoint_writer(
     let run_id = run_id
         .as_ref()
         .context("checkpoint directory requires a resolved run id")?;
-    let root = if existing_only {
-        SecureOutputRoot::open_private(directory)?
-    } else {
-        SecureOutputRoot::open_or_create(directory)?
-    };
+    let root = SecureOutputRoot::open_or_create(directory)?;
     for summary in summaries {
         if let Some(worktree) = &summary.worktree {
             root.reject_inside(&worktree.path)?;
         }
     }
     let name = checkpoint_file_name(run_id);
-    let slot = if existing_only {
-        root.open_existing_leaf(OsStr::new(&name))?
-    } else {
-        root.open_or_reserve(OsStr::new(&name))?
-    };
-    Ok(Some(RunCheckpointWriter { slot }))
+    let slot = root.open_or_reserve(OsStr::new(&name))?;
+    let mut reservation = CheckpointReferenceReservation::new(slot);
+    let result = (|| -> Result<RunCheckpointWriter> {
+        let auth = repository_auth_writer(repo)?.into_authenticator()?;
+        let journal = StateJournal::create(auth, run_id.as_str())?;
+        let reference =
+            signed_checkpoint_reference(journal.authenticator(), repo, journal.identity())?;
+        let reference_path = reservation
+            .slot
+            .as_ref()
+            .map(|slot| slot.path().to_path_buf())
+            .context("checkpoint reference reservation was consumed")?;
+        reservation
+            .slot_mut()?
+            .write_json_atomic(&reference, CHECKPOINT_REFERENCE_MAX_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to write authenticated checkpoint reference {}",
+                    reference_path.display()
+                )
+            })?;
+        let slot = reservation.take()?;
+        let writer = RunCheckpointWriter {
+            slot,
+            reference,
+            journal,
+        };
+        writer.verify_external_reference()?;
+        Ok(writer)
+    })();
+    match result {
+        Ok(writer) => Ok(Some(writer)),
+        Err(error) => match reservation.cleanup() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "also failed to clean checkpoint reference reservation: {cleanup:#}"
+            ))),
+        },
+    }
 }
 
 pub fn write_run_checkpoint(directory: &Path, checkpoint: &RunCheckpoint) -> Result<PathBuf> {
-    let root = SecureOutputRoot::open_or_create(directory)?;
-    let name = checkpoint_file_name(&checkpoint.run_id);
-    let mut writer = RunCheckpointWriter {
-        slot: root.open_or_reserve(OsStr::new(&name))?,
+    if checkpoint.version != CHECKPOINT_STATE_VERSION {
+        bail!(
+            "checkpoint version {} is not writable; create a new v{} run",
+            checkpoint.version,
+            CHECKPOINT_STATE_VERSION
+        );
+    }
+    let controls = OrchestrationRunControls {
+        run_id: Some(checkpoint.run_id.clone()),
+        checkpoint_dir: Some(directory.to_path_buf()),
+        worktree_reuse_policy: Some(checkpoint.worktree_reuse_policy),
+        semantic_coordination: checkpoint.semantic_coordination,
     };
+    let mut writer = prepare_run_checkpoint_writer(
+        &controls,
+        &Some(checkpoint.run_id.clone()),
+        &checkpoint.repo,
+        &[],
+    )?
+    .context("checkpoint writer was not prepared")?;
     writer.write(checkpoint)?;
     Ok(writer.slot.path().to_path_buf())
 }
 
 pub fn read_run_checkpoint(path: &Path) -> Result<RunCheckpoint> {
+    let opened = open_run_checkpoint(path, None)?;
+    Ok(opened.checkpoint)
+}
+
+struct OpenedRunCheckpoint {
+    checkpoint: RunCheckpoint,
+    repo: PathBuf,
+    writer: RunCheckpointWriter,
+}
+
+fn open_run_checkpoint(path: &Path, repo_override: Option<&Path>) -> Result<OpenedRunCheckpoint> {
     let parent = path
         .parent()
         .with_context(|| format!("checkpoint must have a parent: {}", path.display()))?;
@@ -4746,20 +5386,254 @@ pub fn read_run_checkpoint(path: &Path) -> Result<RunCheckpoint> {
         .with_context(|| format!("checkpoint must have a file name: {}", path.display()))?;
     let root = SecureOutputRoot::open_private(parent)?;
     let slot = root.open_existing_leaf(name)?;
-    let contents = slot.read_bounded(CHECKPOINT_OUTPUT_MAX_BYTES)?;
-    let contents = std::str::from_utf8(&contents)
-        .with_context(|| format!("checkpoint is not UTF-8: {}", path.display()))?;
-    let checkpoint: RunCheckpoint = serde_json::from_str(contents)
-        .with_context(|| format!("failed to parse checkpoint {}", path.display()))?;
-    if checkpoint.version != CHECKPOINT_STATE_VERSION {
+    let contents = slot.read_bounded(CHECKPOINT_REFERENCE_MAX_BYTES)?;
+    let value: serde_json::Value = serde_json::from_slice(&contents)
+        .with_context(|| format!("failed to parse checkpoint envelope {}", path.display()))?;
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(CHECKPOINT_STATE_VERSION)) {
+        let observed = version
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "missing".to_string());
         bail!(
-            "unsupported checkpoint version {} in {}; version {} candidate-binding evidence is required, start a new run",
-            checkpoint.version,
+            "checkpoint version {} in {} is unauthenticated or unsupported; start a new run using v{}",
+            observed,
             path.display(),
             CHECKPOINT_STATE_VERSION
         );
     }
+    let reference: AuthenticatedCheckpointReference = serde_json::from_value(value)
+        .with_context(|| format!("invalid v3 checkpoint envelope {}", path.display()))?;
+    validate_checkpoint_reference_bounds(&reference)?;
+
+    // The repository hint is used only to locate a candidate key. No run id,
+    // plan path, journal path, or checkpoint payload is authoritative yet.
+    let repo = discover_repo_root(repo_override.unwrap_or(&reference.repository_hint))?;
+    let authenticator = repository_authenticator(&repo)?;
+    verify_checkpoint_reference(&authenticator, &reference)?;
+    let journal = StateJournal::open(authenticator, &reference.journal)?;
+    let checkpoint = latest_authenticated_checkpoint(&journal)?;
+    if checkpoint.run_id.as_str() != reference.journal.run_id {
+        bail!("authenticated checkpoint snapshot run id does not match its journal");
+    }
+    let expected_path = checkpoint_path(parent, &checkpoint.run_id);
+    if expected_path != path {
+        bail!(
+            "authenticated checkpoint file {} does not match run id '{}'; expected {}",
+            path.display(),
+            checkpoint.run_id.as_str(),
+            expected_path.display()
+        );
+    }
+    let signed_repo = discover_repo_root(&reference.repository_hint)?;
+    if signed_repo != repo || checkpoint.repo != repo {
+        bail!("authenticated checkpoint belongs to a different repository path");
+    }
+    let writer = RunCheckpointWriter {
+        slot,
+        reference,
+        journal,
+    };
+    writer.verify_external_reference()?;
+    Ok(OpenedRunCheckpoint {
+        checkpoint,
+        repo,
+        writer,
+    })
+}
+
+fn signed_checkpoint_reference(
+    authenticator: &RepositoryAuthenticator,
+    repo: &Path,
+    journal: &JournalIdentity,
+) -> Result<AuthenticatedCheckpointReference> {
+    let repository_hint = discover_repo_root(repo)?;
+    let mut reference = AuthenticatedCheckpointReference {
+        version: CHECKPOINT_STATE_VERSION,
+        repository_hint,
+        journal: journal.clone(),
+        mac: AuthenticationTag::zero(),
+    };
+    validate_checkpoint_reference_bounds(&reference)?;
+    reference.mac = authenticator.sign(
+        CHECKPOINT_REFERENCE_DOMAIN,
+        &checkpoint_reference_mac_payload(&reference)?,
+    )?;
+    Ok(reference)
+}
+
+fn verify_checkpoint_reference(
+    authenticator: &RepositoryAuthenticator,
+    reference: &AuthenticatedCheckpointReference,
+) -> Result<()> {
+    validate_checkpoint_reference_bounds(reference)?;
+    authenticator.verify_repository_binding(&reference.journal.repository)?;
+    authenticator.verify_tag(
+        CHECKPOINT_REFERENCE_DOMAIN,
+        &checkpoint_reference_mac_payload(reference)?,
+        &reference.mac,
+    )
+}
+
+fn checkpoint_reference_mac_payload(
+    reference: &AuthenticatedCheckpointReference,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec(&CheckpointReferenceMacPayload {
+        version: reference.version,
+        repository_hint: &reference.repository_hint,
+        journal: &reference.journal,
+    })
+    .context("failed to encode checkpoint reference MAC payload")
+}
+
+fn validate_checkpoint_reference_bounds(
+    reference: &AuthenticatedCheckpointReference,
+) -> Result<()> {
+    if reference.version != CHECKPOINT_STATE_VERSION
+        || reference.repository_hint.components().count() > 256
+        || path_storage_bytes(&reference.repository_hint) > 4096
+    {
+        bail!("checkpoint reference exceeds its bounded canonical format");
+    }
+    reference.mac.validate()?;
+    crate::state_journal::validate_journal_identity(&reference.journal)
+}
+
+#[cfg(unix)]
+fn path_storage_bytes(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(windows)]
+fn path_storage_bytes(path: &Path) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().count().saturating_mul(2)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_storage_bytes(path: &Path) -> usize {
+    path.as_os_str().to_string_lossy().len()
+}
+
+fn latest_authenticated_checkpoint(journal: &StateJournal) -> Result<RunCheckpoint> {
+    validate_command_phase_history(journal)?;
+    let (snapshot_index, record) = journal
+        .records()
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, record)| {
+            record.phase == PHASE_FINAL
+                || record.phase.starts_with(CHECKPOINT_SNAPSHOT_PHASE_PREFIX)
+        })
+        .context("authenticated checkpoint journal has no resumable snapshot; start a new run")?;
+    let mut checkpoint: RunCheckpoint = serde_json::from_value(record.payload.clone())
+        .context("authenticated checkpoint snapshot is malformed")?;
+    if checkpoint.version != CHECKPOINT_STATE_VERSION {
+        bail!("authenticated checkpoint snapshot is not v3; start a new run");
+    }
+    for record in &journal.records()[snapshot_index.saturating_add(1)..] {
+        if !matches!(
+            record.phase.as_str(),
+            PHASE_COMMAND_COMPLETED | PHASE_CANDIDATE_CAPTURED
+        ) {
+            continue;
+        }
+        let agent: AgentCheckpoint = serde_json::from_value(record.payload.clone())
+            .context("authenticated candidate checkpoint payload is malformed")?;
+        let slot = checkpoint
+            .agents
+            .iter_mut()
+            .find(|candidate| candidate.id == agent.id)
+            .with_context(|| {
+                format!(
+                    "authenticated candidate event references unknown agent '{}'",
+                    agent.id
+                )
+            })?;
+        *slot = agent;
+    }
     Ok(checkpoint)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandJournalState {
+    Started,
+    Completed,
+    CandidateCaptured,
+}
+
+fn validate_command_phase_history(journal: &StateJournal) -> Result<()> {
+    let mut states = BTreeMap::<String, CommandJournalState>::new();
+    for record in journal.records() {
+        let Some(subject) = record.subject.as_ref() else {
+            continue;
+        };
+        match record.phase.as_str() {
+            PHASE_COMMAND_STARTED => {
+                if states.contains_key(subject) {
+                    bail!(
+                        "checkpoint records a second command start for agent '{}'; refusing possible double execution",
+                        subject
+                    );
+                }
+                states.insert(subject.clone(), CommandJournalState::Started);
+            }
+            PHASE_COMMAND_COMPLETED => {
+                if states.get(subject) != Some(&CommandJournalState::Started) {
+                    bail!(
+                        "checkpoint command completion for agent '{}' has no unique preceding start",
+                        subject
+                    );
+                }
+                let completed: AgentCheckpoint = serde_json::from_value(record.payload.clone())
+                    .context("authenticated command completion payload is malformed")?;
+                if completed.id != *subject || completed.command_completed_binding.is_none() {
+                    bail!(
+                        "checkpoint command completion for agent '{}' lacks exact worktree state binding evidence",
+                        subject
+                    );
+                }
+                states.insert(subject.clone(), CommandJournalState::Completed);
+            }
+            PHASE_CANDIDATE_CAPTURED => match states.get(subject) {
+                Some(CommandJournalState::Completed)
+                | Some(CommandJournalState::CandidateCaptured) => {
+                    states.insert(subject.clone(), CommandJournalState::CandidateCaptured);
+                }
+                None => {
+                    // A completed candidate may be recaptured and revalidated during resume.
+                }
+                Some(CommandJournalState::Started) => {
+                    bail!(
+                        "checkpoint candidate for agent '{}' was captured without a completed command",
+                        subject
+                    );
+                }
+            },
+            _ => {}
+        }
+    }
+    for (agent, state) in states {
+        match state {
+            CommandJournalState::Started => bail!(
+                "checkpoint shows command_started for agent '{}' without durable completion; execution outcome is uncertain and will not be rerun automatically, start a new run",
+                agent
+            ),
+            CommandJournalState::Completed => {}
+            CommandJournalState::CandidateCaptured => {}
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_stage_name(stage: RunCheckpointStage) -> &'static str {
+    match stage {
+        RunCheckpointStage::WorktreesSelected => "worktrees_selected",
+        RunCheckpointStage::ClaimsAcquired => "claims_acquired",
+        RunCheckpointStage::AgentsCompleted => "agents_completed",
+        RunCheckpointStage::Final => PHASE_FINAL,
+    }
 }
 
 pub fn checkpoint_path(directory: &Path, run_id: &RunId) -> PathBuf {
@@ -4825,6 +5699,7 @@ impl From<&AgentRunSummary> for AgentCheckpoint {
             unclaimed_changed_paths: summary.unclaimed_changed_paths.clone(),
             validation: summary.validation.clone(),
             candidate_binding: summary.candidate_binding.clone(),
+            command_completed_binding: summary.command_completed_binding.clone(),
             error: summary.error.clone(),
         }
     }
@@ -4866,6 +5741,135 @@ fn unix_time_millis() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration_millis(duration),
         Err(_) => 0,
+    }
+}
+
+struct ClaimCleanupGuard {
+    store: SyncStore,
+    tokens: Vec<ClaimToken>,
+    armed: bool,
+    early_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ClaimCleanupGuard {
+    fn new(store: SyncStore, early_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        Self {
+            store,
+            tokens: Vec::new(),
+            armed: true,
+            early_errors,
+        }
+    }
+
+    fn track(&mut self, token: ClaimToken) {
+        self.tokens.push(token);
+    }
+
+    fn set_tokens(&mut self, tokens: Vec<ClaimToken>) {
+        self.tokens = tokens;
+    }
+
+    fn release(&mut self) -> (Vec<PathClaim>, Vec<String>) {
+        self.armed = false;
+        release_claims(&self.store, std::mem::take(&mut self.tokens))
+    }
+
+    fn disarm_keep(&mut self) {
+        self.armed = false;
+        self.tokens.clear();
+    }
+}
+
+impl Drop for ClaimCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (_, errors) = release_claims(&self.store, std::mem::take(&mut self.tokens));
+        if !errors.is_empty() {
+            let mut retained = self
+                .early_errors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retained.extend(errors);
+        }
+    }
+}
+
+struct SemanticCleanupGuard {
+    store: SemanticIntentStore,
+    tokens: Vec<SemanticIntentToken>,
+    armed: bool,
+    early_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl SemanticCleanupGuard {
+    fn new(
+        store: SemanticIntentStore,
+        early_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            store,
+            tokens: Vec::new(),
+            armed: true,
+            early_errors,
+        }
+    }
+
+    fn tokens_mut(&mut self) -> &mut Vec<SemanticIntentToken> {
+        &mut self.tokens
+    }
+
+    fn set_tokens(&mut self, tokens: Vec<SemanticIntentToken>) {
+        self.tokens = tokens;
+    }
+
+    fn release(&mut self) -> (Vec<SemanticIntent>, Vec<String>) {
+        self.armed = false;
+        release_semantic_intents(&self.store, std::mem::take(&mut self.tokens))
+    }
+
+    fn disarm_keep(&mut self) {
+        self.armed = false;
+        self.tokens.clear();
+    }
+}
+
+impl Drop for SemanticCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (_, errors) = release_semantic_intents(&self.store, std::mem::take(&mut self.tokens));
+        if !errors.is_empty() {
+            let mut retained = self
+                .early_errors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retained.extend(errors);
+        }
+    }
+}
+
+fn finish_with_early_cleanup<T>(
+    result: Result<T>,
+    errors: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> Result<T> {
+    let retained = errors
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match (result, retained.is_empty()) {
+        (Ok(value), true) => Ok(value),
+        (Ok(_), false) => bail!(
+            "early orchestration cleanup failed: {}",
+            retained.join("; ")
+        ),
+        (Err(error), true) => Err(error),
+        (Err(error), false) => Err(error.context(format!(
+            "early orchestration cleanup also failed: {}",
+            retained.join("; ")
+        ))),
     }
 }
 
@@ -4936,6 +5940,8 @@ mod tests {
     use crate::sync_store::SyncStore;
     use crate::worktree::WorktreeManager;
     use git2::{Oid, Repository, Signature};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
     use tempfile::TempDir;
 
@@ -4958,14 +5964,14 @@ mod tests {
         let state = capture_consistent_candidate_state(
             worktree_path,
             &base_oid,
-            OrchestrationExecutionRuntime::Verified,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
         )
         .expect("capture test candidate state");
         capture_bound_candidate(
             worktree_path,
             &base_oid,
             &state,
-            OrchestrationExecutionRuntime::Verified,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
         )
         .expect("capture test candidate")
         .binding
@@ -6739,6 +7745,7 @@ mod tests {
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
                     candidate_binding: Some(agent_a_binding),
+                    command_completed_binding: None,
                     error: None,
                 },
                 AgentCheckpoint {
@@ -6752,6 +7759,7 @@ mod tests {
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
                     candidate_binding: None,
+                    command_completed_binding: None,
                     error: None,
                 },
             ],
@@ -6858,6 +7866,7 @@ mod tests {
                 unclaimed_changed_paths: Vec::new(),
                 validation: Vec::new(),
                 candidate_binding: None,
+                command_completed_binding: None,
                 error: None,
             }],
             repo_validation: Vec::new(),
@@ -7043,6 +8052,7 @@ mod tests {
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
                     candidate_binding: Some(agent_a_binding),
+                    command_completed_binding: None,
                     error: None,
                 },
                 AgentCheckpoint {
@@ -7056,6 +8066,7 @@ mod tests {
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
                     candidate_binding: None,
+                    command_completed_binding: None,
                     error: None,
                 },
             ],
@@ -7188,6 +8199,7 @@ mod tests {
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
                     candidate_binding: None,
+                    command_completed_binding: None,
                     error: None,
                 },
                 AgentCheckpoint {
@@ -7201,6 +8213,7 @@ mod tests {
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
                     candidate_binding: None,
+                    command_completed_binding: None,
                     error: None,
                 },
             ],
@@ -7298,6 +8311,7 @@ mod tests {
                 unclaimed_changed_paths: Vec::new(),
                 validation: Vec::new(),
                 candidate_binding: None,
+                command_completed_binding: None,
                 error: None,
             }],
             repo_validation: Vec::new(),
@@ -7462,14 +8476,371 @@ mod tests {
     }
 
     #[test]
+    fn completed_command_recovery_never_reruns_and_raii_cleans_faults() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(repo_path.join("src/lib.rs"), "pub struct Recovery;\n")
+            .expect("write semantic source");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [{
+                "id": "recover-once",
+                "paths": ["README.md"],
+                "semantic_symbols": ["Recovery"],
+                "command": "printf 'once\\n' >> README.md"
+              }]
+            }"#,
+        )
+        .expect("write plan");
+        let run_id = RunId::new("completed-recovery-raii").expect("run id");
+        install_checkpoint_event_failure(run_id.as_str(), PHASE_VALIDATION_STARTED);
+        let first = run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file: plan_file.clone(),
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: Some(run_id.clone()),
+                checkpoint_dir: Some(checkpoint_dir.clone()),
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Block,
+            },
+        )
+        .expect_err("inject post-command structural failure");
+        assert!(first
+            .to_string()
+            .contains("injected checkpoint event failure"));
+        assert!(SyncStore::open(&repo_path)
+            .expect("sync store")
+            .snapshot()
+            .expect("claims")
+            .is_empty());
+        assert!(SemanticIntentStore::open(&repo_path)
+            .expect("semantic store")
+            .snapshot()
+            .expect("semantic intents")
+            .is_empty());
+        let worktree = WorktreeManager::new(&repo_path)
+            .list()
+            .expect("list worktrees")
+            .into_iter()
+            .find(|record| record.name == "recover-once")
+            .expect("recovery worktree");
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("README.md"))
+                .expect("read command output")
+                .matches("once\n")
+                .count(),
+            1
+        );
+
+        let checkpoint_file = checkpoint_path(&checkpoint_dir, &run_id);
+        install_checkpoint_event_failure(run_id.as_str(), PHASE_REPO_VALIDATION_STARTED);
+        let second = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file: checkpoint_file.clone(),
+            repo: Some(repo_path.clone()),
+            plan_file: Some(plan_file.clone()),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("inject resume structural failure");
+        assert!(second
+            .to_string()
+            .contains("injected checkpoint event failure"));
+        assert!(SyncStore::open(&repo_path)
+            .expect("sync store")
+            .snapshot()
+            .expect("claims")
+            .is_empty());
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("README.md"))
+                .expect("read recovered output")
+                .matches("once\n")
+                .count(),
+            1
+        );
+
+        let summary = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file,
+            repo: Some(repo_path),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("resume exact completed state");
+        assert!(summary.success);
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("README.md"))
+                .expect("read final output")
+                .matches("once\n")
+                .count(),
+            1,
+            "resume reran a command whose exact completed state was journaled"
+        );
+    }
+
+    #[test]
+    fn started_only_checkpoint_is_uncertain_and_never_runs_or_retries() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{"agents":[{"id":"uncertain","paths":["README.md"],"command":"printf 'ran\\n' >> README.md"}]}"#,
+        )
+        .expect("write plan");
+        let run_id = RunId::new("started-only-uncertain").expect("run id");
+        install_checkpoint_event_failure(
+            run_id.as_str(),
+            &format!("after:{PHASE_COMMAND_STARTED}"),
+        );
+        run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path.clone(),
+                plan_file: plan_file.clone(),
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: Some(run_id.clone()),
+                checkpoint_dir: Some(checkpoint_dir.clone()),
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Off,
+            },
+        )
+        .expect_err("inject crash after command_started");
+        let worktree = WorktreeManager::new(&repo_path)
+            .list()
+            .expect("list worktrees")
+            .into_iter()
+            .find(|record| record.name == "uncertain")
+            .expect("uncertain worktree");
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("README.md")).expect("read worktree"),
+            "base\n"
+        );
+        let error = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file: checkpoint_path(&checkpoint_dir, &run_id),
+            repo: Some(repo_path),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("started-only resume must fail closed");
+        assert!(error.to_string().contains("execution outcome is uncertain"));
+    }
+
+    #[test]
+    fn authenticated_checkpoint_reference_tamper_is_rejected() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let run_id = RunId::new("reference-tamper").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: run_id.clone(),
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: repo_path,
+            repo_head: None,
+            plan_file: PathBuf::from("untrusted-plan-must-not-be-read.json"),
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: Vec::new(),
+            repo_validation: Vec::new(),
+            repo_validation_target: None,
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let path = write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read envelope"))
+                .expect("parse envelope");
+        envelope["mac"] = serde_json::Value::String("0".repeat(64));
+        fs::write(&path, serde_json::to_vec(&envelope).expect("encode tamper"))
+            .expect("tamper envelope");
+        let error = read_run_checkpoint(&path).expect_err("tampered envelope must fail");
+        assert!(error
+            .to_string()
+            .contains("authentication tag verification failed"));
+        assert!(!error
+            .to_string()
+            .contains("untrusted-plan-must-not-be-read"));
+    }
+
+    #[test]
+    fn orchestration_profile_binds_git_common_and_hides_sensitive_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        SyncStore::open(&repo_path).expect("create repository state root");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "profile-binding".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+        let (common, sensitive) =
+            orchestration_sandbox_roots(&worktree.path).expect("resolve sandbox roots");
+        let linked = Repository::open(&worktree.path).expect("open linked worktree");
+        assert_eq!(common, linked.commondir());
+        assert_eq!(sensitive, linked.commondir().join("maco/state"));
+        let spec = CommandRunSpec {
+            command: "true".to_string(),
+            workspace_root: worktree.path.clone(),
+            working_directory: worktree.path,
+            env: BTreeMap::new(),
+            timeout: None,
+            visible_read_only_roots: vec![common.clone()],
+            hidden_roots: vec![sensitive.clone()],
+            runtime: OrchestrationExecutionRuntime::Verified,
+        };
+        let rendered = format!("{:?}", strict_command_profile(&spec));
+        assert!(rendered.contains(&common.display().to_string()));
+        assert!(rendered.contains(&sensitive.display().to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_child_cannot_read_repository_authentication_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        let key_name = crate::artifacts::state_auth::authentication_key_file_name();
+        fs::write(
+            &plan_file,
+            serde_json::to_vec(&serde_json::json!({
+                "agents": [{
+                    "id": "key-isolation",
+                    "paths": ["README.md"],
+                    "command": format!(
+                        "common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 10; if cat \"$common/maco/state/{key_name}\"; then exit 91; else printf 'state-hidden\\n'; fi"
+                    )
+                }]
+            }))
+            .expect("encode plan"),
+        )
+        .expect("write plan");
+        let summary = super::run_plan_file_with_controls(
+            OrchestrationRunOptions {
+                repo: repo_path,
+                plan_file,
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            },
+            OrchestrationRunControls {
+                run_id: Some(RunId::new("verified-key-isolation").expect("run id")),
+                checkpoint_dir: Some(checkpoint_dir),
+                worktree_reuse_policy: None,
+                semantic_coordination: SemanticCoordinationMode::Off,
+            },
+        )
+        .expect("run verified isolated child");
+        assert!(summary.success);
+        assert_eq!(summary.agents[0].stdout.text, "state-hidden\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_writer_refuses_rekey_when_artifact_marker_exists() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let run = repo_path.join(".maco/autopilot/runs/legacy");
+        fs::create_dir_all(&run).expect("create legacy artifact run");
+        for directory in [
+            repo_path.join(".maco"),
+            repo_path.join(".maco/autopilot"),
+            repo_path.join(".maco/autopilot/runs"),
+            run.clone(),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("private artifact directory");
+        }
+        let marker = run.join(".maco-artifact-final.json");
+        fs::write(&marker, b"existing marker").expect("write marker");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).expect("private marker");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: RunId::new("must-not-rekey").expect("run id"),
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: repo_path.clone(),
+            repo_head: None,
+            plan_file: PathBuf::from("plan.json"),
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: Vec::new(),
+            repo_validation: Vec::new(),
+            repo_validation_target: None,
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let error = write_run_checkpoint(&checkpoint_dir, &checkpoint)
+            .expect_err("existing marker must block key creation");
+        assert!(error
+            .to_string()
+            .contains("existing artifact finalization marker"));
+        assert!(!checkpoint_path(&checkpoint_dir, &checkpoint.run_id).exists());
+        let repo = Repository::open(&repo_path).expect("open repo");
+        assert!(!repo
+            .commondir()
+            .join("maco/state")
+            .join(crate::artifacts::state_auth::authentication_key_file_name())
+            .exists());
+    }
+
+    #[test]
     fn checkpoint_helpers_round_trip_serialized_state() {
         let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
         let run_id = RunId::new("run-1").expect("run id");
         let checkpoint = RunCheckpoint {
             version: CHECKPOINT_STATE_VERSION,
             run_id: run_id.clone(),
             stage: RunCheckpointStage::Final,
-            repo: PathBuf::from("repo"),
+            repo: repo_path,
             repo_head: Some("0123456789012345678901234567890123456789".to_string()),
             plan_file: PathBuf::from("plan.json"),
             plan_snapshot: Some(CheckpointPlanSnapshot {
@@ -7515,6 +8886,7 @@ mod tests {
                     changed_paths: vec![PathBuf::from("README.md")],
                     patch_bytes: 1,
                 }),
+                command_completed_binding: None,
                 error: None,
             }],
             repo_validation: Vec::new(),
@@ -7543,35 +8915,44 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_v1_is_rejected_with_start_new_run_guidance() {
-        let temp = TempDir::new().expect("tempdir");
-        let checkpoint = RunCheckpoint {
-            version: 1,
-            run_id: RunId::new("legacy-v1").expect("run id"),
-            stage: RunCheckpointStage::WorktreesSelected,
-            repo: PathBuf::from("repo"),
-            repo_head: None,
-            plan_file: PathBuf::from("plan.json"),
-            plan_snapshot: None,
-            keep_claims: false,
-            worktree_reuse_policy: WorktreeReusePolicy::Clean,
-            semantic_coordination: SemanticCoordinationMode::Off,
-            success: false,
-            agents: Vec::new(),
-            repo_validation: Vec::new(),
-            repo_validation_target: None,
-            released_claims: Vec::new(),
-            release_errors: Vec::new(),
-            released_semantic_intents: Vec::new(),
-            semantic_release_errors: Vec::new(),
-            updated_unix_ms: 1,
-        };
-        let path = write_run_checkpoint(&temp.path().join("checkpoints"), &checkpoint)
-            .expect("write legacy checkpoint");
+    fn checkpoint_v1_v2_are_rejected_with_start_new_run_guidance() {
+        for version in [1_u32, 2_u32] {
+            let temp = TempDir::new().expect("tempdir");
+            let checkpoint = RunCheckpoint {
+                version,
+                run_id: RunId::new(format!("legacy-v{version}")).expect("run id"),
+                stage: RunCheckpointStage::WorktreesSelected,
+                repo: PathBuf::from("repo"),
+                repo_head: None,
+                plan_file: PathBuf::from("plan.json"),
+                plan_snapshot: None,
+                keep_claims: false,
+                worktree_reuse_policy: WorktreeReusePolicy::Clean,
+                semantic_coordination: SemanticCoordinationMode::Off,
+                success: false,
+                agents: Vec::new(),
+                repo_validation: Vec::new(),
+                repo_validation_target: None,
+                released_claims: Vec::new(),
+                release_errors: Vec::new(),
+                released_semantic_intents: Vec::new(),
+                semantic_release_errors: Vec::new(),
+                updated_unix_ms: 1,
+            };
+            let checkpoint_dir = temp.path().join("checkpoints");
+            let root = SecureOutputRoot::create_new(&checkpoint_dir).expect("checkpoint root");
+            let mut slot = root
+                .reserve(OsStr::new(&format!("legacy-v{version}.json")))
+                .expect("legacy slot");
+            slot.write_json_atomic(&checkpoint, CHECKPOINT_REFERENCE_MAX_BYTES)
+                .expect("write legacy checkpoint");
+            let path = slot.path().to_path_buf();
 
-        let error = read_run_checkpoint(&path).expect_err("legacy v1 must be rejected");
-        assert!(error.to_string().contains("version 2"));
-        assert!(error.to_string().contains("start a new run"));
+            let error = read_run_checkpoint(&path).expect_err("legacy checkpoint must be rejected");
+            assert!(error.to_string().contains(&format!("version {version}")));
+            assert!(error.to_string().contains("v3"));
+            assert!(error.to_string().contains("start a new run"));
+        }
     }
 
     #[test]
@@ -7626,6 +9007,8 @@ mod tests {
             working_directory: temp.path().to_path_buf(),
             env: BTreeMap::new(),
             timeout: Some(Duration::from_secs(3)),
+            visible_read_only_roots: Vec::new(),
+            hidden_roots: Vec::new(),
             runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
         })
         .expect("run large-output agent command");
@@ -7718,19 +9101,26 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().expect("tempdir");
-        let root = SecureOutputRoot::create_new(&temp.path().join("checkpoints"))
-            .expect("create checkpoint root");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
         let run_id = RunId::new("secure-checkpoint").expect("run id");
-        let slot = root
-            .reserve(OsStr::new("secure-checkpoint.json"))
-            .expect("reserve checkpoint");
-        let path = slot.path().to_path_buf();
-        let mut writer = RunCheckpointWriter { slot };
+        let controls = OrchestrationRunControls {
+            run_id: Some(run_id.clone()),
+            checkpoint_dir: Some(checkpoint_dir.clone()),
+            worktree_reuse_policy: None,
+            semantic_coordination: SemanticCoordinationMode::Off,
+        };
+        let mut writer =
+            prepare_run_checkpoint_writer(&controls, &Some(run_id.clone()), &repo_path, &[])
+                .expect("prepare writer")
+                .expect("configured writer");
+        let path = writer.slot.path().to_path_buf();
         let checkpoint = RunCheckpoint {
             version: CHECKPOINT_STATE_VERSION,
             run_id,
             stage: RunCheckpointStage::WorktreesSelected,
-            repo: PathBuf::from("repo"),
+            repo: repo_path,
             repo_head: None,
             plan_file: PathBuf::from("plan.json"),
             plan_snapshot: None,

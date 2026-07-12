@@ -42,7 +42,10 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
     assert!(checkpoint_path.exists());
     let checkpoint: Value =
         serde_json::from_slice(&fs::read(&checkpoint_path)?).context("parse written checkpoint")?;
-    assert_eq!(checkpoint["version"], 2);
+    assert_eq!(checkpoint["version"], 3);
+    assert_eq!(checkpoint["journal"]["run_id"], run_id);
+    assert_eq!(checkpoint["mac"].as_str().map(str::len), Some(64));
+    assert!(checkpoint.get("plan_file").is_none());
 
     if !verified_backend_available {
         assert_eq!(run_summary["success"], false);

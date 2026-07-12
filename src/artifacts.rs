@@ -1,3 +1,9 @@
+#[path = "state_auth.rs"]
+pub(crate) mod state_auth;
+
+use self::state_auth::{
+    sha256_hex, AuthenticationTag, RepositoryAuthWriter, RepositoryAuthenticator,
+};
 use crate::{
     orchestrator::RunId,
     safe_state::{
@@ -5,6 +11,12 @@ use crate::{
         BoundedRegularReader, FileIdentity, KernelStateLock, ReservedDirectory, SafeRoot,
         TreeLinkPolicy,
     },
+};
+
+#[cfg(test)]
+use self::state_auth::{
+    authentication_key_file_name, authentication_key_length, authentication_key_lock_name,
+    BoundStateLock,
 };
 use anyhow::{bail, Context, Result};
 use git2::Repository;
@@ -19,9 +31,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-use std::{io::Read, os::unix::fs::FileTypeExt};
 
 #[cfg(unix)]
 use std::{
@@ -39,10 +48,6 @@ const FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const RUN_LOCK_FILE: &str = ".artifact.lock";
 const ROOT_LOCK_FILE: &str = ".runs.lock";
 const QUARANTINE_DIRECTORY: &str = ".quarantine";
-const ARTIFACT_MAC_KEY_FILE: &str = "artifact_finalization_hmac_v1.key";
-const ARTIFACT_MAC_KEY_LOCK: &str = "artifact_finalization_hmac_v1.lock";
-const ARTIFACT_MAC_KEY_BYTES: usize = 32;
-const ARTIFACT_MAC_DOMAIN: &[u8] = b"MACO\0artifact-finalization\0hmac-sha256\0v2\0";
 const MAX_FINALIZATION_BYTES: u64 = 512 * 1024;
 const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARTIFACT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -329,18 +334,6 @@ struct BoundArtifactLock {
     lock_identity: FileIdentity,
 }
 
-struct ArtifactMacKey {
-    root: SafeRoot,
-    bytes: [u8; ARTIFACT_MAC_KEY_BYTES],
-    identity: FileIdentity,
-    key_id: String,
-}
-
-struct ArtifactMacKeyWriter {
-    key: ArtifactMacKey,
-    lock: BoundArtifactLock,
-}
-
 impl BoundArtifactLock {
     fn acquire(root: &SafeRoot, name: &str) -> Result<Self> {
         let lock = KernelStateLock::acquire_direct(root, name)?;
@@ -384,118 +377,32 @@ fn finish_with_artifact_lock_verification<T>(
     }
 }
 
-impl ArtifactMacKey {
-    fn open_existing(repository: &ArtifactRepository) -> Result<Self> {
-        let state_path = repository.common_dir.join("maco").join("state");
-        let root = SafeRoot::open_existing(&state_path).with_context(|| {
-            format!(
-                "artifact finalization key state is missing or unsafe: {}",
-                state_path.display()
-            )
-        })?;
-        ensure_private_directory(root.path())?;
-        Self::load(&root)
-    }
-
-    fn load(root: &SafeRoot) -> Result<Self> {
-        if !root.direct_child_exists(ARTIFACT_MAC_KEY_FILE)? {
-            bail!("artifact finalization MAC key is missing");
-        }
-        let identity = ensure_private_regular_file(&root.path().join(ARTIFACT_MAC_KEY_FILE))?;
-        let contents = BoundedRegularReader::read_direct(
-            root,
-            ARTIFACT_MAC_KEY_FILE,
-            ARTIFACT_MAC_KEY_BYTES as u64,
-        )?;
-        let bytes: [u8; ARTIFACT_MAC_KEY_BYTES] =
-            contents.try_into().map_err(|contents: Vec<u8>| {
-                anyhow::anyhow!(
-                    "artifact finalization MAC key has invalid length {} (expected {})",
-                    contents.len(),
-                    ARTIFACT_MAC_KEY_BYTES
-                )
-            })?;
-        let key = Self {
-            root: root.clone(),
-            key_id: sha256_hex(&bytes),
-            bytes,
-            identity,
-        };
-        key.verify()?;
-        Ok(key)
-    }
-
-    fn verify(&self) -> Result<()> {
-        self.root.verify()?;
-        let result = (|| -> Result<()> {
-            let observed =
-                ensure_private_regular_file(&self.root.path().join(ARTIFACT_MAC_KEY_FILE))?;
-            if observed != self.identity {
-                bail!("artifact finalization MAC key inode was replaced");
-            }
-            let contents = BoundedRegularReader::read_direct(
-                &self.root,
-                ARTIFACT_MAC_KEY_FILE,
-                ARTIFACT_MAC_KEY_BYTES as u64,
-            )?;
-            if !constant_time_eq(&contents, &self.bytes) {
-                bail!("artifact finalization MAC key contents changed");
-            }
-            Ok(())
-        })();
-        finish_with_artifact_lock_verification(result, self.root.verify())
-    }
+pub(crate) fn repository_auth_writer(repo: &Path) -> Result<RepositoryAuthWriter> {
+    let repository = discover_artifact_repository(repo)?;
+    open_artifact_auth_writer(&repository)
 }
 
-impl ArtifactMacKeyWriter {
-    fn open(repository: &ArtifactRepository) -> Result<Self> {
-        let state_path = repository.common_dir.join("maco").join("state");
-        let existed = fs::symlink_metadata(&state_path).is_ok();
-        let root = match SafeRoot::open_or_create(&state_path) {
-            Ok(root) => root,
-            Err(error) if existed => bail!(
-                "existing artifact-key state root is not owner-private; refusing automatic permission changes: {error:#}"
-            ),
-            Err(error) => return Err(error).context("failed to create artifact-key state root"),
-        };
-        ensure_private_directory(root.path())?;
-        let lock = BoundArtifactLock::acquire(&root, ARTIFACT_MAC_KEY_LOCK)?;
-        lock.verify(&root)?;
-        let result = (|| -> Result<ArtifactMacKey> {
-            if !root.direct_child_exists(ARTIFACT_MAC_KEY_FILE)? {
-                if scan_registered_finalization_markers(repository, None)? > 0 {
-                    bail!(
-                        "artifact finalization MAC key is missing while an existing final marker is present; refusing to generate a replacement key"
-                    );
-                }
-                let mut bytes = [0u8; ARTIFACT_MAC_KEY_BYTES];
-                fill_os_random(&mut bytes)?;
-                AtomicStateWriter::scavenge_direct_temps(&root, ARTIFACT_MAC_KEY_FILE)?;
-                AtomicStateWriter::write_direct_fenced(
-                    &root,
-                    ARTIFACT_MAC_KEY_FILE,
-                    &bytes,
-                    || lock.verify(&root),
-                )?;
-                lock.verify(&root)?;
-            }
-            let key = ArtifactMacKey::load(&root)?;
-            key.verify()?;
-            scan_registered_finalization_markers(repository, Some(&key))?;
-            key.verify()?;
-            Ok(key)
-        })();
-        let key = finish_with_artifact_lock_verification(result, lock.verify(&root))?;
-        let writer = Self { key, lock };
-        writer.verify()?;
-        Ok(writer)
-    }
+pub(crate) fn repository_authenticator(repo: &Path) -> Result<RepositoryAuthenticator> {
+    let repository = discover_artifact_repository(repo)?;
+    let authenticator = RepositoryAuthenticator::open_existing(&repository.common_dir)?;
+    scan_registered_finalization_markers(&repository, Some(&authenticator))?;
+    authenticator.verify()?;
+    Ok(authenticator)
+}
 
-    fn verify(&self) -> Result<()> {
-        self.lock.verify(&self.key.root)?;
-        let result = self.key.verify();
-        finish_with_artifact_lock_verification(result, self.lock.verify(&self.key.root))
-    }
+fn open_artifact_auth_writer(repository: &ArtifactRepository) -> Result<RepositoryAuthWriter> {
+    let writer = RepositoryAuthWriter::open_or_create(&repository.common_dir, || {
+        if scan_registered_finalization_markers(repository, None)? > 0 {
+            bail!(
+                "repository authentication key is missing while an existing artifact finalization marker is present; refusing to establish a replacement key epoch"
+            );
+        }
+        Ok(())
+    })?;
+    writer.verify()?;
+    scan_registered_finalization_markers(repository, Some(writer.authenticator()))?;
+    writer.verify()?;
+    Ok(writer)
 }
 
 impl ArtifactRunWriter {
@@ -817,7 +724,7 @@ impl ArtifactRunWriter {
         let audited = audit_artifact_tree(&self.run, true)?;
         verify_manifest_paths(&self.files, &audited)?;
         verify_manifest_contents(&self.run, self.files.values())?;
-        let mac_key = ArtifactMacKeyWriter::open(&self.repository)?;
+        let mac_key = open_artifact_auth_writer(&self.repository)?;
         mac_key.verify()?;
         let result = (|| -> Result<ArtifactFinalization> {
             let files = self.files.values().cloned().collect::<Vec<_>>();
@@ -834,8 +741,8 @@ impl ArtifactRunWriter {
                 run_id: self.run_id.as_str().to_string(),
                 provenance: self.provenance.clone(),
                 writer_evidence: self.writer_evidence.clone(),
-                mac_key_id: mac_key.key.key_id.clone(),
-                mac_key_identity: mac_key.key.identity.clone(),
+                mac_key_id: mac_key.authenticator().binding().repository_id.clone(),
+                mac_key_identity: mac_key.authenticator().binding().key_identity.clone(),
                 final_report,
                 files,
                 publish_requested,
@@ -844,7 +751,7 @@ impl ArtifactRunWriter {
             };
             verify_writer_evidence(&finalization.writer_evidence, &self.run_root, &self.run)?;
             finalization.checksum = finalization_checksum(&finalization)?;
-            finalization.hmac_sha256 = finalization_hmac(&mac_key.key.bytes, &finalization)?;
+            finalization.hmac_sha256 = finalization_hmac(mac_key.authenticator(), &finalization)?;
             validate_finalization(&finalization)?;
             mac_key.verify()?;
             let mut marker = serde_json::to_vec_pretty(&finalization)
@@ -911,17 +818,14 @@ impl ArtifactRunReader {
             bail!("artifact finalization checksum mismatch");
         }
         validate_finalization(&finalization)?;
-        let mac_key = ArtifactMacKey::open_existing(&repository)?;
+        let mac_key = RepositoryAuthenticator::open_existing(&repository.common_dir)?;
         mac_key.verify()?;
-        if finalization.mac_key_id != mac_key.key_id
-            || finalization.mac_key_identity != mac_key.identity
+        if finalization.mac_key_id != mac_key.binding().repository_id
+            || finalization.mac_key_identity != mac_key.binding().key_identity
         {
             bail!("artifact finalization MAC key binding does not match repository state");
         }
-        let expected_mac = finalization_hmac(&mac_key.bytes, &finalization)?;
-        if !constant_time_eq(expected_mac.as_bytes(), finalization.hmac_sha256.as_bytes()) {
-            bail!("artifact finalization HMAC verification failed");
-        }
+        verify_finalization_hmac(&mac_key, &finalization)?;
         verify_writer_evidence(&finalization.writer_evidence, &run_root, &run)?;
         let audited = audit_artifact_tree(&run, true)?;
         verify_manifest_paths_with_marker(&finalization.files, &audited)?;
@@ -1269,7 +1173,7 @@ fn artifact_repository_from_open(repo: &Repository) -> Result<ArtifactRepository
 
 fn scan_registered_finalization_markers(
     repository: &ArtifactRepository,
-    key: Option<&ArtifactMacKey>,
+    key: Option<&RepositoryAuthenticator>,
 ) -> Result<usize> {
     let mut entries = 0usize;
     let mut markers = 0usize;
@@ -1333,7 +1237,7 @@ fn scan_markers_in_quarantine(
     repository: &ArtifactRepository,
     family: RunArtifactFamily,
     quarantine: &SafeRoot,
-    key: Option<&ArtifactMacKey>,
+    key: Option<&RepositoryAuthenticator>,
     entries: &mut usize,
     markers: &mut usize,
     marker_bytes: &mut u64,
@@ -1369,7 +1273,7 @@ fn observe_finalization_marker(
     repository: &ArtifactRepository,
     family: RunArtifactFamily,
     run: &SafeRoot,
-    key: Option<&ArtifactMacKey>,
+    key: Option<&RepositoryAuthenticator>,
     markers: &mut usize,
     marker_bytes: &mut u64,
 ) -> Result<()> {
@@ -1389,7 +1293,7 @@ fn verify_finalization_marker_key_binding(
     repository: &ArtifactRepository,
     family: RunArtifactFamily,
     run: &SafeRoot,
-    key: &ArtifactMacKey,
+    key: &RepositoryAuthenticator,
     marker_bytes: &mut u64,
 ) -> Result<()> {
     ensure_private_regular_file(&run.path().join(FINALIZATION_MARKER))?;
@@ -1419,13 +1323,12 @@ fn verify_finalization_marker_key_binding(
         bail!("existing artifact finalization marker checksum mismatch");
     }
     validate_finalization(&finalization)?;
-    if finalization.mac_key_id != key.key_id || finalization.mac_key_identity != key.identity {
+    if finalization.mac_key_id != key.binding().repository_id
+        || finalization.mac_key_identity != key.binding().key_identity
+    {
         bail!("artifact finalization MAC key does not match existing marker binding");
     }
-    let expected_mac = finalization_hmac(&key.bytes, &finalization)?;
-    if !constant_time_eq(expected_mac.as_bytes(), finalization.hmac_sha256.as_bytes()) {
-        bail!("existing artifact finalization marker HMAC verification failed");
-    }
+    verify_finalization_hmac(key, &finalization)?;
     run.verify()
 }
 
@@ -1567,55 +1470,6 @@ fn validate_registered_worktree_path(path: &Path) -> Result<()> {
         bail!("registered linked worktree path exceeds its component budget");
     }
     Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn fill_os_random(bytes: &mut [u8]) -> Result<()> {
-    let mut filled = 0usize;
-    while filled < bytes.len() {
-        let result = unsafe {
-            libc::getrandom(
-                bytes[filled..].as_mut_ptr().cast(),
-                bytes.len().saturating_sub(filled),
-                0,
-            )
-        };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error).context("OS getrandom failed for artifact MAC key");
-        }
-        let read = usize::try_from(result).context("OS random byte count overflow")?;
-        if read == 0 {
-            bail!("OS getrandom returned zero bytes for artifact MAC key");
-        }
-        filled = filled
-            .checked_add(read)
-            .context("OS random fill count overflow")?;
-    }
-    Ok(())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn fill_os_random(bytes: &mut [u8]) -> Result<()> {
-    let mut source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/dev/urandom")
-        .context("failed to open OS random source")?;
-    if !source.metadata()?.file_type().is_char_device() {
-        bail!("OS random source is not a character device");
-    }
-    source
-        .read_exact(bytes)
-        .context("failed to read artifact MAC key from OS random source")
-}
-
-#[cfg(not(unix))]
-fn fill_os_random(_bytes: &mut [u8]) -> Result<()> {
-    bail!("artifact MAC key generation requires a supported OS random source")
 }
 
 fn open_or_create_run_root(
@@ -2580,129 +2434,8 @@ fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
     }
 }
 
-fn sha256_hex(input: &[u8]) -> String {
-    hex_encode(&sha256_bytes(input))
-}
-
-fn sha256_bytes(input: &[u8]) -> [u8; 32] {
-    const INITIAL: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let bit_len = u64::try_from(input.len())
-        .unwrap_or(u64::MAX)
-        .wrapping_mul(8);
-    let mut message = input.to_vec();
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-    let mut hash = INITIAL;
-    for chunk in message.chunks_exact(64) {
-        let mut words = [0u32; 64];
-        for (index, bytes) in chunk.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        }
-        for index in 16..64 {
-            let s0 = words[index - 15].rotate_right(7)
-                ^ words[index - 15].rotate_right(18)
-                ^ (words[index - 15] >> 3);
-            let s1 = words[index - 2].rotate_right(17)
-                ^ words[index - 2].rotate_right(19)
-                ^ (words[index - 2] >> 10);
-            words[index] = words[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(words[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = hash;
-        for index in 0..64 {
-            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choice = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(sum1)
-                .wrapping_add(choice)
-                .wrapping_add(K[index])
-                .wrapping_add(words[index]);
-            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = sum0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        hash[0] = hash[0].wrapping_add(a);
-        hash[1] = hash[1].wrapping_add(b);
-        hash[2] = hash[2].wrapping_add(c);
-        hash[3] = hash[3].wrapping_add(d);
-        hash[4] = hash[4].wrapping_add(e);
-        hash[5] = hash[5].wrapping_add(f);
-        hash[6] = hash[6].wrapping_add(g);
-        hash[7] = hash[7].wrapping_add(h);
-    }
-    let mut output = [0u8; 32];
-    for (index, word) in hash.iter().enumerate() {
-        let offset = index.saturating_mul(4);
-        output[offset..offset + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    output
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        let _ = write!(&mut output, "{byte:02x}");
-    }
-    output
-}
-
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut padded_key = [0u8; 64];
-    if key.len() > padded_key.len() {
-        padded_key[..32].copy_from_slice(&sha256_bytes(key));
-    } else {
-        padded_key[..key.len()].copy_from_slice(key);
-    }
-    let mut inner_pad = [0x36u8; 64];
-    let mut outer_pad = [0x5cu8; 64];
-    for index in 0..64 {
-        inner_pad[index] ^= padded_key[index];
-        outer_pad[index] ^= padded_key[index];
-    }
-    let mut inner = Vec::with_capacity(inner_pad.len().saturating_add(message.len()));
-    inner.extend_from_slice(&inner_pad);
-    inner.extend_from_slice(message);
-    let inner_digest = sha256_bytes(&inner);
-    let mut outer = Vec::with_capacity(outer_pad.len().saturating_add(inner_digest.len()));
-    outer.extend_from_slice(&outer_pad);
-    outer.extend_from_slice(&inner_digest);
-    sha256_bytes(&outer)
-}
-
-fn finalization_hmac(
-    key: &[u8; ARTIFACT_MAC_KEY_BYTES],
-    finalization: &ArtifactFinalization,
-) -> Result<String> {
-    let canonical = serde_json::to_vec(&(
+fn finalization_hmac_payload(finalization: &ArtifactFinalization) -> Result<Vec<u8>> {
+    serde_json::to_vec(&(
         finalization.version,
         &finalization.checksum,
         &finalization.repository,
@@ -2717,23 +2450,27 @@ fn finalization_hmac(
         finalization.publish_requested,
         finalization.publishable,
     ))
-    .context("failed to encode canonical artifact HMAC payload")?;
-    let mut domain_separated =
-        Vec::with_capacity(ARTIFACT_MAC_DOMAIN.len().saturating_add(canonical.len()));
-    domain_separated.extend_from_slice(ARTIFACT_MAC_DOMAIN);
-    domain_separated.extend_from_slice(&canonical);
-    Ok(hex_encode(&hmac_sha256(key, &domain_separated)))
+    .context("failed to encode canonical artifact HMAC payload")
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (left, right) in left.iter().zip(right) {
-        difference |= left ^ right;
-    }
-    difference == 0
+fn finalization_hmac(
+    authenticator: &RepositoryAuthenticator,
+    finalization: &ArtifactFinalization,
+) -> Result<String> {
+    let payload = finalization_hmac_payload(finalization)?;
+    Ok(authenticator
+        .sign_legacy_artifact_finalization_v2(&payload)?
+        .as_str()
+        .to_string())
+}
+
+fn verify_finalization_hmac(
+    authenticator: &RepositoryAuthenticator,
+    finalization: &ArtifactFinalization,
+) -> Result<()> {
+    let payload = finalization_hmac_payload(finalization)?;
+    let tag = AuthenticationTag::parse(finalization.hmac_sha256.clone())?;
+    authenticator.verify_legacy_artifact_finalization_v2(&payload, &tag)
 }
 
 fn is_canonical_lower_hex_64(value: &str) -> bool {
@@ -2755,15 +2492,6 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn hmac_sha256_matches_rfc_4231_case_one() {
-        let key = [0x0bu8; 20];
-        assert_eq!(
-            hex_encode(&hmac_sha256(&key, b"Hi There")),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }
 
@@ -3151,11 +2879,11 @@ mod tests {
         let key_path = repository
             .common_dir
             .join("maco/state")
-            .join(ARTIFACT_MAC_KEY_FILE);
+            .join(authentication_key_file_name());
         let key_lock_path = repository
             .common_dir
             .join("maco/state")
-            .join(ARTIFACT_MAC_KEY_LOCK);
+            .join(authentication_key_lock_name());
         assert_eq!(mode(&key_path), 0o600);
         assert_eq!(mode(&key_lock_path), 0o600);
 
@@ -3216,7 +2944,7 @@ mod tests {
             !key_path.exists(),
             "reader must never recreate a missing key"
         );
-        let rekey_error = ArtifactMacKeyWriter::open(&repository)
+        let rekey_error = open_artifact_auth_writer(&repository)
             .err()
             .expect("rekey refusal");
         assert!(rekey_error
@@ -3226,7 +2954,7 @@ mod tests {
         ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
             .expect("restored key");
 
-        fs::write(&key_path, [0xa5; ARTIFACT_MAC_KEY_BYTES]).expect("corrupt bound key");
+        fs::write(&key_path, vec![0xa5; authentication_key_length()]).expect("corrupt bound key");
         let corrupt_key_error =
             ArtifactRunReader::open(&repo, RunArtifactFamily::Autopilot, &run_id)
                 .err()
@@ -3269,10 +2997,10 @@ mod tests {
         let key_path = repository
             .common_dir
             .join("maco/state")
-            .join(ARTIFACT_MAC_KEY_FILE);
+            .join(authentication_key_file_name());
         let original_key = key_path.with_file_name("artifact-key.pre-replacement");
         fs::rename(&key_path, &original_key).expect("move original key");
-        write_private(&key_path, &[0xa5; ARTIFACT_MAC_KEY_BYTES]);
+        write_private(&key_path, &vec![0xa5; authentication_key_length()]);
 
         let second_run = RunId::new("replacement-key-run").expect("run id");
         let mut writer = ArtifactRunWriter::reserve(
@@ -3318,7 +3046,7 @@ mod tests {
         let key_path = repository
             .common_dir
             .join("maco/state")
-            .join(ARTIFACT_MAC_KEY_FILE);
+            .join(authentication_key_file_name());
         let original_key = key_path.with_file_name("artifact-key.missing-linked-test");
         fs::rename(&key_path, &original_key).expect("remove shared key");
 
@@ -3359,9 +3087,9 @@ mod tests {
         let key_path = repository
             .common_dir
             .join("maco/state")
-            .join(ARTIFACT_MAC_KEY_FILE);
+            .join(authentication_key_file_name());
 
-        let error = ArtifactMacKeyWriter::open(&repository)
+        let error = open_artifact_auth_writer(&repository)
             .err()
             .expect("stale worktree registration must fail closed");
         assert!(error.to_string().contains("stale or invalid"));
@@ -3381,9 +3109,9 @@ mod tests {
         let key_path = repository
             .common_dir
             .join("maco/state")
-            .join(ARTIFACT_MAC_KEY_FILE);
+            .join(authentication_key_file_name());
 
-        let error = ArtifactMacKeyWriter::open(&repository)
+        let error = open_artifact_auth_writer(&repository)
             .err()
             .expect("marker scan budget must fail closed");
         assert!(error.to_string().contains("global entry budget"));
@@ -3740,14 +3468,16 @@ mod tests {
         drop(replacement_run_lock);
 
         let repository = discover_artifact_repository(&repo).expect("repository");
-        let key_writer = ArtifactMacKeyWriter::open(&repository).expect("key writer");
-        let key_lock_path = key_writer.lock.lock.path().to_path_buf();
+        let key_writer = open_artifact_auth_writer(&repository).expect("key writer");
+        let key_lock_path = key_writer.lock_path().to_path_buf();
         let old_key_lock = key_lock_path.with_file_name("artifact-key.lock.original");
         fs::rename(&key_lock_path, &old_key_lock).expect("move key lock");
         write_private(&key_lock_path, b"");
-        let replacement_key_lock =
-            BoundArtifactLock::acquire(&key_writer.key.root, ARTIFACT_MAC_KEY_LOCK)
-                .expect("replacement key lock");
+        let replacement_key_lock = BoundStateLock::acquire(
+            key_writer.authenticator().state_root(),
+            authentication_key_lock_name(),
+        )
+        .expect("replacement key lock");
         let key_error = key_writer.verify().expect_err("rebound key lock must fail");
         assert!(
             key_error.to_string().contains("lock path was rebound")
