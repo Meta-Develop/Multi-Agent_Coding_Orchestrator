@@ -1,9 +1,11 @@
 use crate::{
+    merge::capture_worktree_diff_from_commit,
     process_runner::{
-        read_bounded_regular_file_nofollow, run_process, trusted_system_executable, CapturedBytes,
-        EnvironmentMode, ProcessRunError, ProcessSpec, Shell, SideEffectConfinementProfile,
-        StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
+        run_process, trusted_system_executable, CapturedBytes, EnvironmentMode, ProcessRunError,
+        ProcessSpec, Shell, SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
+        WorkspaceAccess,
     },
+    safe_state::BoundedRegularReader,
     secure_output::{ReservedOutputFile, SecureOutputRoot},
     semantic_coord::{
         SemanticConflict, SemanticCoordinationReport, SemanticIntent, SemanticIntentRequest,
@@ -25,37 +27,41 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{self, ExitStatus},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
-const CHECKPOINT_STATE_VERSION: u32 = 1;
+const CHECKPOINT_STATE_VERSION: u32 = 2;
 const GIT_COMMAND_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const GIT_ADMIN_SNAPSHOT_MAX_ENTRIES: usize = 4096;
-const GIT_ADMIN_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const PATCH_OUTPUT_MAX_BYTES: usize = 64 * 1024 * 1024;
 const CHECKPOINT_OUTPUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const CANDIDATE_BINDING_VERSION: u32 = 1;
+const CANDIDATE_CAPTURE_ATTEMPTS: usize = 3;
+const CANDIDATE_MAX_CHANGED_PATHS: usize = 8 * 1024;
+const CANDIDATE_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const CANDIDATE_MAX_SINGLE_FILE_BYTES: usize = 16 * 1024 * 1024;
+const COMBINED_CANDIDATE_MAX_PATCHES: usize = 256;
+const COMBINED_CANDIDATE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE: usize = 128;
+const PLAN_MAX_TOTAL_VALIDATION_COMMANDS: usize = 4 * 1024;
+const PLAN_MAX_DEPENDENCY_EDGES: usize = 4 * 1024;
+static REPO_VALIDATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitAdminSnapshotEntry {
-    kind: &'static str,
-    device: u64,
-    inode: u64,
-    mode: u32,
-    length: u64,
-    digest: Option<Oid>,
+#[cfg(test)]
+struct CandidateBoundaryFailureHook {
+    agent_id: String,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
-#[derive(Debug)]
-struct LinkedGitAdminWriteGuard {
-    directory: PathBuf,
-    device: u64,
-    inode: u64,
-    snapshot: BTreeMap<PathBuf, GitAdminSnapshotEntry>,
-}
+#[cfg(test)]
+static CANDIDATE_BOUNDARY_FAILURE_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<CandidateBoundaryFailureHook>>,
+> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrchestrationExecutionRuntime {
@@ -194,6 +200,8 @@ pub struct RunCheckpoint {
     pub success: bool,
     pub agents: Vec<AgentCheckpoint>,
     pub repo_validation: Vec<ValidationRunSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_validation_target: Option<RepoValidationTargetBinding>,
     pub released_claims: Vec<PathClaim>,
     pub release_errors: Vec<String>,
     #[serde(default)]
@@ -216,6 +224,8 @@ pub struct AgentCheckpoint {
     pub changed_paths: Vec<PathBuf>,
     pub unclaimed_changed_paths: Vec<PathBuf>,
     pub validation: Vec<ValidationRunSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_binding: Option<AgentCandidateBinding>,
     pub error: Option<String>,
 }
 
@@ -320,6 +330,8 @@ pub struct OrchestrationSummary {
     pub success: bool,
     pub agents: Vec<AgentRunSummary>,
     pub repo_validation: Vec<ValidationRunSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_validation_target: Option<RepoValidationTargetBinding>,
     pub released_claims: Vec<PathClaim>,
     pub release_errors: Vec<String>,
     pub released_semantic_intents: Vec<SemanticIntent>,
@@ -358,6 +370,8 @@ pub struct AgentRunSummary {
     pub stdout: OutputSummary,
     pub stderr: OutputSummary,
     pub validation: Vec<ValidationRunSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_binding: Option<AgentCandidateBinding>,
     pub error: Option<String>,
 }
 
@@ -385,9 +399,59 @@ impl AgentRunSummary {
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
             validation: Vec::new(),
+            candidate_binding: None,
             error: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentCandidateBinding {
+    pub version: u32,
+    pub base_oid: String,
+    pub head_oid: String,
+    pub state_oid: String,
+    pub diff_oid: String,
+    pub changed_paths: Vec<PathBuf>,
+    pub patch_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoValidationTargetKind {
+    CombinedCandidate,
+    BaseNoChanges,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RepoValidationTargetBinding {
+    pub version: u32,
+    pub kind: RepoValidationTargetKind,
+    pub base_oid: String,
+    pub combined_diff_oid: String,
+    pub changed_paths: Vec<PathBuf>,
+    pub candidate_count: usize,
+    pub patch_count: usize,
+    pub aggregate_patch_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CandidateStateSnapshot {
+    base_oid: Oid,
+    head_oid: Oid,
+    index_entries_oid: Oid,
+    index_flags_oid: Oid,
+    index_diff_oid: Oid,
+    worktree_diff_oid: Oid,
+    status_oid: Oid,
+    untracked_oid: Oid,
+    changed_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedCandidate {
+    binding: AgentCandidateBinding,
+    patch: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -567,6 +631,7 @@ fn run_plan_with_controls_runtime(
         .map(AgentRunSummary::pending)
         .collect::<Vec<_>>();
     let mut repo_validation = Vec::new();
+    let mut repo_validation_target = None;
     let mut acquired_tokens = Vec::new();
     let mut acquired_semantic_tokens = Vec::new();
 
@@ -592,6 +657,7 @@ fn run_plan_with_controls_runtime(
             success: false,
             agents: &summaries,
             repo_validation: &repo_validation,
+            repo_validation_target: repo_validation_target.as_ref(),
             released_claims: &[],
             release_errors: &[],
             released_semantic_intents: &[],
@@ -600,135 +666,27 @@ fn run_plan_with_controls_runtime(
     )?;
 
     for (index, agent) in plan.agents.iter().enumerate() {
-        let claim = match store.claim_paths(&agent.id, agent.paths.iter()) {
-            Ok(claim) => claim,
-            Err(error) => {
-                summaries[index].status = AgentRunStatus::Failed;
-                summaries[index].error = Some(format!("failed to claim paths: {error}"));
-                for (skipped_index, skipped) in summaries.iter_mut().enumerate() {
-                    if skipped_index != index && skipped.status == AgentRunStatus::Pending {
-                        skipped.status = AgentRunStatus::Skipped;
-                        skipped.error = Some(format!(
-                            "skipped because paths could not be claimed for agent '{}'",
-                            agent.id
-                        ));
-                    }
-                }
-                let (released_claims, release_errors) = if options.keep_claims {
-                    (Vec::new(), Vec::new())
-                } else {
-                    release_claims(&store, acquired_tokens)
-                };
-                let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
-                    (Vec::new(), Vec::new())
-                } else {
-                    release_semantic_intents(&semantic_store, acquired_semantic_tokens)
-                };
-                write_checkpoint_if_configured(
-                    &controls,
-                    RunCheckpointStage::Final,
-                    &run_id,
-                    checkpoint_writer.as_mut(),
-                    CheckpointView {
-                        repo: &repo,
-                        repo_head: &repo_head,
-                        plan_file: &options.plan_file,
-                        plan: &plan,
-                        keep_claims: options.keep_claims,
-                        worktree_reuse_policy,
-                        success: false,
-                        agents: &summaries,
-                        repo_validation: &repo_validation,
-                        released_claims: &released_claims,
-                        release_errors: &release_errors,
-                        released_semantic_intents: &released_semantic_intents,
-                        semantic_release_errors: &semantic_release_errors,
-                    },
-                )?;
-                return Ok(OrchestrationSummary {
-                    run_id,
-                    repo,
-                    plan_file: options.plan_file,
-                    keep_claims: options.keep_claims,
-                    worktree_reuse_policy,
-                    semantic_coordination,
-                    success: false,
-                    agents: summaries,
-                    repo_validation,
-                    released_claims,
-                    release_errors,
-                    released_semantic_intents,
-                    semantic_release_errors,
-                });
+        match store.claim_paths(&agent.id, agent.paths.iter()) {
+            Ok(claim) => {
+                acquired_tokens.push(claim.token);
+                summaries[index].claim = Some(claim);
             }
-        };
-        acquired_tokens.push(claim.token);
-        summaries[index].claim = Some(claim);
+            Err(error) => {
+                fail_summary(
+                    &mut summaries[index],
+                    format!("failed to claim paths for agent '{}': {error}", agent.id),
+                );
+            }
+        }
     }
     if semantic_coordination != SemanticCoordinationMode::Off {
-        if let Some(blocked_index) = coordinate_semantic_intents(
+        coordinate_semantic_intents(
             &semantic_store,
             &plan,
             &mut summaries,
             semantic_coordination,
             &mut acquired_semantic_tokens,
-        ) {
-            let blocked_agent = summaries[blocked_index].id.clone();
-            for (skipped_index, skipped) in summaries.iter_mut().enumerate() {
-                if skipped_index != blocked_index && skipped.status == AgentRunStatus::Pending {
-                    skipped.status = AgentRunStatus::Skipped;
-                    skipped.error = Some(format!(
-                        "skipped because semantic coordination failed for agent '{blocked_agent}'"
-                    ));
-                }
-            }
-            let (released_claims, release_errors) = if options.keep_claims {
-                (Vec::new(), Vec::new())
-            } else {
-                release_claims(&store, acquired_tokens)
-            };
-            let (released_semantic_intents, semantic_release_errors) = if options.keep_claims {
-                (Vec::new(), Vec::new())
-            } else {
-                release_semantic_intents(&semantic_store, acquired_semantic_tokens)
-            };
-            write_checkpoint_if_configured(
-                &controls,
-                RunCheckpointStage::Final,
-                &run_id,
-                checkpoint_writer.as_mut(),
-                CheckpointView {
-                    repo: &repo,
-                    repo_head: &repo_head,
-                    plan_file: &options.plan_file,
-                    plan: &plan,
-                    keep_claims: options.keep_claims,
-                    worktree_reuse_policy,
-                    success: false,
-                    agents: &summaries,
-                    repo_validation: &repo_validation,
-                    released_claims: &released_claims,
-                    release_errors: &release_errors,
-                    released_semantic_intents: &released_semantic_intents,
-                    semantic_release_errors: &semantic_release_errors,
-                },
-            )?;
-            return Ok(OrchestrationSummary {
-                run_id,
-                repo,
-                plan_file: options.plan_file,
-                keep_claims: options.keep_claims,
-                worktree_reuse_policy,
-                semantic_coordination,
-                success: false,
-                agents: summaries,
-                repo_validation,
-                released_claims,
-                release_errors,
-                released_semantic_intents,
-                semantic_release_errors,
-            });
-        }
+        );
     }
     write_checkpoint_if_configured(
         &controls,
@@ -745,6 +703,7 @@ fn run_plan_with_controls_runtime(
             success: false,
             agents: &summaries,
             repo_validation: &repo_validation,
+            repo_validation_target: repo_validation_target.as_ref(),
             released_claims: &[],
             release_errors: &[],
             released_semantic_intents: &[],
@@ -752,20 +711,33 @@ fn run_plan_with_controls_runtime(
         },
     )?;
 
-    run_agent_schedule_with_patch_dir(
-        &plan,
+    let captured_candidates = run_agent_schedule_with_patch_dir(
+        &AgentScheduleContext {
+            manager: &manager,
+            plan: &plan,
+            worktrees: &worktrees,
+            jobs: options.jobs,
+            base_oid: &repo_head,
+            runtime,
+        },
         &mut summaries,
-        &worktrees,
-        options.jobs,
         options.patch_dir.as_deref(),
-        &repo_head,
-        runtime,
     )?;
     if summaries
         .iter()
         .all(|summary| summary.status == AgentRunStatus::Succeeded)
     {
-        repo_validation = run_repo_validation_commands(&plan, &repo, runtime);
+        let outcome = run_repo_validation_commands(
+            &plan,
+            &repo,
+            &manager,
+            &worktrees,
+            &repo_head,
+            &captured_candidates,
+            runtime,
+        );
+        repo_validation = outcome.summaries;
+        repo_validation_target = outcome.target;
     }
     write_checkpoint_if_configured(
         &controls,
@@ -782,6 +754,7 @@ fn run_plan_with_controls_runtime(
             success: false,
             agents: &summaries,
             repo_validation: &repo_validation,
+            repo_validation_target: repo_validation_target.as_ref(),
             released_claims: &[],
             release_errors: &[],
             released_semantic_intents: &[],
@@ -801,6 +774,7 @@ fn run_plan_with_controls_runtime(
     };
     let success = release_errors.is_empty()
         && semantic_release_errors.is_empty()
+        && repo_validation_target.is_some()
         && summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -822,6 +796,7 @@ fn run_plan_with_controls_runtime(
             success,
             agents: &summaries,
             repo_validation: &repo_validation,
+            repo_validation_target: repo_validation_target.as_ref(),
             released_claims: &released_claims,
             release_errors: &release_errors,
             released_semantic_intents: &released_semantic_intents,
@@ -839,6 +814,7 @@ fn run_plan_with_controls_runtime(
         success,
         agents: summaries,
         repo_validation,
+        repo_validation_target,
         released_claims,
         release_errors,
         released_semantic_intents,
@@ -916,8 +892,14 @@ fn resume_plan_file_runtime(
     let store = SyncStore::open(&repo)?;
     let semantic_store = SemanticIntentStore::open(&repo)?;
     let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
-    let worktrees =
-        validate_resume_worktrees(&manager, &plan, &checkpoint, &mut summaries, &repo_head)?;
+    let worktrees = validate_resume_worktrees(
+        &manager,
+        &plan,
+        &checkpoint,
+        &mut summaries,
+        &repo_head,
+        runtime,
+    )?;
 
     if checkpoint.stage == RunCheckpointStage::Final {
         return Ok(summary_from_parts(SummaryParts {
@@ -929,6 +911,7 @@ fn resume_plan_file_runtime(
             semantic_coordination: checkpoint.semantic_coordination,
             summaries,
             repo_validation: checkpoint.repo_validation,
+            repo_validation_target: checkpoint.repo_validation_target,
             released_claims: checkpoint.released_claims,
             release_errors: checkpoint.release_errors,
             released_semantic_intents: checkpoint.released_semantic_intents,
@@ -948,7 +931,7 @@ fn resume_plan_file_runtime(
         &summaries,
         true,
     )?;
-    let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries)?;
+    let acquired_tokens = acquire_resume_claims(&store, &plan, &mut summaries);
     let mut acquired_semantic_tokens =
         active_checkpoint_semantic_tokens(&semantic_store, &summaries)?;
     let had_pending_agents = summaries
@@ -961,69 +944,13 @@ fn resume_plan_file_runtime(
         && had_pending_agents
         && !has_checkpoint_semantic_reports
     {
-        if let Some(blocked_index) = coordinate_semantic_intents(
+        coordinate_semantic_intents(
             &semantic_store,
             &plan,
             &mut summaries,
             checkpoint.semantic_coordination,
             &mut acquired_semantic_tokens,
-        ) {
-            let blocked_agent = summaries[blocked_index].id.clone();
-            for (skipped_index, skipped) in summaries.iter_mut().enumerate() {
-                if skipped_index != blocked_index && skipped.status == AgentRunStatus::Pending {
-                    skipped.status = AgentRunStatus::Skipped;
-                    skipped.error = Some(format!(
-                        "skipped because semantic coordination failed for agent '{blocked_agent}'"
-                    ));
-                }
-            }
-            let (released_claims, release_errors) = if checkpoint.keep_claims {
-                (Vec::new(), Vec::new())
-            } else {
-                release_claims(&store, acquired_tokens)
-            };
-            let (released_semantic_intents, semantic_release_errors) = if checkpoint.keep_claims {
-                (Vec::new(), Vec::new())
-            } else {
-                release_semantic_intents(&semantic_store, acquired_semantic_tokens)
-            };
-            write_checkpoint_if_configured(
-                &controls,
-                RunCheckpointStage::Final,
-                &Some(checkpoint.run_id.clone()),
-                checkpoint_writer.as_mut(),
-                CheckpointView {
-                    repo: &repo,
-                    repo_head: &repo_head,
-                    plan_file: &plan_file,
-                    plan: &plan,
-                    keep_claims: checkpoint.keep_claims,
-                    worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-                    success: false,
-                    agents: &summaries,
-                    repo_validation: &checkpoint.repo_validation,
-                    released_claims: &released_claims,
-                    release_errors: &release_errors,
-                    released_semantic_intents: &released_semantic_intents,
-                    semantic_release_errors: &semantic_release_errors,
-                },
-            )?;
-            return Ok(OrchestrationSummary {
-                run_id: Some(checkpoint.run_id),
-                repo,
-                plan_file,
-                keep_claims: checkpoint.keep_claims,
-                worktree_reuse_policy: checkpoint.worktree_reuse_policy,
-                semantic_coordination: checkpoint.semantic_coordination,
-                success: false,
-                agents: summaries,
-                repo_validation: checkpoint.repo_validation,
-                released_claims,
-                release_errors,
-                released_semantic_intents,
-                semantic_release_errors,
-            });
-        }
+        );
     }
 
     write_checkpoint_if_configured(
@@ -1041,6 +968,7 @@ fn resume_plan_file_runtime(
             success: false,
             agents: &summaries,
             repo_validation: &checkpoint.repo_validation,
+            repo_validation_target: checkpoint.repo_validation_target.as_ref(),
             released_claims: &[],
             release_errors: &[],
             released_semantic_intents: &[],
@@ -1048,26 +976,47 @@ fn resume_plan_file_runtime(
         },
     )?;
 
-    run_agent_schedule_with_patch_dir(
-        &plan,
+    let captured_candidates = run_agent_schedule_with_patch_dir(
+        &AgentScheduleContext {
+            manager: &manager,
+            plan: &plan,
+            worktrees: &worktrees,
+            jobs: options.jobs,
+            base_oid: &repo_head,
+            runtime,
+        },
         &mut summaries,
-        &worktrees,
-        options.jobs,
         options.patch_dir.as_deref(),
-        &repo_head,
-        runtime,
     )?;
-    let repo_validation = if summaries
+    let (repo_validation, repo_validation_target) = if summaries
         .iter()
         .all(|summary| summary.status == AgentRunStatus::Succeeded)
     {
-        if had_pending_agents || checkpoint.repo_validation.is_empty() {
-            run_repo_validation_commands(&plan, &repo, runtime)
+        if had_pending_agents
+            || checkpoint.repo_validation.is_empty()
+            || checkpoint.repo_validation_target.is_none()
+        {
+            let outcome = run_repo_validation_commands(
+                &plan,
+                &repo,
+                &manager,
+                &worktrees,
+                &repo_head,
+                &captured_candidates,
+                runtime,
+            );
+            (outcome.summaries, outcome.target)
         } else {
-            checkpoint.repo_validation.clone()
+            (
+                checkpoint.repo_validation.clone(),
+                checkpoint.repo_validation_target.clone(),
+            )
         }
     } else {
-        checkpoint.repo_validation.clone()
+        (
+            checkpoint.repo_validation.clone(),
+            checkpoint.repo_validation_target.clone(),
+        )
     };
 
     write_checkpoint_if_configured(
@@ -1085,6 +1034,7 @@ fn resume_plan_file_runtime(
             success: false,
             agents: &summaries,
             repo_validation: &repo_validation,
+            repo_validation_target: repo_validation_target.as_ref(),
             released_claims: &[],
             release_errors: &[],
             released_semantic_intents: &[],
@@ -1104,6 +1054,7 @@ fn resume_plan_file_runtime(
     };
     let success = release_errors.is_empty()
         && semantic_release_errors.is_empty()
+        && repo_validation_target.is_some()
         && summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -1126,6 +1077,7 @@ fn resume_plan_file_runtime(
             success,
             agents: &summaries,
             repo_validation: &repo_validation,
+            repo_validation_target: repo_validation_target.as_ref(),
             released_claims: &released_claims,
             release_errors: &release_errors,
             released_semantic_intents: &released_semantic_intents,
@@ -1143,6 +1095,7 @@ fn resume_plan_file_runtime(
         success,
         agents: summaries,
         repo_validation,
+        repo_validation_target,
         released_claims,
         release_errors,
         released_semantic_intents,
@@ -1221,8 +1174,148 @@ fn validate_checkpoint_for_resume(
                 );
             }
         }
+        if checkpoint_agent.status == AgentRunStatus::Succeeded
+            && checkpoint_agent.candidate_binding.is_none()
+        {
+            bail!(
+                "checkpoint '{}' completed agent '{}' is missing candidate validation binding metadata; start a new run",
+                checkpoint.run_id.as_str(),
+                checkpoint_agent.id
+            );
+        }
+        if let Some(binding) = checkpoint_agent.candidate_binding.as_ref() {
+            validate_serialized_agent_binding(binding, agent, repo_head)?;
+            if checkpoint_agent.changed_paths != binding.changed_paths {
+                bail!(
+                    "checkpoint '{}' candidate paths for completed agent '{}' do not match its serialized binding",
+                    checkpoint.run_id.as_str(),
+                    checkpoint_agent.id
+                );
+            }
+        }
     }
 
+    if let Some(target) = checkpoint.repo_validation_target.as_ref() {
+        validate_serialized_repo_validation_target(target, checkpoint, repo_head)?;
+    } else if checkpoint.stage == RunCheckpointStage::Final
+        && checkpoint
+            .agents
+            .iter()
+            .all(|agent| agent.status == AgentRunStatus::Succeeded)
+    {
+        bail!(
+            "checkpoint '{}' has successful candidates but no combined repo-validation target binding; start a new run",
+            checkpoint.run_id.as_str()
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_serialized_agent_binding(
+    binding: &AgentCandidateBinding,
+    agent: &AgentPlan,
+    repo_head: &Oid,
+) -> Result<()> {
+    if binding.version != CANDIDATE_BINDING_VERSION {
+        bail!(
+            "agent '{}' uses unsupported candidate binding version {}",
+            agent.id,
+            binding.version
+        );
+    }
+    if binding.base_oid != repo_head.to_string() {
+        bail!(
+            "agent '{}' candidate binding was captured from a different run base",
+            agent.id
+        );
+    }
+    for (label, value) in [
+        ("base", binding.base_oid.as_str()),
+        ("head", binding.head_oid.as_str()),
+        ("state", binding.state_oid.as_str()),
+        ("diff", binding.diff_oid.as_str()),
+    ] {
+        let oid = Oid::from_str(value)
+            .with_context(|| format!("agent '{}' candidate {label} OID is invalid", agent.id))?;
+        if oid.to_string() != value {
+            bail!(
+                "agent '{}' candidate {label} OID is not canonical",
+                agent.id
+            );
+        }
+    }
+    if binding.patch_bytes >= PATCH_OUTPUT_MAX_BYTES as u64 {
+        bail!(
+            "agent '{}' candidate patch reached the configured byte boundary",
+            agent.id
+        );
+    }
+    if binding.changed_paths.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "agent '{}' candidate changed-path count exceeded its bound",
+            agent.id
+        );
+    }
+    for path in &binding.changed_paths {
+        let normalized = normalize_repo_relative_path(path)?;
+        if &normalized != path {
+            bail!("agent '{}' candidate path is not normalized", agent.id);
+        }
+    }
+    Ok(())
+}
+
+fn validate_serialized_repo_validation_target(
+    target: &RepoValidationTargetBinding,
+    checkpoint: &RunCheckpoint,
+    repo_head: &Oid,
+) -> Result<()> {
+    if target.version != CANDIDATE_BINDING_VERSION || target.base_oid != repo_head.to_string() {
+        bail!("checkpoint repo-validation target has an unsupported or stale binding");
+    }
+    let diff_oid = Oid::from_str(&target.combined_diff_oid)
+        .context("checkpoint repo-validation combined diff OID is invalid")?;
+    if diff_oid.to_string() != target.combined_diff_oid {
+        bail!("checkpoint repo-validation combined diff OID is not canonical");
+    }
+    let successful = checkpoint
+        .agents
+        .iter()
+        .filter(|agent| agent.status == AgentRunStatus::Succeeded)
+        .collect::<Vec<_>>();
+    let mut changed_paths = BTreeSet::new();
+    let mut patch_count = 0_usize;
+    let mut aggregate_patch_bytes = 0_u64;
+    for agent in &successful {
+        let binding = agent
+            .candidate_binding
+            .as_ref()
+            .context("successful checkpoint agent is missing its candidate binding")?;
+        if binding.patch_bytes > 0 {
+            patch_count += 1;
+        }
+        aggregate_patch_bytes = aggregate_patch_bytes
+            .checked_add(binding.patch_bytes)
+            .context("checkpoint candidate byte count overflowed")?;
+        changed_paths.extend(binding.changed_paths.iter().cloned());
+    }
+    let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+    let expected_kind = if changed_paths.is_empty() {
+        RepoValidationTargetKind::BaseNoChanges
+    } else {
+        RepoValidationTargetKind::CombinedCandidate
+    };
+    if target.kind != expected_kind
+        || target.candidate_count != successful.len()
+        || target.patch_count != patch_count
+        || target.aggregate_patch_bytes != aggregate_patch_bytes
+        || target.changed_paths != changed_paths
+        || target.aggregate_patch_bytes >= COMBINED_CANDIDATE_MAX_BYTES as u64
+        || target.patch_count > COMBINED_CANDIDATE_MAX_PATCHES
+    {
+        bail!("checkpoint repo-validation target does not match its successful candidate set");
+    }
     Ok(())
 }
 
@@ -1244,6 +1337,7 @@ fn summaries_from_checkpoint(
             summary.changed_paths = checkpoint_agent.changed_paths.clone();
             summary.unclaimed_changed_paths = checkpoint_agent.unclaimed_changed_paths.clone();
             summary.validation = checkpoint_agent.validation.clone();
+            summary.candidate_binding = checkpoint_agent.candidate_binding.clone();
             summary.error = checkpoint_agent.error.clone();
             Ok(summary)
         })
@@ -1256,6 +1350,7 @@ fn validate_resume_worktrees(
     checkpoint: &RunCheckpoint,
     summaries: &mut [AgentRunSummary],
     repo_head: &Oid,
+    runtime: OrchestrationExecutionRuntime,
 ) -> Result<Vec<SelectedWorktree>> {
     let registered_names = manager
         .list()?
@@ -1304,6 +1399,23 @@ fn validate_resume_worktrees(
                 recorded.branch,
                 current.path.display(),
                 current.branch
+            );
+        }
+
+        let primary_verified = manager
+            .get_managed_verified(&recorded.name)
+            .with_context(|| {
+                format!(
+                    "checkpoint '{}' managed worktree binding for agent '{}' is invalid",
+                    checkpoint.run_id.as_str(),
+                    agent.id
+                )
+            })?;
+        if &primary_verified != current {
+            bail!(
+                "checkpoint '{}' managed worktree record or Git backlink for agent '{}' changed while its write lease was held",
+                checkpoint.run_id.as_str(),
+                agent.id
             );
         }
 
@@ -1382,8 +1494,85 @@ fn validate_resume_worktrees(
                         agent.id
                     );
                 }
+                let binding = checkpoint_agent
+                    .candidate_binding
+                    .as_ref()
+                    .with_context(|| {
+                        format!(
+                            "checkpoint '{}' completed agent '{}' is missing its candidate binding",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                let state = capture_consistent_candidate_state(&current.path, repo_head, runtime)
+                    .with_context(|| {
+                        format!(
+                            "checkpoint '{}' completed agent '{}' candidate state could not be recaptured",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                ensure_candidate_binding_matches_state(binding, &state).with_context(|| {
+                    format!(
+                        "checkpoint '{}' completed agent '{}' candidate binding drifted",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    )
+                })?;
+                let before_patch_capture = manager
+                    .get_managed_verified(&recorded.name)
+                    .with_context(|| {
+                        format!(
+                            "checkpoint '{}' managed worktree binding for agent '{}' changed before exact candidate recapture",
+                            checkpoint.run_id.as_str(),
+                            agent.id
+                        )
+                    })?;
+                if &before_patch_capture != current {
+                    bail!(
+                        "checkpoint '{}' managed worktree record for agent '{}' drifted before exact candidate recapture",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    );
+                }
+                let captured = capture_bound_candidate(
+                    &current.path,
+                    repo_head,
+                    &state,
+                    runtime,
+                )
+                .with_context(|| {
+                    format!(
+                        "checkpoint '{}' completed agent '{}' exact candidate could not be recaptured",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    )
+                })?;
+                if &captured.binding != binding {
+                    bail!(
+                        "checkpoint '{}' completed agent '{}' exact candidate no longer matches its serialized binding",
+                        checkpoint.run_id.as_str(),
+                        agent.id
+                    );
+                }
             }
             AgentRunStatus::Failed | AgentRunStatus::Skipped => {}
+        }
+        let after_validation = manager
+            .get_managed_verified(&recorded.name)
+            .with_context(|| {
+                format!(
+                    "checkpoint '{}' managed worktree binding for agent '{}' changed during resume validation",
+                    checkpoint.run_id.as_str(),
+                    agent.id
+                )
+            })?;
+        if &after_validation != current {
+            bail!(
+                "checkpoint '{}' managed worktree record for agent '{}' drifted during resume validation",
+                checkpoint.run_id.as_str(),
+                agent.id
+            );
         }
         summary.worktree = Some(current.clone());
         summary.worktree_reused = true;
@@ -1423,30 +1612,39 @@ fn acquire_resume_claims(
     store: &SyncStore,
     plan: &OrchestrationPlan,
     summaries: &mut [AgentRunSummary],
-) -> Result<Vec<ClaimToken>> {
+) -> Vec<ClaimToken> {
     let mut tokens = Vec::new();
 
     for (agent, summary) in plan.agents.iter().zip(summaries.iter_mut()) {
-        if let Some(active_claim) = find_active_resume_claim(store, agent, summary.claim.as_ref())?
-        {
-            summary.claim = Some(active_claim.clone());
-            tokens.push(active_claim.token);
-            continue;
-        }
-
-        let claim = store
-            .claim_paths(&agent.id, agent.paths.iter())
-            .with_context(|| {
+        match find_active_resume_claim(store, agent, summary.claim.as_ref()) {
+            Ok(Some(active_claim)) => {
+                summary.claim = Some(active_claim.clone());
+                tokens.push(active_claim.token);
+            }
+            Ok(None) => match store.claim_paths(&agent.id, agent.paths.iter()) {
+                Ok(claim) => {
+                    tokens.push(claim.token);
+                    summary.claim = Some(claim);
+                }
+                Err(error) => fail_summary(
+                    summary,
+                    format!(
+                        "failed to acquire resume claim for agent '{}' on checkpoint paths: {error}",
+                        agent.id
+                    ),
+                ),
+            },
+            Err(error) => fail_summary(
+                summary,
                 format!(
-                    "failed to acquire resume claim for agent '{}' on checkpoint paths",
+                    "failed to validate resume claim for agent '{}' on checkpoint paths: {error}",
                     agent.id
-                )
-            })?;
-        tokens.push(claim.token);
-        summary.claim = Some(claim);
+                ),
+            ),
+        }
     }
 
-    Ok(tokens)
+    tokens
 }
 
 fn find_active_resume_claim(
@@ -1519,12 +1717,15 @@ fn coordinate_semantic_intents(
     summaries: &mut [AgentRunSummary],
     mode: SemanticCoordinationMode,
     acquired_tokens: &mut Vec<SemanticIntentToken>,
-) -> Option<usize> {
+) {
     let mut planned_preview_intents = Vec::new();
     for (index, agent) in plan.agents.iter().enumerate() {
+        if summaries[index].status != AgentRunStatus::Pending {
+            continue;
+        }
         let request = semantic_request_for_agent(agent);
         let report = match mode {
-            SemanticCoordinationMode::Off => return None,
+            SemanticCoordinationMode::Off => return,
             SemanticCoordinationMode::Warn => {
                 store.preview_with_additional_active(request, &planned_preview_intents)
             }
@@ -1537,7 +1738,7 @@ fn coordinate_semantic_intents(
                     &mut summaries[index],
                     format!("semantic coordination failed: {error}"),
                 );
-                return Some(index);
+                continue;
             }
         };
         attach_semantic_report(&mut summaries[index], &report);
@@ -1554,11 +1755,8 @@ fn coordinate_semantic_intents(
                     report.blocking_conflict_count
                 ),
             );
-            return Some(index);
         }
     }
-
-    None
 }
 
 fn semantic_request_for_agent(agent: &AgentPlan) -> SemanticIntentRequest {
@@ -1586,6 +1784,7 @@ struct SummaryParts {
     semantic_coordination: SemanticCoordinationMode,
     summaries: Vec<AgentRunSummary>,
     repo_validation: Vec<ValidationRunSummary>,
+    repo_validation_target: Option<RepoValidationTargetBinding>,
     released_claims: Vec<PathClaim>,
     release_errors: Vec<String>,
     released_semantic_intents: Vec<SemanticIntent>,
@@ -1602,6 +1801,7 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
         semantic_coordination,
         summaries,
         repo_validation,
+        repo_validation_target,
         released_claims,
         release_errors,
         released_semantic_intents,
@@ -1609,6 +1809,7 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
     } = parts;
     let success = release_errors.is_empty()
         && semantic_release_errors.is_empty()
+        && repo_validation_target.is_some()
         && summaries
             .iter()
             .all(|summary| summary.status == AgentRunStatus::Succeeded)
@@ -1626,6 +1827,7 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
         success,
         agents: summaries,
         repo_validation,
+        repo_validation_target,
         released_claims,
         release_errors,
         released_semantic_intents,
@@ -1636,6 +1838,12 @@ fn summary_from_parts(parts: SummaryParts) -> OrchestrationSummary {
 fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
     if raw.agents.is_empty() {
         bail!("orchestration plan must include at least one agent");
+    }
+    if raw.agents.len() > COMBINED_CANDIDATE_MAX_PATCHES {
+        bail!(
+            "orchestration plan exceeds the configured {} agent limit",
+            COMBINED_CANDIDATE_MAX_PATCHES
+        );
     }
     if matches!(raw.default_timeout_seconds, Some(0)) {
         bail!("default timeout must be greater than zero seconds");
@@ -1722,6 +1930,31 @@ fn validate_plan(raw: RawPlan) -> Result<OrchestrationPlan> {
     }
 
     validate_dependencies(&agents, &seen_agents)?;
+    let dependency_edges = agents.iter().try_fold(0_usize, |total, agent| {
+        total
+            .checked_add(agent.depends_on.len())
+            .context("orchestration dependency edge count overflowed")
+    })?;
+    if dependency_edges > PLAN_MAX_DEPENDENCY_EDGES {
+        bail!(
+            "orchestration plan exceeds the configured {} dependency-edge limit",
+            PLAN_MAX_DEPENDENCY_EDGES
+        );
+    }
+    let total_validation_commands =
+        agents
+            .iter()
+            .try_fold(repo_validation_commands.len(), |total, agent| {
+                total
+                    .checked_add(agent.validation_commands.len())
+                    .context("orchestration validation command count overflowed")
+            })?;
+    if total_validation_commands > PLAN_MAX_TOTAL_VALIDATION_COMMANDS {
+        bail!(
+            "orchestration plan exceeds the configured {} total validation-command limit",
+            PLAN_MAX_TOTAL_VALIDATION_COMMANDS
+        );
+    }
 
     Ok(OrchestrationPlan {
         agents,
@@ -1735,6 +1968,12 @@ fn normalize_validation_commands(
     default_timeout_seconds: Option<u64>,
     context_label: &str,
 ) -> Result<Vec<ValidationCommandPlan>> {
+    if raw_commands.len() > PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE {
+        bail!(
+            "{context_label} exceeds the configured {} command limit",
+            PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE
+        );
+    }
     raw_commands
         .into_iter()
         .enumerate()
@@ -2213,28 +2452,32 @@ impl Drop for PatchOutputGuard {
     }
 }
 
-fn run_agent_schedule_with_patch_dir(
-    plan: &OrchestrationPlan,
-    summaries: &mut [AgentRunSummary],
-    worktrees: &[SelectedWorktree],
+struct AgentScheduleContext<'a> {
+    manager: &'a WorktreeManager,
+    plan: &'a OrchestrationPlan,
+    worktrees: &'a [SelectedWorktree],
     jobs: usize,
-    patch_dir: Option<&Path>,
-    base_oid: &Oid,
+    base_oid: &'a Oid,
     runtime: OrchestrationExecutionRuntime,
-) -> Result<()> {
-    let mut patch_outputs = prepare_patch_outputs(patch_dir, plan, summaries, worktrees)?;
+}
+
+fn run_agent_schedule_with_patch_dir(
+    context: &AgentScheduleContext<'_>,
+    summaries: &mut [AgentRunSummary],
+    patch_dir: Option<&Path>,
+) -> Result<Vec<Option<CapturedCandidate>>> {
+    let mut patch_outputs =
+        prepare_patch_outputs(patch_dir, context.plan, summaries, context.worktrees)?;
+    let mut captured_candidates = vec![None; summaries.len()];
     let schedule_result = run_agent_schedule(
-        plan,
+        context,
         summaries,
-        worktrees,
-        jobs,
         &mut patch_outputs,
-        base_oid,
-        runtime,
+        &mut captured_candidates,
     );
     let cleanup_result = cleanup_unused_patch_outputs(patch_outputs);
     match (schedule_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => Ok(captured_candidates),
         (Err(schedule), Ok(())) => Err(schedule),
         (Ok(()), Err(cleanup)) => Err(cleanup),
         (Err(schedule), Err(cleanup)) => Err(schedule.context(format!(
@@ -2244,118 +2487,398 @@ fn run_agent_schedule_with_patch_dir(
 }
 
 fn run_agent_schedule(
-    plan: &OrchestrationPlan,
+    context: &AgentScheduleContext<'_>,
     summaries: &mut [AgentRunSummary],
-    worktrees: &[SelectedWorktree],
-    jobs: usize,
     patch_outputs: &mut [Option<ReservedOutputFile>],
-    base_oid: &Oid,
-    runtime: OrchestrationExecutionRuntime,
+    captured_candidates: &mut [Option<CapturedCandidate>],
 ) -> Result<()> {
-    if worktrees.len() != summaries.len() || worktrees.len() != plan.agents.len() {
+    if context.worktrees.len() != summaries.len()
+        || context.worktrees.len() != context.plan.agents.len()
+        || captured_candidates.len() != summaries.len()
+    {
         bail!("selected worktree lease set does not match the orchestration plan");
     }
-    for (index, worktree) in worktrees.iter().enumerate() {
-        if worktree.record().name != plan.agents[index].id
+    for (index, worktree) in context.worktrees.iter().enumerate() {
+        if worktree.record().name != context.plan.agents[index].id
             || summaries[index].worktree.as_ref() != Some(worktree.record())
         {
             bail!(
                 "selected worktree lease for agent '{}' does not match its run summary",
-                plan.agents[index].id
+                context.plan.agents[index].id
             );
         }
     }
-    let jobs = jobs.max(1);
+    let jobs = context.jobs.max(1);
     let mut remaining = summaries
         .iter()
         .enumerate()
         .filter(|(_, summary)| summary.status == AgentRunStatus::Pending)
         .map(|(index, _)| index)
         .collect::<BTreeSet<_>>();
-    let mut succeeded = summaries
-        .iter()
-        .filter(|summary| summary.status == AgentRunStatus::Succeeded)
-        .map(|summary| summary.id.clone())
-        .collect::<BTreeSet<_>>();
 
-    if let Some(failed_id) = summaries
-        .iter()
-        .find(|summary| summary.status == AgentRunStatus::Failed)
-        .map(|summary| summary.id.clone())
-    {
-        for index in remaining {
-            summaries[index].status = AgentRunStatus::Skipped;
-            summaries[index].error = Some(format!("skipped because agent '{}' failed", failed_id));
+    for index in 0..summaries.len() {
+        if summaries[index].status != AgentRunStatus::Succeeded {
+            continue;
         }
-        return Ok(());
+        let expected = capture_selected_candidate_state(
+            context.manager,
+            &context.plan.agents[index],
+            &summaries[index],
+            &context.worktrees[index],
+            context.base_oid,
+            context.runtime,
+        )
+        .with_context(|| {
+            format!(
+                "failed to recapture completed candidate for agent '{}'",
+                summaries[index].id
+            )
+        })?;
+        let binding = summaries[index]
+            .candidate_binding
+            .as_ref()
+            .with_context(|| {
+                format!(
+                    "completed agent '{}' is missing its candidate binding",
+                    summaries[index].id
+                )
+            })?;
+        ensure_candidate_binding_matches_state(binding, &expected)?;
+        let captured = capture_selected_bound_candidate(
+            context.manager,
+            &context.plan.agents[index],
+            &summaries[index],
+            &context.worktrees[index],
+            context.base_oid,
+            &expected,
+            context.runtime,
+        )?;
+        if &captured.binding != binding {
+            bail!(
+                "completed agent '{}' candidate patch no longer matches its checkpoint binding",
+                summaries[index].id
+            );
+        }
+        captured_candidates[index] = Some(captured);
     }
 
     while !remaining.is_empty() {
-        let ready = remaining
-            .iter()
-            .copied()
-            .filter(|index| {
-                plan.agents[*index]
-                    .depends_on
-                    .iter()
-                    .all(|dependency| succeeded.contains(dependency))
-            })
-            .take(jobs)
-            .collect::<Vec<_>>();
+        propagate_dependency_failures(context.plan, summaries, &mut remaining);
+        if remaining.is_empty() {
+            break;
+        }
+
+        let ready = ready_agent_indices(context.plan, summaries, &remaining, jobs);
 
         if ready.is_empty() {
-            for index in remaining {
+            for index in std::mem::take(&mut remaining) {
+                let unresolved = dependency_statuses(context.plan, summaries, index)
+                    .into_iter()
+                    .filter(|(_, status)| *status != AgentRunStatus::Succeeded)
+                    .map(|(dependency, status)| {
+                        format!("'{dependency}' ({})", agent_status_label(status))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 summaries[index].status = AgentRunStatus::Skipped;
-                summaries[index].error =
-                    Some("skipped because dependencies could not be satisfied".to_string());
+                summaries[index].error = Some(format!(
+                    "skipped because the scheduler could not resolve dependencies: {unresolved}"
+                ));
             }
             break;
         }
 
-        let outcomes = run_ready_agents(plan, summaries, worktrees, &ready, runtime)?;
-        let mut failed_agent = None;
+        let outcomes = run_ready_agents(
+            context.manager,
+            context.plan,
+            summaries,
+            context.worktrees,
+            &ready,
+            context.runtime,
+        )?;
 
         for (index, run_result) in outcomes {
             apply_command_result(&mut summaries[index], run_result);
+            let expected_state = capture_selected_candidate_state(
+                context.manager,
+                &context.plan.agents[index],
+                &summaries[index],
+                &context.worktrees[index],
+                context.base_oid,
+                context.runtime,
+            );
+            let expected_state = match expected_state {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    #[cfg(test)]
+                    notify_candidate_boundary_failure(&context.plan.agents[index].id);
+                    fail_summary(
+                        &mut summaries[index],
+                        format!("failed to bind candidate before validation: {error}"),
+                    );
+                    None
+                }
+            };
+            let mut state_intact = expected_state.is_some();
             if summaries[index].status == AgentRunStatus::Succeeded {
-                run_agent_validation_commands(
-                    &plan.agents[index],
+                if let Some(expected_state) = expected_state.as_ref() {
+                    state_intact = run_agent_validation_commands(
+                        &context.plan.agents[index],
+                        &mut summaries[index],
+                        &context.worktrees[index],
+                        context.manager,
+                        expected_state,
+                        context.base_oid,
+                        context.runtime,
+                    );
+                }
+            }
+            let patch_output = patch_outputs[index].take();
+            let captured = if state_intact {
+                expected_state.as_ref().and_then(|expected_state| {
+                    match capture_selected_bound_candidate(
+                        context.manager,
+                        &context.plan.agents[index],
+                        &summaries[index],
+                        &context.worktrees[index],
+                        context.base_oid,
+                        expected_state,
+                        context.runtime,
+                    ) {
+                        Ok(captured) => Some(captured),
+                        Err(error) => {
+                            fail_summary(
+                                &mut summaries[index],
+                                format!("failed to finalize bound candidate: {error}"),
+                            );
+                            None
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(captured) = captured {
+                summaries[index].candidate_binding = Some(captured.binding.clone());
+                inspect_captured_agent_changes(
+                    &context.plan.agents[index],
                     &mut summaries[index],
-                    &worktrees[index],
-                    runtime,
+                    &captured,
+                    patch_output,
+                );
+                if summaries[index].status == AgentRunStatus::Succeeded {
+                    captured_candidates[index] = Some(captured);
+                }
+            } else {
+                inspect_agent_paths_without_patch(
+                    &context.plan.agents[index],
+                    &mut summaries[index],
+                    context.manager,
+                    &context.worktrees[index],
+                    context.base_oid,
+                    patch_output,
                 );
             }
-            inspect_agent_changes(
-                &plan.agents[index],
-                &mut summaries[index],
-                &worktrees[index],
-                patch_outputs[index].take(),
-                base_oid,
-                runtime,
-            );
             remaining.remove(&index);
-
-            if summaries[index].status == AgentRunStatus::Succeeded {
-                succeeded.insert(summaries[index].id.clone());
-            } else if failed_agent.is_none() {
-                failed_agent = Some(summaries[index].id.clone());
-            }
-        }
-
-        if let Some(failed_agent) = failed_agent {
-            for index in remaining {
-                summaries[index].status = AgentRunStatus::Skipped;
-                summaries[index].error =
-                    Some(format!("skipped because agent '{failed_agent}' failed"));
-            }
-            break;
         }
     }
 
     Ok(())
 }
 
+fn verify_selected_worktree_binding(
+    manager: &WorktreeManager,
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+) -> Result<()> {
+    let recorded = summary
+        .worktree
+        .as_ref()
+        .with_context(|| format!("agent '{}' has no selected worktree binding", agent.id))?;
+    if recorded != worktree.record() || worktree.record().name != agent.id {
+        bail!(
+            "agent '{}' selected worktree does not match its held write lease",
+            agent.id
+        );
+    }
+    let verified = manager
+        .get_managed_verified(&agent.id)
+        .with_context(|| format!("agent '{}' managed worktree binding is invalid", agent.id))?;
+    if &verified != worktree.record() {
+        bail!(
+            "agent '{}' managed worktree record or Git backlink changed while its write lease was held",
+            agent.id
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn install_candidate_boundary_failure_hook(
+    agent_id: &str,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let hook = CANDIDATE_BOUNDARY_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        slot.is_none(),
+        "candidate boundary failure hook already installed"
+    );
+    *slot = Some(CandidateBoundaryFailureHook {
+        agent_id: agent_id.to_string(),
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn notify_candidate_boundary_failure(agent_id: &str) {
+    let hook = CANDIDATE_BOUNDARY_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let selected = {
+        let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.take() {
+            Some(hook) if hook.agent_id == agent_id => Some(hook),
+            Some(other) => {
+                *slot = Some(other);
+                None
+            }
+            None => None,
+        }
+    };
+    if let Some(selected) = selected {
+        let _ = selected.reached.send(());
+        let _ = selected.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+fn capture_selected_candidate_state(
+    manager: &WorktreeManager,
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CandidateStateSnapshot> {
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    let state = capture_consistent_candidate_state(worktree.path(), base_oid, runtime)?;
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    Ok(state)
+}
+
+fn capture_selected_bound_candidate(
+    manager: &WorktreeManager,
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
+    base_oid: &Oid,
+    expected_state: &CandidateStateSnapshot,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CapturedCandidate> {
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    let captured = capture_bound_candidate(worktree.path(), base_oid, expected_state, runtime)?;
+    verify_selected_worktree_binding(manager, agent, summary, worktree)?;
+    Ok(captured)
+}
+
+fn propagate_dependency_failures(
+    plan: &OrchestrationPlan,
+    summaries: &mut [AgentRunSummary],
+    remaining: &mut BTreeSet<usize>,
+) {
+    loop {
+        let blocked = remaining
+            .iter()
+            .copied()
+            .filter_map(|index| {
+                let blockers = dependency_statuses(plan, summaries, index)
+                    .into_iter()
+                    .filter(|(_, status)| {
+                        matches!(status, AgentRunStatus::Failed | AgentRunStatus::Skipped)
+                    })
+                    .collect::<Vec<_>>();
+                (!blockers.is_empty()).then_some((index, blockers))
+            })
+            .collect::<Vec<_>>();
+        if blocked.is_empty() {
+            return;
+        }
+
+        for (index, blockers) in blocked {
+            let detail = blockers
+                .into_iter()
+                .map(|(dependency, status)| {
+                    format!("'{dependency}' ({})", agent_status_label(status))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            summaries[index].status = AgentRunStatus::Skipped;
+            summaries[index].error = Some(format!(
+                "skipped because dependencies did not succeed: {detail}"
+            ));
+            remaining.remove(&index);
+        }
+    }
+}
+
+fn ready_agent_indices(
+    plan: &OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+    remaining: &BTreeSet<usize>,
+    jobs: usize,
+) -> Vec<usize> {
+    remaining
+        .iter()
+        .copied()
+        .filter(|index| {
+            plan.agents[*index].depends_on.iter().all(|dependency| {
+                summary_status_by_id(summaries, dependency) == Some(AgentRunStatus::Succeeded)
+            })
+        })
+        .take(jobs.max(1))
+        .collect()
+}
+
+fn dependency_statuses<'a>(
+    plan: &'a OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+    index: usize,
+) -> Vec<(&'a str, AgentRunStatus)> {
+    plan.agents[index]
+        .depends_on
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.as_str(),
+                summary_status_by_id(summaries, dependency).unwrap_or(AgentRunStatus::Pending),
+            )
+        })
+        .collect()
+}
+
+fn summary_status_by_id(summaries: &[AgentRunSummary], agent_id: &str) -> Option<AgentRunStatus> {
+    summaries
+        .iter()
+        .find(|summary| summary.id == agent_id)
+        .map(|summary| summary.status)
+}
+
+fn agent_status_label(status: AgentRunStatus) -> &'static str {
+    match status {
+        AgentRunStatus::Pending => "pending",
+        AgentRunStatus::Succeeded => "succeeded",
+        AgentRunStatus::Failed => "failed",
+        AgentRunStatus::Skipped => "skipped",
+    }
+}
+
 fn run_ready_agents(
+    manager: &WorktreeManager,
     plan: &OrchestrationPlan,
     summaries: &[AgentRunSummary],
     worktrees: &[SelectedWorktree],
@@ -2364,6 +2887,12 @@ fn run_ready_agents(
 ) -> Result<Vec<(usize, Result<CommandRunResult, ProcessRunError>)>> {
     if ready.len() == 1 {
         let index = ready[0];
+        verify_selected_worktree_binding(
+            manager,
+            &plan.agents[index],
+            &summaries[index],
+            &worktrees[index],
+        )?;
         let spec = command_spec(
             &plan.agents[index],
             &summaries[index],
@@ -2375,6 +2904,12 @@ fn run_ready_agents(
 
     let mut handles = Vec::with_capacity(ready.len());
     for index in ready {
+        verify_selected_worktree_binding(
+            manager,
+            &plan.agents[*index],
+            &summaries[*index],
+            &worktrees[*index],
+        )?;
         let spec = command_spec(
             &plan.agents[*index],
             &summaries[*index],
@@ -2410,61 +2945,20 @@ fn run_ready_agents(
     Ok(outcomes)
 }
 
-fn inspect_agent_changes(
+fn inspect_captured_agent_changes(
     agent: &AgentPlan,
     summary: &mut AgentRunSummary,
-    worktree: &SelectedWorktree,
+    captured: &CapturedCandidate,
     patch_output: Option<ReservedOutputFile>,
-    base_oid: &Oid,
-    runtime: OrchestrationExecutionRuntime,
-) {
-    inspect_agent_changes_at_path(
-        agent,
-        summary,
-        worktree.path(),
-        patch_output,
-        base_oid,
-        runtime,
-    );
-}
-
-fn inspect_agent_changes_at_path(
-    agent: &AgentPlan,
-    summary: &mut AgentRunSummary,
-    worktree_path: &Path,
-    patch_output: Option<ReservedOutputFile>,
-    base_oid: &Oid,
-    runtime: OrchestrationExecutionRuntime,
 ) {
     let mut patch_output = patch_output.map(PatchOutputGuard::new);
     if summary.worktree.is_none() {
         fail_summary(summary, "agent has no selected worktree");
         return;
     }
-    let worktree_path = worktree_path.to_path_buf();
-
-    let repo = match Repository::open(&worktree_path) {
-        Ok(repo) => repo,
-        Err(error) => {
-            fail_summary(
-                summary,
-                format!(
-                    "failed to inspect worktree changes at {}: {error}",
-                    worktree_path.display()
-                ),
-            );
-            return;
-        }
-    };
-
-    let changed_paths = match collect_paths_changed_since_base(&repo, base_oid) {
-        Ok(paths) => paths,
-        Err(error) => {
-            fail_summary(summary, format!("failed to collect changed paths: {error}"));
-            return;
-        }
-    };
-    let unclaimed_changed_paths = changed_paths
+    summary.changed_paths = captured.binding.changed_paths.clone();
+    summary.unclaimed_changed_paths = summary
+        .changed_paths
         .iter()
         .filter(|path| {
             !agent
@@ -2474,9 +2968,6 @@ fn inspect_agent_changes_at_path(
         })
         .cloned()
         .collect::<Vec<_>>();
-
-    summary.changed_paths = changed_paths;
-    summary.unclaimed_changed_paths = unclaimed_changed_paths;
 
     if !summary.unclaimed_changed_paths.is_empty() {
         let paths = summary
@@ -2492,12 +2983,69 @@ fn inspect_agent_changes_at_path(
     }
 
     if let Some(patch_output) = patch_output.as_mut().and_then(PatchOutputGuard::take) {
-        match write_agent_patch(&worktree_path, patch_output, base_oid, runtime) {
+        match write_captured_agent_patch(patch_output, &captured.patch) {
             Ok(Some(path)) => summary.patch_path = Some(path),
             Ok(None) => {}
             Err(error) => fail_summary(summary, format!("failed to write patch: {error}")),
         }
     }
+}
+
+fn inspect_agent_paths_without_patch(
+    agent: &AgentPlan,
+    summary: &mut AgentRunSummary,
+    manager: &WorktreeManager,
+    worktree: &SelectedWorktree,
+    base_oid: &Oid,
+    patch_output: Option<ReservedOutputFile>,
+) {
+    let _patch_output = patch_output.map(PatchOutputGuard::new);
+    if let Err(error) = verify_selected_worktree_binding(manager, agent, summary, worktree) {
+        fail_summary(
+            summary,
+            format!("refusing rejected-candidate inspection: {error}"),
+        );
+        return;
+    }
+    let repo = match Repository::open(worktree.path()) {
+        Ok(repo) => repo,
+        Err(error) => {
+            fail_summary(
+                summary,
+                format!("failed to inspect rejected candidate: {error}"),
+            );
+            return;
+        }
+    };
+    let changed_paths = match collect_paths_changed_since_base(&repo, base_oid) {
+        Ok(paths) => paths,
+        Err(error) => {
+            fail_summary(
+                summary,
+                format!("failed to collect rejected candidate paths: {error}"),
+            );
+            return;
+        }
+    };
+    if let Err(error) = verify_selected_worktree_binding(manager, agent, summary, worktree) {
+        fail_summary(
+            summary,
+            format!("rejected candidate binding changed during inspection: {error}"),
+        );
+        return;
+    }
+    summary.changed_paths = changed_paths;
+    summary.unclaimed_changed_paths = summary
+        .changed_paths
+        .iter()
+        .filter(|path| {
+            !agent
+                .paths
+                .iter()
+                .any(|claim| path_is_covered_by_claim(path, claim))
+        })
+        .cloned()
+        .collect();
 }
 
 fn fail_summary(summary: &mut AgentRunSummary, message: impl Into<String>) {
@@ -2574,6 +3122,476 @@ fn collect_delta_paths(delta: git2::DiffDelta<'_>, paths: &mut BTreeSet<PathBuf>
     }
 }
 
+fn capture_consistent_candidate_state(
+    worktree_path: &Path,
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CandidateStateSnapshot> {
+    for _ in 0..CANDIDATE_CAPTURE_ATTEMPTS {
+        let first = capture_candidate_state_once(worktree_path, base_oid, runtime)?;
+        let second = capture_candidate_state_once(worktree_path, base_oid, runtime)?;
+        if first == second {
+            return Ok(second);
+        }
+    }
+    bail!(
+        "candidate state changed while its validation binding was captured; retry after worktree activity stops"
+    )
+}
+
+fn capture_candidate_state_once(
+    worktree_path: &Path,
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CandidateStateSnapshot> {
+    let repo = Repository::open(worktree_path).context("failed to open candidate worktree")?;
+    let head_oid = head_oid(&repo).context("failed to capture candidate HEAD")?;
+    let merge_base = repo
+        .merge_base(*base_oid, head_oid)
+        .context("failed to verify candidate ancestry from the captured run base")?;
+    if merge_base != *base_oid {
+        bail!("candidate HEAD no longer descends from the captured run base");
+    }
+    let base = base_oid.to_string();
+    let index_entries = capture_fixed_git_stdout(
+        worktree_path,
+        ["ls-files", "--stage", "-z"],
+        runtime,
+        "candidate index entries",
+    )?;
+    let index_flags = capture_fixed_git_stdout(
+        worktree_path,
+        ["ls-files", "-v", "-z"],
+        runtime,
+        "candidate index flags",
+    )?;
+    let index_diff = capture_fixed_git_stdout(
+        worktree_path,
+        [
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            base.as_str(),
+        ],
+        runtime,
+        "candidate index diff",
+    )?;
+    let worktree_diff = capture_fixed_git_stdout(
+        worktree_path,
+        ["diff", "--no-ext-diff", "--no-textconv", "--binary"],
+        runtime,
+        "candidate worktree diff",
+    )?;
+    let status = capture_candidate_status(&repo)?;
+    let untracked = capture_untracked_manifest(worktree_path, runtime)?;
+    let changed_paths = collect_paths_changed_since_base(&repo, base_oid)?
+        .into_iter()
+        .map(|path| normalize_repo_relative_path(&path).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    if changed_paths.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "candidate changed-path count exceeded the configured {} entry limit",
+            CANDIDATE_MAX_CHANGED_PATHS
+        );
+    }
+
+    Ok(CandidateStateSnapshot {
+        base_oid: *base_oid,
+        head_oid,
+        index_entries_oid: hash_candidate_component(&index_entries)?,
+        index_flags_oid: hash_candidate_component(&index_flags)?,
+        index_diff_oid: hash_candidate_component(&index_diff)?,
+        worktree_diff_oid: hash_candidate_component(&worktree_diff)?,
+        status_oid: hash_candidate_component(&status)?,
+        untracked_oid: hash_candidate_component(&untracked)?,
+        changed_paths,
+    })
+}
+
+fn capture_fixed_git_stdout(
+    worktree_path: &Path,
+    args: impl IntoIterator<Item = impl Into<OsString>>,
+    runtime: OrchestrationExecutionRuntime,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let output = run_fixed_git(worktree_path, args, WorkspaceAccess::ReadOnly, runtime)
+        .with_context(|| format!("failed to capture {label}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to capture {label}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn capture_candidate_status(repo: &Repository) -> Result<Vec<u8>> {
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true)
+        .include_unmodified(false);
+    let statuses = repo
+        .statuses(Some(&mut options))
+        .context("failed to capture candidate status")?;
+    if statuses.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "candidate status exceeded the configured {} entry limit",
+            CANDIDATE_MAX_CHANGED_PATHS
+        );
+    }
+    let mut records = statuses
+        .iter()
+        .map(|entry| (entry.path_bytes().to_vec(), entry.status().bits()))
+        .collect::<Vec<_>>();
+    records.sort();
+    let mut encoded = Vec::new();
+    for (path, status) in records {
+        extend_bounded_candidate_bytes(&mut encoded, &status.to_le_bytes())?;
+        extend_bounded_candidate_bytes(&mut encoded, &(path.len() as u64).to_le_bytes())?;
+        extend_bounded_candidate_bytes(&mut encoded, &path)?;
+    }
+    Ok(encoded)
+}
+
+fn capture_untracked_manifest(
+    worktree_path: &Path,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<Vec<u8>> {
+    let output = capture_fixed_git_stdout(
+        worktree_path,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        runtime,
+        "candidate untracked paths",
+    )?;
+    let paths = output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    if paths.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "candidate untracked-path count exceeded the configured {} entry limit",
+            CANDIDATE_MAX_CHANGED_PATHS
+        );
+    }
+
+    let mut manifest = Vec::new();
+    let mut total_content_bytes = 0_usize;
+    for raw_path in paths {
+        let path = normalize_repo_relative_path(Path::new(&git_path_argument(raw_path)?))?;
+        let absolute = worktree_path.join(&path);
+        let metadata = fs::symlink_metadata(&absolute).with_context(|| {
+            format!(
+                "failed to inspect untracked candidate path {}",
+                path.display()
+            )
+        })?;
+        let (kind, content) = if metadata.file_type().is_file() {
+            let bytes = BoundedRegularReader::read_relative(
+                worktree_path,
+                &path,
+                CANDIDATE_MAX_SINGLE_FILE_BYTES as u64,
+            )?;
+            (b'f', bytes)
+        } else if metadata.file_type().is_symlink() {
+            (b'l', read_candidate_symlink(&absolute, &metadata)?)
+        } else {
+            bail!(
+                "candidate untracked path is not a regular file or symlink: {}",
+                path.display()
+            );
+        };
+        if content.len() > CANDIDATE_MAX_SINGLE_FILE_BYTES {
+            bail!(
+                "candidate path '{}' exceeded the configured {} byte per-file limit",
+                path.display(),
+                CANDIDATE_MAX_SINGLE_FILE_BYTES
+            );
+        }
+        total_content_bytes = total_content_bytes
+            .checked_add(content.len())
+            .context("candidate content byte count overflowed")?;
+        if total_content_bytes > CANDIDATE_MAX_TOTAL_BYTES {
+            bail!(
+                "candidate untracked content exceeded the configured {} byte aggregate limit",
+                CANDIDATE_MAX_TOTAL_BYTES
+            );
+        }
+        let path_bytes = candidate_path_bytes(&path);
+        let content_oid = hash_candidate_component(&content)?;
+        extend_bounded_candidate_bytes(&mut manifest, &(path_bytes.len() as u64).to_le_bytes())?;
+        extend_bounded_candidate_bytes(&mut manifest, &path_bytes)?;
+        extend_bounded_candidate_bytes(&mut manifest, &[kind])?;
+        extend_bounded_candidate_bytes(&mut manifest, &(content.len() as u64).to_le_bytes())?;
+        extend_bounded_candidate_bytes(&mut manifest, content_oid.as_bytes())?;
+    }
+    Ok(manifest)
+}
+
+fn read_candidate_symlink(path: &Path, before: &fs::Metadata) -> Result<Vec<u8>> {
+    let target = fs::read_link(path)
+        .with_context(|| format!("failed to read candidate symlink {}", path.display()))?;
+    let after = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to recheck candidate symlink {}", path.display()))?;
+    if !same_candidate_file_identity(before, &after) || !after.file_type().is_symlink() {
+        bail!("candidate symlink changed while it was captured");
+    }
+    Ok(candidate_path_bytes(&target))
+}
+
+#[cfg(unix)]
+fn same_candidate_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.mode() == right.mode()
+        && left.len() == right.len()
+}
+
+#[cfg(not(unix))]
+fn same_candidate_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type() && left.len() == right.len()
+}
+
+#[cfg(unix)]
+fn candidate_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn candidate_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn candidate_path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
+fn extend_bounded_candidate_bytes(target: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let next = target
+        .len()
+        .checked_add(bytes.len())
+        .context("candidate binding byte count overflowed")?;
+    if next > CANDIDATE_MAX_TOTAL_BYTES {
+        bail!(
+            "candidate binding exceeded the configured {} byte limit",
+            CANDIDATE_MAX_TOTAL_BYTES
+        );
+    }
+    target.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn hash_candidate_component(bytes: &[u8]) -> Result<Oid> {
+    Oid::hash_object(git2::ObjectType::Blob, bytes)
+        .context("failed to hash candidate binding component")
+}
+
+impl CandidateStateSnapshot {
+    fn state_oid(&self) -> Result<Oid> {
+        let mut binding = Vec::new();
+        extend_bounded_candidate_bytes(&mut binding, b"MACO\0candidate-state\0v1\0")?;
+        for oid in [
+            self.base_oid,
+            self.head_oid,
+            self.index_entries_oid,
+            self.index_flags_oid,
+            self.index_diff_oid,
+            self.worktree_diff_oid,
+            self.status_oid,
+            self.untracked_oid,
+        ] {
+            extend_bounded_candidate_bytes(&mut binding, oid.as_bytes())?;
+        }
+        for path in &self.changed_paths {
+            let bytes = candidate_path_bytes(path);
+            extend_bounded_candidate_bytes(&mut binding, &(bytes.len() as u64).to_le_bytes())?;
+            extend_bounded_candidate_bytes(&mut binding, &bytes)?;
+        }
+        hash_candidate_component(&binding)
+    }
+
+    fn drift_from(&self, previous: &Self) -> Option<String> {
+        let mut components = Vec::new();
+        if self.head_oid != previous.head_oid {
+            components.push("HEAD");
+        }
+        if self.index_entries_oid != previous.index_entries_oid
+            || self.index_flags_oid != previous.index_flags_oid
+            || self.index_diff_oid != previous.index_diff_oid
+        {
+            components.push("index");
+        }
+        if self.worktree_diff_oid != previous.worktree_diff_oid {
+            components.push("tracked worktree content");
+        }
+        if self.untracked_oid != previous.untracked_oid {
+            components.push("untracked content");
+        }
+        if self.status_oid != previous.status_oid || self.changed_paths != previous.changed_paths {
+            components.push("changed paths/status");
+        }
+        (!components.is_empty()).then(|| {
+            let before = previous
+                .changed_paths
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let after = self.changed_paths.iter().cloned().collect::<BTreeSet<_>>();
+            let path_detail = before
+                .symmetric_difference(&after)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            let path_detail = if path_detail.is_empty() {
+                String::new()
+            } else {
+                format!("; affected paths: {}", path_detail.join(", "))
+            };
+            format!(
+                "candidate-relevant state changed after the agent command: {}{path_detail}",
+                components.join(", ")
+            )
+        })
+    }
+}
+
+fn capture_bound_candidate(
+    worktree_path: &Path,
+    base_oid: &Oid,
+    expected_state: &CandidateStateSnapshot,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CapturedCandidate> {
+    let before = capture_consistent_candidate_state(worktree_path, base_oid, runtime)?;
+    if let Some(drift) = before.drift_from(expected_state) {
+        bail!("{drift}");
+    }
+    let repo = Repository::open(worktree_path).context("failed to open candidate worktree")?;
+    let (changed_paths, patch) = match runtime {
+        OrchestrationExecutionRuntime::Verified => {
+            capture_worktree_diff_from_commit(&repo, worktree_path, *base_oid)
+                .context("failed to capture the exact bounded candidate patch")?
+        }
+        #[cfg(test)]
+        OrchestrationExecutionRuntime::NonpublishableSimulation => {
+            capture_simulation_candidate_patch(&repo, worktree_path, base_oid, runtime)?
+        }
+    };
+    validate_patch_output_size(patch.len())?;
+    let changed_paths = changed_paths
+        .into_iter()
+        .map(|path| normalize_repo_relative_path(&path).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    if changed_paths != before.changed_paths {
+        bail!("candidate patch paths did not match the bound candidate state");
+    }
+    let after = capture_consistent_candidate_state(worktree_path, base_oid, runtime)?;
+    if let Some(drift) = after.drift_from(&before) {
+        bail!("candidate changed while its exact patch was captured: {drift}");
+    }
+    let patch_bytes = u64::try_from(patch.len()).context("candidate patch length overflowed")?;
+    let binding = AgentCandidateBinding {
+        version: CANDIDATE_BINDING_VERSION,
+        base_oid: base_oid.to_string(),
+        head_oid: before.head_oid.to_string(),
+        state_oid: before.state_oid()?.to_string(),
+        diff_oid: hash_candidate_component(&patch)?.to_string(),
+        changed_paths: before.changed_paths.clone(),
+        patch_bytes,
+    };
+    Ok(CapturedCandidate { binding, patch })
+}
+
+#[cfg(test)]
+fn capture_simulation_candidate_patch(
+    repo: &Repository,
+    worktree_path: &Path,
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<(Vec<PathBuf>, Vec<u8>)> {
+    let base = base_oid.to_string();
+    let mut patch = capture_fixed_git_stdout(
+        worktree_path,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            base.as_str(),
+        ],
+        runtime,
+        "simulation candidate tracked patch",
+    )?;
+    let untracked = capture_fixed_git_stdout(
+        worktree_path,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        runtime,
+        "simulation candidate untracked paths",
+    )?;
+    for raw_path in untracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = normalize_repo_relative_path(Path::new(&git_path_argument(raw_path)?))?;
+        let _ = BoundedRegularReader::read_relative(
+            worktree_path,
+            &path,
+            CANDIDATE_MAX_SINGLE_FILE_BYTES as u64,
+        )?;
+        let output = run_fixed_git(
+            worktree_path,
+            vec![
+                OsString::from("diff"),
+                OsString::from("--no-index"),
+                OsString::from("--no-ext-diff"),
+                OsString::from("--no-textconv"),
+                OsString::from("--binary"),
+                OsString::from("--"),
+                OsString::from(git_null_device()),
+                path.as_os_str().to_os_string(),
+            ],
+            WorkspaceAccess::ReadOnly,
+            runtime,
+        )
+        .context("failed to capture simulation untracked patch")?;
+        if output.status.code() != Some(1) && !output.status.success() {
+            bail!("simulation untracked patch capture failed");
+        }
+        extend_bounded_candidate_bytes(&mut patch, &output.stdout)?;
+    }
+    let changed_paths = collect_paths_changed_since_base(repo, base_oid)?;
+    Ok((changed_paths, patch))
+}
+
+fn ensure_candidate_binding_matches_state(
+    binding: &AgentCandidateBinding,
+    state: &CandidateStateSnapshot,
+) -> Result<()> {
+    if binding.version != CANDIDATE_BINDING_VERSION {
+        bail!(
+            "unsupported candidate binding version {}; start a new run",
+            binding.version
+        );
+    }
+    if binding.base_oid != state.base_oid.to_string()
+        || binding.head_oid != state.head_oid.to_string()
+        || binding.state_oid != state.state_oid()?.to_string()
+        || binding.changed_paths != state.changed_paths
+    {
+        bail!("candidate state no longer matches its serialized validation binding");
+    }
+    Ok(())
+}
+
 fn insert_delta_path(path: Option<&Path>, paths: &mut BTreeSet<PathBuf>) {
     if let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) {
         paths.insert(path.to_path_buf());
@@ -2584,76 +3602,37 @@ fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
     path == claim || path.starts_with(claim)
 }
 
-fn write_agent_patch(
-    worktree_path: &Path,
+fn write_captured_agent_patch(
     mut patch_output: ReservedOutputFile,
-    base_oid: &Oid,
-    runtime: OrchestrationExecutionRuntime,
+    bytes: &[u8],
 ) -> Result<Option<PathBuf>> {
-    let result = (|| -> Result<Option<Vec<u8>>> {
-        mark_untracked_intent_to_add(worktree_path, runtime)?;
-        let output = run_fixed_git(
-            worktree_path,
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--binary",
-                &base_oid.to_string(),
-            ],
-            WorkspaceAccess::ReadOnly,
-            runtime,
-        )
-        .with_context(|| format!("failed to run git diff in {}", worktree_path.display()))?;
-        if !output.status.success() {
-            bail!(
-                "git diff failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok((!output.stdout.is_empty()).then_some(output.stdout))
-    })();
-    match result {
-        Ok(Some(bytes)) => {
-            if let Err(error) = validate_patch_output_size(bytes.len()) {
-                let patch_path = patch_output.path().to_path_buf();
-                let cleanup = patch_output.remove();
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(error.context(format!(
-                        "also failed to clean reserved patch {}: {cleanup:#}",
-                        patch_path.display()
-                    ))),
-                };
-            }
-            let patch_path = patch_output.path().to_path_buf();
-            if let Err(error) = patch_output.write_bytes_atomic(&bytes, PATCH_OUTPUT_MAX_BYTES) {
-                let cleanup = patch_output.remove();
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(error.context(format!(
-                        "also failed to clean reserved patch {}: {cleanup:#}",
-                        patch_path.display()
-                    ))),
-                };
-            }
-            Ok(Some(patch_path))
-        }
-        Ok(None) => {
-            patch_output.remove()?;
-            Ok(None)
-        }
-        Err(error) => {
-            let patch_path = patch_output.path().to_path_buf();
-            match patch_output.remove() {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(error.context(format!(
-                    "also failed to clean reserved patch {}: {cleanup:#}",
-                    patch_path.display()
-                ))),
-            }
-        }
+    if bytes.is_empty() {
+        patch_output.remove()?;
+        return Ok(None);
     }
+    if let Err(error) = validate_patch_output_size(bytes.len()) {
+        let patch_path = patch_output.path().to_path_buf();
+        let cleanup = patch_output.remove();
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "also failed to clean reserved patch {}: {cleanup:#}",
+                patch_path.display()
+            ))),
+        };
+    }
+    let patch_path = patch_output.path().to_path_buf();
+    if let Err(error) = patch_output.write_bytes_atomic(bytes, PATCH_OUTPUT_MAX_BYTES) {
+        let cleanup = patch_output.remove();
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "also failed to clean reserved patch {}: {cleanup:#}",
+                patch_path.display()
+            ))),
+        };
+    }
+    Ok(Some(patch_path))
 }
 
 fn validate_patch_output_size(bytes: usize) -> Result<()> {
@@ -2663,69 +3642,6 @@ fn validate_patch_output_size(bytes: usize) -> Result<()> {
             PATCH_OUTPUT_MAX_BYTES
         );
     }
-    Ok(())
-}
-
-fn mark_untracked_intent_to_add(
-    worktree_path: &Path,
-    runtime: OrchestrationExecutionRuntime,
-) -> Result<()> {
-    let output = run_fixed_git(
-        worktree_path,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-        WorkspaceAccess::ReadOnly,
-        runtime,
-    )
-    .with_context(|| {
-        format!(
-            "failed to list untracked files in {}",
-            worktree_path.display()
-        )
-    })?;
-    if !output.status.success() {
-        bail!(
-            "git ls-files failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let paths = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        return Ok(());
-    }
-
-    let mut arguments = vec![
-        OsString::from("add"),
-        OsString::from("-N"),
-        OsString::from("--"),
-    ];
-    for path in paths {
-        arguments.push(git_path_argument(path)?);
-    }
-
-    let output = run_fixed_git(
-        worktree_path,
-        arguments,
-        WorkspaceAccess::ReadWrite,
-        runtime,
-    )
-    .with_context(|| {
-        format!(
-            "failed to mark untracked files in {}",
-            worktree_path.display()
-        )
-    })?;
-    if !output.status.success() {
-        bail!(
-            "git add -N failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
     Ok(())
 }
 
@@ -2742,221 +3658,30 @@ fn git_path_argument(path: &[u8]) -> Result<OsString> {
         .context("Git returned a non-UTF-8 path that this platform cannot represent losslessly")
 }
 
-impl LinkedGitAdminWriteGuard {
-    fn capture(worktree_path: &Path) -> Result<Option<Self>> {
-        let workspace = fs::canonicalize(worktree_path).with_context(|| {
-            format!(
-                "failed to canonicalize worktree before Git index write: {}",
-                worktree_path.display()
-            )
-        })?;
-        let repository = Repository::open(&workspace).with_context(|| {
-            format!(
-                "failed to open worktree before Git index write: {}",
-                workspace.display()
-            )
-        })?;
-        let directory = fs::canonicalize(repository.path()).with_context(|| {
-            format!(
-                "failed to canonicalize linked Git administrative directory: {}",
-                repository.path().display()
-            )
-        })?;
-        if directory.starts_with(&workspace) {
-            return Ok(None);
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-            let metadata = fs::symlink_metadata(&directory)?;
-            // SAFETY: geteuid has no preconditions and does not access Rust memory.
-            let effective_uid = unsafe { libc::geteuid() };
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || metadata.uid() != effective_uid
-                || metadata.permissions().mode() & 0o022 != 0
-            {
-                bail!(
-                    "linked Git administrative directory is not an owner-controlled non-writable-by-others directory: {}",
-                    directory.display()
-                );
-            }
-            validate_git_index_file(&directory.join("index"), false)?;
-            reject_git_index_lock(&directory.join("index.lock"))?;
-            let snapshot = snapshot_linked_git_admin(&directory)?;
-            Ok(Some(Self {
-                directory,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                snapshot,
-            }))
-        }
-        #[cfg(not(unix))]
-        {
-            bail!("linked Git administrative index writes require Unix no-follow identity checks")
-        }
-    }
-
-    fn verify(&self) -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-            let metadata = fs::symlink_metadata(&self.directory)?;
-            // SAFETY: geteuid has no preconditions and does not access Rust memory.
-            let effective_uid = unsafe { libc::geteuid() };
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || metadata.uid() != effective_uid
-                || metadata.permissions().mode() & 0o022 != 0
-                || metadata.dev() != self.device
-                || metadata.ino() != self.inode
-            {
-                bail!(
-                    "linked Git administrative directory identity changed during fixed index write: {}",
-                    self.directory.display()
-                );
-            }
-            reject_git_index_lock(&self.directory.join("index.lock"))?;
-            validate_git_index_file(&self.directory.join("index"), true)?;
-            let after = snapshot_linked_git_admin(&self.directory)?;
-            if after != self.snapshot {
-                bail!(
-                    "fixed git add -N changed linked Git administration outside the authorized index file: {}",
-                    self.directory.display()
-                );
-            }
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            bail!("linked Git administrative verification is unavailable on this platform")
-        }
-    }
-}
-
-#[cfg(unix)]
-fn validate_git_index_file(path: &Path, required: bool) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
-        }
-    };
-    // SAFETY: geteuid has no preconditions and does not access Rust memory.
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != effective_uid
-        || metadata.permissions().mode() & 0o022 != 0
-        || metadata.nlink() != 1
-        || metadata.len() > GIT_ADMIN_SNAPSHOT_MAX_BYTES as u64
-    {
-        bail!(
-            "unsafe linked Git index identity, ownership, links, mode, or size: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn reject_git_index_lock(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => bail!(
-            "linked Git index lock already exists or survived the fixed index write: {}",
-            path.display()
-        ),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-#[cfg(unix)]
-fn snapshot_linked_git_admin(directory: &Path) -> Result<BTreeMap<PathBuf, GitAdminSnapshotEntry>> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let mut snapshot = BTreeMap::new();
-    let mut pending = vec![(directory.to_path_buf(), PathBuf::new())];
-    let mut remaining_entries = GIT_ADMIN_SNAPSHOT_MAX_ENTRIES;
-    let mut remaining_bytes = GIT_ADMIN_SNAPSHOT_MAX_BYTES;
-    while let Some((path, relative)) = pending.pop() {
-        for entry in fs::read_dir(&path)
-            .with_context(|| format!("failed to enumerate linked Git admin {}", path.display()))?
-        {
-            if remaining_entries == 0 {
-                bail!(
-                    "linked Git administrative snapshot exceeded {} entries",
-                    GIT_ADMIN_SNAPSHOT_MAX_ENTRIES
-                );
-            }
-            remaining_entries -= 1;
-            let entry = entry?;
-            let child = entry.path();
-            let child_relative = relative.join(entry.file_name());
-            if child_relative == Path::new("index") {
-                continue;
-            }
-            if child_relative == Path::new("index.lock") {
-                bail!("linked Git index lock exists: {}", child.display());
-            }
-            let metadata = fs::symlink_metadata(&child)?;
-            if metadata.file_type().is_symlink() {
-                bail!(
-                    "linked Git administrative snapshot refuses symlink: {}",
-                    child.display()
-                );
-            }
-            let (kind, digest) = if metadata.is_dir() {
-                pending.push((child.clone(), child_relative.clone()));
-                ("directory", None)
-            } else if metadata.is_file() {
-                let length = usize::try_from(metadata.len()).context("Git admin file too large")?;
-                if length > remaining_bytes {
-                    bail!(
-                        "linked Git administrative snapshot exceeded {} bytes",
-                        GIT_ADMIN_SNAPSHOT_MAX_BYTES
-                    );
-                }
-                let bytes = read_bounded_regular_file_nofollow(&child, remaining_bytes)?;
-                remaining_bytes -= bytes.len();
-                (
-                    "file",
-                    Some(Oid::hash_object(git2::ObjectType::Blob, &bytes)?),
-                )
-            } else {
-                bail!(
-                    "linked Git administrative snapshot refuses special entry: {}",
-                    child.display()
-                );
-            };
-            snapshot.insert(
-                child_relative,
-                GitAdminSnapshotEntry {
-                    kind,
-                    device: metadata.dev(),
-                    inode: metadata.ino(),
-                    mode: metadata.permissions().mode(),
-                    length: metadata.len(),
-                    digest,
-                },
-            );
-        }
-    }
-    Ok(snapshot)
-}
-
 fn run_fixed_git(
     worktree_path: &Path,
     args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
     access: WorkspaceAccess,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<std::process::Output> {
+    run_fixed_git_with_stdin(worktree_path, args, access, StdinMode::Null, runtime)
+}
+
+fn run_fixed_git_with_stdin(
+    worktree_path: &Path,
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+    access: WorkspaceAccess,
+    stdin: StdinMode,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<std::process::Output> {
+    if let StdinMode::Bytes(bytes) = &stdin {
+        if bytes.len() >= COMBINED_CANDIDATE_MAX_BYTES {
+            bail!(
+                "orchestrator Git stdin reached the configured {} byte boundary",
+                COMBINED_CANDIDATE_MAX_BYTES
+            );
+        }
+    }
     let git = trusted_system_executable(
         "git",
         &["/run/current-system/sw/bin/git", "/usr/bin/git", "/bin/git"],
@@ -2977,18 +3702,10 @@ fn run_fixed_git(
         ("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string()),
         ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
     ]);
-    let mut profile = match access {
+    let profile = match access {
         WorkspaceAccess::ReadOnly => StrictOfflineWorkspaceProfile::read_only(worktree_path),
         WorkspaceAccess::ReadWrite => StrictOfflineWorkspaceProfile::read_write(worktree_path),
     };
-    let admin_guard = if access == WorkspaceAccess::ReadWrite {
-        LinkedGitAdminWriteGuard::capture(worktree_path)?
-    } else {
-        None
-    };
-    if let Some(guard) = &admin_guard {
-        profile = profile.with_writable_artifact_root(&guard.directory);
-    }
     let mut command_args = vec![
         std::ffi::OsString::from("--no-pager"),
         std::ffi::OsString::from("--no-optional-locks"),
@@ -3011,7 +3728,8 @@ fn run_fixed_git(
         GIT_COMMAND_CAPTURE_LIMIT_BYTES,
     )
     .with_environment(EnvironmentMode::ClearAndSet(environment))
-    .with_stdin(StdinMode::Null)
+    .with_stdin(stdin)
+    .with_stdin_limit(COMBINED_CANDIDATE_MAX_BYTES)
     .with_timeout(Some(GIT_COMMAND_TIMEOUT));
     let run_result = run_process(match runtime {
         OrchestrationExecutionRuntime::Verified => process_spec
@@ -3023,10 +3741,6 @@ fn run_fixed_git(
         OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     });
-    let admin_verification = admin_guard.as_ref().map(LinkedGitAdminWriteGuard::verify);
-    if let Some(verification) = admin_verification {
-        verification?;
-    }
     let output = run_result?;
     if output.timed_out
         || output.process_error.is_some()
@@ -3099,11 +3813,14 @@ fn run_agent_validation_commands(
     agent: &AgentPlan,
     summary: &mut AgentRunSummary,
     worktree: &SelectedWorktree,
+    manager: &WorktreeManager,
+    expected_state: &CandidateStateSnapshot,
+    base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
-) {
+) -> bool {
     let Some(recorded) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree for validation");
-        return;
+        return false;
     };
     if recorded != worktree.record() || worktree.record().name != agent.id {
         fail_summary(
@@ -3113,12 +3830,25 @@ fn run_agent_validation_commands(
                 agent.id
             ),
         );
-        return;
+        return false;
     }
     let worktree_path = worktree.path().to_path_buf();
+    let mut state_intact = true;
 
     for validation in &agent.validation_commands {
-        let run_summary = run_validation_command(validation, &worktree_path, runtime);
+        let (run_summary, binding_intact) = run_candidate_bound_validation_command(
+            validation,
+            &worktree_path,
+            base_oid,
+            expected_state,
+            runtime,
+            || verify_selected_worktree_binding(manager, agent, summary, worktree),
+        );
+        #[cfg(test)]
+        if !binding_intact {
+            notify_candidate_boundary_failure(&agent.id);
+        }
+        state_intact &= binding_intact;
         if run_summary.status != AgentRunStatus::Succeeded {
             fail_summary(
                 summary,
@@ -3130,16 +3860,515 @@ fn run_agent_validation_commands(
             break;
         }
     }
+    state_intact
+}
+
+fn run_candidate_bound_validation_command(
+    validation: &ValidationCommandPlan,
+    root: &Path,
+    base_oid: &Oid,
+    expected_state: &CandidateStateSnapshot,
+    runtime: OrchestrationExecutionRuntime,
+    mut verify_binding: impl FnMut() -> Result<()>,
+) -> (ValidationRunSummary, bool) {
+    if let Err(error) = verify_binding() {
+        return (
+            internal_validation_failure(
+                validation,
+                format!("managed worktree binding is invalid before validation: {error}"),
+            ),
+            false,
+        );
+    }
+    let mut run_summary = run_validation_command(validation, root, runtime);
+    if let Err(error) = verify_binding() {
+        append_validation_error(
+            &mut run_summary,
+            format!("managed worktree binding changed during validation: {error}"),
+        );
+        return (run_summary, false);
+    }
+    match capture_consistent_candidate_state(root, base_oid, runtime) {
+        Ok(after) => {
+            if let Some(drift) = after.drift_from(expected_state) {
+                append_validation_error(&mut run_summary, drift);
+                return (run_summary, false);
+            }
+        }
+        Err(error) => {
+            append_validation_error(
+                &mut run_summary,
+                format!("failed to verify candidate immutability: {error}"),
+            );
+            return (run_summary, false);
+        }
+    }
+    if let Err(error) = verify_binding() {
+        append_validation_error(
+            &mut run_summary,
+            format!("managed worktree binding changed after validation capture: {error}"),
+        );
+        return (run_summary, false);
+    }
+    (run_summary, true)
+}
+
+fn append_validation_error(summary: &mut ValidationRunSummary, message: String) {
+    summary.status = AgentRunStatus::Failed;
+    summary.error = Some(match summary.error.take() {
+        Some(existing) => format!("{existing}; {message}"),
+        None => message,
+    });
+}
+
+fn internal_validation_failure(
+    validation: &ValidationCommandPlan,
+    message: String,
+) -> ValidationRunSummary {
+    ValidationRunSummary {
+        name: validation.name.clone(),
+        command: validation.command.clone(),
+        working_directory: validation.working_directory.clone(),
+        timeout_seconds: validation.timeout.map(|timeout| timeout.as_secs()),
+        status: AgentRunStatus::Failed,
+        exit_code: None,
+        duration_ms: None,
+        timed_out: false,
+        stdout: OutputSummary::default(),
+        stderr: OutputSummary::default(),
+        error: Some(message),
+    }
+}
+
+struct RepoValidationOutcome {
+    summaries: Vec<ValidationRunSummary>,
+    target: Option<RepoValidationTargetBinding>,
+}
+
+#[derive(Debug)]
+struct CombinedCandidateStats {
+    candidate_count: usize,
+    patch_count: usize,
+    aggregate_patch_bytes: usize,
+    changed_paths: Vec<PathBuf>,
+}
+
+struct DisposableValidationWorktree<'a> {
+    manager: &'a WorktreeManager,
+    name: String,
+    lease: Option<ManagedWorktreeWriteLease>,
+    removed: bool,
+}
+
+impl<'a> DisposableValidationWorktree<'a> {
+    fn create(manager: &'a WorktreeManager, base_oid: &Oid) -> Result<Self> {
+        let sequence = REPO_VALIDATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = normalize_agent_id(&format!("repo-validation-{}-{sequence}", process::id()))?;
+        manager
+            .create(WorktreeCreateOptions {
+                agent_id: name.clone(),
+                branch: None,
+                base: Some(base_oid.to_string()),
+                worktree_root: None,
+            })
+            .context("combined candidate managed worktree creation failed")?;
+        let lease = match manager.acquire_write_execution_lease(&name) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let cleanup = manager.remove(&name, true, true);
+                return match cleanup {
+                    Ok(_) => Err(error)
+                        .context("combined candidate exclusive write lease acquisition failed"),
+                    Err(_) => bail!(
+                        "combined candidate exclusive write lease acquisition and cleanup failed"
+                    ),
+                };
+            }
+        };
+        let mut guard = Self {
+            manager,
+            name,
+            lease: Some(lease),
+            removed: false,
+        };
+        let verification = (|| -> Result<()> {
+            guard.verify_binding()?;
+            let repo = Repository::open(guard.path()?)
+                .context("combined candidate managed worktree could not be opened")?;
+            let head =
+                head_oid(&repo).context("combined candidate worktree HEAD capture failed")?;
+            let dirty = collect_status_paths(&repo)
+                .context("combined candidate initial cleanliness inspection failed")?;
+            if &head != base_oid || !dirty.is_empty() {
+                bail!("combined candidate worktree was not clean at the captured run base");
+            }
+            guard.verify_binding()?;
+            Ok(())
+        })();
+        match verification {
+            Ok(()) => Ok(guard),
+            Err(error) => {
+                let cleanup = guard.cleanup();
+                match cleanup {
+                    Ok(()) => Err(error),
+                    Err(_) => Err(error.context("combined candidate verification cleanup failed")),
+                }
+            }
+        }
+    }
+
+    fn path(&self) -> Result<&Path> {
+        self.lease
+            .as_ref()
+            .map(ManagedWorktreeWriteLease::path)
+            .context("combined candidate write lease was released too early")
+    }
+
+    fn verify_binding(&self) -> Result<()> {
+        let lease = self
+            .lease
+            .as_ref()
+            .context("combined candidate write lease was released too early")?;
+        let verified = self
+            .manager
+            .get_managed_verified(&self.name)
+            .context("combined candidate managed worktree binding is invalid")?;
+        if &verified != lease.record() {
+            bail!(
+                "combined candidate managed worktree record or Git backlink changed while its write lease was held"
+            );
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        self.lease.take();
+        self.manager
+            .remove(&self.name, true, true)
+            .context("combined candidate secure removal failed")?;
+        self.removed = true;
+        Ok(())
+    }
+}
+
+impl Drop for DisposableValidationWorktree<'_> {
+    fn drop(&mut self) {
+        if !self.removed {
+            self.lease.take();
+            let _ = self.manager.remove(&self.name, true, true);
+        }
+    }
 }
 
 fn run_repo_validation_commands(
     plan: &OrchestrationPlan,
     repo: &Path,
+    manager: &WorktreeManager,
+    worktrees: &[SelectedWorktree],
+    base_oid: &Oid,
+    candidates: &[Option<CapturedCandidate>],
+    runtime: OrchestrationExecutionRuntime,
+) -> RepoValidationOutcome {
+    let primary_before = match capture_consistent_candidate_state(repo, base_oid, runtime) {
+        Ok(state) => state,
+        Err(_) => {
+            return RepoValidationOutcome {
+                summaries: vec![internal_repo_validation_failure(
+                    "primary boundary capture",
+                    "could not bind the primary worktree before combined-candidate validation",
+                )],
+                target: None,
+            }
+        }
+    };
+    let stats = match validate_combined_candidate_set(plan, candidates, base_oid) {
+        Ok(stats) => stats,
+        Err(error) => {
+            return RepoValidationOutcome {
+                summaries: vec![internal_repo_validation_failure(
+                    "combined candidate bounds",
+                    &error.to_string(),
+                )],
+                target: None,
+            }
+        }
+    };
+    let mut validation_worktree = match DisposableValidationWorktree::create(manager, base_oid) {
+        Ok(worktree) => worktree,
+        Err(error) => {
+            return RepoValidationOutcome {
+                summaries: vec![internal_repo_validation_failure(
+                    "combined candidate construction",
+                    &error.to_string(),
+                )],
+                target: None,
+            }
+        }
+    };
+
+    let execution = execute_combined_candidate_validation(
+        plan,
+        &validation_worktree,
+        base_oid,
+        candidates,
+        &stats,
+        runtime,
+    );
+    let mut outcome = match execution {
+        Ok(outcome) => outcome,
+        Err(error) => RepoValidationOutcome {
+            summaries: vec![internal_repo_validation_failure(
+                "combined candidate construction",
+                &error.to_string(),
+            )],
+            target: None,
+        },
+    };
+
+    if validation_worktree.cleanup().is_err() {
+        outcome.summaries.push(internal_repo_validation_failure(
+            "combined candidate cleanup",
+            "exclusive removal of the disposable validation target failed",
+        ));
+    }
+
+    match capture_consistent_candidate_state(repo, base_oid, runtime) {
+        Ok(after) => {
+            if let Some(drift) = after.drift_from(&primary_before) {
+                outcome.summaries.push(internal_repo_validation_failure(
+                    "primary boundary verification",
+                    &format!("primary worktree changed during repo validation: {drift}"),
+                ));
+            }
+        }
+        Err(_) => outcome.summaries.push(internal_repo_validation_failure(
+            "primary boundary verification",
+            "could not verify the primary worktree after repo validation",
+        )),
+    }
+    verify_agent_worktrees_after_repo_validation(
+        manager,
+        plan,
+        worktrees,
+        candidates,
+        base_oid,
+        runtime,
+        &mut outcome.summaries,
+    );
+    outcome
+}
+
+fn validate_combined_candidate_set(
+    plan: &OrchestrationPlan,
+    candidates: &[Option<CapturedCandidate>],
+    base_oid: &Oid,
+) -> Result<CombinedCandidateStats> {
+    if candidates.len() != plan.agents.len() {
+        bail!("combined candidate set does not match the orchestration plan");
+    }
+    if candidates.len() > COMBINED_CANDIDATE_MAX_PATCHES {
+        bail!(
+            "combined candidate count exceeded the configured {} limit",
+            COMBINED_CANDIDATE_MAX_PATCHES
+        );
+    }
+    let mut candidate_count = 0_usize;
+    let mut patch_count = 0_usize;
+    let mut aggregate_patch_bytes = 0_usize;
+    let mut changed_paths = BTreeSet::new();
+    for (agent, candidate) in plan.agents.iter().zip(candidates) {
+        let candidate = candidate.as_ref().with_context(|| {
+            format!("successful agent '{}' has no captured candidate", agent.id)
+        })?;
+        candidate_count += 1;
+        if candidate.binding.version != CANDIDATE_BINDING_VERSION
+            || candidate.binding.base_oid != base_oid.to_string()
+            || candidate.binding.diff_oid != hash_candidate_component(&candidate.patch)?.to_string()
+            || candidate.binding.patch_bytes != candidate.patch.len() as u64
+        {
+            bail!("candidate binding for agent '{}' drifted", agent.id);
+        }
+        if !candidate.patch.is_empty() {
+            patch_count += 1;
+        }
+        aggregate_patch_bytes = aggregate_patch_bytes
+            .checked_add(candidate.patch.len())
+            .context("combined candidate patch bytes overflowed")?;
+        if aggregate_patch_bytes >= COMBINED_CANDIDATE_MAX_BYTES {
+            bail!(
+                "combined candidate reached the configured {} byte aggregate boundary",
+                COMBINED_CANDIDATE_MAX_BYTES
+            );
+        }
+        for path in &candidate.binding.changed_paths {
+            if !agent
+                .paths
+                .iter()
+                .any(|claim| path_is_covered_by_claim(path, claim))
+            {
+                bail!(
+                    "candidate for agent '{}' contains unclaimed path '{}'",
+                    agent.id,
+                    path.display()
+                );
+            }
+            if !changed_paths.insert(path.clone()) {
+                bail!(
+                    "combined candidate contains duplicate changed path '{}'",
+                    path.display()
+                );
+            }
+        }
+    }
+    if changed_paths.len() > CANDIDATE_MAX_CHANGED_PATHS {
+        bail!(
+            "combined candidate changed-path count exceeded the configured {} limit",
+            CANDIDATE_MAX_CHANGED_PATHS
+        );
+    }
+    Ok(CombinedCandidateStats {
+        candidate_count,
+        patch_count,
+        aggregate_patch_bytes,
+        changed_paths: changed_paths.into_iter().collect(),
+    })
+}
+
+fn execute_combined_candidate_validation(
+    plan: &OrchestrationPlan,
+    validation_worktree: &DisposableValidationWorktree<'_>,
+    base_oid: &Oid,
+    candidates: &[Option<CapturedCandidate>],
+    stats: &CombinedCandidateStats,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<RepoValidationOutcome> {
+    validation_worktree.verify_binding()?;
+    let validation_path = validation_worktree.path()?;
+    apply_captured_candidate_patches(plan, validation_path, candidates, runtime, || {
+        validation_worktree.verify_binding()
+    })?;
+
+    validation_worktree.verify_binding()?;
+    let combined_state = capture_consistent_candidate_state(validation_path, base_oid, runtime)
+        .context("combined candidate binding capture failed")?;
+    validation_worktree.verify_binding()?;
+    if combined_state.changed_paths != stats.changed_paths {
+        bail!("materialized combined candidate paths did not match the captured union");
+    }
+    let combined = capture_bound_candidate(validation_path, base_oid, &combined_state, runtime)
+        .context("materialized combined candidate diff capture failed")?;
+    validation_worktree.verify_binding()?;
+    let target = repo_validation_target_binding(stats, base_oid, &combined);
+    let summaries = run_bound_repo_validation_commands(
+        plan,
+        validation_worktree,
+        base_oid,
+        &combined_state,
+        runtime,
+    );
+    Ok(RepoValidationOutcome {
+        summaries,
+        target: Some(target),
+    })
+}
+
+fn apply_captured_candidate_patches(
+    plan: &OrchestrationPlan,
+    validation_path: &Path,
+    candidates: &[Option<CapturedCandidate>],
+    runtime: OrchestrationExecutionRuntime,
+    mut verify_binding: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    for (agent, candidate) in plan.agents.iter().zip(candidates) {
+        let candidate = candidate
+            .as_ref()
+            .with_context(|| format!("candidate for agent '{}' disappeared", agent.id))?;
+        if candidate.patch.is_empty() {
+            continue;
+        }
+        verify_binding()?;
+        let output = run_fixed_git_with_stdin(
+            validation_path,
+            ["apply", "--binary", "--whitespace=nowarn", "-"],
+            WorkspaceAccess::ReadWrite,
+            StdinMode::Bytes(candidate.patch.clone()),
+            runtime,
+        )
+        .with_context(|| {
+            format!(
+                "combined candidate patch application failed for agent '{}'",
+                agent.id
+            )
+        })?;
+        if !output.status.success() {
+            bail!(
+                "combined candidate patch conflicted for agent '{}'",
+                agent.id
+            );
+        }
+        verify_binding()?;
+    }
+    Ok(())
+}
+
+fn repo_validation_target_binding(
+    stats: &CombinedCandidateStats,
+    base_oid: &Oid,
+    combined: &CapturedCandidate,
+) -> RepoValidationTargetBinding {
+    RepoValidationTargetBinding {
+        version: CANDIDATE_BINDING_VERSION,
+        kind: if stats.changed_paths.is_empty() {
+            RepoValidationTargetKind::BaseNoChanges
+        } else {
+            RepoValidationTargetKind::CombinedCandidate
+        },
+        base_oid: base_oid.to_string(),
+        combined_diff_oid: combined.binding.diff_oid.clone(),
+        changed_paths: stats.changed_paths.clone(),
+        candidate_count: stats.candidate_count,
+        patch_count: stats.patch_count,
+        aggregate_patch_bytes: stats.aggregate_patch_bytes as u64,
+    }
+}
+
+fn run_bound_repo_validation_commands(
+    plan: &OrchestrationPlan,
+    validation_worktree: &DisposableValidationWorktree<'_>,
+    base_oid: &Oid,
+    expected_state: &CandidateStateSnapshot,
     runtime: OrchestrationExecutionRuntime,
 ) -> Vec<ValidationRunSummary> {
     let mut summaries = Vec::new();
+    let validation_path = match validation_worktree.path() {
+        Ok(path) => path,
+        Err(error) => {
+            return vec![internal_repo_validation_failure(
+                "combined candidate lease",
+                &error.to_string(),
+            )]
+        }
+    };
     for validation in &plan.repo_validation_commands {
-        let run_summary = run_validation_command(validation, repo, runtime);
+        let (mut run_summary, binding_intact) = run_candidate_bound_validation_command(
+            validation,
+            validation_path,
+            base_oid,
+            expected_state,
+            runtime,
+            || validation_worktree.verify_binding(),
+        );
+        if !binding_intact
+            && run_summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("candidate-relevant state changed"))
+        {
+            let drift = run_summary.error.take().unwrap_or_default();
+            run_summary.error = Some(format!(
+                "repo validation mutated the combined candidate: {drift}"
+            ));
+        }
         let failed = run_summary.status != AgentRunStatus::Succeeded;
         summaries.push(run_summary);
         if failed {
@@ -3147,6 +4376,69 @@ fn run_repo_validation_commands(
         }
     }
     summaries
+}
+
+fn verify_agent_worktrees_after_repo_validation(
+    manager: &WorktreeManager,
+    plan: &OrchestrationPlan,
+    worktrees: &[SelectedWorktree],
+    candidates: &[Option<CapturedCandidate>],
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+    summaries: &mut Vec<ValidationRunSummary>,
+) {
+    if worktrees.len() != candidates.len() || worktrees.len() != plan.agents.len() {
+        summaries.push(internal_repo_validation_failure(
+            "agent candidate verification",
+            "agent worktree lease set no longer matches the candidate set",
+        ));
+        return;
+    }
+    for ((agent, worktree), candidate) in plan.agents.iter().zip(worktrees).zip(candidates) {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let verified = manager
+            .get_managed_verified(&agent.id)
+            .and_then(|record| {
+                if &record != worktree.record() {
+                    bail!("managed worktree record drifted");
+                }
+                Ok(())
+            })
+            .and_then(|()| capture_consistent_candidate_state(worktree.path(), base_oid, runtime))
+            .and_then(|state| ensure_candidate_binding_matches_state(&candidate.binding, &state))
+            .and_then(|()| {
+                let record = manager.get_managed_verified(&agent.id)?;
+                if &record != worktree.record() {
+                    bail!("managed worktree record drifted after capture");
+                }
+                Ok(())
+            });
+        if verified.is_err() {
+            summaries.push(internal_repo_validation_failure(
+                "agent candidate verification",
+                "an agent worktree changed while the combined candidate was validated",
+            ));
+            break;
+        }
+    }
+}
+
+fn internal_repo_validation_failure(name: &str, message: &str) -> ValidationRunSummary {
+    ValidationRunSummary {
+        name: Some(name.to_string()),
+        command: "maco internal combined-candidate gate".to_string(),
+        working_directory: None,
+        timeout_seconds: None,
+        status: AgentRunStatus::Failed,
+        exit_code: None,
+        duration_ms: None,
+        timed_out: false,
+        stdout: OutputSummary::default(),
+        stderr: OutputSummary::default(),
+        error: Some(message.to_string()),
+    }
 }
 
 fn run_validation_command(
@@ -3384,6 +4676,7 @@ struct CheckpointView<'a> {
     success: bool,
     agents: &'a [AgentRunSummary],
     repo_validation: &'a [ValidationRunSummary],
+    repo_validation_target: Option<&'a RepoValidationTargetBinding>,
     released_claims: &'a [PathClaim],
     release_errors: &'a [String],
     released_semantic_intents: &'a [SemanticIntent],
@@ -3460,9 +4753,10 @@ pub fn read_run_checkpoint(path: &Path) -> Result<RunCheckpoint> {
         .with_context(|| format!("failed to parse checkpoint {}", path.display()))?;
     if checkpoint.version != CHECKPOINT_STATE_VERSION {
         bail!(
-            "unsupported checkpoint version {} in {}",
+            "unsupported checkpoint version {} in {}; version {} candidate-binding evidence is required, start a new run",
             checkpoint.version,
-            path.display()
+            path.display(),
+            CHECKPOINT_STATE_VERSION
         );
     }
     Ok(checkpoint)
@@ -3505,6 +4799,7 @@ fn write_checkpoint_if_configured(
         success: view.success,
         agents: view.agents.iter().map(AgentCheckpoint::from).collect(),
         repo_validation: view.repo_validation.to_vec(),
+        repo_validation_target: view.repo_validation_target.cloned(),
         released_claims: view.released_claims.to_vec(),
         release_errors: view.release_errors.to_vec(),
         released_semantic_intents: view.released_semantic_intents.to_vec(),
@@ -3529,6 +4824,7 @@ impl From<&AgentRunSummary> for AgentCheckpoint {
             changed_paths: summary.changed_paths.clone(),
             unclaimed_changed_paths: summary.unclaimed_changed_paths.clone(),
             validation: summary.validation.clone(),
+            candidate_binding: summary.candidate_binding.clone(),
             error: summary.error.clone(),
         }
     }
@@ -3658,6 +4954,106 @@ mod tests {
         super::resume_plan_file_simulation(options)
     }
 
+    fn test_candidate_binding(worktree_path: &Path, base_oid: Oid) -> AgentCandidateBinding {
+        let state = capture_consistent_candidate_state(
+            worktree_path,
+            &base_oid,
+            OrchestrationExecutionRuntime::Verified,
+        )
+        .expect("capture test candidate state");
+        capture_bound_candidate(
+            worktree_path,
+            &base_oid,
+            &state,
+            OrchestrationExecutionRuntime::Verified,
+        )
+        .expect("capture test candidate")
+        .binding
+    }
+
+    fn schedule_test_agent(id: &str, depends_on: &[&str]) -> AgentPlan {
+        AgentPlan {
+            id: id.to_string(),
+            paths: vec![PathBuf::from(format!("{id}.txt"))],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            env: BTreeMap::new(),
+            timeout: None,
+            command: "true".to_string(),
+            depends_on: depends_on.iter().map(|value| value.to_string()).collect(),
+            working_directory: None,
+            validation_commands: Vec::new(),
+        }
+    }
+
+    fn schedule_test_plan(agents: Vec<AgentPlan>) -> OrchestrationPlan {
+        OrchestrationPlan {
+            agents,
+            repo_validation_commands: Vec::new(),
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+        }
+    }
+
+    fn run_candidate_validation_test(command: &str) -> ValidationRunSummary {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("claimed.txt"), "base\n").expect("write claimed");
+        fs::write(repo_path.join("other.txt"), "base\n").expect("write other");
+        let base_oid = commit_all(&repo, "initial commit").expect("commit");
+        fs::write(repo_path.join("claimed.txt"), "candidate\n").expect("write candidate");
+        let expected = capture_consistent_candidate_state(
+            &repo_path,
+            &base_oid,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("capture expected candidate");
+        let validation = ValidationCommandPlan {
+            name: Some("binding check".to_string()),
+            command: command.to_string(),
+            env: BTreeMap::new(),
+            timeout: Some(Duration::from_secs(5)),
+            working_directory: None,
+        };
+        run_candidate_bound_validation_command(
+            &validation,
+            &repo_path,
+            &base_oid,
+            &expected,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+            || Ok(()),
+        )
+        .0
+    }
+
+    fn clone_candidate(
+        source: &Path,
+        destination: &Path,
+        base_oid: Oid,
+        relative_path: Option<&str>,
+        contents: &str,
+    ) -> CapturedCandidate {
+        Repository::clone(source.to_str().expect("source path utf8"), destination)
+            .expect("clone candidate");
+        if let Some(relative_path) = relative_path {
+            fs::write(destination.join(relative_path), contents).expect("write candidate change");
+        }
+        let state = capture_consistent_candidate_state(
+            destination,
+            &base_oid,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("capture cloned candidate state");
+        capture_bound_candidate(
+            destination,
+            &base_oid,
+            &state,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("capture cloned candidate")
+    }
+
     #[cfg(unix)]
     fn wait_for_test_marker(path: &Path) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3697,6 +5093,422 @@ mod tests {
             vec![PathBuf::from("README.md"), PathBuf::from("src")]
         );
         assert_eq!(plan.agents[0].command, "echo ok");
+    }
+
+    #[test]
+    fn load_plan_rejects_agent_count_before_candidate_worktree_creation() {
+        let temp = TempDir::new().expect("tempdir");
+        let plan_path = temp.path().join("plan.json");
+        let agents = (0..=COMBINED_CANDIDATE_MAX_PATCHES)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("agent-{index}"),
+                    "paths": [format!("file-{index}.txt")],
+                    "command": "true"
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &plan_path,
+            serde_json::to_vec(&serde_json::json!({"agents": agents})).expect("encode plan"),
+        )
+        .expect("write plan");
+
+        let error = load_plan(&plan_path).expect_err("oversized plan must fail at load");
+        assert!(error.to_string().contains("256 agent limit"));
+    }
+
+    #[test]
+    fn load_plan_bounds_validation_commands_and_dependency_edges() {
+        let temp = TempDir::new().expect("tempdir");
+        let validation_plan = temp.path().join("validation-plan.json");
+        let validations = (0..=PLAN_MAX_VALIDATION_COMMANDS_PER_SCOPE)
+            .map(|_| serde_json::Value::String("true".to_string()))
+            .collect::<Vec<_>>();
+        fs::write(
+            &validation_plan,
+            serde_json::to_vec(&serde_json::json!({
+                "repo_validation_commands": validations,
+                "agents": [{"id": "agent-a", "paths": ["a.txt"], "command": "true"}]
+            }))
+            .expect("encode validation plan"),
+        )
+        .expect("write validation plan");
+        assert!(load_plan(&validation_plan)
+            .expect_err("validation count must be bounded")
+            .to_string()
+            .contains("128 command limit"));
+
+        let dependency_plan = temp.path().join("dependency-plan.json");
+        let agents = (0..100)
+            .map(|index| {
+                let dependencies = (0..index)
+                    .map(|dependency| format!("agent-{dependency}"))
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "id": format!("agent-{index}"),
+                    "paths": [format!("file-{index}.txt")],
+                    "command": "true",
+                    "depends_on": dependencies
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &dependency_plan,
+            serde_json::to_vec(&serde_json::json!({"agents": agents}))
+                .expect("encode dependency plan"),
+        )
+        .expect("write dependency plan");
+        assert!(load_plan(&dependency_plan)
+            .expect_err("dependency edge count must be bounded")
+            .to_string()
+            .contains("4096 dependency-edge limit"));
+    }
+
+    #[test]
+    fn scheduler_failure_propagation_preserves_independent_fork_and_join_branch() {
+        let plan = schedule_test_plan(vec![
+            schedule_test_agent("root-fail", &[]),
+            schedule_test_agent("failed-child", &["root-fail"]),
+            schedule_test_agent("root-ok", &[]),
+            schedule_test_agent("ok-child", &["root-ok"]),
+            schedule_test_agent("join", &["failed-child", "ok-child"]),
+        ]);
+        let mut summaries = plan
+            .agents
+            .iter()
+            .map(AgentRunSummary::pending)
+            .collect::<Vec<_>>();
+        let mut remaining = (0..summaries.len()).collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            ready_agent_indices(&plan, &summaries, &remaining, 2),
+            vec![0, 2]
+        );
+        summaries[0].status = AgentRunStatus::Failed;
+        summaries[2].status = AgentRunStatus::Succeeded;
+        remaining.remove(&0);
+        remaining.remove(&2);
+        propagate_dependency_failures(&plan, &mut summaries, &mut remaining);
+
+        assert_eq!(summaries[1].status, AgentRunStatus::Skipped);
+        assert_eq!(summaries[4].status, AgentRunStatus::Skipped);
+        assert_eq!(summaries[3].status, AgentRunStatus::Pending);
+        assert_eq!(
+            ready_agent_indices(&plan, &summaries, &remaining, 2),
+            vec![3]
+        );
+        assert!(summaries[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("'root-fail' (failed)")));
+        assert!(summaries[4]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("'failed-child' (skipped)")));
+    }
+
+    #[test]
+    fn scheduler_reports_all_same_wave_failed_dependencies_deterministically() {
+        let plan = schedule_test_plan(vec![
+            schedule_test_agent("fail-a", &[]),
+            schedule_test_agent("fail-b", &[]),
+            schedule_test_agent("dependent", &["fail-a", "fail-b"]),
+            schedule_test_agent("independent", &[]),
+        ]);
+        let mut summaries = plan
+            .agents
+            .iter()
+            .map(AgentRunSummary::pending)
+            .collect::<Vec<_>>();
+        summaries[0].status = AgentRunStatus::Failed;
+        summaries[1].status = AgentRunStatus::Failed;
+        let mut remaining = BTreeSet::from([2, 3]);
+
+        propagate_dependency_failures(&plan, &mut summaries, &mut remaining);
+
+        assert_eq!(summaries[2].status, AgentRunStatus::Skipped);
+        assert_eq!(summaries[3].status, AgentRunStatus::Pending);
+        assert_eq!(
+            summaries[2].error.as_deref(),
+            Some(
+                "skipped because dependencies did not succeed: 'fail-a' (failed), 'fail-b' (failed)"
+            )
+        );
+        assert_eq!(
+            ready_agent_indices(&plan, &summaries, &remaining, 4),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn scheduler_accepts_successful_checkpoint_summary_as_dependency() {
+        let plan = schedule_test_plan(vec![
+            schedule_test_agent("completed", &[]),
+            schedule_test_agent("pending-dependent", &["completed"]),
+        ]);
+        let mut summaries = plan
+            .agents
+            .iter()
+            .map(AgentRunSummary::pending)
+            .collect::<Vec<_>>();
+        summaries[0].status = AgentRunStatus::Succeeded;
+        let remaining = BTreeSet::from([1]);
+
+        assert_eq!(
+            ready_agent_indices(&plan, &summaries, &remaining, 1),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn resume_claim_failure_isolated_to_its_dependency_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open sync store");
+        let blocker = store
+            .claim_paths("external-blocker", ["blocked.txt"])
+            .expect("create blocking claim");
+        let mut blocked = schedule_test_agent("blocked", &[]);
+        blocked.paths = vec![PathBuf::from("blocked.txt")];
+        let mut independent = schedule_test_agent("independent", &[]);
+        independent.paths = vec![PathBuf::from("independent.txt")];
+        let plan = schedule_test_plan(vec![blocked, independent]);
+        let mut summaries = plan
+            .agents
+            .iter()
+            .map(AgentRunSummary::pending)
+            .collect::<Vec<_>>();
+
+        let acquired = acquire_resume_claims(&store, &plan, &mut summaries);
+
+        assert_eq!(summaries[0].status, AgentRunStatus::Failed);
+        assert_eq!(summaries[1].status, AgentRunStatus::Pending);
+        assert_eq!(acquired.len(), 1);
+        store.release(acquired[0]).expect("release acquired claim");
+        store.release(blocker.token).expect("release blocker");
+    }
+
+    #[test]
+    fn agent_validation_rejects_within_claim_content_mutation() {
+        let summary = run_candidate_validation_test("printf 'changed\\n' > claimed.txt");
+        assert_eq!(summary.status, AgentRunStatus::Failed);
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("tracked worktree content")));
+    }
+
+    #[test]
+    fn agent_validation_rejects_unclaimed_untracked_mutation() {
+        let summary = run_candidate_validation_test("printf 'new\\n' > unclaimed.txt");
+        assert_eq!(summary.status, AgentRunStatus::Failed);
+        assert!(summary.error.as_deref().is_some_and(|error| {
+            error.contains("untracked content") && error.contains("changed paths/status")
+        }));
+    }
+
+    #[test]
+    fn agent_validation_rejects_head_mutation() {
+        let summary = run_candidate_validation_test(
+            "git -c user.name=test -c user.email=test@example.invalid -c core.hooksPath=/dev/null commit --allow-empty -m validation",
+        );
+        assert_eq!(summary.status, AgentRunStatus::Failed);
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("HEAD")));
+    }
+
+    #[test]
+    fn agent_validation_rejects_index_only_mutation() {
+        let summary = run_candidate_validation_test("git add -- claimed.txt");
+        assert_eq!(summary.status, AgentRunStatus::Failed);
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("index")));
+    }
+
+    #[test]
+    fn agent_validation_accepts_exactly_unchanged_candidate() {
+        let summary = run_candidate_validation_test("true");
+        assert_eq!(summary.status, AgentRunStatus::Succeeded);
+        assert!(summary.error.is_none());
+    }
+
+    #[test]
+    fn repo_validation_materializes_exact_combined_candidate_and_not_primary() {
+        let temp = TempDir::new().expect("tempdir");
+        let primary = temp.path().join("primary");
+        WorktreeManager::init_repository(&primary, "main").expect("init primary");
+        let repo = Repository::open(&primary).expect("open primary");
+        fs::write(primary.join("a.txt"), "base-a\n").expect("write a");
+        fs::write(primary.join("b.txt"), "base-b\n").expect("write b");
+        let base_oid = commit_all(&repo, "initial commit").expect("commit");
+        let candidate_a = clone_candidate(
+            &primary,
+            &temp.path().join("candidate-a"),
+            base_oid,
+            Some("a.txt"),
+            "candidate-a\n",
+        );
+        let candidate_b = clone_candidate(
+            &primary,
+            &temp.path().join("candidate-b"),
+            base_oid,
+            Some("b.txt"),
+            "candidate-b\n",
+        );
+        let mut agent_a = schedule_test_agent("agent-a", &[]);
+        agent_a.paths = vec![PathBuf::from("a.txt")];
+        let mut agent_b = schedule_test_agent("agent-b", &[]);
+        agent_b.paths = vec![PathBuf::from("b.txt")];
+        let plan = schedule_test_plan(vec![agent_a, agent_b]);
+        let candidates = vec![Some(candidate_a), Some(candidate_b)];
+        let stats = validate_combined_candidate_set(&plan, &candidates, &base_oid)
+            .expect("validate candidate union");
+        let validation_path = temp.path().join("validation");
+        let validation_repo =
+            Repository::clone(primary.to_str().expect("primary utf8"), &validation_path)
+                .expect("clone validation target");
+        let index_path = validation_repo.path().join("index");
+        let index_before = fs::read(&index_path).expect("read validation index before apply");
+
+        apply_captured_candidate_patches(
+            &plan,
+            &validation_path,
+            &candidates,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+            || Ok(()),
+        )
+        .expect("apply exact union");
+        assert_eq!(
+            fs::read(&index_path).expect("read validation index after apply"),
+            index_before,
+            "combined materialization must not write shared Git administration"
+        );
+        let combined_state = capture_consistent_candidate_state(
+            &validation_path,
+            &base_oid,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("capture combined state");
+        let combined = capture_bound_candidate(
+            &validation_path,
+            &base_oid,
+            &combined_state,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("capture combined candidate");
+        let target = repo_validation_target_binding(&stats, &base_oid, &combined);
+        let validation = ValidationCommandPlan {
+            name: Some("combined content".to_string()),
+            command: "test \"$(cat a.txt)\" = candidate-a && test \"$(cat b.txt)\" = candidate-b"
+                .to_string(),
+            env: BTreeMap::new(),
+            timeout: Some(Duration::from_secs(5)),
+            working_directory: None,
+        };
+        let (summary, intact) = run_candidate_bound_validation_command(
+            &validation,
+            &validation_path,
+            &base_oid,
+            &combined_state,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+            || Ok(()),
+        );
+
+        assert!(intact);
+        assert_eq!(summary.status, AgentRunStatus::Succeeded);
+        assert_eq!(target.kind, RepoValidationTargetKind::CombinedCandidate);
+        assert_eq!(
+            target.changed_paths,
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+        );
+        assert_eq!(
+            fs::read_to_string(primary.join("a.txt")).expect("read primary a"),
+            "base-a\n"
+        );
+        assert_eq!(
+            fs::read_to_string(primary.join("b.txt")).expect("read primary b"),
+            "base-b\n"
+        );
+        let serialized = serde_json::to_string(&target).expect("serialize target");
+        assert!(!serialized.contains(temp.path().to_str().expect("temp utf8")));
+    }
+
+    #[test]
+    fn repo_validation_zero_change_target_is_explicit() {
+        let temp = TempDir::new().expect("tempdir");
+        let primary = temp.path().join("primary");
+        WorktreeManager::init_repository(&primary, "main").expect("init primary");
+        let repo = Repository::open(&primary).expect("open primary");
+        fs::write(primary.join("README.md"), "base\n").expect("write readme");
+        let base_oid = commit_all(&repo, "initial commit").expect("commit");
+        let candidate =
+            clone_candidate(&primary, &temp.path().join("candidate"), base_oid, None, "");
+        let plan = schedule_test_plan(vec![schedule_test_agent("agent-a", &[])]);
+        let candidates = vec![Some(candidate)];
+        let stats = validate_combined_candidate_set(&plan, &candidates, &base_oid)
+            .expect("validate zero-change set");
+        let target = repo_validation_target_binding(
+            &stats,
+            &base_oid,
+            candidates[0].as_ref().expect("candidate"),
+        );
+
+        assert_eq!(target.kind, RepoValidationTargetKind::BaseNoChanges);
+        assert_eq!(target.candidate_count, 1);
+        assert_eq!(target.patch_count, 0);
+        assert_eq!(target.aggregate_patch_bytes, 0);
+        assert!(target.changed_paths.is_empty());
+    }
+
+    #[test]
+    fn combined_candidate_rejects_duplicate_patch_paths_before_materialization() {
+        let temp = TempDir::new().expect("tempdir");
+        let primary = temp.path().join("primary");
+        WorktreeManager::init_repository(&primary, "main").expect("init primary");
+        let repo = Repository::open(&primary).expect("open primary");
+        fs::write(primary.join("shared.txt"), "base\n").expect("write shared");
+        let base_oid = commit_all(&repo, "initial commit").expect("commit");
+        let first = clone_candidate(
+            &primary,
+            &temp.path().join("first"),
+            base_oid,
+            Some("shared.txt"),
+            "first\n",
+        );
+        let second = clone_candidate(
+            &primary,
+            &temp.path().join("second"),
+            base_oid,
+            Some("shared.txt"),
+            "second\n",
+        );
+        let mut first_agent = schedule_test_agent("first", &[]);
+        first_agent.paths = vec![PathBuf::from("shared.txt")];
+        let mut second_agent = schedule_test_agent("second", &[]);
+        second_agent.paths = vec![PathBuf::from("shared.txt")];
+        let plan = schedule_test_plan(vec![first_agent, second_agent]);
+
+        let error = validate_combined_candidate_set(&plan, &[Some(first), Some(second)], &base_oid)
+            .expect_err("duplicate candidate path must fail closed");
+        assert!(error
+            .to_string()
+            .contains("duplicate changed path 'shared.txt'"));
+    }
+
+    #[test]
+    fn repo_validation_mutation_never_preserves_a_success_status() {
+        let summary = run_candidate_validation_test("printf 'repo mutation\\n' > claimed.txt");
+        assert_eq!(summary.status, AgentRunStatus::Failed);
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("candidate-relevant state changed") }));
     }
 
     #[test]
@@ -4120,6 +5932,90 @@ mod tests {
         assert!(!removed.path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn redirected_git_marker_fails_before_candidate_open_and_holds_lease_through_refusal() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "base\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let record = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "git-marker-redirect".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+        let original_marker = fs::read(record.path.join(".git")).expect("read marker");
+        let foreign_path = temp.path().join("foreign");
+        WorktreeManager::init_repository(&foreign_path, "main").expect("init foreign");
+        fs::write(foreign_path.join("sentinel"), "untouched\n").expect("write sentinel");
+        let command = format!(
+            "printf 'gitdir: %s\\n' '{}' > .git",
+            foreign_path.join(".git").display()
+        );
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec(&serde_json::json!({
+                "worktree_reuse_policy": "required",
+                "agents": [{
+                    "id": "git-marker-redirect",
+                    "paths": ["README.md"],
+                    "command": command
+                }]
+            }))
+            .expect("encode plan"),
+        )
+        .expect("write plan");
+        let (reached, release) = install_candidate_boundary_failure_hook("git-marker-redirect");
+        let run_repo = repo_path.clone();
+        let runner = thread::spawn(move || {
+            run_plan_file(OrchestrationRunOptions {
+                repo: run_repo,
+                plan_file,
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            })
+        });
+
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("candidate boundary failure hook");
+        let competing_lease = manager.acquire_write_execution_lease("git-marker-redirect");
+        let competing_removal = manager.remove("git-marker-redirect", true, false);
+        release.send(()).expect("release refusal hook");
+        assert!(competing_lease.is_err());
+        assert!(competing_removal.is_err());
+        let summary = runner.join().expect("join runner").expect("run summary");
+
+        assert!(!summary.success);
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
+        assert!(summary.agents[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("managed worktree binding is invalid")));
+        assert!(summary.agents[0].candidate_binding.is_none());
+        assert!(summary.agents[0].patch_path.is_none());
+        assert_eq!(
+            fs::read_to_string(foreign_path.join("sentinel")).expect("read sentinel"),
+            "untouched\n"
+        );
+
+        fs::write(record.path.join(".git"), original_marker).expect("restore marker");
+        manager
+            .get_managed_verified("git-marker-redirect")
+            .expect("restored binding");
+        manager
+            .remove("git-marker-redirect", true, true)
+            .expect("remove restored worktree");
+    }
+
     #[test]
     fn run_plan_reports_failed_command_and_releases_claims() {
         let temp = TempDir::new().expect("tempdir");
@@ -4361,7 +6257,7 @@ mod tests {
             SemanticCoordinationMode::Block
         );
         assert_eq!(summary.first_failed_agent(), Some("agent-b"));
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Skipped);
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
         assert_eq!(summary.agents[1].status, AgentRunStatus::Failed);
         assert!(summary.agents[1]
             .semantic_conflicts
@@ -4816,13 +6712,15 @@ mod tests {
         let claim_b = store
             .claim_paths("agent-b", ["b.txt"])
             .expect("claim agent b");
+        let base_oid = current_head_oid(&repo_path).expect("head");
+        let agent_a_binding = test_candidate_binding(&agent_a_worktree.path, base_oid);
         let run_id = RunId::new("resume-skip").expect("run id");
         let checkpoint = RunCheckpoint {
             version: CHECKPOINT_STATE_VERSION,
             run_id: run_id.clone(),
             stage: RunCheckpointStage::ClaimsAcquired,
             repo: repo_path.clone(),
-            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
+            repo_head: Some(base_oid.to_string()),
             plan_file: plan_file.clone(),
             plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
             keep_claims: false,
@@ -4840,6 +6738,7 @@ mod tests {
                     changed_paths: vec![PathBuf::from("a.txt")],
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
+                    candidate_binding: Some(agent_a_binding),
                     error: None,
                 },
                 AgentCheckpoint {
@@ -4852,10 +6751,12 @@ mod tests {
                     changed_paths: Vec::new(),
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
+                    candidate_binding: None,
                     error: None,
                 },
             ],
             repo_validation: Vec::new(),
+            repo_validation_target: None,
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),
@@ -4956,9 +6857,11 @@ mod tests {
                 changed_paths: Vec::new(),
                 unclaimed_changed_paths: Vec::new(),
                 validation: Vec::new(),
+                candidate_binding: None,
                 error: None,
             }],
             repo_validation: Vec::new(),
+            repo_validation_target: None,
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),
@@ -5113,13 +7016,15 @@ mod tests {
                 notes: Vec::new(),
             })
             .expect("claim semantic b");
+        let base_oid = current_head_oid(&repo_path).expect("head");
+        let agent_a_binding = test_candidate_binding(&agent_a_worktree.path, base_oid);
         let run_id = RunId::new("resume-semantic").expect("run id");
         let checkpoint = RunCheckpoint {
             version: CHECKPOINT_STATE_VERSION,
             run_id: run_id.clone(),
             stage: RunCheckpointStage::ClaimsAcquired,
             repo: repo_path.clone(),
-            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
+            repo_head: Some(base_oid.to_string()),
             plan_file: plan_file.clone(),
             plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
             keep_claims: false,
@@ -5137,6 +7042,7 @@ mod tests {
                     changed_paths: vec![PathBuf::from("a.txt")],
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
+                    candidate_binding: Some(agent_a_binding),
                     error: None,
                 },
                 AgentCheckpoint {
@@ -5149,10 +7055,12 @@ mod tests {
                     changed_paths: Vec::new(),
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
+                    candidate_binding: None,
                     error: None,
                 },
             ],
             repo_validation: Vec::new(),
+            repo_validation_target: None,
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),
@@ -5279,6 +7187,7 @@ mod tests {
                     changed_paths: Vec::new(),
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
+                    candidate_binding: None,
                     error: None,
                 },
                 AgentCheckpoint {
@@ -5291,10 +7200,12 @@ mod tests {
                     changed_paths: Vec::new(),
                     unclaimed_changed_paths: Vec::new(),
                     validation: Vec::new(),
+                    candidate_binding: None,
                     error: None,
                 },
             ],
             repo_validation: Vec::new(),
+            repo_validation_target: None,
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),
@@ -5386,9 +7297,11 @@ mod tests {
                 changed_paths: Vec::new(),
                 unclaimed_changed_paths: Vec::new(),
                 validation: Vec::new(),
+                candidate_binding: None,
                 error: None,
             }],
             repo_validation: Vec::new(),
+            repo_validation_target: None,
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),
@@ -5593,9 +7506,28 @@ mod tests {
                 changed_paths: vec![PathBuf::from("README.md")],
                 unclaimed_changed_paths: Vec::new(),
                 validation: Vec::new(),
+                candidate_binding: Some(AgentCandidateBinding {
+                    version: CANDIDATE_BINDING_VERSION,
+                    base_oid: "0123456789012345678901234567890123456789".to_string(),
+                    head_oid: "0123456789012345678901234567890123456789".to_string(),
+                    state_oid: "1111111111111111111111111111111111111111".to_string(),
+                    diff_oid: "2222222222222222222222222222222222222222".to_string(),
+                    changed_paths: vec![PathBuf::from("README.md")],
+                    patch_bytes: 1,
+                }),
                 error: None,
             }],
             repo_validation: Vec::new(),
+            repo_validation_target: Some(RepoValidationTargetBinding {
+                version: CANDIDATE_BINDING_VERSION,
+                kind: RepoValidationTargetKind::CombinedCandidate,
+                base_oid: "0123456789012345678901234567890123456789".to_string(),
+                combined_diff_oid: "3333333333333333333333333333333333333333".to_string(),
+                changed_paths: vec![PathBuf::from("README.md")],
+                candidate_count: 1,
+                patch_count: 1,
+                aggregate_patch_bytes: 1,
+            }),
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),
@@ -5608,6 +7540,38 @@ mod tests {
         assert_eq!(path, checkpoint_path(&checkpoint_dir, &run_id));
         let loaded = read_run_checkpoint(&path).expect("read checkpoint");
         assert_eq!(loaded, checkpoint);
+    }
+
+    #[test]
+    fn checkpoint_v1_is_rejected_with_start_new_run_guidance() {
+        let temp = TempDir::new().expect("tempdir");
+        let checkpoint = RunCheckpoint {
+            version: 1,
+            run_id: RunId::new("legacy-v1").expect("run id"),
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: PathBuf::from("repo"),
+            repo_head: None,
+            plan_file: PathBuf::from("plan.json"),
+            plan_snapshot: None,
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: Vec::new(),
+            repo_validation: Vec::new(),
+            repo_validation_target: None,
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let path = write_run_checkpoint(&temp.path().join("checkpoints"), &checkpoint)
+            .expect("write legacy checkpoint");
+
+        let error = read_run_checkpoint(&path).expect_err("legacy v1 must be rejected");
+        assert!(error.to_string().contains("version 2"));
+        assert!(error.to_string().contains("start a new run"));
     }
 
     #[test]
@@ -5675,42 +7639,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn linked_git_admin_guard_allows_only_safe_index_replacement() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_path = temp.path().join("repo");
-        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
-        let repo = Repository::open(&repo_path).expect("open repo");
-        fs::write(repo_path.join("README.md"), "# guarded\n").expect("write readme");
-        commit_all(&repo, "initial commit").expect("commit");
-        let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
-                agent_id: "guarded-agent".to_string(),
-                branch: None,
-                base: None,
-                worktree_root: None,
-            })
-            .expect("create worktree");
-
-        let guard = LinkedGitAdminWriteGuard::capture(&worktree.path)
-            .expect("capture linked admin")
-            .expect("linked admin must be outside worktree");
-        let index_path = guard.directory.join("index");
-        let index = fs::read(&index_path).expect("read linked index");
-        fs::remove_file(&index_path).expect("remove linked index");
-        fs::write(&index_path, index).expect("replace linked index");
-        guard.verify().expect("safe index replacement");
-
-        let guard = LinkedGitAdminWriteGuard::capture(&worktree.path)
-            .expect("recapture linked admin")
-            .expect("linked admin must remain external");
-        fs::write(guard.directory.join("HEAD"), "ref: refs/heads/tampered\n")
-            .expect("tamper linked HEAD");
-        assert!(guard.verify().is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn intent_to_add_preserves_non_utf8_and_replacement_character_paths_distinctly() {
+    fn candidate_capture_preserves_non_utf8_and_replacement_character_paths_without_index_writes() {
         use std::os::unix::ffi::OsStringExt;
 
         let temp = TempDir::new().expect("tempdir");
@@ -5733,12 +7662,20 @@ mod tests {
             .expect("write raw path");
         fs::write(worktree.path.join(replacement), "replacement\n")
             .expect("write replacement path");
-
-        mark_untracked_intent_to_add(
+        let base_oid = current_head_oid(&repo_path).expect("base");
+        let state = capture_consistent_candidate_state(
             &worktree.path,
+            &base_oid,
             OrchestrationExecutionRuntime::NonpublishableSimulation,
         )
-        .expect("mark both paths intent-to-add");
+        .expect("capture both candidate paths");
+        let captured = capture_bound_candidate(
+            &worktree.path,
+            &base_oid,
+            &state,
+            OrchestrationExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("capture exact candidate patch");
 
         let worktree_repo = Repository::open(&worktree.path).expect("open worktree repo");
         let index = worktree_repo.index().expect("open linked index");
@@ -5746,12 +7683,21 @@ mod tests {
             .iter()
             .map(|entry| entry.path)
             .collect::<BTreeSet<_>>();
-        assert!(indexed.contains(&raw));
-        assert!(indexed.contains(replacement.as_bytes()));
+        assert!(!indexed.contains(&raw));
+        assert!(!indexed.contains(replacement.as_bytes()));
+        assert!(captured
+            .binding
+            .changed_paths
+            .contains(&PathBuf::from(OsString::from_vec(raw))));
+        assert!(captured
+            .binding
+            .changed_paths
+            .contains(&PathBuf::from(replacement)));
+        assert!(!captured.patch.is_empty());
     }
 
     #[test]
-    fn patch_guard_cleans_early_inspection_failure_and_rejects_exact_capture_boundary() {
+    fn patch_guard_cleans_unused_reservation_and_rejects_exact_capture_boundary() {
         let temp = TempDir::new().expect("tempdir");
         let root =
             SecureOutputRoot::create_new(&temp.path().join("patches")).expect("create patch root");
@@ -5759,31 +7705,9 @@ mod tests {
             .reserve(OsStr::new("agent-a.patch"))
             .expect("reserve patch");
         let path = slot.path().to_path_buf();
-        let agent = AgentPlan {
-            id: "agent-a".to_string(),
-            paths: vec![PathBuf::from("README.md")],
-            semantic_symbols: Vec::new(),
-            semantic_modules: Vec::new(),
-            env: BTreeMap::new(),
-            timeout: None,
-            command: "true".to_string(),
-            depends_on: Vec::new(),
-            working_directory: None,
-            validation_commands: Vec::new(),
-        };
-        let mut summary = AgentRunSummary::pending(&agent);
+        drop(PatchOutputGuard::new(slot));
 
-        inspect_agent_changes_at_path(
-            &agent,
-            &mut summary,
-            temp.path(),
-            Some(slot),
-            &Oid::zero(),
-            OrchestrationExecutionRuntime::NonpublishableSimulation,
-        );
-
-        assert_eq!(summary.status, AgentRunStatus::Failed);
-        assert!(!path.exists(), "early return left a reserved patch leaf");
+        assert!(!path.exists(), "drop left an unused reserved patch leaf");
         assert!(validate_patch_output_size(PATCH_OUTPUT_MAX_BYTES - 1).is_ok());
         assert!(validate_patch_output_size(PATCH_OUTPUT_MAX_BYTES).is_err());
     }
@@ -5816,6 +7740,7 @@ mod tests {
             success: false,
             agents: Vec::new(),
             repo_validation: Vec::new(),
+            repo_validation_target: None,
             released_claims: Vec::new(),
             release_errors: Vec::new(),
             released_semantic_intents: Vec::new(),
