@@ -405,6 +405,11 @@ fn status_and_collect_fail_closed_across_absent_active_and_tampered_runs() -> Re
         &active_dir.join("scan-report.json"),
         &json!({"status": "active"}),
     )?;
+    let active_secret = "inbox-active-final-report-secret";
+    fs::write(
+        active_dir.join("final-report.json"),
+        format!("{{malformed:{active_secret}:{}\n", repo_path.display()),
+    )?;
     let active = run_success_json(&[
         "inbox",
         "status",
@@ -414,8 +419,12 @@ fn status_and_collect_fail_closed_across_absent_active_and_tampered_runs() -> Re
         "--json",
     ])?;
     assert_eq!(active["artifacts"]["scan_report"], true);
+    assert_eq!(active["artifacts"]["final_report"], true);
     assert_eq!(active["artifacts"]["item_plan_count"], 0);
     assert!(active["final_report"].is_null());
+    let active_serialized = serde_json::to_string(&active).context("serialize active status")?;
+    assert!(!active_serialized.contains(active_secret));
+    assert!(!active_serialized.contains(&repo_path.display().to_string()));
     let active_collect = run_failure_stderr(&[
         "inbox",
         "collect",

@@ -1725,28 +1725,43 @@ fn summarize_run(
     identity: FileIdentity,
 ) -> Result<RunArtifactSummary> {
     let final_relative = family.final_report_relative_path();
-    let final_report_path = absolute_run_dir.join(&final_relative);
-    let modified = fs::symlink_metadata(&final_report_path)
+    let modified = fs::symlink_metadata(&absolute_run_dir)
         .and_then(|metadata| metadata.modified())
-        .or_else(|_| {
-            fs::symlink_metadata(&absolute_run_dir).and_then(|metadata| metadata.modified())
-        })
         .unwrap_or(UNIX_EPOCH);
     let public_run_dir = family.run_root().join(&run_id);
     let public_final_report_path = public_run_dir.join(&final_relative);
     let run_id_value = RunId::new(&run_id)?;
-    let marker_exists = fs::symlink_metadata(absolute_run_dir.join(FINALIZATION_MARKER)).is_ok();
-    let strict = if marker_exists {
-        ArtifactRunReader::open(&repository.worktree, family, &run_id_value)
-    } else {
-        Err(anyhow::anyhow!(
-            "artifact finalization marker {} is missing",
-            FINALIZATION_MARKER
-        ))
-    };
+    let run = SafeRoot::open_existing(&absolute_run_dir)?;
+    let final_report_exists = metadata_only_report_exists(&run, &final_relative);
+    let marker_exists = run.direct_child_exists(FINALIZATION_MARKER)?;
 
-    match strict {
-        Ok(reader) => {
+    match marker_exists
+        .then(|| ArtifactRunReader::open(&repository.worktree, family, &run_id_value))
+    {
+        None => Ok(RunArtifactSummary {
+            run_id,
+            run_dir: public_run_dir,
+            final_report_path: public_final_report_path,
+            final_report_exists,
+            final_report_status: "active".to_string(),
+            final_report_success: None,
+            final_report_readable: false,
+            final_report_corrupt: false,
+            final_report_error: None,
+            finalized: false,
+            publishable: false,
+            provenance_valid: false,
+            artifact_digests_verified: false,
+            finalization_error: Some(
+                "artifact run is active or unfinalized; finalization marker is missing".to_string(),
+            ),
+            modified,
+            identity,
+        }),
+        Some(Ok(reader)) => {
+            let modified = fs::symlink_metadata(absolute_run_dir.join(&final_relative))
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(modified);
             let contents = reader.read(&final_relative)?;
             let (status, success, readable, corrupt, error) = parse_report(&contents);
             let marker = reader.finalization();
@@ -1769,53 +1784,52 @@ fn summarize_run(
                 identity,
             })
         }
-        Err(finalization_error) => {
-            let (exists, status, success, readable, corrupt, error) =
-                read_unfinalized_report(&absolute_run_dir, &final_relative);
-            Ok(RunArtifactSummary {
-                run_id,
-                run_dir: public_run_dir,
-                final_report_path: public_final_report_path,
-                final_report_exists: exists,
-                final_report_status: status,
-                final_report_success: success,
-                final_report_readable: readable,
-                final_report_corrupt: corrupt,
-                final_report_error: error,
-                finalized: false,
-                publishable: false,
-                provenance_valid: false,
-                artifact_digests_verified: false,
-                finalization_error: Some(finalization_error.to_string()),
-                modified,
-                identity,
-            })
-        }
+        Some(Err(_)) => Ok(RunArtifactSummary {
+            run_id,
+            run_dir: public_run_dir,
+            final_report_path: public_final_report_path,
+            final_report_exists,
+            final_report_status: "unverifiable_finalization".to_string(),
+            final_report_success: None,
+            final_report_readable: false,
+            final_report_corrupt: true,
+            final_report_error: None,
+            finalized: false,
+            publishable: false,
+            provenance_valid: false,
+            artifact_digests_verified: false,
+            finalization_error: Some(
+                "artifact finalization marker is present but verification failed".to_string(),
+            ),
+            modified,
+            identity,
+        }),
     }
 }
 
-fn read_unfinalized_report(
-    run_dir: &Path,
-    relative: &Path,
-) -> (bool, String, Option<bool>, bool, bool, Option<String>) {
-    let path = run_dir.join(relative);
-    if fs::symlink_metadata(&path).is_err() {
-        return (false, "missing".to_string(), None, false, false, None);
-    }
-    match BoundedRegularReader::read_relative(run_dir, relative, MAX_ARTIFACT_FILE_BYTES) {
-        Ok(contents) => {
-            let (status, success, readable, corrupt, error) = parse_report(&contents);
-            (true, status, success, readable, corrupt, error)
+fn metadata_only_report_exists(run: &SafeRoot, relative: &Path) -> bool {
+    (|| -> Result<bool> {
+        let file_name = relative
+            .file_name()
+            .context("artifact report path has no final file name")?;
+        let mut current = run.clone();
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                let Component::Normal(name) = component else {
+                    return Ok(false);
+                };
+                let binding = current.bind_existing_managed_direct_child_directory(name)?;
+                let next = SafeRoot::open_existing(binding.path())?;
+                if next.identity() != binding.identity() {
+                    bail!("artifact report parent identity changed during metadata inspection");
+                }
+                binding.verify(&current)?;
+                current = next;
+            }
         }
-        Err(error) => (
-            true,
-            "read_error".to_string(),
-            None,
-            false,
-            false,
-            Some(error.to_string()),
-        ),
-    }
+        current.direct_child_exists(file_name)
+    })()
+    .unwrap_or(false)
 }
 
 fn parse_report(contents: &[u8]) -> (String, Option<bool>, bool, bool, Option<String>) {
@@ -3125,6 +3139,9 @@ mod tests {
         assert!(summary.provenance_valid);
         assert!(summary.artifact_digests_verified);
         assert_eq!(summary.final_report_status, "succeeded");
+        assert_eq!(summary.final_report_success, Some(true));
+        assert!(summary.final_report_readable);
+        assert!(!summary.final_report_corrupt);
 
         let run = run_dir(&repo, RunArtifactFamily::Autopilot, &run_id);
         assert_eq!(mode(&run), 0o700);
@@ -3388,7 +3405,7 @@ mod tests {
             .expect("latest")
             .run
             .expect("run");
-        assert_eq!(summary.final_report_status, "succeeded");
+        assert_active_unfinalized_summary(&summary, true);
         assert!(!summary.finalized);
         assert!(!summary.publishable);
         assert!(!summary.provenance_valid);
@@ -3406,13 +3423,160 @@ mod tests {
     }
 
     #[test]
+    fn marker_missing_report_bytes_are_never_parsed_or_exposed() {
+        let (_temp, repo) = committed_repo();
+        let secret = "marker-missing-secret-value";
+        let absolute = repo.display().to_string();
+        let fixtures = [
+            (
+                "valid-unfinalized",
+                format!("{{\"status\":\"{secret}\",\"success\":true,\"path\":{absolute:?}}}\n"),
+            ),
+            (
+                "malformed-unfinalized",
+                format!("{{not-json:{secret}:{absolute}\n"),
+            ),
+            ("secret-unfinalized", format!("{secret}\n{absolute}\n")),
+        ];
+
+        for (run_id, contents) in fixtures {
+            let run_id = RunId::new(run_id).expect("run id");
+            ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+            fs::write(
+                final_report_path(&repo, RunArtifactFamily::Inbox, &run_id),
+                contents,
+            )
+            .expect("unfinalized report fixture");
+        }
+
+        let list = list_runs(&repo, RunArtifactFamily::Inbox).expect("list unfinalized runs");
+        assert_eq!(list.runs.len(), 3);
+        for summary in &list.runs {
+            assert_active_unfinalized_summary(summary, true);
+        }
+        let serialized = serde_json::to_string(&list).expect("serialize public listing");
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains(&absolute));
+        assert!(!serialized.contains("not-json"));
+    }
+
+    #[test]
+    fn metadata_only_listing_never_creates_a_missing_report_parent() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("missing-consult-parent").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Consult, &run_id).expect("reserve");
+        let trusted = run_dir(&repo, RunArtifactFamily::Consult, &run_id).join("trusted");
+        assert!(!trusted.exists());
+
+        let summary = latest_run(&repo, RunArtifactFamily::Consult)
+            .expect("metadata-only latest")
+            .run
+            .expect("run");
+        assert_active_unfinalized_summary(&summary, false);
+        assert!(
+            !trusted.exists(),
+            "metadata-only listing must not create a missing report parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_missing_symlink_and_special_reports_are_metadata_only() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = committed_repo();
+        let secret = "external-final-report-secret";
+        let external = temp.path().join("external-final-report.json");
+        write_private(&external, secret.as_bytes());
+
+        let symlink_id = RunId::new("unfinalized-symlink-report").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &symlink_id).expect("reserve");
+        symlink(
+            &external,
+            final_report_path(&repo, RunArtifactFamily::Inbox, &symlink_id),
+        )
+        .expect("symlink report");
+
+        let fifo_id = RunId::new("unfinalized-fifo-report").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &fifo_id).expect("reserve");
+        let fifo_path = final_report_path(&repo, RunArtifactFamily::Inbox, &fifo_id);
+        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let directory_id = RunId::new("unfinalized-directory-report").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &directory_id).expect("reserve");
+        fs::create_dir(final_report_path(
+            &repo,
+            RunArtifactFamily::Inbox,
+            &directory_id,
+        ))
+        .expect("directory report");
+
+        let list = list_runs(&repo, RunArtifactFamily::Inbox).expect("metadata-only listing");
+        assert_eq!(list.runs.len(), 3);
+        for summary in &list.runs {
+            assert_active_unfinalized_summary(summary, true);
+        }
+        let serialized = serde_json::to_string(&list).expect("serialize public listing");
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains(&external.display().to_string()));
+        assert!(!serialized.contains(&repo.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn present_but_invalid_marker_never_falls_back_to_report_parsing() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("invalid-marker-valid-report").expect("run id");
+        ensure_run_dir_available(&repo, RunArtifactFamily::Inbox, &run_id).expect("reserve");
+        let secret = "invalid-marker-secret-value";
+        let absolute = repo.display().to_string();
+        write_private(
+            &final_report_path(&repo, RunArtifactFamily::Inbox, &run_id),
+            format!(
+                "{{\"status\":\"succeeded\",\"success\":true,\"secret\":\"{secret}\",\"path\":{absolute:?}}}\n"
+            )
+            .as_bytes(),
+        );
+        write_private(
+            &run_dir(&repo, RunArtifactFamily::Inbox, &run_id).join(FINALIZATION_MARKER),
+            format!("{{invalid-marker:{secret}:{absolute}\n").as_bytes(),
+        );
+
+        let summary = latest_run(&repo, RunArtifactFamily::Inbox)
+            .expect("latest")
+            .run
+            .expect("run");
+        assert!(summary.final_report_exists);
+        assert_eq!(summary.final_report_status, "unverifiable_finalization");
+        assert_eq!(summary.final_report_success, None);
+        assert!(!summary.final_report_readable);
+        assert!(summary.final_report_corrupt);
+        assert_eq!(summary.final_report_error, None);
+        assert!(!summary.finalized);
+        assert!(!summary.publishable);
+        assert!(!summary.provenance_valid);
+        assert!(!summary.artifact_digests_verified);
+        assert_eq!(
+            summary.finalization_error.as_deref(),
+            Some("artifact finalization marker is present but verification failed")
+        );
+        let serialized = serde_json::to_string(&summary).expect("serialize public summary");
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains(&absolute));
+    }
+
+    #[test]
     fn oversized_report_and_run_root_entry_budget_fail_boundedly() {
         let (_temp, repo) = committed_repo();
         let run_id = RunId::new("large-run").expect("run id");
         ensure_run_dir_available(&repo, RunArtifactFamily::Consult, &run_id).expect("reserve");
         let report = final_report_path(&repo, RunArtifactFamily::Consult, &run_id);
-        fs::create_dir_all(report.parent().expect("consult report parent"))
-            .expect("consult report directory");
+        let report_parent = report.parent().expect("consult report parent");
+        fs::create_dir_all(report_parent).expect("consult report directory");
+        #[cfg(unix)]
+        fs::set_permissions(report_parent, fs::Permissions::from_mode(0o700))
+            .expect("private consult report directory");
         fs::write(
             report,
             vec![b'x'; usize::try_from(MAX_ARTIFACT_FILE_BYTES).expect("limit") + 1],
@@ -3422,8 +3586,7 @@ mod tests {
             .expect("latest")
             .run
             .expect("run");
-        assert_eq!(summary.final_report_status, "read_error");
-        assert!(!summary.final_report_readable);
+        assert_active_unfinalized_summary(&summary, true);
 
         let root = run_root(&repo, RunArtifactFamily::Consult);
         for index in 0..MAX_RUN_ROOT_ENTRIES {
@@ -3830,6 +3993,23 @@ mod tests {
     fn write_private(path: &Path, contents: &[u8]) {
         fs::write(path, contents).expect("private file");
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private mode");
+    }
+
+    fn assert_active_unfinalized_summary(summary: &RunArtifactSummary, report_exists: bool) {
+        assert_eq!(summary.final_report_exists, report_exists);
+        assert_eq!(summary.final_report_status, "active");
+        assert_eq!(summary.final_report_success, None);
+        assert!(!summary.final_report_readable);
+        assert!(!summary.final_report_corrupt);
+        assert_eq!(summary.final_report_error, None);
+        assert!(!summary.finalized);
+        assert!(!summary.publishable);
+        assert!(!summary.provenance_valid);
+        assert!(!summary.artifact_digests_verified);
+        assert_eq!(
+            summary.finalization_error.as_deref(),
+            Some("artifact run is active or unfinalized; finalization marker is missing")
+        );
     }
 
     #[cfg(unix)]
