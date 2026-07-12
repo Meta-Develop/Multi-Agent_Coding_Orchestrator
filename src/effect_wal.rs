@@ -14,6 +14,7 @@ use crate::{
         random_identifier, sha256_hex, AuthenticationDomain, AuthenticationTag, BoundStateLock,
         RepositoryAuthenticator,
     },
+    authenticated_snapshot::SnapshotSpec,
     safe_state::{AtomicStateWriter, BoundedRegularReader, SafeRoot},
     state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalRecord, JournalSpec},
 };
@@ -54,6 +55,19 @@ impl EffectWalSpec for DefaultEffectWalSpec {
     const EFFECT_FORMAT_VERSION: u32 = 1;
     const LOCATOR_DOMAIN: AuthenticationDomain =
         AuthenticationDomain::new(b"MACO\0effect-wal-locator\0v1\0");
+}
+
+// External-effect integration stores one authenticated logical snapshot per
+// stable source-action key in this shared namespace. The independent EffectWal
+// compatibility API remains available during the migration, but new snapshot
+// users receive an explicit namespace-wide finite retention budget.
+impl SnapshotSpec for DefaultEffectWalSpec {
+    const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+    const LOCATOR_DOMAIN: AuthenticationDomain =
+        AuthenticationDomain::new(b"MACO\0external-effect-snapshot-locator\0v1\0");
+    const MAX_LOGICAL_STORES: usize = 4_096;
+    const MAX_ROOT_ENTRIES: usize = 16_384;
+    const MAX_PHYSICAL_INSTANCES: usize = 8_192;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

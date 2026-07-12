@@ -203,6 +203,15 @@ recovers forward from the bound candidate or leaves the old locator
 authoritative. Old journals remain present and are verified on open. A missing
 locator, a substituted or deleted retained journal, an unbound physical
 journal, or locator replay beyond the single-record crash window fails closed.
+Snapshot inventory is namespace-wide: every signed logical locator and pending
+initialization/rollover intent contributes to one bounded union of physical
+journals. Namespace-specific quotas bound logical stores, total root entries,
+and retained physical journals; the external-effect namespace permits 4,096
+logical source-action stores within its larger finite root budget. Capacity is
+checked before a new logical store or rollover candidate is created. Reaching a
+quota fails closed and requires operator archival or other explicit manual
+intervention; MACO does not auto-delete exactly-once receipts or retry the
+external effect to recover capacity.
 Managed-worktree snapshots retain only active incarnations. Retired nonce lease
 files are queued with signed inode identities and scavenged only after an
 exclusive lock proves them inactive; active, foreign, or rebound lease paths

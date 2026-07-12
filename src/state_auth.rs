@@ -4,8 +4,8 @@
 //! binding evidence and domain-separated sign/verify operations.
 
 use crate::safe_state::{
-    identity_for_path, AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock,
-    SafeRoot,
+    identity_for_path, AtomicStateWriter, BoundedRegularReader, ExistingExclusiveLock,
+    FileIdentity, KernelStateLock, SafeRoot,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -182,6 +182,25 @@ impl BoundStateLock {
     pub(crate) fn try_acquire_exclusive(root: &SafeRoot, name: &str) -> Result<Self> {
         let lock = KernelStateLock::try_acquire_exclusive_direct(root, name)?;
         Self::from_lock(root, lock)
+    }
+
+    pub(crate) fn try_acquire_existing_exclusive(root: &SafeRoot, name: &str) -> Result<Self> {
+        match KernelStateLock::try_acquire_existing_exclusive_direct(root, name)? {
+            ExistingExclusiveLock::Acquired(lock) => Self::from_lock(root, lock),
+            ExistingExclusiveLock::Busy => bail!("state lock is active elsewhere"),
+            ExistingExclusiveLock::Missing => bail!("required existing state lock is missing"),
+        }
+    }
+
+    pub(crate) fn try_acquire_optional_existing_exclusive(
+        root: &SafeRoot,
+        name: &str,
+    ) -> Result<Option<Self>> {
+        match KernelStateLock::try_acquire_existing_exclusive_direct(root, name)? {
+            ExistingExclusiveLock::Acquired(lock) => Self::from_lock(root, lock).map(Some),
+            ExistingExclusiveLock::Busy => bail!("state lock is active elsewhere"),
+            ExistingExclusiveLock::Missing => Ok(None),
+        }
     }
 
     fn from_lock(root: &SafeRoot, lock: KernelStateLock) -> Result<Self> {

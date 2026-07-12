@@ -26,13 +26,18 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, fs::File, marker::PhantomData};
 
-const MAX_SNAPSHOT_ROOT_ENTRIES: usize = 512;
-const MAX_PHYSICAL_SNAPSHOT_INSTANCES: usize = 130;
-
 pub(crate) trait SnapshotSpec: JournalSpec {
     const SNAPSHOT_FORMAT_VERSION: u32;
     const SNAPSHOT_PHASE: &'static str = "snapshot";
     const LOCATOR_DOMAIN: AuthenticationDomain;
+    /// Maximum number of logical stores sharing this physical namespace.
+    const MAX_LOGICAL_STORES: usize = 1;
+    /// Namespace-wide bound across every logical store, including locators,
+    /// intents, locks, and physical journal directories.
+    const MAX_ROOT_ENTRIES: usize = 160;
+    /// Namespace-wide physical retention bound. No automatic garbage
+    /// collection is performed because old journals are rollback evidence.
+    const MAX_PHYSICAL_INSTANCES: usize = 129;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -148,6 +153,7 @@ where
         } else if root.direct_child_exists(snapshot_init_name(logical_id))? {
             let _ = read_init_intent::<S>(authenticator, &root, logical_id)?;
         }
+        verify_root_inventory::<S>(authenticator, &root, &root_lock)?;
         root_lock.verify(&root)?;
         Ok(initialized)
     }
@@ -164,7 +170,7 @@ where
     ) -> Result<()> {
         validate_logical_id::<S>(logical_id)?;
         let root = AuthenticatedStateJournal::<S>::existing_root(authenticator)?;
-        root.verify()?;
+        let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
         let locator = read_locator::<S>(authenticator, &root, logical_id)?;
         if &locator.active_identity != identity || locator.generation != generation {
             bail!("active authenticated snapshot locator does not match its retirement tombstone");
@@ -173,8 +179,8 @@ where
             let _ = read_rollover_intent::<S>(authenticator, &root, logical_id)?;
             bail!("authenticated snapshot rollover must be recovered before offline inspection");
         }
-        verify_physical_inventory::<S>(&root, &locator)?;
-        root.verify()?;
+        verify_root_inventory::<S>(authenticator, &root, &root_lock)?;
+        root_lock.verify(&root)?;
         authenticator.verify_epoch()
     }
 
@@ -191,15 +197,17 @@ where
         }
         let root = AuthenticatedStateJournal::<S>::existing_root(authenticator)?;
         let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
-        if root.direct_child_exists(snapshot_locator_name(logical_id))? {
-            return Ok(false);
-        }
-        if !root.direct_child_exists(snapshot_init_name(logical_id))? {
-            return Ok(false);
-        }
-        read_init_intent::<S>(authenticator, &root, logical_id)?;
+        let pending = if root.direct_child_exists(snapshot_locator_name(logical_id))? {
+            false
+        } else if root.direct_child_exists(snapshot_init_name(logical_id))? {
+            read_init_intent::<S>(authenticator, &root, logical_id)?;
+            true
+        } else {
+            false
+        };
+        verify_root_inventory::<S>(authenticator, &root, &root_lock)?;
         root_lock.verify(&root)?;
-        Ok(true)
+        Ok(pending)
     }
 
     pub(crate) fn create(
@@ -250,17 +258,25 @@ where
             retained_instances: Vec::new(),
             mac: AuthenticationTag::zero(),
         };
+        let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
         write_locator::<S>(
             journal.authenticator(),
             &store_root,
             &store_lock,
+            &root_lock,
             &mut locator,
         )?;
         if take_snapshot_fault(SnapshotFaultPoint::AfterInitial) {
             bail!("injected authenticated snapshot initialization fault after locator publication");
         }
-        remove_init_intent::<S>(journal.authenticator(), &store_root, &store_lock, &intent)?;
-        verify_physical_inventory::<S>(&store_root, &locator)?;
+        remove_init_intent::<S>(
+            journal.authenticator(),
+            &store_root,
+            &store_lock,
+            &root_lock,
+            &intent,
+        )?;
+        verify_root_inventory::<S>(journal.authenticator(), &store_root, &root_lock)?;
         Ok(Self {
             journal,
             store_root,
@@ -276,7 +292,31 @@ where
         authenticator: RepositoryAuthenticator,
         logical_id: &str,
     ) -> Result<Self> {
+        validate_logical_id::<S>(logical_id)?;
         let store_root = AuthenticatedStateJournal::<S>::existing_root(&authenticator)?;
+        let store_lock = BoundStateLock::try_acquire_optional_existing_exclusive(
+            &store_root,
+            &snapshot_lock_name(logical_id),
+        )
+        .context("authenticated snapshot store is active elsewhere or incomplete")?;
+        let store_lock = match store_lock {
+            Some(store_lock) => store_lock,
+            None => {
+                // No logical lock exists to order before the namespace lock. A
+                // root-only inspection can therefore distinguish an empty
+                // namespace from a locator whose stable logical lock vanished.
+                let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
+                root_lock.verify(&store_root)?;
+                if !store_root.direct_child_exists(snapshot_locator_name(logical_id))? {
+                    bail!(
+                        "initialized authenticated snapshot namespace '{logical_id}' has no signed locator"
+                    );
+                }
+                bail!(
+                    "initialized authenticated snapshot namespace '{logical_id}' is missing its stable store lock"
+                );
+            }
+        };
         let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
         if !store_root.direct_child_exists(snapshot_locator_name(logical_id))? {
             bail!(
@@ -284,15 +324,23 @@ where
             );
         }
         root_lock.verify(&store_root)?;
-        drop(root_lock);
-        let store_lock =
-            BoundStateLock::try_acquire_exclusive(&store_root, &snapshot_lock_name(logical_id))
-                .context("authenticated snapshot store is active elsewhere")?;
         let mut locator = read_locator::<S>(&authenticator, &store_root, logical_id)?;
-        let authenticator =
-            recover_rollover::<S, T>(authenticator, &store_root, &store_lock, &mut locator)?;
-        verify_physical_inventory::<S>(&store_root, &locator)?;
-        recover_init_after_locator::<S>(&authenticator, &store_root, &store_lock, &locator)?;
+        let authenticator = recover_rollover::<S, T>(
+            authenticator,
+            &store_root,
+            &store_lock,
+            &root_lock,
+            &mut locator,
+        )?;
+        recover_init_after_locator::<S>(
+            &authenticator,
+            &store_root,
+            &store_lock,
+            &root_lock,
+            &locator,
+        )?;
+        verify_root_inventory::<S>(&authenticator, &store_root, &root_lock)?;
+        drop(root_lock);
         let authenticator = verify_retained_instances::<S, T>(authenticator, &locator)?;
         let journal =
             AuthenticatedStateJournal::<S>::open(authenticator, &locator.active_identity)?;
@@ -303,7 +351,8 @@ where
             logical_id.to_string(),
             &mut locator,
         )?;
-        verify_physical_inventory::<S>(&store.store_root, &store.locator)?;
+        let root_lock = BoundStateLock::acquire(&store.store_root, S::ROOT_LOCK_NAME)?;
+        verify_root_inventory::<S>(store.journal.authenticator(), &store.store_root, &root_lock)?;
         Ok(store)
     }
 
@@ -367,7 +416,15 @@ where
             locator.generation = current.generation;
             locator.token = current.token;
             locator.terminal_mac = terminal_mac;
-            write_locator::<S>(journal.authenticator(), &store_root, &store_lock, locator)?;
+            let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
+            write_locator::<S>(
+                journal.authenticator(),
+                &store_root,
+                &store_lock,
+                &root_lock,
+                locator,
+            )?;
+            verify_root_inventory::<S>(journal.authenticator(), &store_root, &root_lock)?;
         } else {
             bail!("authenticated snapshot locator rollback exceeds the one-record crash window");
         }
@@ -433,12 +490,15 @@ where
             .last()
             .map(|record| record.mac.clone())
             .context("authenticated snapshot commit lost its terminal MAC")?;
+        let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
         write_locator::<S>(
             self.journal.authenticator(),
             &self.store_root,
             &self.store_lock,
+            &root_lock,
             &mut self.locator,
         )?;
+        verify_root_inventory::<S>(self.journal.authenticator(), &self.store_root, &root_lock)?;
         Ok(&self.current)
     }
 
@@ -487,12 +547,19 @@ where
             next_terminal_mac: None,
             mac: AuthenticationTag::zero(),
         };
+        let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
+        let usage =
+            verify_root_inventory::<S>(self.journal.authenticator(), &self.store_root, &root_lock)?;
+        ensure_rollover_capacity::<S>(usage)?;
         write_rollover_intent::<S>(
             self.journal.authenticator(),
             &self.store_root,
             &self.store_lock,
+            &root_lock,
             &mut intent,
         )?;
+        verify_root_inventory::<S>(self.journal.authenticator(), &self.store_root, &root_lock)?;
+        drop(root_lock);
         if take_snapshot_fault(SnapshotFaultPoint::AfterRolloverIntent) {
             bail!("injected authenticated snapshot rollover fault after prepared intent");
         }
@@ -514,12 +581,16 @@ where
         intent.phase = SnapshotRolloverPhase::Ready;
         intent.next_identity = Some(journal.identity().clone());
         intent.next_terminal_mac = Some(terminal_mac.clone());
+        let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
         write_rollover_intent::<S>(
             journal.authenticator(),
             &self.store_root,
             &self.store_lock,
+            &root_lock,
             &mut intent,
         )?;
+        verify_root_inventory::<S>(journal.authenticator(), &self.store_root, &root_lock)?;
+        drop(root_lock);
         if take_snapshot_fault(SnapshotFaultPoint::BeforeRollover) {
             bail!("injected authenticated snapshot rollover fault before atomic locator switch");
         }
@@ -547,19 +618,22 @@ where
             retained_instances,
             mac: AuthenticationTag::zero(),
         };
+        let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
         write_locator::<S>(
             journal.authenticator(),
             &self.store_root,
             &self.store_lock,
+            &root_lock,
             &mut locator,
         )?;
         remove_rollover_intent::<S>(
             journal.authenticator(),
             &self.store_root,
             &self.store_lock,
+            &root_lock,
             &intent,
         )?;
-        verify_physical_inventory::<S>(&self.store_root, &locator)?;
+        verify_root_inventory::<S>(journal.authenticator(), &self.store_root, &root_lock)?;
         Ok(Self {
             journal,
             store_root: self.store_root,
@@ -578,52 +652,86 @@ fn begin_snapshot_initialization<S: SnapshotSpec>(
 ) -> Result<(SafeRoot, BoundStateLock, SnapshotInitIntent)> {
     validate_logical_id::<S>(logical_id)?;
     let root = AuthenticatedStateJournal::<S>::create_root(authenticator)?;
-    let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
-    root_lock.verify(&root)?;
     let locator_name = snapshot_locator_name(logical_id);
+    let init_name = snapshot_init_name(logical_id);
+    let store_lock_name = snapshot_lock_name(logical_id);
+    // Root-only bootstrap inspection never waits on a logical store lock. A
+    // missing stable lock file is created under the root lock, released, then
+    // reacquired before the root lock so every state mutation follows the
+    // store-lock -> root-lock order used by commit, rollover, and recovery.
+    let bootstrap_root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+    let usage = verify_root_inventory::<S>(authenticator, &root, &bootstrap_root_lock)?;
     if root.direct_child_exists(&locator_name)? {
         bail!("authenticated snapshot logical store is already initialized");
     }
-    let init_name = snapshot_init_name(logical_id);
-    let store_lock_name = snapshot_lock_name(logical_id);
-    let init_exists = root.direct_child_exists(&init_name)?;
-    let store_lock_exists = root.direct_child_exists(&store_lock_name)?;
-
-    let (store_lock, mut intent) = if init_exists {
-        let store_lock = BoundStateLock::try_acquire_exclusive(&root, &store_lock_name)
-            .context("authenticated snapshot initialization is active elsewhere")?;
-        let mut intent = read_init_intent::<S>(authenticator, &root, logical_id)?;
-        remove_abandoned_initialization_candidate::<S>(&root, &root_lock, &store_lock, &intent)?;
-        intent.attempt = intent
-            .attempt
-            .checked_add(1)
-            .context("authenticated snapshot initialization attempt overflowed")?;
-        if intent.attempt > 8 {
-            bail!("authenticated snapshot initialization exceeded its bounded retry count");
-        }
-        intent.physical_id = random_identifier()?;
-        (store_lock, intent)
+    let init_existed = root.direct_child_exists(&init_name)?;
+    let store_lock_existed = root.direct_child_exists(&store_lock_name)?;
+    let created_placeholder = if store_lock_existed {
+        false
     } else {
-        if store_lock_exists {
-            bail!(
-                "authenticated snapshot locator is missing after initialization; refusing recreation"
-            );
+        if init_existed {
+            if usage.entries.saturating_add(2) > S::MAX_ROOT_ENTRIES {
+                bail!("authenticated snapshot namespace cannot recover its logical bootstrap");
+            }
+            let _ = read_init_intent::<S>(authenticator, &root, logical_id)?;
+        } else {
+            ensure_new_logical_capacity::<S>(usage, 3)?;
+            let mut intent = SnapshotInitIntent {
+                version: S::SNAPSHOT_FORMAT_VERSION,
+                logical_id: logical_id.to_string(),
+                attempt: 1,
+                physical_id: random_identifier()?,
+                mac: AuthenticationTag::zero(),
+            };
+            write_init_intent::<S>(authenticator, &root, &bootstrap_root_lock, &mut intent)?;
         }
-        let mut intent = SnapshotInitIntent {
-            version: S::SNAPSHOT_FORMAT_VERSION,
-            logical_id: logical_id.to_string(),
-            attempt: 1,
-            physical_id: random_identifier()?,
-            mac: AuthenticationTag::zero(),
-        };
-        write_init_intent::<S>(authenticator, &root, &root_lock, &mut intent)?;
-        let store_lock = BoundStateLock::try_acquire_exclusive(&root, &store_lock_name)
-            .context("authenticated snapshot initialization lock could not be acquired")?;
-        (store_lock, intent)
+        let placeholder = BoundStateLock::try_acquire_exclusive(&root, &store_lock_name)
+            .context("authenticated snapshot initialization lock could not be reserved")?;
+        placeholder.verify(&root)?;
+        drop(placeholder);
+        true
+    };
+    bootstrap_root_lock.verify(&root)?;
+    drop(bootstrap_root_lock);
+
+    let store_lock = BoundStateLock::try_acquire_existing_exclusive(&root, &store_lock_name)
+        .context("authenticated snapshot initialization is active elsewhere")?;
+    let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+    verify_root_inventory::<S>(authenticator, &root, &root_lock)?;
+    if root.direct_child_exists(&locator_name)? {
+        bail!("authenticated snapshot logical store is already initialized");
+    }
+    let init_exists = root.direct_child_exists(&init_name)?;
+
+    let mut intent = if init_exists {
+        let mut intent = read_init_intent::<S>(authenticator, &root, logical_id)?;
+        let continuing_fresh_bootstrap = created_placeholder
+            && !root.direct_child_exists(&intent.physical_id)?
+            && intent.attempt == 1;
+        if !continuing_fresh_bootstrap {
+            remove_abandoned_initialization_candidate::<S>(
+                &root,
+                &root_lock,
+                &store_lock,
+                &intent,
+            )?;
+            intent.attempt = intent
+                .attempt
+                .checked_add(1)
+                .context("authenticated snapshot initialization attempt overflowed")?;
+            if intent.attempt > 8 {
+                bail!("authenticated snapshot initialization exceeded its bounded retry count");
+            }
+            intent.physical_id = random_identifier()?;
+        }
+        intent
+    } else {
+        bail!("authenticated snapshot stable lock has no signed initialization intent");
     };
     if init_exists {
         write_init_intent::<S>(authenticator, &root, &root_lock, &mut intent)?;
     }
+    verify_root_inventory::<S>(authenticator, &root, &root_lock)?;
     root_lock.verify(&root)?;
     store_lock.verify(&root)?;
     drop(root_lock);
@@ -718,7 +826,15 @@ fn read_init_intent<S: SnapshotSpec>(
         snapshot_init_name(logical_id),
         S::MAX_RECORD_BYTES,
     )?;
-    let intent: SnapshotInitIntent = serde_json::from_slice(&bytes)
+    decode_init_intent::<S>(authenticator, logical_id, &bytes)
+}
+
+fn decode_init_intent<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    logical_id: &str,
+    bytes: &[u8],
+) -> Result<SnapshotInitIntent> {
+    let intent: SnapshotInitIntent = serde_json::from_slice(bytes)
         .context("authenticated snapshot initialization intent is malformed")?;
     validate_init_intent::<S>(&intent, logical_id)?;
     authenticator.verify_tag(
@@ -747,35 +863,38 @@ fn write_init_intent<S: SnapshotSpec>(
 fn remove_init_intent<S: SnapshotSpec>(
     authenticator: &RepositoryAuthenticator,
     root: &SafeRoot,
-    lock: &BoundStateLock,
+    store_lock: &BoundStateLock,
+    root_lock: &BoundStateLock,
     expected: &SnapshotInitIntent,
 ) -> Result<()> {
     let observed = read_init_intent::<S>(authenticator, root, &expected.logical_id)?;
     if &observed != expected {
         bail!("authenticated snapshot initialization intent changed before cleanup");
     }
-    lock.verify(root)?;
+    store_lock.verify(root)?;
+    root_lock.verify(root)?;
     fs::remove_file(root.direct_child(snapshot_init_name(&expected.logical_id))?)?;
     File::open(root.path())?.sync_all()?;
-    lock.verify(root)
+    store_lock.verify(root)?;
+    root_lock.verify(root)
 }
 
 fn recover_init_after_locator<S: SnapshotSpec>(
     authenticator: &RepositoryAuthenticator,
     root: &SafeRoot,
     store_lock: &BoundStateLock,
+    root_lock: &BoundStateLock,
     locator: &SnapshotLocator,
 ) -> Result<()> {
     let name = snapshot_init_name(&locator.logical_id);
     if !root.direct_child_exists(&name)? {
         return Ok(());
     }
-    let root_lock = BoundStateLock::acquire(root, S::ROOT_LOCK_NAME)?;
     let intent = read_init_intent::<S>(authenticator, root, &locator.logical_id)?;
     if intent.physical_id != locator.active_identity.run_id {
         bail!("authenticated snapshot locator has a mismatched initialization intent");
     }
-    remove_init_intent::<S>(authenticator, root, store_lock, &intent)?;
+    remove_init_intent::<S>(authenticator, root, store_lock, root_lock, &intent)?;
     root_lock.verify(root)
 }
 
@@ -874,7 +993,15 @@ fn read_rollover_intent<S: SnapshotSpec>(
         snapshot_rollover_name(logical_id),
         rollover_intent_limit::<S>(),
     )?;
-    let intent: SnapshotRolloverIntent = serde_json::from_slice(&bytes)
+    decode_rollover_intent::<S>(authenticator, logical_id, &bytes)
+}
+
+fn decode_rollover_intent<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    logical_id: &str,
+    bytes: &[u8],
+) -> Result<SnapshotRolloverIntent> {
+    let intent: SnapshotRolloverIntent = serde_json::from_slice(bytes)
         .context("authenticated snapshot rollover intent is malformed")?;
     validate_rollover_intent::<S>(&intent, logical_id)?;
     authenticator.verify_repository_binding(&intent.previous_identity.repository)?;
@@ -889,7 +1016,8 @@ fn read_rollover_intent<S: SnapshotSpec>(
 fn write_rollover_intent<S: SnapshotSpec>(
     authenticator: &RepositoryAuthenticator,
     root: &SafeRoot,
-    lock: &BoundStateLock,
+    store_lock: &BoundStateLock,
+    root_lock: &BoundStateLock,
     intent: &mut SnapshotRolloverIntent,
 ) -> Result<()> {
     validate_rollover_intent::<S>(intent, &intent.logical_id)?;
@@ -902,23 +1030,29 @@ fn write_rollover_intent<S: SnapshotSpec>(
     }
     let name = snapshot_rollover_name(&intent.logical_id);
     AtomicStateWriter::scavenge_direct_temps(root, &name)?;
-    AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || lock.verify(root))
+    AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || {
+        store_lock.verify(root)?;
+        root_lock.verify(root)
+    })
 }
 
 fn remove_rollover_intent<S: SnapshotSpec>(
     authenticator: &RepositoryAuthenticator,
     root: &SafeRoot,
-    lock: &BoundStateLock,
+    store_lock: &BoundStateLock,
+    root_lock: &BoundStateLock,
     expected: &SnapshotRolloverIntent,
 ) -> Result<()> {
     let observed = read_rollover_intent::<S>(authenticator, root, &expected.logical_id)?;
     if &observed != expected {
         bail!("authenticated snapshot rollover intent changed before cleanup");
     }
-    lock.verify(root)?;
+    store_lock.verify(root)?;
+    root_lock.verify(root)?;
     fs::remove_file(root.direct_child(snapshot_rollover_name(&expected.logical_id))?)?;
     File::open(root.path())?.sync_all()?;
-    lock.verify(root)
+    store_lock.verify(root)?;
+    root_lock.verify(root)
 }
 
 fn locator_matches_rollover_previous(
@@ -978,7 +1112,8 @@ where
 fn recover_rollover<S, T>(
     authenticator: RepositoryAuthenticator,
     root: &SafeRoot,
-    lock: &BoundStateLock,
+    store_lock: &BoundStateLock,
+    root_lock: &BoundStateLock,
     locator: &mut SnapshotLocator,
 ) -> Result<RepositoryAuthenticator>
 where
@@ -999,7 +1134,8 @@ where
     let candidate_exists = root.direct_child_exists(&intent.candidate_run_id)?;
     if !candidate_exists {
         if locator_is_previous && intent.phase == SnapshotRolloverPhase::Prepared {
-            remove_rollover_intent::<S>(&authenticator, root, lock, &intent)?;
+            remove_rollover_intent::<S>(&authenticator, root, store_lock, root_lock, &intent)?;
+            verify_root_inventory::<S>(&authenticator, root, root_lock)?;
             return Ok(authenticator);
         }
         bail!("signed rollover intent refers to a missing physical journal");
@@ -1020,7 +1156,8 @@ where
                 Some(candidate.identity()),
                 TreeLinkPolicy::RejectLinksAndSpecialFiles,
             )?;
-            remove_rollover_intent::<S>(&authenticator, root, lock, &intent)?;
+            remove_rollover_intent::<S>(&authenticator, root, store_lock, root_lock, &intent)?;
+            verify_root_inventory::<S>(&authenticator, root, root_lock)?;
             return Ok(authenticator);
         }
         bail!("ready rollover candidate has no durable snapshot record");
@@ -1038,7 +1175,13 @@ where
         intent.phase = SnapshotRolloverPhase::Ready;
         intent.next_identity = Some(journal.identity().clone());
         intent.next_terminal_mac = Some(terminal_mac.clone());
-        write_rollover_intent::<S>(journal.authenticator(), root, lock, &mut intent)?;
+        write_rollover_intent::<S>(
+            journal.authenticator(),
+            root,
+            store_lock,
+            root_lock,
+            &mut intent,
+        )?;
     } else if intent.next_identity.as_ref() != Some(journal.identity())
         || intent.next_terminal_mac.as_ref() != Some(&terminal_mac)
     {
@@ -1070,85 +1213,311 @@ where
             retained_instances,
             mac: AuthenticationTag::zero(),
         };
-        write_locator::<S>(journal.authenticator(), root, lock, locator)?;
+        write_locator::<S>(
+            journal.authenticator(),
+            root,
+            store_lock,
+            root_lock,
+            locator,
+        )?;
     }
-    remove_rollover_intent::<S>(journal.authenticator(), root, lock, &intent)?;
+    remove_rollover_intent::<S>(
+        journal.authenticator(),
+        root,
+        store_lock,
+        root_lock,
+        &intent,
+    )?;
+    verify_root_inventory::<S>(journal.authenticator(), root, root_lock)?;
     journal.into_authenticator()
 }
 
-fn verify_physical_inventory<S: SnapshotSpec>(
-    root: &SafeRoot,
-    locator: &SnapshotLocator,
-) -> Result<()> {
-    let mut expected = BTreeMap::<String, FileIdentity>::new();
-    for identity in locator
-        .retained_instances
-        .iter()
-        .map(|anchor| &anchor.identity)
-        .chain(std::iter::once(&locator.active_identity))
-    {
-        if expected
-            .insert(
-                identity.run_id.clone(),
-                identity.run_directory_identity.clone(),
-            )
-            .is_some()
-        {
-            bail!("authenticated snapshot locator repeats a physical journal");
-        }
-    }
-    if expected.len() > MAX_PHYSICAL_SNAPSHOT_INSTANCES {
-        bail!("authenticated snapshot physical journal inventory exceeds its bound");
-    }
+#[derive(Debug, Clone, Copy)]
+struct SnapshotRootUsage {
+    entries: usize,
+    physical_instances: usize,
+    logical_stores: usize,
+}
 
-    root.verify()?;
+fn verify_root_inventory<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    root: &SafeRoot,
+    root_lock: &BoundStateLock,
+) -> Result<SnapshotRootUsage> {
+    if S::MAX_LOGICAL_STORES == 0 || S::MAX_ROOT_ENTRIES == 0 || S::MAX_PHYSICAL_INSTANCES == 0 {
+        bail!("authenticated snapshot namespace capacity must be non-zero");
+    }
+    root_lock.verify(root)?;
     let mut entries = 0_usize;
     let mut observed = BTreeMap::<String, FileIdentity>::new();
+    let mut expected = BTreeMap::<String, FileIdentity>::new();
+    let mut owners = BTreeMap::<String, String>::new();
+    let mut locators = BTreeMap::<String, SnapshotLocator>::new();
+    let mut init_candidates = BTreeMap::<String, String>::new();
+    let mut rollover_intents = BTreeMap::<String, SnapshotRolloverIntent>::new();
+    let mut all_logicals = std::collections::BTreeSet::<String>::new();
+
     for entry in fs::read_dir(root.path()).context("failed to enumerate snapshot journal root")? {
         entries = entries
             .checked_add(1)
             .context("snapshot root entry count overflowed")?;
-        if entries > MAX_SNAPSHOT_ROOT_ENTRIES {
-            bail!("authenticated snapshot root exceeds its bounded entry count");
+        if entries > S::MAX_ROOT_ENTRIES {
+            bail!("authenticated snapshot root reached its namespace-wide entry capacity");
         }
         let entry = entry.context("failed to inspect snapshot root entry")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("authenticated snapshot root entry is not UTF-8"))?;
         let metadata = fs::symlink_metadata(entry.path())?;
-        let entry_name = entry.file_name();
-        let canonical_physical_name = entry_name.to_str().is_some_and(|name| {
-            name.len() == 64
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        });
-        if !metadata.file_type().is_dir() {
-            if canonical_physical_name {
-                bail!("authenticated snapshot physical journal entry is not a directory");
+        let canonical_physical_name = is_canonical_physical_id(&name);
+
+        if metadata.file_type().is_dir() {
+            if !canonical_physical_name {
+                bail!("unexpected directory in authenticated snapshot journal root");
+            }
+            let bound = root.bind_existing_direct_child_directory(&name)?;
+            if observed.insert(name, bound.identity().clone()).is_some() {
+                bail!("authenticated snapshot root contains a duplicate physical journal");
+            }
+            if observed.len() > S::MAX_PHYSICAL_INSTANCES {
+                bail!("authenticated snapshot root reached its physical retention capacity");
             }
             continue;
         }
-        let run_id = entry_name
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("snapshot physical journal name is not UTF-8"))?;
-        if run_id.len() != 64
-            || !run_id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            bail!("unexpected directory in authenticated snapshot journal root");
+
+        if canonical_physical_name {
+            bail!("authenticated snapshot physical journal entry is not a directory");
         }
-        let bound = root.bind_existing_direct_child_directory(&run_id)?;
-        if observed.insert(run_id, bound.identity().clone()).is_some() {
-            bail!("authenticated snapshot root contains a duplicate physical journal");
+
+        if let Some(hash) = snapshot_metadata_hash(&name, ".snapshot-locator-")? {
+            let bytes = BoundedRegularReader::read_direct(root, &name, S::MAX_RECORD_BYTES)?;
+            let wire: SnapshotLocator = serde_json::from_slice(&bytes)
+                .context("authenticated snapshot locator is malformed")?;
+            let locator = decode_locator::<S>(authenticator, &wire.logical_id, &bytes)?;
+            verify_metadata_hash(hash, &locator.logical_id)?;
+            all_logicals.insert(locator.logical_id.clone());
+            if locators
+                .insert(locator.logical_id.clone(), locator.clone())
+                .is_some()
+            {
+                bail!("authenticated snapshot root repeats a logical locator");
+            }
+            for identity in locator
+                .retained_instances
+                .iter()
+                .map(|anchor| &anchor.identity)
+                .chain(std::iter::once(&locator.active_identity))
+            {
+                insert_physical_anchor(&mut expected, &mut owners, &locator.logical_id, identity)?;
+            }
+            continue;
         }
-        if observed.len() > MAX_PHYSICAL_SNAPSHOT_INSTANCES {
-            bail!("authenticated snapshot physical journal inventory exceeds its bound");
+
+        if let Some(hash) = snapshot_metadata_hash(&name, ".snapshot-init-")? {
+            let bytes = BoundedRegularReader::read_direct(root, &name, S::MAX_RECORD_BYTES)?;
+            let wire: SnapshotInitIntent = serde_json::from_slice(&bytes)
+                .context("authenticated snapshot initialization intent is malformed")?;
+            let intent = decode_init_intent::<S>(authenticator, &wire.logical_id, &bytes)?;
+            verify_metadata_hash(hash, &intent.logical_id)?;
+            all_logicals.insert(intent.logical_id.clone());
+            if init_candidates
+                .insert(intent.logical_id.clone(), intent.physical_id.clone())
+                .is_some()
+            {
+                bail!("authenticated snapshot root repeats a logical initialization intent");
+            }
+            insert_pending_physical_anchor(
+                root,
+                &mut expected,
+                &mut owners,
+                &intent.logical_id,
+                &intent.physical_id,
+            )?;
+            continue;
+        }
+
+        if let Some(hash) = snapshot_metadata_hash(&name, ".snapshot-rollover-")? {
+            let bytes =
+                BoundedRegularReader::read_direct(root, &name, rollover_intent_limit::<S>())?;
+            let wire: SnapshotRolloverIntent = serde_json::from_slice(&bytes)
+                .context("authenticated snapshot rollover intent is malformed")?;
+            let intent = decode_rollover_intent::<S>(authenticator, &wire.logical_id, &bytes)?;
+            verify_metadata_hash(hash, &intent.logical_id)?;
+            all_logicals.insert(intent.logical_id.clone());
+            if rollover_intents
+                .insert(intent.logical_id.clone(), intent.clone())
+                .is_some()
+            {
+                bail!("authenticated snapshot root repeats a logical rollover intent");
+            }
+            match (&intent.next_identity, intent.phase) {
+                (Some(identity), SnapshotRolloverPhase::Ready) => insert_physical_anchor(
+                    &mut expected,
+                    &mut owners,
+                    &intent.logical_id,
+                    identity,
+                )?,
+                (None, SnapshotRolloverPhase::Prepared) => insert_pending_physical_anchor(
+                    root,
+                    &mut expected,
+                    &mut owners,
+                    &intent.logical_id,
+                    &intent.candidate_run_id,
+                )?,
+                _ => bail!("authenticated snapshot rollover phase is inconsistent"),
+            }
         }
     }
-    root.verify()?;
+
+    for (logical_id, candidate) in &init_candidates {
+        if let Some(locator) = locators.get(logical_id) {
+            if &locator.active_identity.run_id != candidate {
+                bail!("authenticated snapshot initialization tail does not match its locator");
+            }
+        }
+    }
+    for (logical_id, intent) in &rollover_intents {
+        let locator = locators
+            .get(logical_id)
+            .context("authenticated snapshot rollover intent has no signed logical locator")?;
+        if !locator_matches_rollover_previous(locator, intent)
+            && !locator_matches_rollover_next(locator, intent)
+        {
+            bail!("authenticated snapshot rollover intent does not continue its logical locator");
+        }
+    }
+    if all_logicals.len() > S::MAX_LOGICAL_STORES {
+        bail!("authenticated snapshot root reached its logical-store capacity");
+    }
+    if owners.len() > S::MAX_PHYSICAL_INSTANCES {
+        bail!("authenticated snapshot root reached its physical retention capacity");
+    }
+    root_lock.verify(root)?;
     if observed != expected {
-        bail!("authenticated snapshot physical journal inventory is not fully anchored");
+        let unexpected = observed
+            .keys()
+            .find(|run_id| !expected.contains_key(*run_id));
+        if let Some(run_id) = unexpected {
+            bail!("authenticated snapshot physical journal '{run_id}' is not anchored by any signed logical state");
+        }
+        bail!("authenticated snapshot physical journal inventory is incomplete or substituted");
+    }
+    Ok(SnapshotRootUsage {
+        entries,
+        physical_instances: owners.len(),
+        logical_stores: all_logicals.len(),
+    })
+}
+
+fn ensure_new_logical_capacity<S: SnapshotSpec>(
+    usage: SnapshotRootUsage,
+    additional_entries: usize,
+) -> Result<()> {
+    if usage.logical_stores >= S::MAX_LOGICAL_STORES
+        || usage.entries.saturating_add(additional_entries) > S::MAX_ROOT_ENTRIES
+        || usage.physical_instances >= S::MAX_PHYSICAL_INSTANCES
+    {
+        bail!("authenticated snapshot namespace has no capacity for another logical store");
     }
     Ok(())
+}
+
+fn ensure_rollover_capacity<S: SnapshotSpec>(usage: SnapshotRootUsage) -> Result<()> {
+    if usage.entries.saturating_add(2) > S::MAX_ROOT_ENTRIES
+        || usage.physical_instances >= S::MAX_PHYSICAL_INSTANCES
+    {
+        bail!("authenticated snapshot namespace has no retention capacity for rollover");
+    }
+    Ok(())
+}
+
+fn snapshot_metadata_hash<'a>(name: &'a str, prefix: &str) -> Result<Option<&'a str>> {
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return Ok(None);
+    };
+    let hash = suffix
+        .strip_suffix(".json")
+        .context("authenticated snapshot metadata filename is malformed")?;
+    if !is_canonical_physical_id(hash) {
+        bail!("authenticated snapshot metadata filename hash is malformed");
+    }
+    Ok(Some(hash))
+}
+
+fn verify_metadata_hash(hash: &str, logical_id: &str) -> Result<()> {
+    if sha256_hex(logical_id.as_bytes()) != hash {
+        bail!("authenticated snapshot metadata filename does not match its logical id");
+    }
+    Ok(())
+}
+
+fn is_canonical_physical_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn insert_physical_anchor(
+    expected: &mut BTreeMap<String, FileIdentity>,
+    owners: &mut BTreeMap<String, String>,
+    logical_id: &str,
+    identity: &JournalIdentity,
+) -> Result<()> {
+    insert_physical_binding(
+        expected,
+        owners,
+        logical_id,
+        &identity.run_id,
+        &identity.run_directory_identity,
+    )
+}
+
+fn insert_physical_binding(
+    expected: &mut BTreeMap<String, FileIdentity>,
+    owners: &mut BTreeMap<String, String>,
+    logical_id: &str,
+    run_id: &str,
+    identity: &FileIdentity,
+) -> Result<()> {
+    claim_physical_owner(owners, logical_id, run_id)?;
+    if let Some(previous) = expected.insert(run_id.to_string(), identity.clone()) {
+        if previous != *identity {
+            bail!("authenticated snapshot physical journal identity is inconsistent");
+        }
+    }
+    Ok(())
+}
+
+fn claim_physical_owner(
+    owners: &mut BTreeMap<String, String>,
+    logical_id: &str,
+    run_id: &str,
+) -> Result<()> {
+    if let Some(owner) = owners.get(run_id) {
+        if owner != logical_id {
+            bail!("authenticated snapshot physical journal is claimed by multiple logical stores");
+        }
+    } else {
+        owners.insert(run_id.to_string(), logical_id.to_string());
+    }
+    Ok(())
+}
+
+fn insert_pending_physical_anchor(
+    root: &SafeRoot,
+    expected: &mut BTreeMap<String, FileIdentity>,
+    owners: &mut BTreeMap<String, String>,
+    logical_id: &str,
+    physical_id: &str,
+) -> Result<()> {
+    claim_physical_owner(owners, logical_id, physical_id)?;
+    if !root.direct_child_exists(physical_id)? {
+        return Ok(());
+    }
+    let bound = root.bind_existing_direct_child_directory(physical_id)?;
+    insert_physical_binding(expected, owners, logical_id, physical_id, bound.identity())
 }
 
 fn locator_mac_payload(locator: &SnapshotLocator) -> Result<Vec<u8>> {
@@ -1241,8 +1610,16 @@ fn read_locator<S: SnapshotSpec>(
                 "initialized authenticated snapshot namespace '{logical_id}' has no signed locator"
             )
         })?;
+    decode_locator::<S>(authenticator, logical_id, &bytes)
+}
+
+fn decode_locator<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    logical_id: &str,
+    bytes: &[u8],
+) -> Result<SnapshotLocator> {
     let locator: SnapshotLocator =
-        serde_json::from_slice(&bytes).context("authenticated snapshot locator is malformed")?;
+        serde_json::from_slice(bytes).context("authenticated snapshot locator is malformed")?;
     validate_locator::<S>(&locator, logical_id)?;
     authenticator.verify_repository_binding(&locator.active_identity.repository)?;
     authenticator.verify_tag(
@@ -1311,7 +1688,8 @@ where
 fn write_locator<S: SnapshotSpec>(
     authenticator: &RepositoryAuthenticator,
     root: &SafeRoot,
-    lock: &BoundStateLock,
+    store_lock: &BoundStateLock,
+    root_lock: &BoundStateLock,
     locator: &mut SnapshotLocator,
 ) -> Result<()> {
     validate_locator::<S>(locator, &locator.logical_id)?;
@@ -1323,8 +1701,12 @@ fn write_locator<S: SnapshotSpec>(
     }
     let name = snapshot_locator_name(&locator.logical_id);
     AtomicStateWriter::scavenge_direct_temps(root, &name)?;
-    AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || lock.verify(root))?;
-    lock.verify(root)
+    AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || {
+        store_lock.verify(root)?;
+        root_lock.verify(root)
+    })?;
+    store_lock.verify(root)?;
+    root_lock.verify(root)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1370,10 +1752,11 @@ mod tests {
     use super::*;
     use crate::{
         artifacts::{repository_auth_writer, state_auth::AuthenticationDomain},
+        effect_wal::{DefaultEffectWalSpec, EFFECT_WAL_ROOT_NAME},
         state_journal::JournalSpec,
     };
     use git2::Repository;
-    use std::fs;
+    use std::{fs, sync::mpsc, thread, time::Duration};
     use tempfile::TempDir;
 
     enum TestSnapshotSpec {}
@@ -1401,6 +1784,36 @@ mod tests {
         const SNAPSHOT_FORMAT_VERSION: u32 = 1;
         const LOCATOR_DOMAIN: AuthenticationDomain =
             AuthenticationDomain::new(b"MACO\0test-snapshot-locator\0v1\0");
+    }
+
+    enum QuotaSnapshotSpec {}
+
+    impl JournalSpec for QuotaSnapshotSpec {
+        const FORMAT_VERSION: u32 = 1;
+        const NAMESPACE: &'static str = "quota_snapshot";
+        const ROOT_NAME: &'static str = "quota-snapshots-v1";
+        const ROOT_LOCK_NAME: &'static str = ".quota-snapshots.lock";
+        const INSTANCE_LOCK_NAME: &'static str = ".quota-snapshot.lock";
+        const HEAD_FILE_NAME: &'static str = ".head.json";
+        const RECORD_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0quota-snapshot-record\0v1\0");
+        const HEAD_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0quota-snapshot-head\0v1\0");
+        const MAX_RECORDS: usize = 8;
+        const MAX_RECORD_BYTES: u64 = 64 * 1024;
+        const MAX_TOTAL_BYTES: u64 = 256 * 1024;
+        const MAX_PHASE_BYTES: usize = 32;
+        const MAX_SUBJECT_BYTES: usize = 64;
+        const MAX_INSTANCE_ID_BYTES: usize = 64;
+    }
+
+    impl SnapshotSpec for QuotaSnapshotSpec {
+        const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+        const LOCATOR_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0quota-snapshot-locator\0v1\0");
+        const MAX_LOGICAL_STORES: usize = 2;
+        const MAX_ROOT_ENTRIES: usize = 7;
+        const MAX_PHYSICAL_INSTANCES: usize = 2;
     }
 
     fn repository() -> (TempDir, std::path::PathBuf) {
@@ -1442,6 +1855,164 @@ mod tests {
         assert_eq!(reopened.current().generation, 2);
         assert_eq!(reopened.current().token, 9);
         assert_eq!(reopened.current().value, vec!["second".to_string()]);
+    }
+
+    #[test]
+    fn default_effect_namespace_supports_multiple_logical_snapshots() {
+        let (_temp, path) = repository();
+        let first = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::create(
+            authenticator(&path),
+            "source-action-a",
+            1,
+            "planned-a".to_string(),
+        )
+        .expect("create first logical effect snapshot");
+        assert_eq!(
+            first
+                .store_root
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(EFFECT_WAL_ROOT_NAME)
+        );
+        drop(first);
+        let second = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::create(
+            authenticator(&path),
+            "source-action-b",
+            1,
+            "planned-b".to_string(),
+        )
+        .expect("create second logical effect snapshot");
+        drop(second);
+
+        let mut first = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::open_instance(
+            authenticator(&path),
+            "source-action-a",
+        )
+        .expect("open first logical effect snapshot");
+        first
+            .commit(2, "started-a".to_string())
+            .expect("commit first logical effect snapshot");
+        drop(first);
+        let second = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::open_instance(
+            authenticator(&path),
+            "source-action-b",
+        )
+        .expect("open second logical effect snapshot");
+        assert_eq!(second.current().value, "planned-b");
+    }
+
+    #[test]
+    fn replayed_locator_detects_only_its_unanchored_new_journal_in_multi_logical_root() {
+        let (_temp, path) = repository();
+        let first = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::create(
+            authenticator(&path),
+            "source-replay-a",
+            1,
+            "old-a".to_string(),
+        )
+        .expect("create first logical snapshot");
+        let root = first.store_root.path().to_path_buf();
+        let locator_path = root.join(snapshot_locator_name("source-replay-a"));
+        let old_locator = fs::read(&locator_path).expect("old signed locator");
+        let first = first
+            .rollover(authenticator(&path), 2, "new-a".to_string())
+            .expect("roll over first logical snapshot");
+        let unanchored_new_run = first.identity().run_id.clone();
+        drop(first);
+        let second = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::create(
+            authenticator(&path),
+            "source-replay-b",
+            1,
+            "value-b".to_string(),
+        )
+        .expect("create unrelated logical snapshot");
+        let unrelated_run = second.identity().run_id.clone();
+        drop(second);
+        fs::write(&locator_path, old_locator).expect("replay old locator for first logical store");
+
+        let error = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::open_instance(
+            authenticator(&path),
+            "source-replay-a",
+        )
+        .err()
+        .expect("replayed locator must expose its newer journal");
+        let message = error.to_string();
+        assert!(
+            message.contains(&unanchored_new_run),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains(&unrelated_run),
+            "unrelated logical journal was blamed"
+        );
+    }
+
+    #[test]
+    fn other_logical_store_remains_usable_while_rollover_intent_is_pending() {
+        let (_temp, path) = repository();
+        let first = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::create(
+            authenticator(&path),
+            "source-pending-a",
+            1,
+            "old-a".to_string(),
+        )
+        .expect("create first logical snapshot");
+        set_snapshot_fault(SnapshotFaultPoint::AfterRolloverDirectory);
+        first
+            .rollover(authenticator(&path), 2, "new-a".to_string())
+            .err()
+            .expect("leave signed prepared rollover candidate");
+
+        let mut second = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::create(
+            authenticator(&path),
+            "source-pending-b",
+            1,
+            "planned-b".to_string(),
+        )
+        .expect("create unrelated logical store while first intent is pending");
+        second
+            .commit(2, "started-b".to_string())
+            .expect("commit unrelated logical store");
+        drop(second);
+        let first = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::open_instance(
+            authenticator(&path),
+            "source-pending-a",
+        )
+        .expect("recover prepared first logical rollover");
+        assert_eq!(first.current().value, "old-a");
+    }
+
+    #[test]
+    fn namespace_quota_refuses_new_logical_store_before_creating_residue() {
+        let (_temp, path) = repository();
+        for logical_id in ["quota-a", "quota-b"] {
+            let store = AuthenticatedSnapshotStore::<QuotaSnapshotSpec, u64>::create(
+                authenticator(&path),
+                logical_id,
+                1,
+                1,
+            )
+            .expect("create logical store within quota");
+            drop(store);
+        }
+        let error = AuthenticatedSnapshotStore::<QuotaSnapshotSpec, u64>::create(
+            authenticator(&path),
+            "quota-c",
+            1,
+            1,
+        )
+        .err()
+        .expect("quota+1 logical store must fail before creation");
+        assert!(error.to_string().contains("capacity"));
+        let repo = Repository::open(&path).expect("repo");
+        let root = repo
+            .commondir()
+            .join("maco/state")
+            .join(QuotaSnapshotSpec::ROOT_NAME);
+        assert!(!root.join(snapshot_init_name("quota-c")).exists());
+        assert!(!root.join(snapshot_lock_name("quota-c")).exists());
+        assert_eq!(fs::read_dir(root).expect("quota root").count(), 7);
     }
 
     #[test]
@@ -1581,6 +2152,7 @@ mod tests {
         assert!(
             message.contains("physical journal inventory")
                 || message.contains("unexpected directory")
+                || message.contains("not anchored")
         );
     }
 
@@ -1721,6 +2293,50 @@ mod tests {
         .expect("second creator must fail");
         assert!(error.to_string().contains("already initialized"));
         assert_eq!(first.current().value, 1);
+    }
+
+    #[test]
+    fn busy_logical_open_never_acquires_root_lock_before_store_lock() {
+        let (_temp, path) = repository();
+        let mut store = AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::create(
+            authenticator(&path),
+            "lock-order",
+            1,
+            1,
+        )
+        .expect("create held logical store");
+        let (root_acquired_tx, root_acquired_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let open_path = path.clone();
+        let worker = thread::spawn(move || {
+            crate::safe_state::set_kernel_lock_after_flock_hook(move |lock_path| {
+                if lock_path.file_name().and_then(|name| name.to_str())
+                    == Some(TestSnapshotSpec::ROOT_LOCK_NAME)
+                {
+                    root_acquired_tx.send(()).expect("report root lock");
+                    true
+                } else {
+                    false
+                }
+            });
+            let error = AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::open_instance(
+                authenticator(&open_path),
+                "lock-order",
+            )
+            .err()
+            .expect("busy logical store must refuse concurrent open");
+            done_tx.send(error.to_string()).expect("report open result");
+        });
+        let message = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("concurrent open must fail without waiting on the root lock");
+        assert!(message.contains("active") || message.contains("lock"));
+        assert!(
+            root_acquired_rx.try_recv().is_err(),
+            "concurrent open acquired the namespace root before the busy logical store lock"
+        );
+        worker.join().expect("open worker");
+        store.commit(2, 2).expect("held store can still commit");
     }
 
     #[test]
