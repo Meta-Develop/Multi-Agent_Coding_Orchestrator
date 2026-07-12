@@ -405,21 +405,32 @@ The orchestrator validates that plan paths do not overlap, dependencies are
 known and acyclic, commands are non-empty, and timeouts are positive. It creates
 or reuses a linked worktree for each agent id according to
 `worktree_reuse_policy` or CLI `--reuse`, claims all requested paths before
-running commands, runs dependency-ready agents up to `--jobs`, runs each
-agent's `validation_commands` in that agent worktree after its command succeeds,
-verifies that each command only changed claimed paths, and releases claims at
-the end. Use `--keep-claims` to leave acquired claims active for debugging.
+running commands, runs dependency-ready agents up to `--jobs`, and releases
+claims at the end. A failed agent skips only its transitive dependents;
+independent branches continue. Dependency edges control execution order and
+failure propagation only: predecessor edits are not injected into a dependent
+agent's worktree, which starts from the captured run base. Use `--keep-claims`
+to leave acquired claims active for debugging.
 `clean` is the default reuse policy, `required` requires existing clean
 worktrees, `fresh` refuses existing worktrees, and `reset` moves a clean,
 unclaimed stale worktree to the current primary HEAD while refusing dirty,
 untracked, or actively claimed worktrees.
 
 Run summaries include command status, duration, timeout state, changed paths,
-unclaimed changed paths, captured stdout/stderr summaries, and optional patch
-paths. `--patch-dir` writes per-agent binary patches against the run base, the
-primary HEAD captured for that run. Repo-level validation commands currently
-run in the primary worktree after agent commands complete; use agent validation
-commands for checks that must see unmerged agent worktree changes.
+unclaimed changed paths, captured stdout/stderr summaries, candidate bindings,
+and optional patch paths. Each agent's `validation_commands` sees that agent's
+bound candidate state. A validation command that changes Git-visible candidate
+state fails validation, even when the command otherwise exits successfully.
+`--patch-dir` writes the already captured per-agent binary patch against the run
+base, the primary HEAD captured for that run.
+
+Repo-level validation materializes the exact successful, non-overlapping agent
+patch set in plan order into a disposable managed worktree based on the captured
+run base; it never runs against or writes the primary worktree. The summary and
+checkpoint bind this target to the base object id, combined diff digest, changed
+paths, candidate count, and patch sizes. Repo validation also fails if it mutates
+that materialized state. A run with no candidate changes records and validates
+an explicit base-only target.
 
 Patch and checkpoint output roots are created owner-private when absent. An
 existing root must be owned by the current user with mode `0700`; output leaves
