@@ -15,7 +15,7 @@ use git2::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -57,6 +57,31 @@ pub struct WorktreeRecord {
 #[derive(Debug, Clone)]
 pub struct WorktreeManager {
     repo_path: PathBuf,
+}
+
+/// A cooperative shared lease for one verified managed worktree.
+///
+/// MACO parents must hold this value for the complete lifetime of every child
+/// that can access the worktree. Removal takes the matching exclusive lease
+/// before cleanliness checks and retains it through quarantine and cleanup.
+/// This kernel lease coordinates MACO participants; it is not an OS sandbox
+/// against an unrelated, uncooperative process running as the same user.
+#[derive(Debug)]
+pub struct ManagedWorktreeExecutionLease {
+    record: WorktreeRecord,
+    _lock: KernelStateLock,
+}
+
+impl ManagedWorktreeExecutionLease {
+    pub fn record(&self) -> &WorktreeRecord {
+        &self.record
+    }
+}
+
+#[derive(Debug)]
+struct ManagedWorktreeRemovalLease {
+    name: String,
+    _lock: KernelStateLock,
 }
 
 #[derive(Debug, Clone)]
@@ -627,11 +652,11 @@ impl WorktreeManager {
         })
     }
 
-    /// Removes a managed worktree after its child process and every other
-    /// writer have been stopped. The registry lock serializes MACO callers,
-    /// and a Git worktree lock is acquired before quarantine, but callers must
-    /// satisfy the no-active-mutation precondition for arbitrary filesystem
-    /// writers.
+    /// Removes a managed worktree after taking its cooperative exclusive
+    /// execution lease. Active MACO child lifecycles holding a shared lease are
+    /// refused before the remove intent is persisted. The lease cannot stop an
+    /// unrelated, uncooperative same-user process; callers retain that OS trust
+    /// boundary.
     pub fn remove(
         &self,
         agent_id: &str,
@@ -655,6 +680,13 @@ impl WorktreeManager {
             &binding,
             delete_branch,
         )?;
+        let _removal_lease = registry_store
+            .try_acquire_exclusive_worktree_lease(&name)
+            .with_context(|| {
+                format!(
+                    "managed worktree '{name}' has an active cooperative execution lease; stop its MACO child before removal"
+                )
+            })?;
 
         if !force {
             ensure_clean_worktree(&verified.path)?;
@@ -712,7 +744,12 @@ impl WorktreeManager {
             },
         );
         registry_store.save(&mut registry)?;
-        recover_pending_operations(&repo, &registry_store, &mut registry)?;
+        recover_pending_operations_with_held_removal_lease(
+            &repo,
+            &registry_store,
+            &mut registry,
+            Some(&_removal_lease),
+        )?;
 
         Ok(WorktreeRecord {
             name,
@@ -760,6 +797,34 @@ impl WorktreeManager {
             format!("worktree '{name}' has no verified MACO binding; explicit adoption is required")
         })?;
         verified_worktree_record(&repo, &registry_store.repository, binding)
+    }
+
+    /// Acquires the shared cooperative lease that must cover a MACO-owned
+    /// child process or execution-facing read from start through verified
+    /// process-tree cleanup. The returned record was verified while the
+    /// registry lock and lease acquisition were serialized against removal.
+    pub fn acquire_execution_lease(&self, agent_id: &str) -> Result<ManagedWorktreeExecutionLease> {
+        let name = normalize_agent_id(agent_id)?;
+        let repo = self.open_repository()?;
+        let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
+        let _registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load()?;
+        recover_pending_operations(&repo, &registry_store, &mut registry)?;
+        let binding = registry.records.get(&name).with_context(|| {
+            format!("worktree '{name}' has no verified MACO binding; explicit adoption is required")
+        })?;
+        let record = verified_worktree_record(&repo, &registry_store.repository, binding)?;
+        let lock = registry_store
+            .try_acquire_shared_worktree_lease(&name)
+            .with_context(|| {
+                format!(
+                    "managed worktree '{name}' is exclusively leased for removal; refusing execution"
+                )
+            })?;
+        Ok(ManagedWorktreeExecutionLease {
+            record,
+            _lock: lock,
+        })
     }
 
     fn open_repository(&self) -> Result<Repository> {
@@ -825,6 +890,27 @@ impl ManagedWorktreeRegistryStore {
 
     fn lock(&self) -> Result<KernelStateLock> {
         KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")
+    }
+
+    fn try_acquire_shared_worktree_lease(&self, name: &str) -> Result<KernelStateLock> {
+        KernelStateLock::try_acquire_shared_direct(
+            &self.state_root,
+            managed_worktree_lease_name(name)?,
+        )
+    }
+
+    fn try_acquire_exclusive_worktree_lease(
+        &self,
+        name: &str,
+    ) -> Result<ManagedWorktreeRemovalLease> {
+        let lock = KernelStateLock::try_acquire_exclusive_direct(
+            &self.state_root,
+            managed_worktree_lease_name(name)?,
+        )?;
+        Ok(ManagedWorktreeRemovalLease {
+            name: name.to_string(),
+            _lock: lock,
+        })
     }
 
     fn load(&self) -> Result<ManagedWorktreeRegistry> {
@@ -925,6 +1011,16 @@ impl ManagedWorktreeRegistryStore {
     }
 }
 
+fn managed_worktree_lease_name(name: &str) -> Result<OsString> {
+    let normalized = normalize_agent_id(name)?;
+    if normalized != name {
+        bail!("managed worktree lease name is not canonical");
+    }
+    Ok(OsString::from(format!(
+        "managed-worktree-{name}.execution.lock"
+    )))
+}
+
 fn managed_registry_checksum(registry: &ManagedWorktreeRegistry) -> Result<String> {
     let payload = serde_json::to_vec(&(
         registry.version,
@@ -969,6 +1065,15 @@ fn recover_pending_operations(
     store: &ManagedWorktreeRegistryStore,
     registry: &mut ManagedWorktreeRegistry,
 ) -> Result<()> {
+    recover_pending_operations_with_held_removal_lease(repo, store, registry, None)
+}
+
+fn recover_pending_operations_with_held_removal_lease(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    registry: &mut ManagedWorktreeRegistry,
+    held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
+) -> Result<()> {
     let names = registry.operations.keys().cloned().collect::<Vec<_>>();
     for name in names {
         let operation = registry
@@ -984,6 +1089,21 @@ fn recover_pending_operations(
                 recover_create_operation(repo, store, registry, operation)?
             }
             ManagedWorktreeOperationKind::Remove => {
+                let _lease = if held_removal_lease
+                    .is_some_and(|lease| lease.name.as_str() == name.as_str())
+                {
+                    None
+                } else {
+                    Some(
+                        store
+                            .try_acquire_exclusive_worktree_lease(&name)
+                            .with_context(|| {
+                                format!(
+                                    "managed worktree '{name}' has an active cooperative execution lease; pending removal remains durable"
+                                )
+                            })?,
+                    )
+                };
                 recover_remove_operation(repo, store, registry, operation)?
             }
         }
@@ -2882,6 +3002,135 @@ mod tests {
         assert_eq!(removed.name, "agent-a");
         assert!(!removed.path.exists());
         assert!(repo.find_branch("maco/agent-a", BranchType::Local).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cooperative_execution_leases_share_and_block_remove_before_intent() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-leased".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+
+        let first = manager
+            .acquire_execution_lease("agent-leased")
+            .expect("first shared lease");
+        let second = manager
+            .acquire_execution_lease("agent-leased")
+            .expect("second shared lease");
+        assert_eq!(first.record(), &created);
+        assert_eq!(second.record(), &created);
+        let error = manager
+            .remove("agent-leased", true, true)
+            .expect_err("active shared lease must block removal");
+        assert!(error
+            .to_string()
+            .contains("active cooperative execution lease"));
+        assert!(created.path.exists());
+        assert!(repo
+            .find_branch("maco/agent-leased", BranchType::Local)
+            .is_ok());
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let _lock = store.lock().expect("registry lock");
+        assert!(store.load().expect("registry").operations.is_empty());
+        drop(_lock);
+
+        drop(second);
+        drop(first);
+        manager
+            .remove("agent-leased", false, true)
+            .expect("remove after shared leases release");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_remove_refuses_active_lease_then_recovers_after_release() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-pending-lease".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+        let execution = manager
+            .acquire_execution_lease("agent-pending-lease")
+            .expect("shared execution lease");
+        let worktree_quarantine = {
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+            let _lock = store.lock().expect("registry lock");
+            let mut registry = store.load().expect("registry");
+            let (_, worktree_quarantine, _, _) =
+                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+            worktree_quarantine
+        };
+
+        let assert_still_bound = |error: anyhow::Error| {
+            assert!(error
+                .to_string()
+                .contains("pending removal remains durable"));
+            assert!(created.path.exists());
+            assert!(!worktree_quarantine.exists());
+            assert!(repo.find_worktree("agent-pending-lease").is_ok());
+        };
+        assert_still_bound(
+            manager
+                .list()
+                .expect_err("list must refuse active execution lease"),
+        );
+        assert_still_bound(
+            manager
+                .get_managed_verified("agent-pending-lease")
+                .expect_err("get must refuse active execution lease"),
+        );
+        assert_still_bound(
+            manager
+                .acquire_execution_lease("agent-pending-lease")
+                .expect_err("new execution lease must refuse pending removal"),
+        );
+        assert_still_bound(
+            manager
+                .create(WorktreeCreateOptions {
+                    agent_id: "unrelated-create".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: None,
+                })
+                .expect_err("create entrypoint must refuse active pending removal"),
+        );
+        assert_still_bound(
+            manager
+                .remove("agent-pending-lease", true, true)
+                .expect_err("remove entrypoint must refuse active pending removal"),
+        );
+
+        drop(execution);
+        assert!(manager
+            .list()
+            .expect("recover pending removal after lease release")
+            .is_empty());
+        assert!(!created.path.exists());
+        assert!(repo
+            .find_branch("maco/agent-pending-lease", BranchType::Local)
+            .is_err());
     }
 
     #[cfg(unix)]

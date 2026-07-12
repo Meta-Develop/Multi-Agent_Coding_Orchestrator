@@ -668,6 +668,12 @@ pub struct KernelStateLock {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum KernelLockOperation {
+    Shared,
+    Exclusive,
+}
+
 impl KernelStateLock {
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_normalized(path.as_ref())?;
@@ -689,6 +695,42 @@ impl KernelStateLock {
         let path = root.direct_child(file_name)?;
         let file = open_stable_private_file_at(root, file_name)?;
         lock_file(&file, &path)?;
+        root.verify()?;
+        Ok(Self { file, path })
+    }
+
+    pub(crate) fn try_acquire_shared_direct(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+    ) -> Result<Self> {
+        Self::try_acquire_direct_with_operation(
+            root,
+            file_name.as_ref(),
+            KernelLockOperation::Shared,
+        )
+    }
+
+    pub(crate) fn try_acquire_exclusive_direct(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+    ) -> Result<Self> {
+        Self::try_acquire_direct_with_operation(
+            root,
+            file_name.as_ref(),
+            KernelLockOperation::Exclusive,
+        )
+    }
+
+    fn try_acquire_direct_with_operation(
+        root: &SafeRoot,
+        file_name: &OsStr,
+        operation: KernelLockOperation,
+    ) -> Result<Self> {
+        validate_single_component(file_name)?;
+        root.verify()?;
+        let path = root.direct_child(file_name)?;
+        let file = open_stable_private_file_at(root, file_name)?;
+        try_lock_file(&file, &path, operation)?;
         root.verify()?;
         Ok(Self { file, path })
     }
@@ -1576,6 +1618,30 @@ fn lock_file(file: &File, path: &Path) -> Result<()> {
         }
         thread::sleep(LOCK_RETRY_INTERVAL);
     }
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File, path: &Path, operation: KernelLockOperation) -> Result<()> {
+    let operation = match operation {
+        KernelLockOperation::Shared => libc::LOCK_SH,
+        KernelLockOperation::Exclusive => libc::LOCK_EX,
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        bail!("kernel state lock is already held: {}", path.display());
+    }
+    Err(error).with_context(|| format!("failed to acquire kernel state lock {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn try_lock_file(_file: &File, path: &Path, _operation: KernelLockOperation) -> Result<()> {
+    bail!(
+        "shared/exclusive cooperative kernel locks are unsupported on this platform: {}",
+        path.display()
+    )
 }
 
 #[cfg(unix)]
