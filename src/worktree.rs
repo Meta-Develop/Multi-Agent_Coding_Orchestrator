@@ -2,9 +2,10 @@ use crate::{
     process_runner::{run_process, ContainmentPolicy, EnvironmentMode, ProcessSpec, StdinMode},
     safe_state::{
         identity_for_path, quarantine_direct_child_directory, remove_direct_child_tree,
-        remove_quarantined_direct_child_tree, replace_reserved_directory_from, stable_checksum,
-        AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock, SafeRoot,
-        TreeLinkPolicy,
+        remove_quarantined_direct_child_tree, replace_reserved_directory_from,
+        scavenge_private_random_directories, stable_checksum, AtomicStateWriter,
+        BoundedRegularReader, FileIdentity, KernelStateLock, PrivateDirectoryScavengeLimits,
+        SafeRoot, TreeLinkPolicy,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -37,6 +38,16 @@ const MAX_WORKTREE_STATUS_ENTRIES: usize = 100_000;
 const MAX_WORKTREE_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WORKTREE_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PERSISTED_PATH_BYTES: usize = 16 * 1024;
+const WORKTREE_STATUS_RUNTIME_SEED: &str = "git-status";
+const WORKTREE_STATUS_RUNTIME_LOCK: &str = "bounded-status.lock";
+const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
+    PrivateDirectoryScavengeLimits {
+        max_root_entries: 65,
+        max_directories: 64,
+        max_tree_entries: 65_536,
+        max_total_bytes: 64 * 1024 * 1024,
+    };
+const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 
@@ -2723,6 +2734,36 @@ fn bounded_worktree_is_clean(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<bool> {
+    let state_root = bounded_status_runtime_root(path)?;
+    bounded_worktree_is_clean_in_runtime(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        &state_root,
+        |_| Ok(()),
+    )
+}
+
+fn bounded_worktree_is_clean_in_runtime<F>(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+    state_root: &SafeRoot,
+    after_index_snapshot: F,
+) -> Result<bool>
+where
+    F: FnOnce(&SafeRoot) -> Result<()>,
+{
+    let _status_lock = KernelStateLock::acquire_direct_with_timeout(
+        state_root,
+        WORKTREE_STATUS_RUNTIME_LOCK,
+        WORKTREE_STATUS_LOCK_TIMEOUT,
+    )
+    .context("failed to acquire global bounded-status runtime lock")?;
+    scavenge_bounded_status_runtimes(state_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+        .context("failed to scavenge bounded-status crash residue")?;
     let repository = Repository::open(path).with_context(|| {
         format!(
             "failed to open bounded-status repository {}",
@@ -2738,28 +2779,27 @@ fn bounded_worktree_is_clean(
     let index = BoundedRegularReader::read(&index_path, MAX_WORKTREE_INDEX_BYTES)
         .context("failed to capture bounded-status index")?;
     let common_objects = SafeRoot::open_existing(repository.commondir().join("objects"))?;
-    let state_root = bounded_status_runtime_root()?;
-    let runtime = state_root.reserve_random_direct_child_directory("git-status")?;
-    let runtime_root = SafeRoot::open_existing(runtime.path())?;
-    runtime_root.reserve_direct_child_directory("home")?;
-    runtime_root.reserve_direct_child_directory("tmp")?;
-    let git_dir = runtime_root.reserve_direct_child_directory("git")?;
-    let git_root = SafeRoot::open_existing(git_dir.path())?;
-    git_root.reserve_direct_child_directory("refs")?;
-    AtomicStateWriter::write_direct(&git_root, "index", &index)?;
-    AtomicStateWriter::write_direct(&git_root, "HEAD", format!("{head}\n").as_bytes())?;
-    create_validated_object_link(&git_root, common_objects.path())?;
-    let worktree_alias = create_bounded_status_worktree_link(&runtime_root, path)?;
-    let git_context = BoundedGitContext {
-        worktree: &worktree_alias,
-        runtime_root: &runtime_root,
-        git_dir: git_dir.path(),
-    };
-
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .context("worktree status time budget overflowed")?;
+    let runtime = state_root.reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)?;
     let result = (|| -> Result<bool> {
+        let runtime_root = SafeRoot::open_existing(runtime.path())?;
+        runtime_root.reserve_direct_child_directory("home")?;
+        runtime_root.reserve_direct_child_directory("tmp")?;
+        let git_dir = runtime_root.reserve_direct_child_directory("git")?;
+        let git_root = SafeRoot::open_existing(git_dir.path())?;
+        git_root.reserve_direct_child_directory("refs")?;
+        AtomicStateWriter::write_direct(&git_root, "index", &index)?;
+        after_index_snapshot(&runtime_root)?;
+        AtomicStateWriter::write_direct(&git_root, "HEAD", format!("{head}\n").as_bytes())?;
+        create_validated_object_link(&git_root, common_objects.path())?;
+        let worktree_alias = create_bounded_status_worktree_link(&runtime_root, path)?;
+        let git_context = BoundedGitContext {
+            worktree: &worktree_alias,
+            runtime_root: &runtime_root,
+            git_dir: git_dir.path(),
+        };
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("worktree status time budget overflowed")?;
         run_bounded_git_records(
             &git_context,
             ["--no-optional-locks", "ls-files", "-z", "--cached"],
@@ -2785,24 +2825,28 @@ fn bounded_worktree_is_clean(
         )?;
         Ok(bytes.is_empty())
     })();
-    let cleanup = remove_direct_child_tree(
-        &state_root,
-        runtime
-            .path()
-            .file_name()
-            .context("bounded-status runtime has no final component")?,
-        Some(runtime.identity()),
-        TreeLinkPolicy::UnlinkLinks,
-    )
-    .context("failed to remove bounded-status private runtime");
+    let cleanup = scavenge_bounded_status_runtimes(state_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+        .context("failed to remove bounded-status private runtime");
     match (result, cleanup) {
-        (Ok(clean), Ok(())) => Ok(clean),
-        (Err(error), Ok(())) => Err(error),
+        (Ok(clean), Ok(_)) => Ok(clean),
+        (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
         (Err(error), Err(cleanup_error)) => Err(error.context(format!(
             "bounded-status runtime cleanup also failed: {cleanup_error:#}"
         ))),
     }
+}
+
+fn scavenge_bounded_status_runtimes(
+    state_root: &SafeRoot,
+    limits: PrivateDirectoryScavengeLimits,
+) -> Result<usize> {
+    scavenge_private_random_directories(
+        state_root,
+        WORKTREE_STATUS_RUNTIME_LOCK,
+        WORKTREE_STATUS_RUNTIME_SEED,
+        limits,
+    )
 }
 
 struct BoundedGitContext<'a> {
@@ -2811,16 +2855,44 @@ struct BoundedGitContext<'a> {
     git_dir: &'a Path,
 }
 
-#[cfg(target_os = "linux")]
-fn bounded_status_runtime_root() -> Result<SafeRoot> {
+#[cfg(all(target_os = "linux", not(test)))]
+fn bounded_status_runtime_root(_worktree: &Path) -> Result<SafeRoot> {
     SafeRoot::open_or_create(PathBuf::from(format!(
         "/tmp/maco-worktree-status-{}",
         unsafe { libc::geteuid() }
     )))
 }
 
+#[cfg(all(target_os = "linux", test))]
+fn bounded_status_runtime_root(worktree: &Path) -> Result<SafeRoot> {
+    let repository = Repository::open(worktree).with_context(|| {
+        format!(
+            "failed to open test bounded-status repository {}",
+            worktree.display()
+        )
+    })?;
+    let common_dir = repository.commondir();
+    let common_ancestor = worktree
+        .ancestors()
+        .find(|ancestor| common_dir.starts_with(ancestor))
+        .context("test worktree and Git common directory have no common ancestor")?;
+    let outside_worktree = if common_ancestor == worktree {
+        common_ancestor
+            .parent()
+            .context("test worktree common ancestor has no parent")?
+    } else {
+        common_ancestor
+    };
+    let anchor = outside_worktree
+        .ancestors()
+        .find(|ancestor| ancestor.to_str().is_some())
+        .context("test worktree has no UTF-8 ancestor for its private status alias")?;
+    let binding = stable_checksum(worktree.as_os_str().as_bytes());
+    SafeRoot::open_or_create(anchor.join(format!(".maco-test-worktree-status-{binding}")))
+}
+
 #[cfg(not(target_os = "linux"))]
-fn bounded_status_runtime_root() -> Result<SafeRoot> {
+fn bounded_status_runtime_root(_worktree: &Path) -> Result<SafeRoot> {
     bail!("bounded worktree status requires the verified Linux containment boundary")
 }
 
@@ -3488,6 +3560,293 @@ mod tests {
             !marker.exists(),
             "ambient or repository-configured helper executed"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_setup_failure_cleans_large_index_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let index = fs::OpenOptions::new()
+            .write(true)
+            .open(repo.path().join("index"))
+            .expect("open index");
+        index
+            .set_len(MAX_WORKTREE_INDEX_BYTES - 4096)
+            .expect("expand index fixture");
+        drop(index);
+        let runtime_root =
+            SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+
+        let error = bounded_worktree_is_clean_in_runtime(
+            &repo_path,
+            MAX_WORKTREE_STATUS_ENTRIES,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            WORKTREE_STATUS_TIMEOUT,
+            &runtime_root,
+            |_| bail!("injected setup failure after index snapshot"),
+        )
+        .expect_err("injected setup failure");
+
+        assert!(error.to_string().contains("injected setup failure"));
+        assert_status_root_contains_only_lock(&runtime_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_scavenges_prior_crash_index_and_symlink_tree() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let runtime_root =
+            SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let residue = runtime_root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("crash residue");
+        let residue_root = SafeRoot::open_existing(residue.path()).expect("residue root");
+        residue_root
+            .reserve_direct_child_directory("home")
+            .expect("home");
+        residue_root
+            .reserve_direct_child_directory("tmp")
+            .expect("tmp");
+        let git = residue_root
+            .reserve_direct_child_directory("git")
+            .expect("git");
+        let git_root = SafeRoot::open_existing(git.path()).expect("git root");
+        git_root
+            .reserve_direct_child_directory("refs")
+            .expect("refs");
+        AtomicStateWriter::write_direct(&git_root, "index", b"stale index\n").expect("stale index");
+        AtomicStateWriter::write_direct(&git_root, "HEAD", b"deadbeef\n").expect("stale HEAD");
+        let external = temp.path().join("external");
+        fs::create_dir(&external).expect("external");
+        fs::write(external.join("sentinel"), b"keep\n").expect("sentinel");
+        symlink(&external, git_root.path().join("objects")).expect("objects link");
+        symlink(&repo_path, residue_root.path().join("worktree")).expect("worktree link");
+        let residue_path = residue.path().to_path_buf();
+
+        assert!(bounded_worktree_is_clean_in_runtime(
+            &repo_path,
+            MAX_WORKTREE_STATUS_ENTRIES,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            WORKTREE_STATUS_TIMEOUT,
+            &runtime_root,
+            |_| Ok(()),
+        )
+        .expect("status after crash recovery"));
+
+        assert!(!residue_path.exists());
+        assert!(external.join("sentinel").exists());
+        assert_status_root_contains_only_lock(&runtime_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_scavenger_refuses_unexpected_and_symlink_prefix_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let unexpected_root =
+            SafeRoot::open_or_create(temp.path().join("unexpected-root")).expect("root");
+        let _unexpected_lock =
+            KernelStateLock::acquire_direct(&unexpected_root, WORKTREE_STATUS_RUNTIME_LOCK)
+                .expect("lock");
+        AtomicStateWriter::write_direct(&unexpected_root, "foreign", b"inspect\n")
+            .expect("unexpected file");
+        let error =
+            scavenge_bounded_status_runtimes(&unexpected_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+                .expect_err("unexpected entry must fail closed");
+        assert!(error.to_string().contains("unexpected entry"));
+        assert!(unexpected_root.path().join("foreign").exists());
+
+        let symlink_root =
+            SafeRoot::open_or_create(temp.path().join("symlink-root")).expect("root");
+        let _symlink_lock =
+            KernelStateLock::acquire_direct(&symlink_root, WORKTREE_STATUS_RUNTIME_LOCK)
+                .expect("lock");
+        let external = temp.path().join("external-directory");
+        fs::create_dir(&external).expect("external");
+        let matching_name = ".git-status.1-2.tmp";
+        symlink(&external, symlink_root.path().join(matching_name)).expect("matching symlink");
+        let error =
+            scavenge_bounded_status_runtimes(&symlink_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+                .expect_err("matching symlink must fail closed");
+        assert!(error.to_string().contains("owner-private directory"));
+        assert!(symlink_root.path().join(matching_name).exists());
+        assert!(external.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_scavenger_enforces_root_directory_tree_and_byte_budgets() {
+        let temp = TempDir::new().expect("tempdir");
+
+        let root_entry_root =
+            SafeRoot::open_or_create(temp.path().join("root-entry-budget")).expect("root");
+        let _root_entry_lock =
+            KernelStateLock::acquire_direct(&root_entry_root, WORKTREE_STATUS_RUNTIME_LOCK)
+                .expect("lock");
+        let root_entry_residue = root_entry_root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("residue");
+        let error = scavenge_bounded_status_runtimes(
+            &root_entry_root,
+            PrivateDirectoryScavengeLimits {
+                max_root_entries: 1,
+                max_directories: 1,
+                max_tree_entries: 1,
+                max_total_bytes: 1,
+            },
+        )
+        .expect_err("root entry budget");
+        assert!(error.to_string().contains("entry budget"));
+        assert!(root_entry_residue.path().exists());
+
+        let directory_root =
+            SafeRoot::open_or_create(temp.path().join("directory-budget")).expect("root");
+        let _directory_lock =
+            KernelStateLock::acquire_direct(&directory_root, WORKTREE_STATUS_RUNTIME_LOCK)
+                .expect("lock");
+        let first = directory_root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("first residue");
+        let second = directory_root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("second residue");
+        let error = scavenge_bounded_status_runtimes(
+            &directory_root,
+            PrivateDirectoryScavengeLimits {
+                max_root_entries: 3,
+                max_directories: 1,
+                max_tree_entries: 1,
+                max_total_bytes: 1,
+            },
+        )
+        .expect_err("directory work budget");
+        assert!(error.to_string().contains("cleanup limit"));
+        assert!(first.path().exists());
+        assert!(second.path().exists());
+
+        let tree_root = SafeRoot::open_or_create(temp.path().join("tree-budget")).expect("root");
+        let _tree_lock = KernelStateLock::acquire_direct(&tree_root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("lock");
+        let tree_residue = tree_root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("residue");
+        let tree_residue_root = SafeRoot::open_existing(tree_residue.path()).expect("residue root");
+        AtomicStateWriter::write_direct(&tree_residue_root, "first", b"1").expect("first");
+        AtomicStateWriter::write_direct(&tree_residue_root, "second", b"2").expect("second");
+        let error = scavenge_bounded_status_runtimes(
+            &tree_root,
+            PrivateDirectoryScavengeLimits {
+                max_root_entries: 2,
+                max_directories: 1,
+                max_tree_entries: 1,
+                max_total_bytes: 2,
+            },
+        )
+        .expect_err("tree entry budget");
+        assert!(error.to_string().contains("bounded safety contract"));
+        assert!(tree_residue.path().exists());
+
+        let byte_root = SafeRoot::open_or_create(temp.path().join("byte-budget")).expect("root");
+        let _byte_lock = KernelStateLock::acquire_direct(&byte_root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("lock");
+        let byte_residue = byte_root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("residue");
+        let byte_residue_root = SafeRoot::open_existing(byte_residue.path()).expect("residue root");
+        AtomicStateWriter::write_direct(&byte_residue_root, "large", b"123456789")
+            .expect("large file");
+        let error = scavenge_bounded_status_runtimes(
+            &byte_root,
+            PrivateDirectoryScavengeLimits {
+                max_root_entries: 2,
+                max_directories: 1,
+                max_tree_entries: 1,
+                max_total_bytes: 8,
+            },
+        )
+        .expect_err("byte budget");
+        assert!(format!("{error:#}").contains("byte cleanup budget"));
+        assert!(byte_residue.path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_concurrent_lifecycles_serialize_without_cross_deletion() {
+        use std::{sync::mpsc, thread};
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let runtime_root =
+            SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_repo = repo_path.clone();
+        let first_root = runtime_root.clone();
+        let first = thread::spawn(move || {
+            bounded_worktree_is_clean_in_runtime(
+                &first_repo,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+                &first_root,
+                move |runtime| {
+                    first_entered_tx
+                        .send(runtime.path().to_path_buf())
+                        .context("send first runtime")?;
+                    release_first_rx.recv().context("release first runtime")?;
+                    Ok(())
+                },
+            )
+        });
+        let first_runtime = first_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first lifecycle entered");
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let second_repo = repo_path.clone();
+        let second_root = runtime_root.clone();
+        let second = thread::spawn(move || {
+            bounded_worktree_is_clean_in_runtime(
+                &second_repo,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_STATUS_TIMEOUT,
+                &second_root,
+                move |_| {
+                    second_entered_tx.send(()).context("send second entry")?;
+                    Ok(())
+                },
+            )
+        });
+
+        assert!(matches!(
+            second_entered_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(first_runtime.exists());
+        release_first_tx.send(()).expect("release first lifecycle");
+        assert!(first.join().expect("first thread").expect("first status"));
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second lifecycle entered after first cleanup");
+        assert!(second
+            .join()
+            .expect("second thread")
+            .expect("second status"));
+        assert_status_root_contains_only_lock(&runtime_root);
     }
 
     #[test]
@@ -4593,6 +4952,16 @@ mod tests {
             assert!(error.to_string().contains("exactly one"));
             assert!(registry.operations.contains_key(&binding.name));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_status_root_contains_only_lock(root: &SafeRoot) {
+        let mut names = fs::read_dir(root.path())
+            .expect("read status root")
+            .map(|entry| entry.expect("status entry").file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec![OsString::from(WORKTREE_STATUS_RUNTIME_LOCK)]);
     }
 
     fn prepare_remove_operation_for_test(
