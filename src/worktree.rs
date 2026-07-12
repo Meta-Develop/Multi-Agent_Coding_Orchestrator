@@ -1,12 +1,16 @@
-use crate::safe_state::{
-    identity_for_path, remove_direct_child_tree, replace_reserved_directory_from, stable_checksum,
-    AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock, SafeRoot,
-    TreeLinkPolicy, DEFAULT_MAX_STATE_BYTES,
+use crate::{
+    process_runner::{run_process, ContainmentPolicy, EnvironmentMode, ProcessSpec, StdinMode},
+    safe_state::{
+        identity_for_path, quarantine_direct_child_directory, remove_direct_child_tree,
+        remove_quarantined_direct_child_tree, replace_reserved_directory_from, stable_checksum,
+        AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock, SafeRoot,
+        TreeLinkPolicy,
+    },
 };
 use anyhow::{bail, Context, Result};
 use git2::{
-    Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, RepositoryInitOptions,
-    StatusOptions, Transaction, WorktreeAddOptions, WorktreeLockStatus,
+    Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, RepositoryInitOptions, Transaction,
+    WorktreeAddOptions, WorktreeLockStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,6 +19,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -23,6 +28,15 @@ use std::os::unix::ffi::OsStrExt;
 const DEFAULT_BRANCH_PREFIX: &str = "maco";
 const MANAGED_WORKTREE_REGISTRY_VERSION: u32 = 1;
 const MAX_WORKTREE_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_AGENT_ID_BYTES: usize = 64;
+const MAX_BRANCH_NAME_BYTES: usize = 255;
+const MAX_MANAGED_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_MANAGED_RECORDS: usize = 4096;
+const MAX_MANAGED_OPERATIONS: usize = 4096;
+const MAX_WORKTREE_STATUS_ENTRIES: usize = 100_000;
+const MAX_WORKTREE_STATUS_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RepositoryInfo {
@@ -110,6 +124,8 @@ enum ManagedWorktreeOperationPhase {
     CreateStaged,
     CreateObserved,
     RemovePrepared,
+    WorktreeQuarantined,
+    MetadataQuarantined,
     WorktreeDeleted,
     MetadataDeleted,
     BranchDeleted,
@@ -147,6 +163,14 @@ struct ManagedWorktreeOperation {
     delete_branch: bool,
     force: bool,
     expected_branch_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree_quarantine_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree_quarantine_identity: Option<FileIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_quarantine_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_quarantine_identity: Option<FileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -201,6 +225,12 @@ impl WorktreeManager {
         if registry.records.contains_key(&name) {
             bail!("managed worktree '{name}' already has a registry binding");
         }
+        if registry.records.len() >= MAX_MANAGED_RECORDS {
+            bail!("managed worktree registry has no remaining record capacity");
+        }
+        if registry.operations.len() >= MAX_MANAGED_OPERATIONS {
+            bail!("managed worktree registry has no remaining operation capacity");
+        }
         let requested_root = options
             .worktree_root
             .unwrap_or_else(|| default_worktree_root(&repo));
@@ -254,6 +284,10 @@ impl WorktreeManager {
                 delete_branch: false,
                 force: false,
                 expected_branch_oid: None,
+                worktree_quarantine_path: None,
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: None,
+                metadata_quarantine_identity: None,
             },
         );
         registry_store.save(&mut registry)?;
@@ -409,6 +443,11 @@ impl WorktreeManager {
         })
     }
 
+    /// Removes a managed worktree after its child process and every other
+    /// writer have been stopped. The registry lock serializes MACO callers,
+    /// and a Git worktree lock is acquired before quarantine, but callers must
+    /// satisfy the no-active-mutation precondition for arbitrary filesystem
+    /// writers.
     pub fn remove(
         &self,
         agent_id: &str,
@@ -436,6 +475,22 @@ impl WorktreeManager {
         if !force {
             ensure_clean_worktree(&verified.path)?;
         }
+        if registry.operations.len() >= MAX_MANAGED_OPERATIONS {
+            bail!("managed worktree registry has no remaining operation capacity");
+        }
+        let worktree_quarantine_path = deterministic_remove_quarantine_path(
+            &binding.root,
+            "worktree",
+            &binding.name,
+            &binding.path_identity,
+        );
+        let metadata_root = registry_store.repository.common_dir.join("worktrees");
+        let metadata_quarantine_path = deterministic_remove_quarantine_path(
+            &metadata_root,
+            "metadata",
+            &binding.name,
+            &binding.metadata_dir_identity,
+        );
         registry.operations.insert(
             name.clone(),
             ManagedWorktreeOperation {
@@ -466,6 +521,10 @@ impl WorktreeManager {
                 delete_branch,
                 force,
                 expected_branch_oid: Some(verified.branch_oid.to_string()),
+                worktree_quarantine_path: Some(worktree_quarantine_path),
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: Some(metadata_quarantine_path),
+                metadata_quarantine_identity: None,
             },
         );
         registry_store.save(&mut registry)?;
@@ -594,7 +653,7 @@ impl ManagedWorktreeRegistryStore {
         let contents = BoundedRegularReader::read_direct(
             &self.state_root,
             "managed_worktrees.json",
-            DEFAULT_MAX_STATE_BYTES,
+            MAX_MANAGED_REGISTRY_BYTES,
         )?;
         let registry: ManagedWorktreeRegistry =
             serde_json::from_slice(&contents).with_context(|| {
@@ -621,6 +680,7 @@ impl ManagedWorktreeRegistryStore {
                 "managed worktree registry repository binding does not match the current repository"
             );
         }
+        validate_registry_bounds(&registry)?;
         let expected_checksum = managed_registry_checksum(&registry)?;
         if registry.checksum != expected_checksum {
             bail!(
@@ -634,10 +694,16 @@ impl ManagedWorktreeRegistryStore {
     fn save(&self, registry: &mut ManagedWorktreeRegistry) -> Result<()> {
         registry.version = MANAGED_WORKTREE_REGISTRY_VERSION;
         registry.repository = self.repository.clone();
+        validate_registry_bounds(registry)?;
         registry.checksum = managed_registry_checksum(registry)?;
         let mut contents = serde_json::to_vec_pretty(registry)
             .context("failed to serialize managed worktree registry")?;
         contents.push(b'\n');
+        if contents.len() as u64 > MAX_MANAGED_REGISTRY_BYTES {
+            bail!(
+                "managed worktree registry exceeds its serialized size limit of {MAX_MANAGED_REGISTRY_BYTES} bytes"
+            );
+        }
         AtomicStateWriter::scavenge_direct_temps(&self.state_root, "managed_worktrees.json")?;
         AtomicStateWriter::write_direct(&self.state_root, "managed_worktrees.json", &contents)
             .with_context(|| {
@@ -671,6 +737,34 @@ fn managed_registry_checksum(registry: &ManagedWorktreeRegistry) -> Result<Strin
     ))
     .context("failed to encode managed worktree registry checksum payload")?;
     Ok(stable_checksum(&payload))
+}
+
+fn validate_registry_bounds(registry: &ManagedWorktreeRegistry) -> Result<()> {
+    if registry.records.len() > MAX_MANAGED_RECORDS {
+        bail!(
+            "managed worktree registry has {} records, exceeding its limit of {MAX_MANAGED_RECORDS}",
+            registry.records.len()
+        );
+    }
+    if registry.operations.len() > MAX_MANAGED_OPERATIONS {
+        bail!(
+            "managed worktree registry has {} operations, exceeding its limit of {MAX_MANAGED_OPERATIONS}",
+            registry.operations.len()
+        );
+    }
+    for (name, binding) in &registry.records {
+        if normalize_agent_id(name)? != *name || binding.name != *name {
+            bail!("managed worktree registry record key/name is not canonical");
+        }
+        validate_branch_name(&binding.branch)?;
+    }
+    for (name, operation) in &registry.operations {
+        if normalize_agent_id(name)? != *name || operation.name != *name {
+            bail!("managed worktree registry operation key/name is not canonical");
+        }
+        validate_branch_name(&operation.branch)?;
+    }
+    Ok(())
 }
 
 fn recover_pending_operations(
@@ -1274,10 +1368,18 @@ fn verify_worktree_clean_at(path: &Path, branch: &str, expected: Oid) -> Result<
         Ok(())
     };
     verify_head()?;
+    ensure_clean_worktree(path)
+        .context("created worktree is not clean at its persisted branch OID")?;
 
     let mut index = worktree_repo
         .index()
         .context("failed to open created worktree index")?;
+    if index.len() > MAX_WORKTREE_STATUS_ENTRIES {
+        bail!(
+            "created worktree index has {} entries, exceeding its limit of {MAX_WORKTREE_STATUS_ENTRIES}",
+            index.len()
+        );
+    }
     let index_tree = index
         .write_tree()
         .context("failed to materialize created worktree index tree")?;
@@ -1289,14 +1391,6 @@ fn verify_worktree_clean_at(path: &Path, branch: &str, expected: Oid) -> Result<
         bail!("created worktree index does not match its persisted branch OID");
     }
 
-    let mut options = StatusOptions::new();
-    options.include_untracked(true).recurse_untracked_dirs(true);
-    let statuses = worktree_repo
-        .statuses(Some(&mut options))
-        .context("failed to inspect created worktree status")?;
-    if !statuses.is_empty() {
-        bail!("created worktree is not clean at its persisted branch OID");
-    }
     verify_head()
 }
 
@@ -1389,22 +1483,32 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::RemovePrepared {
+        let worktree_quarantine = operation_worktree_quarantine_path(&operation)?;
         let path_exists = path_entry_exists(&binding.path)?;
+        let quarantine_exists = path_entry_exists(&worktree_quarantine)?;
+        if path_exists == quarantine_exists {
+            bail!(
+                "remove operation '{}' requires exactly one of its worktree source and quarantine to exist",
+                operation.name
+            );
+        }
+        let metadata_quarantine = operation_metadata_quarantine_path(&operation)?;
         let metadata_exists = path_entry_exists(&binding.metadata_dir)?;
+        let metadata_quarantine_exists = path_entry_exists(&metadata_quarantine)?;
+        if !metadata_exists || metadata_quarantine_exists {
+            bail!(
+                "remove operation '{}' metadata state is inconsistent before worktree quarantine",
+                operation.name
+            );
+        }
         verify_recovering_branch(
             repo,
             &binding,
             expected_branch_oid,
             operation.delete_branch,
-            path_exists || metadata_exists,
+            true,
         )?;
         if path_exists {
-            if !metadata_exists {
-                bail!(
-                    "remove operation '{}' lost metadata while its worktree still exists",
-                    operation.name
-                );
-            }
             let verified = verify_managed_worktree_binding(
                 repo,
                 &store.repository,
@@ -1414,8 +1518,78 @@ fn recover_remove_operation(
             if !operation.force {
                 ensure_clean_worktree(&verified.path)?;
             }
-            remove_bound_directory(&binding.root, &binding.path, &binding.path_identity)?;
         }
+        ensure_removal_worktree_lock(repo, &binding)?;
+        let quarantined = quarantine_bound_directory(
+            &binding.root,
+            &binding.path,
+            &worktree_quarantine,
+            &binding.path_identity,
+        )?;
+        operation.phase = ManagedWorktreeOperationPhase::WorktreeQuarantined;
+        operation.worktree_quarantine_identity = Some(quarantined);
+        registry
+            .operations
+            .insert(operation.name.clone(), operation.clone());
+        store.save(registry)?;
+    }
+
+    if operation.phase == ManagedWorktreeOperationPhase::WorktreeQuarantined {
+        let worktree_quarantine = operation_worktree_quarantine_path(&operation)?;
+        let worktree_quarantine_identity = operation
+            .worktree_quarantine_identity
+            .as_ref()
+            .context("worktree-quarantined operation lacks its quarantine identity")?;
+        if worktree_quarantine_identity != &binding.path_identity {
+            bail!("worktree quarantine identity differs from its create-time binding");
+        }
+        quarantine_bound_directory(
+            &binding.root,
+            &binding.path,
+            &worktree_quarantine,
+            worktree_quarantine_identity,
+        )?;
+        let metadata_quarantine = operation_metadata_quarantine_path(&operation)?;
+        let metadata_exists = path_entry_exists(&binding.metadata_dir)?;
+        let metadata_quarantine_exists = path_entry_exists(&metadata_quarantine)?;
+        if metadata_exists == metadata_quarantine_exists {
+            bail!(
+                "remove operation '{}' requires exactly one of its metadata source and quarantine to exist",
+                operation.name
+            );
+        }
+        if metadata_exists {
+            verify_metadata_binding_after_worktree_removal(&store.repository, &binding)?;
+            ensure_removal_worktree_lock(repo, &binding)?;
+        }
+        let metadata_root = store.repository.common_dir.join("worktrees");
+        let quarantined = quarantine_bound_directory(
+            &metadata_root,
+            &binding.metadata_dir,
+            &metadata_quarantine,
+            &binding.metadata_dir_identity,
+        )?;
+        operation.phase = ManagedWorktreeOperationPhase::MetadataQuarantined;
+        operation.metadata_quarantine_identity = Some(quarantined);
+        registry
+            .operations
+            .insert(operation.name.clone(), operation.clone());
+        store.save(registry)?;
+    }
+
+    if operation.phase == ManagedWorktreeOperationPhase::MetadataQuarantined {
+        ensure_original_binding_absent(&binding.path, "worktree")?;
+        ensure_original_binding_absent(&binding.metadata_dir, "metadata")?;
+        let worktree_quarantine = operation_worktree_quarantine_path(&operation)?;
+        let worktree_quarantine_identity = operation
+            .worktree_quarantine_identity
+            .as_ref()
+            .context("metadata-quarantined operation lacks worktree quarantine identity")?;
+        remove_quarantined_bound_directory(
+            &binding.root,
+            &worktree_quarantine,
+            worktree_quarantine_identity,
+        )?;
         operation.phase = ManagedWorktreeOperationPhase::WorktreeDeleted;
         registry
             .operations
@@ -1424,15 +1598,18 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::WorktreeDeleted {
-        if path_entry_exists(&binding.metadata_dir)? {
-            verify_metadata_binding_after_worktree_removal(&store.repository, &binding)?;
-            let metadata_root = store.repository.common_dir.join("worktrees");
-            remove_bound_directory(
-                &metadata_root,
-                &binding.metadata_dir,
-                &binding.metadata_dir_identity,
-            )?;
-        }
+        ensure_original_binding_absent(&binding.path, "worktree")?;
+        ensure_original_binding_absent(&binding.metadata_dir, "metadata")?;
+        let metadata_quarantine = operation_metadata_quarantine_path(&operation)?;
+        let metadata_quarantine_identity = operation
+            .metadata_quarantine_identity
+            .as_ref()
+            .context("worktree-deleted operation lacks metadata quarantine identity")?;
+        remove_quarantined_bound_directory(
+            &store.repository.common_dir.join("worktrees"),
+            &metadata_quarantine,
+            metadata_quarantine_identity,
+        )?;
         operation.phase = ManagedWorktreeOperationPhase::MetadataDeleted;
         registry
             .operations
@@ -1441,11 +1618,15 @@ fn recover_remove_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::MetadataDeleted {
+        ensure_original_binding_absent(&binding.path, "worktree")?;
+        ensure_original_binding_absent(&binding.metadata_dir, "metadata")?;
         if operation.delete_branch {
-            delete_bound_local_branch_if_present(
+            compare_and_delete_local_branch(
                 repo,
-                &binding,
+                &binding.branch,
                 expected_branch_oid.context("remove operation lacks expected branch OID")?,
+                true,
+                "managed worktree removal",
             )?;
         }
         operation.phase = ManagedWorktreeOperationPhase::BranchDeleted;
@@ -1475,6 +1656,149 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
+fn deterministic_remove_quarantine_path(
+    root: &Path,
+    kind: &str,
+    name: &str,
+    identity: &FileIdentity,
+) -> PathBuf {
+    let payload = format!(
+        "{kind}\0{name}\0{:016x}\0{:016x}",
+        identity.device, identity.file
+    );
+    root.join(format!(
+        ".maco-remove-{kind}-{}",
+        stable_checksum(payload.as_bytes())
+    ))
+}
+
+fn operation_worktree_quarantine_path(operation: &ManagedWorktreeOperation) -> Result<PathBuf> {
+    let binding = operation
+        .binding
+        .as_ref()
+        .context("remove operation lacks its managed binding")?;
+    let expected = deterministic_remove_quarantine_path(
+        &binding.root,
+        "worktree",
+        &binding.name,
+        &binding.path_identity,
+    );
+    let observed = operation
+        .worktree_quarantine_path
+        .as_ref()
+        .context("remove operation lacks its worktree quarantine path")?;
+    if observed != &expected {
+        bail!("remove operation worktree quarantine path is not deterministic");
+    }
+    Ok(expected)
+}
+
+fn operation_metadata_quarantine_path(operation: &ManagedWorktreeOperation) -> Result<PathBuf> {
+    let binding = operation
+        .binding
+        .as_ref()
+        .context("remove operation lacks its managed binding")?;
+    let metadata_root = binding
+        .metadata_dir
+        .parent()
+        .context("managed metadata binding has no parent")?;
+    let expected = deterministic_remove_quarantine_path(
+        metadata_root,
+        "metadata",
+        &binding.name,
+        &binding.metadata_dir_identity,
+    );
+    let observed = operation
+        .metadata_quarantine_path
+        .as_ref()
+        .context("remove operation lacks its metadata quarantine path")?;
+    if observed != &expected {
+        bail!("remove operation metadata quarantine path is not deterministic");
+    }
+    Ok(expected)
+}
+
+fn quarantine_bound_directory(
+    root_path: &Path,
+    source_path: &Path,
+    quarantine_path: &Path,
+    expected: &FileIdentity,
+) -> Result<FileIdentity> {
+    let root = SafeRoot::open_existing(root_path)?;
+    if source_path.parent() != Some(root.path()) || quarantine_path.parent() != Some(root.path()) {
+        bail!("bound source or quarantine is not a direct child of its recorded root");
+    }
+    let source_name = source_path
+        .file_name()
+        .context("bound source directory has no final component")?;
+    let quarantine_name = quarantine_path
+        .file_name()
+        .context("bound quarantine directory has no final component")?;
+    quarantine_direct_child_directory(&root, source_name, quarantine_name, expected)
+}
+
+fn remove_quarantined_bound_directory(
+    root_path: &Path,
+    quarantine_path: &Path,
+    expected: &FileIdentity,
+) -> Result<bool> {
+    let root = SafeRoot::open_existing(root_path)?;
+    if quarantine_path.parent() != Some(root.path()) {
+        bail!("bound quarantine is not a direct child of its recorded root");
+    }
+    let quarantine_name = quarantine_path
+        .file_name()
+        .context("bound quarantine directory has no final component")?;
+    remove_quarantined_direct_child_tree(
+        &root,
+        quarantine_name,
+        expected,
+        TreeLinkPolicy::UnlinkLinks,
+    )
+}
+
+fn ensure_original_binding_absent(path: &Path, kind: &str) -> Result<()> {
+    if path_entry_exists(path)? {
+        bail!("{kind} source path reappeared after durable quarantine");
+    }
+    Ok(())
+}
+
+fn ensure_removal_worktree_lock(repo: &Repository, binding: &ManagedWorktreeBinding) -> Result<()> {
+    if path_entry_exists(&binding.metadata_dir.join("index.lock"))? {
+        bail!(
+            "managed worktree '{}' has an active Git index lock; stop the child before removal",
+            binding.name
+        );
+    }
+    let worktree = repo.find_worktree(&binding.name).with_context(|| {
+        format!(
+            "failed to find worktree '{}' before quarantine",
+            binding.name
+        )
+    })?;
+    match worktree
+        .is_locked()
+        .with_context(|| format!("failed to inspect worktree lock for '{}'", binding.name))?
+    {
+        WorktreeLockStatus::Unlocked => worktree
+            .lock(Some(REMOVAL_LOCK_REASON))
+            .with_context(|| format!("failed to lock worktree '{}' for removal", binding.name))?,
+        WorktreeLockStatus::Locked(Some(reason)) if reason == REMOVAL_LOCK_REASON => {}
+        WorktreeLockStatus::Locked(_) => bail!(
+            "managed worktree '{}' is locked by another owner; stop it before removal",
+            binding.name
+        ),
+    }
+    match worktree
+        .is_locked()
+        .with_context(|| format!("failed to recheck worktree lock for '{}'", binding.name))?
+    {
+        WorktreeLockStatus::Locked(Some(reason)) if reason == REMOVAL_LOCK_REASON => Ok(()),
+        _ => bail!("managed worktree removal lock was not retained"),
+    }
+}
+
 fn cleanup_create_branch_if_owned(
     repo: &Repository,
     operation: &ManagedWorktreeOperation,
@@ -1482,9 +1806,6 @@ fn cleanup_create_branch_if_owned(
     if operation.branch_ownership != ManagedBranchOwnership::CreatedByMaco {
         return Ok(());
     }
-    let Some(observed) = local_branch_oid(repo, &operation.branch)? else {
-        return Ok(());
-    };
     let expected = operation
         .owned_branch_oid
         .as_deref()
@@ -1492,26 +1813,44 @@ fn cleanup_create_branch_if_owned(
         .transpose()
         .context("create operation owned branch OID is malformed")?
         .context("create operation marked branch-owned without an owned OID")?;
-    if observed != expected {
-        bail!(
-            "newly-created branch '{}' changed after create failure; preserving it",
-            operation.branch
-        );
+    compare_and_delete_local_branch(
+        repo,
+        &operation.branch,
+        expected,
+        true,
+        "failed worktree creation cleanup",
+    )
+}
+
+fn compare_and_delete_local_branch(
+    repo: &Repository,
+    branch: &str,
+    expected: Oid,
+    missing_ok: bool,
+    action: &str,
+) -> Result<()> {
+    validate_branch_name(branch)?;
+    let reference_name = format!("refs/heads/{branch}");
+    let mut transaction = repo
+        .transaction()
+        .with_context(|| format!("failed to start ref transaction for {action}"))?;
+    transaction
+        .lock_ref(&reference_name)
+        .with_context(|| format!("failed to lock branch '{branch}' for {action}"))?;
+    match local_branch_oid(repo, branch)? {
+        None if missing_ok => return Ok(()),
+        None => bail!("branch '{branch}' disappeared before {action}"),
+        Some(observed) if observed != expected => bail!(
+            "branch '{branch}' changed before {action}; expected {expected}, observed {observed}; preserving it"
+        ),
+        Some(_) => {}
     }
-    let mut branch = repo
-        .find_branch(&operation.branch, BranchType::Local)
-        .with_context(|| {
-            format!(
-                "failed to open create-operation branch '{}'",
-                operation.branch
-            )
-        })?;
-    branch.delete().with_context(|| {
-        format!(
-            "failed to clean up create-operation branch '{}'",
-            operation.branch
-        )
-    })
+    transaction
+        .remove(&reference_name)
+        .with_context(|| format!("failed to stage branch '{branch}' deletion for {action}"))?;
+    transaction
+        .commit()
+        .with_context(|| format!("failed to commit branch '{branch}' deletion for {action}"))
 }
 
 fn local_branch_oid(repo: &Repository, branch: &str) -> Result<Option<Oid>> {
@@ -1548,17 +1887,6 @@ fn verify_recovering_branch(
     }
 }
 
-fn remove_bound_directory(root_path: &Path, path: &Path, identity: &FileIdentity) -> Result<()> {
-    let root = SafeRoot::open_existing(root_path)?;
-    if path.parent() != Some(root.path()) {
-        bail!("bound directory is not a direct child of its recorded root");
-    }
-    let name = path
-        .file_name()
-        .context("bound directory has no final component")?;
-    remove_direct_child_tree(&root, name, Some(identity), TreeLinkPolicy::UnlinkLinks)
-}
-
 fn verify_metadata_binding_after_worktree_removal(
     repository: &ManagedRepositoryBinding,
     binding: &ManagedWorktreeBinding,
@@ -1583,23 +1911,6 @@ fn verify_metadata_binding_after_worktree_removal(
         bail!("managed metadata gitdir backlink changed during remove recovery");
     }
     Ok(())
-}
-
-fn delete_bound_local_branch_if_present(
-    repo: &Repository,
-    binding: &ManagedWorktreeBinding,
-    expected_oid: Oid,
-) -> Result<()> {
-    match local_branch_oid(repo, &binding.branch)? {
-        Some(observed) if observed == expected_oid => {
-            delete_bound_local_branch(repo, binding, expected_oid)
-        }
-        Some(_) => bail!(
-            "managed branch '{}' changed before idempotent deletion",
-            binding.branch
-        ),
-        None => Ok(()),
-    }
 }
 
 fn managed_repository_binding(repo: &Repository) -> Result<ManagedRepositoryBinding> {
@@ -1926,32 +2237,6 @@ fn verify_metadata_branch(head_file: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn delete_bound_local_branch(
-    repo: &Repository,
-    binding: &ManagedWorktreeBinding,
-    expected_oid: Oid,
-) -> Result<()> {
-    if !binding.branch_created_by_maco {
-        bail!("refusing to delete a branch not created by this managed worktree");
-    }
-    let mut branch = repo
-        .find_branch(&binding.branch, BranchType::Local)
-        .with_context(|| format!("failed to open managed branch '{}'", binding.branch))?;
-    let observed = branch
-        .get()
-        .target()
-        .with_context(|| format!("managed branch '{}' has no direct target", binding.branch))?;
-    if observed != expected_oid {
-        bail!(
-            "managed branch '{}' changed after removal preflight; refusing deletion",
-            binding.branch
-        );
-    }
-    branch
-        .delete()
-        .with_context(|| format!("failed to delete managed branch '{}'", binding.branch))
-}
-
 fn repository_info(repo: &Repository) -> Result<RepositoryInfo> {
     let path = repo
         .workdir()
@@ -1979,6 +2264,9 @@ pub fn normalize_agent_id(agent_id: &str) -> Result<String> {
     if matches!(trimmed, "." | "..") {
         bail!("agent id cannot be '.' or '..'");
     }
+    if trimmed.len() > MAX_AGENT_ID_BYTES {
+        bail!("agent id exceeds its {MAX_AGENT_ID_BYTES}-byte limit");
+    }
     if !trimmed
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -1994,6 +2282,9 @@ fn default_branch_name(name: &str) -> String {
 }
 
 fn validate_branch_name(branch_name: &str) -> Result<()> {
+    if branch_name.len() > MAX_BRANCH_NAME_BYTES {
+        bail!("branch name exceeds its {MAX_BRANCH_NAME_BYTES}-byte limit");
+    }
     if !Branch::name_is_valid(branch_name).context("failed to validate branch name")? {
         bail!("branch name is not a valid Git branch: {branch_name}");
     }
@@ -2081,19 +2372,102 @@ fn find_worktree(repo: &Repository, name: &str) -> Result<Option<git2::Worktree>
 }
 
 fn ensure_clean_worktree(path: &Path) -> Result<()> {
-    let repo = Repository::open(path)
-        .with_context(|| format!("failed to open worktree repository {}", path.display()))?;
-    let mut options = StatusOptions::new();
-    options.include_untracked(true).recurse_untracked_dirs(true);
-    let statuses = repo
-        .statuses(Some(&mut options))
-        .context("failed to inspect worktree status")?;
-
-    if !statuses.is_empty() {
+    if !bounded_worktree_is_clean(
+        path,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_STATUS_TIMEOUT,
+    )? {
         bail!("worktree is dirty; rerun with --force to remove it anyway");
     }
-
     Ok(())
+}
+
+fn bounded_worktree_is_clean(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("worktree status time budget overflowed")?;
+    run_bounded_git_records(
+        path,
+        ["ls-files", "-z", "--cached"],
+        max_entries,
+        max_output_bytes,
+        deadline,
+        "bounded managed-worktree index listing",
+    )?;
+    let bytes = run_bounded_git_records(
+        path,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+        max_entries,
+        max_output_bytes,
+        deadline,
+        "bounded managed-worktree status",
+    )?;
+    Ok(bytes.is_empty())
+}
+
+fn run_bounded_git_records<const N: usize>(
+    path: &Path,
+    args: [&str; N],
+    max_entries: usize,
+    max_output_bytes: usize,
+    deadline: Instant,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let git = crate::merge::resolve_trusted_executable("git")
+        .context("failed to resolve trusted Git for bounded worktree status")?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("worktree status exhausted its total time budget")?;
+    let mut environment = BTreeMap::new();
+    environment.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
+    environment.insert("LC_ALL".to_string(), "C".to_string());
+    let spec = ProcessSpec::direct(label, git, args, path, max_output_bytes)
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(remaining));
+    let output = run_process(spec).context("bounded worktree status command failed")?;
+    if output.timed_out {
+        bail!(
+            "worktree status exceeded its {} millisecond time budget",
+            remaining.as_millis()
+        );
+    }
+    if output.stdout.is_truncated() || output.stderr.is_truncated() {
+        bail!("worktree status exceeded its {max_output_bytes}-byte output budget");
+    }
+    if output.process_error.is_some() || output.stdin_error.is_some() {
+        bail!("worktree status process cleanup was not verified");
+    }
+    let status = output
+        .status
+        .context("worktree status command returned no exit status")?;
+    if !status.success() {
+        let stderr = output.stderr.summarize_chars(512);
+        bail!("worktree status command failed: {}", stderr.text);
+    }
+    let bytes = output.stdout.as_bytes();
+    if !bytes.is_empty() && !bytes.ends_with(&[0]) {
+        bail!("worktree status returned a malformed non-NUL-terminated record");
+    }
+    let entries = bytes.iter().filter(|byte| **byte == 0).count();
+    if entries > max_entries {
+        bail!("worktree status reported {entries} entries, exceeding its limit of {max_entries}");
+    }
+    Ok(bytes.to_vec())
 }
 
 #[cfg(test)]
@@ -2254,6 +2628,60 @@ mod tests {
 
         let parent_error = normalize_agent_id("..").expect_err("parent id should fail");
         assert!(parent_error.to_string().contains("cannot be"));
+    }
+
+    #[test]
+    fn rejects_oversized_agent_and_branch_names() {
+        let agent = "a".repeat(MAX_AGENT_ID_BYTES + 1);
+        let error = normalize_agent_id(&agent).expect_err("oversized agent id");
+        assert!(error.to_string().contains("byte limit"));
+
+        let branch = "b".repeat(MAX_BRANCH_NAME_BYTES + 1);
+        let error = validate_branch_name(&branch).expect_err("oversized branch");
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn bounded_status_refuses_entry_output_and_time_budget_exhaustion() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        for index in 0..3 {
+            fs::write(repo_path.join(format!("untracked-{index}")), "dirty")
+                .expect("untracked file");
+        }
+
+        let index_entries = bounded_worktree_is_clean(
+            &repo_path,
+            0,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            Duration::from_secs(2),
+        )
+        .expect_err("tracked index entry budget must fail");
+        assert!(index_entries.to_string().contains("entries"));
+
+        let entries = bounded_worktree_is_clean(
+            &repo_path,
+            2,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            Duration::from_secs(2),
+        )
+        .expect_err("entry budget must fail");
+        assert!(entries.to_string().contains("entries"));
+
+        let output = bounded_worktree_is_clean(&repo_path, 10, 1, Duration::from_secs(2))
+            .expect_err("output budget must fail");
+        assert!(output.to_string().contains("output budget"));
+
+        bounded_worktree_is_clean(
+            &repo_path,
+            10,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            Duration::ZERO,
+        )
+        .expect_err("zero time budget must fail before unbounded traversal");
     }
 
     #[test]
@@ -2581,6 +3009,67 @@ mod tests {
     }
 
     #[test]
+    fn transactional_branch_delete_refuses_concurrent_ref_lock_and_preserves_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let oid = commit_readme(&repo).expect("initial commit");
+        let commit = repo.find_commit(oid).expect("commit");
+        repo.branch("topic/locked-delete", &commit, false)
+            .expect("branch");
+        let mut concurrent = repo.transaction().expect("concurrent transaction");
+        concurrent
+            .lock_ref("refs/heads/topic/locked-delete")
+            .expect("concurrent ref lock");
+
+        let error = compare_and_delete_local_branch(
+            &repo,
+            "topic/locked-delete",
+            oid,
+            false,
+            "test deletion",
+        )
+        .expect_err("concurrent ref lock must refuse deletion");
+
+        assert!(error.to_string().contains("failed to lock branch"));
+        assert_eq!(
+            local_branch_oid(&repo, "topic/locked-delete").expect("branch oid"),
+            Some(oid)
+        );
+        drop(concurrent);
+        compare_and_delete_local_branch(&repo, "topic/locked-delete", oid, false, "test deletion")
+            .expect("delete after lock release");
+        assert!(local_branch_oid(&repo, "topic/locked-delete")
+            .expect("missing branch")
+            .is_none());
+
+        let commit = repo.find_commit(oid).expect("commit for advanced branch");
+        repo.branch("topic/advanced-delete", &commit, false)
+            .expect("advanced branch");
+        let advanced =
+            commit_descendant(&repo, "README.md", "# Ref advanced\n").expect("advanced commit");
+        repo.find_branch("topic/advanced-delete", BranchType::Local)
+            .expect("advanced branch ref")
+            .into_reference()
+            .set_target(advanced, "simulate concurrent update-ref")
+            .expect("advance deletion target");
+        let error = compare_and_delete_local_branch(
+            &repo,
+            "topic/advanced-delete",
+            oid,
+            false,
+            "test deletion",
+        )
+        .expect_err("changed branch must be preserved");
+        assert!(error.to_string().contains("preserving it"));
+        assert_eq!(
+            local_branch_oid(&repo, "topic/advanced-delete").expect("advanced oid"),
+            Some(advanced)
+        );
+    }
+
+    #[test]
     fn recovers_create_prepare_by_cleaning_only_unchanged_new_branch() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -2623,6 +3112,10 @@ mod tests {
                 delete_branch: false,
                 force: false,
                 expected_branch_oid: None,
+                worktree_quarantine_path: None,
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: None,
+                metadata_quarantine_identity: None,
             },
         );
         store.save(&mut registry).expect("save prepare");
@@ -2678,6 +3171,10 @@ mod tests {
                     delete_branch: false,
                     force: false,
                     expected_branch_oid: None,
+                    worktree_quarantine_path: None,
+                    worktree_quarantine_identity: None,
+                    metadata_quarantine_path: None,
+                    metadata_quarantine_identity: None,
                 },
             );
             store.save(&mut registry).expect("save intent");
@@ -2733,6 +3230,10 @@ mod tests {
                 delete_branch: false,
                 force: false,
                 expected_branch_oid: None,
+                worktree_quarantine_path: None,
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: None,
+                metadata_quarantine_identity: None,
             },
         );
         store.save(&mut registry).expect("save intent");
@@ -2831,7 +3332,101 @@ mod tests {
     }
 
     #[test]
-    fn recovers_remove_after_worktree_directory_was_already_deleted() {
+    fn registry_store_enforces_record_operation_and_serialized_size_limits() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-limits".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let _lock = store.lock().expect("registry lock");
+        let loaded = store.load().expect("registry");
+        let binding = loaded
+            .records
+            .get("agent-limits")
+            .cloned()
+            .expect("binding");
+
+        let mut too_many_records = store.empty_registry();
+        for index in 0..=MAX_MANAGED_RECORDS {
+            too_many_records
+                .records
+                .insert(format!("record-{index}"), binding.clone());
+        }
+        let error = store
+            .save(&mut too_many_records)
+            .expect_err("record count limit");
+        assert!(error.to_string().contains("records"));
+
+        let template_operation = ManagedWorktreeOperation {
+            kind: ManagedWorktreeOperationKind::Create,
+            phase: ManagedWorktreeOperationPhase::CreateIntent,
+            name: "template".to_string(),
+            root: binding.root.clone(),
+            root_identity: binding.root_identity.clone(),
+            path: binding.path.clone(),
+            prepared_path_identity: None,
+            staging_root: None,
+            staging_root_identity: None,
+            staging_path: None,
+            staged_path_identity: None,
+            staged_metadata: None,
+            branch: "maco/template".to_string(),
+            base_oid: binding.base_oid.clone(),
+            branch_preexisting_oid: None,
+            branch_ownership: ManagedBranchOwnership::Unknown,
+            owned_branch_oid: None,
+            binding: None,
+            delete_branch: false,
+            force: false,
+            expected_branch_oid: None,
+            worktree_quarantine_path: None,
+            worktree_quarantine_identity: None,
+            metadata_quarantine_path: None,
+            metadata_quarantine_identity: None,
+        };
+        let mut too_many_operations = store.empty_registry();
+        for index in 0..=MAX_MANAGED_OPERATIONS {
+            too_many_operations
+                .operations
+                .insert(format!("operation-{index}"), template_operation.clone());
+        }
+        let error = store
+            .save(&mut too_many_operations)
+            .expect_err("operation count limit");
+        assert!(error.to_string().contains("operations"));
+
+        let mut oversized = store.empty_registry();
+        let mut oversized_binding = binding;
+        oversized_binding.root = PathBuf::from("x".repeat(MAX_MANAGED_REGISTRY_BYTES as usize));
+        oversized
+            .records
+            .insert(oversized_binding.name.clone(), oversized_binding);
+        let error = store
+            .save(&mut oversized)
+            .expect_err("serialized size limit");
+        assert!(error.to_string().contains("serialized size"));
+
+        AtomicStateWriter::write_direct(
+            &store.state_root,
+            "managed_worktrees.json",
+            &vec![b' '; MAX_MANAGED_REGISTRY_BYTES as usize + 1],
+        )
+        .expect("write oversized registry fixture");
+        store.load().expect_err("load size limit");
+    }
+
+    #[test]
+    fn recovers_remove_after_worktree_quarantine_rename_before_phase_save() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -2857,6 +3452,18 @@ mod tests {
             .expect("binding");
         let verified = verify_managed_worktree_binding(&repo, &store.repository, &binding, true)
             .expect("verify");
+        let worktree_quarantine_path = deterministic_remove_quarantine_path(
+            &binding.root,
+            "worktree",
+            &binding.name,
+            &binding.path_identity,
+        );
+        let metadata_quarantine_path = deterministic_remove_quarantine_path(
+            &store.repository.common_dir.join("worktrees"),
+            "metadata",
+            &binding.name,
+            &binding.metadata_dir_identity,
+        );
         registry.operations.insert(
             binding.name.clone(),
             ManagedWorktreeOperation {
@@ -2887,11 +3494,21 @@ mod tests {
                 delete_branch: true,
                 force: true,
                 expected_branch_oid: Some(verified.branch_oid.to_string()),
+                worktree_quarantine_path: Some(worktree_quarantine_path.clone()),
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: Some(metadata_quarantine_path),
+                metadata_quarantine_identity: None,
             },
         );
         store.save(&mut registry).expect("save remove prepare");
-        remove_bound_directory(&binding.root, &binding.path, &binding.path_identity)
-            .expect("simulate directory deletion before phase save");
+        ensure_removal_worktree_lock(&repo, &binding).expect("lock before quarantine");
+        quarantine_bound_directory(
+            &binding.root,
+            &binding.path,
+            &worktree_quarantine_path,
+            &binding.path_identity,
+        )
+        .expect("simulate worktree quarantine rename before phase save");
 
         recover_pending_operations(&repo, &store, &mut registry).expect("recover remove");
         assert!(!created.path.exists());
@@ -2901,6 +3518,355 @@ mod tests {
             .is_err());
         assert!(registry.records.is_empty());
         assert!(registry.operations.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remove_recovery_resumes_every_durable_quarantine_boundary() {
+        let boundaries = [
+            "worktree_persisted",
+            "metadata_renamed",
+            "metadata_persisted",
+            "partial_worktree_cleanup",
+            "worktree_deleted_persisted",
+            "partial_metadata_cleanup",
+            "metadata_deleted_persisted",
+            "branch_deleted_before_persist",
+        ];
+        for boundary in boundaries {
+            let temp = TempDir::new().expect("tempdir");
+            let repo_path = temp.path().join("repo");
+            let worktree_root = temp.path().join("worktrees");
+            WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+            let repo = Repository::open(&repo_path).expect("open repo");
+            commit_readme(&repo).expect("initial commit");
+            let manager = WorktreeManager::new(&repo_path);
+            manager
+                .create(WorktreeCreateOptions {
+                    agent_id: "agent-boundary".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                })
+                .expect("create worktree");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+            let _lock = store.lock().expect("registry lock");
+            let mut registry = store.load().expect("registry");
+            let (binding, worktree_quarantine, metadata_quarantine, expected_oid) =
+                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+
+            ensure_removal_worktree_lock(&repo, &binding).expect("removal lock");
+            quarantine_bound_directory(
+                &binding.root,
+                &binding.path,
+                &worktree_quarantine,
+                &binding.path_identity,
+            )
+            .expect("quarantine worktree");
+            {
+                let operation = registry
+                    .operations
+                    .get_mut(&binding.name)
+                    .expect("remove operation");
+                operation.phase = ManagedWorktreeOperationPhase::WorktreeQuarantined;
+                operation.worktree_quarantine_identity = Some(binding.path_identity.clone());
+            }
+            store
+                .save(&mut registry)
+                .expect("persist worktree quarantine");
+            if boundary == "worktree_persisted" {
+                recover_pending_operations(&repo, &store, &mut registry)
+                    .expect("recover after worktree persist");
+                assert_completed_remove(&repo, &registry, &binding);
+                continue;
+            }
+
+            verify_metadata_binding_after_worktree_removal(&store.repository, &binding)
+                .expect("metadata binding");
+            quarantine_bound_directory(
+                &store.repository.common_dir.join("worktrees"),
+                &binding.metadata_dir,
+                &metadata_quarantine,
+                &binding.metadata_dir_identity,
+            )
+            .expect("quarantine metadata");
+            if boundary == "metadata_renamed" {
+                recover_pending_operations(&repo, &store, &mut registry)
+                    .expect("recover metadata rename before phase save");
+                assert_completed_remove(&repo, &registry, &binding);
+                continue;
+            }
+            {
+                let operation = registry
+                    .operations
+                    .get_mut(&binding.name)
+                    .expect("remove operation");
+                operation.phase = ManagedWorktreeOperationPhase::MetadataQuarantined;
+                operation.metadata_quarantine_identity =
+                    Some(binding.metadata_dir_identity.clone());
+            }
+            store
+                .save(&mut registry)
+                .expect("persist metadata quarantine");
+            if boundary == "metadata_persisted" {
+                recover_pending_operations(&repo, &store, &mut registry)
+                    .expect("recover after metadata persist");
+                assert_completed_remove(&repo, &registry, &binding);
+                continue;
+            }
+            if boundary == "partial_worktree_cleanup" {
+                fs::remove_file(worktree_quarantine.join("README.md"))
+                    .expect("simulate partial worktree cleanup");
+                recover_pending_operations(&repo, &store, &mut registry)
+                    .expect("resume partial worktree cleanup");
+                assert_completed_remove(&repo, &registry, &binding);
+                continue;
+            }
+
+            remove_quarantined_bound_directory(
+                &binding.root,
+                &worktree_quarantine,
+                &binding.path_identity,
+            )
+            .expect("delete worktree quarantine");
+            {
+                let operation = registry
+                    .operations
+                    .get_mut(&binding.name)
+                    .expect("remove operation");
+                operation.phase = ManagedWorktreeOperationPhase::WorktreeDeleted;
+            }
+            store
+                .save(&mut registry)
+                .expect("persist worktree deletion");
+            if boundary == "worktree_deleted_persisted" {
+                recover_pending_operations(&repo, &store, &mut registry)
+                    .expect("recover after worktree deletion persist");
+                assert_completed_remove(&repo, &registry, &binding);
+                continue;
+            }
+            if boundary == "partial_metadata_cleanup" {
+                let removable = fs::read_dir(&metadata_quarantine)
+                    .expect("metadata quarantine entries")
+                    .filter_map(std::result::Result::ok)
+                    .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                    .expect("metadata regular file");
+                fs::remove_file(removable.path()).expect("simulate partial metadata cleanup");
+                recover_pending_operations(&repo, &store, &mut registry)
+                    .expect("resume partial metadata cleanup");
+                assert_completed_remove(&repo, &registry, &binding);
+                continue;
+            }
+
+            remove_quarantined_bound_directory(
+                &store.repository.common_dir.join("worktrees"),
+                &metadata_quarantine,
+                &binding.metadata_dir_identity,
+            )
+            .expect("delete metadata quarantine");
+            {
+                let operation = registry
+                    .operations
+                    .get_mut(&binding.name)
+                    .expect("remove operation");
+                operation.phase = ManagedWorktreeOperationPhase::MetadataDeleted;
+            }
+            store
+                .save(&mut registry)
+                .expect("persist metadata deletion");
+            if boundary == "metadata_deleted_persisted" {
+                recover_pending_operations(&repo, &store, &mut registry)
+                    .expect("recover after metadata deletion persist");
+                assert_completed_remove(&repo, &registry, &binding);
+                continue;
+            }
+
+            compare_and_delete_local_branch(
+                &repo,
+                &binding.branch,
+                expected_oid,
+                true,
+                "test crash before branch phase persist",
+            )
+            .expect("delete branch before phase persist");
+            recover_pending_operations(&repo, &store, &mut registry)
+                .expect("recover branch deletion before phase save");
+            assert_completed_remove(&repo, &registry, &binding);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remove_prepared_refuses_both_absent_and_both_present_states() {
+        for both_present in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let repo_path = temp.path().join("repo");
+            let worktree_root = temp.path().join("worktrees");
+            WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+            let repo = Repository::open(&repo_path).expect("open repo");
+            commit_readme(&repo).expect("initial commit");
+            let manager = WorktreeManager::new(&repo_path);
+            manager
+                .create(WorktreeCreateOptions {
+                    agent_id: "agent-ambiguous".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                })
+                .expect("create worktree");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+            let _lock = store.lock().expect("registry lock");
+            let mut registry = store.load().expect("registry");
+            let (binding, worktree_quarantine, _, _) =
+                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+            if both_present {
+                fs::create_dir(&worktree_quarantine).expect("ambiguous quarantine");
+            } else {
+                fs::remove_dir_all(&binding.path).expect("simulate missing source");
+            }
+
+            let error = recover_pending_operations(&repo, &store, &mut registry)
+                .expect_err("ambiguous remove state must fail closed");
+            assert!(error.to_string().contains("exactly one"));
+            assert!(registry.operations.contains_key(&binding.name));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worktree_quarantined_refuses_ambiguous_metadata_states() {
+        for both_present in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let repo_path = temp.path().join("repo");
+            let worktree_root = temp.path().join("worktrees");
+            WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+            let repo = Repository::open(&repo_path).expect("open repo");
+            commit_readme(&repo).expect("initial commit");
+            WorktreeManager::new(&repo_path)
+                .create(WorktreeCreateOptions {
+                    agent_id: "agent-metadata-state".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                })
+                .expect("create worktree");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+            let _lock = store.lock().expect("registry lock");
+            let mut registry = store.load().expect("registry");
+            let (binding, worktree_quarantine, metadata_quarantine, _) =
+                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+            ensure_removal_worktree_lock(&repo, &binding).expect("removal lock");
+            quarantine_bound_directory(
+                &binding.root,
+                &binding.path,
+                &worktree_quarantine,
+                &binding.path_identity,
+            )
+            .expect("worktree quarantine");
+            {
+                let operation = registry
+                    .operations
+                    .get_mut(&binding.name)
+                    .expect("operation");
+                operation.phase = ManagedWorktreeOperationPhase::WorktreeQuarantined;
+                operation.worktree_quarantine_identity = Some(binding.path_identity.clone());
+            }
+            store.save(&mut registry).expect("persist worktree phase");
+            if both_present {
+                fs::create_dir(&metadata_quarantine).expect("ambiguous metadata quarantine");
+            } else {
+                fs::remove_dir_all(&binding.metadata_dir).expect("simulate missing metadata");
+            }
+
+            let error = recover_pending_operations(&repo, &store, &mut registry)
+                .expect_err("ambiguous metadata state must fail closed");
+            assert!(error.to_string().contains("exactly one"));
+            assert!(registry.operations.contains_key(&binding.name));
+        }
+    }
+
+    fn prepare_remove_operation_for_test(
+        repo: &Repository,
+        store: &ManagedWorktreeRegistryStore,
+        registry: &mut ManagedWorktreeRegistry,
+    ) -> (ManagedWorktreeBinding, PathBuf, PathBuf, Oid) {
+        let binding = registry
+            .records
+            .values()
+            .next()
+            .cloned()
+            .expect("managed binding");
+        let verified = verify_managed_worktree_binding(repo, &store.repository, &binding, true)
+            .expect("verify binding");
+        let worktree_quarantine = deterministic_remove_quarantine_path(
+            &binding.root,
+            "worktree",
+            &binding.name,
+            &binding.path_identity,
+        );
+        let metadata_quarantine = deterministic_remove_quarantine_path(
+            &store.repository.common_dir.join("worktrees"),
+            "metadata",
+            &binding.name,
+            &binding.metadata_dir_identity,
+        );
+        registry.operations.insert(
+            binding.name.clone(),
+            ManagedWorktreeOperation {
+                kind: ManagedWorktreeOperationKind::Remove,
+                phase: ManagedWorktreeOperationPhase::RemovePrepared,
+                name: binding.name.clone(),
+                root: binding.root.clone(),
+                root_identity: binding.root_identity.clone(),
+                path: binding.path.clone(),
+                prepared_path_identity: Some(binding.path_identity.clone()),
+                staging_root: None,
+                staging_root_identity: None,
+                staging_path: None,
+                staged_path_identity: None,
+                staged_metadata: None,
+                branch: binding.branch.clone(),
+                base_oid: binding.base_oid.clone(),
+                branch_preexisting_oid: None,
+                branch_ownership: if binding.branch_created_by_maco {
+                    ManagedBranchOwnership::CreatedByMaco
+                } else {
+                    ManagedBranchOwnership::Preexisting
+                },
+                owned_branch_oid: binding
+                    .branch_created_by_maco
+                    .then(|| binding.created_branch_oid.clone()),
+                binding: Some(binding.clone()),
+                delete_branch: true,
+                force: true,
+                expected_branch_oid: Some(verified.branch_oid.to_string()),
+                worktree_quarantine_path: Some(worktree_quarantine.clone()),
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: Some(metadata_quarantine.clone()),
+                metadata_quarantine_identity: None,
+            },
+        );
+        store.save(registry).expect("persist remove prepare");
+        (
+            binding,
+            worktree_quarantine,
+            metadata_quarantine,
+            verified.branch_oid,
+        )
+    }
+
+    fn assert_completed_remove(
+        repo: &Repository,
+        registry: &ManagedWorktreeRegistry,
+        binding: &ManagedWorktreeBinding,
+    ) {
+        assert!(!binding.path.exists());
+        assert!(!binding.metadata_dir.exists());
+        assert!(repo
+            .find_branch(&binding.branch, BranchType::Local)
+            .is_err());
+        assert!(!registry.records.contains_key(&binding.name));
+        assert!(!registry.operations.contains_key(&binding.name));
     }
 
     fn commit_readme(repo: &Repository) -> Result<Oid> {

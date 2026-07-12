@@ -39,6 +39,10 @@ pub const DEFAULT_MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 128;
 const MAX_TREE_ENTRIES: usize = 1_000_000;
+#[cfg(target_os = "linux")]
+const ENTRY_QUARANTINE_PREFIX: &str = ".maco-entry-quarantine-";
+#[cfg(target_os = "linux")]
+const TEMP_QUARANTINE_PREFIX: &str = ".maco-temp-quarantine-";
 const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -566,15 +570,16 @@ impl AtomicStateWriter {
             sync_directory(root)?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = unlink_direct_file(root, &temp_name);
-        }
+        // A failed write deliberately leaves its random temporary name for
+        // lock-held scavenging. Name-only best-effort unlink here would reopen
+        // an ABA window against a concurrent same-UID writer.
         result
     }
 
     /// Removes bounded crash residue for this exact state-file namespace.
     /// Callers must hold the corresponding stable `KernelStateLock` for the
-    /// same `SafeRoot`; otherwise a live writer could be mistaken for residue.
+    /// same `SafeRoot` and ensure every writer has stopped or honors that lock;
+    /// otherwise a live same-UID writer could be mistaken for residue.
     pub(crate) fn scavenge_direct_temps(
         root: &SafeRoot,
         file_name: impl AsRef<OsStr>,
@@ -582,19 +587,22 @@ impl AtomicStateWriter {
         let file_name = file_name.as_ref();
         validate_single_component(file_name)?;
         root.verify()?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             let mut prefix = Vec::with_capacity(file_name.as_bytes().len() + 2);
             prefix.push(b'.');
             prefix.extend_from_slice(file_name.as_bytes());
             prefix.push(b'.');
+            let quarantine_prefix = temp_quarantine_namespace(file_name);
             let mut budget = TreeBudget {
                 remaining_entries: 4096,
             };
             let mut removed = 0usize;
             for entry in directory_entries(root.directory.as_raw_fd(), &mut budget)? {
                 let bytes = entry.as_bytes();
-                if !bytes.starts_with(&prefix) || !bytes.ends_with(b".tmp") {
+                let is_live_temp = bytes.starts_with(&prefix) && bytes.ends_with(b".tmp");
+                let is_quarantine = bytes.starts_with(quarantine_prefix.as_bytes());
+                if !is_live_temp && !is_quarantine {
                     continue;
                 }
                 let name = c_string(&entry)?;
@@ -609,17 +617,27 @@ impl AtomicStateWriter {
                         root.path().join(&entry).display()
                     );
                 }
-                let rebound = fstatat_no_follow(root.directory.as_raw_fd(), &name)?;
-                if identity_from_stat(&rebound) != identity_from_stat(&stat)
+                let expected = identity_from_stat(&stat);
+                let quarantine = temp_quarantine_name(file_name, &entry, &expected);
+                quarantine_regular_file(root, &entry, &quarantine, &expected)?;
+                sync_directory(root)?;
+                let quarantine_c = c_string(&quarantine)?;
+                let rebound = fstatat_no_follow(root.directory.as_raw_fd(), &quarantine_c)?;
+                if identity_from_stat(&rebound) != expected
                     || rebound.st_mode & libc::S_IFMT != libc::S_IFREG
+                    || rebound.st_nlink != 1
+                    || rebound.st_uid != unsafe { libc::geteuid() }
+                    || rebound.st_mode & 0o777 != 0o600
                 {
-                    bail!("state temp residue changed immediately before cleanup");
+                    bail!("state temp quarantine changed immediately before cleanup");
                 }
-                if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                if unsafe { libc::unlinkat(root.directory.as_raw_fd(), quarantine_c.as_ptr(), 0) }
+                    != 0
+                {
                     return Err(std::io::Error::last_os_error()).with_context(|| {
                         format!(
                             "failed to remove state temp residue {}",
-                            root.path().join(&entry).display()
+                            root.path().join(&quarantine).display()
                         )
                     });
                 }
@@ -630,7 +648,7 @@ impl AtomicStateWriter {
             }
             Ok(removed)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         bail!("safe state temp scavenging is unsupported on this platform")
     }
 
@@ -697,6 +715,75 @@ pub enum TreeLinkPolicy {
     RejectLinksAndSpecialFiles,
 }
 
+/// Moves an identity-bound direct-child directory to a caller-supplied
+/// quarantine name using an atomic no-replace rename. The source process must
+/// already be stopped and no writer may mutate the tree during quarantine or
+/// cleanup. Linux provides the required `renameat2(RENAME_NOREPLACE)`
+/// primitive; other platforms fail closed.
+///
+/// Recovery is explicit: exactly one of `child_name` and `quarantine_name`
+/// must exist. If the source is absent and the quarantine entry has the
+/// expected identity, the prior rename is adopted. Both-present, both-absent,
+/// and identity-mismatch states are refused.
+pub fn quarantine_direct_child_directory(
+    root: &SafeRoot,
+    child_name: impl AsRef<OsStr>,
+    quarantine_name: impl AsRef<OsStr>,
+    expected: &FileIdentity,
+) -> Result<FileIdentity> {
+    let child_name = child_name.as_ref();
+    let quarantine_name = quarantine_name.as_ref();
+    validate_single_component(child_name)?;
+    validate_single_component(quarantine_name)?;
+    if child_name == quarantine_name {
+        bail!("source and quarantine directory names must differ");
+    }
+    root.verify()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        quarantine_direct_child_directory_linux(root, child_name, quarantine_name, expected)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = expected;
+        bail!(
+            "atomic no-replace directory quarantine is unsupported on this platform; refusing to mutate {}",
+            root.path().join(child_name).display()
+        )
+    }
+}
+
+/// Resumably removes an already-durable quarantine directory. Absence of both
+/// the durable name and its deterministic cleanup name means cleanup already
+/// completed. The stopped-child/no-active-writer precondition from
+/// [`quarantine_direct_child_directory`] continues to apply.
+pub fn remove_quarantined_direct_child_tree(
+    root: &SafeRoot,
+    quarantine_name: impl AsRef<OsStr>,
+    expected: &FileIdentity,
+    policy: TreeLinkPolicy,
+) -> Result<bool> {
+    let quarantine_name = quarantine_name.as_ref();
+    validate_single_component(quarantine_name)?;
+    root.verify()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        remove_quarantined_direct_child_tree_linux(root, quarantine_name, expected, policy)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (expected, policy);
+        bail!(
+            "secure quarantine cleanup is unsupported on this platform; refusing to delete {}",
+            root.path().join(quarantine_name).display()
+        )
+    }
+}
+
 /// Atomically replaces an empty reserved final directory with a verified
 /// staged directory. Both names are rebound to their opened inodes immediately
 /// before and after `renameat`.
@@ -755,9 +842,12 @@ pub fn replace_reserved_directory_from(
     bail!("handle-relative staged directory replacement is unsupported on this platform")
 }
 
-/// Removes one direct child of a previously verified root. Unix deletion is
-/// handle-relative and performs a complete no-follow preflight before the
-/// first mutation. Platforms without equivalent guarantees fail closed.
+/// Removes one direct child of a previously verified root. The caller must
+/// first stop every process that can mutate the tree and hold its coordination
+/// lock. Linux deletion first moves the bound inode to a deterministic
+/// no-replace quarantine name, verifies the post-rename identity, and then
+/// performs a complete no-follow preflight. Platforms without the required
+/// atomic quarantine primitive fail closed.
 pub fn remove_direct_child_tree(
     root: &SafeRoot,
     child_name: impl AsRef<OsStr>,
@@ -768,12 +858,12 @@ pub fn remove_direct_child_tree(
     validate_single_component(child_name)?;
     root.verify()?;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         remove_direct_child_tree_unix(root, child_name, expected, policy)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = (expected, policy);
         bail!(
@@ -1582,6 +1672,130 @@ fn atomic_replace_at(root: &SafeRoot, source: &OsStr, destination: &OsStr) -> Re
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn rename_noreplace_at(root: &SafeRoot, source: &OsStr, destination: &OsStr) -> Result<()> {
+    let source_name = c_string(source)?;
+    let destination_name = c_string(destination)?;
+    if let Err(error) =
+        rename_noreplace_fd(root.directory.as_raw_fd(), &source_name, &destination_name)
+    {
+        return Err(error).with_context(|| {
+            format!(
+                "failed atomic no-replace quarantine rename from {} to {}",
+                root.path().join(source).display(),
+                root.path().join(destination).display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace_fd(
+    fd: RawFd,
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    if unsafe {
+        libc::renameat2(
+            fd,
+            source.as_ptr(),
+            fd,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_regular_file(
+    root: &SafeRoot,
+    source: &OsStr,
+    quarantine: &OsStr,
+    expected: &FileIdentity,
+) -> Result<()> {
+    let source_name = c_string(source)?;
+    let quarantine_name = c_string(quarantine)?;
+    let source_stat = fstatat_optional_no_follow(root.directory.as_raw_fd(), &source_name)?;
+    let quarantine_stat = fstatat_optional_no_follow(root.directory.as_raw_fd(), &quarantine_name)?;
+    match (source_stat, quarantine_stat) {
+        (Some(_), Some(_)) => bail!("state temp source and quarantine both exist"),
+        (None, None) => bail!("state temp source and quarantine are both absent"),
+        (None, Some(stat)) => {
+            validate_private_regular_quarantine(&stat, expected)?;
+            Ok(())
+        }
+        (Some(stat), None) => {
+            validate_private_regular_quarantine(&stat, expected)?;
+            rename_noreplace_at(root, source, quarantine)?;
+            let rebound = fstatat_no_follow(root.directory.as_raw_fd(), &quarantine_name)?;
+            validate_private_regular_quarantine(&rebound, expected)?;
+            if fstatat_optional_no_follow(root.directory.as_raw_fd(), &source_name)?.is_some() {
+                bail!("state temp source name reappeared during quarantine");
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_regular_quarantine(stat: &libc::stat, expected: &FileIdentity) -> Result<()> {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_nlink != 1
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_mode & 0o777 != 0o600
+        || identity_from_stat(stat) != *expected
+    {
+        bail!("state temp quarantine is unsafe or changed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn component_checksum(name: &OsStr) -> String {
+    stable_checksum(name.as_bytes())
+}
+
+#[cfg(target_os = "linux")]
+fn deletion_quarantine_name(name: &OsStr, identity: &FileIdentity) -> OsString {
+    OsString::from(format!(
+        ".maco-delete-{}-{:016x}-{:016x}",
+        component_checksum(name),
+        identity.device,
+        identity.file
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn entry_quarantine_name(name: &OsStr, identity: &FileIdentity) -> OsString {
+    OsString::from(format!(
+        "{ENTRY_QUARANTINE_PREFIX}{}-{:016x}-{:016x}",
+        component_checksum(name),
+        identity.device,
+        identity.file
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn temp_quarantine_namespace(file_name: &OsStr) -> String {
+    format!("{TEMP_QUARANTINE_PREFIX}{}-", component_checksum(file_name))
+}
+
+#[cfg(target_os = "linux")]
+fn temp_quarantine_name(file_name: &OsStr, source: &OsStr, identity: &FileIdentity) -> OsString {
+    OsString::from(format!(
+        "{}{}-{:016x}-{:016x}",
+        temp_quarantine_namespace(file_name),
+        component_checksum(source),
+        identity.device,
+        identity.file
+    ))
+}
+
 #[cfg(not(unix))]
 fn atomic_replace_at(root: &SafeRoot, source: &OsStr, destination: &OsStr) -> Result<()> {
     let _ = source;
@@ -1597,54 +1811,159 @@ fn sync_directory(root: &SafeRoot) -> Result<()> {
         .with_context(|| format!("failed to flush state directory {}", root.path().display()))
 }
 
-#[cfg(unix)]
-fn unlink_direct_file(root: &SafeRoot, file_name: &OsStr) -> Result<()> {
-    let name = c_string(file_name)?;
-    if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(error).with_context(|| {
+#[cfg(target_os = "linux")]
+fn quarantine_direct_child_directory_linux(
+    root: &SafeRoot,
+    child_name: &OsStr,
+    quarantine_name: &OsStr,
+    expected: &FileIdentity,
+) -> Result<FileIdentity> {
+    let parent_fd = root.directory.as_raw_fd();
+    let source = c_string(child_name)?;
+    let quarantine = c_string(quarantine_name)?;
+    let source_stat = fstatat_optional_no_follow(parent_fd, &source)?;
+    let quarantine_stat = fstatat_optional_no_follow(parent_fd, &quarantine)?;
+    match (source_stat, quarantine_stat) {
+        (Some(_), Some(_)) => bail!(
+            "source and quarantine both exist; refusing ambiguous recovery for {}",
+            root.path().join(child_name).display()
+        ),
+        (None, None) => bail!(
+            "source and quarantine are both absent; refusing ambiguous recovery for {}",
+            root.path().join(child_name).display()
+        ),
+        (None, Some(stat)) => {
+            validate_private_quarantine_directory(root, quarantine_name, &stat, expected)?;
+            Ok(expected.clone())
+        }
+        (Some(stat), None) => {
+            validate_private_quarantine_directory(root, child_name, &stat, expected)?;
+            rename_noreplace_at(root, child_name, quarantine_name)?;
+            let rebound = fstatat_no_follow(parent_fd, &quarantine)?;
+            if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || identity_from_stat(&rebound) != *expected
+            {
+                bail!(
+                    "quarantine identity mismatch after atomic rename for {}",
+                    root.path().join(child_name).display()
+                );
+            }
+            if fstatat_optional_no_follow(parent_fd, &source)?.is_some() {
+                bail!("source name reappeared during directory quarantine");
+            }
+            sync_directory(root)?;
+            Ok(expected.clone())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_quarantine_directory(
+    root: &SafeRoot,
+    name: &OsStr,
+    stat: &libc::stat,
+    expected: &FileIdentity,
+) -> Result<()> {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || identity_from_stat(stat) != *expected
+        || stat.st_uid != unsafe { libc::geteuid() }
+    {
+        bail!(
+            "quarantine directory binding is unsafe or changed: {}",
+            root.path().join(name).display()
+        );
+    }
+    let cname = c_string(name)?;
+    let directory = openat_directory(root.directory.as_raw_fd(), &cname)?;
+    let opened = fstat(directory.as_raw_fd())?;
+    if identity_from_stat(&opened) != *expected {
+        bail!("quarantine directory changed while opening its handle");
+    }
+    if opened.st_mode & 0o777 != 0o700 {
+        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
                 format!(
-                    "failed to remove temporary state {}",
-                    root.path().join(file_name).display()
+                    "failed to tighten quarantine directory permissions at {}",
+                    root.path().join(name).display()
                 )
             });
         }
+        let tightened = fstat(directory.as_raw_fd())?;
+        if identity_from_stat(&tightened) != *expected || tightened.st_mode & 0o777 != 0o700 {
+            bail!("quarantine directory did not become owner-private");
+        }
+        directory
+            .sync_all()
+            .context("failed to flush owner-private quarantine directory")?;
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn unlink_direct_file(root: &SafeRoot, file_name: &OsStr) -> Result<()> {
-    bail!(
-        "handle-relative temporary cleanup is unsupported on this platform: {}",
-        root.path().join(file_name).display()
-    )
+#[cfg(target_os = "linux")]
+fn remove_quarantined_direct_child_tree_linux(
+    root: &SafeRoot,
+    quarantine_name: &OsStr,
+    expected: &FileIdentity,
+    policy: TreeLinkPolicy,
+) -> Result<bool> {
+    let cleanup_name = deletion_quarantine_name(quarantine_name, expected);
+    let quarantine = c_string(quarantine_name)?;
+    let cleanup = c_string(&cleanup_name)?;
+    let source_exists =
+        fstatat_optional_no_follow(root.directory.as_raw_fd(), &quarantine)?.is_some();
+    let cleanup_exists =
+        fstatat_optional_no_follow(root.directory.as_raw_fd(), &cleanup)?.is_some();
+    if !source_exists && !cleanup_exists {
+        return Ok(false);
+    }
+    quarantine_direct_child_directory_linux(root, quarantine_name, &cleanup_name, expected)?;
+    remove_tree_at_name_linux(root, &cleanup_name, expected, policy)?;
+    Ok(true)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn remove_direct_child_tree_unix(
     root: &SafeRoot,
     child_name: &OsStr,
     expected: Option<&FileIdentity>,
     policy: TreeLinkPolicy,
 ) -> Result<()> {
+    let expected = match expected {
+        Some(expected) => expected.clone(),
+        None => {
+            let name = c_string(child_name)?;
+            let stat = fstatat_no_follow(root.directory.as_raw_fd(), &name)?;
+            identity_from_stat(&stat)
+        }
+    };
+    let quarantine_name = deletion_quarantine_name(child_name, &expected);
+    quarantine_direct_child_directory_linux(root, child_name, &quarantine_name, &expected)?;
+    remove_tree_at_name_linux(root, &quarantine_name, &expected, policy)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_tree_at_name_linux(
+    root: &SafeRoot,
+    name: &OsStr,
+    expected: &FileIdentity,
+    policy: TreeLinkPolicy,
+) -> Result<()> {
     let directory = root.directory.as_ref();
     let root_stat = fstat(directory.as_raw_fd())?;
-    let name = c_string(child_name)?;
-    let child = openat_directory(directory.as_raw_fd(), &name)?;
+    let cname = c_string(name)?;
+    let child = openat_directory(directory.as_raw_fd(), &cname)?;
     let child_stat = fstat(child.as_raw_fd())?;
     if child_stat.st_dev != root_stat.st_dev {
         bail!(
             "refusing to cross a filesystem boundary while deleting {}",
-            root.path().join(child_name).display()
+            root.path().join(name).display()
         );
     }
     let observed = identity_from_stat(&child_stat);
-    if expected.is_some_and(|expected| expected != &observed) {
+    if expected != &observed {
         bail!(
             "directory identity changed before deletion at {}",
-            root.path().join(child_name).display()
+            root.path().join(name).display()
         );
     }
     let mut audit_budget = TreeBudget::new();
@@ -1664,21 +1983,22 @@ fn remove_direct_child_tree_unix(
         &mut removal_budget,
     )?;
     drop(child);
-    let rebound = fstatat_no_follow(directory.as_raw_fd(), &name)?;
+    let rebound = fstatat_no_follow(directory.as_raw_fd(), &cname)?;
     if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR || identity_from_stat(&rebound) != observed {
         bail!(
             "top-level directory binding changed immediately before removal: {}",
-            root.path().join(child_name).display()
+            root.path().join(name).display()
         );
     }
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| {
             format!(
                 "failed to remove verified directory {}",
-                root.path().join(child_name).display()
+                root.path().join(name).display()
             )
         });
     }
+    sync_directory(root)?;
     root.verify()?;
     Ok(())
 }
@@ -1705,7 +2025,7 @@ impl TreeBudget {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn audit_directory_unix(
     fd: RawFd,
     device: libc::dev_t,
@@ -1766,7 +2086,7 @@ fn audit_directory_unix(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn remove_directory_contents_unix(
     fd: RawFd,
     device: libc::dev_t,
@@ -1778,19 +2098,45 @@ fn remove_directory_contents_unix(
         bail!("recursive deletion exceeded its maximum depth of {MAX_TREE_DEPTH}");
     }
     for name in directory_entries(fd, budget)? {
-        let cname = c_string(&name)?;
-        let stat = fstatat_no_follow(fd, &cname)?;
+        let source_name = c_string(&name)?;
+        let stat = fstatat_no_follow(fd, &source_name)?;
         if stat.st_dev != device {
             bail!(
                 "filesystem entry changed across devices during deletion: {}",
                 name.to_string_lossy()
             );
         }
-        let kind = stat.st_mode & libc::S_IFMT;
+        let expected = identity_from_stat(&stat);
+        let quarantine_name = entry_quarantine_name(&name, &expected);
+        let quarantine_c = c_string(&quarantine_name)?;
+        rename_noreplace_fd(fd, &source_name, &quarantine_c).with_context(|| {
+            format!(
+                "failed to quarantine child entry {} before deletion",
+                name.to_string_lossy()
+            )
+        })?;
+        let rebound = fstatat_no_follow(fd, &quarantine_c)?;
+        if identity_from_stat(&rebound) != expected
+            || rebound.st_mode & libc::S_IFMT != stat.st_mode & libc::S_IFMT
+        {
+            bail!(
+                "child entry identity changed during quarantine: {}",
+                name.to_string_lossy()
+            );
+        }
+        if fstatat_optional_no_follow(fd, &source_name)?.is_some() {
+            bail!("child source name reappeared during quarantine");
+        }
+        let cname = c_string(&quarantine_name)?;
+        let quarantined = fstatat_no_follow(fd, &cname)?;
+        if identity_from_stat(&quarantined) != expected {
+            bail!("quarantined child identity changed before deletion");
+        }
+        let kind = quarantined.st_mode & libc::S_IFMT;
         if kind == libc::S_IFDIR {
             let child = openat_directory(fd, &cname)?;
             let opened = fstat(child.as_raw_fd())?;
-            if identity_from_stat(&opened) != identity_from_stat(&stat) {
+            if identity_from_stat(&opened) != expected {
                 bail!(
                     "directory entry changed during deletion: {}",
                     name.to_string_lossy()
@@ -1806,7 +2152,7 @@ fn remove_directory_contents_unix(
             drop(child);
             let rebound = fstatat_no_follow(fd, &cname)?;
             if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR
-                || identity_from_stat(&rebound) != identity_from_stat(&opened)
+                || identity_from_stat(&rebound) != expected
             {
                 bail!(
                     "child directory binding changed immediately before removal: {}",
@@ -1823,7 +2169,7 @@ fn remove_directory_contents_unix(
             }
         } else {
             if policy == TreeLinkPolicy::RejectLinksAndSpecialFiles
-                && (kind == libc::S_IFLNK || kind != libc::S_IFREG || stat.st_nlink != 1)
+                && (kind == libc::S_IFLNK || kind != libc::S_IFREG || quarantined.st_nlink != 1)
             {
                 bail!(
                     "artifact entry changed to an unsafe type: {}",
@@ -1831,9 +2177,7 @@ fn remove_directory_contents_unix(
                 );
             }
             let rebound = fstatat_no_follow(fd, &cname)?;
-            if identity_from_stat(&rebound) != identity_from_stat(&stat)
-                || rebound.st_mode & libc::S_IFMT != kind
-            {
+            if identity_from_stat(&rebound) != expected || rebound.st_mode & libc::S_IFMT != kind {
                 bail!(
                     "child entry binding changed immediately before unlink: {}",
                     name.to_string_lossy()
@@ -1870,7 +2214,7 @@ fn directory_entries(fd: RawFd, budget: &mut TreeBudget) -> Result<Vec<OsString>
     }
     let mut entries = Vec::new();
     loop {
-        unsafe { *libc::__errno_location() = 0 };
+        clear_thread_errno()?;
         let entry = unsafe { libc::readdir(directory) };
         if entry.is_null() {
             let errno = std::io::Error::last_os_error();
@@ -1892,6 +2236,23 @@ fn directory_entries(fd: RawFd, budget: &mut TreeBudget) -> Result<Vec<OsString>
     }
     entries.sort();
     Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_thread_errno() -> Result<()> {
+    unsafe { *libc::__errno_location() = 0 };
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_thread_errno() -> Result<()> {
+    unsafe { *libc::__error() = 0 };
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn clear_thread_errno() -> Result<()> {
+    bail!("directory iteration is unsupported for this Unix errno ABI")
 }
 
 #[cfg(unix)]
@@ -1927,6 +2288,20 @@ fn fstatat_no_follow(fd: RawFd, name: &std::ffi::CStr) -> Result<libc::stat> {
             .context("failed to inspect directory entry without following links");
     }
     Ok(stat)
+}
+
+#[cfg(target_os = "linux")]
+fn fstatat_optional_no_follow(fd: RawFd, name: &std::ffi::CStr) -> Result<Option<libc::stat>> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+        return Ok(Some(stat));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(error).context("failed to inspect optional directory entry without following links")
+    }
 }
 
 #[cfg(unix)]
@@ -2019,10 +2394,17 @@ mod tests {
         .expect_err("strict delete must refuse link");
         assert!(error.to_string().contains("symbolic link"));
         assert!(external.join("keep").exists());
-        assert!(run.exists());
+        assert!(!run.exists());
+        let quarantine = root
+            .path()
+            .join(deletion_quarantine_name(OsStr::new("run-a"), &identity));
+        assert_eq!(
+            identity_for_path(&quarantine).expect("quarantined identity"),
+            identity
+        );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn existing_managed_root_accepts_0755_but_strict_state_root_does_not_chmod_it() {
         let temp = TempDir::new().expect("tempdir");
@@ -2059,9 +2441,89 @@ mod tests {
         let error =
             remove_direct_child_tree(&root, "child", Some(&expected), TreeLinkPolicy::UnlinkLinks)
                 .expect_err("substitute must not be removed");
-        assert!(error.to_string().contains("identity changed"));
+        assert!(!error.to_string().is_empty());
         assert!(child.exists());
         assert!(moved.join("original").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_quarantine_adopts_only_one_matching_binding() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create_managed(temp.path().join("root")).expect("root");
+        let source = root.path().join("source");
+        let quarantine = root.path().join("quarantine");
+        fs::create_dir(&source).expect("source");
+        let expected = identity_for_path(&source).expect("identity");
+
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("initial quarantine");
+        assert!(!source.exists());
+        assert_eq!(
+            identity_for_path(&quarantine).expect("quarantine identity"),
+            expected
+        );
+        assert_eq!(
+            fs::symlink_metadata(&quarantine)
+                .expect("quarantine metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("adopt prior rename");
+
+        fs::create_dir(&source).expect("ambiguous source");
+        let error = quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect_err("both-present state must fail closed");
+        assert!(error.to_string().contains("both exist"));
+        assert!(source.exists());
+        assert!(quarantine.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quarantined_tree_cleanup_resumes_after_entry_rename_and_partial_delete() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create_managed(temp.path().join("root")).expect("root");
+        let source = root.path().join("source");
+        fs::create_dir(&source).expect("source");
+        fs::write(source.join("first"), "first").expect("first");
+        fs::write(source.join("second"), "second").expect("second");
+        let expected = identity_for_path(&source).expect("source identity");
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("durable quarantine");
+        let quarantine = root.path().join("quarantine");
+        fs::remove_file(quarantine.join("first")).expect("simulate partial cleanup");
+        let second = quarantine.join("second");
+        let second_identity = identity_for_path(&second).expect("second identity");
+        let entry_quarantine = entry_quarantine_name(OsStr::new("second"), &second_identity);
+        fs::rename(&second, quarantine.join(&entry_quarantine))
+            .expect("simulate crash after child quarantine rename");
+
+        assert!(remove_quarantined_direct_child_tree(
+            &root,
+            "quarantine",
+            &expected,
+            TreeLinkPolicy::UnlinkLinks,
+        )
+        .expect("resume cleanup"));
+        assert!(!quarantine.exists());
+        assert!(!remove_quarantined_direct_child_tree(
+            &root,
+            "quarantine",
+            &expected,
+            TreeLinkPolicy::UnlinkLinks,
+        )
+        .expect("idempotent completed cleanup"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn supported_unix_errno_abi_can_be_cleared_explicitly() {
+        clear_thread_errno().expect("supported errno ABI");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(0));
     }
 
     #[cfg(unix)]
@@ -2085,7 +2547,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_writer_scavenges_only_safe_matching_crash_temps() {
         let temp = TempDir::new().expect("tempdir");
@@ -2094,6 +2556,21 @@ mod tests {
         let residue = root.path().join(".claims.json.crashed.tmp");
         fs::write(&residue, "partial").expect("residue");
         fs::set_permissions(&residue, fs::Permissions::from_mode(0o600)).expect("private mode");
+        let expected = BoundedRegularReader::identity(&residue).expect("residue identity");
+        let quarantine = temp_quarantine_name(
+            OsStr::new("claims.json"),
+            OsStr::new(".claims.json.crashed.tmp"),
+            &expected,
+        );
+        quarantine_regular_file(
+            &root,
+            OsStr::new(".claims.json.crashed.tmp"),
+            &quarantine,
+            &expected,
+        )
+        .expect("simulate crash after temp quarantine rename");
+        assert!(!residue.exists());
+        assert!(root.path().join(&quarantine).exists());
 
         assert_eq!(
             AtomicStateWriter::scavenge_direct_temps(&root, "claims.json").expect("scavenge"),
