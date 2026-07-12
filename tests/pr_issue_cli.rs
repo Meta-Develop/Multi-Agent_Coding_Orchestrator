@@ -237,6 +237,147 @@ fn pr_publish_required_validation_blocks_missing_evidence() -> Result<()> {
 }
 
 #[test]
+fn pr_publish_required_validation_accepts_exact_candidate_binding() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nbound pr\n").context("edit worktree")?;
+    let preview = run_success_json(&[
+        "pr",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    let validation_path = temp.path().join("bound-pr-validation.json");
+    write_bound_validation(
+        &validation_path,
+        &preview["preview"]["candidate"]["validation_binding"],
+    )?;
+
+    let report = run_success_json(&[
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--require-validation",
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "published");
+    assert_eq!(report["validation_required"], true);
+    assert_eq!(
+        report["preview"]["safety"]["validation_evidence"]["binding_status"],
+        "bound"
+    );
+    Ok(())
+}
+
+#[test]
+fn pr_publish_required_validation_rejects_legacy_unbound_pass() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nlegacy pr\n")
+        .context("edit worktree")?;
+    let validation_path = temp.path().join("legacy-pr-validation.json");
+    fs::write(
+        &validation_path,
+        r#"[{"name":"unit","status":"passed","paths":["README.md"]}]"#,
+    )
+    .context("write legacy validation")?;
+
+    let report = run_failure_json(&[
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--require-validation",
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(
+        report["preview"]["safety"]["validation_evidence"]["binding_status"],
+        "unbound"
+    );
+    assert_contains(&report["blockers"], "validation_missing")?;
+    assert_eq!(git_status_porcelain(worktree_path)?, " M README.md\n");
+    Ok(())
+}
+
+#[test]
+fn pr_preview_required_validation_rejects_mismatched_candidate_binding() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nfirst pr\n")
+        .context("edit first candidate")?;
+    let initial = run_success_json(&[
+        "pr",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    let validation_path = temp.path().join("stale-pr-validation.json");
+    write_bound_validation(
+        &validation_path,
+        &initial["preview"]["candidate"]["validation_binding"],
+    )?;
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nsecond pr\n")
+        .context("change candidate")?;
+
+    let report = run_success_json(&[
+        "pr",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(
+        report["preview"]["safety"]["validation_evidence"]["binding_status"],
+        "mismatched"
+    );
+    assert_contains(&report["blockers"], "validation_missing")?;
+    Ok(())
+}
+
+#[test]
 fn issue_preview_redacts_body_and_does_not_create_issue() -> Result<()> {
     let report = run_success_json(&[
         "issue",
@@ -346,6 +487,20 @@ printf '%s\n' 'https://github.example/issues/1'
     assert!(!gh_args.contains("API_TOKEN=secret"));
 
     Ok(())
+}
+
+fn write_bound_validation(path: &Path, binding: &Value) -> Result<()> {
+    let evidence = serde_json::json!({
+        "validation_binding": binding,
+        "reports": [
+            {"name": "unit", "status": "passed", "paths": ["README.md"]}
+        ]
+    });
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&evidence).context("serialize evidence")?,
+    )
+    .context("write bound validation")
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {

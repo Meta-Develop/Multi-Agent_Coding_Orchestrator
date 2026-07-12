@@ -3,14 +3,14 @@ use crate::{
     worktree::{normalize_agent_id, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
-use git2::{Delta, DiffOptions, ErrorCode, Oid, Repository, Status, StatusOptions};
+use git2::{Delta, DiffOptions, ErrorCode, ObjectType, Oid, Repository, Status, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
-    fs,
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -18,6 +18,7 @@ use std::{
 };
 
 pub const DEFAULT_DIFF_SUMMARY_CHAR_LIMIT: usize = 32 * 1024;
+pub const VALIDATION_BINDING_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeCollectOptions {
@@ -65,6 +66,9 @@ pub struct MergeCandidate {
     pub unclaimed_changed_paths: Vec<PathBuf>,
     pub diff: DiffOutput,
     pub validations: Vec<ValidationReport>,
+    pub validation_binding: CandidateValidationBinding,
+    #[serde(skip_serializing)]
+    pub validation_evidence: ValidationEvidenceBundle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -119,6 +123,28 @@ pub struct ValidationReport {
     pub paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateValidationBinding {
+    pub version: u32,
+    pub agent_id: String,
+    pub primary_head: Option<String>,
+    pub agent_head: Option<String>,
+    pub merge_base: Option<String>,
+    pub diff_oid: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidationEvidenceBundle {
+    groups: Vec<ValidationEvidenceGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationEvidenceGroup {
+    binding: Option<CandidateValidationBinding>,
+    reports: Vec<ValidationReport>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationStatus {
@@ -126,6 +152,71 @@ pub enum ValidationStatus {
     Passed,
     Failed,
     Skipped,
+}
+
+impl CandidateValidationBinding {
+    fn canonicalized(mut self) -> Result<Self> {
+        if self.version != VALIDATION_BINDING_VERSION {
+            bail!(
+                "unsupported validation binding version {}; expected {}",
+                self.version,
+                VALIDATION_BINDING_VERSION
+            );
+        }
+        let normalized_agent = normalize_agent_id(&self.agent_id)
+            .context("validation binding has an invalid agent_id")?;
+        if normalized_agent != self.agent_id {
+            bail!("validation binding agent_id must be canonical");
+        }
+        self.primary_head = canonical_optional_oid(self.primary_head, "primary_head")?;
+        self.agent_head = canonical_optional_oid(self.agent_head, "agent_head")?;
+        self.merge_base = canonical_optional_oid(self.merge_base, "merge_base")?;
+        self.diff_oid = canonical_oid(&self.diff_oid, "diff_oid")?;
+        Ok(self)
+    }
+}
+
+impl ValidationEvidenceBundle {
+    pub fn legacy(reports: Vec<ValidationReport>) -> Self {
+        if reports.is_empty() {
+            Self::default()
+        } else {
+            Self {
+                groups: vec![ValidationEvidenceGroup {
+                    binding: None,
+                    reports,
+                }],
+            }
+        }
+    }
+
+    pub fn reports(&self) -> Vec<ValidationReport> {
+        let mut reports = self
+            .groups
+            .iter()
+            .flat_map(|group| group.reports.iter().cloned())
+            .collect::<Vec<_>>();
+        sort_validation_reports(&mut reports);
+        reports
+    }
+
+    pub fn extend(&mut self, mut other: Self) {
+        self.groups.append(&mut other.groups);
+    }
+
+    fn push_bound_reports(
+        &mut self,
+        binding: CandidateValidationBinding,
+        reports: Vec<ValidationReport>,
+    ) {
+        if reports.is_empty() {
+            return;
+        }
+        self.groups.push(ValidationEvidenceGroup {
+            binding: Some(binding),
+            reports,
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -136,11 +227,13 @@ pub struct MergeApplyPreview {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MergeApplySafety {
+    pub primary_state_unchanged: SafetyCheck,
     pub dirty_primary: SafetyCheck,
     pub stale_base: SafetyCheck,
     pub apply_check: SafetyCheck,
     pub unclaimed_edits: SafetyCheck,
     pub validation: SafetyCheck,
+    pub validation_evidence: ValidationEvidenceCheck,
     pub validation_required: bool,
     pub candidate_validation_commands: Vec<String>,
     pub force_options: MergeForceOptions,
@@ -203,6 +296,24 @@ pub enum ApplyBlocker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValidationEvidenceCheck {
+    pub status: SafetyCheckStatus,
+    pub binding_status: ValidationBindingStatus,
+    pub message: Option<String>,
+    pub paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationBindingStatus {
+    NotRequired,
+    NoPassedReport,
+    Bound,
+    Unbound,
+    Mismatched,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyBlockerDetail {
     pub kind: ApplyBlocker,
     pub disposition: ApplyBlockerDisposition,
@@ -245,6 +356,25 @@ struct GitCommandOutput {
     stderr: Vec<u8>,
 }
 
+struct MergeApplyLock {
+    path: PathBuf,
+    owner: String,
+}
+
+struct PendingMergeApplyLock {
+    path: PathBuf,
+    owner: String,
+    file: Option<fs::File>,
+    committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrimaryRepositoryState {
+    head: Option<Oid>,
+    index_digest: Option<Oid>,
+    worktree_digest: Oid,
+}
+
 pub fn find_agent_worktree(
     manager: &WorktreeManager,
     agent_id: impl AsRef<str>,
@@ -258,6 +388,14 @@ pub fn find_agent_worktree(
 }
 
 pub fn collect_agent_result(options: MergeCollectOptions) -> Result<MergeCandidate> {
+    let evidence = ValidationEvidenceBundle::legacy(options.validations.clone());
+    collect_agent_result_with_evidence(options, evidence)
+}
+
+fn collect_agent_result_with_evidence(
+    options: MergeCollectOptions,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<MergeCandidate> {
     let repo_root = discover_primary_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo_root);
     let record = find_agent_worktree(&manager, &options.agent_id)?;
@@ -276,6 +414,8 @@ pub fn collect_agent_result(options: MergeCollectOptions) -> Result<MergeCandida
         .collect::<Vec<_>>();
     let unclaimed_changed_paths = unclaimed_paths(&changed_paths, &claimed_paths);
     let full_diff = collect_full_diff(&record.path, diff_base)?;
+    let validation_binding = candidate_validation_binding(&metadata, &full_diff)?;
+    let validations = validation_evidence.reports();
     let diff = DiffOutput {
         summary: summarize_text(&full_diff, options.diff_summary_char_limit),
         full: options.include_full_diff.then_some(full_diff),
@@ -288,32 +428,51 @@ pub fn collect_agent_result(options: MergeCollectOptions) -> Result<MergeCandida
         changes,
         unclaimed_changed_paths,
         diff,
-        validations: options.validations,
+        validations,
+        validation_binding,
+        validation_evidence,
     })
 }
 
 pub fn preview_merge_apply(options: MergePreviewOptions) -> Result<MergeApplyPreview> {
+    let evidence = ValidationEvidenceBundle::legacy(options.collect.validations.clone());
+    preview_merge_apply_with_evidence(options, evidence)
+}
+
+pub fn preview_merge_apply_with_evidence(
+    options: MergePreviewOptions,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<MergeApplyPreview> {
     let mut collect = options.collect;
     collect.include_full_diff = true;
-    let candidate = collect_agent_result(collect)?;
+    let candidate = collect_agent_result_with_evidence(collect, validation_evidence)?;
     let patch = candidate.diff.full.as_deref().unwrap_or_default();
     let candidate_validation_commands = Vec::new();
 
+    let primary_state_unchanged = passed_safety_check();
     let dirty_primary = dirty_primary_check(&candidate.metadata.primary_repo_root)?;
     let stale_base = stale_base_check(&candidate.metadata);
     let unclaimed_edits = unclaimed_edits_check(&candidate.unclaimed_changed_paths);
     let validation = validation_check(&candidate.validations, options.require_validation);
+    let validation_evidence = validation_evidence_check(
+        &candidate.validation_evidence,
+        &candidate.validation_binding,
+        options.require_validation,
+        &candidate.changed_paths,
+    );
     let (apply_check, apply_mode) = apply_check(
         &candidate.metadata.primary_repo_root,
         patch,
         options.forces.allow_apply_conflicts,
     )?;
     let checks = SafetyChecks {
+        primary_state_unchanged: &primary_state_unchanged,
         dirty_primary: &dirty_primary,
         stale_base: &stale_base,
         apply_check: &apply_check,
         unclaimed_edits: &unclaimed_edits,
         validation: &validation,
+        validation_evidence: &validation_evidence,
         validations: &candidate.validations,
         require_validation: options.require_validation,
         validation_commands: &candidate_validation_commands,
@@ -324,11 +483,13 @@ pub fn preview_merge_apply(options: MergePreviewOptions) -> Result<MergeApplyPre
     Ok(MergeApplyPreview {
         candidate,
         safety: MergeApplySafety {
+            primary_state_unchanged,
             dirty_primary,
             stale_base,
             apply_check,
             unclaimed_edits,
             validation,
+            validation_evidence,
             validation_required: options.require_validation,
             candidate_validation_commands,
             force_options: options.forces,
@@ -339,7 +500,15 @@ pub fn preview_merge_apply(options: MergePreviewOptions) -> Result<MergeApplyPre
 }
 
 pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport> {
-    let report = merge_apply_report(options)?;
+    let evidence = ValidationEvidenceBundle::legacy(options.preview.collect.validations.clone());
+    apply_merge_result_with_evidence(options, evidence)
+}
+
+pub fn apply_merge_result_with_evidence(
+    options: MergeApplyOptions,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<MergeApplyReport> {
+    let report = merge_apply_report_with_evidence(options, validation_evidence)?;
     if report.status == MergeApplyReportStatus::Blocked {
         bail!(
             "merge apply refused: {}",
@@ -351,20 +520,32 @@ pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport
 }
 
 pub fn merge_apply_report(options: MergeApplyOptions) -> Result<MergeApplyReport> {
+    let evidence = ValidationEvidenceBundle::legacy(options.preview.collect.validations.clone());
+    merge_apply_report_with_evidence(options, evidence)
+}
+
+pub fn merge_apply_report_with_evidence(
+    options: MergeApplyOptions,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<MergeApplyReport> {
+    let repo_root = discover_primary_repo_root(&options.preview.collect.repo)?;
+    let _lock = MergeApplyLock::acquire(&repo_root)?;
     let mut preview_options = options.preview;
     let require_validation_after_candidate = preview_options.require_validation;
     if !options.candidate_validation_commands.is_empty() {
         preview_options.require_validation = false;
     }
-    let preview = preview_merge_apply(preview_options)?;
+    let preview = preview_merge_apply_with_evidence(preview_options, validation_evidence)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         return Ok(blocked_merge_apply_report(preview));
     }
+    let expected_primary_state = PrimaryRepositoryState::capture(&repo_root)?;
 
-    apply_prechecked_merge_with_candidate_validation(
+    apply_prechecked_merge_with_candidate_validation_locked(
         preview,
         options.candidate_validation_commands,
         require_validation_after_candidate,
+        &expected_primary_state,
     )
 }
 
@@ -393,9 +574,26 @@ pub fn apply_prechecked_merge(preview: MergeApplyPreview) -> Result<MergeApplyRe
 }
 
 pub fn apply_prechecked_merge_with_candidate_validation(
+    preview: MergeApplyPreview,
+    candidate_validation_commands: Vec<CandidateValidationCommand>,
+    require_validation_after_candidate: bool,
+) -> Result<MergeApplyReport> {
+    let repo_root = preview.candidate.metadata.primary_repo_root.clone();
+    let _lock = MergeApplyLock::acquire(&repo_root)?;
+    let expected_primary_state = PrimaryRepositoryState::capture(&repo_root)?;
+    apply_prechecked_merge_with_candidate_validation_locked(
+        preview,
+        candidate_validation_commands,
+        require_validation_after_candidate,
+        &expected_primary_state,
+    )
+}
+
+fn apply_prechecked_merge_with_candidate_validation_locked(
     mut preview: MergeApplyPreview,
     candidate_validation_commands: Vec<CandidateValidationCommand>,
     require_validation_after_candidate: bool,
+    expected_primary_state: &PrimaryRepositoryState,
 ) -> Result<MergeApplyReport> {
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         bail!(
@@ -404,7 +602,13 @@ pub fn apply_prechecked_merge_with_candidate_validation(
         );
     }
 
-    let patch = preview.candidate.diff.full.as_deref().unwrap_or_default();
+    let patch = preview
+        .candidate
+        .diff
+        .full
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
     if patch.is_empty() {
         return Ok(MergeApplyReport {
             preview,
@@ -426,16 +630,28 @@ pub fn apply_prechecked_merge_with_candidate_validation(
             .map(|command| command.command.clone())
             .collect::<Vec<_>>();
         let reports = run_candidate_validation_commands(&preview, &candidate_validation_commands)?;
+        preview.candidate.validation_evidence.push_bound_reports(
+            preview.candidate.validation_binding.clone(),
+            reports.clone(),
+        );
         preview.candidate.validations.extend(reports);
         preview.safety.candidate_validation_commands = command_labels;
         preview.safety.validation_required = true;
         preview.safety.validation = validation_check(&preview.candidate.validations, true);
+        preview.safety.validation_evidence = validation_evidence_check(
+            &preview.candidate.validation_evidence,
+            &preview.candidate.validation_binding,
+            true,
+            &preview.candidate.changed_paths,
+        );
         let checks = SafetyChecks {
+            primary_state_unchanged: &preview.safety.primary_state_unchanged,
             dirty_primary: &preview.safety.dirty_primary,
             stale_base: &preview.safety.stale_base,
             apply_check: &preview.safety.apply_check,
             unclaimed_edits: &preview.safety.unclaimed_edits,
             validation: &preview.safety.validation,
+            validation_evidence: &preview.safety.validation_evidence,
             validations: &preview.candidate.validations,
             require_validation: true,
             validation_commands: &preview.safety.candidate_validation_commands,
@@ -448,12 +664,20 @@ pub fn apply_prechecked_merge_with_candidate_validation(
     } else if require_validation_after_candidate {
         preview.safety.validation_required = true;
         preview.safety.validation = validation_check(&preview.candidate.validations, true);
+        preview.safety.validation_evidence = validation_evidence_check(
+            &preview.candidate.validation_evidence,
+            &preview.candidate.validation_binding,
+            true,
+            &preview.candidate.changed_paths,
+        );
         let checks = SafetyChecks {
+            primary_state_unchanged: &preview.safety.primary_state_unchanged,
             dirty_primary: &preview.safety.dirty_primary,
             stale_base: &preview.safety.stale_base,
             apply_check: &preview.safety.apply_check,
             unclaimed_edits: &preview.safety.unclaimed_edits,
             validation: &preview.safety.validation,
+            validation_evidence: &preview.safety.validation_evidence,
             validations: &preview.candidate.validations,
             require_validation: true,
             validation_commands: &preview.safety.candidate_validation_commands,
@@ -463,6 +687,11 @@ pub fn apply_prechecked_merge_with_candidate_validation(
         if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
             return Ok(blocked_merge_apply_report(preview));
         }
+    }
+
+    refresh_apply_safety(&mut preview, expected_primary_state)?;
+    if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
+        return Ok(blocked_merge_apply_report(preview));
     }
 
     let args = match preview.safety.apply_mode {
@@ -481,7 +710,7 @@ pub fn apply_prechecked_merge_with_candidate_validation(
         });
     }
 
-    let output = run_git_with_input(&preview.candidate.metadata.primary_repo_root, &args, patch)
+    let output = run_git_with_input(&preview.candidate.metadata.primary_repo_root, &args, &patch)
         .context("failed to run git apply")?;
     if !output.success {
         bail!(
@@ -507,15 +736,26 @@ pub fn apply_prechecked_merge_with_candidate_validation(
 }
 
 pub fn validation_reports_from_json(value: &Value) -> Result<Vec<ValidationReport>> {
-    validation_reports_from_json_for_agent(value, None)
+    validation_evidence_from_json(value).map(|evidence| evidence.reports())
 }
 
 pub fn validation_reports_from_json_for_agent(
     value: &Value,
     agent_id: Option<&str>,
 ) -> Result<Vec<ValidationReport>> {
+    validation_evidence_from_json_for_agent(value, agent_id).map(|evidence| evidence.reports())
+}
+
+pub fn validation_evidence_from_json(value: &Value) -> Result<ValidationEvidenceBundle> {
+    validation_evidence_from_json_for_agent(value, None)
+}
+
+pub fn validation_evidence_from_json_for_agent(
+    value: &Value,
+    agent_id: Option<&str>,
+) -> Result<ValidationEvidenceBundle> {
     if let Some(agents) = value.get("agents").and_then(Value::as_array) {
-        let mut reports = Vec::new();
+        let mut evidence = ValidationEvidenceBundle::default();
         let mut matched_agent = false;
         for agent in agents {
             let candidate_id = agent.get("id").and_then(Value::as_str);
@@ -523,7 +763,7 @@ pub fn validation_reports_from_json_for_agent(
                 continue;
             }
             matched_agent = true;
-            reports.extend(validation_reports_from_agent_json(agent).with_context(|| {
+            evidence.extend(validation_evidence_from_agent_json(agent).with_context(|| {
                 match candidate_id {
                     Some(id) => format!("invalid validation reports for agent '{id}'"),
                     None => "invalid validation reports for summary agent".to_string(),
@@ -534,10 +774,13 @@ pub fn validation_reports_from_json_for_agent(
             let id = agent_id.unwrap_or_default();
             bail!("validation report summary does not contain agent '{id}'");
         }
-        sort_validation_reports(&mut reports);
-        return Ok(reports);
+        return Ok(evidence);
     }
 
+    validation_evidence_group_from_json(value)
+}
+
+fn validation_evidence_group_from_json(value: &Value) -> Result<ValidationEvidenceBundle> {
     let report_values = if let Some(validations) = value.get("validation").and_then(Value::as_array)
     {
         validations
@@ -548,7 +791,13 @@ pub fn validation_reports_from_json_for_agent(
     } else if let Some(array) = value.as_array() {
         array
     } else if value.as_object().is_some() {
-        return Ok(vec![validation_report_from_json(value)?]);
+        let binding = validation_binding_from_json(value)?;
+        return Ok(ValidationEvidenceBundle {
+            groups: vec![ValidationEvidenceGroup {
+                binding,
+                reports: vec![validation_report_from_json(value)?],
+            }],
+        });
     } else {
         bail!("validation report JSON must be an object or array");
     };
@@ -558,17 +807,25 @@ pub fn validation_reports_from_json_for_agent(
         .map(validation_report_from_json)
         .collect::<Result<Vec<_>>>()?;
     sort_validation_reports(&mut reports);
-    Ok(reports)
+    if reports.is_empty() {
+        return Ok(ValidationEvidenceBundle::default());
+    }
+    Ok(ValidationEvidenceBundle {
+        groups: vec![ValidationEvidenceGroup {
+            binding: validation_binding_from_json(value)?,
+            reports,
+        }],
+    })
 }
 
-fn validation_reports_from_agent_json(agent: &Value) -> Result<Vec<ValidationReport>> {
+fn validation_evidence_from_agent_json(agent: &Value) -> Result<ValidationEvidenceBundle> {
     if agent.get("validation").is_some()
         || agent.get("validations").is_some()
         || agent.get("reports").is_some()
     {
-        validation_reports_from_json(agent)
+        validation_evidence_from_json(agent)
     } else {
-        Ok(Vec::new())
+        Ok(ValidationEvidenceBundle::default())
     }
 }
 
@@ -599,6 +856,37 @@ fn collect_metadata(
         merge_base: merge_base.map(|oid| oid.to_string()),
         base_matches_primary,
     })
+}
+
+fn candidate_validation_binding(
+    metadata: &WorktreeMergeMetadata,
+    full_diff: &str,
+) -> Result<CandidateValidationBinding> {
+    let diff_oid = Oid::hash_object(ObjectType::Blob, full_diff.as_bytes())
+        .context("failed to hash merge candidate diff")?;
+    CandidateValidationBinding {
+        version: VALIDATION_BINDING_VERSION,
+        agent_id: metadata.agent_id.clone(),
+        primary_head: metadata.primary_head.clone(),
+        agent_head: metadata.agent_head.clone(),
+        merge_base: metadata.merge_base.clone(),
+        diff_oid: diff_oid.to_string(),
+    }
+    .canonicalized()
+}
+
+fn canonical_optional_oid(value: Option<String>, field: &str) -> Result<Option<String>> {
+    value.map(|value| canonical_oid(&value, field)).transpose()
+}
+
+fn canonical_oid(value: &str, field: &str) -> Result<String> {
+    let oid = Oid::from_str(value)
+        .with_context(|| format!("validation binding {field} must be a Git object id"))?;
+    let canonical = oid.to_string();
+    if canonical != value {
+        bail!("validation binding {field} must use its canonical 40-character lowercase form");
+    }
+    Ok(canonical)
 }
 
 fn collection_base_oid(metadata: &WorktreeMergeMetadata) -> Result<Option<Oid>> {
@@ -772,6 +1060,81 @@ fn collect_untracked_paths(worktree_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn passed_safety_check() -> SafetyCheck {
+    SafetyCheck {
+        status: SafetyCheckStatus::Passed,
+        message: None,
+        paths: Vec::new(),
+    }
+}
+
+fn validation_evidence_check(
+    evidence: &ValidationEvidenceBundle,
+    expected: &CandidateValidationBinding,
+    require_validation: bool,
+    changed_paths: &[PathBuf],
+) -> ValidationEvidenceCheck {
+    if !require_validation {
+        return ValidationEvidenceCheck {
+            status: SafetyCheckStatus::Skipped,
+            binding_status: ValidationBindingStatus::NotRequired,
+            message: Some("candidate-bound validation evidence was not required".to_string()),
+            paths: Vec::new(),
+        };
+    }
+
+    let passing_groups = evidence
+        .groups
+        .iter()
+        .filter(|group| {
+            group
+                .reports
+                .iter()
+                .any(|report| report.status == ValidationStatus::Passed)
+        })
+        .collect::<Vec<_>>();
+    if passing_groups.is_empty() {
+        return ValidationEvidenceCheck {
+            status: SafetyCheckStatus::Skipped,
+            binding_status: ValidationBindingStatus::NoPassedReport,
+            message: Some("no passed validation report was available to bind".to_string()),
+            paths: Vec::new(),
+        };
+    }
+    if passing_groups
+        .iter()
+        .any(|group| group.binding.as_ref() == Some(expected))
+    {
+        return ValidationEvidenceCheck {
+            status: SafetyCheckStatus::Passed,
+            binding_status: ValidationBindingStatus::Bound,
+            message: None,
+            paths: Vec::new(),
+        };
+    }
+    if passing_groups.iter().any(|group| group.binding.is_some()) {
+        return ValidationEvidenceCheck {
+            status: SafetyCheckStatus::Failed,
+            binding_status: ValidationBindingStatus::Mismatched,
+            message: Some(
+                "passed validation evidence is bound to a different candidate; rerun validation for the current candidate.validation_binding"
+                    .to_string(),
+            ),
+            paths: changed_paths.to_vec(),
+        };
+    }
+
+    ValidationEvidenceCheck {
+        status: SafetyCheckStatus::Failed,
+        binding_status: ValidationBindingStatus::Unbound,
+        message: Some(
+            "passed validation evidence uses the legacy unbound format; include the current candidate.validation_binding in the validation report envelope"
+                .to_string(),
+        ),
+        paths: changed_paths.to_vec(),
+    }
+}
+
 fn dirty_primary_check(repo_root: &Path) -> Result<SafetyCheck> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
@@ -822,6 +1185,130 @@ fn stale_base_check(metadata: &WorktreeMergeMetadata) -> SafetyCheck {
             paths: Vec::new(),
         },
     }
+}
+
+fn stale_base_check_for_current_head(
+    metadata: &WorktreeMergeMetadata,
+    current_head: Option<Oid>,
+) -> SafetyCheck {
+    let candidate_base = metadata
+        .merge_base
+        .as_deref()
+        .or(metadata.primary_head.as_deref());
+    let current_head = current_head.map(|oid| oid.to_string());
+    match (candidate_base, current_head.as_deref()) {
+        (Some(base), Some(current)) if base == current => passed_safety_check(),
+        (None, None) => passed_safety_check(),
+        (Some(_), Some(_)) => SafetyCheck {
+            status: SafetyCheckStatus::Failed,
+            message: Some(
+                "candidate base is stale relative to the current primary HEAD".to_string(),
+            ),
+            paths: Vec::new(),
+        },
+        _ => SafetyCheck {
+            status: SafetyCheckStatus::Skipped,
+            message: Some("base freshness could not be determined".to_string()),
+            paths: Vec::new(),
+        },
+    }
+}
+
+fn primary_state_check(
+    expected: &PrimaryRepositoryState,
+    current: &PrimaryRepositoryState,
+) -> SafetyCheck {
+    if expected == current {
+        return passed_safety_check();
+    }
+    let mut changed = Vec::new();
+    if expected.head != current.head {
+        changed.push("HEAD");
+    }
+    if expected.index_digest != current.index_digest {
+        changed.push("index");
+    }
+    if expected.worktree_digest != current.worktree_digest {
+        changed.push("worktree");
+    }
+    SafetyCheck {
+        status: SafetyCheckStatus::Failed,
+        message: Some(format!(
+            "primary repository state changed after the merge safety preview ({})",
+            changed.join(", ")
+        )),
+        paths: Vec::new(),
+    }
+}
+
+fn refresh_apply_safety(
+    preview: &mut MergeApplyPreview,
+    expected_primary_state: &PrimaryRepositoryState,
+) -> Result<()> {
+    let repo_root = &preview.candidate.metadata.primary_repo_root;
+    let current_primary_state = PrimaryRepositoryState::capture(repo_root)?;
+    let dirty_primary = dirty_primary_check(repo_root)?;
+    let stale_base =
+        stale_base_check_for_current_head(&preview.candidate.metadata, current_primary_state.head);
+    let unclaimed_edits = unclaimed_edits_check(&preview.candidate.unclaimed_changed_paths);
+    let validation_required = preview.safety.validation_required;
+    let validation = validation_check(&preview.candidate.validations, validation_required);
+    let validation_evidence = validation_evidence_check(
+        &preview.candidate.validation_evidence,
+        &preview.candidate.validation_binding,
+        validation_required,
+        &preview.candidate.changed_paths,
+    );
+    let patch = preview
+        .candidate
+        .diff
+        .full
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    let (apply_check, apply_mode) = apply_check(
+        repo_root,
+        &patch,
+        preview.safety.force_options.allow_apply_conflicts,
+    )?;
+    let verified_primary_state = PrimaryRepositoryState::capture(repo_root)?;
+    let primary_state_unchanged = if current_primary_state == verified_primary_state {
+        primary_state_check(expected_primary_state, &verified_primary_state)
+    } else {
+        SafetyCheck {
+            status: SafetyCheckStatus::Failed,
+            message: Some(
+                "primary repository state changed while apply-time safety checks were running"
+                    .to_string(),
+            ),
+            paths: Vec::new(),
+        }
+    };
+    let checks = SafetyChecks {
+        primary_state_unchanged: &primary_state_unchanged,
+        dirty_primary: &dirty_primary,
+        stale_base: &stale_base,
+        apply_check: &apply_check,
+        unclaimed_edits: &unclaimed_edits,
+        validation: &validation,
+        validation_evidence: &validation_evidence,
+        validations: &preview.candidate.validations,
+        require_validation: validation_required,
+        validation_commands: &preview.safety.candidate_validation_commands,
+        validation_related_paths: &preview.candidate.changed_paths,
+    };
+    let readiness = classify_apply_safety(checks, &preview.safety.force_options);
+
+    preview.safety.primary_state_unchanged = primary_state_unchanged;
+    preview.safety.dirty_primary = dirty_primary;
+    preview.safety.stale_base = stale_base;
+    preview.safety.apply_check = apply_check;
+    preview.safety.unclaimed_edits = unclaimed_edits;
+    preview.safety.validation = validation;
+    preview.safety.validation_evidence = validation_evidence;
+    preview.safety.apply_mode = apply_mode;
+    preview.safety.readiness = readiness;
+    Ok(())
 }
 
 fn unclaimed_edits_check(paths: &[PathBuf]) -> SafetyCheck {
@@ -1030,12 +1517,18 @@ impl CandidateValidationSandbox {
     fn create(preview: &MergeApplyPreview) -> Result<Self> {
         let primary_repo_root = preview.candidate.metadata.primary_repo_root.clone();
         let path = candidate_validation_sandbox_path(&primary_repo_root)?;
+        let base_revision = preview
+            .candidate
+            .metadata
+            .primary_head
+            .as_deref()
+            .unwrap_or("HEAD");
         let add_output = Command::new("git")
             .arg("-C")
             .arg(&primary_repo_root)
             .args(["worktree", "add", "--detach", "--force"])
             .arg(&path)
-            .arg("HEAD")
+            .arg(base_revision)
             .output()
             .with_context(|| {
                 format!(
@@ -1167,11 +1660,13 @@ fn candidate_validation_message(output: &std::process::Output) -> Option<String>
 }
 
 struct SafetyChecks<'a> {
+    primary_state_unchanged: &'a SafetyCheck,
     dirty_primary: &'a SafetyCheck,
     stale_base: &'a SafetyCheck,
     apply_check: &'a SafetyCheck,
     unclaimed_edits: &'a SafetyCheck,
     validation: &'a SafetyCheck,
+    validation_evidence: &'a ValidationEvidenceCheck,
     validations: &'a [ValidationReport],
     require_validation: bool,
     validation_commands: &'a [String],
@@ -1180,6 +1675,11 @@ struct SafetyChecks<'a> {
 
 fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -> ApplyReadiness {
     let candidates = [
+        (
+            checks.primary_state_unchanged,
+            ApplyBlocker::ApplyCheckFailed,
+            false,
+        ),
         (
             checks.dirty_primary,
             ApplyBlocker::DirtyPrimary,
@@ -1224,6 +1724,11 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
         });
     }
 
+    if let Some(detail) = validation_evidence_blocker_detail(&checks) {
+        blockers.push(detail.kind);
+        details.push(detail);
+    }
+
     for detail in validation_blocker_details(&checks, forces) {
         match detail.disposition {
             ApplyBlockerDisposition::Blocked => blockers.push(detail.kind),
@@ -1231,6 +1736,11 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
         }
         details.push(detail);
     }
+
+    blockers.sort();
+    blockers.dedup();
+    forced.sort();
+    forced.dedup();
 
     let status = if !blockers.is_empty() {
         ApplyReadinessStatus::Blocked
@@ -1246,6 +1756,38 @@ fn classify_apply_safety(checks: SafetyChecks<'_>, forces: &MergeForceOptions) -
         forced,
         details,
     }
+}
+
+fn validation_evidence_blocker_detail(checks: &SafetyChecks<'_>) -> Option<ApplyBlockerDetail> {
+    if checks.validation_evidence.status != SafetyCheckStatus::Failed {
+        return None;
+    }
+    let (kind, next_safe_operation) = match checks.validation_evidence.binding_status {
+        ValidationBindingStatus::Unbound => (
+            ApplyBlocker::ValidationMissing,
+            "regenerate the validation report as an envelope containing the current candidate.validation_binding and its reports",
+        ),
+        ValidationBindingStatus::Mismatched => (
+            ApplyBlocker::ValidationMissing,
+            "rerun validation for the current candidate.validation_binding and replace stale evidence",
+        ),
+        _ => return None,
+    };
+    Some(ApplyBlockerDetail {
+        kind,
+        disposition: ApplyBlockerDisposition::Blocked,
+        check_status: checks.validation_evidence.status,
+        paths: checks.validation_evidence.paths.clone(),
+        message: checks.validation_evidence.message.clone(),
+        validation_reports: checks
+            .validations
+            .iter()
+            .filter(|report| report.status == ValidationStatus::Passed)
+            .cloned()
+            .collect(),
+        validation_commands: checks.validation_commands.to_vec(),
+        next_safe_operation: Some(next_safe_operation.to_string()),
+    })
 }
 
 fn validation_blocker_details(
@@ -1473,6 +2015,130 @@ fn discover_primary_repo_root(repo_path: &Path) -> Result<PathBuf> {
         .context("merge operations require a non-bare primary repository")
 }
 
+impl MergeApplyLock {
+    fn acquire(repo_root: &Path) -> Result<Self> {
+        let repo = Repository::open(repo_root).with_context(|| {
+            format!(
+                "failed to open repository for merge apply lock {}",
+                repo_root.display()
+            )
+        })?;
+        let state_dir = repo.commondir().join("maco").join("state");
+        fs::create_dir_all(&state_dir).with_context(|| {
+            format!(
+                "failed to create merge apply lock directory {}",
+                state_dir.display()
+            )
+        })?;
+        let path = state_dir.join("merge-apply.lock");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time before UNIX epoch")?
+            .as_nanos();
+        let owner = format!("pid={} nonce={nanos}\n", std::process::id());
+        let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let current_owner =
+                    fs::read_to_string(&path).unwrap_or_else(|_| "owner unavailable".to_string());
+                bail!(
+                    "merge apply lock is already held in the repository common state ({}); wait for the active apply to finish, or after verifying no apply process is running remove the stale lock",
+                    current_owner.trim()
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to acquire merge apply lock {}", path.display())
+                });
+            }
+        };
+        PendingMergeApplyLock {
+            path,
+            owner,
+            file: Some(file),
+            committed: false,
+        }
+        .commit()
+    }
+}
+
+impl PendingMergeApplyLock {
+    fn commit(mut self) -> Result<MergeApplyLock> {
+        let file = self
+            .file
+            .as_mut()
+            .context("merge apply lock file was unavailable during acquisition")?;
+        file.write_all(self.owner.as_bytes())
+            .context("failed to record merge apply lock owner")?;
+        file.sync_all()
+            .context("failed to persist merge apply lock owner")?;
+        let _ = self.file.take();
+        self.committed = true;
+        Ok(MergeApplyLock {
+            path: self.path.clone(),
+            owner: self.owner.clone(),
+        })
+    }
+}
+
+impl Drop for PendingMergeApplyLock {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for MergeApplyLock {
+    fn drop(&mut self) {
+        if fs::read_to_string(&self.path).ok().as_deref() == Some(self.owner.as_str()) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl PrimaryRepositoryState {
+    fn capture(repo_root: &Path) -> Result<Self> {
+        let first = Self::capture_once(repo_root)?;
+        let second = Self::capture_once(repo_root)?;
+        if first != second {
+            bail!(
+                "primary repository state changed while it was being captured; retry merge apply after concurrent repository activity stops"
+            );
+        }
+        Ok(second)
+    }
+
+    fn capture_once(repo_root: &Path) -> Result<Self> {
+        let repo = Repository::open(repo_root).with_context(|| {
+            format!("failed to open primary repository {}", repo_root.display())
+        })?;
+        let head = head_oid(&repo).context("failed to read primary HEAD for merge transaction")?;
+        let index_path = repo.path().join("index");
+        let index_digest = match fs::read(&index_path) {
+            Ok(bytes) => Some(
+                Oid::hash_object(ObjectType::Blob, &bytes)
+                    .context("failed to hash primary index state")?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read primary index {}", index_path.display())
+                });
+            }
+        };
+        let worktree_diff = collect_full_diff(repo_root, head)?;
+        let worktree_digest = Oid::hash_object(ObjectType::Blob, worktree_diff.as_bytes())
+            .context("failed to hash primary worktree state")?;
+        Ok(Self {
+            head,
+            index_digest,
+            worktree_digest,
+        })
+    }
+}
+
 fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<GitCommandOutput> {
     run_git_capture_paths(repo_root, args, &[])
 }
@@ -1640,6 +2306,15 @@ fn parse_quoted_error_path(line: &str, prefix: &str) -> Option<PathBuf> {
     }
 }
 
+fn validation_binding_from_json(value: &Value) -> Result<Option<CandidateValidationBinding>> {
+    let Some(binding) = value.get("validation_binding") else {
+        return Ok(None);
+    };
+    let binding: CandidateValidationBinding = serde_json::from_value(binding.clone())
+        .context("validation_binding must match the candidate validation binding schema")?;
+    binding.canonicalized().map(Some)
+}
+
 fn validation_report_from_json(value: &Value) -> Result<ValidationReport> {
     let object = value
         .as_object()
@@ -1719,6 +2394,15 @@ mod tests {
     use super::*;
     use git2::Signature;
 
+    fn passed_validation_evidence_check() -> ValidationEvidenceCheck {
+        ValidationEvidenceCheck {
+            status: SafetyCheckStatus::Passed,
+            binding_status: ValidationBindingStatus::Bound,
+            message: None,
+            paths: Vec::new(),
+        }
+    }
+
     #[test]
     fn classifies_unclaimed_paths_by_repo_relative_claim_coverage() {
         let changed = vec![
@@ -1763,12 +2447,15 @@ mod tests {
             message: None,
             paths: Vec::new(),
         };
+        let evidence = passed_validation_evidence_check();
         let checks = SafetyChecks {
+            primary_state_unchanged: &passed,
             dirty_primary: &failed,
             stale_base: &passed,
             apply_check: &passed,
             unclaimed_edits: &failed,
             validation: &passed,
+            validation_evidence: &evidence,
             validations: &[],
             require_validation: false,
             validation_commands: &[],
@@ -1805,12 +2492,15 @@ mod tests {
             message: None,
             paths: Vec::new(),
         };
+        let evidence = passed_validation_evidence_check();
         let checks = SafetyChecks {
+            primary_state_unchanged: &passed,
             dirty_primary: &failed,
             stale_base: &failed,
             apply_check: &passed,
             unclaimed_edits: &passed,
             validation: &passed,
+            validation_evidence: &evidence,
             validations: &[],
             require_validation: false,
             validation_commands: &[],
@@ -1850,12 +2540,15 @@ mod tests {
             message: None,
             paths: Vec::new(),
         };
+        let evidence = passed_validation_evidence_check();
         let checks = SafetyChecks {
+            primary_state_unchanged: &passed,
             dirty_primary: &passed,
             stale_base: &passed,
             apply_check: &failed,
             unclaimed_edits: &passed,
             validation: &passed,
+            validation_evidence: &evidence,
             validations: &[],
             require_validation: false,
             validation_commands: &[],
@@ -1872,6 +2565,27 @@ mod tests {
 
         assert_eq!(readiness.status, ApplyReadinessStatus::Blocked);
         assert_eq!(readiness.blockers, vec![ApplyBlocker::ApplyCheckFailed]);
+    }
+
+    #[test]
+    fn pending_merge_apply_lock_removes_created_file_when_not_committed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("merge-apply.lock");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create pending lock");
+        let pending = PendingMergeApplyLock {
+            path: path.clone(),
+            owner: "test-owner".to_string(),
+            file: Some(file),
+            committed: false,
+        };
+
+        drop(pending);
+
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1930,13 +2644,26 @@ mod tests {
                     full: Some("this is not a patch\n".to_string()),
                 },
                 validations: Vec::new(),
+                validation_binding: CandidateValidationBinding {
+                    version: VALIDATION_BINDING_VERSION,
+                    agent_id: "agent-a".to_string(),
+                    primary_head: None,
+                    agent_head: None,
+                    merge_base: None,
+                    diff_oid: Oid::hash_object(ObjectType::Blob, b"this is not a patch\n")
+                        .expect("hash invalid patch")
+                        .to_string(),
+                },
+                validation_evidence: ValidationEvidenceBundle::default(),
             },
             safety: MergeApplySafety {
+                primary_state_unchanged: passed.clone(),
                 dirty_primary: passed.clone(),
                 stale_base: passed.clone(),
                 apply_check: passed.clone(),
                 unclaimed_edits: passed.clone(),
                 validation: passed,
+                validation_evidence: passed_validation_evidence_check(),
                 validation_required: false,
                 candidate_validation_commands: Vec::new(),
                 force_options: MergeForceOptions::default(),

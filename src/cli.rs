@@ -15,7 +15,7 @@ use crate::{
     merge::{
         self, CandidateValidationCommand, MergeApplyOptions, MergeApplyPreview, MergeApplyReport,
         MergeCandidate, MergeCollectOptions, MergeForceOptions, MergePreviewOptions,
-        ValidationReport,
+        ValidationEvidenceBundle, ValidationReport,
     },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
@@ -1959,12 +1959,15 @@ fn preview_merge_from_args(
     require_validation: bool,
 ) -> Result<MergeApplyPreview> {
     let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
-    let validations = load_validation_reports(&validation_report_paths, &agent_id)?;
-    merge::preview_merge_apply(MergePreviewOptions {
-        collect: collect_options_from_claims(&repo, &agent_id, claims, true, validations),
-        forces,
-        require_validation,
-    })
+    let validation_evidence = load_validation_evidence(&validation_report_paths, &agent_id)?;
+    merge::preview_merge_apply_with_evidence(
+        MergePreviewOptions {
+            collect: collect_options_from_claims(&repo, &agent_id, claims, true, Vec::new()),
+            forces,
+            require_validation,
+        },
+        validation_evidence,
+    )
 }
 
 #[derive(Debug, Args)]
@@ -1989,7 +1992,8 @@ impl MergeCommand {
             }
             MergeSubcommand::Apply(args) => {
                 let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
-                let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
+                let validation_evidence =
+                    load_validation_evidence(&args.validation_report, &args.agent_id)?;
                 let candidate_validation_commands = args
                     .validation_command
                     .into_iter()
@@ -2001,16 +2005,19 @@ impl MergeCommand {
                         &args.agent_id,
                         claims,
                         true,
-                        validations,
+                        Vec::new(),
                     ),
                     forces: args.forces.into_force_options(),
                     require_validation: args.require_validation,
                 };
                 let report = if args.json {
-                    let report = merge::merge_apply_report(MergeApplyOptions {
-                        preview: preview_options,
-                        candidate_validation_commands,
-                    })?;
+                    let report = merge::merge_apply_report_with_evidence(
+                        MergeApplyOptions {
+                            preview: preview_options,
+                            candidate_validation_commands,
+                        },
+                        validation_evidence,
+                    )?;
                     if report.status == merge::MergeApplyReportStatus::Blocked {
                         print_merge_apply_report(&report, true)?;
                         let message = report
@@ -2021,10 +2028,13 @@ impl MergeCommand {
                     }
                     report
                 } else {
-                    merge::apply_merge_result(MergeApplyOptions {
-                        preview: preview_options,
-                        candidate_validation_commands,
-                    })?
+                    merge::apply_merge_result_with_evidence(
+                        MergeApplyOptions {
+                            preview: preview_options,
+                            candidate_validation_commands,
+                        },
+                        validation_evidence,
+                    )?
                 };
                 print_merge_apply_report(&report, args.json)
             }
@@ -2132,18 +2142,22 @@ impl PrCommand {
             PrSubcommand::Preview(args) => {
                 let json = args.json;
                 let require_validation = args.require_validation;
-                let report = publication::preview_pr_with_validation_requirement(
-                    pr_options_from_preview_args(args)?,
+                let (options, validation_evidence) = pr_options_from_preview_args(args)?;
+                let report = publication::preview_pr_with_validation_evidence(
+                    options,
                     require_validation,
+                    validation_evidence,
                 )?;
                 print_pr_publication_report(&report, json)
             }
             PrSubcommand::Publish(args) => {
                 let json = args.json;
                 let require_validation = args.require_validation;
-                let report = publication::publish_pr_with_validation_requirement(
-                    pr_options_from_publish_args(args)?,
+                let (options, validation_evidence) = pr_options_from_publish_args(args)?;
+                let report = publication::publish_pr_with_validation_evidence(
+                    options,
                     require_validation,
+                    validation_evidence,
                 )?;
                 print_pr_publication_report(&report, json)?;
                 if report.status == PrPublicationStatus::Blocked {
@@ -2312,28 +2326,38 @@ struct IssueCreateArgs {
     json: bool,
 }
 
-fn pr_options_from_preview_args(args: PrPreviewArgs) -> Result<PrPublicationOptions> {
-    let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
-    Ok(PrPublicationOptions {
-        repo: args.repo,
-        agent_id: args.agent_id,
-        claimed_paths: args.claim,
-        validations,
-        forge: args.forge,
-        draft: !args.ready,
-    })
+fn pr_options_from_preview_args(
+    args: PrPreviewArgs,
+) -> Result<(PrPublicationOptions, ValidationEvidenceBundle)> {
+    let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
+    Ok((
+        PrPublicationOptions {
+            repo: args.repo,
+            agent_id: args.agent_id,
+            claimed_paths: args.claim,
+            validations: Vec::new(),
+            forge: args.forge,
+            draft: !args.ready,
+        },
+        validation_evidence,
+    ))
 }
 
-fn pr_options_from_publish_args(args: PrPublishArgs) -> Result<PrPublicationOptions> {
-    let validations = load_validation_reports(&args.validation_report, &args.agent_id)?;
-    Ok(PrPublicationOptions {
-        repo: args.repo,
-        agent_id: args.agent_id,
-        claimed_paths: args.claim,
-        validations,
-        forge: args.forge,
-        draft: !args.ready,
-    })
+fn pr_options_from_publish_args(
+    args: PrPublishArgs,
+) -> Result<(PrPublicationOptions, ValidationEvidenceBundle)> {
+    let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
+    Ok((
+        PrPublicationOptions {
+            repo: args.repo,
+            agent_id: args.agent_id,
+            claimed_paths: args.claim,
+            validations: Vec::new(),
+            forge: args.forge,
+            draft: !args.ready,
+        },
+        validation_evidence,
+    ))
 }
 
 fn issue_options_from_args(
@@ -2436,25 +2460,19 @@ fn validation_reports_from_summary(agent: &Value) -> Result<Vec<ValidationReport
     }
 }
 
-fn load_validation_reports(paths: &[PathBuf], agent_id: &str) -> Result<Vec<ValidationReport>> {
-    let mut reports = Vec::new();
+fn load_validation_evidence(paths: &[PathBuf], agent_id: &str) -> Result<ValidationEvidenceBundle> {
+    let mut evidence = ValidationEvidenceBundle::default();
     for path in paths {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("failed to read validation report {}", path.display()))?;
         let value: Value = serde_json::from_str(&contents)
             .with_context(|| format!("failed to parse validation report {}", path.display()))?;
-        reports.extend(
-            merge::validation_reports_from_json_for_agent(&value, Some(agent_id))
+        evidence.extend(
+            merge::validation_evidence_from_json_for_agent(&value, Some(agent_id))
                 .with_context(|| format!("invalid validation report {}", path.display()))?,
         );
     }
-    reports.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.paths.cmp(&right.paths))
-            .then_with(|| left.message.cmp(&right.message))
-    });
-    Ok(reports)
+    Ok(evidence)
 }
 
 #[derive(Debug, Serialize)]

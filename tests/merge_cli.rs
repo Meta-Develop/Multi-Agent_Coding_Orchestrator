@@ -51,6 +51,252 @@ fn merge_apply_accepts_external_validation_report_and_applies() -> Result<()> {
 }
 
 #[test]
+fn merge_apply_required_validation_accepts_exact_candidate_binding() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nbound\n").context("edit worktree")?;
+    let preview = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    let validation_path = temp.path().join("bound-validation.json");
+    write_bound_validation(
+        &validation_path,
+        &preview["candidate"]["validation_binding"],
+    )?;
+
+    let report = run_success_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "applied");
+    assert_eq!(
+        report["preview"]["safety"]["validation_evidence"]["binding_status"],
+        "bound"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
+        "# Smoke\n\nbound\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn merge_preview_required_validation_rejects_legacy_unbound_pass() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nlegacy\n").context("edit worktree")?;
+    let validation_path = temp.path().join("legacy-validation.json");
+    fs::write(
+        &validation_path,
+        r#"[{"name":"unit","status":"passed","paths":["README.md"]}]"#,
+    )
+    .context("write legacy validation")?;
+
+    let preview = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_eq!(preview["safety"]["readiness"]["status"], "blocked");
+    assert_eq!(
+        preview["safety"]["validation_evidence"]["binding_status"],
+        "unbound"
+    );
+    assert_contains(
+        &preview["safety"]["readiness"]["blockers"],
+        "validation_missing",
+    )?;
+    assert!(preview["safety"]["readiness"]["details"]
+        .as_array()
+        .context("details array")?
+        .iter()
+        .any(|detail| detail["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("legacy unbound")));
+    Ok(())
+}
+
+#[test]
+fn merge_apply_rejects_stale_binding_after_agent_candidate_changes() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nfirst\n")
+        .context("edit first candidate")?;
+    let preview = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    let validation_path = temp.path().join("stale-validation.json");
+    write_bound_validation(
+        &validation_path,
+        &preview["candidate"]["validation_binding"],
+    )?;
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nsecond\n")
+        .context("change candidate after validation")?;
+
+    let report = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--require-validation",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(
+        report["preview"]["safety"]["validation_evidence"]["binding_status"],
+        "mismatched"
+    );
+    assert_contains(
+        &report["preview"]["safety"]["readiness"]["blockers"],
+        "validation_missing",
+    )?;
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\ncandidate\n")
+        .context("edit worktree")?;
+    let mutation_command = format!(
+        "printf 'pub fn ok() -> bool {{ false }}\\n' > {} && git -C {} add src/lib.rs && git -C {} -c user.name='maco test' -c user.email='maco-test@example.invalid' commit -m concurrent-primary",
+        repo_path.join("src/lib.rs").display(),
+        repo_path.display(),
+        repo_path.display()
+    );
+
+    let report = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-command",
+        &mutation_command,
+        "--force-stale-base",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(
+        report["preview"]["safety"]["primary_state_unchanged"]["status"],
+        "failed"
+    );
+    assert_contains(
+        &report["preview"]["safety"]["readiness"]["blockers"],
+        "apply_check_failed",
+    )?;
+    assert_contains(
+        &report["preview"]["safety"]["readiness"]["forced"],
+        "stale_base",
+    )?;
+    assert_eq!(
+        report["preview"]["safety"]["dirty_primary"]["status"],
+        "passed"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nlocked\n").context("edit worktree")?;
+    let lock_dir = repo_path.join(".git/maco/state");
+    fs::create_dir_all(&lock_dir).context("create lock dir")?;
+    fs::write(lock_dir.join("merge-apply.lock"), "pid=test nonce=held\n")
+        .context("write held lock")?;
+
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--json",
+        ])
+        .output()
+        .context("run locked merge apply")?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("merge apply lock is already held"));
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn merge_apply_json_reports_dirty_primary_blocker() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -443,6 +689,20 @@ fn merge_apply_candidate_validation_failure_blocks_before_primary_apply() -> Res
     );
 
     Ok(())
+}
+
+fn write_bound_validation(path: &Path, binding: &Value) -> Result<()> {
+    let evidence = serde_json::json!({
+        "validation_binding": binding,
+        "reports": [
+            {"name": "unit", "status": "passed", "paths": ["README.md"]}
+        ]
+    });
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&evidence).context("serialize evidence")?,
+    )
+    .context("write bound validation")
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {

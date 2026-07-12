@@ -2,7 +2,8 @@ use crate::{
     llm::{RedactionSummary, Redactor},
     merge::{
         self, ApplyBlocker, ApplyReadinessStatus, MergeApplyPreview, MergeCollectOptions,
-        MergeForceOptions, MergePreviewOptions, OutputSummary, SafetyCheckStatus, ValidationReport,
+        MergeForceOptions, MergePreviewOptions, OutputSummary, SafetyCheckStatus,
+        ValidationEvidenceBundle, ValidationReport,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -114,7 +115,16 @@ pub fn preview_pr_with_validation_requirement(
     options: PrPublicationOptions,
     require_validation: bool,
 ) -> Result<PrPublicationReport> {
-    let preview = build_merge_preview(&options, require_validation)?;
+    let evidence = ValidationEvidenceBundle::legacy(options.validations.clone());
+    preview_pr_with_validation_evidence(options, require_validation, evidence)
+}
+
+pub fn preview_pr_with_validation_evidence(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<PrPublicationReport> {
+    let preview = build_merge_preview(&options, require_validation, validation_evidence)?;
     let primary_repo = Repository::open(&preview.candidate.metadata.primary_repo_root)
         .context("failed to open primary repository")?;
     let base = current_branch_name(&primary_repo).unwrap_or_else(|| "HEAD".to_string());
@@ -165,7 +175,17 @@ pub fn publish_pr_with_validation_requirement(
     options: PrPublicationOptions,
     require_validation: bool,
 ) -> Result<PrPublicationReport> {
-    let mut report = preview_pr_with_validation_requirement(options, require_validation)?;
+    let evidence = ValidationEvidenceBundle::legacy(options.validations.clone());
+    publish_pr_with_validation_evidence(options, require_validation, evidence)
+}
+
+pub fn publish_pr_with_validation_evidence(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<PrPublicationReport> {
+    let mut report =
+        preview_pr_with_validation_evidence(options, require_validation, validation_evidence)?;
     if report.readiness == ApplyReadinessStatus::Blocked {
         return Ok(report);
     }
@@ -280,19 +300,23 @@ pub fn create_issue(options: IssuePublicationOptions) -> Result<IssuePublication
 fn build_merge_preview(
     options: &PrPublicationOptions,
     require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
 ) -> Result<MergeApplyPreview> {
-    merge::preview_merge_apply(MergePreviewOptions {
-        collect: MergeCollectOptions {
-            repo: options.repo.clone(),
-            agent_id: options.agent_id.clone(),
-            claimed_paths: options.claimed_paths.clone(),
-            include_full_diff: true,
-            diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
-            validations: options.validations.clone(),
+    merge::preview_merge_apply_with_evidence(
+        MergePreviewOptions {
+            collect: MergeCollectOptions {
+                repo: options.repo.clone(),
+                agent_id: options.agent_id.clone(),
+                claimed_paths: options.claimed_paths.clone(),
+                include_full_diff: true,
+                diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                validations: Vec::new(),
+            },
+            forces: MergeForceOptions::default(),
+            require_validation,
         },
-        forces: MergeForceOptions::default(),
-        require_validation,
-    })
+        validation_evidence,
+    )
 }
 
 fn pr_title(preview: &MergeApplyPreview) -> String {
