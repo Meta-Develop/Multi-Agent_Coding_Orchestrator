@@ -1,4 +1,8 @@
 use crate::{
+    process_runner::{
+        run_process, ContainmentEvidence, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
+        StdinMode,
+    },
     sync::normalize_repo_relative_path,
     worktree::{normalize_agent_id, WorktreeManager, WorktreeRecord},
 };
@@ -14,8 +18,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const DEFAULT_DIFF_SUMMARY_CHAR_LIMIT: usize = 32 * 1024;
@@ -28,6 +31,19 @@ const VALIDATION_RAW_MAX_ENTRIES: usize = 8 * 1024;
 const VALIDATION_RAW_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const VALIDATION_RAW_MAX_SINGLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const VALIDATION_MARKER_MAX_BYTES: u64 = 64 * 1024;
+const LOCAL_GIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const NETWORK_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+const CANDIDATE_VALIDATION_PROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+const GIT_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const VALIDATION_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
+const GIT_STDIN_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const PRIVATE_RUNTIME_OWNER_VERSION: u32 = 1;
+const PRIVATE_RUNTIME_OWNER_FILE: &str = "maco-runtime-owner.json";
+const PRIVATE_RUNTIME_LOCK_FILE: &str = ".maco-private-runtime.lock";
+const PRIVATE_RUNTIME_OWNER_MAX_BYTES: u64 = 4 * 1024;
+const PRIVATE_RUNTIME_SCAN_MAX_DIRECTORIES: usize = 128;
+const PRIVATE_RUNTIME_REMOVAL_MAX_ENTRIES: usize = 32 * 1024;
+const PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeCollectOptions {
@@ -370,11 +386,13 @@ pub enum MergeApplyReportStatus {
     Blocked,
 }
 
-struct GitCommandOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct RequiredCommandOutput {
+    pub(crate) success: bool,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
+
+type GitCommandOutput = RequiredCommandOutput;
 
 pub(crate) struct RepoCommonLock {
     file: fs::File,
@@ -420,9 +438,63 @@ struct CandidateRepositorySnapshot {
 
 struct TemporaryIndex {
     directory: PathBuf,
+    _runtime_directory: Option<PrivateRuntimeDirectory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrivateRuntimeKind {
+    CandidateCapture,
+    CandidateValidation,
+    PublicationGit,
+    GhConfig,
+}
+
+impl PrivateRuntimeKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::CandidateCapture => "maco-candidate-capture-",
+            Self::CandidateValidation => "maco-candidate-validation-",
+            Self::PublicationGit => "maco-publication-git-",
+            Self::GhConfig => "maco-gh-config-",
+        }
+    }
+
+    fn owner_path(self, directory: &Path) -> PathBuf {
+        match self {
+            Self::CandidateValidation => directory.join(".git").join(PRIVATE_RUNTIME_OWNER_FILE),
+            _ => directory.join(PRIVATE_RUNTIME_OWNER_FILE),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateRuntimeOwner {
+    version: u32,
+    pid: u32,
+    process_start: Option<ProcessStartIdentity>,
+    boot_id: Option<String>,
+    created_unix_seconds: u64,
+    kind: PrivateRuntimeKind,
+    nonce: String,
+}
+
+pub(crate) struct PrivateRuntimeDirectory {
+    runtime_root: PathBuf,
     path: PathBuf,
-    object_directory: PathBuf,
-    alternate_object_directory: PathBuf,
+    owner: PrivateRuntimeOwner,
+    directory_metadata: fs::Metadata,
+}
+
+struct PrivateRuntimeRootLock {
+    file: fs::File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrivateRuntimeScavengeReport {
+    removed: usize,
+    retained: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -928,7 +1000,7 @@ fn capture_candidate_snapshot_once(
     record: &WorktreeRecord,
     primary_repo_root: PathBuf,
 ) -> Result<Option<CandidateRepositorySnapshot>> {
-    let before = capture_candidate_boundary(primary_repo, agent_repo, &record.path)?;
+    let before = capture_candidate_boundary(primary_repo, agent_repo)?;
     let metadata = metadata_from_heads(
         primary_repo,
         record,
@@ -944,7 +1016,7 @@ fn capture_candidate_snapshot_once(
         base_oid,
     )?;
     preserve_untracked_change_kinds(&before.worktree_status, &mut captured.changes)?;
-    let after = capture_candidate_boundary(primary_repo, agent_repo, &record.path)?;
+    let after = capture_candidate_boundary(primary_repo, agent_repo)?;
     if before != after {
         return Ok(None);
     }
@@ -976,34 +1048,52 @@ fn preserve_untracked_change_kinds(porcelain_v2: &[u8], changes: &mut [ChangedPa
 fn capture_candidate_boundary(
     primary_repo: &Repository,
     agent_repo: &Repository,
-    worktree_path: &Path,
 ) -> Result<CandidateBoundaryState> {
     let primary_head = head_oid(primary_repo).context("failed to read primary HEAD")?;
     let agent_head = head_oid(agent_repo).context("failed to read agent HEAD")?;
     let index_digest = hash_optional_file(&agent_repo.path().join("index"))?;
-    let status = run_git_capture(
-        worktree_path,
-        &[
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-    )
-    .context("failed to capture agent worktree status")?;
-    if !status.success {
-        bail!(
-            "git status failed while capturing candidate: {}",
-            String::from_utf8_lossy(&status.stderr).trim()
-        );
-    }
+    let worktree_status =
+        capture_repository_status(agent_repo).context("failed to capture agent worktree status")?;
     Ok(CandidateBoundaryState {
         primary_head,
         agent_head,
         index_digest,
-        worktree_status: status.stdout,
+        worktree_status,
     })
+}
+
+fn capture_repository_status(repo: &Repository) -> Result<Vec<u8>> {
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true)
+        .include_unmodified(false);
+    let statuses = repo
+        .statuses(Some(&mut options))
+        .context("failed to inspect repository status")?;
+    if statuses.len() > VALIDATION_RAW_MAX_ENTRIES {
+        return Err(CandidateCaptureQuotaError::EntryCountExceeded {
+            limit: VALIDATION_RAW_MAX_ENTRIES,
+        }
+        .into());
+    }
+    let mut records = BTreeMap::<Vec<u8>, u32>::new();
+    for entry in statuses.iter() {
+        records.insert(entry.path_bytes().to_vec(), entry.status().bits());
+    }
+    let mut output = Vec::new();
+    for (path, status) in records {
+        if Status::from_bits_retain(status) == Status::WT_NEW {
+            output.extend_from_slice(b"? ");
+        } else {
+            write!(&mut output, "{status:08x} ").context("failed to encode status bits")?;
+        }
+        output.extend_from_slice(&path);
+        output.push(0);
+    }
+    Ok(output)
 }
 
 fn metadata_from_heads(
@@ -1097,6 +1187,68 @@ fn collect_changed_paths(repo: &Repository) -> Result<Vec<ChangedPath>> {
         .collect())
 }
 
+fn enforce_candidate_capture_quota(repo: &Repository, worktree_path: &Path) -> Result<()> {
+    let changes = collect_changed_paths(repo)?;
+    if changes.len() > VALIDATION_RAW_MAX_ENTRIES {
+        return Err(CandidateCaptureQuotaError::EntryCountExceeded {
+            limit: VALIDATION_RAW_MAX_ENTRIES,
+        }
+        .into());
+    }
+    let mut total_bytes = 0_u64;
+    for change in changes {
+        let absolute = worktree_path.join(&change.path);
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect candidate path {}", absolute.display())
+                })
+            }
+        };
+        let bytes = if metadata.file_type().is_file() {
+            metadata.len()
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&absolute).with_context(|| {
+                format!("failed to read candidate symlink {}", absolute.display())
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                target.as_os_str().as_bytes().len() as u64
+            }
+            #[cfg(not(unix))]
+            {
+                target.to_string_lossy().len() as u64
+            }
+        } else {
+            0
+        };
+        if bytes > VALIDATION_RAW_MAX_SINGLE_FILE_BYTES {
+            return Err(CandidateCaptureQuotaError::SingleFileTooLarge {
+                path: change.path,
+                limit: VALIDATION_RAW_MAX_SINGLE_FILE_BYTES,
+            }
+            .into());
+        }
+        total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+            CandidateCaptureQuotaError::TotalContentTooLarge {
+                path: change.path.clone(),
+                limit: VALIDATION_RAW_MAX_TOTAL_BYTES,
+            }
+        })?;
+        if total_bytes > VALIDATION_RAW_MAX_TOTAL_BYTES {
+            return Err(CandidateCaptureQuotaError::TotalContentTooLarge {
+                path: change.path,
+                limit: VALIDATION_RAW_MAX_TOTAL_BYTES,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_worktree_candidate(
     repo: &Repository,
     worktree_path: &Path,
@@ -1105,35 +1257,62 @@ fn snapshot_worktree_candidate(
     snapshot_worktree_candidate_from_base(repo, worktree_path, head, head)
 }
 
+pub(crate) fn capture_worktree_diff_from_commit(
+    repo: &Repository,
+    worktree_path: &Path,
+    base: Oid,
+) -> Result<(Vec<PathBuf>, Vec<u8>)> {
+    let captured =
+        snapshot_worktree_candidate_from_base(repo, worktree_path, Some(base), Some(base))?;
+    Ok((
+        captured
+            .changes
+            .into_iter()
+            .map(|change| change.path)
+            .collect(),
+        captured.raw_diff,
+    ))
+}
+
 fn snapshot_worktree_candidate_from_base(
     repo: &Repository,
     worktree_path: &Path,
     head: Option<Oid>,
     base_commit: Option<Oid>,
 ) -> Result<CapturedWorktreeTree> {
+    enforce_candidate_capture_quota(repo, worktree_path)?;
     let index = TemporaryIndex::create(repo.commondir())?;
-    let mut read_tree = git_command(worktree_path, &["read-tree"])?;
-    index.configure_command(&mut read_tree);
-    match head {
-        Some(oid) => {
-            read_tree.arg(oid.to_string());
-        }
-        None => {
-            read_tree.arg("--empty");
-        }
-    }
-    run_command_success(read_tree, "initialize candidate snapshot index")?;
+    let head_text = head.map(|oid| oid.to_string());
+    let read_tree_args = match head_text.as_deref() {
+        Some(oid) => vec!["read-tree", oid],
+        None => vec!["read-tree", "--empty"],
+    };
+    let output = run_isolated_git_process(
+        &index,
+        worktree_path,
+        &read_tree_args,
+        StdinMode::Null,
+        "initialize candidate snapshot index",
+    )?;
+    require_git_success(output, "initialize candidate snapshot index")?;
 
-    let mut add = git_command(worktree_path, &["add", "--all", "--", "."])?;
-    index.configure_command(&mut add);
-    run_command_success(add, "populate candidate snapshot index")?;
+    let output = run_isolated_git_process(
+        &index,
+        worktree_path,
+        &["add", "--all", "--", "."],
+        StdinMode::Null,
+        "populate candidate snapshot index",
+    )?;
+    require_git_success(output, "populate candidate snapshot index")?;
 
-    let mut write_tree = git_command(worktree_path, &["write-tree"])?;
-    index.configure_command(&mut write_tree);
-    let output = write_tree
-        .output()
-        .context("failed to write candidate snapshot tree")?;
-    if !output.status.success() {
+    let output = run_isolated_git_process(
+        &index,
+        worktree_path,
+        &["write-tree"],
+        StdinMode::Null,
+        "write candidate snapshot tree",
+    )?;
+    if !output.success {
         bail!(
             "failed to write candidate snapshot tree: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -1166,13 +1345,14 @@ fn temporary_base_tree_oid(
         return Ok(tree_id);
     }
 
-    let mut command = git_command(worktree_path, &["mktree"])?;
-    index.configure_command(&mut command);
-    command.stdin(Stdio::null());
-    let output = command
-        .output()
-        .context("failed to create empty base tree")?;
-    if !output.status.success() {
+    let output = run_isolated_git_process(
+        index,
+        worktree_path,
+        &["mktree"],
+        StdinMode::Null,
+        "create empty base tree",
+    )?;
+    if !output.success {
         bail!(
             "failed to create empty base tree: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -1190,7 +1370,8 @@ fn collect_snapshot_changes(
 ) -> Result<Vec<ChangedPath>> {
     let base = base_tree.to_string();
     let snapshot = snapshot_tree.to_string();
-    let mut command = git_command(
+    let output = run_isolated_git_process(
+        index,
         worktree_path,
         &[
             "diff",
@@ -1201,12 +1382,10 @@ fn collect_snapshot_changes(
             &snapshot,
             "--",
         ],
+        StdinMode::Null,
+        "collect candidate snapshot paths",
     )?;
-    index.configure_command(&mut command);
-    let output = command
-        .output()
-        .context("failed to collect candidate snapshot paths")?;
-    if !output.status.success() {
+    if !output.success {
         bail!(
             "failed to collect candidate snapshot paths: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -1249,7 +1428,8 @@ fn collect_snapshot_diff(
 ) -> Result<Vec<u8>> {
     let base = base_tree.to_string();
     let snapshot = snapshot_tree.to_string();
-    let mut command = git_command(
+    let output = run_isolated_git_process(
+        index,
         worktree_path,
         &[
             "diff",
@@ -1262,12 +1442,10 @@ fn collect_snapshot_diff(
             &snapshot,
             "--",
         ],
+        StdinMode::Null,
+        "collect candidate snapshot diff",
     )?;
-    index.configure_command(&mut command);
-    let output = command
-        .output()
-        .context("failed to collect candidate snapshot diff")?;
-    if !output.status.success() {
+    if !output.success {
         bail!(
             "failed to collect candidate snapshot diff: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -1278,62 +1456,1321 @@ fn collect_snapshot_diff(
 
 impl TemporaryIndex {
     fn create(common_dir: &Path) -> Result<Self> {
-        let runtime_root = trusted_runtime_root(common_dir)?;
+        let runtime_directory =
+            PrivateRuntimeDirectory::create(common_dir, PrivateRuntimeKind::CandidateCapture)?;
+        let directory = runtime_directory.path().to_path_buf();
+        Self::initialize_existing(&directory, common_dir, Some(runtime_directory))
+            .map_err(anyhow::Error::from)
+            .context("failed to initialize candidate capture directory")
+    }
+
+    fn create_in_managed(
+        runtime_directory: &PrivateRuntimeDirectory,
+        common_dir: &Path,
+    ) -> std::io::Result<Self> {
+        let directory = runtime_directory.path().join(".git");
+        Self::initialize_existing(&directory, common_dir, None)
+    }
+
+    fn initialize_existing(
+        directory: &Path,
+        common_dir: &Path,
+        runtime_directory: Option<PrivateRuntimeDirectory>,
+    ) -> std::io::Result<Self> {
+        let result = (|| -> Result<()> {
+            let object_directory = directory.join("objects");
+            let refs_heads = directory.join("refs/heads");
+            let refs_tags = directory.join("refs/tags");
+            create_private_directory(&object_directory)?;
+            create_private_directory(&directory.join("refs"))?;
+            create_private_directory(&refs_heads)?;
+            create_private_directory(&refs_tags)?;
+            write_git_alternates_file(&object_directory, &common_dir.join("objects"))?;
+            write_private_file(&directory.join("HEAD"), b"ref: refs/heads/maco-isolated\n")?;
+            let hooks = directory.join("disabled-hooks");
+            create_private_directory(&hooks)?;
+            let config_path = directory.join("config");
+            write_private_file(&config_path, b"")?;
+            let mut config =
+                git2::Config::open(&config_path).context("failed to open isolated Git config")?;
+            config
+                .set_i32("core.repositoryformatversion", 0)
+                .context("failed to set isolated repository version")?;
+            config
+                .set_bool("core.bare", false)
+                .context("failed to set isolated repository worktree mode")?;
+            config
+                .set_bool("core.logallrefupdates", false)
+                .context("failed to disable isolated reflogs")?;
+            config
+                .set_bool("core.fsmonitor", false)
+                .context("failed to disable isolated fsmonitor")?;
+            config
+                .set_bool("core.untrackedcache", false)
+                .context("failed to disable isolated untracked cache")?;
+            config
+                .set_str(
+                    "core.hookspath",
+                    hooks
+                        .to_str()
+                        .context("isolated hooks path was not UTF-8")?,
+                )
+                .context("failed to disable isolated hooks")?;
+            config
+                .set_str("protocol.ext.allow", "never")
+                .context("failed to disable external Git transports")?;
+            drop(config);
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(Self {
+                directory: directory.to_path_buf(),
+                _runtime_directory: runtime_directory,
+            }),
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        }
+    }
+
+    fn command_args(&self, worktree_path: &Path, operation: &[&str]) -> Vec<OsString> {
+        self.command_args_os(
+            worktree_path,
+            operation.iter().map(OsString::from).collect(),
+        )
+    }
+
+    fn command_args_os(&self, worktree_path: &Path, operation: Vec<OsString>) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("--git-dir"),
+            self.directory.as_os_str().to_os_string(),
+            OsString::from("--work-tree"),
+            worktree_path.as_os_str().to_os_string(),
+            OsString::from("-c"),
+            OsString::from("core.fsmonitor=false"),
+            OsString::from("-c"),
+            OsString::from("core.untrackedCache=false"),
+            OsString::from("-c"),
+            OsString::from("protocol.ext.allow=never"),
+        ];
+        args.extend(operation);
+        args
+    }
+
+    fn set_detached_head(&self, oid: Oid) -> Result<()> {
+        fs::write(self.directory.join("HEAD"), format!("{oid}\n"))
+            .context("failed to set isolated detached HEAD")
+    }
+}
+
+impl PrivateRuntimeDirectory {
+    pub(crate) fn create(repo_root: &Path, kind: PrivateRuntimeKind) -> Result<Self> {
+        let runtime_root = trusted_runtime_root(repo_root)?;
+        Self::create_in_root(&runtime_root, kind)
+    }
+
+    #[cfg(unix)]
+    fn create_in_root(runtime_root: &Path, kind: PrivateRuntimeKind) -> Result<Self> {
+        validate_private_runtime_root(runtime_root)?;
+        let _runtime_lock = PrivateRuntimeRootLock::acquire(runtime_root)?;
+        let current_boot_id = private_runtime_boot_id()?;
+        scavenge_private_runtime_orphans_locked_with(
+            runtime_root,
+            current_boot_id.as_deref(),
+            process_start_identity,
+        )?;
+        let pid = std::process::id();
+        let process_start = private_runtime_current_process_start_identity()?;
+        let boot_id = current_boot_id;
+        let created_unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time before UNIX epoch while reserving private runtime")?
+            .as_secs();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("system time before UNIX epoch")?
+            .context("system time before UNIX epoch while naming private runtime")?
             .as_nanos();
         for attempt in 0..32_u32 {
-            let directory = runtime_root.join(format!(
-                "maco-candidate-capture-{}-{nanos}-{attempt}",
-                std::process::id()
-            ));
-            match fs::create_dir(&directory) {
-                Ok(()) => {
-                    let object_directory = directory.join("objects");
-                    if let Err(error) = fs::create_dir(&object_directory) {
-                        let _ = fs::remove_dir_all(&directory);
-                        return Err(error)
-                            .context("failed to create temporary Git object directory");
-                    }
-                    return Ok(Self {
-                        path: directory.join("index"),
-                        object_directory,
-                        alternate_object_directory: common_dir.join("objects"),
-                        directory,
-                    });
-                }
+            let nonce = format!("{nanos}-{attempt}");
+            let path = runtime_root.join(format!("{}{pid}-{nonce}", kind.prefix()));
+            match reserve_owner_only_directory(&path) {
+                Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
-                    return Err(error).context("failed to create candidate capture directory")
+                    return Err(error).with_context(|| {
+                        format!("failed to reserve private runtime {}", path.display())
+                    })
+                }
+            }
+            let owner = PrivateRuntimeOwner {
+                version: PRIVATE_RUNTIME_OWNER_VERSION,
+                pid,
+                process_start: process_start.clone(),
+                boot_id: boot_id.clone(),
+                created_unix_seconds,
+                kind,
+                nonce,
+            };
+            let directory_metadata = validate_private_runtime_directory(&path)?;
+            if let Err(error) = write_private_runtime_owner(&path, &owner) {
+                let _ = remove_private_runtime_directory_by_identity(
+                    runtime_root,
+                    &path,
+                    &directory_metadata,
+                );
+                return Err(error);
+            }
+            return Ok(Self {
+                runtime_root: runtime_root.to_path_buf(),
+                path,
+                owner,
+                directory_metadata,
+            });
+        }
+        bail!("failed to reserve a unique private runtime directory")
+    }
+
+    #[cfg(not(unix))]
+    fn create_in_root(_runtime_root: &Path, _kind: PrivateRuntimeKind) -> Result<Self> {
+        bail!(
+            "safe handle-relative private runtime cleanup is unavailable on this platform; refusing temporary context creation"
+        )
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateRuntimeDirectory {
+    fn drop(&mut self) {
+        let Ok(_runtime_lock) = PrivateRuntimeRootLock::acquire(&self.runtime_root) else {
+            return;
+        };
+        let _ = remove_owned_private_runtime_directory(
+            &self.runtime_root,
+            &self.path,
+            &self.owner,
+            &self.directory_metadata,
+        );
+    }
+}
+
+impl PrivateRuntimeRootLock {
+    fn acquire(runtime_root: &Path) -> Result<Self> {
+        validate_private_runtime_root(runtime_root)?;
+        let path = runtime_root.join(PRIVATE_RUNTIME_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("failed to open private runtime lock {}", path.display()))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    bail!(
+                        "timed out acquiring private runtime lock {}; refusing concurrent cleanup",
+                        path.display()
+                    );
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to acquire private runtime lock {}", path.display())
+                    });
                 }
             }
         }
-        bail!("failed to reserve a unique candidate capture directory")
-    }
-
-    fn configure_command(&self, command: &mut Command) {
-        command
-            .env("GIT_INDEX_FILE", &self.path)
-            .env("GIT_OBJECT_DIRECTORY", &self.object_directory)
-            .env(
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                &self.alternate_object_directory,
+        let path_metadata = fs::symlink_metadata(&path).with_context(|| {
+            format!("failed to inspect private runtime lock {}", path.display())
+        })?;
+        let file_metadata = file.metadata().with_context(|| {
+            format!(
+                "failed to inspect open private runtime lock {}",
+                path.display()
+            )
+        })?;
+        if path_metadata.file_type().is_symlink()
+            || metadata_is_windows_reparse_point(&path_metadata)
+            || !path_metadata.file_type().is_file()
+            || !same_filesystem_identity(&path_metadata, &file_metadata)
+        {
+            bail!(
+                "private runtime lock {} changed while it was opened",
+                path.display()
             );
+        }
+        validate_private_runtime_owner_file_metadata(&path, &path_metadata)?;
+        validate_private_runtime_owner_file_metadata(&path, &file_metadata)?;
+        Ok(Self { file })
     }
 }
 
-impl Drop for TemporaryIndex {
+impl Drop for PrivateRuntimeRootLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
+        let _ = self.file.unlock();
     }
 }
 
-fn run_command_success(mut command: Command, label: &str) -> Result<()> {
-    let output = command
-        .output()
-        .with_context(|| format!("failed to {label}"))?;
-    if !output.status.success() {
+fn reserve_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn write_private_runtime_owner(directory: &Path, owner: &PrivateRuntimeOwner) -> Result<()> {
+    let owner_path = owner.kind.owner_path(directory);
+    let owner_parent = owner_path
+        .parent()
+        .context("private runtime owner path omitted parent")?;
+    if owner.kind == PrivateRuntimeKind::CandidateValidation {
+        create_private_directory(owner_parent)?;
+    }
+    let mut bytes =
+        serde_json::to_vec(owner).context("failed to serialize private runtime owner")?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > PRIVATE_RUNTIME_OWNER_MAX_BYTES {
+        bail!("private runtime owner record exceeded its size limit");
+    }
+    let temporary = owner_parent.join(format!(".{PRIVATE_RUNTIME_OWNER_FILE}.{}.tmp", owner.nonce));
+    write_private_file(&temporary, &bytes)?;
+    fs::rename(&temporary, &owner_path).with_context(|| {
+        format!(
+            "failed to publish private runtime owner {}",
+            owner_path.display()
+        )
+    })?;
+    sync_managed_directory(owner_parent)?;
+    if owner_parent != directory {
+        sync_managed_directory(directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn scavenge_private_runtime_orphans(runtime_root: &Path) -> Result<PrivateRuntimeScavengeReport> {
+    let boot_id = private_runtime_boot_id()?;
+    scavenge_private_runtime_orphans_with(runtime_root, boot_id.as_deref(), |pid| {
+        process_start_identity(pid)
+    })
+}
+
+#[cfg(test)]
+fn scavenge_private_runtime_orphans_with(
+    runtime_root: &Path,
+    current_boot_id: Option<&str>,
+    process_identity: impl FnMut(u32) -> Result<Option<ProcessStartIdentity>>,
+) -> Result<PrivateRuntimeScavengeReport> {
+    validate_private_runtime_root(runtime_root)?;
+    let _runtime_lock = PrivateRuntimeRootLock::acquire(runtime_root)?;
+    scavenge_private_runtime_orphans_locked_with(runtime_root, current_boot_id, process_identity)
+}
+
+fn scavenge_private_runtime_orphans_locked_with(
+    runtime_root: &Path,
+    current_boot_id: Option<&str>,
+    mut process_identity: impl FnMut(u32) -> Result<Option<ProcessStartIdentity>>,
+) -> Result<PrivateRuntimeScavengeReport> {
+    let mut managed = Vec::new();
+    for entry in fs::read_dir(runtime_root)
+        .with_context(|| format!("failed to scan private runtime {}", runtime_root.display()))?
+    {
+        let entry = entry.context("failed to read private runtime entry")?;
+        let Some(kind) = private_runtime_kind_for_name(&entry.file_name())? else {
+            continue;
+        };
+        managed.push((entry.path(), kind));
+        if managed.len() > PRIVATE_RUNTIME_SCAN_MAX_DIRECTORIES {
+            bail!(
+                "private runtime contains more than {} managed directories; refusing unbounded scavenging",
+                PRIVATE_RUNTIME_SCAN_MAX_DIRECTORIES
+            );
+        }
+    }
+    managed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut report = PrivateRuntimeScavengeReport {
+        removed: 0,
+        retained: 0,
+    };
+    for (path, expected_kind) in managed {
+        let outcome = (|| -> Result<bool> {
+            let directory_metadata = validate_private_runtime_directory(&path)?;
+            let owner_path = expected_kind.owner_path(&path);
+            match fs::symlink_metadata(&owner_path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    validate_incomplete_private_runtime_name(&path, expected_kind)?;
+                    remove_private_runtime_directory_by_identity(
+                        runtime_root,
+                        &path,
+                        &directory_metadata,
+                    )?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect private runtime owner {}",
+                            owner_path.display()
+                        )
+                    })
+                }
+            }
+            let (owner, owner_metadata) = read_private_runtime_owner(&path, expected_kind)?;
+            validate_private_runtime_owner(&path, &owner, expected_kind, current_boot_id)?;
+
+            let owner_is_live = if private_runtime_owner_boot_matches(&owner, current_boot_id)? {
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                {
+                    match process_identity(owner.pid).with_context(|| {
+                        format!(
+                            "failed to verify owner process {} for private runtime {}",
+                            owner.pid,
+                            path.display()
+                        )
+                    })? {
+                        Some(identity) => owner.process_start.as_ref() == Some(&identity),
+                        None => false,
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                {
+                    if owner.pid == std::process::id() {
+                        true
+                    } else {
+                        bail!(
+                            "cannot safely reclaim private runtime {} without process start identity support",
+                            path.display()
+                        );
+                    }
+                }
+            } else {
+                false
+            };
+            if owner_is_live {
+                return Ok(false);
+            }
+
+            let current_directory_metadata = validate_private_runtime_directory(&path)?;
+            if !same_filesystem_identity(&directory_metadata, &current_directory_metadata) {
+                bail!(
+                    "private runtime directory {} changed while it was being reclaimed",
+                    path.display()
+                );
+            }
+            let (current_owner, current_owner_metadata) =
+                read_private_runtime_owner(&path, expected_kind)?;
+            if current_owner != owner
+                || !same_filesystem_identity(&owner_metadata, &current_owner_metadata)
+            {
+                bail!(
+                    "private runtime owner {} changed while it was being reclaimed",
+                    expected_kind.owner_path(&path).display()
+                );
+            }
+            remove_owned_private_runtime_directory(
+                runtime_root,
+                &path,
+                &owner,
+                &directory_metadata,
+            )?;
+            Ok(true)
+        })();
+        match outcome {
+            Ok(true) => report.removed += 1,
+            Ok(false) => {}
+            Err(error) => {
+                report.retained += 1;
+                tracing::warn!(
+                    kind = ?expected_kind,
+                    error = %error,
+                    "retained unsafe or unverifiable private runtime entry"
+                );
+            }
+        }
+    }
+    if report.removed > 0 {
+        sync_managed_directory(runtime_root)?;
+    }
+    if report.retained > 0 {
+        tracing::warn!(
+            removed = report.removed,
+            retained = report.retained,
+            "private runtime scavenger completed with retained entries"
+        );
+    }
+    Ok(report)
+}
+
+fn validate_incomplete_private_runtime_name(path: &Path, kind: PrivateRuntimeKind) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("incomplete private runtime name was not UTF-8")?;
+    let remainder = name
+        .strip_prefix(kind.prefix())
+        .context("incomplete private runtime kind prefix changed")?;
+    let (pid, nonce) = remainder
+        .split_once('-')
+        .context("incomplete private runtime name omitted owner identity")?;
+    let pid = pid
+        .parse::<u32>()
+        .context("incomplete private runtime PID was invalid")?;
+    let mut nonce_fields = nonce.split('-');
+    let nanos = nonce_fields.next().unwrap_or_default();
+    let attempt = nonce_fields.next().unwrap_or_default();
+    if pid == 0
+        || nanos.is_empty()
+        || attempt.is_empty()
+        || nonce_fields.next().is_some()
+        || !nanos.bytes().all(|byte| byte.is_ascii_digit())
+        || !attempt.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!(
+            "incomplete private runtime {} has an invalid reservation name; refusing reclamation",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn private_runtime_kind_for_name(name: &OsStr) -> Result<Option<PrivateRuntimeKind>> {
+    let kinds = [
+        PrivateRuntimeKind::CandidateCapture,
+        PrivateRuntimeKind::CandidateValidation,
+        PrivateRuntimeKind::PublicationGit,
+        PrivateRuntimeKind::GhConfig,
+    ];
+    let Some(name) = name.to_str() else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Ok(kinds
+                .iter()
+                .copied()
+                .find(|kind| name.as_bytes().starts_with(kind.prefix().as_bytes())));
+        }
+        #[cfg(not(unix))]
+        return Ok(None);
+    };
+    Ok(kinds
+        .into_iter()
+        .find(|kind| name.starts_with(kind.prefix())))
+}
+
+fn validate_private_runtime_root(runtime_root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(runtime_root).with_context(|| {
+        format!(
+            "failed to inspect private runtime root {}",
+            runtime_root.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&metadata)
+        || !metadata.file_type().is_dir()
+    {
+        bail!(
+            "private runtime root {} is not a real directory",
+            runtime_root.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "private runtime root {} is not owner-only",
+                runtime_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_runtime_directory(path: &Path) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect private runtime {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&metadata)
+        || !metadata.file_type().is_dir()
+    {
+        bail!(
+            "managed private runtime {} is not a real directory; refusing reclamation",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "managed private runtime {} has a foreign owner or unsafe mode; refusing reclamation",
+                path.display()
+            );
+        }
+    }
+    Ok(metadata)
+}
+
+fn read_private_runtime_owner(
+    directory: &Path,
+    kind: PrivateRuntimeKind,
+) -> Result<(PrivateRuntimeOwner, fs::Metadata)> {
+    let path = kind.owner_path(directory);
+    let path_metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("private runtime owner {} is missing", path.display()))?;
+    if path_metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&path_metadata)
+        || !path_metadata.file_type().is_file()
+    {
+        bail!(
+            "private runtime owner {} is not a regular file; refusing reclamation",
+            path.display()
+        );
+    }
+    validate_private_runtime_owner_file_metadata(&path, &path_metadata)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("failed to open private runtime owner {}", path.display()))?;
+    let file_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect private runtime owner {}", path.display()))?;
+    validate_private_runtime_owner_file_metadata(&path, &file_metadata)?;
+    if !same_filesystem_identity(&path_metadata, &file_metadata) {
+        bail!(
+            "private runtime owner {} changed while it was opened",
+            path.display()
+        );
+    }
+    if file_metadata.len() == 0 || file_metadata.len() > PRIVATE_RUNTIME_OWNER_MAX_BYTES {
+        bail!(
+            "private runtime owner {} has an invalid size",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(PRIVATE_RUNTIME_OWNER_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read private runtime owner {}", path.display()))?;
+    if bytes.is_empty() || bytes.len() as u64 > PRIVATE_RUNTIME_OWNER_MAX_BYTES {
+        bail!(
+            "private runtime owner {} changed size while read",
+            path.display()
+        );
+    }
+    let owner = serde_json::from_slice(&bytes)
+        .with_context(|| format!("private runtime owner {} is malformed", path.display()))?;
+    Ok((owner, file_metadata))
+}
+
+fn validate_private_runtime_owner_file_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.nlink() != 1
+        {
+            bail!(
+                "private runtime owner {} has a foreign owner, unsafe mode, or multiple links",
+                path.display()
+            );
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.number_of_links() != Some(1) {
+            bail!(
+                "private runtime owner {} has multiple links",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_runtime_owner(
+    directory: &Path,
+    owner: &PrivateRuntimeOwner,
+    expected_kind: PrivateRuntimeKind,
+    current_boot_id: Option<&str>,
+) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time before UNIX epoch while validating private runtime")?
+        .as_secs();
+    let expected_name = format!("{}{}-{}", owner.kind.prefix(), owner.pid, owner.nonce);
+    if owner.version != PRIVATE_RUNTIME_OWNER_VERSION
+        || owner.pid == 0
+        || owner.kind != expected_kind
+        || owner.nonce.is_empty()
+        || owner.nonce.len() > 96
+        || !owner
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        || owner.created_unix_seconds == 0
+        || owner.created_unix_seconds > now.saturating_add(300)
+        || !valid_process_start_identity(owner.process_start.as_ref())
+        || directory.file_name().and_then(OsStr::to_str) != Some(expected_name.as_str())
+    {
+        bail!(
+            "private runtime owner for {} is invalid; refusing reclamation",
+            directory.display()
+        );
+    }
+    private_runtime_owner_boot_matches(owner, current_boot_id)?;
+    Ok(())
+}
+
+fn private_runtime_owner_boot_matches(
+    owner: &PrivateRuntimeOwner,
+    current_boot_id: Option<&str>,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let recorded = owner
+            .boot_id
+            .as_deref()
+            .context("Linux private runtime owner omitted boot identity")?;
+        let current = current_boot_id.context("current Linux boot identity is unavailable")?;
+        validate_linux_boot_id(recorded)?;
+        validate_linux_boot_id(current)?;
+        Ok(recorded == current)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if owner.boot_id.is_some() || current_boot_id.is_some() {
+            bail!("private runtime owner contained an unsupported boot identity");
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_boot_id(value: &str) -> Result<()> {
+    if value.len() != 36
+        || !value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        bail!("Linux boot identity was invalid");
+    }
+    Ok(())
+}
+
+fn remove_owned_private_runtime_directory(
+    runtime_root: &Path,
+    path: &Path,
+    expected_owner: &PrivateRuntimeOwner,
+    expected_directory_metadata: &fs::Metadata,
+) -> Result<()> {
+    let expected_kind = expected_owner.kind;
+    let current_directory_metadata = validate_private_runtime_directory(path)?;
+    if !same_filesystem_identity(expected_directory_metadata, &current_directory_metadata) {
+        bail!(
+            "private runtime directory {} changed before cleanup",
+            path.display()
+        );
+    }
+    let (current_owner, _) = read_private_runtime_owner(path, expected_kind)?;
+    if &current_owner != expected_owner {
+        bail!(
+            "private runtime owner {} changed before cleanup",
+            expected_kind.owner_path(path).display()
+        );
+    }
+    remove_private_runtime_directory_by_identity(runtime_root, path, expected_directory_metadata)
+}
+
+fn remove_private_runtime_directory_by_identity(
+    runtime_root: &Path,
+    path: &Path,
+    expected_directory_metadata: &fs::Metadata,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("private runtime directory omitted parent")?;
+    if parent != runtime_root {
+        bail!(
+            "private runtime {} is not a direct child of {}",
+            path.display(),
+            runtime_root.display()
+        );
+    }
+    validate_private_runtime_root(runtime_root)?;
+    #[cfg(unix)]
+    {
+        remove_private_runtime_directory_unix(runtime_root, path, expected_directory_metadata)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expected_directory_metadata;
+        bail!(
+            "safe handle-relative private runtime cleanup is unavailable on this platform; preserving {}",
+            path.display()
+        );
+    }
+    sync_managed_directory(runtime_root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_private_runtime_directory_unix(
+    runtime_root: &Path,
+    path: &Path,
+    expected_directory_metadata: &fs::Metadata,
+) -> Result<()> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    };
+
+    let mut root_options = OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let root_file = root_options.open(runtime_root).with_context(|| {
+        format!(
+            "failed to open private runtime root {} for cleanup",
+            runtime_root.display()
+        )
+    })?;
+    let name = path
+        .file_name()
+        .context("private runtime directory omitted name")?;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .context("private runtime directory name contained NUL")?;
+    let raw = unsafe {
+        libc::openat(
+            root_file.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to open private runtime {}", path.display()));
+    }
+    // SAFETY: openat returned a new owned descriptor on success.
+    let directory = unsafe { fs::File::from_raw_fd(raw) };
+    let opened_metadata = directory.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened private runtime {}",
+            path.display()
+        )
+    })?;
+    if opened_metadata.dev() != expected_directory_metadata.dev()
+        || opened_metadata.ino() != expected_directory_metadata.ino()
+    {
+        bail!(
+            "private runtime directory {} changed while it was opened for cleanup",
+            path.display()
+        );
+    }
+
+    let mut validation_entries = 1_usize;
+    validate_private_runtime_contents_unix(
+        directory.as_raw_fd(),
+        opened_metadata.dev() as libc::dev_t,
+        &mut validation_entries,
+        PRIVATE_RUNTIME_REMOVAL_MAX_ENTRIES,
+        PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH,
+        0,
+    )?;
+    let mut entries = 1_usize;
+    remove_private_runtime_contents_unix(
+        directory.as_raw_fd(),
+        opened_metadata.dev() as libc::dev_t,
+        &mut entries,
+        0,
+    )?;
+
+    let current = fstatat_unix(root_file.as_raw_fd(), &name)?;
+    if current.st_dev != opened_metadata.dev() as libc::dev_t
+        || current.st_ino != opened_metadata.ino() as libc::ino_t
+        || (current.st_mode & libc::S_IFMT) != libc::S_IFDIR
+    {
+        bail!(
+            "private runtime directory {} changed before final unlink",
+            path.display()
+        );
+    }
+    let result =
+        unsafe { libc::unlinkat(root_file.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to unlink private runtime {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_runtime_contents_unix(
+    directory_fd: i32,
+    root_device: libc::dev_t,
+    entries: &mut usize,
+    max_entries: usize,
+    max_depth: usize,
+    depth: usize,
+) -> Result<()> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+
+    let remaining = max_entries.saturating_sub(*entries);
+    let names = read_directory_names_unix(directory_fd, remaining)?;
+    for name in names {
+        *entries += 1;
+        let name = std::ffi::CString::new(name.as_bytes())
+            .context("private runtime entry name contained NUL")?;
+        let before = fstatat_unix(directory_fd, &name)?;
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if before.st_uid != uid || before.st_dev != root_device {
+            bail!("private runtime entry has a foreign owner or filesystem; refusing cleanup");
+        }
+        if (before.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            if depth >= max_depth {
+                bail!("private runtime exceeded the {max_depth}-level cleanup depth limit");
+            }
+            let raw = unsafe {
+                libc::openat(
+                    directory_fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to open private runtime child during bounded validation");
+            }
+            // SAFETY: openat returned a new owned descriptor on success.
+            let child = unsafe { fs::File::from_raw_fd(raw) };
+            let opened = fstat_unix(child.as_raw_fd())?;
+            if opened.st_dev != root_device
+                || opened.st_dev != before.st_dev
+                || opened.st_ino != before.st_ino
+            {
+                bail!("private runtime child changed during bounded validation");
+            }
+            validate_private_runtime_contents_unix(
+                child.as_raw_fd(),
+                root_device,
+                entries,
+                max_entries,
+                max_depth,
+                depth + 1,
+            )?;
+            let current = fstatat_unix(directory_fd, &name)?;
+            if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
+                bail!("private runtime child changed during bounded validation");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_private_runtime_contents_unix(
+    directory_fd: i32,
+    root_device: libc::dev_t,
+    entries: &mut usize,
+    depth: usize,
+) -> Result<()> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+
+    let remaining = PRIVATE_RUNTIME_REMOVAL_MAX_ENTRIES.saturating_sub(*entries);
+    let names = read_directory_names_unix(directory_fd, remaining)?;
+    for name in names {
+        *entries += 1;
+        let name = std::ffi::CString::new(name.as_bytes())
+            .context("private runtime entry name contained NUL")?;
+        let before = fstatat_unix(directory_fd, &name)?;
+        // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+        let uid = unsafe { libc::geteuid() };
+        if before.st_uid != uid || before.st_dev != root_device {
+            bail!("private runtime entry has a foreign owner or filesystem; refusing cleanup");
+        }
+        if (before.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            if depth >= PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH {
+                bail!(
+                    "private runtime exceeded the {}-level cleanup depth limit",
+                    PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH
+                );
+            }
+            let raw = unsafe {
+                libc::openat(
+                    directory_fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to open private runtime child directory");
+            }
+            // SAFETY: openat returned a new owned descriptor on success.
+            let child = unsafe { fs::File::from_raw_fd(raw) };
+            let opened = fstat_unix(child.as_raw_fd())?;
+            if opened.st_dev != root_device
+                || opened.st_dev != before.st_dev
+                || opened.st_ino != before.st_ino
+            {
+                bail!("private runtime child changed while it was opened");
+            }
+            remove_private_runtime_contents_unix(
+                child.as_raw_fd(),
+                root_device,
+                entries,
+                depth + 1,
+            )?;
+            let current = fstatat_unix(directory_fd, &name)?;
+            if current.st_dev != opened.st_dev
+                || current.st_ino != opened.st_ino
+                || (current.st_mode & libc::S_IFMT) != libc::S_IFDIR
+            {
+                bail!("private runtime child changed before directory unlink");
+            }
+            let result = unsafe { libc::unlinkat(directory_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to unlink private runtime child directory");
+            }
+        } else {
+            let result = unsafe { libc::unlinkat(directory_fd, name.as_ptr(), 0) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to unlink private runtime child entry");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct UnixDirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl Drop for UnixDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: fdopendir returned this stream and closedir consumes it once.
+        let _ = unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(unix)]
+fn read_directory_names_unix(directory_fd: i32, max_names: usize) -> Result<Vec<OsString>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let current = c".";
+    // SAFETY: openat creates a new file description with an independent
+    // directory-stream offset while remaining anchored to directory_fd.
+    let duplicate = unsafe {
+        libc::openat(
+            directory_fd,
+            current.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to reopen private runtime directory descriptor");
+    }
+    // SAFETY: fdopendir takes ownership of duplicate on success.
+    let raw_stream = unsafe { libc::fdopendir(duplicate) };
+    if raw_stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: fdopendir did not take ownership on failure.
+        let _ = unsafe { libc::close(duplicate) };
+        return Err(error).context("failed to open private runtime directory stream");
+    }
+    let stream = UnixDirectoryStream(raw_stream);
+    let mut names = Vec::new();
+    loop {
+        set_unix_errno(0);
+        // SAFETY: stream remains valid for the duration of this loop.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let errno = get_unix_errno();
+            if errno != 0 {
+                return Err(std::io::Error::from_raw_os_error(errno))
+                    .context("failed to enumerate private runtime directory");
+            }
+            break;
+        }
+        // SAFETY: readdir returns a dirent whose d_name is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        if names.len() >= max_names {
+            bail!("private runtime exceeded the bounded directory-entry limit");
+        }
+        names.push(OsString::from_vec(name.to_vec()));
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_unix_errno(value: i32) {
+    // SAFETY: errno is thread-local writable process state.
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn get_unix_errno() -> i32 {
+    // SAFETY: errno is thread-local readable process state.
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn set_unix_errno(value: i32) {
+    // SAFETY: errno is thread-local writable process state.
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn get_unix_errno() -> i32 {
+    // SAFETY: errno is thread-local readable process state.
+    unsafe { *libc::__error() }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+fn set_unix_errno(_value: i32) {}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+fn get_unix_errno() -> i32 {
+    0
+}
+
+#[cfg(unix)]
+fn fstatat_unix(directory_fd: i32, name: &std::ffi::CStr) -> Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory_fd,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect private runtime entry");
+    }
+    // SAFETY: fstatat initialized metadata when it returned success.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+#[cfg(unix)]
+fn fstat_unix(fd: i32) -> Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstat(fd, metadata.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect opened private runtime entry");
+    }
+    // SAFETY: fstat initialized metadata when it returned success.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        left.volume_serial_number() == right.volume_serial_number()
+            && left.file_index() == right.file_index()
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn private_runtime_current_process_start_identity() -> Result<Option<ProcessStartIdentity>> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        process_start_identity(std::process::id())?
+            .context("current process identity disappeared while reserving private runtime")
+            .map(Some)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn private_runtime_boot_id() -> Result<Option<String>> {
+    let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("failed to read Linux boot identity")?;
+    let value = value.trim().to_ascii_lowercase();
+    validate_linux_boot_id(&value)?;
+    Ok(Some(value))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn private_runtime_boot_id() -> Result<Option<String>> {
+    Ok(None)
+}
+
+pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .with_context(|| format!("failed to create private directory {}", path.display()))
+}
+
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create private file {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write private file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to persist private file {}", path.display()))
+}
+
+pub(crate) fn write_git_alternates_file(object_directory: &Path, alternate: &Path) -> Result<()> {
+    let alternate = fs::canonicalize(alternate).with_context(|| {
+        format!(
+            "failed to resolve Git object alternate {}",
+            alternate.display()
+        )
+    })?;
+    let info = object_directory.join("info");
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&info)
+        .with_context(|| format!("failed to create Git object info dir {}", info.display()))?;
+    let path = info.join("alternates");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("failed to create Git alternates file {}", path.display()))?;
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        alternate.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = alternate.to_string_lossy().as_bytes().to_vec();
+    if bytes.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)) {
+        bail!("Git object alternate path contains an unsupported control byte");
+    }
+    file.write_all(&bytes)
+        .context("failed to write Git object alternate")?;
+    file.write_all(b"\n")
+        .context("failed to terminate Git object alternate")?;
+    file.sync_all()
+        .context("failed to persist Git object alternate")
+}
+
+fn require_git_success(output: GitCommandOutput, label: &str) -> Result<()> {
+    if !output.success {
         bail!(
             "failed to {label}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -1796,8 +3233,8 @@ fn run_candidate_validation_commands(
 }
 
 struct CandidateValidationSandbox {
-    primary_repo_root: PathBuf,
-    path: PathBuf,
+    runtime_directory: PrivateRuntimeDirectory,
+    git_context: TemporaryIndex,
     baseline_integrity: Option<CandidateValidationSandboxIntegrity>,
 }
 
@@ -1861,6 +3298,16 @@ enum ValidationFilesystemFingerprintError {
     TotalContentTooLarge { path: PathBuf, limit: u64 },
 }
 
+#[derive(Debug, thiserror::Error)]
+enum CandidateCaptureQuotaError {
+    #[error("candidate capture exceeded the {limit}-entry limit")]
+    EntryCountExceeded { limit: usize },
+    #[error("candidate file {path:?} exceeded the {limit}-byte single-file limit")]
+    SingleFileTooLarge { path: PathBuf, limit: u64 },
+    #[error("candidate capture exceeded the {limit}-byte total-content limit at {path:?}")]
+    TotalContentTooLarge { path: PathBuf, limit: u64 },
+}
+
 struct ValidationFilesystemBudget {
     entries: usize,
     total_bytes: u64,
@@ -1872,35 +3319,45 @@ struct ValidationFilesystemBudget {
 impl CandidateValidationSandbox {
     fn create(preview: &MergeApplyPreview) -> Result<Self> {
         let primary_repo_root = preview.candidate.metadata.primary_repo_root.clone();
-        let path = candidate_validation_sandbox_path(&primary_repo_root)?;
-        let base_revision = preview
+        let runtime_directory = PrivateRuntimeDirectory::create(
+            &primary_repo_root,
+            PrivateRuntimeKind::CandidateValidation,
+        )?;
+        let primary_repo = Repository::open(&primary_repo_root).with_context(|| {
+            format!(
+                "failed to open primary repository {}",
+                primary_repo_root.display()
+            )
+        })?;
+        let base_oid = preview
             .candidate
             .metadata
             .primary_head
             .as_deref()
-            .unwrap_or("HEAD");
-        let mut add_command = sanitized_git_command(&primary_repo_root)?;
-        add_command
-            .args(["worktree", "add", "--detach", "--force"])
-            .arg(&path)
-            .arg(base_revision);
-        let add_output = add_command.output().with_context(|| {
-            format!(
-                "failed to create candidate validation worktree {}",
-                path.display()
-            )
-        })?;
-        if !add_output.status.success() {
-            bail!(
-                "failed to create candidate validation worktree: {}",
-                String::from_utf8_lossy(&add_output.stderr).trim()
-            );
-        }
+            .map(Oid::from_str)
+            .transpose()
+            .context("candidate validation base OID was invalid")?;
+        let git_context =
+            TemporaryIndex::create_in_managed(&runtime_directory, primary_repo.commondir())
+                .map_err(anyhow::Error::from)
+                .context("failed to create isolated candidate validation repository")?;
         let mut sandbox = Self {
-            primary_repo_root,
-            path,
+            runtime_directory,
+            git_context,
             baseline_integrity: None,
         };
+        initialize_isolated_index(&sandbox.git_context, sandbox.path(), base_oid)?;
+        if let Some(base_oid) = base_oid {
+            sandbox.git_context.set_detached_head(base_oid)?;
+        }
+        let checkout = run_isolated_git_process(
+            &sandbox.git_context,
+            sandbox.path(),
+            &["checkout-index", "--all", "--force"],
+            StdinMode::Null,
+            "materialize candidate validation base",
+        )?;
+        require_git_success(checkout, "materialize candidate validation base")?;
 
         let patch = preview.candidate.raw_diff.as_slice();
         let args = match preview.safety.apply_mode {
@@ -1909,8 +3366,14 @@ impl CandidateValidationSandbox {
             ApplyMode::None => Vec::new(),
         };
         if !args.is_empty() {
-            let apply_output = run_git_with_input(&sandbox.path, &args, patch)
-                .context("failed to apply candidate patch to validation worktree")?;
+            let apply_output = run_isolated_git_process(
+                &sandbox.git_context,
+                sandbox.path(),
+                &args,
+                StdinMode::Bytes(patch.to_vec()),
+                "apply candidate patch to validation repository",
+            )
+            .context("failed to apply candidate patch to validation worktree")?;
             if !apply_output.success {
                 bail!(
                     "failed to apply candidate patch to validation worktree: {}",
@@ -1925,7 +3388,7 @@ impl CandidateValidationSandbox {
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.runtime_directory.path()
     }
 
     fn enforce_candidate_integrity(
@@ -1961,17 +3424,20 @@ impl CandidateValidationSandbox {
         &self,
         preview: &MergeApplyPreview,
     ) -> Result<CandidateValidationSandboxIntegrity> {
-        let repo = Repository::open(&self.path).with_context(|| {
-            format!("failed to open validation sandbox {}", self.path.display())
+        let repo = Repository::open(self.path()).with_context(|| {
+            format!(
+                "failed to open validation sandbox {}",
+                self.path().display()
+            )
         })?;
         let base = collection_base_oid(&preview.candidate.metadata)?;
         capture_two_matching(|| {
             let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
-            let captured = snapshot_worktree_candidate_from_base(&repo, &self.path, head, base)?;
+            let captured = snapshot_worktree_candidate_from_base(&repo, self.path(), head, base)?;
             let binding =
                 candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)?;
             let repository =
-                validation_repository_fingerprint(&repo, &self.path, Some(captured.oid), 0)?;
+                validation_repository_fingerprint(&repo, self.path(), Some(captured.oid), 0)?;
             Ok(Some(CandidateValidationSandboxIntegrity {
                 binding,
                 repository,
@@ -1991,23 +3457,8 @@ fn validation_repository_fingerprint(
     }
     let head = head_oid(repo).context("failed to read validation repository HEAD")?;
     let index_digest = hash_optional_file(&repo.path().join("index"))?;
-    let status = run_git_capture(
-        worktree_path,
-        &[
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-    )
-    .context("failed to capture recursive validation repository status")?;
-    if !status.success {
-        bail!(
-            "git status failed while fingerprinting validation repository: {}",
-            String::from_utf8_lossy(&status.stderr).trim()
-        );
-    }
+    let status = capture_repository_status(repo)
+        .context("failed to capture recursive validation repository status")?;
     let snapshot_tree = match known_snapshot_tree {
         Some(snapshot_tree) => snapshot_tree,
         None => snapshot_worktree_candidate(repo, worktree_path, head)?.oid,
@@ -2058,50 +3509,35 @@ fn validation_repository_fingerprint(
     Ok(ValidationRepositoryFingerprint {
         head,
         index_digest,
-        status: status.stdout,
+        status,
         snapshot_tree,
         submodules,
     })
 }
 
 fn validation_gitlinks(worktree_path: &Path) -> Result<Vec<(PathBuf, Oid)>> {
-    let output = run_git_capture(worktree_path, &["ls-files", "--stage", "-z", "--"])
-        .context("failed to enumerate validation repository gitlinks")?;
-    if !output.success {
-        bail!(
-            "git ls-files failed while enumerating validation submodules: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    let repo = Repository::open(worktree_path).with_context(|| {
+        format!(
+            "failed to open validation repository {}",
+            worktree_path.display()
+        )
+    })?;
+    let index = repo
+        .index()
+        .context("failed to read validation repository index")?;
     let mut gitlinks = BTreeMap::new();
-    for entry in output.stdout.split(|byte| *byte == 0) {
-        if entry.is_empty() {
+    for entry in index.iter() {
+        if entry.mode != 0o160000 {
             continue;
         }
-        let tab = entry
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .context("git ls-files stage record did not contain a path separator")?;
-        let metadata = std::str::from_utf8(&entry[..tab])
-            .context("git ls-files stage metadata was not ASCII")?;
-        let mut fields = metadata.split_ascii_whitespace();
-        let mode = fields.next().context("gitlink record missing mode")?;
-        let oid = fields.next().context("gitlink record missing object id")?;
-        let stage = fields.next().context("gitlink record missing stage")?;
-        if fields.next().is_some() {
-            bail!("gitlink record contained unexpected metadata fields");
-        }
-        if mode != "160000" {
-            continue;
-        }
-        if stage != "0" {
+        let stage = (entry.flags >> 12) & 0x3;
+        if stage != 0 {
             bail!(
                 "validation repository contains a conflicted submodule gitlink; refusing incomplete integrity capture"
             );
         }
-        let path = normalize_repo_relative_path(path_buf_from_git_bytes(&entry[tab + 1..])?)?;
-        let oid = Oid::from_str(oid).context("gitlink object id was invalid")?;
-        if gitlinks.insert(path.clone(), oid).is_some() {
+        let path = normalize_repo_relative_path(path_buf_from_git_bytes(&entry.path)?)?;
+        if gitlinks.insert(path.clone(), entry.id).is_some() {
             bail!(
                 "validation repository reported duplicate gitlink {}",
                 path_json_text(&path)
@@ -2336,50 +3772,49 @@ fn validation_file_mode(metadata: &fs::Metadata) -> u32 {
     }
 }
 
-impl Drop for CandidateValidationSandbox {
-    fn drop(&mut self) {
-        if let Ok(mut command) = sanitized_git_command(&self.primary_repo_root) {
-            let _ = command
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.path)
-                .output();
-        }
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn candidate_validation_sandbox_path(primary_repo_root: &Path) -> Result<PathBuf> {
-    let repo_name = primary_repo_root
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("repo");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system time before UNIX epoch")?
-        .as_nanos();
-    Ok(trusted_runtime_root(primary_repo_root)?.join(format!(
-        "maco-candidate-validation-{repo_name}-{}-{nanos}",
-        std::process::id()
-    )))
-}
-
 fn run_candidate_validation_command(
     worktree_path: &Path,
     validation: &CandidateValidationCommand,
     index: usize,
     changed_paths: &[PathBuf],
 ) -> ValidationReport {
-    let mut command = shell_command(&validation.command);
-    sanitize_validation_command_environment(&mut command);
-    let output = command
-        .current_dir(worktree_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    run_candidate_validation_command_with_timeout(
+        worktree_path,
+        validation,
+        index,
+        changed_paths,
+        CANDIDATE_VALIDATION_PROCESS_TIMEOUT,
+    )
+}
+
+fn run_candidate_validation_command_with_timeout(
+    worktree_path: &Path,
+    validation: &CandidateValidationCommand,
+    index: usize,
+    changed_paths: &[PathBuf],
+    timeout: Duration,
+) -> ValidationReport {
+    let output = run_process(
+        ProcessSpec::shell(
+            "candidate validation command",
+            Shell::for_current_platform(),
+            &validation.command,
+            worktree_path,
+            VALIDATION_CAPTURE_LIMIT_BYTES,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(
+            validation_command_environment(),
+        ))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(timeout)),
+    );
 
     match output {
         Ok(output) => {
-            let passed = output.status.success();
+            let evidence = require_verified_process_output("candidate validation command", &output);
+            let passed = evidence.is_ok()
+                && output.status.is_some_and(|status| status.success())
+                && !output.timed_out;
             ValidationReport {
                 name: format!("candidate validation {}", index + 1),
                 status: if passed {
@@ -2387,7 +3822,10 @@ fn run_candidate_validation_command(
                 } else {
                     ValidationStatus::Failed
                 },
-                message: candidate_validation_message(&output),
+                message: evidence
+                    .err()
+                    .map(|error| error.to_string())
+                    .or_else(|| candidate_validation_message(&output)),
                 paths: if passed {
                     Vec::new()
                 } else {
@@ -2404,12 +3842,12 @@ fn run_candidate_validation_command(
     }
 }
 
-fn candidate_validation_message(output: &std::process::Output) -> Option<String> {
-    if output.status.success() {
+fn candidate_validation_message(output: &ProcessOutput) -> Option<String> {
+    if output.status.is_some_and(|status| status.success()) {
         return None;
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+    let stdout = String::from_utf8_lossy(output.stdout.as_bytes());
     let text = if !stderr.trim().is_empty() {
         stderr.trim()
     } else if !stdout.trim().is_empty() {
@@ -2419,7 +3857,7 @@ fn candidate_validation_message(output: &std::process::Output) -> Option<String>
     };
     let exit = output
         .status
-        .code()
+        .and_then(|status| status.code())
         .map(|code| format!("exited with status {code}"))
         .unwrap_or_else(|| "terminated without an exit code".to_string());
     Some(format!("{exit}: {}", summarize_text(text, 1024).text))
@@ -3315,6 +4753,11 @@ fn process_start_identity(pid: u32) -> Result<Option<ProcessStartIdentity>> {
     windows_process_start_identity(pid)
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn process_start_identity(_pid: u32) -> Result<Option<ProcessStartIdentity>> {
+    Ok(None)
+}
+
 fn lock_owner_process_start_identity() -> Result<Option<ProcessStartIdentity>> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
@@ -3424,98 +4867,77 @@ impl PrimaryRepositoryState {
     }
 }
 
-fn run_git_capture(repo_root: &Path, args: &[&str]) -> Result<GitCommandOutput> {
-    run_git_capture_paths(repo_root, args, &[])
-}
-
-fn run_git_capture_paths(
-    repo_root: &Path,
-    args: &[&str],
-    path_args: &[&Path],
-) -> Result<GitCommandOutput> {
-    let mut command = git_command(repo_root, args)?;
-    for path in path_args {
-        command.arg(path);
-    }
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run git in {}", repo_root.display()))?;
-
-    Ok(GitCommandOutput {
-        success: output.status.success(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-}
-
 fn run_git_with_input(repo_root: &Path, args: &[&str], input: &[u8]) -> Result<GitCommandOutput> {
-    let mut child = git_command(repo_root, args)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start git in {}", repo_root.display()))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("failed to open git stdin for patch input")?;
-    stdin
-        .write_all(input)
-        .context("failed to write patch to git stdin")?;
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .context("failed waiting for git command")?;
-    Ok(GitCommandOutput {
-        success: output.status.success(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
+    let repo = Repository::open(repo_root)
+        .with_context(|| format!("failed to open Git worktree {}", repo_root.display()))?;
+    let context = TemporaryIndex::create(repo.commondir())?;
+    initialize_isolated_index(&context, repo_root, head_oid(&repo)?)?;
+    run_isolated_git_process(
+        &context,
+        repo_root,
+        args,
+        StdinMode::Bytes(input.to_vec()),
+        "git patch command",
+    )
 }
 
-fn git_command(repo_root: &Path, args: &[&str]) -> Result<Command> {
-    let mut command = sanitized_git_command(repo_root)?;
-    command.args(args);
-    Ok(command)
+fn run_isolated_git_process(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+    operation: &[&str],
+    stdin: StdinMode,
+    label: &str,
+) -> Result<GitCommandOutput> {
+    run_isolated_git_process_os(
+        context,
+        worktree_path,
+        context.command_args(worktree_path, operation),
+        stdin,
+        label,
+    )
 }
 
-pub(crate) fn sanitized_git_command(repo_root: &Path) -> Result<Command> {
-    let mut command = Command::new(resolve_trusted_executable("git")?);
-    let runtime_root = configure_capture_environment(&mut command, repo_root)?;
-    command
-        .args(["-c", "core.fsmonitor=false"])
-        .args(["-c", "core.untrackedCache=false"])
-        .arg("-c")
-        .arg(format!(
-            "core.hooksPath={}",
-            disabled_git_path(&runtime_root, "hooks").display()
-        ))
-        .arg("-C")
-        .arg(repo_root);
-    Ok(command)
+fn run_isolated_git_process_os(
+    _context: &TemporaryIndex,
+    worktree_path: &Path,
+    command_args: Vec<OsString>,
+    stdin: StdinMode,
+    label: &str,
+) -> Result<GitCommandOutput> {
+    run_required_direct(
+        label,
+        resolve_trusted_executable("git")?,
+        command_args,
+        worktree_path,
+        capture_git_environment(worktree_path)?,
+        stdin,
+        LOCAL_GIT_PROCESS_TIMEOUT,
+        GIT_CAPTURE_LIMIT_BYTES,
+        GIT_STDIN_LIMIT_BYTES,
+    )
 }
 
-pub(crate) fn sanitized_git_push_command(repo_root: &Path) -> Result<Command> {
-    let mut command = Command::new(resolve_trusted_executable("git")?);
-    sanitize_network_command_environment(&mut command)?;
-    let runtime_root = trusted_runtime_root(repo_root)?;
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            disabled_git_path(&runtime_root, "network-global-config"),
-        )
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["-c", "core.fsmonitor=false"])
-        .arg("-C")
-        .arg(repo_root);
-    Ok(command)
+fn initialize_isolated_index(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+    head: Option<Oid>,
+) -> Result<()> {
+    let head_text = head.map(|oid| oid.to_string());
+    let args = match head_text.as_deref() {
+        Some(oid) => vec!["read-tree", oid],
+        None => vec!["read-tree", "--empty"],
+    };
+    let output = run_isolated_git_process(
+        context,
+        worktree_path,
+        &args,
+        StdinMode::Null,
+        "initialize isolated Git index",
+    )?;
+    require_git_success(output, "initialize isolated Git index")
 }
 
-fn configure_capture_environment(command: &mut Command, repo_root: &Path) -> Result<PathBuf> {
+fn capture_git_environment(repo_root: &Path) -> Result<BTreeMap<String, String>> {
     let allowed = [
         "SystemRoot",
         "WINDIR",
@@ -3525,59 +4947,139 @@ fn configure_capture_environment(command: &mut Command, repo_root: &Path) -> Res
         "LC_ALL",
         "LC_CTYPE",
     ];
-    let preserved = allowed
-        .iter()
-        .filter_map(|key| env::var_os(key).map(|value| ((*key).to_string(), value)))
-        .collect::<Vec<_>>();
-    command.env_clear();
-    command.envs(preserved);
+    let mut environment = explicit_environment(&allowed);
     let runtime_root = trusted_runtime_root(repo_root)?;
-    command
-        .env("PATH", trusted_executable_search_path()?)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            disabled_git_path(&runtime_root, "global-config"),
-        )
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("TMPDIR", &runtime_root)
-        .env("TMP", &runtime_root)
-        .env("TEMP", &runtime_root);
-    Ok(runtime_root)
+    environment.insert("PATH".to_string(), trusted_path_text()?);
+    environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert(
+        "GIT_CONFIG_GLOBAL".to_string(),
+        path_environment_value(&disabled_git_path(&runtime_root, "global-config"))?,
+    );
+    environment.insert("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
+    environment.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+    let runtime = path_environment_value(&runtime_root)?;
+    environment.insert("TMPDIR".to_string(), runtime.clone());
+    environment.insert("TMP".to_string(), runtime.clone());
+    environment.insert("TEMP".to_string(), runtime);
+    Ok(environment)
 }
 
-pub(crate) fn sanitize_validation_command_environment(command: &mut Command) {
-    remove_git_injection_environment(command);
-    command.env("GIT_OPTIONAL_LOCKS", "0");
+fn validation_command_environment() -> BTreeMap<String, String> {
+    let mut environment = env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            if is_git_injection_environment_key(&key)
+                || key.starts_with("LD_")
+                || key.starts_with("DYLD_")
+            {
+                None
+            } else {
+                Some((key, value))
+            }
+        })
+        .collect::<BTreeMap<_, _>>();
+    environment.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
+    environment
 }
 
-pub(crate) fn sanitize_network_command_environment(command: &mut Command) -> Result<()> {
-    remove_git_injection_environment(command);
-    remove_dynamic_loader_environment(command);
-    command
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("PATH", trusted_executable_search_path()?);
+pub(crate) fn minimal_network_environment(
+    allow_ssh_agent: bool,
+) -> Result<BTreeMap<String, String>> {
+    let mut allowed = vec![
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ];
+    if allow_ssh_agent {
+        allowed.push("SSH_AUTH_SOCK");
+    }
+    let mut environment = explicit_environment(&allowed);
+    environment.insert("PATH".to_string(), trusted_path_text()?);
+    environment.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string());
+    environment.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
+    environment.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+    Ok(environment)
+}
+
+fn explicit_environment(keys: &[&str]) -> BTreeMap<String, String> {
+    keys.iter()
+        .filter_map(|key| env::var(key).ok().map(|value| ((*key).to_string(), value)))
+        .collect()
+}
+
+fn trusted_path_text() -> Result<String> {
+    trusted_executable_search_path()?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("trusted executable PATH was not valid UTF-8"))
+}
+
+fn path_environment_value(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("environment path was not UTF-8: {}", path.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_required_direct(
+    label: &str,
+    program: PathBuf,
+    args: Vec<OsString>,
+    current_dir: &Path,
+    environment: BTreeMap<String, String>,
+    stdin: StdinMode,
+    timeout: Duration,
+    capture_limit_bytes: usize,
+    stdin_limit_bytes: usize,
+) -> Result<RequiredCommandOutput> {
+    if let StdinMode::Bytes(bytes) = &stdin {
+        if bytes.len() > stdin_limit_bytes {
+            bail!("{label} stdin exceeded the {stdin_limit_bytes}-byte safety limit");
+        }
+    }
+    let output = run_process(
+        ProcessSpec::direct(label, program, args, current_dir, capture_limit_bytes)
+            .with_environment(EnvironmentMode::ClearAndSet(environment))
+            .with_stdin(stdin)
+            .with_timeout(Some(timeout)),
+    )
+    .with_context(|| format!("failed to run {label}"))?;
+    require_verified_process_output(label, &output)?;
+    Ok(RequiredCommandOutput {
+        success: output.status.is_some_and(|status| status.success()),
+        stdout: output.stdout.as_bytes().to_vec(),
+        stderr: output.stderr.as_bytes().to_vec(),
+    })
+}
+
+fn require_verified_process_output(label: &str, output: &ProcessOutput) -> Result<()> {
+    require_verified_containment(label, output.containment)?;
+    if output.timed_out {
+        bail!("{label} exceeded its total operation deadline");
+    }
+    if let Some(error) = &output.process_error {
+        bail!("{label} process cleanup failed: {error}");
+    }
+    if let Some(error) = &output.stdin_error {
+        bail!("{label} stdin failed: {error}");
+    }
+    if output.stdout.is_truncated() || output.stderr.is_truncated() {
+        bail!("{label} exceeded its bounded output capture limit");
+    }
     Ok(())
 }
 
-fn remove_git_injection_environment(command: &mut Command) {
-    for (key, _) in env::vars_os() {
-        let key_text = key.to_string_lossy();
-        if is_git_injection_environment_key(&key_text) {
-            command.env_remove(key);
-        }
+fn require_verified_containment(label: &str, evidence: ContainmentEvidence) -> Result<()> {
+    if !evidence.is_verified_empty() {
+        bail!("{label} returned without verified-empty process containment: {evidence:?}");
     }
-}
-
-fn remove_dynamic_loader_environment(command: &mut Command) {
-    for (key, _) in env::vars_os() {
-        let key_text = key.to_string_lossy();
-        if key_text.starts_with("LD_") || key_text.starts_with("DYLD_") {
-            command.env_remove(key);
-        }
-    }
+    Ok(())
 }
 
 fn is_git_injection_environment_key(key: &str) -> bool {
@@ -3615,7 +5117,7 @@ fn is_git_injection_environment_key(key: &str) -> bool {
 }
 
 pub(crate) fn resolve_trusted_executable(name: &str) -> Result<PathBuf> {
-    if !matches!(name, "git" | "gh") {
+    if !matches!(name, "git" | "gh" | "ssh") {
         bail!("unsupported trusted executable name '{name}'");
     }
     #[cfg(target_os = "windows")]
@@ -3824,7 +5326,7 @@ fn disabled_git_path(runtime_root: &Path, label: &str) -> PathBuf {
     ))
 }
 
-fn trusted_runtime_root(repo_root: &Path) -> Result<PathBuf> {
+pub(crate) fn trusted_runtime_root(repo_root: &Path) -> Result<PathBuf> {
     #[cfg(unix)]
     let candidate = private_unix_runtime_root()?;
     #[cfg(target_os = "windows")]
@@ -3866,7 +5368,8 @@ fn private_unix_runtime_root() -> Result<PathBuf> {
     let parent = match validate_private_unix_directory(&run_user, uid) {
         Ok(()) => run_user,
         Err(_) => {
-            let temporary = PathBuf::from("/tmp");
+            let temporary =
+                fs::canonicalize("/tmp").context("failed to resolve /tmp runtime fallback")?;
             let metadata = fs::symlink_metadata(&temporary)
                 .context("failed to inspect /tmp runtime fallback")?;
             let mode = metadata.permissions().mode();
@@ -3933,21 +5436,6 @@ fn windows_temp_path() -> Result<PathBuf> {
     }
     buffer.truncate(length as usize);
     Ok(PathBuf::from(OsString::from_wide(&buffer)))
-}
-
-fn shell_command(command_text: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("cmd");
-        command.arg("/C").arg(command_text);
-        command
-    }
-    #[cfg(not(windows))]
-    {
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(command_text);
-        command
-    }
 }
 
 fn format_blockers(blockers: &[ApplyBlocker]) -> String {
@@ -4128,6 +5616,126 @@ fn sort_validation_reports(reports: &mut [ValidationReport]) {
 mod tests {
     use super::*;
     use git2::Signature;
+    use std::process::{Command, Stdio};
+
+    fn private_runtime_test_root(temp: &tempfile::TempDir) -> PathBuf {
+        let root = temp.path().join("runtime");
+        create_private_directory(&root).expect("create private runtime test root");
+        root
+    }
+
+    fn rewrite_private_runtime_owner(path: &Path, owner: &PrivateRuntimeOwner) {
+        let mut bytes = serde_json::to_vec(owner).expect("serialize private runtime owner");
+        bytes.push(b'\n');
+        let owner_path = owner.kind.owner_path(path);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&owner_path)
+            .expect("open private runtime owner for rewrite");
+        file.write_all(&bytes)
+            .expect("rewrite private runtime owner");
+        file.sync_all().expect("persist rewritten runtime owner");
+    }
+
+    fn private_runtime_owner_for_test(
+        kind: PrivateRuntimeKind,
+        nonce: &str,
+    ) -> PrivateRuntimeOwner {
+        PrivateRuntimeOwner {
+            version: PRIVATE_RUNTIME_OWNER_VERSION,
+            pid: std::process::id(),
+            process_start: private_runtime_current_process_start_identity()
+                .expect("current process identity"),
+            boot_id: private_runtime_boot_id().expect("current boot identity"),
+            created_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_secs(),
+            kind,
+            nonce: nonce.to_string(),
+        }
+    }
+
+    fn create_incomplete_private_runtime(
+        root: &Path,
+        kind: PrivateRuntimeKind,
+        nonce: &str,
+        create_validation_git: bool,
+        write_owner_temp: bool,
+        publish_owner: bool,
+    ) -> PathBuf {
+        let owner = private_runtime_owner_for_test(kind, nonce);
+        let path = root.join(format!("{}{}-{}", kind.prefix(), owner.pid, owner.nonce));
+        reserve_owner_only_directory(&path).expect("reserve incomplete private runtime");
+        let owner_path = kind.owner_path(&path);
+        let parent = owner_path.parent().expect("owner parent");
+        if create_validation_git && kind == PrivateRuntimeKind::CandidateValidation {
+            create_private_directory(parent).expect("create incomplete validation gitdir");
+        }
+        if write_owner_temp || publish_owner {
+            if kind == PrivateRuntimeKind::CandidateValidation && !parent.exists() {
+                create_private_directory(parent).expect("create owner parent");
+            }
+            let mut bytes = serde_json::to_vec(&owner).expect("serialize owner");
+            bytes.push(b'\n');
+            let temporary = parent.join(format!(".{PRIVATE_RUNTIME_OWNER_FILE}.{nonce}.tmp"));
+            write_private_file(&temporary, &bytes).expect("write owner temp");
+            if publish_owner {
+                fs::rename(&temporary, &owner_path).expect("publish owner");
+            }
+        }
+        path
+    }
+
+    #[test]
+    fn successful_status_cannot_bypass_nonverified_containment_seam() {
+        let error = require_verified_containment(
+            "synthetic successful command",
+            ContainmentEvidence::TrustedBestEffort(
+                crate::process_runner::ContainmentBackend::UnixProcessGroup,
+            ),
+        )
+        .expect_err("non-verified containment must be rejected");
+        assert!(error.to_string().contains("without verified-empty"));
+    }
+
+    #[test]
+    fn candidate_validation_total_deadline_returns_failed_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = std::time::Instant::now();
+        let report = run_candidate_validation_command_with_timeout(
+            temp.path(),
+            &CandidateValidationCommand {
+                command: "sleep 2".to_string(),
+            },
+            0,
+            &[PathBuf::from("README.md")],
+            Duration::from_millis(100),
+        );
+        assert_eq!(report.status, ValidationStatus::Failed);
+        assert_eq!(report.paths, vec![PathBuf::from("README.md")]);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(report
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("deadline") || message.contains("timed out")));
+    }
+
+    #[test]
+    fn candidate_capture_quota_rejects_oversized_changed_file_before_git_spawn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(temp.path()).expect("init repo");
+        let oversized = temp.path().join("oversized.bin");
+        let file = fs::File::create(&oversized).expect("create oversized file");
+        file.set_len(VALIDATION_RAW_MAX_SINGLE_FILE_BYTES + 1)
+            .expect("size oversized file");
+
+        let error = snapshot_worktree_candidate(&repo, temp.path(), None)
+            .expect_err("oversized candidate must fail");
+
+        assert!(error.to_string().contains("single-file limit"));
+    }
 
     fn passed_validation_evidence_check() -> ValidationEvidenceCheck {
         ValidationEvidenceCheck {
@@ -4638,6 +6246,470 @@ mod tests {
         assert_eq!(metadata.uid(), uid);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
         assert!(!runtime.starts_with(temp.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_all_kinds_publish_owner_retain_live_and_reuse_lock_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        let mut lock_inode = None;
+        for kind in [
+            PrivateRuntimeKind::CandidateCapture,
+            PrivateRuntimeKind::CandidateValidation,
+            PrivateRuntimeKind::PublicationGit,
+            PrivateRuntimeKind::GhConfig,
+        ] {
+            let runtime =
+                PrivateRuntimeDirectory::create_in_root(&root, kind).expect("create runtime");
+            let owner_path = kind.owner_path(runtime.path());
+            let owner_metadata = fs::symlink_metadata(&owner_path).expect("owner metadata");
+            assert_eq!(owner_metadata.permissions().mode() & 0o777, 0o600);
+            let (owner, _) =
+                read_private_runtime_owner(runtime.path(), kind).expect("read runtime owner");
+            assert_eq!(owner.kind, kind);
+            assert_eq!(owner.pid, std::process::id());
+            if kind == PrivateRuntimeKind::CandidateValidation {
+                assert_eq!(
+                    owner_path.parent(),
+                    Some(runtime.path().join(".git").as_path())
+                );
+            } else {
+                assert_eq!(owner_path.parent(), Some(runtime.path()));
+            }
+
+            let report = scavenge_private_runtime_orphans(&root).expect("scan live runtime");
+            assert_eq!(
+                report,
+                PrivateRuntimeScavengeReport {
+                    removed: 0,
+                    retained: 0,
+                }
+            );
+            assert!(runtime.path().exists());
+            let path = runtime.path().to_path_buf();
+            drop(runtime);
+            assert!(!path.exists());
+
+            let lock = fs::symlink_metadata(root.join(PRIVATE_RUNTIME_LOCK_FILE))
+                .expect("persistent runtime lock");
+            assert_eq!(lock.nlink(), 1);
+            match lock_inode {
+                Some(inode) => assert_eq!(lock.ino(), inode),
+                None => lock_inode = Some(lock.ino()),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_root_lock_serializes_concurrent_creators() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        let held = PrivateRuntimeRootLock::acquire(&root).expect("hold runtime lock");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let child_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            let result = PrivateRuntimeDirectory::create_in_root(
+                &child_root,
+                PrivateRuntimeKind::CandidateCapture,
+            )
+            .map(|runtime| {
+                let path = runtime.path().to_path_buf();
+                drop(runtime);
+                path
+            });
+            sender.send(result).expect("send creator result");
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        let path = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("creator completed after unlock")
+            .expect("creator result");
+        worker.join().expect("join creator");
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_runtime_scavenger_reclaims_reused_and_missing_pid_but_retains_live_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+
+        let live =
+            PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::CandidateCapture)
+                .expect("create live runtime");
+        let live_path = live.path().to_path_buf();
+        let report = scavenge_private_runtime_orphans(&root).expect("scan live owner");
+        assert_eq!(report.removed, 0);
+        assert!(live_path.exists());
+
+        let reused =
+            PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::PublicationGit)
+                .expect("create reused PID fixture");
+        let reused_path = reused.path().to_path_buf();
+        let mut reused_owner = reused.owner.clone();
+        let Some(ProcessStartIdentity::LinuxProcStartTicks(start)) =
+            reused_owner.process_start.as_mut()
+        else {
+            panic!("Linux owner omitted start ticks");
+        };
+        *start = start.saturating_add(1);
+        rewrite_private_runtime_owner(&reused_path, &reused_owner);
+        let report = scavenge_private_runtime_orphans(&root).expect("reclaim reused PID owner");
+        assert_eq!(report.removed, 1);
+        assert!(!reused_path.exists());
+
+        let missing = PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::GhConfig)
+            .expect("create missing PID fixture");
+        let missing_path = missing.path().to_path_buf();
+        let report = scavenge_private_runtime_orphans_with(
+            &root,
+            private_runtime_boot_id().expect("boot id").as_deref(),
+            |_| Ok(None),
+        )
+        .expect("reclaim missing PID owner");
+        assert_eq!(report.removed, 2);
+        assert!(!missing_path.exists());
+        assert!(!live_path.exists());
+        std::mem::forget((live, reused, missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_scavenger_retains_corrupt_unknown_and_unverifiable_entries_per_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        let corrupt =
+            PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::CandidateCapture)
+                .expect("create corrupt fixture");
+        let corrupt_path = corrupt.path().to_path_buf();
+        fs::write(
+            PrivateRuntimeKind::CandidateCapture.owner_path(&corrupt_path),
+            b"{broken",
+        )
+        .expect("corrupt owner");
+        std::mem::forget(corrupt);
+
+        let unknown = root.join("maco-publication-git-not-a-valid-reservation");
+        create_private_directory(&unknown).expect("create unknown managed entry");
+        let mut non_utf8_name = PrivateRuntimeKind::CandidateValidation
+            .prefix()
+            .as_bytes()
+            .to_vec();
+        non_utf8_name.extend_from_slice(b"1-20000-0-");
+        non_utf8_name.push(0xff);
+        let non_utf8 = root.join(OsString::from_vec(non_utf8_name));
+        create_private_directory(&non_utf8).expect("create non-UTF-8 managed entry");
+        let unverifiable =
+            PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::GhConfig)
+                .expect("create unverifiable fixture");
+        let unverifiable_path = unverifiable.path().to_path_buf();
+        std::mem::forget(unverifiable);
+
+        let report = scavenge_private_runtime_orphans_with(
+            &root,
+            private_runtime_boot_id().expect("boot id").as_deref(),
+            |_| bail!("synthetic identity lookup failure"),
+        )
+        .expect("per-directory failures must not abort bounded scan");
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.retained, 4);
+        assert!(corrupt_path.exists());
+        assert!(unknown.exists());
+        assert!(non_utf8.exists());
+        assert!(unverifiable_path.exists());
+
+        let fresh =
+            PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::CandidateValidation)
+                .expect("retained entries must not globally block a fresh reservation");
+        assert!(fresh.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_scavenger_recovers_each_owner_publication_crash_point() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        let kinds = [
+            PrivateRuntimeKind::CandidateCapture,
+            PrivateRuntimeKind::CandidateValidation,
+            PrivateRuntimeKind::PublicationGit,
+            PrivateRuntimeKind::GhConfig,
+        ];
+        let mut paths = Vec::new();
+        for (kind_index, kind) in kinds.into_iter().enumerate() {
+            paths.push(create_incomplete_private_runtime(
+                &root,
+                kind,
+                &format!("{}-0", 10_000 + kind_index),
+                false,
+                false,
+                false,
+            ));
+            if kind == PrivateRuntimeKind::CandidateValidation {
+                paths.push(create_incomplete_private_runtime(
+                    &root, kind, "11000-0", true, false, false,
+                ));
+            }
+            paths.push(create_incomplete_private_runtime(
+                &root,
+                kind,
+                &format!("{}-1", 12_000 + kind_index),
+                kind == PrivateRuntimeKind::CandidateValidation,
+                true,
+                false,
+            ));
+            paths.push(create_incomplete_private_runtime(
+                &root,
+                kind,
+                &format!("{}-2", 13_000 + kind_index),
+                kind == PrivateRuntimeKind::CandidateValidation,
+                true,
+                true,
+            ));
+        }
+        let report = scavenge_private_runtime_orphans_with(
+            &root,
+            private_runtime_boot_id().expect("boot id").as_deref(),
+            |_| Ok(None),
+        )
+        .expect("recover interrupted reservations");
+        assert_eq!(report.removed, paths.len());
+        assert_eq!(report.retained, 0);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_runtime_parent_sigkill_residue_is_reclaimed_on_next_entry() {
+        const CHILD_ROOT: &str = "MACO_TEST_PRIVATE_RUNTIME_CHILD_ROOT";
+        const CHILD_READY: &str = "MACO_TEST_PRIVATE_RUNTIME_CHILD_READY";
+        if let (Some(root), Some(ready)) = (env::var_os(CHILD_ROOT), env::var_os(CHILD_READY)) {
+            let runtime = PrivateRuntimeDirectory::create_in_root(
+                Path::new(&root),
+                PrivateRuntimeKind::CandidateCapture,
+            )
+            .expect("child creates private runtime");
+            fs::write(&ready, runtime.path().as_os_str().as_encoded_bytes())
+                .expect("publish child runtime path");
+            loop {
+                std::thread::park_timeout(Duration::from_secs(60));
+            }
+        }
+
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        let ready = temp.path().join("ready");
+        let executable = env::current_exe().expect("current test executable");
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "merge::tests::private_runtime_parent_sigkill_residue_is_reclaimed_on_next_entry",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &root)
+            .env(CHILD_READY, &ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn private runtime crash child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "private runtime crash child did not publish its path"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let path = PathBuf::from(OsString::from_vec(
+            fs::read(&ready).expect("read child runtime path"),
+        ));
+        assert!(path.exists());
+        // SAFETY: child.id identifies the live subprocess created above.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+        child.wait().expect("reap crash child");
+        let report = scavenge_private_runtime_orphans(&root).expect("reclaim crashed owner");
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.retained, 0);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_fd_cleanup_never_follows_symlink_or_hardlink_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        let outside = temp.path().join("outside");
+        create_private_directory(&outside).expect("create outside directory");
+        let marker = outside.join("marker");
+        fs::write(&marker, "preserve\n").expect("write outside marker");
+        let hardlink_target = outside.join("hardlink-target");
+        fs::write(&hardlink_target, "preserve hardlink\n").expect("write hardlink target");
+
+        let runtime =
+            PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::CandidateCapture)
+                .expect("create stale runtime");
+        let runtime_path = runtime.path().to_path_buf();
+        symlink(&outside, runtime_path.join("escape")).expect("create escape symlink");
+        fs::hard_link(&hardlink_target, runtime_path.join("hardlink"))
+            .expect("create outside hardlink");
+        std::mem::forget(runtime);
+        let report = scavenge_private_runtime_orphans_with(
+            &root,
+            private_runtime_boot_id().expect("boot id").as_deref(),
+            |_| Ok(None),
+        )
+        .expect("reclaim runtime containing links");
+        assert_eq!(report.removed, 1);
+        assert_eq!(
+            fs::read_to_string(&marker).expect("outside marker"),
+            "preserve\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&hardlink_target).expect("outside hardlink target"),
+            "preserve hardlink\n"
+        );
+
+        let top_level = root.join(format!(
+            "{}{}-14000-0",
+            PrivateRuntimeKind::GhConfig.prefix(),
+            std::process::id()
+        ));
+        symlink(&outside, &top_level).expect("create top-level managed symlink");
+        let report = scavenge_private_runtime_orphans(&root).expect("retain top-level symlink");
+        assert_eq!(report.retained, 1);
+        assert!(top_level.symlink_metadata().is_ok());
+        assert!(marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_fd_cleanup_race_never_escapes_managed_directory() {
+        use std::{
+            os::unix::fs::symlink,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        let outside = temp.path().join("outside-race");
+        create_private_directory(&outside).expect("create outside race directory");
+        let marker = outside.join("marker");
+        fs::write(&marker, "outside survives\n").expect("write outside race marker");
+
+        let runtime =
+            PrivateRuntimeDirectory::create_in_root(&root, PrivateRuntimeKind::CandidateCapture)
+                .expect("create race runtime");
+        let runtime_path = runtime.path().to_path_buf();
+        let race = runtime_path.join("race");
+        let holding = runtime_path.join("holding");
+        create_private_directory(&race).expect("create raced child");
+        fs::write(race.join("inside"), "inside\n").expect("write raced child content");
+        std::mem::forget(runtime);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let worker_outside = outside.clone();
+        let worker = std::thread::spawn(move || {
+            while worker_running.load(Ordering::Acquire) {
+                if fs::rename(&race, &holding).is_ok() {
+                    if symlink(&worker_outside, &race).is_ok() {
+                        std::thread::yield_now();
+                        let _ = fs::remove_file(&race);
+                    }
+                    let _ = fs::rename(&holding, &race);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let report = scavenge_private_runtime_orphans_with(
+            &root,
+            private_runtime_boot_id().expect("boot id").as_deref(),
+            |_| Ok(None),
+        )
+        .expect("race cleanup remains bounded");
+        running.store(false, Ordering::Release);
+        worker.join().expect("join race worker");
+        assert_eq!(report.removed + report.retained, 1);
+        assert_eq!(
+            fs::read_to_string(&marker).expect("outside race marker"),
+            "outside survives\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_scan_entry_and_tree_depth_bounds_fail_before_deletion() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = private_runtime_test_root(&temp);
+        for index in 0..=PRIVATE_RUNTIME_SCAN_MAX_DIRECTORIES {
+            let path = root.join(format!(
+                "{}{}-{}-0",
+                PrivateRuntimeKind::CandidateCapture.prefix(),
+                std::process::id(),
+                20_000 + index
+            ));
+            create_private_directory(&path).expect("create bounded scan fixture");
+        }
+        let error = scavenge_private_runtime_orphans(&root)
+            .expect_err("managed directory count overflow must fail");
+        assert!(error.to_string().contains("unbounded scavenging"));
+
+        let tree_root = temp.path().join("tree");
+        create_private_directory(&tree_root).expect("create bounded tree root");
+        create_private_directory(&tree_root.join("child")).expect("create bounded child");
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let tree = options.open(&tree_root).expect("open bounded tree");
+        let device = tree.metadata().expect("tree metadata").dev() as libc::dev_t;
+        let mut entries = 1;
+        let error = validate_private_runtime_contents_unix(
+            tree.as_raw_fd(),
+            device,
+            &mut entries,
+            1,
+            16,
+            0,
+        )
+        .expect_err("entry overflow must fail before deletion");
+        assert!(error.to_string().contains("bounded directory-entry limit"));
+        assert!(tree_root.join("child").exists());
+
+        let mut entries = 1;
+        let error = validate_private_runtime_contents_unix(
+            tree.as_raw_fd(),
+            device,
+            &mut entries,
+            16,
+            0,
+            0,
+        )
+        .expect_err("depth overflow must fail before deletion");
+        assert!(error.to_string().contains("depth limit"));
+        assert!(tree_root.join("child").exists());
     }
 
     #[test]

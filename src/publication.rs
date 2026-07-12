@@ -6,24 +6,27 @@ use crate::{
         OutputSummary, RepoCommonLock, SafetyCheckStatus, ValidationEvidenceBundle,
         ValidationReport,
     },
+    process_runner::StdinMode,
 };
 use anyhow::{bail, Context, Result};
-use git2::{ConfigLevel, ObjectType, Oid, Repository};
+use git2::{ObjectType, Oid, Repository};
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const SUMMARY_LIMIT: usize = 12 * 1024;
-const PUBLICATION_JOURNAL_VERSION: u32 = 1;
+const PUBLICATION_JOURNAL_VERSION: u32 = 2;
 const REMOTE_BINDING_SECRET_FILE: &str = "publication-remote-binding.key";
 const REMOTE_BINDING_SECRET_BYTES: usize = 32;
+const GH_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
+const GH_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +109,7 @@ pub struct PrPublicationReceipt {
     pub sequence: u64,
     pub phase: PublicationTransactionPhase,
     pub expected_oid: String,
+    pub expected_base_oid: Option<String>,
     pub remote_ref: String,
     pub github_repository: Option<String>,
     pub push_observed_oid: Option<String>,
@@ -138,6 +142,7 @@ struct PublicationTransactionJournal {
     agent_id: String,
     forge: ForgeKind,
     expected_oid: String,
+    expected_base_oid: Option<String>,
     remote_name: String,
     remote_binding_digest: String,
     remote_display: String,
@@ -182,6 +187,17 @@ struct PublicationTransaction {
     remote_private_values: Vec<String>,
 }
 
+struct PublicationGitContext {
+    directory: PathBuf,
+    _runtime_directory: merge::PrivateRuntimeDirectory,
+    environment: BTreeMap<String, String>,
+}
+
+struct GhCommandContext {
+    _runtime_directory: merge::PrivateRuntimeDirectory,
+    environment: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IssuePublicationReport {
     pub title: String,
@@ -198,6 +214,7 @@ pub struct IssuePublicationReport {
 struct GithubPrResult {
     url: String,
     head_oid: String,
+    base_oid: String,
     number: u64,
     base_ref_name: String,
     state: String,
@@ -541,7 +558,9 @@ pub fn publish_pr_with_validation_evidence(
                 &expected_head,
             )?;
             report.publication_receipt = Some(transaction.receipt());
-            if let Err(error) = ensure_remote_expected_commit(&worktree_path, &mut transaction) {
+            if let Err(error) =
+                ensure_github_remote_expected_commit(&worktree_path, &mut transaction)
+            {
                 return Ok(publication_transaction_failure(
                     report,
                     &mut transaction,
@@ -638,8 +657,10 @@ fn publication_transaction_failure(
         transaction.journal.last_error = Some(message.clone());
     }
     report.status = PrPublicationStatus::Blocked;
-    report.pushed = transaction.journal.push_observed_oid.as_deref()
-        == Some(transaction.journal.expected_oid.as_str());
+    // A failing attempt has no current end-to-end observation. The durable receipt retains the
+    // last verified push OID, but the report must not present that historical observation as the
+    // current attempt's success.
+    report.pushed = false;
     report.pr_url = transaction.journal.pr_url.clone();
     report.created = transaction.journal.created_by_transaction;
     report.publication_receipt = Some(transaction.receipt());
@@ -772,55 +793,62 @@ fn commit_agent_changes(
     let signature = repo.signature().context(
         "git identity missing; configure user.name and user.email before publishing uncommitted agent changes",
     )?;
-    git_add_all(worktree_path, changed_paths)?;
-
-    let mut index = repo
-        .index()
-        .context("failed to open agent worktree index")?;
-    index
-        .write()
-        .context("failed to write agent worktree index")?;
-    let tree_id = index.write_tree().context("failed to write commit tree")?;
-    let tree = repo
-        .find_tree(tree_id)
-        .context("failed to read staged commit tree")?;
     let parent = repo
         .head()
         .context("agent worktree has no HEAD commit")?
         .peel_to_commit()
         .context("failed to read agent HEAD commit")?;
+    let (captured_paths, raw_diff) =
+        merge::capture_worktree_diff_from_commit(&repo, worktree_path, parent.id())?;
+    let allowed = changed_paths.iter().collect::<BTreeSet<_>>();
+    let unexpected = captured_paths
+        .iter()
+        .filter(|path| !allowed.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        bail!(
+            "agent worktree changed outside the reviewed publication paths during commit capture: {:?}",
+            unexpected
+        );
+    }
+    let diff = git2::Diff::from_buffer(&raw_diff)
+        .context("failed to parse isolated publication commit diff")?;
+    let parent_tree = parent.tree().context("failed to read agent parent tree")?;
+    let mut index = repo
+        .apply_to_tree(&parent_tree, &diff, None)
+        .context("failed to apply isolated publication diff to parent tree")?;
+    let tree_id = index
+        .write_tree_to(&repo)
+        .context("failed to write publication commit tree")?;
+    let tree = repo
+        .find_tree(tree_id)
+        .context("failed to read publication commit tree")?;
     if parent.tree_id() == tree_id {
         return Ok(parent.id());
     }
     let parents = [&parent];
     let message = commit_message(agent_id, preview);
-    repo.commit(
-        Some("HEAD"),
-        &signature,
-        &signature,
-        &message,
-        &tree,
-        &parents,
-    )
-    .context("failed to commit agent worktree changes")
-}
-
-fn git_add_all(worktree_path: &Path, changed_paths: &[PathBuf]) -> Result<()> {
-    let mut command = merge::sanitized_git_command(worktree_path)?;
-    command.args(["add", "--all", "--"]);
-    for path in changed_paths {
-        command.arg(path);
-    }
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run git add in {}", worktree_path.display()))?;
-    if !output.status.success() {
-        bail!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
+    let commit_id = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            &message,
+            &tree,
+            &parents,
+        )
+        .context("failed to commit agent worktree changes")?;
+    let mut worktree_index = repo
+        .index()
+        .context("failed to reopen publication worktree index")?;
+    worktree_index
+        .read_tree(&tree)
+        .context("failed to align publication worktree index with committed tree")?;
+    worktree_index
+        .write()
+        .context("failed to persist publication worktree index")?;
+    Ok(commit_id)
 }
 
 fn commit_message(agent_id: &str, preview: &MergeApplyPreview) -> String {
@@ -936,21 +964,19 @@ fn remote_private_values(url: &str) -> Vec<String> {
             values.push(fragment.to_string());
         }
     }
-    values.sort();
-    values.dedup();
+    sort_private_values(&mut values);
     values
 }
 
 fn publication_private_values(remote_url: &str) -> Vec<String> {
     let mut values = remote_private_values(remote_url);
     values.extend(network_auth_private_values());
-    values.sort();
-    values.dedup();
+    sort_private_values(&mut values);
     values
 }
 
 fn network_auth_private_values() -> Vec<String> {
-    [
+    let mut values = [
         "GH_TOKEN",
         "GITHUB_TOKEN",
         "GH_ENTERPRISE_TOKEN",
@@ -960,7 +986,15 @@ fn network_auth_private_values() -> Vec<String> {
     .into_iter()
     .filter_map(|key| env::var(key).ok())
     .filter(|value| !value.is_empty())
-    .collect()
+    .collect::<Vec<_>>();
+    sort_private_values(&mut values);
+    values
+}
+
+fn sort_private_values(values: &mut Vec<String>) {
+    values.retain(|value| !value.is_empty());
+    values.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    values.dedup();
 }
 
 fn github_repository_identity(remote_url: &str) -> Result<GithubRepositoryIdentity> {
@@ -1624,6 +1658,17 @@ impl PublicationTransaction {
         expected_oid: &str,
     ) -> Result<Self> {
         Oid::from_str(expected_oid).context("publication expected OID was invalid")?;
+        validate_publication_remote_url(remote_url)?;
+        let expected_base_oid = report
+            .base_head
+            .as_deref()
+            .map(Oid::from_str)
+            .transpose()
+            .context("publication expected base OID was invalid")?
+            .map(|oid| oid.to_string());
+        if report.forge == ForgeKind::Github && expected_base_oid.is_none() {
+            bail!("GitHub publication requires an exact reviewed base OID");
+        }
         let remote_branch = publication_remote_branch(&report.agent_id, expected_oid);
         let remote_ref = format!("refs/heads/{remote_branch}");
         let forge = match report.forge {
@@ -1669,6 +1714,7 @@ impl PublicationTransaction {
                 || journal.agent_id != report.agent_id
                 || journal.forge != report.forge
                 || journal.expected_oid != expected_oid
+                || journal.expected_base_oid != expected_base_oid
                 || journal.remote_name != remote_name
                 || journal.remote_binding_digest != remote_binding_digest
                 || journal.remote_display != remote_display
@@ -1700,6 +1746,7 @@ impl PublicationTransaction {
                 agent_id: report.agent_id.clone(),
                 forge: report.forge,
                 expected_oid: expected_oid.to_string(),
+                expected_base_oid,
                 remote_name: remote_name.to_string(),
                 remote_binding_digest,
                 remote_display,
@@ -1818,6 +1865,7 @@ impl PublicationTransaction {
             sequence: self.journal.sequence,
             phase: self.journal.phase,
             expected_oid: self.journal.expected_oid.clone(),
+            expected_base_oid: self.journal.expected_base_oid.clone(),
             remote_ref: self.journal.remote_ref.clone(),
             github_repository: self
                 .journal
@@ -1919,6 +1967,9 @@ fn publication_journal_records(directory: &Path) -> Result<Vec<(u64, PathBuf)>> 
 
 fn validate_publication_journal(journal: &PublicationTransactionJournal) -> Result<()> {
     Oid::from_str(&journal.expected_oid).context("publication journal expected OID was invalid")?;
+    if let Some(oid) = journal.expected_base_oid.as_deref() {
+        Oid::from_str(oid).context("publication journal expected base OID was invalid")?;
+    }
     Oid::from_str(&journal.remote_binding_digest)
         .context("publication journal remote binding digest was invalid")?;
     if let Some(oid) = journal.push_observed_oid.as_deref() {
@@ -1963,6 +2014,7 @@ fn validate_publication_journal_transition(
         || previous.agent_id != current.agent_id
         || previous.forge != current.forge
         || previous.expected_oid != current.expected_oid
+        || previous.expected_base_oid != current.expected_base_oid
         || previous.remote_name != current.remote_name
         || previous.remote_binding_digest != current.remote_binding_digest
         || previous.remote_display != current.remote_display
@@ -2012,18 +2064,187 @@ fn publication_remote_branch(agent_id: &str, expected_oid: &str) -> String {
     )
 }
 
+impl PublicationGitContext {
+    fn create(worktree_path: &Path, remote_url: &str) -> Result<Self> {
+        validate_publication_remote_url(remote_url)?;
+        let repo = Repository::open(worktree_path).with_context(|| {
+            format!(
+                "failed to open publication worktree {}",
+                worktree_path.display()
+            )
+        })?;
+        let runtime_directory = merge::PrivateRuntimeDirectory::create(
+            worktree_path,
+            merge::PrivateRuntimeKind::PublicationGit,
+        )?;
+        let directory = runtime_directory.path().to_path_buf();
+        let result = (|| -> Result<BTreeMap<String, String>> {
+            let objects = directory.join("objects");
+            merge::create_private_directory(&objects)?;
+            merge::create_private_directory(&directory.join("refs"))?;
+            merge::create_private_directory(&directory.join("refs/heads"))?;
+            merge::create_private_directory(&directory.join("refs/tags"))?;
+            merge::create_private_directory(&directory.join("disabled-hooks"))?;
+            merge::write_git_alternates_file(&objects, &repo.commondir().join("objects"))?;
+            merge::write_private_file(
+                &directory.join("HEAD"),
+                b"ref: refs/heads/maco-publication\n",
+            )?;
+            let config_path = directory.join("config");
+            merge::write_private_file(&config_path, b"")?;
+            let mut config = git2::Config::open(&config_path)
+                .context("failed to open private publication Git config")?;
+            config
+                .set_i32("core.repositoryformatversion", 0)
+                .context("failed to set publication repository version")?;
+            config
+                .set_bool("core.bare", true)
+                .context("failed to set publication repository bare mode")?;
+            config
+                .set_bool("core.fsmonitor", false)
+                .context("failed to disable publication fsmonitor")?;
+            config
+                .set_bool("core.untrackedcache", false)
+                .context("failed to disable publication untracked cache")?;
+            config
+                .set_str(
+                    "core.hookspath",
+                    directory
+                        .join("disabled-hooks")
+                        .to_str()
+                        .context("publication hooks path was not UTF-8")?,
+                )
+                .context("failed to disable publication hooks")?;
+            config
+                .set_str("protocol.ext.allow", "never")
+                .context("failed to disable external publication protocol")?;
+            let uses_ssh = publication_remote_uses_ssh(remote_url);
+            if uses_ssh {
+                config
+                    .set_str("core.sshcommand", &fixed_trusted_ssh_command()?)
+                    .context("failed to bind trusted publication SSH command")?;
+            }
+            drop(config);
+            let global_config = directory.join("disabled-global-config");
+            merge::write_private_file(&global_config, b"")?;
+            let mut environment = merge::minimal_network_environment(uses_ssh)?;
+            environment.insert(
+                "GIT_CONFIG_GLOBAL".to_string(),
+                global_config
+                    .to_str()
+                    .context("publication global config path was not UTF-8")?
+                    .to_string(),
+            );
+            environment.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+            environment.insert(
+                "GIT_CONFIG_KEY_0".to_string(),
+                "remote.maco-publication.url".to_string(),
+            );
+            environment.insert("GIT_CONFIG_VALUE_0".to_string(), remote_url.to_string());
+            Ok(environment)
+        })();
+        match result {
+            Ok(environment) => Ok(Self {
+                directory,
+                _runtime_directory: runtime_directory,
+                environment,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run(&self, label: &str, operation: Vec<OsString>) -> Result<merge::RequiredCommandOutput> {
+        let args = self.command_args(operation);
+        merge::run_required_direct(
+            label,
+            merge::resolve_trusted_executable("git")?,
+            args,
+            &self.directory,
+            self.environment.clone(),
+            StdinMode::Null,
+            merge::NETWORK_PROCESS_TIMEOUT,
+            GH_CAPTURE_LIMIT_BYTES,
+            0,
+        )
+    }
+
+    fn command_args(&self, operation: Vec<OsString>) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("--git-dir"),
+            self.directory.as_os_str().to_os_string(),
+            OsString::from("-c"),
+            OsString::from("core.fsmonitor=false"),
+            OsString::from("-c"),
+            OsString::from("core.untrackedCache=false"),
+            OsString::from("-c"),
+            OsString::from("protocol.ext.allow=never"),
+        ];
+        args.extend(operation);
+        args
+    }
+}
+
+fn validate_publication_remote_url(remote_url: &str) -> Result<()> {
+    if remote_url.is_empty()
+        || remote_url
+            .as_bytes()
+            .iter()
+            .any(|byte| byte.is_ascii_control())
+    {
+        bail!("publication remote URL is empty or contains control bytes");
+    }
+    if remote_url.contains(['?', '#']) {
+        bail!(
+            "publication remote URLs containing query or fragment credentials are unsupported; use SSH agent authentication or URL userinfo without encoded secrets"
+        );
+    }
+    let authority = if let Some((_, remainder)) = remote_url.split_once("://") {
+        remainder
+            .split_once('/')
+            .map_or(remainder, |(authority, _)| authority)
+    } else {
+        remote_url
+            .split_once(':')
+            .map_or(remote_url, |(authority, _)| authority)
+    };
+    if authority.contains('@') && authority.contains('%') {
+        bail!(
+            "percent-encoded publication URL credentials are unsupported because safe error redaction cannot be guaranteed"
+        );
+    }
+    Ok(())
+}
+
+fn publication_remote_uses_ssh(remote_url: &str) -> bool {
+    remote_url.starts_with("ssh://")
+        || (!remote_url.contains("://")
+            && remote_url
+                .split_once(':')
+                .is_some_and(|(authority, _)| authority.contains('@')))
+}
+
+fn fixed_trusted_ssh_command() -> Result<String> {
+    let ssh = merge::resolve_trusted_executable("ssh")?;
+    let ssh = ssh
+        .to_str()
+        .context("trusted SSH executable path was not UTF-8")?;
+    if !ssh.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.' | b'+')
+    }) {
+        bail!("trusted SSH executable path contained unsafe shell characters");
+    }
+    Ok(format!(
+        "{ssh} -F /dev/null -o BatchMode=yes -o PermitLocalCommand=no -o ProxyCommand=none -o ClearAllForwardings=yes -o RequestTTY=no"
+    ))
+}
+
 fn ensure_remote_expected_commit(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
 ) -> Result<()> {
-    validate_publication_git_config(worktree_path, &transaction.journal.remote_name)?;
+    let git = PublicationGitContext::create(worktree_path, &transaction.remote_url)?;
     let previous = transaction.journal.clone();
-    let before = observe_remote_ref(
-        worktree_path,
-        &transaction.remote_url,
-        &transaction.journal.remote_ref,
-    )?;
-    transaction.journal.push_observed_oid = before.clone();
+    let before = observe_remote_ref(&git, &transaction.journal.remote_ref)?;
     if let Some(observed) = before {
         if observed != transaction.journal.expected_oid {
             bail!(
@@ -2033,6 +2254,7 @@ fn ensure_remote_expected_commit(
                 transaction.journal.expected_oid
             );
         }
+        transaction.journal.push_observed_oid = Some(observed);
         transaction.advance_phase(PublicationTransactionPhase::PushObserved);
         transaction.journal.last_error = None;
         transaction.persist_if_changed(&previous)?;
@@ -2040,25 +2262,20 @@ fn ensure_remote_expected_commit(
     }
 
     let push = push_git_commit_create_only(
-        worktree_path,
-        &transaction.remote_url,
+        &git,
         &transaction.journal.remote_ref,
         &transaction.journal.expected_oid,
     )?;
-    let after = observe_remote_ref(
-        worktree_path,
-        &transaction.remote_url,
-        &transaction.journal.remote_ref,
-    )?;
-    transaction.journal.push_observed_oid = after.clone();
+    let after = observe_remote_ref(&git, &transaction.journal.remote_ref)?;
     if after.as_deref() == Some(transaction.journal.expected_oid.as_str()) {
+        transaction.journal.push_observed_oid = after;
         transaction.advance_phase(PublicationTransactionPhase::PushObserved);
         transaction.journal.last_error = None;
         transaction.persist_if_changed(&previous)?;
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&push.stderr).trim().to_string();
-    if push.status.success() {
+    if push.success {
         bail!(
             "git push returned success but remote ref {} was not bound to expected OID {}",
             transaction.journal.remote_ref,
@@ -2075,65 +2292,29 @@ fn ensure_remote_expected_commit(
     )
 }
 
-fn validate_publication_git_config(worktree_path: &Path, remote_name: &str) -> Result<()> {
-    let repo = Repository::open(worktree_path).with_context(|| {
-        format!(
-            "failed to open publication worktree {} for config audit",
-            worktree_path.display()
-        )
-    })?;
-    let config = repo
-        .config()
-        .context("failed to open publication Git config")?;
-    let local = config
-        .open_level(ConfigLevel::Local)
-        .context("failed to open repository-local publication Git config")?;
-    let mut entries = local
-        .entries(None)
-        .context("failed to enumerate repository-local Git config")?;
-    let remote_prefix = format!("remote.{}.", remote_name.to_ascii_lowercase());
-    while let Some(entry) = entries.next() {
-        let entry = entry.context("failed to read repository-local Git config entry")?;
-        let Some(name) = entry.name() else {
-            bail!("repository-local Git config contained a nameless entry");
-        };
-        let name = name.to_ascii_lowercase();
-        let remote_execution_override = name.starts_with(&remote_prefix)
-            && matches!(
-                name.strip_prefix(&remote_prefix),
-                Some("pushurl" | "receivepack" | "proxy")
-            );
-        let credential_helper = name == "credential.helper"
-            || (name.starts_with("credential.") && name.ends_with(".helper"));
-        let url_redirect = name.starts_with("url.")
-            && (name.ends_with(".insteadof") || name.ends_with(".pushinsteadof"));
-        if matches!(
-            name.as_str(),
-            "core.sshcommand" | "core.gitproxy" | "include.path"
-        ) || name.starts_with("includeif.")
-            || remote_execution_override
-            || credential_helper
-            || url_redirect
-        {
-            bail!(
-                "repository-local Git config contains a key that can redirect or execute publication commands; refusing push"
-            );
-        }
-    }
-    Ok(())
+fn ensure_github_remote_expected_commit(
+    worktree_path: &Path,
+    transaction: &mut PublicationTransaction,
+) -> Result<()> {
+    require_remote_expected_base(
+        worktree_path,
+        transaction,
+        "before publication ref creation",
+    )?;
+    ensure_remote_expected_commit(worktree_path, transaction)
 }
 
-fn observe_remote_ref(
-    worktree_path: &Path,
-    remote_url: &str,
-    remote_ref: &str,
-) -> Result<Option<String>> {
-    let mut command = merge::sanitized_git_push_command(worktree_path)?;
-    command.args(["ls-remote", "--refs", remote_url, remote_ref]);
-    let output = command
-        .output()
-        .with_context(|| format!("failed to observe publication remote ref {remote_ref}"))?;
-    if !output.status.success() {
+fn observe_remote_ref(context: &PublicationGitContext, remote_ref: &str) -> Result<Option<String>> {
+    let output = context.run(
+        "observe publication remote ref",
+        vec![
+            OsString::from("ls-remote"),
+            OsString::from("--refs"),
+            OsString::from("maco-publication"),
+            OsString::from(remote_ref),
+        ],
+    )?;
+    if !output.success {
         bail!(
             "git ls-remote failed for {}: {}",
             remote_ref,
@@ -2166,17 +2347,22 @@ fn observe_remote_ref(
 }
 
 fn push_git_commit_create_only(
-    worktree_path: &Path,
-    remote_url: &str,
+    context: &PublicationGitContext,
     remote_ref: &str,
     expected_oid: &str,
-) -> Result<std::process::Output> {
-    let mut push = merge::sanitized_git_push_command(worktree_path)?;
+) -> Result<merge::RequiredCommandOutput> {
     let lease = format!("--force-with-lease={remote_ref}:");
     let refspec = format!("{expected_oid}:{remote_ref}");
-    push.args(["push", "--no-verify", &lease, remote_url, &refspec]);
-    push.output()
-        .context("failed to start create-only git push")
+    context.run(
+        "create publication remote ref",
+        vec![
+            OsString::from("push"),
+            OsString::from("--no-verify"),
+            OsString::from(lease),
+            OsString::from("maco-publication"),
+            OsString::from(refspec),
+        ],
+    )
 }
 
 fn reconcile_github_pr(
@@ -2213,7 +2399,13 @@ fn reconcile_github_pr_with_api(
             .map(|number| number.to_string())
             .unwrap_or_else(|| transaction.journal.remote_branch.clone());
         if let Ok(receipt) = api.view(worktree_path, &selector, &github_repository) {
-            return verify_github_receipt(worktree_path, transaction, receipt);
+            return verify_github_receipt(
+                worktree_path,
+                transaction,
+                receipt,
+                transaction.journal.created_by_transaction,
+                transaction.journal.observed_existing_pr,
+            );
         }
     }
 
@@ -2231,10 +2423,14 @@ fn reconcile_github_pr_with_api(
     if let Some(existing) = existing.into_iter().next() {
         let selector = existing.number.to_string();
         let receipt = api.view(worktree_path, &selector, &github_repository)?;
-        if !transaction.journal.created_by_transaction {
-            transaction.journal.observed_existing_pr = true;
-        }
-        return verify_github_receipt(worktree_path, transaction, receipt);
+        let created_by_transaction = transaction.journal.created_by_transaction;
+        return verify_github_receipt(
+            worktree_path,
+            transaction,
+            receipt,
+            created_by_transaction,
+            !created_by_transaction,
+        );
     }
 
     require_remote_expected(
@@ -2255,12 +2451,6 @@ fn reconcile_github_pr_with_api(
     )?;
     let create_succeeded = create.success;
     let hinted_url = first_non_empty_line(&String::from_utf8_lossy(&create.stdout));
-    if let Some(url) = hinted_url.clone() {
-        transaction.journal.pr_url = Some(redact_remote_url(&url));
-        transaction.journal.created_by_transaction = true;
-        transaction.journal.observed_existing_pr = false;
-        transaction.persist()?;
-    }
 
     let receipt = if hinted_url.is_some() {
         api.view(
@@ -2294,20 +2484,28 @@ fn reconcile_github_pr_with_api(
                     }
                 );
             };
-            transaction.journal.created_by_transaction = create_succeeded;
-            transaction.journal.observed_existing_pr = !create_succeeded;
             let selector = recovered.number.to_string();
             api.view(worktree_path, &selector, &github_repository)?
         }
     };
-    verify_github_receipt(worktree_path, transaction, receipt)
+    verify_github_receipt(
+        worktree_path,
+        transaction,
+        receipt,
+        create_succeeded,
+        !create_succeeded,
+    )
 }
 
 fn verify_github_receipt(
     worktree_path: &Path,
     transaction: &mut PublicationTransaction,
     receipt: GithubPrResult,
+    created_by_transaction: bool,
+    observed_existing_pr: bool,
 ) -> Result<GithubPrResult> {
+    validate_github_receipt_contract(&receipt, &transaction.journal)?;
+    require_remote_expected(worktree_path, transaction, "after GitHub PR creation")?;
     let previous = transaction.journal.clone();
     transaction.journal.pr_url = Some(receipt.url.clone());
     transaction.journal.pr_head_oid = Some(receipt.head_oid.clone());
@@ -2315,13 +2513,16 @@ fn verify_github_receipt(
     transaction.journal.pr_state = Some(receipt.state.clone());
     transaction.journal.pr_is_draft = Some(receipt.is_draft);
     transaction.journal.pr_number = Some(receipt.number);
+    transaction.journal.created_by_transaction =
+        transaction.journal.created_by_transaction || created_by_transaction;
+    transaction.journal.observed_existing_pr = !transaction.journal.created_by_transaction
+        && (transaction.journal.observed_existing_pr || observed_existing_pr);
     transaction.advance_phase(PublicationTransactionPhase::PrObserved);
     transaction.persist_if_changed(&previous)?;
-    validate_github_receipt_contract(&receipt, &transaction.journal)?;
-    require_remote_expected(worktree_path, transaction, "after GitHub PR creation")?;
     Ok(GithubPrResult {
         url: receipt.url,
         head_oid: receipt.head_oid,
+        base_oid: receipt.base_oid,
         number: receipt.number,
         base_ref_name: receipt.base_ref_name,
         state: receipt.state,
@@ -2344,6 +2545,17 @@ fn validate_github_receipt_contract(
             "GitHub PR receipt headRefOid {} does not match reviewed OID {}",
             receipt.head_oid,
             journal.expected_oid
+        );
+    }
+    let expected_base_oid = journal
+        .expected_base_oid
+        .as_deref()
+        .context("GitHub publication journal omitted exact base OID")?;
+    if receipt.base_oid != expected_base_oid {
+        bail!(
+            "GitHub PR receipt baseRefOid {} does not match reviewed base OID {}",
+            receipt.base_oid,
+            expected_base_oid
         );
     }
     if receipt.base_ref_name != journal.base {
@@ -2374,12 +2586,8 @@ fn require_remote_expected(
     transaction: &PublicationTransaction,
     stage: &str,
 ) -> Result<()> {
-    validate_publication_git_config(worktree_path, &transaction.journal.remote_name)?;
-    let observed = observe_remote_ref(
-        worktree_path,
-        &transaction.remote_url,
-        &transaction.journal.remote_ref,
-    )?;
+    let git = PublicationGitContext::create(worktree_path, &transaction.remote_url)?;
+    let observed = observe_remote_ref(&git, &transaction.journal.remote_ref)?;
     if observed.as_deref() != Some(transaction.journal.expected_oid.as_str()) {
         bail!(
             "publication remote ref {} changed {stage}: observed {:?}, expected {}",
@@ -2388,7 +2596,107 @@ fn require_remote_expected(
             transaction.journal.expected_oid
         );
     }
+    require_remote_expected_base_with_context(&git, transaction, stage)?;
     Ok(())
+}
+
+fn require_remote_expected_base(
+    worktree_path: &Path,
+    transaction: &PublicationTransaction,
+    stage: &str,
+) -> Result<()> {
+    let git = PublicationGitContext::create(worktree_path, &transaction.remote_url)?;
+    require_remote_expected_base_with_context(&git, transaction, stage)
+}
+
+fn require_remote_expected_base_with_context(
+    git: &PublicationGitContext,
+    transaction: &PublicationTransaction,
+    stage: &str,
+) -> Result<()> {
+    let expected_base_oid = transaction
+        .journal
+        .expected_base_oid
+        .as_deref()
+        .context("GitHub publication journal omitted exact base OID")?;
+    let base_ref = format!("refs/heads/{}", transaction.journal.base);
+    let observed_base = observe_remote_ref(git, &base_ref)?;
+    if observed_base.as_deref() != Some(expected_base_oid) {
+        bail!(
+            "publication base ref {} changed {stage}: observed {:?}, expected {}",
+            base_ref,
+            observed_base,
+            expected_base_oid
+        );
+    }
+    Ok(())
+}
+
+impl GhCommandContext {
+    fn create(worktree_path: &Path) -> Result<Self> {
+        let runtime_directory = merge::PrivateRuntimeDirectory::create(
+            worktree_path,
+            merge::PrivateRuntimeKind::GhConfig,
+        )?;
+        let directory = runtime_directory.path().to_path_buf();
+        let result = (|| -> Result<BTreeMap<String, String>> {
+            let mut environment = merge::minimal_network_environment(false)?;
+            for key in [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "GITHUB_ENTERPRISE_TOKEN",
+            ] {
+                if let Ok(value) = env::var(key) {
+                    if !value.is_empty() {
+                        environment.insert(key.to_string(), value);
+                    }
+                }
+            }
+            environment.insert(
+                "GH_CONFIG_DIR".to_string(),
+                directory
+                    .to_str()
+                    .context("private gh config path was not UTF-8")?
+                    .to_string(),
+            );
+            environment.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
+            Ok(environment)
+        })();
+        match result {
+            Ok(environment) => Ok(Self {
+                _runtime_directory: runtime_directory,
+                environment,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run(
+        &self,
+        worktree_path: &Path,
+        label: &str,
+        args: Vec<OsString>,
+        stdin: StdinMode,
+    ) -> Result<merge::RequiredCommandOutput> {
+        merge::run_required_direct(
+            label,
+            merge::resolve_trusted_executable("gh")?,
+            args,
+            worktree_path,
+            self.environment.clone(),
+            stdin,
+            merge::NETWORK_PROCESS_TIMEOUT,
+            GH_CAPTURE_LIMIT_BYTES,
+            GH_STDIN_LIMIT_BYTES,
+        )
+    }
+}
+
+impl Drop for GhCommandContext {
+    fn drop(&mut self) {
+        self.environment.clear();
+    }
 }
 
 fn cli_github_pr_list(
@@ -2396,20 +2704,28 @@ fn cli_github_pr_list(
     branch: &str,
     repository: &GithubRepositoryIdentity,
 ) -> Result<Vec<GithubPrResult>> {
-    let mut command = trusted_gh_command(worktree_path)?;
-    command.current_dir(worktree_path).args([
-        "pr",
-        "list",
-        "--repo",
-        &repository.selector(),
-        "--head",
-        branch,
-        "--state",
-        "all",
-        "--json",
-        "url,headRefOid,number,baseRefName,state,isDraft",
-    ]);
-    let stdout = run_command(&mut command, "gh pr list")?;
+    let context = GhCommandContext::create(worktree_path)?;
+    let output = context.run(
+        worktree_path,
+        "gh pr list",
+        [
+            "pr",
+            "list",
+            "--repo",
+            &repository.selector(),
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh pr list")?;
     let value: serde_json::Value =
         serde_json::from_str(&stdout).context("gh pr list did not return valid JSON")?;
     value
@@ -2425,17 +2741,25 @@ fn cli_github_pr_view(
     selector: &str,
     repository: &GithubRepositoryIdentity,
 ) -> Result<GithubPrResult> {
-    let mut command = trusted_gh_command(worktree_path)?;
-    command.current_dir(worktree_path).args([
-        "pr",
-        "view",
-        selector,
-        "--repo",
-        &repository.selector(),
-        "--json",
-        "url,headRefOid,number,baseRefName,state,isDraft",
-    ]);
-    let stdout = run_command(&mut command, "gh pr view")?;
+    let context = GhCommandContext::create(worktree_path)?;
+    let output = context.run(
+        worktree_path,
+        "gh pr view",
+        [
+            "pr",
+            "view",
+            selector,
+            "--repo",
+            &repository.selector(),
+            "--json",
+            "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh pr view")?;
     let value: serde_json::Value =
         serde_json::from_str(&stdout).context("gh pr view did not return valid JSON")?;
     github_pr_receipt_from_json(&value)
@@ -2452,6 +2776,13 @@ fn github_pr_receipt_from_json(value: &serde_json::Value) -> Result<GithubPrResu
         .context("GitHub PR receipt omitted headRefOid")?;
     let head_oid = Oid::from_str(head_oid)
         .context("GitHub PR receipt headRefOid was invalid")?
+        .to_string();
+    let base_oid = value
+        .get("baseRefOid")
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub PR receipt omitted baseRefOid")?;
+    let base_oid = Oid::from_str(base_oid)
+        .context("GitHub PR receipt baseRefOid was invalid")?
         .to_string();
     let number = value
         .get("number")
@@ -2472,6 +2803,7 @@ fn github_pr_receipt_from_json(value: &serde_json::Value) -> Result<GithubPrResu
     Ok(GithubPrResult {
         url: redact_remote_url(url),
         head_oid,
+        base_oid,
         number,
         base_ref_name: base_ref_name.to_string(),
         state: state.to_string(),
@@ -2489,52 +2821,38 @@ fn cli_github_pr_create(
     draft: bool,
     repository: &GithubRepositoryIdentity,
 ) -> Result<GithubCreateOutput> {
-    let mut command = trusted_gh_command(worktree_path)?;
-    command
-        .current_dir(worktree_path)
-        .args([
-            "pr",
-            "create",
-            "--repo",
-            &repository.selector(),
-            "--base",
-            base,
-            "--head",
-            branch,
-        ])
-        .arg("--title")
-        .arg(title)
-        .arg("--body")
-        .arg(body);
+    let context = GhCommandContext::create(worktree_path)?;
+    let mut args = [
+        "pr",
+        "create",
+        "--repo",
+        &repository.selector(),
+        "--base",
+        base,
+        "--head",
+        branch,
+        "--title",
+        title,
+        "--body-file",
+        "-",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
     if draft {
-        command.arg("--draft");
+        args.push(OsString::from("--draft"));
     }
-    let output = command.output().context("failed to run gh pr create")?;
+    let output = context.run(
+        worktree_path,
+        "gh pr create",
+        args,
+        StdinMode::Bytes(body.as_bytes().to_vec()),
+    )?;
     Ok(GithubCreateOutput {
-        success: output.status.success(),
+        success: output.success,
         stdout: output.stdout,
         stderr: output.stderr,
     })
-}
-
-fn trusted_gh_command(worktree_path: &Path) -> Result<Command> {
-    let mut command = Command::new(merge::resolve_trusted_executable("gh")?);
-    configure_gh_command_environment(&mut command)?;
-    command.current_dir(worktree_path);
-    Ok(command)
-}
-
-fn configure_gh_command_environment(command: &mut Command) -> Result<()> {
-    merge::sanitize_network_command_environment(command)?;
-    command
-        .env_remove("GH_REPO")
-        .env_remove("GH_HOST")
-        .env_remove("GH_CONFIG_DIR")
-        .env_remove("GH_DEBUG")
-        .env_remove("GH_FORCE_TTY")
-        .env_remove("GH_PAGER")
-        .env("GH_PROMPT_DISABLED", "1");
-    Ok(())
 }
 
 fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) -> Result<String> {
@@ -2547,25 +2865,31 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
     let remote_url = remote_url(&repository, "origin")
         .context("GitHub issue creation requires an 'origin' remote")?;
     let github_repository = github_repository_identity(&remote_url)?;
-    merge::resolve_trusted_executable("gh")
-        .context("GitHub issue creation requires a trusted gh executable")?;
-    let mut command = trusted_gh_command(repo)?;
-    command
-        .current_dir(repo)
-        .args([
-            "issue",
-            "create",
-            "--repo",
-            &github_repository.selector(),
-            "--title",
-        ])
-        .arg(title)
-        .arg("--body")
-        .arg(body);
+    let context = GhCommandContext::create(repo)?;
+    let mut args = [
+        "issue",
+        "create",
+        "--repo",
+        &github_repository.selector(),
+        "--title",
+        title,
+        "--body-file",
+        "-",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
     for label in labels {
-        command.arg("--label").arg(label);
+        args.push(OsString::from("--label"));
+        args.push(OsString::from(label));
     }
-    let stdout = run_command(&mut command, "gh issue create")?;
+    let output = context.run(
+        repo,
+        "gh issue create",
+        args,
+        StdinMode::Bytes(body.as_bytes().to_vec()),
+    )?;
+    let stdout = required_command_stdout(output, "gh issue create")?;
     Ok(first_non_empty_line(&stdout).unwrap_or_else(|| {
         format!(
             "https://{}/{}/{}/issues",
@@ -2574,11 +2898,8 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
     }))
 }
 
-fn run_command(command: &mut Command, label: &str) -> Result<String> {
-    let output = command
-        .output()
-        .with_context(|| format!("failed to run {label}"))?;
-    if !output.status.success() {
+fn required_command_stdout(output: merge::RequiredCommandOutput, label: &str) -> Result<String> {
+    if !output.success {
         let redactor = network_auth_private_values()
             .into_iter()
             .fold(Redactor::new(), |redactor, value| {
@@ -2706,6 +3027,7 @@ fn summarize_text(text: &str, limit: usize) -> OutputSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     struct LostResponseGithubApi {
         list_calls: usize,
@@ -2773,6 +3095,7 @@ mod tests {
                 agent_id: "agent-a".to_string(),
                 forge: ForgeKind::Github,
                 expected_oid: "1111111111111111111111111111111111111111".to_string(),
+                expected_base_oid: Some("3333333333333333333333333333333333333333".to_string()),
                 remote_name: "origin".to_string(),
                 remote_binding_digest,
                 remote_display: remote_display.to_string(),
@@ -2870,6 +3193,7 @@ mod tests {
             agent_id: "agent-a".to_string(),
             forge: ForgeKind::Github,
             expected_oid: "1111111111111111111111111111111111111111".to_string(),
+            expected_base_oid: Some("3333333333333333333333333333333333333333".to_string()),
             remote_name: "origin".to_string(),
             remote_binding_digest,
             remote_display: remote_display.to_string(),
@@ -2899,6 +3223,7 @@ mod tests {
         let mut receipt = GithubPrResult {
             url: "https://example.invalid/owner/repo/pull/1".to_string(),
             head_oid: journal.expected_oid.clone(),
+            base_oid: journal.expected_base_oid.clone().expect("base oid"),
             number: 1,
             base_ref_name: "release".to_string(),
             state: "OPEN".to_string(),
@@ -3034,7 +3359,12 @@ mod tests {
         let push = Command::new(git)
             .arg("-C")
             .arg(&repo_path)
-            .args(["push", "origin", &format!("{expected}:{remote_ref}")])
+            .args([
+                "push",
+                "origin",
+                &format!("{expected}:{remote_ref}"),
+                &format!("{expected}:refs/heads/main"),
+            ])
             .output()
             .expect("push reviewed ref");
         assert!(
@@ -3059,6 +3389,7 @@ mod tests {
                 agent_id: "agent-a".to_string(),
                 forge: ForgeKind::Github,
                 expected_oid: expected.clone(),
+                expected_base_oid: Some(expected.clone()),
                 remote_name: "origin".to_string(),
                 remote_binding_digest: "2222222222222222222222222222222222222222".to_string(),
                 remote_display: "https://github.example/owner/repo.git".to_string(),
@@ -3090,7 +3421,8 @@ mod tests {
             exists: false,
             receipt: GithubPrResult {
                 url: "https://github.example/owner/repo/pull/11".to_string(),
-                head_oid: expected,
+                head_oid: expected.clone(),
+                base_oid: expected,
                 number: 11,
                 base_ref_name: "main".to_string(),
                 state: "OPEN".to_string(),
@@ -3116,24 +3448,425 @@ mod tests {
     }
 
     #[test]
-    fn github_command_environment_removes_ambient_repository_and_output_routing() {
-        let mut command = Command::new("unused-gh");
-        configure_gh_command_environment(&mut command).expect("configure gh environment");
-        let removals = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(key, _)| key.to_string_lossy().to_string())
-            .collect::<BTreeSet<_>>();
+    fn github_base_mismatch_blocks_before_publication_ref_creation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let origin_path = temp.path().join("origin.git");
+        let repo = Repository::init(&repo_path).expect("init repo");
+        Repository::init_bare(&origin_path).expect("init bare origin");
+        fs::write(repo_path.join("README.md"), "reviewed\n").expect("write reviewed file");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("add reviewed file");
+        index.write().expect("write reviewed index");
+        let reviewed_tree_id = index.write_tree().expect("write reviewed tree");
+        let reviewed_tree = repo
+            .find_tree(reviewed_tree_id)
+            .expect("find reviewed tree");
+        let signature =
+            git2::Signature::now("maco test", "maco@example.invalid").expect("signature");
+        let expected = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "reviewed",
+                &reviewed_tree,
+                &[],
+            )
+            .expect("commit reviewed")
+            .to_string();
+        drop(reviewed_tree);
+
+        fs::write(repo_path.join("README.md"), "moved base\n").expect("write moved base");
+        let mut index = repo.index().expect("reopen index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("add moved base");
+        index.write().expect("write moved base index");
+        let moved_tree_id = index.write_tree().expect("write moved base tree");
+        let moved_tree = repo.find_tree(moved_tree_id).expect("find moved base tree");
+        let reviewed_parent = repo
+            .find_commit(Oid::from_str(&expected).expect("expected oid"))
+            .expect("find reviewed parent");
+        let moved_base = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "moved base",
+                &moved_tree,
+                &[&reviewed_parent],
+            )
+            .expect("commit moved base")
+            .to_string();
+        repo.remote("origin", origin_path.to_str().expect("origin UTF-8"))
+            .expect("configure origin");
+        let git = merge::resolve_trusted_executable("git").expect("trusted git");
+        let push = Command::new(git)
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["push", "origin", &format!("{moved_base}:refs/heads/main")])
+            .output()
+            .expect("push moved base");
+        assert!(
+            push.status.success(),
+            "{}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+
+        let remote_branch = format!("maco/review/agent-a/{expected}");
+        let remote_ref = format!("refs/heads/{remote_branch}");
+        let journal_directory = temp.path().join("journal");
+        fs::create_dir(&journal_directory).expect("journal directory");
+        let mut transaction = PublicationTransaction {
+            directory: journal_directory,
+            journal: PublicationTransactionJournal {
+                version: PUBLICATION_JOURNAL_VERSION,
+                transaction_id: "base-mismatch-before-push".to_string(),
+                sequence: 0,
+                agent_id: "agent-a".to_string(),
+                forge: ForgeKind::Github,
+                expected_oid: expected.clone(),
+                expected_base_oid: Some(expected.clone()),
+                remote_name: "origin".to_string(),
+                remote_binding_digest: "2222222222222222222222222222222222222222".to_string(),
+                remote_display: "https://github.example/owner/repo.git".to_string(),
+                remote_ref: remote_ref.clone(),
+                remote_branch,
+                github_repository: Some(GithubRepositoryIdentity {
+                    host: "github.example".to_string(),
+                    owner: "owner".to_string(),
+                    name: "repo".to_string(),
+                }),
+                base: "main".to_string(),
+                draft: true,
+                phase: PublicationTransactionPhase::Prepared,
+                push_observed_oid: None,
+                pr_url: None,
+                pr_head_oid: None,
+                pr_base: None,
+                pr_state: None,
+                pr_is_draft: None,
+                pr_number: None,
+                create_attempted: false,
+                created_by_transaction: false,
+                observed_existing_pr: false,
+                last_error: None,
+                updated_unix_seconds: 0,
+            },
+            remote_url: origin_path.to_string_lossy().to_string(),
+            remote_private_values: Vec::new(),
+        };
+
+        let error = ensure_github_remote_expected_commit(&repo_path, &mut transaction)
+            .expect_err("moved base must block before publication push");
+        assert!(error
+            .to_string()
+            .contains("before publication ref creation"));
+        assert!(transaction.journal.push_observed_oid.is_none());
+        let origin = Repository::open_bare(&origin_path).expect("open bare origin");
+        assert!(origin.find_reference(&remote_ref).is_err());
+    }
+
+    #[test]
+    fn wrong_remote_oid_records_diagnostic_without_poisoning_recovery_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let origin_path = temp.path().join("origin.git");
+        let repo = Repository::init(&repo_path).expect("init repo");
+        Repository::init_bare(&origin_path).expect("init bare origin");
+        fs::write(repo_path.join("README.md"), "reviewed\n").expect("write reviewed file");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("add reviewed file");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write reviewed tree");
+        let tree = repo.find_tree(tree_id).expect("find reviewed tree");
+        let signature =
+            git2::Signature::now("maco test", "maco@example.invalid").expect("signature");
+        let expected = repo
+            .commit(Some("HEAD"), &signature, &signature, "reviewed", &tree, &[])
+            .expect("commit reviewed")
+            .to_string();
+        drop(tree);
+        fs::write(repo_path.join("README.md"), "unreviewed\n").expect("write attack file");
+        let mut index = repo.index().expect("reopen index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("add attack file");
+        index.write().expect("write attack index");
+        let attack_tree_id = index.write_tree().expect("write attack tree");
+        let attack_tree = repo.find_tree(attack_tree_id).expect("find attack tree");
+        let parent = repo
+            .find_commit(Oid::from_str(&expected).expect("expected oid"))
+            .expect("find reviewed parent");
+        let attack = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "unreviewed",
+                &attack_tree,
+                &[&parent],
+            )
+            .expect("commit attack")
+            .to_string();
+        repo.remote("origin", origin_path.to_str().expect("origin UTF-8"))
+            .expect("configure origin");
+        let remote_ref = format!("refs/heads/maco/review/agent-a/{expected}");
+        let git = merge::resolve_trusted_executable("git").expect("trusted git");
+        let initial = Command::new(&git)
+            .arg("-C")
+            .arg(&repo_path)
+            .args([
+                "push",
+                "origin",
+                &format!("{expected}:{remote_ref}"),
+                &format!("{expected}:refs/heads/main"),
+            ])
+            .output()
+            .expect("push reviewed refs");
+        assert!(
+            initial.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initial.stderr)
+        );
+
+        let journal_directory = temp.path().join("journal");
+        fs::create_dir(&journal_directory).expect("journal directory");
+        let mut transaction = PublicationTransaction {
+            directory: journal_directory.clone(),
+            journal: PublicationTransactionJournal {
+                version: PUBLICATION_JOURNAL_VERSION,
+                transaction_id: "wrong-remote-recovery".to_string(),
+                sequence: 0,
+                agent_id: "agent-a".to_string(),
+                forge: ForgeKind::Git,
+                expected_oid: expected.clone(),
+                expected_base_oid: Some(expected.clone()),
+                remote_name: "origin".to_string(),
+                remote_binding_digest: "2222222222222222222222222222222222222222".to_string(),
+                remote_display: origin_path.to_string_lossy().to_string(),
+                remote_ref: remote_ref.clone(),
+                remote_branch: remote_ref.trim_start_matches("refs/heads/").to_string(),
+                github_repository: None,
+                base: "main".to_string(),
+                draft: true,
+                phase: PublicationTransactionPhase::Completed,
+                push_observed_oid: Some(expected.clone()),
+                pr_url: None,
+                pr_head_oid: None,
+                pr_base: None,
+                pr_state: None,
+                pr_is_draft: None,
+                pr_number: None,
+                create_attempted: false,
+                created_by_transaction: false,
+                observed_existing_pr: false,
+                last_error: None,
+                updated_unix_seconds: 0,
+            },
+            remote_url: origin_path.to_string_lossy().to_string(),
+            remote_private_values: Vec::new(),
+        };
+        transaction.persist().expect("persist initial receipt");
+        let moved = Command::new(&git)
+            .arg("-C")
+            .arg(&repo_path)
+            .args([
+                "push",
+                "--force",
+                "origin",
+                &format!("{attack}:{remote_ref}"),
+            ])
+            .output()
+            .expect("move remote ref");
+        assert!(moved.status.success());
+
+        let error = ensure_remote_expected_commit(&repo_path, &mut transaction)
+            .expect_err("wrong remote OID must block");
+        assert_eq!(
+            transaction.journal.push_observed_oid.as_deref(),
+            Some(expected.as_str())
+        );
+        transaction.journal.last_error = Some(error.to_string());
+        transaction.persist().expect("persist safe diagnostic");
+        let loaded = load_latest_publication_journal(&journal_directory)
+            .expect("load journal after wrong observation")
+            .expect("journal exists");
+        assert_eq!(loaded.push_observed_oid.as_deref(), Some(expected.as_str()));
+
+        let restored = Command::new(&git)
+            .arg("-C")
+            .arg(&repo_path)
+            .args([
+                "push",
+                "--force",
+                "origin",
+                &format!("{expected}:{remote_ref}"),
+            ])
+            .output()
+            .expect("restore remote ref");
+        assert!(restored.status.success());
+        ensure_remote_expected_commit(&repo_path, &mut transaction)
+            .expect("reconcile restored remote ref");
+        assert!(transaction.journal.last_error.is_none());
+    }
+
+    #[test]
+    fn invalid_github_receipt_is_not_persisted_before_contract_checks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut transaction = PublicationTransaction {
+            directory: temp.path().to_path_buf(),
+            journal: PublicationTransactionJournal {
+                version: PUBLICATION_JOURNAL_VERSION,
+                transaction_id: "invalid-receipt".to_string(),
+                sequence: 0,
+                agent_id: "agent-a".to_string(),
+                forge: ForgeKind::Github,
+                expected_oid: "1111111111111111111111111111111111111111".to_string(),
+                expected_base_oid: Some("2222222222222222222222222222222222222222".to_string()),
+                remote_name: "origin".to_string(),
+                remote_binding_digest: "3333333333333333333333333333333333333333".to_string(),
+                remote_display: "https://github.example/owner/repo.git".to_string(),
+                remote_ref: "refs/heads/maco/review/agent-a/test".to_string(),
+                remote_branch: "maco/review/agent-a/test".to_string(),
+                github_repository: Some(GithubRepositoryIdentity {
+                    host: "github.example".to_string(),
+                    owner: "owner".to_string(),
+                    name: "repo".to_string(),
+                }),
+                base: "main".to_string(),
+                draft: true,
+                phase: PublicationTransactionPhase::PushObserved,
+                push_observed_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                pr_url: None,
+                pr_head_oid: None,
+                pr_base: None,
+                pr_state: None,
+                pr_is_draft: None,
+                pr_number: None,
+                create_attempted: true,
+                created_by_transaction: false,
+                observed_existing_pr: false,
+                last_error: None,
+                updated_unix_seconds: 0,
+            },
+            remote_url: "https://github.example/owner/repo.git".to_string(),
+            remote_private_values: Vec::new(),
+        };
+        let receipt = GithubPrResult {
+            url: "https://github.example/owner/repo/pull/7".to_string(),
+            head_oid: transaction.journal.expected_oid.clone(),
+            base_oid: "4444444444444444444444444444444444444444".to_string(),
+            number: 7,
+            base_ref_name: "main".to_string(),
+            state: "OPEN".to_string(),
+            is_draft: true,
+            created: false,
+        };
+
+        let error = verify_github_receipt(temp.path(), &mut transaction, receipt, true, false)
+            .expect_err("wrong base receipt must fail before persistence");
+
+        assert!(error.to_string().contains("baseRefOid"));
+        assert_eq!(transaction.journal.sequence, 0);
+        assert_eq!(
+            transaction.journal.phase,
+            PublicationTransactionPhase::PushObserved
+        );
+        assert!(transaction.journal.pr_url.is_none());
+        assert_eq!(
+            fs::read_dir(temp.path()).expect("read journal dir").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn github_command_environment_is_an_explicit_data_auth_allowlist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let context = GhCommandContext::create(temp.path()).expect("create gh context");
         for key in [
             "GH_REPO",
             "GH_HOST",
-            "GH_CONFIG_DIR",
             "GH_DEBUG",
             "GH_FORCE_TTY",
             "GH_PAGER",
+            "HOME",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "GIT_SSL_CAINFO",
+            "GIT_SSL_CAPATH",
         ] {
-            assert!(removals.contains(key), "missing removal for {key}");
+            assert!(
+                !context.environment.contains_key(key),
+                "unexpected inherited routing variable {key}"
+            );
         }
+        assert_eq!(
+            context
+                .environment
+                .get("GH_PROMPT_DISABLED")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            context.environment.get("GH_CONFIG_DIR").map(String::as_str),
+            context._runtime_directory.path().to_str()
+        );
+    }
+
+    #[test]
+    fn publication_git_keeps_remote_credentials_out_of_argv_and_disk_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("init repo");
+        let raw = "https://user:abcdef@example.invalid/owner/repo.git";
+        let context =
+            PublicationGitContext::create(&repo_path, raw).expect("create publication Git context");
+        let args = context.command_args(vec![
+            OsString::from("ls-remote"),
+            OsString::from("--refs"),
+            OsString::from("maco-publication"),
+            OsString::from("refs/heads/test"),
+        ]);
+        let argv = args
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!argv.contains(raw));
+        assert!(!argv.contains("abcdef"));
+        assert_eq!(
+            context
+                .environment
+                .get("GIT_CONFIG_VALUE_0")
+                .map(String::as_str),
+            Some(raw)
+        );
+        let config = fs::read(context.directory.join("config")).expect("read private config");
+        assert!(!String::from_utf8_lossy(&config).contains("abcdef"));
+    }
+
+    #[test]
+    fn publication_remote_rejects_ambiguous_encoded_query_and_fragment_credentials() {
+        assert!(validate_publication_remote_url(
+            "https://user:secret@example.invalid/repo.git?token=secret"
+        )
+        .is_err());
+        assert!(validate_publication_remote_url(
+            "https://user:secret@example.invalid/repo.git#secret"
+        )
+        .is_err());
+        assert!(
+            validate_publication_remote_url("https://user:abc%64ef@example.invalid/repo.git")
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

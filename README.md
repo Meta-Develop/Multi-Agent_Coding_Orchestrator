@@ -473,38 +473,77 @@ without a bound passed report. JSON readiness details distinguish `validation_mi
 `validation_not_run`, `validation_skipped`, and `validation_failed`, include
 related paths when available, and report the next safe operation.
 
-`merge apply --validation-command <command>` creates an independent temporary
-candidate worktree for each command, applies the agent diff there, and runs the
-command against that merged candidate before applying anything to the primary
-worktree. A failed command blocks the apply. A successful command is also
+`merge apply --validation-command <command>` creates an independent standalone
+temporary repository for each command. It materializes the reviewed base through
+a private Git directory and controlled object alternate, applies the agent diff,
+and runs the command there before applying anything to the primary worktree. A
+failed command blocks the apply. A successful command is also
 rejected if it changes the candidate's HEAD, index, tracked files,
 non-ignored untracked files, or recursive submodule state. For an initialized
 submodule, checking records the `.git` marker identity plus the recursive
 repository fingerprint, so ignored build output is outside the comparison. For
 an uninitialized submodule, a bounded raw-path fallback detects initialization,
 marker removal, or checkout deletion. That fallback fails closed if it exceeds
-8,192 entries, 64 MiB total content, or 16 MiB for one file. The tool does not
-initialize or fetch submodules during this check.
+8,192 entries, 64 MiB total content, or 16 MiB for one file. Candidate capture
+uses the same entry, total-content, and single-file limits before it writes new
+temporary objects; Git stdin and output are bounded separately and an exceeded
+limit fails closed. The tool does not initialize or fetch submodules during this
+check.
 
 The races addressed by the merge and publication boundary are concrete: a
 candidate can change while validation runs, another local process can start a
 merge or publication, a branch can move between preview and push, and GitHub can
 create a pull request even when the local `gh` process loses its response.
-Ambient Git repository, config, trace, and temporary-directory variables can
-also redirect an otherwise read-only command. Candidate capture therefore uses
-a restricted Git environment and an owner-only runtime below `/run/user/<uid>`
-or an owner-validated `0700` fallback below the root-owned sticky `/tmp`.
+Ambient Git repository, config, trace, filter, and temporary-directory variables
+can also redirect an otherwise read-only command. Candidate capture therefore
+uses a private Git directory, private index, private object directory, and a
+verified alternate to the repository's object database. It does not read the
+real repository's local or worktree config, global config, `info/attributes`, or
+`info/exclude`; external clean/process filters, external diff drivers, textconv,
+hooks, and the `ext` transport are unavailable in that context. Worktree
+`.gitattributes` and `.gitignore` still apply when their behavior does not depend
+on omitted private config. This deliberately excludes repository-local and
+global ignore/attribute rules from candidate meaning; move any review-relevant
+rule into the tracked worktree files.
+
+Temporary state uses an owner-only runtime below `/run/user/<uid>` or a `0700`
+child of the canonical root-owned sticky temporary directory. This also handles
+Darwin's usual `/tmp` symlink by validating its canonical target. Candidate
+capture, candidate validation, publication Git, and private `gh` directories
+carry a versioned `0600` owner record with PID, process-start identity, Linux
+boot identity, creation time, kind, and a name-bound nonce. A persistent,
+single-link runtime-root lock serializes bounded scanning, reservation
+publication, and normal cleanup without unlinking the lock inode. After a crash,
+the next entry reclaims only a dead or PID-reused owner whose record and file
+identity still match. Interrupted reservations at each owner-record publication
+stage are recognizable under that lock. Corrupt, foreign, symlinked, or
+unverifiable entries are retained per directory and counted diagnostically;
+they do not authorize deletion or turn one entry into a global scan failure.
+The scan and deletion walks have direct-directory, entry, and depth limits.
+On Unix, cleanup stays anchored to no-follow directory descriptors and uses
+`fstatat`/`unlinkat`, refuses a device transition before descending, and never
+follows a symlink or hard link outside the managed directory. Platforms without
+that handle-relative cleanup backend refuse private temporary-context creation;
+Windows therefore fails closed before creating one rather than relying on a
+verify-then-path-delete sequence.
 Internal `git` and `gh` commands resolve only through the fixed
 `/run/current-system/sw/bin`, `/usr/bin`, or `/bin` entries, then verify the
 canonical executable and its ancestors are root-owned and non-writable. An
 arbitrary `PATH` entry is never a candidate, including a directly named
 immutable Nix store output whose build provenance is not established. User Nix
-profiles and Homebrew therefore fail closed at this boundary. External commands remove Git routing, trace, dynamic-loader,
-askpass/proxy, and custom-SSH execution variables while preserving
-non-executable authentication such as `SSH_AUTH_SOCK` and GitHub token
-variables; preserved authentication values are registered for error redaction.
-Windows external-tool trust and ACL resolution is not implemented,
-so these command paths fail closed on Windows.
+profiles and Homebrew therefore fail closed at this boundary.
+
+Every merge validation, local Git, network Git, and `gh` child has a finite total
+deadline, bounded stdin/output, and required process-tree containment. Success is
+accepted only after the runner proves its owned process tree empty. On Linux this
+requires a trusted user systemd manager and cgroup v2; Windows uses a Job Object,
+but trusted Windows Git/`gh` executable and ACL resolution is not implemented,
+so Git-dependent paths still fail closed there. Required containment currently
+has no strict Darwin backend, so Git-dependent merge/publication paths fail
+closed on Darwin rather than silently using process-group compatibility. These
+controls prevent a completed command from leaving a delayed child. They do not
+make a trusted validation command an adversarial filesystem sandbox while it is
+running.
 
 Merge apply and PR publication share a kernel-managed advisory lock on the
 stable repo-common file `.git/maco/state/repository-mutation.lock`. The file is
@@ -517,18 +556,31 @@ holder.
 
 Validation evidence remains bound to the exact candidate snapshot described
 above. Git and GitHub publication use a unique OID-derived remote ref and push
-the reviewed object to the bound raw origin URL with a create-only lease.
-System/global Git config is disabled for network commands, and publication
-rejects repository-local URL redirects, credential helpers, custom SSH/proxy
-commands, push URLs, and config includes before contacting the remote. GitHub publication observes the
-remote OID before PR creation, reads the resulting PR with `gh pr view`, and
-requires the expected head OID, base branch, open state, and draft/ready value.
+the reviewed object with a create-only lease. Network Git runs against a private
+bare context and structurally reads none of the real repository's local,
+worktree, included, global, or system config. The raw origin URL is supplied as
+guarded child-only config data, not an argument, process display, journal field,
+or on-disk temporary config. Proxy, custom CA, askpass, credential-helper, HOME,
+and custom SSH routing variables are absent. SSH origins always use a trusted
+absolute `ssh` with user config disabled, batch mode, `ProxyCommand=none`, and
+local commands disabled; `SSH_AUTH_SOCK` is the only preserved SSH data-auth
+input. HTTPS Git publication therefore requires credentials in unencoded URL
+userinfo or another transport that needs no inherited helper. Query, fragment,
+and percent-encoded credential forms are refused because reliable transport and
+error redaction semantics cannot be guaranteed.
+
+GitHub publication observes the remote head and exact base OIDs before PR
+creation, reads the resulting PR with `gh pr view`, and requires matching
+`headRefOid`, `baseRefOid`, base branch, open state, and draft/ready value before
+persisting any PR receipt fields or advancing the receipt phase.
 The HTTPS/SSH origin is also parsed into a bound host/owner/repository identity.
 Every `gh pr` and `gh issue create` call receives that explicit `--repo`;
-ambient `GH_REPO`, `GH_HOST`, config routing, debug, pager, and forced-TTY
-variables are removed. The receipt URL must identify the same repository and PR
-number. Publication observes the remote OID again after that receipt. A mismatch
-is reported as blocked rather than published.
+`gh` receives an empty private config directory and an explicit environment
+allowlist containing only OS/locale essentials plus GitHub token variables.
+HOME, proxy, custom CA, ambient repository, debug, pager, and forced-TTY routing
+are absent. The receipt URL must identify the same repository and PR number.
+Publication observes the remote head and base again after that receipt. A
+mismatch is reported as blocked rather than published.
 
 Publication writes versioned, append-only transaction records below the common
 `.git/maco/state/publication-transactions/` directory. Record replacement is
@@ -545,9 +597,9 @@ while prior transaction entries exist, publication fails closed instead of
 creating a new key. The JSON
 `publication_receipt` reports the monotonic
 phase (`prepared`, `push_observed`, `pr_observed`, or `completed`), expected and
-observed OIDs, remote ref, PR URL and verified PR fields, whether creation was
-attempted, whether a successful create response or URL directly attributed the
-PR to this transaction, whether reconciliation found an existing PR, and the
+observed head OIDs, exact expected base OID, remote ref, PR URL and verified PR
+fields, whether creation was attempted, whether a contract-checked receipt
+attributed the PR to this transaction, whether reconciliation found an existing PR, and the
 last redacted error. A PR recovered only through `list`/`view` after a lost
 response is conservatively reported as `created_by_transaction=false` and
 `observed_existing_pr=true`. Rerun the same `pr publish` command: it reconciles
@@ -613,8 +665,12 @@ cargo run -- issue create --title "Bug title" --body-file issue.md --label bug -
 `maco issue preview` redacts secret-looking body assignments and reports
 `created=false`. `maco issue create --forge fake|github` uses the deterministic
 local-only fake forge or, with explicit `--forge github`, shells out to
-`gh issue create`. Issue triage is intentionally minimal: title, body, and
-labels.
+`gh issue create` through the same contained, allowlisted process boundary.
+Issue triage is intentionally minimal: title, body, and labels. Unlike PR
+publication, issue creation does not yet have a write-ahead receipt or retry
+reconciliation protocol; if the remote creates an issue but the response is
+lost, an operator retry can duplicate it. Treat an ambiguous issue-create result
+as a manual reconciliation point.
 
 Inspect and refresh live work claims:
 

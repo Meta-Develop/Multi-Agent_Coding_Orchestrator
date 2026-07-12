@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
@@ -300,12 +302,14 @@ fn pr_publish_git_pushes_agent_branch_without_calling_gh() -> Result<()> {
 }
 
 #[test]
-fn pr_publish_git_rejects_repository_local_url_redirect_before_push() -> Result<()> {
+fn pr_publish_git_ignores_worktree_config_url_redirect_during_push() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path())?;
     let attack_path = temp.path().join("attack.git");
+    let local_attack_path = temp.path().join("local-attack.git");
     Repository::init_bare(&attack_path).context("init attack origin")?;
+    Repository::init_bare(&local_attack_path).context("init local attack origin")?;
     run_git(&[
         "-C",
         path_str(&repo_path)?,
@@ -314,25 +318,42 @@ fn pr_publish_git_rejects_repository_local_url_redirect_before_push() -> Result<
         "origin",
         path_str(&origin_path)?,
     ])?;
-    let redirect_key = format!("url.{}.insteadOf", path_str(&attack_path)?);
+    let local_redirect_key = format!("url.{}.pushInsteadOf", path_str(&local_attack_path)?);
     run_git(&[
         "-C",
         path_str(&repo_path)?,
         "config",
         "--add",
-        &redirect_key,
+        &local_redirect_key,
         path_str(&origin_path)?,
+    ])?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "config",
+        "extensions.worktreeConfig",
+        "true",
     ])?;
     let repo = repo_path.to_str().context("repo path utf8")?;
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    let redirect_key = format!("url.{}.insteadOf", path_str(&attack_path)?);
+    run_git(&[
+        "-C",
+        path_str(worktree_path)?,
+        "config",
+        "--worktree",
+        "--add",
+        &redirect_key,
+        path_str(&origin_path)?,
+    ])?;
     fs::write(
         worktree_path.join("README.md"),
         "# Smoke\n\nredirect audit\n",
     )
     .context("edit worktree")?;
 
-    let report = run_failure_json(&[
+    let report = run_success_json(&[
         "pr",
         "publish",
         "agent-a",
@@ -345,22 +366,95 @@ fn pr_publish_git_rejects_repository_local_url_redirect_before_push() -> Result<
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "blocked");
-    assert_eq!(report["pushed"], false);
-    assert!(report["publication_receipt"]["last_error"]
-        .as_str()
-        .context("publication error")?
-        .contains("can redirect or execute"));
+    assert_eq!(report["status"], "published");
+    assert_eq!(report["pushed"], true);
     let remote_ref = report["publication_receipt"]["remote_ref"]
         .as_str()
         .context("publication ref")?;
-    assert!(!git_ref_exists(&origin_path, remote_ref)?);
+    assert!(git_ref_exists(&origin_path, remote_ref)?);
     assert!(!git_ref_exists(&attack_path, remote_ref)?);
+    assert!(!git_ref_exists(&local_attack_path, remote_ref)?);
     Ok(())
 }
 
 #[test]
-fn pr_publish_git_removes_ambient_custom_ssh_command() -> Result<()> {
+fn pr_publish_fake_does_not_execute_repository_filter_or_diff_driver() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let filter_marker = temp.path().join("filter-marker");
+    let diff_marker = temp.path().join("diff-marker");
+    let filter = temp.path().join("filter-driver");
+    let diff = temp.path().join("diff-driver");
+    fs::write(
+        &filter,
+        format!(
+            "#!/bin/sh\nprintf invoked > {}\ncat\n",
+            shell_quote_path(&filter_marker)
+        ),
+    )?;
+    fs::write(
+        &diff,
+        format!(
+            "#!/bin/sh\nprintf invoked > {}\nexit 0\n",
+            shell_quote_path(&diff_marker)
+        ),
+    )?;
+    for driver in [&filter, &diff] {
+        let mut permissions = fs::metadata(driver)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(driver, permissions)?;
+    }
+    fs::write(
+        repo_path.join(".gitattributes"),
+        "README.md filter=attack diff=attack\n",
+    )?;
+    let repository = Repository::open(&repo_path)?;
+    commit_all(&repository, "add hostile attributes")?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "config",
+        "filter.attack.clean",
+        path_str(&filter)?,
+    ])?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "config",
+        "diff.attack.command",
+        path_str(&diff)?,
+    ])?;
+    let repo = path_str(&repo_path)?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    let _ = fs::remove_file(&filter_marker);
+    let _ = fs::remove_file(&diff_marker);
+    fs::write(
+        worktree_path.join("README.md"),
+        "# Smoke\n\nfilter isolation\n",
+    )?;
+
+    let report = run_success_json(&[
+        "pr",
+        "publish",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "published");
+    assert!(!filter_marker.exists());
+    assert!(!diff_marker.exists());
+    Ok(())
+}
+
+#[test]
+fn pr_publish_git_forces_trusted_ssh_without_home_repo_or_env_commands() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     run_git(&[
@@ -392,6 +486,23 @@ fn pr_publish_git_removes_ambient_custom_ssh_command() -> Result<()> {
     let mut permissions = fs::metadata(&fake_ssh)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&fake_ssh, permissions)?;
+    let home = temp.path().join("hostile-home");
+    fs::create_dir_all(home.join(".ssh"))?;
+    fs::write(
+        home.join(".ssh/config"),
+        format!(
+            "Host *\n  ProxyCommand {}\n  PermitLocalCommand yes\n  LocalCommand {}\n",
+            fake_ssh.display(),
+            fake_ssh.display()
+        ),
+    )?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "config",
+        "core.sshCommand",
+        path_str(&fake_ssh)?,
+    ])?;
 
     let output = Command::new(BIN)
         .args([
@@ -407,6 +518,7 @@ fn pr_publish_git_removes_ambient_custom_ssh_command() -> Result<()> {
             "--json",
         ])
         .env("GIT_SSH_COMMAND", &fake_ssh)
+        .env("HOME", &home)
         .output()
         .context("run publication with custom SSH injection")?;
 
@@ -1138,6 +1250,7 @@ fn pr_preview_required_validation_rejects_mismatched_candidate_binding() -> Resu
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn pr_publish_refuses_live_repo_common_publication_lock() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
@@ -1774,6 +1887,7 @@ fn lock_record(pid: u32, operation: &str, process_start_ticks: u64) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Result<u64> {
     let bytes = fs::read(format!("/proc/{pid}/stat")).context("read process stat")?;
     let closing = bytes

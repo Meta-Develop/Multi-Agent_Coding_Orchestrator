@@ -3,7 +3,6 @@ use git2::{Oid, Repository, Signature};
 use serde_json::Value;
 use std::{
     env, fs,
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
     thread,
@@ -267,8 +266,10 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
@@ -462,6 +463,7 @@ fn merge_apply_refuses_malformed_repo_common_lock() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
     use std::os::unix::fs::symlink;
@@ -499,6 +501,7 @@ fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_apply_refuses_symlink_repository_state_directory() -> Result<()> {
     use std::os::unix::fs::symlink;
@@ -1015,6 +1018,55 @@ fn merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox() ->
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn merge_apply_kills_setsid_validation_descendant_before_accepting_success() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(
+        worktree_path.join("README.md"),
+        "# Smoke\n\nreviewed candidate\n",
+    )
+    .context("edit worktree")?;
+    let escaped_marker = temp
+        .path()
+        .join("escaped-validation-descendant")
+        .to_string_lossy()
+        .replace('\'', "'\"'\"'");
+    let validation = format!(
+        "setsid sh -c 'sleep 0.5; printf delayed > README.md; printf escaped > '\"'\"'{escaped_marker}'\"'\"'' </dev/null >/dev/null 2>&1 &"
+    );
+
+    let report = run_success_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-command",
+        &validation,
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "applied");
+    assert_eq!(
+        report["preview"]["candidate"]["validations"][0]["status"],
+        "passed"
+    );
+    thread::sleep(Duration::from_secs(1));
+    assert!(!temp.path().join("escaped-validation-descendant").exists());
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md"))?,
+        "# Smoke\n\nreviewed candidate\n"
+    );
+    Ok(())
+}
+
 #[test]
 fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
@@ -1379,6 +1431,7 @@ fn lock_record(pid: u32, operation: &str, process_start_ticks: u64) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Result<u64> {
     let bytes = fs::read(format!("/proc/{pid}/stat")).context("read process stat")?;
     let closing = bytes
