@@ -710,6 +710,10 @@ fn security_document_describes_deterministic_fake_and_verified_codex_boundary() 
     assert!(security.contains("does not execute `--codex-bin`"));
     assert!(security.contains("can never produce publishable acceptance"));
     assert!(security.contains("maco_external_codex"));
+    assert!(security.contains("strict-offline `--version` diagnostic"));
+    assert!(security.contains("sibling `trusted/` and `incoming/` roots"));
+    assert!(security.contains("Checkpoint v1 is not authenticated state"));
+    assert!(security.contains("fixed known-hosts set is a later integration boundary"));
     Ok(())
 }
 

@@ -39,8 +39,10 @@ that requested verified side-effect confinement.
 ## External Codex
 
 The default Codex executable is resolved only from fixed system locations and must be root-owned,
-executable, and not group/world writable. An explicitly supplied absolute executable may run for
-diagnostics, but its result is never publishable.
+executable, and not group/world writable. An explicitly supplied absolute executable is limited to
+the bounded strict-offline `--version` diagnostic. MACO never starts its requested model target,
+never projects `auth.json` or provider credentials into it, grants it no provider network, and
+never treats its diagnostic result as publishable.
 
 MACO invokes supported Codex versions with strict, ephemeral configuration, a custom permission
 profile, disabled web search/integrations, no inherited shell environment, and model-generated
@@ -60,6 +62,34 @@ or stricter. MACO does not expose the rest of `CODEX_HOME`. Prompts are bounded 
 standard input. An output schema is exposed as one exact read-only file, while result/log
 destinations are reserved and bounded separately.
 
+External result files are created before target release as owner-owned `0600`, single-link regular
+files under an owner-owned `0700` `incoming` root. MACO retains the read/write descriptor and reads
+bounded result bytes from that descriptor after execution; it does not reopen the child-writable
+pathname. The parent tee similarly owns the raw-log descriptor, so the log directory is not a
+child-writable artifact root. Consult runs use sibling `trusted/` and `incoming/` roots inside the
+run container. Supervise runs use sibling `reports/` and `incoming/` roots. Normalized and final
+parent reports are reserved before child execution and replaced with descriptor-relative,
+no-follow, fsynced atomic writes. Same-UID pathname replacement, symlink, hard-link, and directory
+rebind attempts fail closed without following an attacker-selected target.
+
+## Local state and artifact integrity
+
+Patch directories and checkpoint directories must be current-user-owned `0700` directories;
+their leaves are `0600` single-link regular files. Patch leaves are reserved for every pending
+agent before the schedule starts, are rejected if the output root overlaps any child worktree, and
+are removed through identity-checked cleanup when unused. Checkpoint v1 retains one root/file
+capability across every stage write, uses bounded descriptor reads for resume, and is protected
+against path-confusion and link-following attacks.
+
+Checkpoint v1 is not authenticated state: it has no MAC, signature, monotonic sequence, or external
+authority binding. A same-user actor who can write the valid file contents before or after MACO
+captures its descriptor can forge a syntactically valid checkpoint. Authenticated checkpoint
+v2/WAL authority is a future boundary and is not claimed here. Likewise, the current artifact
+`prune` implementation
+is intended for quiescent, operator-owned run roots; finalized-only descriptor-relative bounded
+deletion and crash scavenging remain part of the pending state-writer integration. Do not prune a
+family concurrently with an active run or a hostile same-UID path mutator.
+
 ## Resource limits and residual risk
 
 `MemoryMax`, `TasksMax`, CPU quota, descriptor limits, `LimitCORE`, and
@@ -72,9 +102,10 @@ also require an exact Git administrative-directory write grant for MACO's fixed,
 `git add -N` index operation. That grant is never given to external/model-generated commands: the
 administrative directory and backlink tree are identity/content snapshotted before and after, only
 a bounded single-link index replacement is accepted, and a surviving index lock fails the run.
-The common object/ref directory remains read-only. Filesystem or kernel behavior below the verified
-mount/cgroup boundary, compromise of the same user outside MACO, and a compromised root/systemd/
-kernel are outside this boundary.
+The common object/ref directory remains read-only. Descriptor-held output/state paths explicitly
+defend against same-UID pathname substitution, but arbitrary compromise of the same user outside
+those capabilities, filesystem or kernel behavior below the verified mount/cgroup boundary, and a
+compromised root/systemd/kernel remain outside the complete execution boundary.
 
 Network-provider availability and model correctness are not security evidence. External Claude
 consultation is refused because the current integration cannot enforce an equivalent inner
@@ -85,7 +116,8 @@ Fixed-network confinement is not a caller-constructible general-purpose profile;
 for the validated external-provider launch path. The Fake supervisor runtime is deterministic
 in-process simulation: it does not execute `--codex-bin`, task text, model commands, or network
 operations, and it can never produce publishable acceptance. Explicit custom executables used by
-verified external runtimes likewise cannot produce publishable acceptance.
+verified external runtimes are diagnostic-only as described above and cannot receive credentials,
+run the requested model target, or produce publishable acceptance.
 
 ## Reporting
 

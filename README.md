@@ -85,7 +85,8 @@ The current implementation covers a local-first command-line slice:
 - `maco consult ask` asks a terminal read-only cross-runtime consultant for
   advisory help, using deterministic fake mode by default or an explicit
   Codex/Claude-compatible executable when selected. Consultant runs write local
-  artifacts under `.maco/consult/runs/<run-id>/`.
+  artifacts under `.maco/consult/runs/<run-id>/`: parent-owned files live in
+  `trusted/`, while a real external result is isolated under `incoming/`.
 - `maco consult artifacts list/latest/prune` inspects or prunes durable
   consultant run artifacts.
 - `.agents/scripts/o2-autopilot` runs bounded autonomous O2 supervisors under
@@ -211,7 +212,9 @@ cargo run -- consult artifacts list --repo . --json
 `prune` orders runs newest first, keeps the requested number, and supports
 `--dry-run` before deletion. It is scoped to the selected family root, such as
 `.maco/autopilot/runs`, `.maco/consult/runs`, `.maco/inbox/runs`, or
-`.maco/o2/runs`.
+`.maco/o2/runs`. Run pruning is currently for quiescent operator-owned roots;
+do not prune concurrently with an active run or an untrusted same-UID path
+mutator. Finalized-only descriptor-relative deletion remains planned work.
 
 ## Cross-runtime consultant
 
@@ -241,9 +244,10 @@ cargo run -- consult ask \
   --json
 ```
 
-Claude consultant mode expects a Claude-compatible executable that supports
-`claude -p --output-format json` and returns the answer in the JSON envelope's
-`result` field:
+Claude consultant mode is currently refused before launch because MACO cannot
+enforce an equivalent inner read-only permission contract. Supplying an
+executable does not weaken that refusal. The command form below demonstrates
+the expected fail-closed response; it does not launch Claude.
 
 ```bash
 cargo run -- consult ask \
@@ -416,12 +420,21 @@ primary HEAD captured for that run. Repo-level validation commands currently
 run in the primary worktree after agent commands complete; use agent validation
 commands for checks that must see unmerged agent worktree changes.
 
+Patch and checkpoint output roots are created owner-private when absent. An
+existing root must be owned by the current user with mode `0700`; output leaves
+are `0600`, single-link regular files. Roots overlapping a child worktree are
+refused, and patch/checkpoint writes retain descriptor capabilities instead of
+reopening post-child paths.
+
 `maco orchestrate resume <checkpoint-file>` only resumes checkpoints whose run
 id matches the checkpoint filename, whose recorded repository matches the
 requested repository, whose primary HEAD and plan snapshot still match, and
 whose recorded worktrees still exist at the expected paths and branches.
 Completed agents are validated against their recorded changed paths and skipped;
 pending agents must have clean worktrees before they are run.
+Checkpoint v1 is path-safe but not authenticated: it has no signature/MAC or
+external authority binding. Treat checkpoint files as current-user trusted
+input until the planned authenticated v2/WAL format exists.
 
 Collect and preview agent output:
 
@@ -813,6 +826,10 @@ cargo run -- supervise artifacts latest --repo . --json
 configured Codex-compatible executable, creates isolated child worktrees, claims
 each assignment's paths, records semantic coordination metadata when the plan
 requests it, and writes structured logs and reports under the run directory.
+Child/model final-message bytes are confined to `incoming/`; normalized child
+reports and `supervisor-final.json` are parent-owned under `reports/`. Only the
+incoming root is granted writable to an external child. The parent retains file
+descriptors for bounded reads and atomic final writes.
 Each Codex CLI child orchestrator is instructed to read `AGENTS.md` and
 project-local `.agents` guidance before acting. The generated prompt contract is
 user-directed root O2 -> autonomous O2 supervisor -> O1 child orchestrator ->
