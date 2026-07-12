@@ -11,7 +11,10 @@ use crate::{
     },
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
-    worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
+    worktree::{
+        normalize_agent_id, ManagedWorktreeWriteLease, WorktreeCreateOptions, WorktreeManager,
+        WorktreeRecord,
+    },
 };
 use anyhow::{bail, Context, Result};
 use git2::{Delta, DiffOptions, Oid, Repository, ResetType};
@@ -568,9 +571,9 @@ fn run_plan_with_controls_runtime(
     let mut acquired_semantic_tokens = Vec::new();
 
     let worktrees = select_worktrees(&manager, &store, &repo_head, &plan, worktree_reuse_policy)?;
-    for (summary, worktree) in summaries.iter_mut().zip(worktrees) {
+    for (summary, worktree) in summaries.iter_mut().zip(&worktrees) {
         summary.worktree_reused = worktree.reused;
-        summary.worktree = Some(worktree.record);
+        summary.worktree = Some(worktree.record().clone());
     }
     let mut checkpoint_writer =
         prepare_run_checkpoint_writer(&controls, &run_id, &summaries, false)?;
@@ -752,6 +755,7 @@ fn run_plan_with_controls_runtime(
     run_agent_schedule_with_patch_dir(
         &plan,
         &mut summaries,
+        &worktrees,
         options.jobs,
         options.patch_dir.as_deref(),
         &repo_head,
@@ -912,7 +916,8 @@ fn resume_plan_file_runtime(
     let store = SyncStore::open(&repo)?;
     let semantic_store = SemanticIntentStore::open(&repo)?;
     let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
-    validate_resume_worktrees(&manager, &plan, &checkpoint, &mut summaries, &repo_head)?;
+    let worktrees =
+        validate_resume_worktrees(&manager, &plan, &checkpoint, &mut summaries, &repo_head)?;
 
     if checkpoint.stage == RunCheckpointStage::Final {
         return Ok(summary_from_parts(SummaryParts {
@@ -1046,6 +1051,7 @@ fn resume_plan_file_runtime(
     run_agent_schedule_with_patch_dir(
         &plan,
         &mut summaries,
+        &worktrees,
         options.jobs,
         options.patch_dir.as_deref(),
         &repo_head,
@@ -1250,12 +1256,13 @@ fn validate_resume_worktrees(
     checkpoint: &RunCheckpoint,
     summaries: &mut [AgentRunSummary],
     repo_head: &Oid,
-) -> Result<()> {
-    let records = manager
+) -> Result<Vec<SelectedWorktree>> {
+    let registered_names = manager
         .list()?
         .into_iter()
-        .map(|record| (record.name.clone(), record))
-        .collect::<BTreeMap<_, _>>();
+        .map(|record| record.name)
+        .collect::<BTreeSet<_>>();
+    let mut selected = Vec::with_capacity(plan.agents.len());
 
     for ((agent, checkpoint_agent), summary) in plan
         .agents
@@ -1270,14 +1277,24 @@ fn validate_resume_worktrees(
                 agent.id
             );
         };
-        let Some(current) = records.get(&recorded.name) else {
+        if !registered_names.contains(&recorded.name) {
             bail!(
                 "checkpoint '{}' references missing worktree '{}' for agent '{}'; restore the worktree or start a new run",
                 checkpoint.run_id.as_str(),
                 recorded.name,
                 agent.id
             );
-        };
+        }
+        let lease = manager
+            .acquire_write_execution_lease(&recorded.name)
+            .with_context(|| {
+                format!(
+                    "checkpoint '{}' could not reacquire the exclusive execution lease for worktree '{}'",
+                    checkpoint.run_id.as_str(),
+                    recorded.name
+                )
+            })?;
+        let current = lease.record();
         if current.path != recorded.path || current.branch != recorded.branch {
             bail!(
                 "checkpoint '{}' worktree metadata for agent '{}' is stale; expected {} on branch {}, found {} on branch {}",
@@ -1370,9 +1387,13 @@ fn validate_resume_worktrees(
         }
         summary.worktree = Some(current.clone());
         summary.worktree_reused = true;
+        selected.push(SelectedWorktree {
+            lease,
+            reused: true,
+        });
     }
 
-    Ok(())
+    Ok(selected)
 }
 
 fn ensure_worktree_descends_from_base(
@@ -1912,10 +1933,20 @@ struct PlanPathOwner {
     path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SelectedWorktree {
-    record: WorktreeRecord,
+    lease: ManagedWorktreeWriteLease,
     reused: bool,
+}
+
+impl SelectedWorktree {
+    fn record(&self) -> &WorktreeRecord {
+        self.lease.record()
+    }
+
+    fn path(&self) -> &Path {
+        self.lease.path()
+    }
 }
 
 fn select_worktrees(
@@ -1933,25 +1964,33 @@ fn select_worktrees(
     let mut selected = Vec::with_capacity(plan.agents.len());
 
     for agent in &plan.agents {
-        if let Some(record) = existing.remove(&agent.id) {
+        if let Some(discovered) = existing.remove(&agent.id) {
             if policy == WorktreeReusePolicy::Fresh {
                 bail!(
                     "worktree reuse policy 'fresh' requires no existing worktree for agent '{}' at {}",
                     agent.id,
-                    record.path.display()
+                    discovered.path.display()
                 );
             }
+            let lease = manager
+                .acquire_write_execution_lease(&agent.id)
+                .with_context(|| {
+                    format!(
+                        "failed to acquire exclusive execution lease for worktree '{}'",
+                        agent.id
+                    )
+                })?;
             match policy {
                 WorktreeReusePolicy::Reset => {
-                    reset_reusable_worktree(store, agent, &record, primary_head)?;
+                    reset_reusable_worktree(store, agent, lease.record(), primary_head)?;
                 }
                 WorktreeReusePolicy::Clean | WorktreeReusePolicy::Required => {
-                    ensure_reusable_worktree(&record, primary_head)?;
+                    ensure_reusable_worktree(lease.record(), primary_head)?;
                 }
                 WorktreeReusePolicy::Fresh => {}
             }
             selected.push(SelectedWorktree {
-                record,
+                lease,
                 reused: true,
             });
             continue;
@@ -1963,14 +2002,28 @@ fn select_worktrees(
             );
         }
 
-        let record = manager.create(WorktreeCreateOptions {
+        manager.create(WorktreeCreateOptions {
             agent_id: agent.id.clone(),
             branch: None,
             base: None,
             worktree_root: None,
         })?;
+        let lease = manager
+            .acquire_write_execution_lease(&agent.id)
+            .with_context(|| {
+                format!(
+                    "failed to acquire exclusive execution lease for newly created worktree '{}'",
+                    agent.id
+                )
+            })?;
+        ensure_reusable_worktree(lease.record(), primary_head).with_context(|| {
+            format!(
+                "newly created worktree '{}' changed before its execution lease was acquired",
+                agent.id
+            )
+        })?;
         selected.push(SelectedWorktree {
-            record,
+            lease,
             reused: false,
         });
     }
@@ -2087,16 +2140,15 @@ fn prepare_patch_outputs(
     patch_dir: Option<&Path>,
     plan: &OrchestrationPlan,
     summaries: &[AgentRunSummary],
+    worktrees: &[SelectedWorktree],
 ) -> Result<Vec<Option<ReservedOutputFile>>> {
     let mut outputs = (0..summaries.len()).map(|_| None).collect::<Vec<_>>();
     let Some(patch_dir) = patch_dir else {
         return Ok(outputs);
     };
     let root = SecureOutputRoot::open_or_create(patch_dir)?;
-    for summary in summaries {
-        if let Some(worktree) = &summary.worktree {
-            root.reject_inside(&worktree.path)?;
-        }
+    for worktree in worktrees {
+        root.reject_inside(worktree.path())?;
     }
     for (index, (agent, summary)) in plan.agents.iter().zip(summaries).enumerate() {
         if summary.status != AgentRunStatus::Pending {
@@ -2164,14 +2216,22 @@ impl Drop for PatchOutputGuard {
 fn run_agent_schedule_with_patch_dir(
     plan: &OrchestrationPlan,
     summaries: &mut [AgentRunSummary],
+    worktrees: &[SelectedWorktree],
     jobs: usize,
     patch_dir: Option<&Path>,
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<()> {
-    let mut patch_outputs = prepare_patch_outputs(patch_dir, plan, summaries)?;
-    let schedule_result =
-        run_agent_schedule(plan, summaries, jobs, &mut patch_outputs, base_oid, runtime);
+    let mut patch_outputs = prepare_patch_outputs(patch_dir, plan, summaries, worktrees)?;
+    let schedule_result = run_agent_schedule(
+        plan,
+        summaries,
+        worktrees,
+        jobs,
+        &mut patch_outputs,
+        base_oid,
+        runtime,
+    );
     let cleanup_result = cleanup_unused_patch_outputs(patch_outputs);
     match (schedule_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -2186,11 +2246,25 @@ fn run_agent_schedule_with_patch_dir(
 fn run_agent_schedule(
     plan: &OrchestrationPlan,
     summaries: &mut [AgentRunSummary],
+    worktrees: &[SelectedWorktree],
     jobs: usize,
     patch_outputs: &mut [Option<ReservedOutputFile>],
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<()> {
+    if worktrees.len() != summaries.len() || worktrees.len() != plan.agents.len() {
+        bail!("selected worktree lease set does not match the orchestration plan");
+    }
+    for (index, worktree) in worktrees.iter().enumerate() {
+        if worktree.record().name != plan.agents[index].id
+            || summaries[index].worktree.as_ref() != Some(worktree.record())
+        {
+            bail!(
+                "selected worktree lease for agent '{}' does not match its run summary",
+                plan.agents[index].id
+            );
+        }
+    }
     let jobs = jobs.max(1);
     let mut remaining = summaries
         .iter()
@@ -2238,17 +2312,23 @@ fn run_agent_schedule(
             break;
         }
 
-        let outcomes = run_ready_agents(plan, summaries, &ready, runtime)?;
+        let outcomes = run_ready_agents(plan, summaries, worktrees, &ready, runtime)?;
         let mut failed_agent = None;
 
         for (index, run_result) in outcomes {
             apply_command_result(&mut summaries[index], run_result);
             if summaries[index].status == AgentRunStatus::Succeeded {
-                run_agent_validation_commands(&plan.agents[index], &mut summaries[index], runtime);
+                run_agent_validation_commands(
+                    &plan.agents[index],
+                    &mut summaries[index],
+                    &worktrees[index],
+                    runtime,
+                );
             }
             inspect_agent_changes(
                 &plan.agents[index],
                 &mut summaries[index],
+                &worktrees[index],
                 patch_outputs[index].take(),
                 base_oid,
                 runtime,
@@ -2278,18 +2358,29 @@ fn run_agent_schedule(
 fn run_ready_agents(
     plan: &OrchestrationPlan,
     summaries: &[AgentRunSummary],
+    worktrees: &[SelectedWorktree],
     ready: &[usize],
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<Vec<(usize, Result<CommandRunResult, ProcessRunError>)>> {
     if ready.len() == 1 {
         let index = ready[0];
-        let spec = command_spec(&plan.agents[index], &summaries[index], runtime)?;
+        let spec = command_spec(
+            &plan.agents[index],
+            &summaries[index],
+            &worktrees[index],
+            runtime,
+        )?;
         return Ok(vec![(index, run_agent_command(spec))]);
     }
 
     let mut handles = Vec::with_capacity(ready.len());
     for index in ready {
-        let spec = command_spec(&plan.agents[*index], &summaries[*index], runtime)?;
+        let spec = command_spec(
+            &plan.agents[*index],
+            &summaries[*index],
+            &worktrees[*index],
+            runtime,
+        )?;
         let index = *index;
         handles.push((
             index,
@@ -2322,16 +2413,35 @@ fn run_ready_agents(
 fn inspect_agent_changes(
     agent: &AgentPlan,
     summary: &mut AgentRunSummary,
+    worktree: &SelectedWorktree,
+    patch_output: Option<ReservedOutputFile>,
+    base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
+) {
+    inspect_agent_changes_at_path(
+        agent,
+        summary,
+        worktree.path(),
+        patch_output,
+        base_oid,
+        runtime,
+    );
+}
+
+fn inspect_agent_changes_at_path(
+    agent: &AgentPlan,
+    summary: &mut AgentRunSummary,
+    worktree_path: &Path,
     patch_output: Option<ReservedOutputFile>,
     base_oid: &Oid,
     runtime: OrchestrationExecutionRuntime,
 ) {
     let mut patch_output = patch_output.map(PatchOutputGuard::new);
-    let Some(worktree) = summary.worktree.as_ref() else {
+    if summary.worktree.is_none() {
         fail_summary(summary, "agent has no selected worktree");
         return;
-    };
-    let worktree_path = worktree.path.clone();
+    }
+    let worktree_path = worktree_path.to_path_buf();
 
     let repo = match Repository::open(&worktree_path) {
         Ok(repo) => repo,
@@ -2956,21 +3066,28 @@ fn git_null_device() -> &'static str {
 fn command_spec(
     agent: &AgentPlan,
     summary: &AgentRunSummary,
+    worktree: &SelectedWorktree,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<CommandRunSpec> {
-    let worktree = summary
+    let recorded = summary
         .worktree
         .as_ref()
         .with_context(|| format!("agent '{}' has no selected worktree", summary.id))?;
+    if recorded != worktree.record() || worktree.record().name != agent.id {
+        bail!(
+            "agent '{}' selected worktree does not match its exclusive execution lease",
+            agent.id
+        );
+    }
     let working_directory = agent
         .working_directory
         .as_ref()
-        .map(|path| worktree.path.join(path))
-        .unwrap_or_else(|| worktree.path.clone());
+        .map(|path| worktree.path().join(path))
+        .unwrap_or_else(|| worktree.path().to_path_buf());
 
     Ok(CommandRunSpec {
         command: agent.command.clone(),
-        workspace_root: worktree.path.clone(),
+        workspace_root: worktree.path().to_path_buf(),
         working_directory,
         env: agent.env.clone(),
         timeout: agent.timeout,
@@ -2981,13 +3098,24 @@ fn command_spec(
 fn run_agent_validation_commands(
     agent: &AgentPlan,
     summary: &mut AgentRunSummary,
+    worktree: &SelectedWorktree,
     runtime: OrchestrationExecutionRuntime,
 ) {
-    let Some(worktree) = summary.worktree.as_ref() else {
+    let Some(recorded) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree for validation");
         return;
     };
-    let worktree_path = worktree.path.clone();
+    if recorded != worktree.record() || worktree.record().name != agent.id {
+        fail_summary(
+            summary,
+            format!(
+                "agent '{}' selected worktree does not match its exclusive execution lease",
+                agent.id
+            ),
+        );
+        return;
+    }
+    let worktree_path = worktree.path().to_path_buf();
 
     for validation in &agent.validation_commands {
         let run_summary = run_validation_command(validation, &worktree_path, runtime);
@@ -3512,6 +3640,7 @@ mod tests {
     use crate::sync_store::SyncStore;
     use crate::worktree::WorktreeManager;
     use git2::{Oid, Repository, Signature};
+    use std::sync::mpsc;
     use tempfile::TempDir;
 
     fn run_plan_file(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
@@ -3527,6 +3656,19 @@ mod tests {
 
     fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<OrchestrationSummary> {
         super::resume_plan_file_simulation(options)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_marker(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -3810,6 +3952,172 @@ mod tests {
                 .expect("snapshot"),
             Vec::<PathClaim>::new()
         );
+        let released = WorktreeManager::new(&repo_path)
+            .acquire_write_execution_lease("agent-a")
+            .expect("successful run releases write lease");
+        drop(released);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_holds_write_lease_through_child_validation_and_finalization() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+        commit_all(&repo, "initial commit").expect("commit");
+        let manager = WorktreeManager::new(&repo_path);
+        manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-a worktree");
+        let unrelated = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-b".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-b worktree");
+
+        let child_ready = temp.path().join("child-ready");
+        let child_release = temp.path().join("child-release");
+        let validation_ready = temp.path().join("validation-ready");
+        let validation_release = temp.path().join("validation-release");
+        let child_command = format!(
+            "printf ready > '{}'; while [ ! -f '{}' ]; do sleep 0.02; done",
+            child_ready.display(),
+            child_release.display()
+        );
+        let validation_command = format!(
+            "printf ready > '{}'; while [ ! -f '{}' ]; do sleep 0.02; done",
+            validation_ready.display(),
+            validation_release.display()
+        );
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "worktree_reuse_policy": "required",
+                "agents": [{
+                    "id": "agent-a",
+                    "paths": ["README.md"],
+                    "command": child_command,
+                    "validation_commands": [validation_command]
+                }]
+            }))
+            .expect("encode plan"),
+        )
+        .expect("write plan");
+        let run_repo = repo_path.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let runner = thread::spawn(move || {
+            let result = run_plan_file(OrchestrationRunOptions {
+                repo: run_repo,
+                plan_file,
+                keep_claims: false,
+                jobs: 1,
+                patch_dir: None,
+            });
+            done_tx.send(()).expect("signal runner return");
+            result
+        });
+
+        wait_for_test_marker(&child_ready);
+        let child_writer_blocked = manager.acquire_write_execution_lease("agent-a").is_err();
+        let child_removal = manager.remove("agent-a", true, false);
+        let unrelated_during_child = manager
+            .acquire_write_execution_lease("agent-b")
+            .map(|lease| lease.path().to_path_buf());
+        fs::write(&child_release, "release\n").expect("release child");
+
+        wait_for_test_marker(&validation_ready);
+        let validation_writer_blocked = manager.acquire_write_execution_lease("agent-a").is_err();
+        let validation_removal = manager.remove("agent-a", true, false);
+        let unrelated_during_validation = manager
+            .acquire_write_execution_lease("agent-b")
+            .map(|lease| lease.path().to_path_buf());
+        assert!(
+            done_rx.try_recv().is_err(),
+            "run returned before final release"
+        );
+        fs::write(&validation_release, "release\n").expect("release validation");
+
+        let summary = runner.join().expect("join runner").expect("run plan");
+        assert!(summary.success);
+        assert!(child_writer_blocked);
+        assert!(child_removal.is_err());
+        assert_eq!(
+            unrelated_during_child
+                .expect("unrelated writer during child")
+                .as_path(),
+            unrelated.path
+        );
+        assert!(validation_writer_blocked);
+        assert!(validation_removal.is_err());
+        assert_eq!(
+            unrelated_during_validation
+                .expect("unrelated writer during validation")
+                .as_path(),
+            unrelated.path
+        );
+        let released = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("orchestration releases write lease after finalization");
+        drop(released);
+        let removed = manager
+            .remove("agent-a", true, false)
+            .expect("orchestration releases removal authority after finalization");
+        assert!(!removed.path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_releases_write_lease_after_timeout() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+        commit_all(&repo, "initial commit").expect("commit");
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            r#"{
+              "agents": [{
+                "id": "agent-timeout",
+                "paths": ["README.md"],
+                "command": "sleep 5",
+                "timeout_seconds": 1
+              }]
+            }"#,
+        )
+        .expect("write plan");
+
+        let summary = run_plan_file(OrchestrationRunOptions {
+            repo: repo_path.clone(),
+            plan_file,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("run timeout plan");
+        assert!(!summary.success);
+        assert!(summary.agents[0].timed_out);
+        let manager = WorktreeManager::new(&repo_path);
+        let released = manager
+            .acquire_write_execution_lease("agent-timeout")
+            .expect("timeout releases write lease");
+        drop(released);
+        let removed = manager
+            .remove("agent-timeout", true, false)
+            .expect("timeout releases removal authority");
+        assert!(!removed.path.exists());
     }
 
     #[test]
@@ -3850,6 +4158,15 @@ mod tests {
                 .expect("snapshot"),
             Vec::<PathClaim>::new()
         );
+        let manager = WorktreeManager::new(&repo_path);
+        let released = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("failed command releases write lease");
+        drop(released);
+        let removed = manager
+            .remove("agent-a", true, false)
+            .expect("failed command releases removal authority");
+        assert!(!removed.path.exists());
     }
 
     #[test]
@@ -4573,6 +4890,140 @@ mod tests {
             read_run_checkpoint(&checkpoint_path(&checkpoint_dir, &run_id)).expect("checkpoint");
         assert_eq!(final_checkpoint.stage, RunCheckpointStage::Final);
         assert!(final_checkpoint.success);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_reacquires_fresh_write_lease_and_releases_it_on_every_return() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+        commit_all(&repo, "initial commit").expect("commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let worktree = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-resume".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create resume worktree");
+
+        let ready = temp.path().join("resume-ready");
+        let release = temp.path().join("resume-release");
+        let command = format!(
+            "printf ready > '{}'; while [ ! -f '{}' ]; do sleep 0.02; done",
+            ready.display(),
+            release.display()
+        );
+        let plan_file = temp.path().join("plan.json");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": [{
+                    "id": "agent-resume",
+                    "paths": ["README.md"],
+                    "command": command
+                }]
+            }))
+            .expect("encode plan"),
+        )
+        .expect("write plan");
+        let plan = load_plan(&plan_file).expect("load plan");
+        let run_id = RunId::new("resume-write-lease").expect("run id");
+        let checkpoint = RunCheckpoint {
+            version: CHECKPOINT_STATE_VERSION,
+            run_id: run_id.clone(),
+            stage: RunCheckpointStage::WorktreesSelected,
+            repo: repo_path.clone(),
+            repo_head: Some(current_head_oid(&repo_path).expect("head").to_string()),
+            plan_file: plan_file.clone(),
+            plan_snapshot: Some(CheckpointPlanSnapshot::from(&plan)),
+            keep_claims: false,
+            worktree_reuse_policy: WorktreeReusePolicy::Clean,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            success: false,
+            agents: vec![AgentCheckpoint {
+                id: "agent-resume".to_string(),
+                status: AgentRunStatus::Pending,
+                worktree: Some(CheckpointWorktreeRecord::from(&worktree)),
+                claim: None,
+                semantic_intent: None,
+                semantic_conflicts: Vec::new(),
+                changed_paths: Vec::new(),
+                unclaimed_changed_paths: Vec::new(),
+                validation: Vec::new(),
+                error: None,
+            }],
+            repo_validation: Vec::new(),
+            released_claims: Vec::new(),
+            release_errors: Vec::new(),
+            released_semantic_intents: Vec::new(),
+            semantic_release_errors: Vec::new(),
+            updated_unix_ms: 1,
+        };
+        let checkpoint_file =
+            write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+        let run_checkpoint = checkpoint_file.clone();
+        let run_repo = repo_path.clone();
+        let run_plan = plan_file.clone();
+        let runner = thread::spawn(move || {
+            resume_plan_file(OrchestrationResumeOptions {
+                checkpoint_file: run_checkpoint,
+                repo: Some(run_repo),
+                plan_file: Some(run_plan),
+                jobs: 1,
+                patch_dir: None,
+            })
+        });
+
+        wait_for_test_marker(&ready);
+        let writer_blocked = manager
+            .acquire_write_execution_lease("agent-resume")
+            .is_err();
+        let removal_blocked = manager.remove("agent-resume", true, false).is_err();
+        fs::write(&release, "release\n").expect("release resume command");
+        let summary = runner.join().expect("join resume").expect("resume plan");
+        assert!(summary.success);
+        assert!(writer_blocked);
+        assert!(removal_blocked);
+
+        let external_writer = manager
+            .acquire_write_execution_lease("agent-resume")
+            .expect("first resume released its write lease");
+        let reacquire_error = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file: checkpoint_file.clone(),
+            repo: Some(repo_path.clone()),
+            plan_file: Some(plan_file.clone()),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect_err("each resume must reacquire instead of reusing a stale handle");
+        assert!(reacquire_error
+            .to_string()
+            .contains("could not reacquire the exclusive execution lease"));
+        drop(external_writer);
+
+        let replay = resume_plan_file(OrchestrationResumeOptions {
+            checkpoint_file,
+            repo: Some(repo_path.clone()),
+            plan_file: Some(plan_file),
+            jobs: 1,
+            patch_dir: None,
+        })
+        .expect("resume final checkpoint after releasing external writer");
+        assert!(replay.success);
+        let released = manager
+            .acquire_write_execution_lease("agent-resume")
+            .expect("final checkpoint resume releases its reacquired lease");
+        drop(released);
+        let removed = manager
+            .remove("agent-resume", true, false)
+            .expect("resume releases removal authority");
+        assert!(!removed.path.exists());
     }
 
     #[test]
@@ -5322,9 +5773,10 @@ mod tests {
         };
         let mut summary = AgentRunSummary::pending(&agent);
 
-        inspect_agent_changes(
+        inspect_agent_changes_at_path(
             &agent,
             &mut summary,
+            temp.path(),
             Some(slot),
             &Oid::zero(),
             OrchestrationExecutionRuntime::NonpublishableSimulation,

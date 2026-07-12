@@ -5,7 +5,7 @@ use crate::{
         StdinMode,
     },
     sync::normalize_repo_relative_path,
-    worktree::{normalize_agent_id, WorktreeManager, WorktreeRecord},
+    worktree::{normalize_agent_id, ManagedWorktreeReadLease, WorktreeManager, WorktreeRecord},
 };
 use anyhow::{bail, Context, Result};
 use git2::{ErrorCode, ObjectType, Oid, Repository, Status, StatusOptions};
@@ -18,6 +18,7 @@ use std::{
     fmt::Write as FmtWrite,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    ops::Deref,
     path::{Component, Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -513,16 +514,57 @@ struct PrimaryRepositoryState {
     worktree_digest: Oid,
 }
 
+/// A verified managed-worktree record whose shared execution lease remains
+/// held for the complete lifetime of the value.
+///
+/// Field access transparently dereferences to [`WorktreeRecord`] for existing
+/// callers, but the record cannot be returned without retaining the lease.
+#[derive(Debug)]
+pub struct AgentWorktreeReadLease {
+    lease: ManagedWorktreeReadLease,
+}
+
+impl AgentWorktreeReadLease {
+    pub fn record(&self) -> &WorktreeRecord {
+        self.lease.record()
+    }
+}
+
+impl Deref for AgentWorktreeReadLease {
+    type Target = WorktreeRecord;
+
+    fn deref(&self) -> &Self::Target {
+        self.record()
+    }
+}
+
+/// Resolves a managed worktree for immutable inspection only.
+///
+/// The returned shared lease excludes writers and removal. Callers that may
+/// run validation, repair, Git index updates, or any other mutating operation
+/// must acquire `WorktreeManager::acquire_write_execution_lease` instead.
+pub fn find_agent_worktree_read_only(
+    manager: &WorktreeManager,
+    agent_id: impl AsRef<str>,
+) -> Result<AgentWorktreeReadLease> {
+    let agent_id = normalize_agent_id(agent_id.as_ref())?;
+    let lease = manager
+        .acquire_read_execution_lease(&agent_id)
+        .with_context(|| {
+            format!("worktree for agent '{agent_id}' is not registered or readable")
+        })?;
+    Ok(AgentWorktreeReadLease { lease })
+}
+
+/// Compatibility spelling for immutable lookup.
+///
+/// Despite the historical name, this API grants read-only authority. It is
+/// retained while mutating call sites migrate to explicit write leases.
 pub fn find_agent_worktree(
     manager: &WorktreeManager,
     agent_id: impl AsRef<str>,
-) -> Result<WorktreeRecord> {
-    let agent_id = normalize_agent_id(agent_id.as_ref())?;
-    manager
-        .list()?
-        .into_iter()
-        .find(|record| record.name == agent_id)
-        .with_context(|| format!("worktree for agent '{agent_id}' is not registered"))
+) -> Result<AgentWorktreeReadLease> {
+    find_agent_worktree_read_only(manager, agent_id)
 }
 
 pub fn collect_agent_result(options: MergeCollectOptions) -> Result<MergeCandidate> {
@@ -534,9 +576,22 @@ fn collect_agent_result_with_evidence(
     options: MergeCollectOptions,
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<MergeCandidate> {
+    collect_agent_result_with_evidence_after_lease(options, validation_evidence, || {})
+}
+
+fn collect_agent_result_with_evidence_after_lease<F>(
+    options: MergeCollectOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    after_lease: F,
+) -> Result<MergeCandidate>
+where
+    F: FnOnce(),
+{
     let repo_root = discover_primary_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo_root);
-    let record = find_agent_worktree(&manager, &options.agent_id)?;
+    let leased_worktree = find_agent_worktree_read_only(&manager, &options.agent_id)?;
+    after_lease();
+    let record = leased_worktree.record();
     let primary_repo = Repository::open(&repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
     let agent_repo = Repository::open(&record.path)
@@ -544,7 +599,7 @@ fn collect_agent_result_with_evidence(
 
     let claimed_paths = normalize_claim_paths(options.claimed_paths)?;
     let snapshot =
-        capture_consistent_candidate_snapshot(&primary_repo, &agent_repo, &record, repo_root)?;
+        capture_consistent_candidate_snapshot(&primary_repo, &agent_repo, record, repo_root)?;
     let metadata = snapshot.metadata;
     let changes = snapshot.changes;
     let changed_paths = changes
@@ -5856,11 +5911,115 @@ fn sort_validation_reports(reports: &mut [ValidationReport]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::WorktreeCreateOptions;
     use git2::Signature;
     use std::process::{Command, Stdio};
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
 
     static VALIDATION_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn create_managed_merge_fixture(
+        root: &Path,
+    ) -> (PathBuf, WorktreeManager, WorktreeRecord, WorktreeRecord) {
+        let repo_path = root.join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+        let repo = Repository::open(&repo_path).expect("open repository");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        drop(tree);
+        drop(repo);
+
+        let manager = WorktreeManager::new(&repo_path);
+        let agent_a = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-a worktree");
+        let agent_b = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-b".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create agent-b worktree");
+        (repo_path, manager, agent_a, agent_b)
+    }
+
+    #[test]
+    fn candidate_collection_holds_read_lease_until_snapshot_finishes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, manager, agent_a, agent_b) = create_managed_merge_fixture(temp.path());
+        fs::write(agent_a.path.join("README.md"), "# Agent change\n").expect("edit agent worktree");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let collector_repo = repo_path.clone();
+        let collector = std::thread::spawn(move || {
+            collect_agent_result_with_evidence_after_lease(
+                MergeCollectOptions {
+                    repo: collector_repo,
+                    agent_id: "agent-a".to_string(),
+                    claimed_paths: vec![PathBuf::from("README.md")],
+                    include_full_diff: false,
+                    diff_summary_char_limit: DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                    validations: Vec::new(),
+                },
+                ValidationEvidenceBundle::default(),
+                || {
+                    ready_tx.send(()).expect("publish acquired read lease");
+                    release_rx.recv().expect("release collector");
+                },
+            )
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("collector acquired read lease");
+        let writer_error = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect_err("collector read lease must exclude a writer");
+        assert!(writer_error.to_string().contains("exclusive write lease"));
+        let removal_error = manager
+            .remove("agent-a", true, false)
+            .expect_err("collector read lease must exclude removal");
+        assert!(removal_error
+            .to_string()
+            .contains("active cooperative execution lease"));
+
+        let unrelated = manager
+            .acquire_write_execution_lease("agent-b")
+            .expect("unrelated worktree writer remains available");
+        assert_eq!(unrelated.path(), agent_b.path);
+        drop(unrelated);
+
+        release_tx.send(()).expect("release collector");
+        let candidate = collector
+            .join()
+            .expect("join collector")
+            .expect("collect candidate");
+        assert_eq!(candidate.changed_paths, vec![PathBuf::from("README.md")]);
+        let released = manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("collector releases read lease after snapshot");
+        drop(released);
+        let removed = manager
+            .remove("agent-a", true, false)
+            .expect("collector releases removal authority after snapshot");
+        assert!(!removed.path.exists());
+    }
 
     #[test]
     fn required_process_output_rejects_unverified_side_effect_evidence() {
