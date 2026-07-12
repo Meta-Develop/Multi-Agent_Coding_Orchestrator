@@ -417,6 +417,13 @@ struct ManagedWorktreeRegistryStore {
     repository: ManagedRepositoryBinding,
 }
 
+#[derive(Debug)]
+struct ManagedWorktreeRegistryLock {
+    lock: KernelStateLock,
+    root_identity: FileIdentity,
+    lock_identity: FileIdentity,
+}
+
 impl WorktreeManager {
     pub fn new(repo_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -445,9 +452,9 @@ impl WorktreeManager {
     pub fn create(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
-        let _registry_lock = registry_store.lock()?;
-        let mut registry = registry_store.load()?;
-        recover_pending_operations(&repo, &registry_store, &mut registry)?;
+        let registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load(&registry_lock)?;
+        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
         let name = normalize_agent_id(&options.agent_id)?;
         let branch_name = options.branch.unwrap_or_else(|| default_branch_name(&name));
         validate_branch_name(&branch_name)?;
@@ -519,12 +526,12 @@ impl WorktreeManager {
                 metadata_quarantine_identity: None,
             },
         );
-        registry_store.save(&mut registry)?;
+        registry_store.save(&registry_lock, &mut registry)?;
 
         let reserved = match root.reserve_direct_child_directory(&name) {
             Ok(reserved) => reserved,
             Err(error) => {
-                recover_pending_operations(&repo, &registry_store, &mut registry)?;
+                recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
                 return Err(error);
             }
         };
@@ -537,7 +544,7 @@ impl WorktreeManager {
                     Some(reserved.identity()),
                     TreeLinkPolicy::UnlinkLinks,
                 )?;
-                recover_pending_operations(&repo, &registry_store, &mut registry)?;
+                recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
                 return Err(error);
             }
         };
@@ -556,7 +563,7 @@ impl WorktreeManager {
             operation.staging_root = Some(staging_root.path().to_path_buf());
             operation.staging_root_identity = Some(staging_root.identity().clone());
             operation.staging_path = Some(staging_path.clone());
-            registry_store.save(&mut registry)
+            registry_store.save(&registry_lock, &mut registry)
         })();
         if let Err(error) = prepared_save {
             remove_direct_child_tree(
@@ -617,7 +624,7 @@ impl WorktreeManager {
                     ManagedBranchOwnership::Preexisting
                 };
                 operation.owned_branch_oid = created_by_maco.then(|| branch_oid.to_string());
-                registry_store.save(&mut registry)?;
+                registry_store.save(&registry_lock, &mut registry)?;
                 let _branch_guard = lock_branch_reference(&repo, &branch_name)?;
                 verify_local_branch_oid(&repo, &branch_name, branch_oid)?;
                 let reference = branch.into_reference();
@@ -648,10 +655,11 @@ impl WorktreeManager {
                 operation.phase = ManagedWorktreeOperationPhase::CreateStaged;
                 operation.staged_path_identity = Some(staged.identity().clone());
                 operation.staged_metadata = Some(staged_metadata);
-                registry_store.save(&mut registry)?;
+                registry_store.save(&registry_lock, &mut registry)?;
                 Ok(())
             })();
-        let recovery_result = recover_pending_operations(&repo, &registry_store, &mut registry);
+        let recovery_result =
+            recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry);
         if let Err(create_error) = create_result {
             recovery_result.with_context(|| {
                 format!(
@@ -686,9 +694,9 @@ impl WorktreeManager {
         let repo = self.open_repository()?;
         let name = normalize_agent_id(agent_id)?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
-        let _registry_lock = registry_store.lock()?;
-        let mut registry = registry_store.load()?;
-        recover_pending_operations(&repo, &registry_store, &mut registry)?;
+        let registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load(&registry_lock)?;
+        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
         let binding = registry.records.get(&name).cloned().with_context(|| {
             format!(
                 "worktree '{name}' has no create-time managed binding; refusing filesystem or branch deletion even with --force"
@@ -763,10 +771,11 @@ impl WorktreeManager {
                 metadata_quarantine_identity: None,
             },
         );
-        registry_store.save(&mut registry)?;
+        registry_store.save(&registry_lock, &mut registry)?;
         recover_pending_operations_with_held_removal_lease(
             &repo,
             &registry_store,
+            &registry_lock,
             &mut registry,
             Some(&_removal_lease),
         )?;
@@ -788,9 +797,9 @@ impl WorktreeManager {
     pub fn list_managed_verified(&self) -> Result<Vec<WorktreeRecord>> {
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
-        let _registry_lock = registry_store.lock()?;
-        let mut registry = registry_store.load()?;
-        recover_pending_operations(&repo, &registry_store, &mut registry)?;
+        let registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load(&registry_lock)?;
+        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
         let mut records = Vec::with_capacity(registry.records.len());
         for binding in registry.records.values() {
             records.push(verified_worktree_record(
@@ -810,9 +819,9 @@ impl WorktreeManager {
         let name = normalize_agent_id(agent_id)?;
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
-        let _registry_lock = registry_store.lock()?;
-        let mut registry = registry_store.load()?;
-        recover_pending_operations(&repo, &registry_store, &mut registry)?;
+        let registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load(&registry_lock)?;
+        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
         let binding = registry.records.get(&name).with_context(|| {
             format!("worktree '{name}' has no verified MACO binding; explicit adoption is required")
         })?;
@@ -827,9 +836,9 @@ impl WorktreeManager {
         let name = normalize_agent_id(agent_id)?;
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
-        let _registry_lock = registry_store.lock()?;
-        let mut registry = registry_store.load()?;
-        recover_pending_operations(&repo, &registry_store, &mut registry)?;
+        let registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load(&registry_lock)?;
+        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
         let binding = registry.records.get(&name).with_context(|| {
             format!("worktree '{name}' has no verified MACO binding; explicit adoption is required")
         })?;
@@ -908,8 +917,15 @@ impl ManagedWorktreeRegistryStore {
         })
     }
 
-    fn lock(&self) -> Result<KernelStateLock> {
-        KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")
+    fn lock(&self) -> Result<ManagedWorktreeRegistryLock> {
+        let lock = KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")?;
+        let bound = ManagedWorktreeRegistryLock {
+            root_identity: self.state_root.identity().clone(),
+            lock_identity: lock.identity().clone(),
+            lock,
+        };
+        self.verify_lock(&bound)?;
+        Ok(bound)
     }
 
     fn try_acquire_shared_worktree_lease(&self, name: &str) -> Result<KernelStateLock> {
@@ -933,82 +949,101 @@ impl ManagedWorktreeRegistryStore {
         })
     }
 
-    fn load(&self) -> Result<ManagedWorktreeRegistry> {
-        if !self
-            .state_root
-            .direct_child_exists("managed_worktrees.json")?
-        {
-            return Ok(self.empty_registry());
-        }
-        let contents = BoundedRegularReader::read_direct(
-            &self.state_root,
-            "managed_worktrees.json",
-            MAX_MANAGED_REGISTRY_BYTES,
-        )?;
-        let value: serde_json::Value = serde_json::from_slice(&contents).with_context(|| {
-            format!(
-                "failed to parse managed worktree registry {}",
-                self.state_root
-                    .path()
-                    .join("managed_worktrees.json")
-                    .display()
-            )
-        })?;
-        let version = value
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .context("managed worktree registry has no valid version")?;
-        if version != u64::from(MANAGED_WORKTREE_REGISTRY_VERSION) {
-            bail!(
-                "unsupported managed worktree registry version {} in {}",
-                version,
-                self.state_root
-                    .path()
-                    .join("managed_worktrees.json")
-                    .display()
-            );
-        }
-        let registry: ManagedWorktreeRegistry =
-            serde_json::from_value(value).with_context(|| {
-                format!(
-                    "failed to decode managed worktree registry {}",
+    fn load(&self, lock: &ManagedWorktreeRegistryLock) -> Result<ManagedWorktreeRegistry> {
+        self.verify_lock(lock)?;
+        let result = (|| -> Result<ManagedWorktreeRegistry> {
+            if !self
+                .state_root
+                .direct_child_exists("managed_worktrees.json")?
+            {
+                return Ok(self.empty_registry());
+            }
+            let contents = BoundedRegularReader::read_direct(
+                &self.state_root,
+                "managed_worktrees.json",
+                MAX_MANAGED_REGISTRY_BYTES,
+            )?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&contents).with_context(|| {
+                    format!(
+                        "failed to parse managed worktree registry {}",
+                        self.state_root
+                            .path()
+                            .join("managed_worktrees.json")
+                            .display()
+                    )
+                })?;
+            let version = value
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
+                .context("managed worktree registry has no valid version")?;
+            if version != u64::from(MANAGED_WORKTREE_REGISTRY_VERSION) {
+                bail!(
+                    "unsupported managed worktree registry version {} in {}",
+                    version,
                     self.state_root
                         .path()
                         .join("managed_worktrees.json")
                         .display()
-                )
-            })?;
-        if registry.repository != self.repository {
-            bail!(
-                "managed worktree registry repository binding does not match the current repository"
-            );
-        }
-        validate_registry_bounds(&registry)?;
-        let expected_checksum = managed_registry_checksum(&registry)?;
-        if registry.checksum != expected_checksum {
-            bail!(
-                "managed worktree registry checksum mismatch in {}; refusing destructive operations",
-                self.state_root.path().join("managed_worktrees.json").display()
-            );
-        }
-        Ok(registry)
+                );
+            }
+            let registry: ManagedWorktreeRegistry =
+                serde_json::from_value(value).with_context(|| {
+                    format!(
+                        "failed to decode managed worktree registry {}",
+                        self.state_root
+                            .path()
+                            .join("managed_worktrees.json")
+                            .display()
+                    )
+                })?;
+            if registry.repository != self.repository {
+                bail!(
+                    "managed worktree registry repository binding does not match this repository"
+                );
+            }
+            validate_registry_bounds(&registry)?;
+            let expected_checksum = managed_registry_checksum(&registry)?;
+            if registry.checksum != expected_checksum {
+                bail!(
+                    "managed worktree registry checksum mismatch in {}; refusing destructive operations",
+                    self.state_root.path().join("managed_worktrees.json").display()
+                );
+            }
+            Ok(registry)
+        })();
+        finish_with_registry_lock_verification(result, self.verify_lock(lock))
     }
 
-    fn save(&self, registry: &mut ManagedWorktreeRegistry) -> Result<()> {
-        registry.version = MANAGED_WORKTREE_REGISTRY_VERSION;
-        registry.repository = self.repository.clone();
-        validate_registry_bounds(registry)?;
-        registry.checksum = managed_registry_checksum(registry)?;
-        let mut contents = serde_json::to_vec_pretty(registry)
-            .context("failed to serialize managed worktree registry")?;
-        contents.push(b'\n');
-        if contents.len() as u64 > MAX_MANAGED_REGISTRY_BYTES {
-            bail!(
-                "managed worktree registry exceeds its serialized size limit of {MAX_MANAGED_REGISTRY_BYTES} bytes"
-            );
-        }
-        AtomicStateWriter::scavenge_direct_temps(&self.state_root, "managed_worktrees.json")?;
-        AtomicStateWriter::write_direct(&self.state_root, "managed_worktrees.json", &contents)
+    fn save(
+        &self,
+        lock: &ManagedWorktreeRegistryLock,
+        registry: &mut ManagedWorktreeRegistry,
+    ) -> Result<()> {
+        self.verify_lock(lock)?;
+        run_managed_registry_after_precheck_hook();
+        let result = (|| -> Result<()> {
+            registry.version = MANAGED_WORKTREE_REGISTRY_VERSION;
+            registry.repository = self.repository.clone();
+            validate_registry_bounds(registry)?;
+            registry.checksum = managed_registry_checksum(registry)?;
+            let mut contents = serde_json::to_vec_pretty(registry)
+                .context("failed to serialize managed worktree registry")?;
+            contents.push(b'\n');
+            if contents.len() as u64 > MAX_MANAGED_REGISTRY_BYTES {
+                bail!(
+                    "managed worktree registry exceeds its serialized size limit of {MAX_MANAGED_REGISTRY_BYTES} bytes"
+                );
+            }
+            self.verify_lock(lock)?;
+            AtomicStateWriter::scavenge_direct_temps(&self.state_root, "managed_worktrees.json")?;
+            self.verify_lock(lock)?;
+            AtomicStateWriter::write_direct_fenced(
+                &self.state_root,
+                "managed_worktrees.json",
+                &contents,
+                || self.verify_lock(lock),
+            )
             .with_context(|| {
                 format!(
                     "failed to save managed worktree registry {}",
@@ -1017,7 +1052,21 @@ impl ManagedWorktreeRegistryStore {
                         .join("managed_worktrees.json")
                         .display()
                 )
-            })
+            })?;
+            self.verify_lock(lock)
+        })();
+        finish_with_registry_lock_verification(result, self.verify_lock(lock))
+    }
+
+    fn verify_lock(&self, lock: &ManagedWorktreeRegistryLock) -> Result<()> {
+        if lock.root_identity != *self.state_root.identity() {
+            bail!("managed worktree registry lock belongs to a different state root");
+        }
+        lock.lock.verify_direct_binding(&self.state_root)?;
+        if lock.lock.identity() != &lock.lock_identity {
+            bail!("managed worktree registry lock identity changed unexpectedly");
+        }
+        Ok(())
     }
 
     fn empty_registry(&self) -> ManagedWorktreeRegistry {
@@ -1030,6 +1079,42 @@ impl ManagedWorktreeRegistryStore {
         }
     }
 }
+
+fn finish_with_registry_lock_verification<T>(
+    result: Result<T>,
+    verification: Result<()>,
+) -> Result<T> {
+    match (result, verification) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(lock_error)) => Err(lock_error),
+        (Err(error), Err(lock_error)) => Err(error.context(format!(
+            "operation also lost its managed registry lock-path binding: {lock_error:#}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MANAGED_REGISTRY_AFTER_PRECHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_managed_registry_after_precheck_hook(hook: impl FnOnce() + 'static) {
+    MANAGED_REGISTRY_AFTER_PRECHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_managed_registry_after_precheck_hook() {
+    let hook = MANAGED_REGISTRY_AFTER_PRECHECK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_managed_registry_after_precheck_hook() {}
 
 fn managed_worktree_lease_name(name: &str) -> Result<OsString> {
     let normalized = normalize_agent_id(name)?;
@@ -1083,14 +1168,16 @@ fn validate_registry_bounds(registry: &ManagedWorktreeRegistry) -> Result<()> {
 fn recover_pending_operations(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
 ) -> Result<()> {
-    recover_pending_operations_with_held_removal_lease(repo, store, registry, None)
+    recover_pending_operations_with_held_removal_lease(repo, store, lock, registry, None)
 }
 
 fn recover_pending_operations_with_held_removal_lease(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
 ) -> Result<()> {
@@ -1106,7 +1193,7 @@ fn recover_pending_operations_with_held_removal_lease(
         }
         match operation.kind {
             ManagedWorktreeOperationKind::Create => {
-                recover_create_operation(repo, store, registry, operation)?
+                recover_create_operation(repo, store, lock, registry, operation)?
             }
             ManagedWorktreeOperationKind::Remove => {
                 let _lease = if held_removal_lease
@@ -1124,16 +1211,17 @@ fn recover_pending_operations_with_held_removal_lease(
                             })?,
                     )
                 };
-                recover_remove_operation(repo, store, registry, operation)?
+                recover_remove_operation(repo, store, lock, registry, operation)?
             }
         }
     }
-    reconcile_creation_locks(repo, store, registry)
+    reconcile_creation_locks(repo, store, lock, registry)
 }
 
 fn recover_create_operation(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     mut operation: ManagedWorktreeOperation,
 ) -> Result<()> {
@@ -1223,7 +1311,7 @@ fn recover_create_operation(
             )?;
         }
         registry.operations.remove(&operation.name);
-        store.save(registry)?;
+        store.save(lock, registry)?;
         return Ok(());
     }
 
@@ -1306,7 +1394,7 @@ fn recover_create_operation(
             remove_staging_root_if_empty(&root, &staging_root, &staging_root_identity)?;
             cleanup_create_branch_if_owned(repo, &operation)?;
             registry.operations.remove(&operation.name);
-            store.save(registry)?;
+            store.save(lock, registry)?;
             return Ok(());
         }
         if !staging_path_exists {
@@ -1343,7 +1431,7 @@ fn recover_create_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(registry)?;
+        store.save(lock, registry)?;
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreateStaged {
@@ -1464,7 +1552,7 @@ fn recover_create_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(registry)?;
+        store.save(lock, registry)?;
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreateObserved {
@@ -1523,8 +1611,8 @@ fn recover_create_operation(
             registry.records.insert(operation.name.clone(), binding);
         }
         registry.operations.remove(&operation.name);
-        store.save(registry)?;
-        complete_creation_lock(repo, store, registry, &operation.name)?;
+        store.save(lock, registry)?;
+        complete_creation_lock(repo, store, lock, registry, &operation.name)?;
         return Ok(());
     }
 
@@ -1734,6 +1822,7 @@ fn verify_worktree_clean_at(path: &Path, branch: &str, expected: Oid) -> Result<
 fn complete_creation_lock(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     name: &str,
 ) -> Result<()> {
@@ -1767,12 +1856,13 @@ fn complete_creation_lock(
         .get_mut(name)
         .context("creation lock binding disappeared before completion")?
         .creation_lock_pending = false;
-    store.save(registry)
+    store.save(lock, registry)
 }
 
 fn reconcile_creation_locks(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
 ) -> Result<()> {
     let names = registry
@@ -1789,7 +1879,7 @@ fn reconcile_creation_locks(
             .branch
             .clone();
         let _branch_guard = lock_branch_reference(repo, &branch)?;
-        complete_creation_lock(repo, store, registry, &name)?;
+        complete_creation_lock(repo, store, lock, registry, &name)?;
     }
     Ok(())
 }
@@ -1797,6 +1887,7 @@ fn reconcile_creation_locks(
 fn recover_remove_operation(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     mut operation: ManagedWorktreeOperation,
 ) -> Result<()> {
@@ -1868,7 +1959,7 @@ fn recover_remove_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(registry)?;
+        store.save(lock, registry)?;
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::WorktreeQuarantined {
@@ -1911,7 +2002,7 @@ fn recover_remove_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(registry)?;
+        store.save(lock, registry)?;
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::MetadataQuarantined {
@@ -1931,7 +2022,7 @@ fn recover_remove_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(registry)?;
+        store.save(lock, registry)?;
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::WorktreeDeleted {
@@ -1951,7 +2042,7 @@ fn recover_remove_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(registry)?;
+        store.save(lock, registry)?;
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::MetadataDeleted {
@@ -1970,7 +2061,7 @@ fn recover_remove_operation(
         registry
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(registry)?;
+        store.save(lock, registry)?;
     }
 
     if operation.phase != ManagedWorktreeOperationPhase::BranchDeleted {
@@ -1982,7 +2073,7 @@ fn recover_remove_operation(
     }
     registry.records.remove(&operation.name);
     registry.operations.remove(&operation.name);
-    store.save(registry)
+    store.save(lock, registry)
 }
 
 fn path_entry_exists(path: &Path) -> Result<bool> {
@@ -3233,9 +3324,9 @@ mod tests {
             .find_branch("maco/agent-leased", BranchType::Local)
             .is_ok());
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
-        let _lock = store.lock().expect("registry lock");
-        assert!(store.load().expect("registry").operations.is_empty());
-        drop(_lock);
+        let lock = store.lock().expect("registry lock");
+        assert!(store.load(&lock).expect("registry").operations.is_empty());
+        drop(lock);
 
         drop(second);
         drop(first);
@@ -3267,10 +3358,10 @@ mod tests {
             .expect("shared execution lease");
         let worktree_quarantine = {
             let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
-            let _lock = store.lock().expect("registry lock");
-            let mut registry = store.load().expect("registry");
+            let lock = store.lock().expect("registry lock");
+            let mut registry = store.load(&lock).expect("registry");
             let (_, worktree_quarantine, _, _) =
-                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+                prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
             worktree_quarantine
         };
 
@@ -3389,8 +3480,8 @@ mod tests {
 
         {
             let store = ManagedWorktreeRegistryStore::open(&repo).expect("open registry");
-            let _lock = store.lock().expect("registry lock");
-            let mut registry = store.load().expect("load registry");
+            let lock = store.lock().expect("registry lock");
+            let mut registry = store.load(&lock).expect("load registry");
             repo.find_worktree("non-utf8-agent")
                 .expect("managed worktree")
                 .lock(Some("simulate crash before lock completion"))
@@ -3400,7 +3491,9 @@ mod tests {
                 .get_mut("non-utf8-agent")
                 .expect("managed binding")
                 .creation_lock_pending = true;
-            store.save(&mut registry).expect("persist crash fixture");
+            store
+                .save(&lock, &mut registry)
+                .expect("persist crash fixture");
             let bytes = BoundedRegularReader::read_direct(
                 &store.state_root,
                 "managed_worktrees.json",
@@ -3449,16 +3542,17 @@ mod tests {
             .lock(Some("simulate crash before creation-lock completion"))
             .expect("re-lock worktree");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-        let _lock = store.lock().expect("registry lock");
-        let mut registry = store.load().expect("registry");
+        let lock = store.lock().expect("registry lock");
+        let mut registry = store.load(&lock).expect("registry");
         registry
             .records
             .get_mut("agent-lock")
             .expect("binding")
             .creation_lock_pending = true;
-        store.save(&mut registry).expect("save pending lock");
+        store.save(&lock, &mut registry).expect("save pending lock");
 
-        recover_pending_operations(&repo, &store, &mut registry).expect("recover creation lock");
+        recover_pending_operations(&repo, &store, &lock, &mut registry)
+            .expect("recover creation lock");
 
         assert!(
             !registry
@@ -4442,8 +4536,8 @@ mod tests {
             .reserve_random_direct_child_directory("test-stage")
             .expect("staging root");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-        let _lock = store.lock().expect("lock");
-        let mut registry = store.load().expect("registry");
+        let lock = store.lock().expect("lock");
+        let mut registry = store.load(&lock).expect("registry");
         let name = "agent-crash".to_string();
         registry.operations.insert(
             name.clone(),
@@ -4475,12 +4569,12 @@ mod tests {
                 metadata_quarantine_identity: None,
             },
         );
-        store.save(&mut registry).expect("save prepare");
+        store.save(&lock, &mut registry).expect("save prepare");
         let commit = repo.find_commit(oid).expect("commit");
         repo.branch("maco/agent-crash", &commit, false)
             .expect("create branch before crash");
 
-        recover_pending_operations(&repo, &store, &mut registry).expect("recover create");
+        recover_pending_operations(&repo, &store, &lock, &mut registry).expect("recover create");
         assert!(registry.operations.is_empty());
         assert!(registry.records.is_empty());
         assert!(repo
@@ -4502,8 +4596,8 @@ mod tests {
             let staging_name = "stage-intent";
             let staging_root_path = root.path().join(staging_name);
             let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-            let _lock = store.lock().expect("lock");
-            let mut registry = store.load().expect("registry");
+            let lock = store.lock().expect("lock");
+            let mut registry = store.load(&lock).expect("registry");
             registry.operations.insert(
                 name.clone(),
                 ManagedWorktreeOperation {
@@ -4534,7 +4628,7 @@ mod tests {
                     metadata_quarantine_identity: None,
                 },
             );
-            store.save(&mut registry).expect("save intent");
+            store.save(&lock, &mut registry).expect("save intent");
             root.reserve_direct_child_directory(&name)
                 .expect("simulate final mkdir");
             if with_staging {
@@ -4542,7 +4636,8 @@ mod tests {
                     .expect("simulate staging mkdir");
             }
 
-            recover_pending_operations(&repo, &store, &mut registry).expect("recover intent");
+            recover_pending_operations(&repo, &store, &lock, &mut registry)
+                .expect("recover intent");
             assert!(!root.path().join(&name).exists());
             assert!(!staging_root_path.exists());
             assert!(registry.operations.is_empty());
@@ -4559,8 +4654,8 @@ mod tests {
         let oid = commit_readme(&repo).expect("initial commit");
         let root = SafeRoot::open_or_create_managed(&worktree_root).expect("root");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-        let _lock = store.lock().expect("lock");
-        let mut registry = store.load().expect("registry");
+        let lock = store.lock().expect("lock");
+        let mut registry = store.load(&lock).expect("registry");
         let name = "agent-branch-race".to_string();
         let staging_root_path = root.path().join("stage-branch-race");
         registry.operations.insert(
@@ -4593,12 +4688,12 @@ mod tests {
                 metadata_quarantine_identity: None,
             },
         );
-        store.save(&mut registry).expect("save intent");
+        store.save(&lock, &mut registry).expect("save intent");
         let commit = repo.find_commit(oid).expect("commit");
         repo.branch("maco/agent-branch-race", &commit, false)
             .expect("external branch creation");
 
-        let error = recover_pending_operations(&repo, &store, &mut registry)
+        let error = recover_pending_operations(&repo, &store, &lock, &mut registry)
             .expect_err("unknown ownership must not be inferred");
         assert!(error.to_string().contains("unexpectedly created branch"));
         assert!(repo
@@ -4629,14 +4724,16 @@ mod tests {
             .lock(Some("simulate incomplete handoff"))
             .expect("lock worktree");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-        let _lock = store.lock().expect("registry lock");
-        let mut registry = store.load().expect("registry");
+        let lock = store.lock().expect("registry lock");
+        let mut registry = store.load(&lock).expect("registry");
         registry
             .records
             .get_mut("agent-advanced")
             .expect("binding")
             .creation_lock_pending = true;
-        store.save(&mut registry).expect("save pending handoff");
+        store
+            .save(&lock, &mut registry)
+            .expect("save pending handoff");
 
         let advanced =
             commit_descendant(&repo, "README.md", "# Advanced\n").expect("descendant commit");
@@ -4646,7 +4743,7 @@ mod tests {
             .set_target(advanced, "simulate concurrent update-ref")
             .expect("advance managed branch");
 
-        let error = recover_pending_operations(&repo, &store, &mut registry)
+        let error = recover_pending_operations(&repo, &store, &lock, &mut registry)
             .expect_err("branch advancement must block incomplete handoff");
 
         assert!(error
@@ -4677,15 +4774,111 @@ mod tests {
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
         let repo = Repository::open(&repo_path).expect("open repo");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-        let _lock = store.lock().expect("lock");
+        let lock = store.lock().expect("lock");
         let old_root = store.state_root.path().with_file_name("state-old");
         fs::rename(store.state_root.path(), &old_root).expect("rename state root");
         fs::create_dir(store.state_root.path()).expect("replacement root");
         fs::set_permissions(store.state_root.path(), fs::Permissions::from_mode(0o700))
             .expect("replacement mode");
 
-        let error = store.load().expect_err("replaced state root must fail");
+        let error = store
+            .load(&lock)
+            .expect_err("replaced state root must fail");
         assert!(error.to_string().contains("replaced"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_lock_rebind_after_precheck_preserves_newer_record_and_live_temp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        manager
+            .create(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root.clone()),
+            })
+            .expect("create initial worktree");
+
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let stale_lock = store.lock().expect("stale lock");
+        let mut stale_registry = store.load(&stale_lock).expect("stale registry");
+        let mut newer_binding = stale_registry
+            .records
+            .get("agent-a")
+            .cloned()
+            .expect("initial binding");
+        newer_binding.name = "agent-b".to_string();
+        newer_binding.branch = "maco/agent-b".to_string();
+        let lock_path = stale_lock.lock.path().to_path_buf();
+        let moved_lock = lock_path.with_file_name("managed_worktrees.lock.stale-original");
+        let live_temp = store
+            .state_root
+            .path()
+            .join(".managed_worktrees.json.live-writer.tmp");
+        set_managed_registry_after_precheck_hook({
+            let live_temp = live_temp.clone();
+            let repo_path = repo_path.clone();
+            move || {
+                fs::rename(&lock_path, &moved_lock).expect("move held registry lock");
+                fs::write(&lock_path, b"").expect("create replacement registry lock");
+                fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                    .expect("private replacement lock");
+                let replacement_repo = Repository::open(&repo_path).expect("replacement repo");
+                let replacement_store = ManagedWorktreeRegistryStore::open(&replacement_repo)
+                    .expect("replacement store");
+                let replacement_lock = replacement_store.lock().expect("replacement lock");
+                let mut newer_registry = replacement_store
+                    .load(&replacement_lock)
+                    .expect("replacement registry");
+                newer_registry
+                    .records
+                    .insert("agent-b".to_string(), newer_binding);
+                replacement_store
+                    .save(&replacement_lock, &mut newer_registry)
+                    .expect("commit newer replacement-domain record");
+                fs::write(&live_temp, b"live writer staging").expect("create live temp");
+                fs::set_permissions(&live_temp, fs::Permissions::from_mode(0o600))
+                    .expect("private live temp");
+            }
+        });
+
+        let error = store
+            .save(&stale_lock, &mut stale_registry)
+            .expect_err("stale lock-domain save must fail before temp scavenging");
+        assert!(
+            error
+                .to_string()
+                .contains("does not name its opened descriptor")
+                || error.to_string().contains("was rebound"),
+            "unexpected stale-save error: {error:#}"
+        );
+        assert!(
+            live_temp.exists(),
+            "stale writer deleted a live-domain temp"
+        );
+        drop(stale_lock);
+
+        let fresh_lock = store.lock().expect("fresh lock");
+        let current = store.load(&fresh_lock).expect("newer registry");
+        assert!(current.records.contains_key("agent-a"));
+        assert!(current.records.contains_key("agent-b"));
+        assert_eq!(
+            current.checksum,
+            managed_registry_checksum(&current).expect("current checksum")
+        );
+        assert!(
+            live_temp.exists(),
+            "read path unexpectedly scavenged live temp"
+        );
     }
 
     #[test]
@@ -4705,8 +4898,8 @@ mod tests {
             })
             .expect("create worktree");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-        let _lock = store.lock().expect("registry lock");
-        let loaded = store.load().expect("registry");
+        let lock = store.lock().expect("registry lock");
+        let loaded = store.load(&lock).expect("registry");
         let binding = loaded
             .records
             .get("agent-limits")
@@ -4720,7 +4913,7 @@ mod tests {
                 .insert(format!("record-{index}"), binding.clone());
         }
         let error = store
-            .save(&mut too_many_records)
+            .save(&lock, &mut too_many_records)
             .expect_err("record count limit");
         assert!(error.to_string().contains("records"));
 
@@ -4758,7 +4951,7 @@ mod tests {
                 .insert(format!("operation-{index}"), template_operation.clone());
         }
         let error = store
-            .save(&mut too_many_operations)
+            .save(&lock, &mut too_many_operations)
             .expect_err("operation count limit");
         assert!(error.to_string().contains("operations"));
 
@@ -4773,7 +4966,7 @@ mod tests {
                 .insert(oversized_binding.name.clone(), oversized_binding);
         }
         let error = store
-            .save(&mut oversized)
+            .save(&lock, &mut oversized)
             .expect_err("serialized size limit");
         assert!(error.to_string().contains("serialized size"));
 
@@ -4783,7 +4976,7 @@ mod tests {
             &vec![b' '; MAX_MANAGED_REGISTRY_BYTES as usize + 1],
         )
         .expect("write oversized registry fixture");
-        store.load().expect_err("load size limit");
+        store.load(&lock).expect_err("load size limit");
     }
 
     #[test]
@@ -4804,8 +4997,8 @@ mod tests {
             })
             .expect("create worktree");
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-        let _lock = store.lock().expect("lock");
-        let mut registry = store.load().expect("registry");
+        let lock = store.lock().expect("lock");
+        let mut registry = store.load(&lock).expect("registry");
         let binding = registry
             .records
             .get("agent-remove-crash")
@@ -4861,7 +5054,9 @@ mod tests {
                 metadata_quarantine_identity: None,
             },
         );
-        store.save(&mut registry).expect("save remove prepare");
+        store
+            .save(&lock, &mut registry)
+            .expect("save remove prepare");
         ensure_removal_worktree_lock(&repo, &binding).expect("lock before quarantine");
         quarantine_bound_directory(
             &binding.root,
@@ -4871,7 +5066,7 @@ mod tests {
         )
         .expect("simulate worktree quarantine rename before phase save");
 
-        recover_pending_operations(&repo, &store, &mut registry).expect("recover remove");
+        recover_pending_operations(&repo, &store, &lock, &mut registry).expect("recover remove");
         assert!(!created.path.exists());
         assert!(!binding.metadata_dir.exists());
         assert!(repo
@@ -4911,10 +5106,10 @@ mod tests {
                 })
                 .expect("create worktree");
             let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-            let _lock = store.lock().expect("registry lock");
-            let mut registry = store.load().expect("registry");
+            let lock = store.lock().expect("registry lock");
+            let mut registry = store.load(&lock).expect("registry");
             let (binding, worktree_quarantine, metadata_quarantine, expected_oid) =
-                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+                prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
 
             ensure_removal_worktree_lock(&repo, &binding).expect("removal lock");
             quarantine_bound_directory(
@@ -4933,10 +5128,10 @@ mod tests {
                 operation.worktree_quarantine_identity = Some(binding.path_identity.clone());
             }
             store
-                .save(&mut registry)
+                .save(&lock, &mut registry)
                 .expect("persist worktree quarantine");
             if boundary == "worktree_persisted" {
-                recover_pending_operations(&repo, &store, &mut registry)
+                recover_pending_operations(&repo, &store, &lock, &mut registry)
                     .expect("recover after worktree persist");
                 assert_completed_remove(&repo, &registry, &binding);
                 continue;
@@ -4952,7 +5147,7 @@ mod tests {
             )
             .expect("quarantine metadata");
             if boundary == "metadata_renamed" {
-                recover_pending_operations(&repo, &store, &mut registry)
+                recover_pending_operations(&repo, &store, &lock, &mut registry)
                     .expect("recover metadata rename before phase save");
                 assert_completed_remove(&repo, &registry, &binding);
                 continue;
@@ -4967,10 +5162,10 @@ mod tests {
                     Some(binding.metadata_dir_identity.clone());
             }
             store
-                .save(&mut registry)
+                .save(&lock, &mut registry)
                 .expect("persist metadata quarantine");
             if boundary == "metadata_persisted" {
-                recover_pending_operations(&repo, &store, &mut registry)
+                recover_pending_operations(&repo, &store, &lock, &mut registry)
                     .expect("recover after metadata persist");
                 assert_completed_remove(&repo, &registry, &binding);
                 continue;
@@ -4978,7 +5173,7 @@ mod tests {
             if boundary == "partial_worktree_cleanup" {
                 fs::remove_file(worktree_quarantine.join("README.md"))
                     .expect("simulate partial worktree cleanup");
-                recover_pending_operations(&repo, &store, &mut registry)
+                recover_pending_operations(&repo, &store, &lock, &mut registry)
                     .expect("resume partial worktree cleanup");
                 assert_completed_remove(&repo, &registry, &binding);
                 continue;
@@ -4998,10 +5193,10 @@ mod tests {
                 operation.phase = ManagedWorktreeOperationPhase::WorktreeDeleted;
             }
             store
-                .save(&mut registry)
+                .save(&lock, &mut registry)
                 .expect("persist worktree deletion");
             if boundary == "worktree_deleted_persisted" {
-                recover_pending_operations(&repo, &store, &mut registry)
+                recover_pending_operations(&repo, &store, &lock, &mut registry)
                     .expect("recover after worktree deletion persist");
                 assert_completed_remove(&repo, &registry, &binding);
                 continue;
@@ -5013,7 +5208,7 @@ mod tests {
                     .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
                     .expect("metadata regular file");
                 fs::remove_file(removable.path()).expect("simulate partial metadata cleanup");
-                recover_pending_operations(&repo, &store, &mut registry)
+                recover_pending_operations(&repo, &store, &lock, &mut registry)
                     .expect("resume partial metadata cleanup");
                 assert_completed_remove(&repo, &registry, &binding);
                 continue;
@@ -5033,10 +5228,10 @@ mod tests {
                 operation.phase = ManagedWorktreeOperationPhase::MetadataDeleted;
             }
             store
-                .save(&mut registry)
+                .save(&lock, &mut registry)
                 .expect("persist metadata deletion");
             if boundary == "metadata_deleted_persisted" {
-                recover_pending_operations(&repo, &store, &mut registry)
+                recover_pending_operations(&repo, &store, &lock, &mut registry)
                     .expect("recover after metadata deletion persist");
                 assert_completed_remove(&repo, &registry, &binding);
                 continue;
@@ -5050,7 +5245,7 @@ mod tests {
                 "test crash before branch phase persist",
             )
             .expect("delete branch before phase persist");
-            recover_pending_operations(&repo, &store, &mut registry)
+            recover_pending_operations(&repo, &store, &lock, &mut registry)
                 .expect("recover branch deletion before phase save");
             assert_completed_remove(&repo, &registry, &binding);
         }
@@ -5076,17 +5271,17 @@ mod tests {
                 })
                 .expect("create worktree");
             let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-            let _lock = store.lock().expect("registry lock");
-            let mut registry = store.load().expect("registry");
+            let lock = store.lock().expect("registry lock");
+            let mut registry = store.load(&lock).expect("registry");
             let (binding, worktree_quarantine, _, _) =
-                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+                prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
             if both_present {
                 fs::create_dir(&worktree_quarantine).expect("ambiguous quarantine");
             } else {
                 fs::remove_dir_all(&binding.path).expect("simulate missing source");
             }
 
-            let error = recover_pending_operations(&repo, &store, &mut registry)
+            let error = recover_pending_operations(&repo, &store, &lock, &mut registry)
                 .expect_err("ambiguous remove state must fail closed");
             assert!(error.to_string().contains("exactly one"));
             assert!(registry.operations.contains_key(&binding.name));
@@ -5112,10 +5307,10 @@ mod tests {
                 })
                 .expect("create worktree");
             let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
-            let _lock = store.lock().expect("registry lock");
-            let mut registry = store.load().expect("registry");
+            let lock = store.lock().expect("registry lock");
+            let mut registry = store.load(&lock).expect("registry");
             let (binding, worktree_quarantine, metadata_quarantine, _) =
-                prepare_remove_operation_for_test(&repo, &store, &mut registry);
+                prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
             ensure_removal_worktree_lock(&repo, &binding).expect("removal lock");
             quarantine_bound_directory(
                 &binding.root,
@@ -5132,14 +5327,16 @@ mod tests {
                 operation.phase = ManagedWorktreeOperationPhase::WorktreeQuarantined;
                 operation.worktree_quarantine_identity = Some(binding.path_identity.clone());
             }
-            store.save(&mut registry).expect("persist worktree phase");
+            store
+                .save(&lock, &mut registry)
+                .expect("persist worktree phase");
             if both_present {
                 fs::create_dir(&metadata_quarantine).expect("ambiguous metadata quarantine");
             } else {
                 fs::remove_dir_all(&binding.metadata_dir).expect("simulate missing metadata");
             }
 
-            let error = recover_pending_operations(&repo, &store, &mut registry)
+            let error = recover_pending_operations(&repo, &store, &lock, &mut registry)
                 .expect_err("ambiguous metadata state must fail closed");
             assert!(error.to_string().contains("exactly one"));
             assert!(registry.operations.contains_key(&binding.name));
@@ -5159,6 +5356,7 @@ mod tests {
     fn prepare_remove_operation_for_test(
         repo: &Repository,
         store: &ManagedWorktreeRegistryStore,
+        lock: &ManagedWorktreeRegistryLock,
         registry: &mut ManagedWorktreeRegistry,
     ) -> (ManagedWorktreeBinding, PathBuf, PathBuf, Oid) {
         let binding = registry
@@ -5217,7 +5415,7 @@ mod tests {
                 metadata_quarantine_identity: None,
             },
         );
-        store.save(registry).expect("persist remove prepare");
+        store.save(lock, registry).expect("persist remove prepare");
         (
             binding,
             worktree_quarantine,
