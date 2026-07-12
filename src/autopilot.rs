@@ -1,8 +1,11 @@
 use crate::{
     artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
     live_claim::{self, LiveClock},
+    llm::Redactor,
     merge::{
-        ApplyBlocker, ApplyReadinessStatus, SafetyCheckStatus, ValidationReport, ValidationStatus,
+        ApplyBlocker, ApplyReadinessStatus, BoundValidationEvidenceBundle,
+        CandidateValidationBinding, SafetyCheckStatus, ValidationEvidenceBundle, ValidationReport,
+        ValidationStatus,
     },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
@@ -41,6 +44,7 @@ const AUTOPILOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
 const VALIDATION_OUTPUT_LIMIT: usize = 8 * 1024;
 const VALIDATION_CAPTURE_LIMIT_BYTES: usize = VALIDATION_OUTPUT_LIMIT * 4;
+const AUTOPILOT_MESSAGE_LIMIT_CHARS: usize = 8 * 1024;
 const ARTIFACT_FINAL_MARKER: &str = ".maco-artifact-final.json";
 
 #[derive(Debug, Clone)]
@@ -293,7 +297,25 @@ pub struct AutopilotAttemptSummary {
     pub review_status: Option<ReviewReportStatus>,
     pub blocking_findings: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_candidate_binding: Option<CandidateValidationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_candidate: Option<AutopilotReviewedCandidate>,
+    #[serde(default)]
+    pub publication_authorized: bool,
+    #[serde(default)]
+    pub publication_attempted: bool,
+    #[serde(default)]
+    pub publication_effect_observed: bool,
+    pub prepublication_stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotReviewedCandidate {
+    pub binding: CandidateValidationBinding,
+    pub reviewer_mode: ReviewerMode,
+    pub authoritative: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -486,6 +508,12 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             pr_status: None,
             review_status: None,
             blocking_findings: 0,
+            prepared_candidate_binding: None,
+            reviewed_candidate: None,
+            publication_authorized: false,
+            publication_attempted: false,
+            publication_effect_observed: false,
+            prepublication_stage: "not_started".to_string(),
             repair_reason: None,
         };
         let (codex_bin, runtime) = match &options.codex_bin {
@@ -581,154 +609,132 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
                 break;
             }
         };
-        let validation_reports = match run_validation_commands(worktree_lease.path(), &plan) {
-            Ok(reports) => reports,
-            Err(error) => {
-                write_failed_report(
-                    &mut artifact_writer,
-                    "pr-report.json",
-                    "validation_execution_failed",
-                    &sanitize_text(&repo, &format!("{error:#}")),
-                )?;
-                write_skipped_report(
-                    &mut artifact_writer,
-                    "review-report.json",
-                    "validation_execution_failed",
-                )?;
-                attempt_summary.repair_reason = Some("validation execution failed".to_string());
-                attempts.push(attempt_summary);
-                next_action =
-                    "repair the validation runtime, then rerun autopilot before publication"
-                        .to_string();
-                break;
-            }
-        };
-        last_validation = validation_summary(validation_reports.clone());
-        attempt_summary.validation_status = last_validation.status;
-        if last_validation.status == AutopilotValidationStatus::Failed {
-            write_skipped_report(&mut artifact_writer, "pr-report.json", "validation_failed")?;
-            write_skipped_report(
-                &mut artifact_writer,
-                "review-report.json",
-                "validation_failed",
-            )?;
-            if attempt < max_attempts {
-                let reason = validation_repair_reason(&last_validation);
-                attempt_summary.repair_reason = Some(reason.clone());
-                repair_reasons.push(reason);
-                attempts.push(attempt_summary);
-                continue;
-            }
-            attempts.push(attempt_summary);
-            next_action =
-                "fix failing validation, rerun autopilot, then have a human review and merge manually"
-                    .to_string();
-            break;
-        }
-
-        let pr_report = match publish_pr_holding_write_lease(
-            &worktree_lease,
-            PrPublicationOptions {
-                repo: repo.clone(),
-                agent_id: agent_id.clone(),
-                claimed_paths: plan.assigned_paths.clone(),
-                validations: validation_reports,
-                forge: plan.forge_mode.into_publication_forge(),
-                draft: plan.publish_mode == AutopilotPublishMode::DraftOnly,
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| {
+                publication::prepare_pr_candidate_with_write_lease(options, &worktree_lease)
             },
-        ) {
-            Ok(report) => report,
-            Err(error) => {
+            validate: |worktree: PathBuf| run_validation_commands(&worktree, &plan),
+            review: review::review_pr,
+            publish: |options, evidence| {
+                publication::publish_prepared_pr_with_write_lease(
+                    options,
+                    &evidence,
+                    &worktree_lease,
+                )
+            },
+        };
+        let outcome = run_prepublication_attempt(
+            &repo,
+            &agent_id,
+            attempt,
+            &plan,
+            &worktree_lease,
+            &mut hooks,
+        );
+        last_validation = outcome.validation.clone();
+        attempt_summary.validation_status = last_validation.status;
+        attempt_summary.prepublication_stage = outcome.reason.clone();
+        attempt_summary.prepared_candidate_binding = outcome.prepared_binding.clone();
+        attempt_summary.reviewed_candidate = outcome.reviewed_candidate.clone();
+        attempt_summary.publication_attempted = outcome.publication_attempted;
+        attempt_summary.publication_effect_observed = outcome.publication_effect_observed;
+        attempt_summary.publication_authorized = outcome.publication_attempted
+            && matches!(
+                plan.forge_mode,
+                AutopilotForgeMode::Git | AutopilotForgeMode::Github
+            )
+            && outcome
+                .reviewed_candidate
+                .as_ref()
+                .is_some_and(|reviewed| reviewed.authoritative);
+        if let Some(review_report) = outcome.review.as_ref() {
+            attempt_summary.review_status = Some(review_report.status);
+            attempt_summary.blocking_findings = review_report.blocking_finding_count;
+            let sanitized_review = sanitize_autopilot_review_report(&repo, review_report);
+            write_private_json(
+                &mut artifact_writer,
+                "review-report.json",
+                &sanitized_review,
+            )?;
+            last_review = Some(sanitized_review);
+        } else {
+            write_skipped_report(&mut artifact_writer, "review-report.json", &outcome.reason)?;
+        }
+
+        if outcome.disposition == PrepublicationDisposition::Published {
+            let pr_report = outcome
+                .publication
+                .context("verified publication outcome lost its publication report")?;
+            let sanitized_pr = sanitize_pr_report(&pr_report);
+            attempt_summary.pr_status = Some(sanitized_pr.status.clone());
+            write_private_json(&mut artifact_writer, "pr-report.json", &sanitized_pr)?;
+            last_pr = Some(sanitized_pr);
+            attempts.push(attempt_summary);
+            status = AutopilotRunStatus::Succeeded;
+            next_action = if plan.forge_mode == AutopilotForgeMode::Fake {
+                "non-authoritative Fake publication simulation completed locally; no branch or pull request was pushed"
+                    .to_string()
+            } else {
+                "independent pre-publication review passed; a human verifies the published draft and merges manually"
+                    .to_string()
+            };
+            drop(worktree_lease);
+            break;
+        }
+
+        if let Some(pr_report) = outcome.publication.as_ref() {
+            if let Some(receipt) = pr_report.publication_receipt.as_ref() {
+                write_private_json(
+                    &mut artifact_writer,
+                    PathBuf::from(format!("publication-receipt-attempt-{attempt}.json")),
+                    receipt,
+                )?;
+            }
+            if pr_report.status == PrPublicationStatus::Published {
                 write_failed_report(
                     &mut artifact_writer,
                     "pr-report.json",
-                    "publication_failed",
-                    &sanitize_text(&repo, &format!("{error:#}")),
+                    &outcome.reason,
+                    &sanitize_text(&repo, &outcome.message),
                 )?;
-                write_skipped_report(
-                    &mut artifact_writer,
-                    "review-report.json",
-                    "publication_failed",
-                )?;
-                attempts.push(attempt_summary);
-                next_action =
-                    "inspect the publication failure, reconcile any durable receipt, and rerun"
-                        .to_string();
-                break;
+                attempt_summary.pr_status = Some("published_unverified".to_string());
+            } else {
+                let sanitized_pr = sanitize_pr_report(pr_report);
+                attempt_summary.pr_status = Some(sanitized_pr.status.clone());
+                write_private_json(&mut artifact_writer, "pr-report.json", &sanitized_pr)?;
             }
-        };
-        let sanitized_pr = sanitize_pr_report(&pr_report);
-        attempt_summary.pr_status = Some(sanitized_pr.status.clone());
-        write_private_json(&mut artifact_writer, "pr-report.json", &sanitized_pr)?;
-        last_pr = Some(sanitized_pr);
-
-        if pr_report.status == PrPublicationStatus::Blocked {
-            write_skipped_report(
+        } else if outcome.reason.contains("failed") {
+            write_failed_report(
                 &mut artifact_writer,
-                "review-report.json",
-                "pr_safety_blocked",
+                "pr-report.json",
+                &outcome.reason,
+                &sanitize_text(&repo, &outcome.message),
             )?;
-            attempts.push(attempt_summary);
-            next_action =
-                "resolve PR safety blockers before review; no automatic merge was performed"
-                    .to_string();
-            break;
+        } else {
+            write_skipped_report(&mut artifact_writer, "pr-report.json", &outcome.reason)?;
         }
-
-        let review_report = match review::review_pr(ReviewPrOptions {
-            repo: repo.clone(),
-            target: pr_report
-                .pr_url
-                .clone()
-                .unwrap_or_else(|| format!("agent-worktree:{agent_id}")),
-            reviewer: plan.reviewer.clone(),
-            attempt,
-            changed_paths: review::normalize_changed_paths(pr_report.changed_paths.clone()),
-            diff_summary: review::diff_summary_from_text(
-                &pr_report.preview.candidate.diff.summary.text,
-            ),
-        }) {
-            Ok(report) => report,
-            Err(error) => {
-                write_failed_report(
-                    &mut artifact_writer,
-                    "review-report.json",
-                    "review_failed",
-                    &sanitize_text(&repo, &format!("{error:#}")),
-                )?;
-                attempts.push(attempt_summary);
-                next_action =
-                    "repair the independent reviewer runtime, then rerun before manual merge"
-                        .to_string();
-                break;
-            }
-        };
-        attempt_summary.review_status = Some(review_report.status);
-        attempt_summary.blocking_findings = review_report.blocking_finding_count;
-        write_private_json(&mut artifact_writer, "review-report.json", &review_report)?;
-        last_review = Some(review_report.clone());
-
-        if review_report.blocking_finding_count > 0 {
-            if attempt < max_attempts {
-                let reason = review_repair_reason(&review_report);
-                attempt_summary.repair_reason = Some(reason.clone());
-                repair_reasons.push(reason);
-                attempts.push(attempt_summary);
-                continue;
-            }
+        let repair_message = sanitize_text(&repo, &outcome.message);
+        if outcome.retryable && attempt < max_attempts {
+            attempt_summary.repair_reason = Some(repair_message.clone());
+            repair_reasons.push(repair_message);
             attempts.push(attempt_summary);
-            next_action =
-                "repair blocking review findings, rerun autopilot, then have a human merge manually"
-                    .to_string();
-            break;
+            continue;
         }
-
+        attempt_summary.repair_reason = Some(repair_message.clone());
         attempts.push(attempt_summary);
-        status = AutopilotRunStatus::Succeeded;
-        next_action =
-            "human reviews the draft pull request and merges manually; autopilot never auto-merges"
-                .to_string();
-        drop(worktree_lease);
+        next_action = if outcome.publication_effect_observed {
+            format!(
+                "{repair_message}; publication was attempted only after validation and independent review, so inspect the durable receipt and reconcile without starting a blind retry"
+            )
+        } else if outcome.publication_attempted {
+            format!(
+                "{repair_message}; the strict publish call ran after validation and review but no external effect was observed, so resolve its candidate or base blocker before retrying"
+            )
+        } else {
+            format!(
+                "{repair_message}; publication was not attempted, so repair the failed pre-publication gate before retrying"
+            )
+        };
         break;
     }
 
@@ -749,7 +755,14 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
         auto_merge_requested: plan.auto_merge,
     });
     write_private_json(&mut artifact_writer, "final-report.json", &report)?;
-    let publish_requested = report.success && real_runtime_requested;
+    let publish_requested = publish_requested_for_audit(
+        real_runtime_requested,
+        plan.forge_mode,
+        report
+            .attempts
+            .iter()
+            .any(|attempt| attempt.publication_attempted),
+    );
     artifact_writer.finalize("final-report.json", publish_requested)?;
     Ok(report)
 }
@@ -997,6 +1010,663 @@ fn supervisor_task(plan: &AutopilotPlan, attempt: usize, repair_reasons: &[Strin
     task
 }
 
+#[derive(Debug, Clone)]
+struct PreparedAutopilotCandidate {
+    binding: CandidateValidationBinding,
+    head: String,
+    changed_paths: Vec<PathBuf>,
+    diff_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrepublicationDisposition {
+    Published,
+    Stopped,
+}
+
+struct AutopilotPrepublicationOutcome {
+    disposition: PrepublicationDisposition,
+    reason: String,
+    message: String,
+    retryable: bool,
+    validation: AutopilotValidationSummary,
+    review: Option<ReviewReport>,
+    prepared_binding: Option<CandidateValidationBinding>,
+    reviewed_candidate: Option<AutopilotReviewedCandidate>,
+    publication: Option<PrPublicationReport>,
+    publication_attempted: bool,
+    publication_effect_observed: bool,
+}
+
+impl AutopilotPrepublicationOutcome {
+    fn with_publication_audit(mut self, attempted: bool, effect_observed: bool) -> Self {
+        self.publication_attempted = attempted;
+        self.publication_effect_observed = effect_observed;
+        self
+    }
+}
+
+struct PrepublicationHooks<P, V, R, U> {
+    prepare: P,
+    validate: V,
+    review: R,
+    publish: U,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stopped_prepublication(
+    reason: &str,
+    message: impl Into<String>,
+    retryable: bool,
+    validation: AutopilotValidationSummary,
+    review: Option<ReviewReport>,
+    prepared_binding: Option<CandidateValidationBinding>,
+    reviewed_candidate: Option<AutopilotReviewedCandidate>,
+    publication: Option<PrPublicationReport>,
+) -> AutopilotPrepublicationOutcome {
+    AutopilotPrepublicationOutcome {
+        disposition: PrepublicationDisposition::Stopped,
+        reason: reason.to_string(),
+        message: message.into(),
+        retryable,
+        validation,
+        review,
+        prepared_binding,
+        reviewed_candidate,
+        publication,
+        publication_attempted: false,
+        publication_effect_observed: false,
+    }
+}
+
+fn run_prepublication_attempt<P, V, R, U>(
+    repo: &Path,
+    agent_id: &str,
+    attempt: usize,
+    plan: &AutopilotPlan,
+    lease: &ManagedWorktreeWriteLease,
+    hooks: &mut PrepublicationHooks<P, V, R, U>,
+) -> AutopilotPrepublicationOutcome
+where
+    P: FnMut(PrPublicationOptions) -> Result<PrPublicationReport>,
+    V: FnMut(PathBuf) -> Result<Vec<ValidationReport>>,
+    R: FnMut(ReviewPrOptions) -> Result<ReviewReport>,
+    U: FnMut(PrPublicationOptions, BoundValidationEvidenceBundle) -> Result<PrPublicationReport>,
+{
+    let skipped_validation = || AutopilotValidationSummary {
+        status: AutopilotValidationStatus::Skipped,
+        reports: Vec::new(),
+    };
+    let forge = plan.forge_mode.into_publication_forge();
+    let publication_options = || PrPublicationOptions {
+        repo: repo.to_path_buf(),
+        agent_id: agent_id.to_string(),
+        claimed_paths: plan.assigned_paths.clone(),
+        validations: Vec::new(),
+        forge,
+        draft: plan.publish_mode == AutopilotPublishMode::DraftOnly,
+    };
+
+    let prepared_report = match (hooks.prepare)(publication_options()) {
+        Ok(report) => report,
+        Err(error) => {
+            return stopped_prepublication(
+                "preparation_failed",
+                format!("candidate preparation failed: {error:#}"),
+                true,
+                skipped_validation(),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+    };
+    if prepared_report.status == PrPublicationStatus::Blocked {
+        return stopped_prepublication(
+            "preparation_blocked",
+            "candidate preparation was blocked before validation",
+            true,
+            skipped_validation(),
+            None,
+            None,
+            None,
+            Some(prepared_report),
+        );
+    }
+    let prepared =
+        match prepared_candidate_from_report(&prepared_report, repo, agent_id, forge, lease) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return stopped_prepublication(
+                    "preparation_invalid",
+                    format!(
+                        "candidate preparation did not return a clean exact preview: {error:#}"
+                    ),
+                    true,
+                    skipped_validation(),
+                    None,
+                    None,
+                    None,
+                    Some(prepared_report),
+                )
+            }
+        };
+    let prepared_binding = prepared.binding.clone();
+
+    let validation_reports = match (hooks.validate)(lease.path().to_path_buf()) {
+        Ok(reports) => reports,
+        Err(error) => {
+            return stopped_prepublication(
+                "validation_execution_failed",
+                format!("validation execution failed: {error:#}"),
+                true,
+                skipped_validation(),
+                None,
+                Some(prepared_binding),
+                None,
+                None,
+            )
+        }
+    };
+    let validation = validation_summary(validation_reports.clone());
+    if validation.status == AutopilotValidationStatus::Failed {
+        return stopped_prepublication(
+            "validation_failed",
+            validation_repair_reason(&validation),
+            true,
+            validation,
+            None,
+            Some(prepared_binding),
+            None,
+            None,
+        );
+    }
+    let bound_evidence =
+        match ValidationEvidenceBundle::bound_to(prepared.binding.clone(), validation_reports) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return stopped_prepublication(
+                    "validation_evidence_invalid",
+                    format!("strict candidate-bound validation evidence was refused: {error:#}"),
+                    false,
+                    validation,
+                    None,
+                    Some(prepared_binding),
+                    None,
+                    None,
+                )
+            }
+        };
+
+    if let Err(outcome) = reverify_prepared_candidate(
+        publication_options(),
+        agent_id,
+        &prepared.binding,
+        lease,
+        &mut hooks.prepare,
+        "after validation",
+        validation.clone(),
+        None,
+        None,
+    ) {
+        return *outcome;
+    }
+
+    let real_publication = matches!(forge, ForgeKind::Git | ForgeKind::Github);
+    if !reviewer_mode_may_authorize_publication(forge, plan.reviewer.mode) {
+        return stopped_prepublication(
+            "reviewer_not_authoritative",
+            "real Git or GitHub publication requires a successful ExternalCommand reviewer; Fake review is non-authoritative",
+            false,
+            validation,
+            None,
+            Some(prepared_binding),
+            None,
+            None,
+        );
+    }
+
+    let review_target = format!("prepared-candidate:{agent_id}@{}", prepared.head);
+    let review_paths = review::normalize_changed_paths(prepared.changed_paths.clone());
+    let review_report = match (hooks.review)(ReviewPrOptions {
+        repo: lease.path().to_path_buf(),
+        target: review_target.clone(),
+        reviewer: plan.reviewer.clone(),
+        attempt,
+        changed_paths: review_paths.clone(),
+        diff_summary: prepared.diff_summary.clone(),
+    }) {
+        Ok(report) => report,
+        Err(error) => {
+            return stopped_prepublication(
+                "review_execution_failed",
+                format!("independent pre-publication review failed: {error:#}"),
+                true,
+                validation,
+                None,
+                Some(prepared_binding),
+                None,
+                None,
+            )
+        }
+    };
+    let reviewer_authoritative = plan.reviewer.mode == ReviewerMode::ExternalCommand
+        && review_report.reviewer.mode == ReviewerMode::ExternalCommand;
+    let reviewed_candidate = AutopilotReviewedCandidate {
+        binding: prepared.binding.clone(),
+        reviewer_mode: review_report.reviewer.mode,
+        authoritative: reviewer_authoritative,
+    };
+    let actual_blocking = review_report
+        .findings
+        .iter()
+        .filter(|finding| finding.blocking)
+        .count();
+    if review_report.target != review_target
+        || review_report.attempt != attempt
+        || review_report.changed_paths != review_paths
+        || review_report.blocking_finding_count != actual_blocking
+        || review_report.reviewer.mode != plan.reviewer.mode
+    {
+        return stopped_prepublication(
+            "review_evidence_invalid",
+            "independent reviewer returned evidence for a different candidate, attempt, path set, or reviewer mode",
+            true,
+            validation,
+            Some(review_report),
+            Some(prepared_binding),
+            Some(reviewed_candidate),
+            None,
+        );
+    }
+    if review_report.status == ReviewReportStatus::Blocked
+        || review_report.blocking_finding_count > 0
+    {
+        let message = review_repair_reason(&review_report);
+        return stopped_prepublication(
+            "review_blocked",
+            message,
+            true,
+            validation,
+            Some(review_report),
+            Some(prepared_binding),
+            Some(reviewed_candidate),
+            None,
+        );
+    }
+    if review_report.status != ReviewReportStatus::Passed || !review_report.success {
+        return stopped_prepublication(
+            "review_failed",
+            "independent reviewer did not return a successful Passed report",
+            true,
+            validation,
+            Some(review_report),
+            Some(prepared_binding),
+            Some(reviewed_candidate),
+            None,
+        );
+    }
+    if real_publication && !reviewer_authoritative {
+        return stopped_prepublication(
+            "reviewer_not_authoritative",
+            "real publication requires authoritative ExternalCommand review evidence",
+            false,
+            validation,
+            Some(review_report),
+            Some(prepared_binding),
+            Some(reviewed_candidate),
+            None,
+        );
+    }
+
+    if let Err(outcome) = reverify_prepared_candidate(
+        publication_options(),
+        agent_id,
+        &prepared.binding,
+        lease,
+        &mut hooks.prepare,
+        "after independent review",
+        validation.clone(),
+        Some(review_report.clone()),
+        Some(reviewed_candidate.clone()),
+    ) {
+        return *outcome;
+    }
+
+    let publication_report = match (hooks.publish)(publication_options(), bound_evidence) {
+        Ok(report) => report,
+        Err(error) => {
+            let mut outcome = stopped_prepublication(
+                "publication_failed",
+                format!("strict prepared publication failed: {error:#}"),
+                false,
+                validation,
+                Some(review_report),
+                Some(prepared_binding),
+                Some(reviewed_candidate),
+                None,
+            );
+            outcome.publication_attempted = true;
+            return outcome;
+        }
+    };
+    let effect_observed = publication_effect_observed(&publication_report);
+    let receipt_result =
+        verify_publication_receipt(&publication_report, &prepared.binding, forge, agent_id);
+    let final_candidate_result = reverify_prepared_candidate(
+        publication_options(),
+        agent_id,
+        &prepared.binding,
+        lease,
+        &mut hooks.prepare,
+        "after publication",
+        validation.clone(),
+        Some(review_report.clone()),
+        Some(reviewed_candidate.clone()),
+    );
+
+    if publication_report.status != PrPublicationStatus::Published {
+        let has_durable_receipt = publication_report.publication_receipt.is_some();
+        return stopped_prepublication(
+            "publication_blocked",
+            "strict publication did not reach a verified Published state",
+            false,
+            validation,
+            Some(review_report),
+            Some(prepared_binding),
+            Some(reviewed_candidate),
+            Some(publication_report),
+        )
+        .with_publication_audit(true, effect_observed || has_durable_receipt);
+    }
+    if let Err(error) = receipt_result {
+        return stopped_prepublication(
+            "publication_receipt_invalid",
+            format!("publication receipt did not verify: {error:#}"),
+            false,
+            validation,
+            Some(review_report),
+            Some(prepared_binding),
+            Some(reviewed_candidate),
+            Some(publication_report),
+        )
+        .with_publication_audit(true, effect_observed);
+    }
+    if let Err(mut outcome) = final_candidate_result {
+        outcome.publication = Some(publication_report);
+        outcome.retryable = false;
+        outcome.publication_attempted = true;
+        outcome.publication_effect_observed = effect_observed;
+        return *outcome;
+    }
+
+    AutopilotPrepublicationOutcome {
+        disposition: PrepublicationDisposition::Published,
+        reason: "verified_published".to_string(),
+        message: "prepared candidate passed validation, independent review, strict publication, receipt verification, and final candidate verification".to_string(),
+        retryable: false,
+        validation,
+        review: Some(review_report),
+        prepared_binding: Some(prepared.binding),
+        reviewed_candidate: Some(reviewed_candidate),
+        publication: Some(publication_report),
+        publication_attempted: true,
+        publication_effect_observed: effect_observed,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reverify_prepared_candidate<P>(
+    options: PrPublicationOptions,
+    agent_id: &str,
+    expected_binding: &CandidateValidationBinding,
+    lease: &ManagedWorktreeWriteLease,
+    prepare: &mut P,
+    phase: &str,
+    validation: AutopilotValidationSummary,
+    review: Option<ReviewReport>,
+    reviewed_candidate: Option<AutopilotReviewedCandidate>,
+) -> std::result::Result<(), Box<AutopilotPrepublicationOutcome>>
+where
+    P: FnMut(PrPublicationOptions) -> Result<PrPublicationReport>,
+{
+    let expected_repo = options.repo.clone();
+    let expected_forge = options.forge;
+    let report = match prepare(options) {
+        Ok(report) => report,
+        Err(error) => {
+            return Err(Box::new(stopped_prepublication(
+                "candidate_reverification_failed",
+                format!("candidate reverification failed {phase}: {error:#}"),
+                true,
+                validation,
+                review,
+                Some(expected_binding.clone()),
+                reviewed_candidate,
+                None,
+            )))
+        }
+    };
+    if report.status == PrPublicationStatus::Blocked {
+        return Err(Box::new(stopped_prepublication(
+            "candidate_reverification_blocked",
+            format!("candidate reverification was blocked {phase}"),
+            true,
+            validation,
+            review,
+            Some(expected_binding.clone()),
+            reviewed_candidate,
+            Some(report),
+        )));
+    }
+    let current = match prepared_candidate_from_report(
+        &report,
+        &expected_repo,
+        agent_id,
+        expected_forge,
+        lease,
+    ) {
+        Ok(current) => current,
+        Err(error) => {
+            return Err(Box::new(stopped_prepublication(
+                "candidate_reverification_invalid",
+                format!("candidate reverification was invalid {phase}: {error:#}"),
+                true,
+                validation,
+                review,
+                Some(expected_binding.clone()),
+                reviewed_candidate,
+                Some(report),
+            )))
+        }
+    };
+    if &current.binding != expected_binding {
+        return Err(Box::new(stopped_prepublication(
+            "candidate_binding_mismatch",
+            format!("candidate or primary binding changed {phase}"),
+            true,
+            validation,
+            review,
+            Some(expected_binding.clone()),
+            reviewed_candidate,
+            None,
+        )));
+    }
+    Ok(())
+}
+
+fn prepared_candidate_from_report(
+    report: &PrPublicationReport,
+    expected_repo: &Path,
+    agent_id: &str,
+    expected_forge: ForgeKind,
+    lease: &ManagedWorktreeWriteLease,
+) -> Result<PreparedAutopilotCandidate> {
+    if report.status != PrPublicationStatus::Preview
+        || report.readiness == ApplyReadinessStatus::Blocked
+    {
+        bail!("prepared candidate must be a non-blocked Preview");
+    }
+    if report.forge != expected_forge {
+        bail!("prepared candidate forge does not match the requested forge");
+    }
+    if report.agent_id != agent_id
+        || report.preview.candidate.metadata.agent_id != agent_id
+        || report.preview.candidate.validation_binding.agent_id != agent_id
+    {
+        bail!("prepared candidate belongs to a different agent");
+    }
+    if report.preview.candidate.metadata.worktree_path != lease.path() {
+        bail!(
+            "prepared candidate report names a different managed worktree than the retained lease"
+        );
+    }
+    let expected_repo = discover_repo_root(expected_repo)?;
+    if report.preview.candidate.metadata.primary_repo_root != expected_repo {
+        bail!("prepared candidate report names a different primary repository");
+    }
+    WorktreeManager::new(&expected_repo).verify_write_execution_lease(agent_id, lease)?;
+    if report.pushed
+        || report.created
+        || report.pr_url.is_some()
+        || report.publication_receipt.is_some()
+    {
+        bail!("candidate preparation unexpectedly performed an external publication effect");
+    }
+    let binding = report.preview.candidate.validation_binding.clone();
+    let head = binding
+        .agent_head
+        .clone()
+        .context("prepared candidate binding has no agent HEAD")?;
+    if report.commit_id.as_deref() != Some(&head)
+        || report.head_id.as_deref() != Some(&head)
+        || report.preview.candidate.metadata.agent_head.as_deref() != Some(&head)
+        || report.base_head != binding.primary_head
+        || report.preview.candidate.metadata.primary_head != binding.primary_head
+        || report.preview.candidate.metadata.merge_base != binding.merge_base
+    {
+        bail!("prepared candidate report metadata disagrees with its exact validation binding");
+    }
+    if !repository_worktree_is_clean(&report.preview.candidate.metadata.worktree_path)? {
+        bail!("prepared candidate worktree is not clean");
+    }
+    Ok(PreparedAutopilotCandidate {
+        binding,
+        head,
+        changed_paths: report.changed_paths.clone(),
+        diff_summary: Some(report.preview.candidate.diff.summary.text.clone()),
+    })
+}
+
+fn repository_worktree_is_clean(worktree: &Path) -> Result<bool> {
+    let repo = Repository::open(worktree)
+        .with_context(|| format!("failed to open prepared worktree {}", worktree.display()))?;
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let clean = repo.statuses(Some(&mut options))?.is_empty();
+    Ok(clean)
+}
+
+fn verify_publication_receipt(
+    report: &PrPublicationReport,
+    binding: &CandidateValidationBinding,
+    expected_forge: ForgeKind,
+    expected_agent_id: &str,
+) -> Result<()> {
+    if report.status != PrPublicationStatus::Published
+        || report.forge != expected_forge
+        || report.agent_id != expected_agent_id
+        || report.preview.candidate.validation_binding != *binding
+        || report.preview.candidate.metadata.agent_id != expected_agent_id
+        || report.base_head != binding.primary_head
+        || report.preview.candidate.metadata.primary_head != binding.primary_head
+        || report.preview.candidate.metadata.merge_base != binding.merge_base
+    {
+        bail!(
+            "publication report forge, agent, base, or candidate does not match the reviewed binding"
+        );
+    }
+    let expected_head = binding
+        .agent_head
+        .as_deref()
+        .context("reviewed candidate binding has no agent HEAD")?;
+    if report.head_id.as_deref() != Some(expected_head)
+        || report.commit_id.as_deref() != Some(expected_head)
+    {
+        bail!("publication report HEAD does not match the reviewed candidate binding");
+    }
+    match report.forge {
+        ForgeKind::Fake => {
+            if report.pushed
+                || !report.created
+                || report.pr_url.is_none()
+                || report.publication_receipt.is_some()
+            {
+                bail!("Fake publication must remain a receipt-free local simulation");
+            }
+        }
+        ForgeKind::Git | ForgeKind::Github => {
+            let receipt = report
+                .publication_receipt
+                .as_ref()
+                .context("real publication has no durable receipt")?;
+            if receipt.phase != publication::PublicationTransactionPhase::Completed
+                || receipt.expected_oid != expected_head
+                || receipt.expected_base_oid != binding.primary_head
+                || receipt.push_observed_oid.as_deref() != Some(expected_head)
+                || !report.pushed
+            {
+                bail!("real publication receipt does not prove the expected completed push");
+            }
+            match report.forge {
+                ForgeKind::Github => {
+                    if receipt.pr_head_oid.as_deref() != Some(expected_head)
+                        || receipt.pr_url.as_deref() != report.pr_url.as_deref()
+                        || receipt.pr_base.as_deref() != Some(report.base.as_str())
+                        || report.pr_url.is_none()
+                    {
+                        bail!(
+                            "GitHub publication receipt does not prove the expected pull request and base"
+                        );
+                    }
+                }
+                ForgeKind::Git => {
+                    if report.created
+                        || report.pr_url.is_some()
+                        || receipt.pr_url.is_some()
+                        || receipt.pr_head_oid.is_some()
+                        || receipt.pr_base.is_some()
+                    {
+                        bail!("Git publication receipt unexpectedly claims a pull request effect");
+                    }
+                }
+                ForgeKind::Fake => {
+                    bail!("real publication receipt unexpectedly used the Fake forge")
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn publication_effect_observed(report: &PrPublicationReport) -> bool {
+    report.pushed
+        || report.created
+        || report.pr_url.is_some()
+        || report.publication_receipt.as_ref().is_some_and(|receipt| {
+            receipt.push_observed_oid.is_some()
+                || receipt.pr_url.is_some()
+                || receipt.pr_head_oid.is_some()
+                || receipt.create_attempted
+                || receipt.created_by_transaction
+                || receipt.observed_existing_pr
+        })
+}
+
 fn run_validation_commands(worktree: &Path, plan: &AutopilotPlan) -> Result<Vec<ValidationReport>> {
     let mut reports = Vec::new();
     for (index, validation) in plan.validation_commands.iter().enumerate() {
@@ -1009,7 +1679,7 @@ fn run_validation_commands(worktree: &Path, plan: &AutopilotPlan) -> Result<Vec<
         let passed = output.safety_sensitive_succeeded();
         let mut message = validation_failure_message(&output, validation.timeout_seconds);
         if let Some(text) = message.as_mut() {
-            *text = sanitize_validation_message(text);
+            *text = sanitize_validation_message(worktree, text);
         }
         reports.push(ValidationReport {
             name: validation
@@ -1030,17 +1700,6 @@ fn run_validation_commands(worktree: &Path, plan: &AutopilotPlan) -> Result<Vec<
         });
     }
     Ok(reports)
-}
-
-/// Publication mutates and repeatedly snapshots the selected worktree. The
-/// write lease is therefore an explicit argument even while the publication
-/// module migrates to its borrowed-authority entrypoint. The lease must remain
-/// live through publication, independent review, and final quiescence.
-fn publish_pr_holding_write_lease(
-    lease: &ManagedWorktreeWriteLease,
-    options: PrPublicationOptions,
-) -> Result<PrPublicationReport> {
-    publication::publish_pr_with_write_lease(options, lease)
 }
 
 fn acquire_autopilot_worktree_write_lease(
@@ -1266,6 +1925,39 @@ fn sanitize_pr_report(report: &PrPublicationReport) -> SanitizedPrReport {
         body_summary: report.body_summary.text.clone(),
         body_truncated: report.body_summary.truncated,
     }
+}
+
+fn sanitize_autopilot_review_report(repo: &Path, report: &ReviewReport) -> ReviewReport {
+    let mut sanitized = report.clone();
+    sanitized.target = sanitize_text(repo, &sanitized.target);
+    sanitized.reviewer.reviewer_id = sanitize_text(repo, &sanitized.reviewer.reviewer_id);
+    sanitized.reviewer.model = sanitize_text(repo, &sanitized.reviewer.model);
+    sanitized.changed_paths = sanitized
+        .changed_paths
+        .iter()
+        .filter_map(|path| public_report_path(repo, path))
+        .collect();
+    for finding in &mut sanitized.findings {
+        finding.path = finding
+            .path
+            .as_ref()
+            .and_then(|path| public_report_path(repo, path));
+        finding.severity = sanitize_text(repo, &finding.severity);
+        finding.summary = sanitize_text(repo, &finding.summary);
+        finding.suggested_fix = sanitize_text(repo, &finding.suggested_fix);
+    }
+    sanitized.diff_source = sanitize_text(repo, &sanitized.diff_source);
+    sanitized.ci_reaction = sanitize_text(repo, &sanitized.ci_reaction);
+    sanitized.next_action = sanitize_text(repo, &sanitized.next_action);
+    if let Some(diagnostics) = sanitized.diagnostics.as_mut() {
+        diagnostics.stdout.text = sanitize_text(repo, &diagnostics.stdout.text);
+        diagnostics.stderr.text = sanitize_text(repo, &diagnostics.stderr.text);
+        diagnostics.process_error = diagnostics
+            .process_error
+            .as_deref()
+            .map(|message| sanitize_text(repo, message));
+    }
+    sanitized
 }
 
 fn validation_summary(reports: Vec<ValidationReport>) -> AutopilotValidationSummary {
@@ -1595,15 +2287,42 @@ fn public_report_path(repo: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 fn sanitize_text(repo: &Path, text: &str) -> String {
-    let mut sanitized = text.replace(&repo.display().to_string(), ".");
+    let mut redactor =
+        Redactor::new().with_private_value("repository-path", repo.display().to_string());
     if let Some(parent) = repo.parent() {
-        sanitized = sanitized.replace(&parent.display().to_string(), "<repo-parent>");
+        redactor = redactor.with_private_value("repository-parent", parent.display().to_string());
     }
-    sanitized
+    if let Ok(repository) = Repository::open(repo) {
+        redactor = redactor
+            .with_private_value("git-path", repository.path().display().to_string())
+            .with_private_value(
+                "git-common-path",
+                repository.commondir().display().to_string(),
+            );
+        if let Some(primary_root) = repository.commondir().parent() {
+            redactor = redactor.with_private_value(
+                "primary-repository-path",
+                primary_root.display().to_string(),
+            );
+        }
+    }
+    let without_controls = text
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    let redacted = redactor.redact(&without_controls).text;
+    let mut bounded = redacted
+        .chars()
+        .take(AUTOPILOT_MESSAGE_LIMIT_CHARS)
+        .collect::<String>();
+    if redacted.chars().count() > AUTOPILOT_MESSAGE_LIMIT_CHARS {
+        bounded.push_str("…<truncated>");
+    }
+    bounded
 }
 
-fn sanitize_validation_message(text: &str) -> String {
-    text.replace('\0', "")
+fn sanitize_validation_message(worktree: &Path, text: &str) -> String {
+    sanitize_text(worktree, text)
 }
 
 fn default_autopilot_schema_version() -> u32 {
@@ -1622,6 +2341,18 @@ impl AutopilotForgeMode {
             Self::Github => ForgeKind::Github,
         }
     }
+}
+
+fn reviewer_mode_may_authorize_publication(forge: ForgeKind, reviewer_mode: ReviewerMode) -> bool {
+    matches!(forge, ForgeKind::Fake) || reviewer_mode == ReviewerMode::ExternalCommand
+}
+
+fn publish_requested_for_audit(
+    real_runtime_requested: bool,
+    forge_mode: AutopilotForgeMode,
+    publication_attempted: bool,
+) -> bool {
+    real_runtime_requested && forge_mode != AutopilotForgeMode::Fake && publication_attempted
 }
 
 fn pr_status_label(status: PrPublicationStatus) -> &'static str {
@@ -1691,7 +2422,12 @@ fn finding_severity_label(severity: FindingSeverity) -> &'static str {
 mod tests {
     use super::*;
     use crate::worktree::WorktreeCreateOptions;
-    use std::{sync::mpsc, thread, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
 
     fn create_managed_worktree_fixture(root: &Path, agent_id: &str) -> (PathBuf, WorktreeManager) {
         let repo_path = root.join("repo");
@@ -1721,6 +2457,117 @@ mod tests {
             })
             .expect("create managed worktree");
         (repo_path, manager)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_prepublication_fixture(
+        root: &Path,
+        agent_id: &str,
+    ) -> (PathBuf, WorktreeManager, PathBuf) {
+        let (repo, manager) = create_managed_worktree_fixture(root, agent_id);
+        let record = manager
+            .get_managed_verified(agent_id)
+            .expect("verified managed worktree");
+        fs::write(
+            record.path.join("README.md"),
+            format!("# Prepared candidate for {agent_id}\n"),
+        )
+        .expect("edit candidate README");
+        (repo, manager, record.path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepublication_test_plan(
+        forge_mode: AutopilotForgeMode,
+        reviewer_mode: ReviewerMode,
+    ) -> AutopilotPlan {
+        AutopilotPlan {
+            version: AUTOPILOT_SCHEMA_VERSION,
+            task: AutopilotTask {
+                title: "Strict pre-publication test".to_string(),
+                body: "Exercise the exact prepared candidate gate.".to_string(),
+            },
+            assigned_paths: vec![PathBuf::from("README.md")],
+            path_proposal: planning::TaskPathProposalDiagnostics::default(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            validation_commands: Vec::new(),
+            max_repair_attempts: 1,
+            forge_mode,
+            reviewer: ReviewerConfig {
+                mode: reviewer_mode,
+                blocking_attempts: 0,
+                finding: None,
+                command: (reviewer_mode == ReviewerMode::ExternalCommand)
+                    .then(|| "injected-review".to_string()),
+                timeout_seconds: None,
+            },
+            publish_mode: AutopilotPublishMode::DraftOnly,
+            auto_merge: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn passed_prepublication_validation() -> Vec<ValidationReport> {
+        vec![ValidationReport {
+            name: "prepared-unit".to_string(),
+            status: ValidationStatus::Passed,
+            message: None,
+            paths: vec![PathBuf::from("README.md")],
+        }]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn injected_external_review(
+        options: ReviewPrOptions,
+        status: ReviewReportStatus,
+    ) -> ReviewReport {
+        let blocked = status == ReviewReportStatus::Blocked;
+        let findings = if blocked {
+            vec![review::ReviewFinding {
+                severity: "error".to_string(),
+                path: Some(PathBuf::from("README.md")),
+                summary: "injected blocking finding".to_string(),
+                suggested_fix: "repair before publication".to_string(),
+                blocking: true,
+            }]
+        } else {
+            Vec::new()
+        };
+        ReviewReport {
+            status,
+            success: status == ReviewReportStatus::Passed,
+            target: options.target,
+            reviewer: review::ReviewerIdentity {
+                mode: ReviewerMode::ExternalCommand,
+                reviewer_id: "injected-external-reviewer".to_string(),
+                model: "injected-model".to_string(),
+            },
+            attempt: options.attempt,
+            blocking_finding_count: findings.len(),
+            findings,
+            changed_paths: options.changed_paths,
+            diff_source: "sanitized_merge_candidate_summary".to_string(),
+            ci_reaction_supported: false,
+            ci_reaction: "unsupported".to_string(),
+            diagnostics: None,
+            next_action: "continue only after the strict gate".to_string(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publication_transactions_path(repo: &Path) -> PathBuf {
+        repo.join(".git/maco/state/publication-transactions")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_remote_publication_state(repo: &Path) {
+        assert!(!publication_transactions_path(repo).exists());
+        let repository = Repository::open(repo).expect("open primary repository");
+        let mut references = repository
+            .references_glob("refs/remotes/*")
+            .expect("list remote refs");
+        assert!(references.next().is_none(), "unexpected remote reference");
     }
 
     #[test]
@@ -1754,6 +2601,444 @@ mod tests {
 
         let error = result.expect_err("empty proposal must be refused");
         assert!(error.to_string().contains("assigned paths are empty"));
+    }
+
+    #[test]
+    fn real_forges_require_external_reviewer_authority() {
+        assert!(reviewer_mode_may_authorize_publication(
+            ForgeKind::Fake,
+            ReviewerMode::Fake
+        ));
+        assert!(!reviewer_mode_may_authorize_publication(
+            ForgeKind::Git,
+            ReviewerMode::Fake
+        ));
+        assert!(!reviewer_mode_may_authorize_publication(
+            ForgeKind::Github,
+            ReviewerMode::Fake
+        ));
+        assert!(reviewer_mode_may_authorize_publication(
+            ForgeKind::Git,
+            ReviewerMode::ExternalCommand
+        ));
+    }
+
+    #[test]
+    fn publish_requested_records_failed_real_attempts_but_not_fake_simulation() {
+        assert!(publish_requested_for_audit(
+            true,
+            AutopilotForgeMode::Github,
+            true
+        ));
+        assert!(!publish_requested_for_audit(
+            true,
+            AutopilotForgeMode::Github,
+            false
+        ));
+        assert!(!publish_requested_for_audit(
+            true,
+            AutopilotForgeMode::Fake,
+            true
+        ));
+        assert!(!publish_requested_for_audit(
+            false,
+            AutopilotForgeMode::Git,
+            true
+        ));
+    }
+
+    #[test]
+    fn autopilot_message_sanitization_redacts_paths_secrets_and_bounds_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("private-repo");
+        Repository::init(&repo).expect("init repository");
+        let secret = "autopilot-private-secret";
+        let message = format!(
+            "repo={}\nAPI_TOKEN={secret}\n{}\0",
+            repo.display(),
+            "x".repeat(AUTOPILOT_MESSAGE_LIMIT_CHARS * 2)
+        );
+
+        let sanitized = sanitize_text(&repo, &message);
+
+        assert!(!sanitized.contains(&repo.display().to_string()));
+        assert!(!sanitized.contains(secret));
+        assert!(!sanitized.contains('\0'));
+        assert!(sanitized.contains("<redacted:"));
+        assert!(sanitized.ends_with("…<truncated>"));
+        assert!(
+            sanitized.chars().count()
+                <= AUTOPILOT_MESSAGE_LIMIT_CHARS + "…<truncated>".chars().count()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_prepublication_orders_prepare_validate_review_publish_under_one_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "order-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+            .expect("autopilot write lease");
+        let plan =
+            prepublication_test_plan(AutopilotForgeMode::Fake, ReviewerMode::ExternalCommand);
+        let trace = RefCell::new(Vec::new());
+        let publish_calls = Cell::new(0usize);
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| {
+                trace.borrow_mut().push("prepare");
+                publication::prepare_pr_candidate_with_write_lease(options, &lease)
+            },
+            validate: |_| {
+                trace.borrow_mut().push("validate");
+                Ok(passed_prepublication_validation())
+            },
+            review: |options| {
+                trace.borrow_mut().push("review");
+                Ok(injected_external_review(
+                    options,
+                    ReviewReportStatus::Passed,
+                ))
+            },
+            publish: |options, evidence| {
+                trace.borrow_mut().push("publish");
+                publish_calls.set(publish_calls.get() + 1);
+                publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
+            },
+        };
+
+        let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
+
+        assert_eq!(
+            trace.into_inner(),
+            vec!["prepare", "validate", "prepare", "review", "prepare", "publish", "prepare"]
+        );
+        assert_eq!(publish_calls.get(), 1);
+        assert_eq!(outcome.disposition, PrepublicationDisposition::Published);
+        assert!(outcome.publication_attempted);
+        assert!(outcome.publication_effect_observed);
+        assert!(outcome
+            .reviewed_candidate
+            .as_ref()
+            .is_some_and(|reviewed| reviewed.authoritative));
+        assert_no_remote_publication_state(&repo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_publication_rejects_fake_blocking_and_failed_review_before_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "review-gate-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+            .expect("autopilot write lease");
+        let review_calls = Cell::new(0usize);
+        let publish_calls = Cell::new(0usize);
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            validate: |_| Ok(passed_prepublication_validation()),
+            review: |options: ReviewPrOptions| {
+                review_calls.set(review_calls.get() + 1);
+                let status = match options.reviewer.command.as_deref() {
+                    Some("blocked") => ReviewReportStatus::Blocked,
+                    Some("failed") => ReviewReportStatus::Failed,
+                    _ => ReviewReportStatus::Passed,
+                };
+                Ok(injected_external_review(options, status))
+            },
+            publish: |_, _| {
+                publish_calls.set(publish_calls.get() + 1);
+                bail!("publish must not be called for rejected review")
+            },
+        };
+
+        let fake_plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::Fake);
+        let fake = run_prepublication_attempt(&repo, agent_id, 1, &fake_plan, &lease, &mut hooks);
+        assert_eq!(fake.reason, "reviewer_not_authoritative");
+        assert!(!fake.publication_attempted);
+        assert_eq!(review_calls.get(), 0);
+
+        let mut blocked_plan =
+            prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
+        blocked_plan.reviewer.command = Some("blocked".to_string());
+        let blocked =
+            run_prepublication_attempt(&repo, agent_id, 1, &blocked_plan, &lease, &mut hooks);
+        assert_eq!(blocked.reason, "review_blocked");
+        assert!(!blocked.publication_attempted);
+
+        let mut failed_plan = blocked_plan;
+        failed_plan.reviewer.command = Some("failed".to_string());
+        let failed =
+            run_prepublication_attempt(&repo, agent_id, 1, &failed_plan, &lease, &mut hooks);
+        assert_eq!(failed.reason, "review_failed");
+        assert!(!failed.publication_attempted);
+        assert_eq!(review_calls.get(), 2);
+        assert_eq!(publish_calls.get(), 0);
+        assert_no_remote_publication_state(&repo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_validation_refuses_real_publication_before_review_or_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "empty-validation-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+            .expect("autopilot write lease");
+        let plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
+        let review_calls = Cell::new(0usize);
+        let publish_calls = Cell::new(0usize);
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            validate: |_| Ok(Vec::new()),
+            review: |options| {
+                review_calls.set(review_calls.get() + 1);
+                Ok(injected_external_review(
+                    options,
+                    ReviewReportStatus::Passed,
+                ))
+            },
+            publish: |_, _| {
+                publish_calls.set(publish_calls.get() + 1);
+                bail!("empty validation must stop before publication")
+            },
+        };
+
+        let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
+
+        assert_eq!(outcome.reason, "validation_evidence_invalid");
+        assert!(!outcome.publication_attempted);
+        assert_eq!(review_calls.get(), 0);
+        assert_eq!(publish_calls.get(), 0);
+        assert_no_remote_publication_state(&repo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_mutation_changes_binding_and_prevents_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "review-mutation-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+            .expect("autopilot write lease");
+        let plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
+        let publish_calls = Cell::new(0usize);
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            validate: |_| Ok(passed_prepublication_validation()),
+            review: |options: ReviewPrOptions| {
+                fs::write(
+                    options.repo.join("README.md"),
+                    "# Mutated during independent review\n",
+                )
+                .expect("inject review mutation");
+                Ok(injected_external_review(
+                    options,
+                    ReviewReportStatus::Passed,
+                ))
+            },
+            publish: |_, _| {
+                publish_calls.set(publish_calls.get() + 1);
+                bail!("mutated review candidate must not publish")
+            },
+        };
+
+        let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
+
+        assert_eq!(outcome.reason, "candidate_binding_mismatch");
+        assert!(!outcome.publication_attempted);
+        assert_eq!(publish_calls.get(), 0);
+        assert_no_remote_publication_state(&repo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_forge_with_fake_reviewer_is_local_and_non_authoritative() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "fake-local-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+            .expect("autopilot write lease");
+        let plan = prepublication_test_plan(AutopilotForgeMode::Fake, ReviewerMode::Fake);
+        let publish_calls = Cell::new(0usize);
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            validate: |_| Ok(passed_prepublication_validation()),
+            review: review::review_pr,
+            publish: |options, evidence| {
+                publish_calls.set(publish_calls.get() + 1);
+                publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
+            },
+        };
+
+        let outcome = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
+
+        assert_eq!(outcome.disposition, PrepublicationDisposition::Published);
+        assert_eq!(publish_calls.get(), 1);
+        assert!(outcome
+            .reviewed_candidate
+            .as_ref()
+            .is_some_and(|reviewed| !reviewed.authoritative));
+        assert_eq!(
+            outcome.publication.as_ref().map(|report| report.forge),
+            Some(ForgeKind::Fake)
+        );
+        assert_no_remote_publication_state(&repo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepublication_retry_reuses_prepared_commit_without_duplicate_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "retry-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+            .expect("autopilot write lease");
+        let mut plan = prepublication_test_plan(AutopilotForgeMode::Fake, ReviewerMode::Fake);
+        plan.reviewer.blocking_attempts = 1;
+        let publish_calls = Cell::new(0usize);
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            validate: |_| Ok(passed_prepublication_validation()),
+            review: review::review_pr,
+            publish: |options, evidence| {
+                publish_calls.set(publish_calls.get() + 1);
+                publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)
+            },
+        };
+
+        let first = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
+        assert_eq!(first.reason, "review_blocked");
+        assert!(!first.publication_attempted);
+        assert_eq!(publish_calls.get(), 0);
+
+        let second = run_prepublication_attempt(&repo, agent_id, 2, &plan, &lease, &mut hooks);
+        assert_eq!(second.disposition, PrepublicationDisposition::Published);
+        assert_eq!(publish_calls.get(), 1);
+        assert_no_remote_publication_state(&repo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_hook_report_forge_and_base_mismatch_are_nonretryable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "hook-mismatch-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+            .expect("autopilot write lease");
+        let plan = prepublication_test_plan(AutopilotForgeMode::Git, ReviewerMode::ExternalCommand);
+        let publish_calls = Cell::new(0usize);
+        let return_base_mismatch = Cell::new(false);
+        let mut hooks = PrepublicationHooks {
+            prepare: |options| publication::prepare_pr_candidate_with_write_lease(options, &lease),
+            validate: |_| Ok(passed_prepublication_validation()),
+            review: |options| {
+                Ok(injected_external_review(
+                    options,
+                    ReviewReportStatus::Passed,
+                ))
+            },
+            publish: |mut options: PrPublicationOptions,
+                      evidence: BoundValidationEvidenceBundle| {
+                publish_calls.set(publish_calls.get() + 1);
+                options.forge = ForgeKind::Fake;
+                let mut report =
+                    publication::publish_prepared_pr_with_write_lease(options, &evidence, &lease)?;
+                if return_base_mismatch.get() {
+                    let expected_head = evidence
+                        .binding()
+                        .agent_head
+                        .clone()
+                        .context("bound evidence HEAD")?;
+                    report.forge = ForgeKind::Git;
+                    report.pushed = true;
+                    report.created = false;
+                    report.pr_url = None;
+                    report.publication_receipt = Some(publication::PrPublicationReceipt {
+                        version: 1,
+                        transaction_id: "injected-receipt".to_string(),
+                        sequence: 1,
+                        phase: publication::PublicationTransactionPhase::Completed,
+                        expected_oid: expected_head.clone(),
+                        expected_base_oid: Some(
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                        ),
+                        remote_ref: "refs/heads/injected".to_string(),
+                        github_repository: None,
+                        push_observed_oid: Some(expected_head),
+                        pr_url: None,
+                        pr_head_oid: None,
+                        pr_base: None,
+                        pr_state: None,
+                        pr_is_draft: None,
+                        create_attempted: false,
+                        created_by_transaction: false,
+                        observed_existing_pr: false,
+                        last_error: None,
+                    });
+                }
+                Ok(report)
+            },
+        };
+
+        let wrong_forge = run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks);
+        assert_eq!(wrong_forge.reason, "publication_receipt_invalid");
+        assert!(wrong_forge.publication_attempted);
+        assert!(!wrong_forge.retryable);
+
+        return_base_mismatch.set(true);
+        let wrong_base = run_prepublication_attempt(&repo, agent_id, 2, &plan, &lease, &mut hooks);
+        assert_eq!(wrong_base.reason, "publication_receipt_invalid");
+        assert!(wrong_base.publication_attempted);
+        assert!(wrong_base.publication_effect_observed);
+        assert!(!wrong_base.retryable);
+        assert_eq!(publish_calls.get(), 2);
+        assert_no_remote_publication_state(&repo);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_lease_excludes_competing_access_through_review_and_releases_on_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_id = "review-lease-agent";
+        let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
+        let plan =
+            prepublication_test_plan(AutopilotForgeMode::Fake, ReviewerMode::ExternalCommand);
+        let publish_calls = Cell::new(0usize);
+        let outcome = {
+            let lease = acquire_autopilot_worktree_write_lease(&manager, agent_id)
+                .expect("autopilot write lease");
+            let mut hooks = PrepublicationHooks {
+                prepare: |options| {
+                    publication::prepare_pr_candidate_with_write_lease(options, &lease)
+                },
+                validate: |_| Ok(passed_prepublication_validation()),
+                review: |_: ReviewPrOptions| {
+                    manager
+                        .acquire_read_execution_lease(agent_id)
+                        .expect_err("review retains writer against readers");
+                    manager
+                        .acquire_write_execution_lease(agent_id)
+                        .expect_err("review retains writer against writers");
+                    manager
+                        .remove(agent_id, true, false)
+                        .expect_err("review retains writer against removal");
+                    bail!("injected independent review failure")
+                },
+                publish: |_, _| {
+                    publish_calls.set(publish_calls.get() + 1);
+                    bail!("review error must stop before publication")
+                },
+            };
+            run_prepublication_attempt(&repo, agent_id, 1, &plan, &lease, &mut hooks)
+        };
+
+        assert_eq!(outcome.reason, "review_execution_failed");
+        assert!(!outcome.publication_attempted);
+        assert_eq!(publish_calls.get(), 0);
+        manager
+            .remove(agent_id, true, false)
+            .expect("error scope releases the retained write lease");
     }
 
     #[test]

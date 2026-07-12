@@ -357,10 +357,6 @@ pub(crate) fn preview_pr_with_validation_evidence_and_write_lease(
 /// lease and one repository mutation lock. The pre-commit, commit-tree, and
 /// post-commit snapshots must describe identical candidate content; only the
 /// expected agent HEAD transition may differ.
-#[cfg_attr(
-    any(not(test), not(target_os = "linux")),
-    expect(dead_code, reason = "consumed by the Autopilot integration commit")
-)]
 pub(crate) fn prepare_pr_candidate_with_write_lease(
     options: PrPublicationOptions,
     write_lease: &ManagedWorktreeWriteLease,
@@ -762,10 +758,6 @@ pub(crate) fn publish_pr_with_write_lease(
 /// Publishes a previously prepared candidate with mandatory exact validation
 /// evidence. There is intentionally no `require_validation` argument: callers
 /// cannot downgrade this strict bridge to legacy or unbound validation.
-#[cfg_attr(
-    any(not(test), not(target_os = "linux")),
-    expect(dead_code, reason = "consumed by the Autopilot integration commit")
-)]
 pub(crate) fn publish_prepared_pr_with_write_lease(
     options: PrPublicationOptions,
     bound_evidence: &BoundValidationEvidenceBundle,

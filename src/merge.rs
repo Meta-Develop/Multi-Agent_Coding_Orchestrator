@@ -261,10 +261,6 @@ impl ValidationEvidenceBundle {
     }
 
     /// Constructs canonical passed evidence for one exact candidate binding.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the Autopilot integration commit")
-    )]
     pub(crate) fn bound_to(
         binding: CandidateValidationBinding,
         reports: Vec<ValidationReport>,
