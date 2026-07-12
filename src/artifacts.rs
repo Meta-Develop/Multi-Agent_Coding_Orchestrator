@@ -3410,8 +3410,11 @@ mod tests {
         let (_temp, repo) = committed_repo();
         let run_id = RunId::new("large-run").expect("run id");
         ensure_run_dir_available(&repo, RunArtifactFamily::Consult, &run_id).expect("reserve");
+        let report = final_report_path(&repo, RunArtifactFamily::Consult, &run_id);
+        fs::create_dir_all(report.parent().expect("consult report parent"))
+            .expect("consult report directory");
         fs::write(
-            final_report_path(&repo, RunArtifactFamily::Consult, &run_id),
+            report,
             vec![b'x'; usize::try_from(MAX_ARTIFACT_FILE_BYTES).expect("limit") + 1],
         )
         .expect("oversized report");
