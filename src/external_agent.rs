@@ -1,5 +1,6 @@
 use crate::process_runner::{
-    run_process, CapturedBytes, EnvironmentMode, ProcessSpec, StdinMode, StreamCapture,
+    run_process, CapturedBytes, ContainmentEvidence, EnvironmentMode, ProcessRunError, ProcessSpec,
+    StdinMode, StreamCapture,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,10 @@ pub struct ExternalAgentRun {
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// Present only after the shared runner starts and closes the owned execution boundary.
+    /// [`ExternalAgentRun::succeeded`] accepts only verified-empty evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<ContainmentEvidence>,
     pub stdout: CapturedOutput,
     pub stderr: CapturedOutput,
     pub error: Option<String>,
@@ -121,7 +126,12 @@ pub struct ExternalAgentRun {
 
 impl ExternalAgentRun {
     pub fn succeeded(&self) -> bool {
-        self.exit_code == Some(0) && !self.timed_out && self.error.is_none()
+        self.exit_code == Some(0)
+            && !self.timed_out
+            && self.error.is_none()
+            && self
+                .containment
+                .is_some_and(ContainmentEvidence::is_verified_empty)
     }
 }
 
@@ -151,6 +161,7 @@ pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
         exit_code: None,
         duration_ms: 0,
         timed_out: false,
+        containment: None,
         stdout: CapturedOutput::default(),
         stderr: CapturedOutput::default(),
         error: None,
@@ -199,27 +210,42 @@ pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
         Ok(output) => {
             report.exit_code = output.status.and_then(|status| status.code());
             report.timed_out = output.timed_out;
+            report.containment = Some(output.containment);
             report.stdout = summarize_output(&output.stdout);
             report.stderr = summarize_output(&output.stderr);
-            report.error = output.stdin_error.or(output.process_error);
-            if output.timed_out && report.error.is_none() {
-                report.error = Some(format!(
-                    "external agent timed out after {} seconds",
-                    spec.timeout.as_secs()
-                ));
+            report.error = append_external_error(output.stdin_error, output.process_error);
+            if output.timed_out {
+                report.error = append_external_error(
+                    report.error.take(),
+                    Some(format!(
+                        "external agent timed out after {} seconds",
+                        spec.timeout.as_secs()
+                    )),
+                );
             } else if !output.timed_out && !output.status.is_some_and(|status| status.success()) {
-                report.error = Some(match output.status.and_then(|status| status.code()) {
+                let status_error = match output.status.and_then(|status| status.code()) {
                     Some(code) => format!("external agent exited with status {code}"),
                     None => "external agent terminated without an exit code".to_string(),
-                });
+                };
+                report.error = append_external_error(report.error.take(), Some(status_error));
             }
         }
         Err(error) => {
+            report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
             report.error = Some(error.to_string());
         }
     }
     report.duration_ms = duration_millis(started.elapsed());
     report
+}
+
+fn append_external_error(existing: Option<String>, next: Option<String>) -> Option<String> {
+    match (existing, next) {
+        (Some(existing), Some(next)) => Some(format!("{existing}; {next}")),
+        (Some(existing), None) => Some(existing),
+        (None, Some(next)) => Some(next),
+        (None, None) => None,
+    }
 }
 
 fn command_argv(spec: &ExternalAgentCommand) -> Vec<String> {
@@ -322,6 +348,80 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_runner::ContainmentBackend;
+
+    #[test]
+    fn external_errors_are_composed_and_success_requires_verified_empty_containment() {
+        assert_eq!(
+            append_external_error(
+                Some("cleanup evidence".to_string()),
+                Some("exit status 7".to_string())
+            ),
+            Some("cleanup evidence; exit status 7".to_string())
+        );
+
+        let mut report = ExternalAgentRun {
+            command: vec!["fake".to_string()],
+            cwd: PathBuf::from("."),
+            timeout_seconds: 1,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            containment: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+        };
+        assert!(!report.succeeded());
+        report.containment = Some(ContainmentEvidence::TrustedBestEffort(
+            ContainmentBackend::UnixProcessGroup,
+        ));
+        assert!(!report.succeeded());
+        report.containment = Some(ContainmentEvidence::Unverified(
+            ContainmentBackend::SystemdUserService,
+        ));
+        assert!(!report.succeeded());
+        report.containment = Some(ContainmentEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        assert!(report.succeeded());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_timeout_is_reported_as_timed_out_without_starting_external_agent() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let marker = temp.path().join("must-not-run");
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
+        let mut permissions = fs::metadata(&agent)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&agent, permissions)?;
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "do not start\n")?;
+        let spec = ExternalAgentCommand::codex(
+            agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            temp.path().join("last-message.txt"),
+            Duration::ZERO,
+        );
+
+        let report = run_external_agent(&spec);
+
+        assert!(report.timed_out);
+        assert_eq!(report.exit_code, None);
+        assert_eq!(report.containment, None);
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out before command start")));
+        assert!(!marker.exists());
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -421,7 +521,7 @@ exit 0
             &prompt,
             temp.path().join("events.jsonl"),
             temp.path().join("last-message.txt"),
-            Duration::from_millis(200),
+            Duration::from_secs(1),
         );
 
         let started = Instant::now();

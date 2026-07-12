@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
+    env,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -20,12 +21,115 @@ const PIPE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const PIPE_CHANNEL_CAPACITY: usize = 8;
 const MAX_PIPE_EVENTS_PER_POLL: usize = PIPE_CHANNEL_CAPACITY * 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const THREAD_JOIN_GRACE: Duration = Duration::from_millis(50);
+const THREAD_JOIN_GRACE: Duration = Duration::from_millis(500);
 const IO_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(unix)]
 const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const SYSTEMD_OPERATION_GRACE: Duration = Duration::from_secs(3);
+#[cfg(target_os = "linux")]
+const SYSTEMD_SLOT_WAIT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const MAX_CONCURRENT_SYSTEMD_UNITS: usize = 8;
+#[cfg(target_os = "linux")]
+const EXPEDITED_SYSTEMD_SLOT_THRESHOLD: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const RESERVED_EXPEDITED_SYSTEMD_SLOTS: usize = 1;
+#[cfg(target_os = "linux")]
+const SYSTEMD_RUNTIME_OVERHEAD: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
+const SYSTEMD_ORPHAN_SAFETY_FUSE: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(target_os = "linux")]
+const SYSTEMD_GUARDIAN_SCRIPT: &str = r#"
+environment_file=$1
+shift
+ready=$1
+shift
+waiting=$1
+shift
+environment_fifo=$1
+shift
+start_fifo=$1
+shift
+owner_fifo=$1
+shift
+owner_pid=$1
+shift
+owner_start=$1
+shift
+sleep_program=$1
+shift
+mkfifo_program=$1
+shift
+
+owner_alive() {
+    owner_stat=
+    [ -r "/proc/$owner_pid/stat" ] || return 1
+    { IFS= read -r owner_stat < "/proc/$owner_pid/stat"; } 2>/dev/null || return 1
+    owner_fields=${owner_stat##*) }
+    set -- $owner_fields
+    [ "$#" -ge 20 ] || return 1
+    shift 19
+    [ "$1" = "$owner_start" ]
+}
+
+child_running() {
+    child_stat=
+    [ -r "/proc/$1/stat" ] || return 1
+    { IFS= read -r child_stat < "/proc/$1/stat"; } 2>/dev/null || return 1
+    child_fields=${child_stat##*) }
+    set -- $child_fields
+    [ "$#" -ge 1 ] || return 1
+    [ "$1" != Z ] && [ "$1" != X ]
+}
+
+guardian=$$
+(
+    while owner_alive; do
+        "$sleep_program" 0.01 || {
+            kill -KILL "$guardian"
+            exit 125
+        }
+    done
+    kill -KILL "$guardian"
+) &
+umask 077
+"$mkfifo_program" "$environment_fifo" "$start_fifo" "$owner_fifo" || exit 125
+exec 3<"$owner_fifo" || exit 125
+(
+    IFS= read -r _ <&3
+    kill -KILL "$guardian"
+) &
+: > "$waiting" || exit 125
+IFS= read -r environment_token < "$environment_fifo" || exit 125
+[ "$environment_token" = environment ] || exit 125
+owner_alive || exit 125
+
+target_launcher() {
+    set -a
+    . "$1" || exit 125
+    set +a
+    : > "$2" || exit 125
+    IFS= read -r start_token < "$3" || exit 125
+    [ "$start_token" = start ] || exit 125
+    shift 3
+    exec "$@"
+}
+exec 4<&0 || exit 125
+target_launcher "$environment_file" "$ready" "$start_fifo" "$@" <&4 &
+target=$!
+exec 4<&-
+while child_running "$target"; do
+    owner_alive || exit 125
+    "$sleep_program" 0.01 || exit 125
+done
+wait "$target"
+exit $?
+"#;
 static NEXT_TEE_BACKUP_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "linux")]
+static NEXT_SYSTEMD_UNIT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
@@ -121,6 +225,54 @@ pub enum StdinMode {
     Bytes(Vec<u8>),
 }
 
+/// Selects the ownership guarantee that must be established before a command executes.
+///
+/// A required run fails before releasing the requested command when the host cannot provide the
+/// backend. Linux requires a trusted user-systemd service manager on cgroup v2; Windows uses
+/// suspended creation followed by Job Object assignment. Other Unix platforms currently require
+/// the caller to opt into the weaker compatibility policy explicitly. The Linux service also has
+/// an orphan-only runtime fuse: the requested timeout plus 30 seconds, or 24 hours when no command
+/// timeout is requested. This finite fuse is a last-resort cleanup boundary, not the command
+/// timeout reported by [`ProcessOutput::timed_out`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContainmentPolicy {
+    /// Require a backend that places the child before execution and proves the complete subtree
+    /// empty before success. Unsupported hosts fail before the requested command is spawned.
+    #[default]
+    Required,
+    /// Explicit compatibility mode for trusted commands. Unix process groups do not contain
+    /// descendants that deliberately call `setsid` or move to another process group.
+    TrustedBestEffort,
+}
+
+/// Identifies the operating-system ownership mechanism used for one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainmentBackend {
+    SystemdUserService,
+    WindowsJobObject,
+    UnixProcessGroup,
+    DirectChild,
+}
+
+/// Records whether the selected backend proved that no owned process remained at return.
+///
+/// Safety-sensitive callers must accept only [`ContainmentEvidence::VerifiedEmpty`]. A successful
+/// exit status does not upgrade best-effort or failed verification evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "status", content = "backend", rename_all = "snake_case")]
+pub enum ContainmentEvidence {
+    VerifiedEmpty(ContainmentBackend),
+    TrustedBestEffort(ContainmentBackend),
+    Unverified(ContainmentBackend),
+}
+
+impl ContainmentEvidence {
+    pub const fn is_verified_empty(self) -> bool {
+        matches!(self, Self::VerifiedEmpty(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamCapture {
     pub max_bytes: usize,
@@ -147,7 +299,14 @@ pub struct ProcessSpec {
     pub command: ProcessCommand,
     pub current_dir: PathBuf,
     pub environment: EnvironmentMode,
+    /// Required by default. Use [`ProcessSpec::with_containment`] to make a trusted compatibility
+    /// decision explicit at the call site.
+    pub containment: ContainmentPolicy,
     pub stdin: StdinMode,
+    /// Total operation deadline starting at [`run_process`] entry. It covers containment-slot
+    /// acquisition, pre-start setup, start-gate release, and command execution. Bounded cleanup may
+    /// extend the return past this deadline to prove that no owned process remains. On strict Linux
+    /// runs this value also sizes the independent orphan-safety fuse.
     pub timeout: Option<Duration>,
     pub stdout: StreamCapture,
     pub stderr: StreamCapture,
@@ -169,6 +328,7 @@ impl ProcessSpec {
             },
             current_dir: current_dir.into(),
             environment: EnvironmentMode::Inherit,
+            containment: ContainmentPolicy::Required,
             stdin: StdinMode::Inherit,
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
@@ -191,6 +351,7 @@ impl ProcessSpec {
             },
             current_dir: current_dir.into(),
             environment: EnvironmentMode::Inherit,
+            containment: ContainmentPolicy::Required,
             stdin: StdinMode::Inherit,
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
@@ -200,6 +361,11 @@ impl ProcessSpec {
 
     pub fn with_environment(mut self, environment: EnvironmentMode) -> Self {
         self.environment = environment;
+        self
+    }
+
+    pub fn with_containment(mut self, containment: ContainmentPolicy) -> Self {
+        self.containment = containment;
         self
     }
 
@@ -261,6 +427,7 @@ pub struct ProcessOutput {
     pub status: Option<ExitStatus>,
     pub duration: Duration,
     pub timed_out: bool,
+    pub containment: ContainmentEvidence,
     pub stdout: CapturedBytes,
     pub stderr: CapturedBytes,
     pub process_error: Option<String>,
@@ -271,6 +438,7 @@ pub struct ProcessOutput {
 pub struct ProcessFailureEvidence {
     pub stdout: CapturedBytes,
     pub stderr: CapturedBytes,
+    pub containment: ContainmentEvidence,
     pub process_error: Option<String>,
     pub stdin_error: Option<String>,
 }
@@ -287,6 +455,7 @@ impl fmt::Display for ProcessFailureEvidence {
             stderr.text,
             if stderr.truncated { " (truncated)" } else { "" }
         )?;
+        write!(formatter, "; containment={:?}", self.containment)?;
         if let Some(error) = &self.process_error {
             write!(formatter, "; process cleanup: {error}")?;
         }
@@ -329,6 +498,23 @@ pub enum ProcessRunError {
         #[source]
         source: std::io::Error,
     },
+    #[error("required process containment is unavailable for {label} ({command}): {source}")]
+    ContainmentUnavailable {
+        label: String,
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The total operation budget expired while the requested command was still behind its start
+    /// gate. Any spawned containment wrapper has been rolled back before this error is returned.
+    #[error("{label} ({command}) timed out before command start during {phase}: {source}")]
+    SetupTimeout {
+        label: String,
+        command: String,
+        phase: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to query {label} ({command}) status: {source}; retained evidence: {evidence}")]
     Wait {
         label: String,
@@ -356,33 +542,128 @@ pub enum ProcessRunError {
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
     let command_display = spec.command.display();
-    let (stdout_tee, stderr_tee) = prepare_tees(&spec.label, &spec.stdout, &spec.stderr)?;
-    let mut command = spec.command.build();
-    configure_process_tree(&mut command);
-    command.current_dir(&spec.current_dir);
-    configure_environment(&mut command, &spec.environment);
+    let operation_deadline = spec
+        .timeout
+        .map(|timeout| {
+            started.checked_add(timeout).ok_or_else(|| {
+                setup_timeout_error(
+                    &spec.label,
+                    &command_display,
+                    "timeout validation",
+                    "requested duration exceeds the platform Instant range",
+                )
+            })
+        })
+        .transpose()?;
+    preflight_direct_program(&spec.command).map_err(|source| ProcessRunError::Spawn {
+        label: spec.label.clone(),
+        command: command_display.clone(),
+        current_dir: spec.current_dir.clone(),
+        source,
+    })?;
+    ensure_setup_budget(
+        operation_deadline,
+        &spec.label,
+        &command_display,
+        "preflight",
+    )?;
+    let mut prepared_process_tree = PreparedProcessTree::prepare(
+        spec.containment,
+        &spec.label,
+        &command_display,
+        operation_deadline,
+    )?;
+    let prepared_tees = prepare_tees(&spec.label, &spec.stdout, &spec.stderr)?;
+    let mut command = prepared_process_tree
+        .build_command(&spec)
+        .map_err(|source| ProcessRunError::ContainmentUnavailable {
+            label: spec.label.clone(),
+            command: command_display.clone(),
+            source,
+        })?;
+    ensure_setup_budget(
+        operation_deadline,
+        &spec.label,
+        &command_display,
+        "containment and I/O setup",
+    )?;
     configure_stdin(&mut command, &spec.stdin);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    #[cfg(test)]
+    if env::var_os("MACO_TEST_ABORT_BEFORE_CHILD_SPAWN").is_some() {
+        std::process::abort();
+    }
+    #[cfg(test)]
+    if env::var_os("MACO_TEST_FAIL_BEFORE_CHILD_SPAWN").is_some() {
+        return Err(ProcessRunError::Spawn {
+            label: spec.label.clone(),
+            command: command_display.clone(),
+            current_dir: spec.current_dir.clone(),
+            source: std::io::Error::other("synthetic child spawn failure"),
+        });
+    }
     let mut child = command.spawn().map_err(|source| ProcessRunError::Spawn {
         label: spec.label.clone(),
         command: command_display.clone(),
         current_dir: spec.current_dir.clone(),
         source,
     })?;
-    let process_tree =
-        match ProcessTree::attach_and_start(&mut child, &spec.label, &command_display) {
-            Ok(process_tree) => process_tree,
-            Err(error) => {
-                terminate_unowned_child(&mut child);
-                return Err(error);
-            }
-        };
-    let prepared_io = match PreparedChildIo::take(&mut child, &spec.stdin) {
+    #[cfg(test)]
+    if let Some(marker) = env::var_os("MACO_TEST_AFTER_CHILD_SPAWN_MARKER") {
+        if let Err(source) = fs::write(marker, b"spawned") {
+            let error = ProcessRunError::Spawn {
+                label: spec.label.clone(),
+                command: command_display.clone(),
+                current_dir: spec.current_dir.clone(),
+                source,
+            };
+            let cleanup = terminate_unowned_child(&mut child, &spec.label);
+            return Err(append_process_run_error_cleanup(error, cleanup));
+        }
+        while env::var_os("MACO_TEST_HOLD_AFTER_CHILD_SPAWN").is_some() {
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+    let mut attached_process_tree = match prepared_process_tree.attach(
+        &mut child,
+        &spec.label,
+        &command_display,
+        operation_deadline,
+    ) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let cleanup = terminate_unowned_child(&mut child, &spec.label);
+            return Err(append_process_run_error_cleanup(error, cleanup));
+        }
+    };
+    let prepared_io_result = {
+        #[cfg(test)]
+        if env::var_os("MACO_TEST_FAIL_PRE_RELEASE_IO_SETUP").is_some() {
+            Err(std::io::Error::other(
+                "synthetic pre-release child I/O setup failure",
+            ))
+        } else {
+            PreparedChildIo::take(&mut child, &spec.stdin)
+        }
+        #[cfg(not(test))]
+        PreparedChildIo::take(&mut child, &spec.stdin)
+    };
+    let prepared_io = match prepared_io_result {
         Ok(prepared_io) => prepared_io,
         Err(source) => {
-            let _ = process_tree.terminate(&mut child, false, &spec.label);
-            let _ = wait_for_exit_until(&mut child, Instant::now() + EXIT_AND_DRAIN_GRACE);
+            let cleanup = attached_process_tree.cleanup(
+                &mut child,
+                &spec.label,
+                "pre-release I/O setup rollback",
+            );
+            let cleanup_error = append_error(
+                cleanup.error,
+                wait_for_child_cleanup(&mut child, &spec.label, "pre-release I/O setup rollback"),
+            );
+            let source = append_error(Some(source.to_string()), cleanup_error)
+                .map(std::io::Error::other)
+                .unwrap_or(source);
             return Err(ProcessRunError::IoSetup {
                 label: spec.label.clone(),
                 command: command_display,
@@ -390,6 +671,35 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
             });
         }
     };
+    if let Err(error) = prepared_tees.validate(&spec.label) {
+        let cleanup = attached_process_tree.cleanup(
+            &mut child,
+            &spec.label,
+            "tee transaction validation rollback",
+        );
+        let cleanup_error = append_error(
+            cleanup.error,
+            wait_for_child_cleanup(
+                &mut child,
+                &spec.label,
+                "tee transaction validation rollback",
+            ),
+        );
+        return Err(append_process_run_error_cleanup(error, cleanup_error));
+    }
+    let mut process_tree = match attached_process_tree.release(
+        &mut child,
+        &spec.label,
+        &command_display,
+        operation_deadline,
+    ) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let cleanup = terminate_unowned_child(&mut child, &spec.label);
+            return Err(append_process_run_error_cleanup(error, cleanup));
+        }
+    };
+    let (stdout_tee, stderr_tee) = prepared_tees.commit();
     let (mut input_writer, mut output_drainers) = prepared_io.start(
         &spec.label,
         spec.stdin,
@@ -401,6 +711,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
     let mut status = None;
     let mut timed_out = false;
     let mut process_error = None;
+    let containment;
 
     loop {
         let output_backlog = output_drainers.drain_ready();
@@ -412,7 +723,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                 Err(source) => {
                     let evidence = cleanup_after_wait_error(
                         &mut child,
-                        &process_tree,
+                        &mut process_tree,
                         &spec.label,
                         output_drainers,
                         input_writer,
@@ -427,15 +738,16 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
             };
         }
 
-        if spec
-            .timeout
-            .is_some_and(|timeout| started.elapsed() >= timeout)
-        {
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             timed_out = true;
-            process_error = append_error(
-                process_error,
-                process_tree.terminate(&mut child, status.is_some(), &spec.label),
+            let cleanup = process_tree.cleanup(
+                &mut child,
+                status.is_some(),
+                &spec.label,
+                "timeout termination",
             );
+            containment = cleanup.evidence;
+            process_error = append_error(process_error, cleanup.error);
 
             let exit_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
             if status.is_none() {
@@ -444,7 +756,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                     Err(source) => {
                         let evidence = cleanup_after_wait_error(
                             &mut child,
-                            &process_tree,
+                            &mut process_tree,
                             &spec.label,
                             output_drainers,
                             input_writer,
@@ -466,6 +778,10 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                             EXIT_AND_DRAIN_GRACE.as_millis()
                         )),
                     );
+                    let (reaped_status, reap_error) =
+                        kill_and_reap_child(&mut child, &spec.label, "timeout fallback");
+                    status = Some(reaped_status);
+                    process_error = append_error(process_error, reap_error);
                 }
             }
 
@@ -480,10 +796,14 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         }
 
         if status.is_some() {
-            process_error = append_error(
-                process_error,
-                process_tree.finalize(&mut child, &spec.label),
+            let cleanup = process_tree.cleanup(
+                &mut child,
+                true,
+                &spec.label,
+                "normal process-tree finalization",
             );
+            containment = cleanup.evidence;
+            process_error = append_error(process_error, cleanup.error);
             finish_child_io(
                 &spec.label,
                 "after normal process exit",
@@ -510,6 +830,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         status,
         duration: started.elapsed(),
         timed_out,
+        containment,
         stdout,
         stderr,
         process_error,
@@ -517,40 +838,178 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
     })
 }
 
-fn terminate_unowned_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = wait_for_exit_until(child, Instant::now() + EXIT_AND_DRAIN_GRACE);
+fn preflight_direct_program(command: &ProcessCommand) -> std::io::Result<()> {
+    let ProcessCommand::Direct { program, .. } = command else {
+        return Ok(());
+    };
+    if program.is_absolute() || program.components().count() > 1 {
+        fs::metadata(program).map(|_| ())?;
+    }
+    Ok(())
+}
+
+fn terminate_unowned_child(child: &mut Child, label: &str) -> Option<String> {
+    let (_, error) = kill_and_reap_child(child, label, "unowned-child rollback");
+    error
+}
+
+fn wait_for_child_cleanup(child: &mut Child, label: &str, context: &str) -> Option<String> {
+    match wait_for_exit_until(child, Instant::now() + EXIT_AND_DRAIN_GRACE) {
+        Ok(Some(_)) => None,
+        Ok(None) => {
+            let (_, cleanup) = kill_and_reap_child(child, label, context);
+            append_error(
+                Some(format!(
+                    "{label} did not exit within {} ms during {context}",
+                    EXIT_AND_DRAIN_GRACE.as_millis()
+                )),
+                cleanup,
+            )
+        }
+        Err(error) => {
+            let (_, cleanup) = kill_and_reap_child(child, label, context);
+            append_error(
+                Some(format!(
+                    "failed to wait for {label} during {context}: {error}"
+                )),
+                cleanup,
+            )
+        }
+    }
+}
+
+fn kill_and_reap_child(
+    child: &mut Child,
+    label: &str,
+    context: &str,
+) -> (ExitStatus, Option<String>) {
+    let mut error = child
+        .kill()
+        .err()
+        .map(|error| format!("failed to kill {label} during {context}: {error}"));
+    for attempt in 1..=2 {
+        match wait_for_exit_until(child, Instant::now() + EXIT_AND_DRAIN_GRACE) {
+            Ok(Some(status)) => return (status, error),
+            Ok(None) => {
+                error = append_error(
+                    error,
+                    Some(format!(
+                        "{label} remained live after bounded reap attempt {attempt} during {context}"
+                    )),
+                );
+            }
+            Err(wait_error) => {
+                error = append_error(
+                    error,
+                    Some(format!(
+                        "failed to wait for {label} on reap attempt {attempt} during {context}: {wait_error}"
+                    )),
+                );
+            }
+        }
+        error = append_error(
+            error,
+            child
+                .kill()
+                .err()
+                .map(|kill_error| format!("repeat kill failed for {label}: {kill_error}")),
+        );
+    }
+    fail_closed_stuck_owner(&format!("{label} child during {context}"));
+}
+
+fn append_process_run_error_cleanup(
+    error: ProcessRunError,
+    cleanup: Option<String>,
+) -> ProcessRunError {
+    let Some(cleanup) = cleanup else {
+        return error;
+    };
+    match error {
+        ProcessRunError::OpenTee {
+            label,
+            stream,
+            path,
+            source,
+        } => ProcessRunError::OpenTee {
+            label,
+            stream,
+            path,
+            source: std::io::Error::new(
+                source.kind(),
+                format!("{source}; cleanup failed: {cleanup}"),
+            ),
+        },
+        ProcessRunError::ProcessOwnership {
+            label,
+            command,
+            source,
+        } => ProcessRunError::ProcessOwnership {
+            label,
+            command,
+            source: std::io::Error::other(format!("{source}; cleanup failed: {cleanup}")),
+        },
+        ProcessRunError::SetupTimeout {
+            label,
+            command,
+            phase,
+            source,
+        } => ProcessRunError::SetupTimeout {
+            label,
+            command,
+            phase,
+            source: std::io::Error::other(format!("{source}; cleanup failed: {cleanup}")),
+        },
+        other => other,
+    }
+}
+
+fn setup_timeout_error(
+    label: &str,
+    command: &str,
+    phase: &'static str,
+    detail: impl Into<String>,
+) -> ProcessRunError {
+    ProcessRunError::SetupTimeout {
+        label: label.to_string(),
+        command: command.to_string(),
+        phase,
+        source: std::io::Error::new(std::io::ErrorKind::TimedOut, detail.into()),
+    }
+}
+
+fn ensure_setup_budget(
+    deadline: Option<Instant>,
+    label: &str,
+    command: &str,
+    phase: &'static str,
+) -> Result<(), ProcessRunError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(setup_timeout_error(
+            label,
+            command,
+            phase,
+            "the total operation deadline was exhausted before command release",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn cleanup_after_wait_error(
     child: &mut Child,
-    process_tree: &ProcessTree,
+    process_tree: &mut ProcessTree,
     label: &str,
     mut output_drainers: OutputDrainers,
     mut input_writer: InputWriter,
 ) -> ProcessFailureEvidence {
-    let mut process_error = process_tree.terminate(child, false, label);
-    let exit_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
-    match wait_for_exit_until(child, exit_deadline) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            process_error = append_error(
-                process_error,
-                Some(format!(
-                    "{label} did not exit within {} ms during error cleanup",
-                    EXIT_AND_DRAIN_GRACE.as_millis()
-                )),
-            );
-        }
-        Err(error) => {
-            process_error = append_error(
-                process_error,
-                Some(format!(
-                    "failed to wait for {label} during error cleanup: {error}"
-                )),
-            );
-        }
-    }
+    let cleanup = process_tree.cleanup(child, false, label, "wait-error cleanup");
+    let containment = cleanup.evidence;
+    let mut process_error = cleanup.error;
+    process_error = append_error(
+        process_error,
+        wait_for_child_cleanup(child, label, "error cleanup"),
+    );
     finish_child_io(
         label,
         "during wait-error cleanup",
@@ -565,6 +1024,7 @@ fn cleanup_after_wait_error(
     ProcessFailureEvidence {
         stdout,
         stderr,
+        containment,
         process_error,
         stdin_error,
     }
@@ -608,7 +1068,7 @@ fn prepare_tees(
     label: &str,
     stdout: &StreamCapture,
     stderr: &StreamCapture,
-) -> Result<(Option<TeeWriter>, Option<TeeWriter>), ProcessRunError> {
+) -> Result<PreparedTees, ProcessRunError> {
     if let (Some(stdout), Some(stderr)) = (&stdout.tee_path, &stderr.tee_path) {
         if stdout == stderr {
             return Err(ProcessRunError::TeeConflict {
@@ -662,65 +1122,90 @@ fn prepare_tees(
         }
     }
 
-    let stdout_backup = match stdout.as_ref().filter(|tee| !tee.created) {
-        Some(tee) if stderr.is_some() => match TeeBackup::create(&tee.path) {
-            Ok(backup) => Some(backup),
-            Err(source) => {
-                let path = tee.path.clone();
-                rollback_created_tee(stdout.take());
-                rollback_created_tee(stderr.take());
-                return Err(ProcessRunError::OpenTee {
+    let stdout = match stdout.take() {
+        Some(tee) => {
+            let path = tee.path.clone();
+            Some(
+                PreparedTee::new(tee).map_err(|source| ProcessRunError::OpenTee {
                     label: label.to_string(),
                     stream: "stdout",
                     path,
                     source,
-                });
-            }
-        },
-        _ => None,
+                })?,
+            )
+        }
+        None => None,
     };
-
-    if let Some(tee) = stdout.as_mut() {
-        if let Err(source) = tee.file.set_len(0) {
+    let stderr = match stderr.take() {
+        Some(tee) => {
             let path = tee.path.clone();
-            rollback_created_tee(stdout.take());
-            rollback_created_tee(stderr.take());
+            match PreparedTee::new(tee) {
+                Ok(tee) => Some(tee),
+                Err(source) => {
+                    let mut transaction = PreparedTees {
+                        stdout,
+                        stderr: None,
+                        finished: false,
+                    };
+                    let rollback = transaction.rollback().err();
+                    return Err(ProcessRunError::OpenTee {
+                        label: label.to_string(),
+                        stream: "stderr",
+                        path,
+                        source: combine_tee_rollback_error(source, rollback),
+                    });
+                }
+            }
+        }
+        None => None,
+    };
+    let mut transaction = PreparedTees {
+        stdout,
+        stderr,
+        finished: false,
+    };
+    if let Err((stream, path, source)) = transaction.initialize() {
+        let rollback = transaction.rollback().err();
+        return Err(ProcessRunError::OpenTee {
+            label: label.to_string(),
+            stream,
+            path,
+            source: combine_tee_rollback_error(source, rollback),
+        });
+    }
+    #[cfg(all(test, unix))]
+    if let Some(pid_path) = env::var_os("MACO_TEST_TEE_HELPER_PID_FILE") {
+        let pids = [&transaction.stdout, &transaction.stderr]
+            .into_iter()
+            .flatten()
+            .filter_map(|tee| tee.writer.as_ref())
+            .map(|writer| writer.helper.child.id().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(source) = fs::write(&pid_path, pids) {
+            let rollback = transaction.rollback().err();
             return Err(ProcessRunError::OpenTee {
                 label: label.to_string(),
-                stream: "stdout",
-                path,
-                source,
+                stream: "stdout/stderr",
+                path: PathBuf::from(pid_path),
+                source: combine_tee_rollback_error(source, rollback),
             });
         }
     }
-    if let Some(tee) = stderr.as_mut() {
-        if let Err(source) = tee.file.set_len(0) {
-            let path = tee.path.clone();
-            let rollback_error = match (&mut stdout, stdout_backup.as_ref()) {
-                (Some(stdout), Some(backup)) => backup.restore(&mut stdout.file).err(),
-                _ => None,
-            };
-            rollback_created_tee(stdout.take());
-            rollback_created_tee(stderr.take());
-            let source = match rollback_error {
-                Some(rollback_error) => std::io::Error::other(format!(
-                    "{source}; failed to restore stdout tee after transactional truncate failure: {rollback_error}"
-                )),
-                None => source,
-            };
-            return Err(ProcessRunError::OpenTee {
-                label: label.to_string(),
-                stream: "stderr",
-                path,
-                source,
-            });
-        }
-    }
+    Ok(transaction)
+}
 
-    Ok((
-        stdout.map(TeePreflight::commit),
-        stderr.map(TeePreflight::commit),
-    ))
+fn combine_tee_rollback_error(
+    source: std::io::Error,
+    rollback: Option<std::io::Error>,
+) -> std::io::Error {
+    match rollback {
+        Some(rollback) => std::io::Error::new(
+            source.kind(),
+            format!("{source}; tee transaction rollback failed: {rollback}"),
+        ),
+        None => source,
+    }
 }
 
 struct TeePreflight {
@@ -729,12 +1214,236 @@ struct TeePreflight {
     created: bool,
 }
 
-impl TeePreflight {
-    fn commit(self) -> TeeWriter {
-        TeeWriter {
-            file: self.file,
-            path: self.path,
+struct CreatedTeeGuard<'a> {
+    file: &'a File,
+    path: &'a Path,
+    armed: bool,
+}
+
+impl CreatedTeeGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreatedTeeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && tee_path_matches_file(self.path, self.file).unwrap_or(false) {
+            let _ = fs::remove_file(self.path);
         }
+    }
+}
+
+struct PreparedTees {
+    stdout: Option<PreparedTee>,
+    stderr: Option<PreparedTee>,
+    finished: bool,
+}
+
+impl PreparedTees {
+    fn initialize(&mut self) -> Result<(), (&'static str, PathBuf, std::io::Error)> {
+        for (stream, tee) in [
+            ("stdout", self.stdout.as_mut()),
+            ("stderr", self.stderr.as_mut()),
+        ] {
+            let Some(tee) = tee else {
+                continue;
+            };
+            if let Err(source) = tee.start_helper(stream) {
+                return Err((stream, tee.path.clone(), source));
+            }
+        }
+        for (stream, tee) in [
+            ("stdout", self.stdout.as_mut()),
+            ("stderr", self.stderr.as_mut()),
+        ] {
+            let Some(tee) = tee else {
+                continue;
+            };
+            if let Err(source) = tee.truncate(stream) {
+                return Err((stream, tee.path.clone(), source));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate(&self, label: &str) -> Result<(), ProcessRunError> {
+        for (stream, tee) in [
+            ("stdout", self.stdout.as_ref()),
+            ("stderr", self.stderr.as_ref()),
+        ] {
+            let Some(tee) = tee else {
+                continue;
+            };
+            match tee.path_matches_file() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ProcessRunError::OpenTee {
+                        label: label.to_string(),
+                        stream,
+                        path: tee.path.clone(),
+                        source: std::io::Error::other(
+                            "tee path identity changed before transaction commit",
+                        ),
+                    });
+                }
+                Err(source) => {
+                    return Err(ProcessRunError::OpenTee {
+                        label: label.to_string(),
+                        stream,
+                        path: tee.path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(mut self) -> (Option<TeeWriter>, Option<TeeWriter>) {
+        self.finished = true;
+        (
+            self.stdout.as_mut().and_then(|tee| tee.writer.take()),
+            self.stderr.as_mut().and_then(|tee| tee.writer.take()),
+        )
+    }
+
+    fn rollback(&mut self) -> std::io::Result<()> {
+        for tee in [&mut self.stdout, &mut self.stderr].into_iter().flatten() {
+            drop(tee.writer.take());
+        }
+        let mut errors = Vec::new();
+        for tee in [&mut self.stdout, &mut self.stderr].into_iter().flatten() {
+            if let Err(error) = tee.rollback() {
+                errors.push(format!("{}: {error}", tee.path.display()));
+            }
+        }
+        self.finished = true;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(errors.join("; ")))
+        }
+    }
+}
+
+impl Drop for PreparedTees {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Err(error) = self.rollback() {
+                fail_closed_stuck_owner(&format!("tee transaction rollback: {error}"));
+            }
+        }
+    }
+}
+
+struct PreparedTee {
+    startup_file: Option<File>,
+    rollback_file: Option<File>,
+    writer: Option<TeeWriter>,
+    backup: Option<TeeBackup>,
+    path: PathBuf,
+    created: bool,
+    modified: bool,
+}
+
+impl PreparedTee {
+    fn new(tee: TeePreflight) -> std::io::Result<Self> {
+        let backup = if tee.created {
+            None
+        } else {
+            Some(TeeBackup::create(&tee.file, &tee.path)?)
+        };
+        let rollback_file = tee.file.try_clone()?;
+        Ok(Self {
+            startup_file: Some(tee.file),
+            rollback_file: Some(rollback_file),
+            writer: None,
+            backup,
+            path: tee.path,
+            created: tee.created,
+            modified: false,
+        })
+    }
+
+    fn start_helper(&mut self, stream: &'static str) -> std::io::Result<()> {
+        #[cfg(not(test))]
+        let _ = stream;
+        #[cfg(test)]
+        if env::var_os("MACO_TEST_FAIL_TEE_HELPER_STREAM").as_deref() == Some(OsStr::new(stream)) {
+            return Err(std::io::Error::other(format!(
+                "synthetic {stream} tee helper startup failure"
+            )));
+        }
+        if !self.path_matches_file()? {
+            return Err(std::io::Error::other(
+                "tee path identity changed before helper startup",
+            ));
+        }
+        let file = self
+            .startup_file
+            .take()
+            .ok_or_else(|| std::io::Error::other("tee helper file was already consumed"))?;
+        self.writer = Some(TeeWriter::start(file, self.path.clone())?);
+        Ok(())
+    }
+
+    fn truncate(&mut self, stream: &'static str) -> std::io::Result<()> {
+        #[cfg(not(test))]
+        let _ = stream;
+        #[cfg(test)]
+        if env::var_os("MACO_TEST_FAIL_TEE_TRUNCATE_STREAM").as_deref() == Some(OsStr::new(stream))
+        {
+            return Err(std::io::Error::other(format!(
+                "synthetic {stream} tee truncate failure"
+            )));
+        }
+        if !self.path_matches_file()? {
+            return Err(std::io::Error::other(
+                "tee path identity changed before transactional truncate",
+            ));
+        }
+        let file = self
+            .rollback_file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("tee rollback file was already closed"))?;
+        file.set_len(0)?;
+        self.modified = true;
+        file.seek(SeekFrom::Start(0)).map(|_| ())
+    }
+
+    fn path_matches_file(&self) -> std::io::Result<bool> {
+        let file = self
+            .rollback_file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("tee rollback file was already closed"))?;
+        tee_path_matches_file(&self.path, file)
+    }
+
+    fn rollback(&mut self) -> std::io::Result<()> {
+        let Some(mut file) = self.rollback_file.take() else {
+            return Ok(());
+        };
+        if self.created {
+            let matches = tee_path_matches_file(&self.path, &file).unwrap_or(false);
+            drop(file);
+            if matches {
+                match fs::remove_file(&self.path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(());
+        }
+        if !self.modified {
+            return Ok(());
+        }
+        let backup = self
+            .backup
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("existing tee omitted rollback backup"))?;
+        backup.restore(&mut file)
     }
 }
 
@@ -743,17 +1452,39 @@ fn preflight_tee(
     stream: &'static str,
     path: &Path,
 ) -> Result<TeePreflight, ProcessRunError> {
-    let create_result = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path);
+    let mut create_options = OpenOptions::new();
+    create_options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        create_options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        create_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let create_result = create_options.open(path);
     let (file, created) = match create_result {
         Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
+            let mut existing_options = OpenOptions::new();
+            existing_options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                existing_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+                existing_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            let file = existing_options
                 .open(path)
                 .map_err(|source| ProcessRunError::OpenTee {
                     label: label.to_string(),
@@ -772,19 +1503,40 @@ fn preflight_tee(
             });
         }
     };
+    let mut created_guard = created.then(|| CreatedTeeGuard {
+        file: &file,
+        path,
+        armed: true,
+    });
 
-    let regular = fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
-        && file
-            .metadata()
-            .map(|metadata| metadata.file_type().is_file())
-            .unwrap_or(false);
-    if !regular {
-        drop(file);
-        if created {
-            let _ = fs::remove_file(path);
-        }
+    #[cfg(unix)]
+    if created {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| ProcessRunError::OpenTee {
+                label: label.to_string(),
+                stream,
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    #[cfg(test)]
+    if created && env::var_os("MACO_TEST_FAIL_NEW_TEE_PREFLIGHT").is_some() {
+        return Err(ProcessRunError::OpenTee {
+            label: label.to_string(),
+            stream,
+            path: path.to_path_buf(),
+            source: std::io::Error::other("synthetic new tee preflight failure"),
+        });
+    }
+    let identity_matches =
+        tee_path_matches_file(path, &file).map_err(|source| ProcessRunError::OpenTee {
+            label: label.to_string(),
+            stream,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !identity_matches {
         return Err(ProcessRunError::OpenTee {
             label: label.to_string(),
             stream,
@@ -795,6 +1547,10 @@ fn preflight_tee(
             ),
         });
     }
+    if let Some(guard) = created_guard.as_mut() {
+        guard.disarm();
+    }
+    drop(created_guard);
 
     Ok(TeePreflight {
         file,
@@ -809,10 +1565,47 @@ fn rollback_created_tee(tee: Option<TeePreflight>) {
     };
     let created = tee.created;
     let path = tee.path.clone();
+    let matches = created && tee_path_matches_file(&path, &tee.file).unwrap_or(false);
     drop(tee);
-    if created {
+    if matches {
         let _ = fs::remove_file(path);
     }
+}
+
+#[cfg(unix)]
+fn tee_path_matches_file(path: &Path, file: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path_metadata = fs::symlink_metadata(path)?;
+    let file_metadata = file.metadata()?;
+    Ok(path_metadata.file_type().is_file()
+        && file_metadata.file_type().is_file()
+        && path_metadata.dev() == file_metadata.dev()
+        && path_metadata.ino() == file_metadata.ino())
+}
+
+#[cfg(target_os = "windows")]
+fn tee_path_matches_file(path: &Path, file: &File) -> std::io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let path_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let path_identity = windows_file_identity(&path_file)?;
+    let file_identity = windows_file_identity(file)?;
+    Ok(path_identity.2 & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && file_identity.2 & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && path_identity.0 == file_identity.0
+        && path_identity.1 == file_identity.1)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn tee_path_matches_file(path: &Path, file: &File) -> std::io::Result<bool> {
+    Ok(fs::symlink_metadata(path)?.file_type().is_file() && file.metadata()?.file_type().is_file())
 }
 
 #[cfg(unix)]
@@ -825,29 +1618,35 @@ fn tee_files_are_same(left: &TeePreflight, right: &TeePreflight) -> std::io::Res
 
 #[cfg(target_os = "windows")]
 fn tee_files_are_same(left: &TeePreflight, right: &TeePreflight) -> std::io::Result<bool> {
+    let left = windows_file_identity(&left.file)?;
+    let right = windows_file_identity(&right.file)?;
+    Ok(left.0 == right.0 && left.1 == right.1)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_file_identity(file: &File) -> std::io::Result<(u32, u64, u32)> {
     use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     };
 
-    fn identity(file: &File) -> std::io::Result<(u32, u64)> {
-        let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-        // SAFETY: `information` points to writable storage and the borrowed file handle remains
-        // valid for the duration of this call.
-        if unsafe {
-            GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: a successful call initialized the complete structure.
-        let information = unsafe { information.assume_init() };
-        let index =
-            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-        Ok((information.dwVolumeSerialNumber, index))
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `information` points to writable storage and the borrowed file handle remains valid
+    // for the duration of this call.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr()) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
-
-    Ok(identity(&left.file)? == identity(&right.file)?)
+    // SAFETY: a successful call initialized the complete structure.
+    let information = unsafe { information.assume_init() };
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((
+        information.dwVolumeSerialNumber,
+        index,
+        information.dwFileAttributes,
+    ))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -861,20 +1660,27 @@ struct TeeBackup {
 }
 
 impl TeeBackup {
-    fn create(source_path: &Path) -> std::io::Result<Self> {
-        let mut source = File::open(source_path)?;
+    fn create(source_file: &File, source_path: &Path) -> std::io::Result<Self> {
+        let mut source = source_file.try_clone()?;
+        source.seek(SeekFrom::Start(0))?;
         for _ in 0..32 {
             let id = NEXT_TEE_BACKUP_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("maco-tee-backup-{}-{id}.tmp", std::process::id()));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
+            let directory = source_path.parent().unwrap_or_else(|| Path::new("."));
+            let path = directory.join(format!(".maco-tee-backup-{}-{id}.tmp", std::process::id()));
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .mode(0o600)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            }
+            match options.open(&path) {
                 Ok(mut file) => {
                     let prepared = std::io::copy(&mut source, &mut file)
+                        .and_then(|_| file.sync_all())
+                        .and_then(|_| source.seek(SeekFrom::Start(0)))
                         .and_then(|_| file.seek(SeekFrom::Start(0)))
                         .map(|_| ());
                     if let Err(error) = prepared {
@@ -898,6 +1704,12 @@ impl TeeBackup {
     }
 
     fn restore(&self, destination: &mut File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if env::var_os("MACO_TEST_FAIL_TEE_RESTORE").is_some() {
+            return Err(std::io::Error::other(
+                "synthetic tee backup restore failure",
+            ));
+        }
         let mut source = self
             .file
             .as_ref()
@@ -907,7 +1719,8 @@ impl TeeBackup {
         destination.set_len(0)?;
         destination.seek(SeekFrom::Start(0))?;
         std::io::copy(&mut source, destination)?;
-        Ok(())
+        destination.sync_all()?;
+        destination.seek(SeekFrom::Start(0)).map(|_| ())
     }
 }
 
@@ -919,8 +1732,270 @@ impl Drop for TeeBackup {
 }
 
 struct TeeWriter {
-    file: File,
+    sink: TeeSink,
+    #[cfg(unix)]
+    helper: TeeHelper,
     path: PathBuf,
+}
+
+impl TeeWriter {
+    fn start(file: File, path: PathBuf) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let (helper, sink) = TeeHelper::start(file, &path)?;
+            Ok(Self { sink, helper, path })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                sink: TeeSink { file },
+                path,
+            })
+        }
+    }
+
+    fn split(self) -> (TeeSink, Option<TeeHelperHandle>, PathBuf) {
+        #[cfg(unix)]
+        {
+            let helper = TeeHelperHandle(self.helper);
+            (self.sink, Some(helper), self.path)
+        }
+
+        #[cfg(not(unix))]
+        {
+            (self.sink, None, self.path)
+        }
+    }
+}
+
+struct TeeSink {
+    #[cfg(unix)]
+    input: ChildStdin,
+    #[cfg(not(unix))]
+    file: File,
+}
+
+impl TeeSink {
+    fn write_all_cancellable(&mut self, bytes: &[u8], cancel: &AtomicBool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut written = 0;
+            while written < bytes.len() {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "tee write cancelled",
+                    ));
+                }
+                match self.input.write(&bytes[written..]) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "tee helper input returned a zero-length write",
+                        ));
+                    }
+                    Ok(count) => written += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(IO_CANCEL_POLL_INTERVAL);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.file.write_all(bytes)
+        }
+    }
+}
+
+struct TeeHelperHandle(#[cfg(unix)] TeeHelper, #[cfg(not(unix))] ());
+
+impl TeeHelperHandle {
+    fn finish(self, label: &str, stream: &str) -> Option<String> {
+        #[cfg(unix)]
+        {
+            self.0.finish(label, stream)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, label, stream);
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TeeHelper {
+    child: Child,
+    path: PathBuf,
+    reaped: bool,
+}
+
+#[cfg(unix)]
+impl TeeHelper {
+    fn start(file: File, path: &Path) -> std::io::Result<(Self, TeeSink)> {
+        use std::os::unix::process::CommandExt;
+
+        let cat = find_trusted_unix_executable(
+            "cat",
+            &["/bin/cat", "/usr/bin/cat", "/run/current-system/sw/bin/cat"],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "tee capture requires a root-owned, non-writable cat helper",
+            )
+        })?;
+        let mut command = Command::new(cat);
+        command
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(file))
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn()?;
+        let input = match child.stdin.take() {
+            Some(input) => input,
+            None => {
+                let cleanup = rollback_tee_helper_start(&mut child, path);
+                return Err(std::io::Error::other(format!(
+                    "failed to open tee helper stdin{cleanup}"
+                )));
+            }
+        };
+        if let Err(error) = configure_cancellable_io(&input) {
+            drop(input);
+            let cleanup = rollback_tee_helper_start(&mut child, path);
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("failed to configure tee helper stdin: {error}{cleanup}"),
+            ));
+        }
+        Ok((
+            Self {
+                child,
+                path: path.to_path_buf(),
+                reaped: false,
+            },
+            TeeSink { input },
+        ))
+    }
+
+    fn finish(mut self, label: &str, stream: &str) -> Option<String> {
+        let deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
+        let mut error = None;
+        let status = match wait_for_exit_until(&mut self.child, deadline) {
+            Ok(Some(status)) => Some(status),
+            Ok(None) => {
+                error = Some(format!(
+                    "{label} {stream} tee helper for {} did not finish within {} ms",
+                    self.path.display(),
+                    EXIT_AND_DRAIN_GRACE.as_millis()
+                ));
+                error = append_error(
+                    error,
+                    terminate_unix_process_group(&mut self.child, false, label),
+                );
+                match wait_for_exit_until(&mut self.child, Instant::now() + EXIT_AND_DRAIN_GRACE) {
+                    Ok(Some(status)) => Some(status),
+                    Ok(None) => fail_closed_stuck_owner(&format!(
+                        "{label} {stream} tee helper for {}",
+                        self.path.display()
+                    )),
+                    Err(wait_error) => {
+                        error = append_error(
+                            error,
+                            Some(format!("failed to reap tee helper: {wait_error}")),
+                        );
+                        match self.child.try_wait() {
+                            Ok(Some(status)) => Some(status),
+                            _ => fail_closed_stuck_owner(&format!(
+                                "{label} {stream} tee helper for {}",
+                                self.path.display()
+                            )),
+                        }
+                    }
+                }
+            }
+            Err(wait_error) => {
+                error = Some(format!("failed to wait for tee helper: {wait_error}"));
+                let _ = terminate_unix_process_group(&mut self.child, false, label);
+                match wait_for_exit_until(&mut self.child, Instant::now() + EXIT_AND_DRAIN_GRACE) {
+                    Ok(Some(status)) => Some(status),
+                    _ => fail_closed_stuck_owner(&format!(
+                        "{label} {stream} tee helper for {}",
+                        self.path.display()
+                    )),
+                }
+            }
+        };
+        self.reaped = true;
+        if status.is_some_and(|status| !status.success()) {
+            error = append_error(
+                error,
+                Some(format!(
+                    "{label} {stream} tee helper for {} exited unsuccessfully",
+                    self.path.display()
+                )),
+            );
+        }
+        error
+    }
+}
+
+#[cfg(unix)]
+fn rollback_tee_helper_start(child: &mut Child, path: &Path) -> String {
+    let error = terminate_unix_process_group(child, false, "tee helper startup rollback");
+    match wait_for_exit_until(child, Instant::now() + EXIT_AND_DRAIN_GRACE) {
+        Ok(Some(_)) => error
+            .map(|error| format!("; cleanup diagnostic: {error}"))
+            .unwrap_or_default(),
+        Ok(None) => fail_closed_stuck_owner(&format!(
+            "tee helper for {} during startup rollback",
+            path.display()
+        )),
+        Err(wait_error) => match child.try_wait() {
+            Ok(Some(_)) => format!("; cleanup wait diagnostic: {wait_error}"),
+            _ => fail_closed_stuck_owner(&format!(
+                "tee helper for {} during startup rollback",
+                path.display()
+            )),
+        },
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TeeHelper {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = terminate_unix_process_group(&mut self.child, false, "tee helper drop");
+            if !matches!(
+                wait_for_exit_until(&mut self.child, Instant::now() + EXIT_AND_DRAIN_GRACE),
+                Ok(Some(_))
+            ) {
+                fail_closed_stuck_owner(&format!(
+                    "tee helper for {} during drop",
+                    self.path.display()
+                ));
+            }
+        }
+        self.reaped = true;
+    }
+}
+
+fn fail_closed_stuck_owner(label: &str) -> ! {
+    eprintln!(
+        "fatal: {label} remained live past its bounded cleanup deadline; aborting rather than detaching owned execution"
+    );
+    std::process::abort()
 }
 
 fn configure_environment(command: &mut Command, environment: &EnvironmentMode) {
@@ -949,128 +2024,1354 @@ fn configure_stdin(command: &mut Command, stdin: &StdinMode) {
     }
 }
 
-fn configure_process_tree(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(WINDOWS_PROCESS_CREATION_FLAGS);
-    }
-}
-
 #[cfg(target_os = "windows")]
 const WINDOWS_PROCESS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
 
-struct ProcessTree {
-    #[cfg(target_os = "windows")]
-    job: WindowsJob,
+struct PreparedProcessTree {
+    backend: PreparedContainmentBackend,
 }
 
-impl ProcessTree {
-    fn attach_and_start(
+enum PreparedContainmentBackend {
+    #[cfg(target_os = "linux")]
+    Systemd(Box<SystemdUnit>),
+    #[cfg(target_os = "windows")]
+    WindowsJob,
+    #[cfg(unix)]
+    UnixProcessGroup,
+    #[cfg(not(any(unix, target_os = "windows")))]
+    DirectChild,
+}
+
+impl PreparedProcessTree {
+    fn prepare(
+        policy: ContainmentPolicy,
+        label: &str,
+        command: &str,
+        operation_deadline: Option<Instant>,
+    ) -> Result<Self, ProcessRunError> {
+        let unavailable = |source| ProcessRunError::ContainmentUnavailable {
+            label: label.to_string(),
+            command: command.to_string(),
+            source,
+        };
+        match policy {
+            ContainmentPolicy::Required => {
+                #[cfg(target_os = "linux")]
+                {
+                    match SystemdUnit::prepare(operation_deadline) {
+                        Ok(unit) => Ok(Self {
+                            backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
+                        }),
+                        Err(source)
+                            if operation_deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline) =>
+                        {
+                            Err(setup_timeout_error(
+                                label,
+                                command,
+                                "strict containment slot acquisition",
+                                source.to_string(),
+                            ))
+                        }
+                        Err(source) => Err(unavailable(source)),
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    return Ok(Self {
+                        backend: PreparedContainmentBackend::WindowsJob,
+                    });
+                }
+                #[cfg(all(unix, not(target_os = "linux")))]
+                {
+                    return Err(unavailable(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "no verified subtree-containment backend is implemented on this Unix platform; use TrustedBestEffort only for trusted commands",
+                    )));
+                }
+                #[cfg(not(any(unix, target_os = "windows")))]
+                {
+                    return Err(unavailable(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "no verified subtree-containment backend is implemented on this platform",
+                    )));
+                }
+            }
+            ContainmentPolicy::TrustedBestEffort => {
+                #[cfg(unix)]
+                {
+                    Ok(Self {
+                        backend: PreparedContainmentBackend::UnixProcessGroup,
+                    })
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    Ok(Self {
+                        backend: PreparedContainmentBackend::WindowsJob,
+                    })
+                }
+                #[cfg(not(any(unix, target_os = "windows")))]
+                {
+                    Ok(Self {
+                        backend: PreparedContainmentBackend::DirectChild,
+                    })
+                }
+            }
+        }
+    }
+
+    fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            PreparedContainmentBackend::Systemd(unit) => unit.build_command(spec),
+            #[cfg(target_os = "windows")]
+            PreparedContainmentBackend::WindowsJob => {
+                use std::os::windows::process::CommandExt;
+                let mut command = spec.command.build();
+                command.creation_flags(WINDOWS_PROCESS_CREATION_FLAGS);
+                command.current_dir(&spec.current_dir);
+                configure_environment(&mut command, &spec.environment);
+                Ok(command)
+            }
+            #[cfg(unix)]
+            PreparedContainmentBackend::UnixProcessGroup => {
+                use std::os::unix::process::CommandExt;
+                let mut command = spec.command.build();
+                command.process_group(0);
+                command.current_dir(&spec.current_dir);
+                configure_environment(&mut command, &spec.environment);
+                Ok(command)
+            }
+            #[cfg(not(any(unix, target_os = "windows")))]
+            PreparedContainmentBackend::DirectChild => {
+                let mut command = spec.command.build();
+                command.current_dir(&spec.current_dir);
+                configure_environment(&mut command, &spec.environment);
+                Ok(command)
+            }
+        }
+    }
+
+    fn attach(
+        self,
         child: &mut Child,
         label: &str,
         command: &str,
-    ) -> Result<Self, ProcessRunError> {
-        #[cfg(target_os = "windows")]
-        {
-            let job = WindowsJob::create_and_assign(child).map_err(|source| {
-                ProcessRunError::ProcessOwnership {
-                    label: label.to_string(),
-                    command: command.to_string(),
-                    source,
+        operation_deadline: Option<Instant>,
+    ) -> Result<AttachedProcessTree, ProcessRunError> {
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            PreparedContainmentBackend::Systemd(mut unit) => {
+                unit.launcher_spawned = true;
+                if let Err(source) = unit.confirm_attached(child, operation_deadline) {
+                    if let Err(error) = unit.rollback_startup(label) {
+                        fail_closed_stuck_owner(&format!(
+                            "{label} systemd containment startup rollback: {error}"
+                        ));
+                    }
+                    return if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        Err(setup_timeout_error(
+                            label,
+                            command,
+                            "strict containment start gate",
+                            source.to_string(),
+                        ))
+                    } else {
+                        Err(ProcessRunError::ProcessOwnership {
+                            label: label.to_string(),
+                            command: command.to_string(),
+                            source,
+                        })
+                    };
                 }
-            })?;
-            if let Err(source) = resume_suspended_child(child) {
-                let termination_error = job.terminate(label, "startup rollback");
-                let wait_error = wait_for_exit_until(child, Instant::now() + EXIT_AND_DRAIN_GRACE)
-                    .err()
-                    .map(|error| format!("failed to wait for suspended child rollback: {error}"));
-                let source = append_error(
-                    Some(source.to_string()),
-                    append_error(termination_error, wait_error),
-                )
-                .map(std::io::Error::other)
-                .unwrap_or(source);
-                return Err(ProcessRunError::ProcessOwnership {
-                    label: label.to_string(),
-                    command: command.to_string(),
-                    source,
-                });
+                Ok(AttachedProcessTree {
+                    backend: ProcessTreeBackend::Systemd(unit),
+                })
             }
-            Ok(Self { job })
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (child, label, command);
-            Ok(Self {})
-        }
-    }
-
-    fn finalize(&self, child: &mut Child, label: &str) -> Option<String> {
-        #[cfg(unix)]
-        {
-            let _ = self;
-            finalize_unix_process_group(child.id(), label)
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            let _ = child;
-            self.job
-                .terminate(label, "normal process-tree finalization")
-        }
-
-        #[cfg(not(any(unix, target_os = "windows")))]
-        {
-            let _ = (self, child, label);
-            None
+            #[cfg(target_os = "windows")]
+            PreparedContainmentBackend::WindowsJob => {
+                let job = WindowsJob::create_and_assign(child).map_err(|source| {
+                    ProcessRunError::ProcessOwnership {
+                        label: label.to_string(),
+                        command: command.to_string(),
+                        source,
+                    }
+                })?;
+                Ok(AttachedProcessTree {
+                    backend: ProcessTreeBackend::WindowsJob(job),
+                })
+            }
+            #[cfg(unix)]
+            PreparedContainmentBackend::UnixProcessGroup => Ok(AttachedProcessTree {
+                backend: ProcessTreeBackend::UnixProcessGroup,
+            }),
+            #[cfg(not(any(unix, target_os = "windows")))]
+            PreparedContainmentBackend::DirectChild => Ok(AttachedProcessTree {
+                backend: ProcessTreeBackend::DirectChild,
+            }),
         }
     }
+}
 
-    fn terminate(
-        &self,
+struct AttachedProcessTree {
+    backend: ProcessTreeBackend,
+}
+
+impl AttachedProcessTree {
+    fn cleanup(&mut self, child: &mut Child, label: &str, context: &str) -> TreeCleanup {
+        cleanup_process_tree_backend(&mut self.backend, child, false, label, context)
+    }
+
+    fn release(
+        mut self,
+        child: &mut Child,
+        label: &str,
+        command: &str,
+        operation_deadline: Option<Instant>,
+    ) -> Result<ProcessTree, ProcessRunError> {
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            ProcessTreeBackend::Systemd(unit) => {
+                if let Err(source) = unit.release_start_gate(child, operation_deadline) {
+                    if let Err(error) = unit.rollback_startup(label) {
+                        fail_closed_stuck_owner(&format!(
+                            "{label} systemd containment start-gate rollback: {error}"
+                        ));
+                    }
+                    return if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        Err(setup_timeout_error(
+                            label,
+                            command,
+                            "strict containment start gate",
+                            source.to_string(),
+                        ))
+                    } else {
+                        Err(ProcessRunError::ProcessOwnership {
+                            label: label.to_string(),
+                            command: command.to_string(),
+                            source,
+                        })
+                    };
+                }
+            }
+            #[cfg(target_os = "windows")]
+            ProcessTreeBackend::WindowsJob(job) => {
+                if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let cleanup = job.cleanup(label, "startup timeout rollback");
+                    if cleanup.error.is_some() || !cleanup.evidence.is_verified_empty() {
+                        fail_closed_stuck_owner(&format!(
+                            "{label} Windows Job Object startup-timeout rollback: {}",
+                            cleanup.error.unwrap_or_else(|| {
+                                "job did not report verified-empty containment".to_string()
+                            })
+                        ));
+                    }
+                    return Err(setup_timeout_error(
+                        label,
+                        command,
+                        "Windows Job Object attachment",
+                        "the total operation deadline expired before the suspended child was resumed",
+                    ));
+                }
+                if let Err(source) = resume_suspended_child(child) {
+                    let cleanup = job.cleanup(label, "startup rollback");
+                    if cleanup.error.is_some() || !cleanup.evidence.is_verified_empty() {
+                        fail_closed_stuck_owner(&format!(
+                            "{label} Windows Job Object resume rollback: {}",
+                            cleanup.error.unwrap_or_else(|| {
+                                "job did not report verified-empty containment".to_string()
+                            })
+                        ));
+                    }
+                    return Err(ProcessRunError::ProcessOwnership {
+                        label: label.to_string(),
+                        command: command.to_string(),
+                        source,
+                    });
+                }
+            }
+            #[cfg(unix)]
+            ProcessTreeBackend::UnixProcessGroup => {}
+            #[cfg(not(any(unix, target_os = "windows")))]
+            ProcessTreeBackend::DirectChild => {}
+        }
+        Ok(ProcessTree {
+            backend: self.backend,
+        })
+    }
+}
+
+struct ProcessTree {
+    backend: ProcessTreeBackend,
+}
+
+enum ProcessTreeBackend {
+    #[cfg(target_os = "linux")]
+    Systemd(Box<SystemdUnit>),
+    #[cfg(target_os = "windows")]
+    WindowsJob(WindowsJob),
+    #[cfg(unix)]
+    UnixProcessGroup,
+    #[cfg(not(any(unix, target_os = "windows")))]
+    DirectChild,
+}
+
+struct TreeCleanup {
+    error: Option<String>,
+    evidence: ContainmentEvidence,
+}
+
+impl ProcessTree {
+    fn cleanup(
+        &mut self,
         child: &mut Child,
         child_already_exited: bool,
         label: &str,
-    ) -> Option<String> {
-        #[cfg(unix)]
-        {
-            let _ = self;
-            terminate_unix_process_group(child, child_already_exited, label)
-        }
+        context: &str,
+    ) -> TreeCleanup {
+        cleanup_process_tree_backend(
+            &mut self.backend,
+            child,
+            child_already_exited,
+            label,
+            context,
+        )
+    }
+}
 
+fn cleanup_process_tree_backend(
+    backend: &mut ProcessTreeBackend,
+    child: &mut Child,
+    child_already_exited: bool,
+    label: &str,
+    context: &str,
+) -> TreeCleanup {
+    match backend {
+        #[cfg(target_os = "linux")]
+        ProcessTreeBackend::Systemd(unit) => unit.cleanup(child, label, context),
         #[cfg(target_os = "windows")]
-        {
-            match self.job.terminate(label, "process termination") {
-                None => None,
-                Some(job_error) if child_already_exited => Some(job_error),
-                Some(job_error) => match child.kill() {
-                    Ok(()) => Some(format!("{job_error}; direct child was killed")),
-                    Err(error) => Some(format!("{job_error}; direct process kill failed: {error}")),
-                },
-            }
-        }
-
+        ProcessTreeBackend::WindowsJob(job) => job.cleanup(label, context),
+        #[cfg(unix)]
+        ProcessTreeBackend::UnixProcessGroup => TreeCleanup {
+            error: terminate_unix_process_group(child, child_already_exited, label),
+            evidence: ContainmentEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup),
+        },
         #[cfg(not(any(unix, target_os = "windows")))]
-        {
-            let _ = self;
-            if child_already_exited {
+        ProcessTreeBackend::DirectChild => TreeCleanup {
+            error: if child_already_exited {
                 None
             } else {
                 child
                     .kill()
                     .err()
-                    .map(|error| format!("{label} timed out but process kill failed: {error}"))
+                    .map(|error| format!("{label} {context} direct process kill failed: {error}"))
+            },
+            evidence: ContainmentEvidence::TrustedBestEffort(ContainmentBackend::DirectChild),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SystemdUnit {
+    _permit: SystemdUnitPermit,
+    systemd_run: PathBuf,
+    systemctl: PathBuf,
+    env_program: PathBuf,
+    shell: PathBuf,
+    sleep_program: PathBuf,
+    mkfifo_program: PathBuf,
+    name: String,
+    cgroup_path: PathBuf,
+    runtime_dir: PathBuf,
+    client_runtime: PathBuf,
+    environment_file: PathBuf,
+    ready_path: PathBuf,
+    waiting_path: PathBuf,
+    environment_fifo_path: PathBuf,
+    start_fifo_path: PathBuf,
+    owner_fifo_path: PathBuf,
+    owner_channel: Option<File>,
+    pending_environment: Option<EnvironmentMode>,
+    environment_published: bool,
+    environment_released: bool,
+    runner_pid: u32,
+    runner_start_time: u64,
+    launcher_spawned: bool,
+    launcher_completed: bool,
+    observed_owned: bool,
+    cleaned: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct SystemdUnitPermit {
+    file: File,
+}
+
+#[cfg(target_os = "linux")]
+impl SystemdUnitPermit {
+    fn acquire(runtime_root: &Path, operation_deadline: Option<Instant>) -> std::io::Result<Self> {
+        use std::os::unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            io::AsRawFd,
+        };
+
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        let deadline = bounded_operation_deadline(SYSTEMD_SLOT_WAIT, operation_deadline)?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no systemd containment execution slot became available before the bounded setup deadline",
+                ));
+            }
+            let first_slot = if operation_deadline.is_some_and(|deadline| {
+                deadline.saturating_duration_since(Instant::now())
+                    <= EXPEDITED_SYSTEMD_SLOT_THRESHOLD
+            }) {
+                0
+            } else {
+                RESERVED_EXPEDITED_SYSTEMD_SLOTS
+            };
+            // Slot zero stays available for operations whose total deadline is at most one second;
+            // longer and unbounded runs share the other seven slots.
+            for slot in first_slot..MAX_CONCURRENT_SYSTEMD_UNITS {
+                let path = runtime_root.join(format!("maco-process-runner-slot-{slot}.lock"));
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file()
+                    || metadata.uid() != effective_uid
+                    || metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("unsafe systemd containment slot file {}", path.display()),
+                    ));
+                }
+                // SAFETY: flock operates on this live owned descriptor and does not access memory.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    if Instant::now() >= deadline {
+                        drop(file);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "a systemd containment execution slot became available only after the bounded setup deadline",
+                        ));
+                    }
+                    return Ok(Self { file });
+                }
+                let error = std::io::Error::last_os_error();
+                let code = error.raw_os_error();
+                if code != Some(libc::EWOULDBLOCK) && code != Some(libc::EAGAIN) {
+                    return Err(error);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "no systemd containment execution slot became available within {} seconds",
+                        SYSTEMD_SLOT_WAIT.as_secs()
+                    ),
+                ));
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SystemdUnitPermit {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+
+        // SAFETY: unlocking this live descriptor is advisory cleanup; closing also releases it.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SystemdUnit {
+    fn prepare(operation_deadline: Option<Instant>) -> std::io::Result<Self> {
+        #[cfg(test)]
+        if env::var_os("MACO_TEST_DISABLE_STRICT_CONTAINMENT").is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "strict containment disabled by isolated regression test",
+            ));
+        }
+        let client_runtime = trusted_linux_runtime_root()?;
+        let permit = SystemdUnitPermit::acquire(&client_runtime, operation_deadline)?;
+        let systemd_run = find_trusted_unix_executable(
+            "systemd-run",
+            &[
+                "/usr/bin/systemd-run",
+                "/bin/systemd-run",
+                "/run/current-system/sw/bin/systemd-run",
+            ],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "strict containment requires a root-owned, non-writable systemd-run at a trusted system path",
+            )
+        })?;
+        let shell = find_trusted_unix_executable(
+            "sh",
+            &["/bin/sh", "/usr/bin/sh", "/run/current-system/sw/bin/sh"],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "strict containment requires a root-owned, non-writable POSIX shell at a trusted system path",
+            )
+        })?;
+        let systemctl = find_trusted_unix_executable(
+            "systemctl",
+            &[
+                "/usr/bin/systemctl",
+                "/bin/systemctl",
+                "/run/current-system/sw/bin/systemctl",
+            ],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "strict containment requires a root-owned, non-writable systemctl at a trusted system path",
+            )
+        })?;
+        let env_program = find_trusted_unix_executable(
+            "env",
+            &["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "strict containment requires a root-owned, non-writable env helper at a trusted system path",
+            )
+        })?;
+        let sleep_program = find_trusted_unix_executable(
+            "sleep",
+            &[
+                "/usr/bin/sleep",
+                "/bin/sleep",
+                "/run/current-system/sw/bin/sleep",
+            ],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "strict containment requires a root-owned, non-writable sleep helper at a trusted system path",
+            )
+        })?;
+        let mkfifo_program = find_trusted_unix_executable(
+            "mkfifo",
+            &[
+                "/usr/bin/mkfifo",
+                "/bin/mkfifo",
+                "/run/current-system/sw/bin/mkfifo",
+            ],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "strict containment requires a root-owned, non-writable mkfifo helper at a trusted system path",
+            )
+        })?;
+        let manager_cgroup = systemd_user_manager_cgroup()?;
+        let manager_path = Path::new("/sys/fs/cgroup").join(
+            manager_cgroup
+                .strip_prefix("/")
+                .unwrap_or(manager_cgroup.as_path()),
+        );
+        if !manager_path.join("cgroup.controllers").is_file()
+            || !manager_path.join("cgroup.kill").is_file()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "systemd user manager cgroup {} does not expose cgroup v2 kill/verification controls",
+                    manager_path.display()
+                ),
+            ));
+        }
+        let sequence = NEXT_SYSTEMD_UNIT_ID.fetch_add(1, Ordering::Relaxed);
+        let runner_pid = std::process::id();
+        let runner_start_time = linux_process_start_time(runner_pid)?;
+        let name = format!("maco-process-{runner_pid}-{sequence}.service");
+        let cgroup_path = manager_path.join("app.slice").join(&name);
+        let runtime_dir = client_runtime
+            .clone()
+            .join(format!("maco-process-{runner_pid}-{sequence}"));
+        let environment_file = runtime_dir.join("environment");
+        let ready_path = runtime_dir.join("environment-ready");
+        let waiting_path = runtime_dir.join("guardian-waiting");
+        let environment_fifo_path = runtime_dir.join("environment-gate");
+        let start_fifo_path = runtime_dir.join("start-gate");
+        let owner_fifo_path = runtime_dir.join("owner-liveness");
+        Ok(Self {
+            _permit: permit,
+            systemd_run,
+            systemctl,
+            env_program,
+            shell,
+            sleep_program,
+            mkfifo_program,
+            name,
+            cgroup_path,
+            runtime_dir,
+            client_runtime,
+            environment_file,
+            ready_path,
+            waiting_path,
+            environment_fifo_path,
+            start_fifo_path,
+            owner_fifo_path,
+            owner_channel: None,
+            pending_environment: None,
+            environment_published: false,
+            environment_released: false,
+            runner_pid,
+            runner_start_time,
+            launcher_spawned: false,
+            launcher_completed: false,
+            observed_owned: false,
+            cleaned: false,
+        })
+    }
+
+    fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
+        self.pending_environment = Some(spec.environment.clone());
+        let runtime_name = self
+            .runtime_dir
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "systemd containment runtime directory name is not valid UTF-8",
+                )
+            })?;
+        let runtime_max = systemd_runtime_max(spec.timeout)?;
+        let mut command = Command::new(&self.systemd_run);
+        command
+            .env_clear()
+            .env("XDG_RUNTIME_DIR", &self.client_runtime)
+            .args([
+                "--user",
+                "--quiet",
+                "--pipe",
+                "--wait",
+                "--collect",
+                "--service-type=exec",
+                "--slice=app.slice",
+                "--expand-environment=no",
+                "--property=KillMode=control-group",
+                "--property=KillSignal=SIGKILL",
+                "--property=FinalKillSignal=SIGKILL",
+                "--property=ProtectControlGroups=yes",
+                "--property=TimeoutStopSec=100ms",
+                "--property=RuntimeDirectoryPreserve=no",
+                "--property=RuntimeDirectoryMode=0700",
+            ])
+            .arg(format!("--property=RuntimeDirectory={runtime_name}"))
+            .arg(format!(
+                "--property=RuntimeMaxSec={}ms",
+                runtime_max.as_millis()
+            ))
+            .arg("--unit")
+            .arg(&self.name)
+            .arg("--working-directory")
+            .arg(&spec.current_dir)
+            .arg("--")
+            .arg(&self.env_program)
+            .arg("-i")
+            .arg(&self.shell)
+            .args([
+                OsStr::new("-c"),
+                OsStr::new(SYSTEMD_GUARDIAN_SCRIPT),
+                OsStr::new("maco-containment-guardian"),
+            ])
+            .arg(&self.environment_file)
+            .arg(&self.ready_path)
+            .arg(&self.waiting_path)
+            .arg(&self.environment_fifo_path)
+            .arg(&self.start_fifo_path)
+            .arg(&self.owner_fifo_path)
+            .arg(self.runner_pid.to_string())
+            .arg(self.runner_start_time.to_string())
+            .arg(&self.sleep_program)
+            .arg(&self.mkfifo_program);
+        match &spec.command {
+            ProcessCommand::Shell {
+                shell,
+                command: text,
+            } => match shell {
+                Shell::UnixSh => {
+                    command.arg(&self.shell).arg("-c").arg(text);
+                }
+                Shell::WindowsCmd => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Windows cmd shell cannot run through Linux systemd containment",
+                    ));
+                }
+            },
+            ProcessCommand::Direct { program, args } => {
+                command.arg(program).args(args);
+            }
+        }
+        Ok(command)
+    }
+
+    fn confirm_attached(
+        &mut self,
+        child: &mut Child,
+        operation_deadline: Option<Instant>,
+    ) -> std::io::Result<()> {
+        let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "systemd transient unit {} did not reach its start gate before the bounded setup deadline",
+                        self.name
+                    ),
+                ));
+            }
+            if matches!(cgroup_populated(&self.cgroup_path)?, Some(true)) {
+                self.observed_owned = true;
+            }
+            if self.observed_owned && self.owner_channel.is_none() && self.owner_fifo_path.exists()
+            {
+                match open_systemd_owner_fifo(&self.owner_fifo_path) {
+                    Ok(channel) => self.owner_channel = Some(channel),
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if self.owner_channel.is_some()
+                && self.waiting_path.is_file()
+                && !self.environment_published
+            {
+                let environment = self.pending_environment.take().ok_or_else(|| {
+                    std::io::Error::other("systemd containment omitted pending environment")
+                })?;
+                publish_systemd_environment_file(&self.environment_file, &environment)?;
+                self.environment_published = true;
+                #[cfg(test)]
+                if let Some(marker) = env::var_os("MACO_TEST_ENVIRONMENT_PUBLISHED_MARKER") {
+                    fs::write(marker, b"published")?;
+                    while env::var_os("MACO_TEST_HOLD_AFTER_ENVIRONMENT_PUBLISH").is_some() {
+                        thread::sleep(POLL_INTERVAL);
+                    }
+                }
+            }
+            if self.environment_published && !self.environment_released {
+                match signal_systemd_fifo(&self.environment_fifo_path, b"environment\n") {
+                    Ok(()) => self.environment_released = true,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if self.environment_released && self.ready_path.is_file() {
+                #[cfg(test)]
+                if env::var_os("MACO_TEST_ABORT_BEFORE_START_RELEASE").is_some() {
+                    std::process::abort();
+                }
+                return Ok(());
+            }
+            if let Some(status) = child.try_wait()? {
+                self.launcher_completed = true;
+                let startup_output = collect_exited_child_startup_output(child);
+                return Err(std::io::Error::other(format!(
+                    "systemd-run exited with {status} before transient-unit ownership was observed{startup_output}"
+                )));
+            }
+            thread::sleep(IO_CANCEL_POLL_INTERVAL);
+        }
+    }
+
+    fn release_start_gate(
+        &mut self,
+        child: &mut Child,
+        operation_deadline: Option<Instant>,
+    ) -> std::io::Result<()> {
+        let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+        remove_file_if_present(&self.environment_file).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to remove consumed private environment file before releasing containment gate: {error}"
+                ),
+            )
+        })?;
+        remove_file_if_present(&self.owner_fifo_path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to unlink confirmed systemd owner-liveness FIFO: {error}"),
+            )
+        })?;
+        loop {
+            match signal_systemd_fifo(&self.start_fifo_path, b"start\n") {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(status) = child.try_wait()? {
+                self.launcher_completed = true;
+                let startup_output = collect_exited_child_startup_output(child);
+                return Err(std::io::Error::other(format!(
+                    "systemd-run exited with {status} before the execution gate was released{startup_output}"
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "systemd transient unit {} did not consume its start gate before the bounded setup deadline",
+                        self.name
+                    ),
+                ));
+            }
+            thread::sleep(IO_CANCEL_POLL_INTERVAL);
+        }
+    }
+
+    fn cleanup(&mut self, _child: &mut Child, label: &str, context: &str) -> TreeCleanup {
+        if self.cleaned {
+            return TreeCleanup {
+                error: None,
+                evidence: ContainmentEvidence::VerifiedEmpty(
+                    ContainmentBackend::SystemdUserService,
+                ),
+            };
+        }
+        let error = self.kill_and_verify(label, context).err().map(|error| {
+            format!(
+                "{label} {context} could not verify empty systemd containment unit {}: {error}",
+                self.name
+            )
+        });
+        if error.is_none() && self.observed_owned {
+            self.cleaned = true;
+            self.remove_runtime_files();
+        }
+        TreeCleanup {
+            evidence: if error.is_none() && self.observed_owned {
+                ContainmentEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+            } else {
+                ContainmentEvidence::Unverified(ContainmentBackend::SystemdUserService)
+            },
+            error,
+        }
+    }
+
+    fn rollback_startup(&mut self, label: &str) -> std::io::Result<()> {
+        self.owner_channel.take();
+        if !self.launcher_spawned {
+            self.cleaned = true;
+            self.remove_runtime_files();
+            return Ok(());
+        }
+        if self.observed_owned {
+            self.kill_and_verify(label, "startup rollback")?;
+            self.cleaned = true;
+            self.remove_runtime_files();
+            return Ok(());
+        }
+        if self.launcher_completed && cgroup_populated(&self.cgroup_path)?.is_none() {
+            self.cleaned = true;
+            self.remove_runtime_files();
+            return Ok(());
+        }
+        let status = run_control_command_bounded(
+            &self.systemctl,
+            [
+                OsStr::new("--user"),
+                OsStr::new("--no-block"),
+                OsStr::new("stop"),
+                self.name.as_ref(),
+            ],
+            "systemctl startup rollback",
+            &self.client_runtime,
+        )?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "systemctl stop for {} exited with {status}",
+                self.name
+            )));
+        }
+        let deadline = Instant::now() + SYSTEMD_OPERATION_GRACE;
+        loop {
+            match cgroup_populated(&self.cgroup_path)? {
+                Some(true) => {
+                    self.observed_owned = true;
+                    return self.kill_and_verify(label, "startup rollback");
+                }
+                Some(false) => {
+                    self.observed_owned = true;
+                }
+                None => {
+                    self.cleaned = true;
+                    self.remove_runtime_files();
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "systemd startup rollback did not collect the transient unit",
+                ));
+            }
+            thread::sleep(IO_CANCEL_POLL_INTERVAL);
+        }
+    }
+
+    fn kill_and_verify(&mut self, _label: &str, _context: &str) -> std::io::Result<()> {
+        if !self.observed_owned {
+            return Err(std::io::Error::other(
+                "systemd transient-unit ownership was never observed",
+            ));
+        }
+        self.owner_channel.take();
+        if matches!(cgroup_populated(&self.cgroup_path)?, Some(true)) {
+            match OpenOptions::new()
+                .write(true)
+                .open(self.cgroup_path.join("cgroup.kill"))
+                .and_then(|mut kill| kill.write_all(b"1\n"))
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let deadline = Instant::now() + SYSTEMD_OPERATION_GRACE;
+        loop {
+            match cgroup_populated(&self.cgroup_path)? {
+                None => return Ok(()),
+                Some(false) if Instant::now() >= deadline => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "cgroup became empty but the transient unit was not collected/inactive after {} ms",
+                            SYSTEMD_OPERATION_GRACE.as_millis()
+                        ),
+                    ));
+                }
+                Some(false) => thread::sleep(IO_CANCEL_POLL_INTERVAL),
+                Some(true) if Instant::now() >= deadline => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "cgroup remained populated after {} ms",
+                            SYSTEMD_OPERATION_GRACE.as_millis()
+                        ),
+                    ));
+                }
+                Some(true) => thread::sleep(IO_CANCEL_POLL_INTERVAL),
             }
         }
     }
+
+    fn remove_runtime_files(&self) {
+        let _ = fs::remove_file(&self.start_fifo_path);
+        let _ = fs::remove_file(&self.owner_fifo_path);
+        let _ = fs::remove_file(&self.environment_fifo_path);
+        let _ = fs::remove_file(&self.waiting_path);
+        let _ = fs::remove_file(&self.ready_path);
+        let _ = fs::remove_file(&self.environment_file);
+        let _ = fs::remove_dir(&self.runtime_dir);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_control_command_bounded<'a>(
+    program: &Path,
+    args: impl IntoIterator<Item = &'a OsStr>,
+    label: &str,
+    client_runtime: &Path,
+) -> std::io::Result<ExitStatus> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("XDG_RUNTIME_DIR", client_runtime)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    match wait_for_exit_until(&mut child, Instant::now() + SYSTEMD_OPERATION_GRACE)? {
+        Some(status) => Ok(status),
+        None => {
+            let cleanup = terminate_unix_process_group(&mut child, false, label);
+            match wait_for_exit_until(&mut child, Instant::now() + SYSTEMD_OPERATION_GRACE)? {
+                Some(status) => {
+                    if let Some(cleanup) = cleanup {
+                        Err(std::io::Error::other(cleanup))
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("{label} exceeded its bounded deadline and was terminated with {status}"),
+                        ))
+                    }
+                }
+                None => fail_closed_stuck_owner(label),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_exited_child_startup_output(child: &mut Child) -> String {
+    fn read(stream: Option<impl Read>) -> String {
+        let Some(stream) = stream else {
+            return String::new();
+        };
+        let mut bytes = Vec::new();
+        let _ = stream
+            .take((PIPE_READ_CHUNK_SIZE * 4) as u64)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).trim().to_string()
+    }
+
+    let stdout = read(child.stdout.take());
+    let stderr = read(child.stderr.take());
+    let mut details = Vec::new();
+    if !stdout.is_empty() {
+        details.push(format!("stdout={stdout:?}"));
+    }
+    if !stderr.is_empty() {
+        details.push(format!("stderr={stderr:?}"));
+    }
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!("; startup output: {}", details.join("; "))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SystemdUnit {
+    fn drop(&mut self) {
+        if !self.cleaned && self.launcher_spawned {
+            if let Err(error) = self.rollback_startup("process") {
+                fail_closed_stuck_owner(&format!(
+                    "systemd containment drop rollback for {}: {error}",
+                    self.name
+                ));
+            }
+        }
+        self.remove_runtime_files();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_manager_cgroup() -> std::io::Result<PathBuf> {
+    let contents = fs::read_to_string("/proc/self/cgroup")?;
+    let current = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "strict containment requires a unified cgroup v2 hierarchy",
+            )
+        })?;
+    let mut manager = PathBuf::from("/");
+    for component in Path::new(current).components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        manager.push(component);
+        let component = component.to_string_lossy();
+        if component.starts_with("user@") && component.ends_with(".service") {
+            return Ok(manager);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("current cgroup {current} is not inside a delegated systemd user manager"),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
+    let events = match fs::read_to_string(path.join("cgroup.events")) {
+        Ok(events) => events,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    events
+        .lines()
+        .find_map(|line| line.strip_prefix("populated "))
+        .map(|value| match value {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected cgroup populated value {other:?}"),
+            )),
+        })
+        .transpose()?
+        .map(Some)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cgroup.events omitted populated state",
+            )
+        })
+}
+
+#[cfg(unix)]
+fn find_trusted_unix_executable(_name: &str, candidates: &[&str]) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    candidates.iter().find_map(|candidate| {
+        let canonical = fs::canonicalize(candidate).ok()?;
+        let metadata = canonical.metadata().ok()?;
+        (metadata.is_file()
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o111 != 0
+            && metadata.permissions().mode() & 0o022 == 0)
+            .then(|| PathBuf::from(candidate))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn effective_environment(mode: &EnvironmentMode) -> BTreeMap<OsString, OsString> {
+    let mut environment = match mode {
+        EnvironmentMode::Inherit | EnvironmentMode::InheritAndSet(_) => env::vars_os().collect(),
+        EnvironmentMode::ClearAndSet(_) => BTreeMap::new(),
+    };
+    match mode {
+        EnvironmentMode::Inherit => {}
+        EnvironmentMode::InheritAndSet(values) | EnvironmentMode::ClearAndSet(values) => {
+            environment.extend(
+                values
+                    .iter()
+                    .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+            );
+        }
+    }
+    environment
+}
+
+#[cfg(target_os = "linux")]
+fn open_systemd_owner_fifo(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_fifo()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("unsafe systemd owner-liveness FIFO {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_systemd_fifo(path: &Path, token: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut gate = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = gate.metadata()?;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_fifo()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("systemd containment gate {} is not a FIFO", path.display()),
+        ));
+    }
+    gate.write_all(token)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_start_time(pid: u32) -> std::io::Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat omitted the process name terminator"),
+            )
+        })?;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat omitted process start time"),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid /proc/{pid}/stat process start time: {error}"),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_runtime_max(timeout: Option<Duration>) -> std::io::Result<Duration> {
+    match timeout {
+        Some(timeout) => timeout
+            .checked_add(SYSTEMD_RUNTIME_OVERHEAD)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "process timeout is too large to add the systemd cleanup allowance",
+                )
+            }),
+        None => Ok(SYSTEMD_ORPHAN_SAFETY_FUSE),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_operation_deadline(
+    platform_grace: Duration,
+    operation_deadline: Option<Instant>,
+) -> std::io::Result<Instant> {
+    let now = Instant::now();
+    if operation_deadline.is_some_and(|deadline| now >= deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the total operation deadline was exhausted during containment setup",
+        ));
+    }
+    let platform_deadline = now.checked_add(platform_grace).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "platform containment grace exceeds the Instant range",
+        )
+    })?;
+    Ok(operation_deadline
+        .map(|deadline| deadline.min(platform_deadline))
+        .unwrap_or(platform_deadline))
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_linux_runtime_root() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    let user_runtime = PathBuf::from(format!("/run/user/{effective_uid}"));
+    if user_runtime.metadata().is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == effective_uid
+            && metadata.permissions().mode() & 0o077 == 0
+    }) {
+        return Ok(user_runtime);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "strict systemd containment requires an owner-private /run/user/<uid> runtime root",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_systemd_environment_file(path: &Path, mode: &EnvironmentMode) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let published = (|| {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || metadata.uid() != effective_uid
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("unsafe systemd environment file {}", path.display()),
+            ));
+        }
+        for (name, value) in effective_environment(mode) {
+            let name = name.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "strict systemd containment cannot project a non-UTF-8 environment name",
+                )
+            })?;
+            let valid_name = name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+            });
+            if name.is_empty() || !valid_name {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid environment variable name {name:?}"),
+                ));
+            }
+            let value = value.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("strict systemd containment cannot project non-UTF-8 value for {name}"),
+                )
+            })?;
+            let escaped = value.replace('\'', "'\\''");
+            writeln!(file, "{name}='{escaped}'")?;
+        }
+        file.sync_all()?;
+        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    })();
+    if published.is_err() {
+        let matches = tee_path_matches_file(path, &file).unwrap_or(false);
+        drop(file);
+        if matches {
+            let _ = fs::remove_file(path);
+        }
+    }
+    published
 }
 
 #[cfg(unix)]
@@ -1126,7 +3427,7 @@ fn direct_child_kill_after_group_error(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn finalize_unix_process_group(pid: u32, label: &str) -> Option<String> {
     match send_unix_process_group_signal(pid, libc::SIGTERM) {
         Ok(GroupSignalResult::Missing) => None,
@@ -1245,6 +3546,60 @@ impl WindowsJob {
                 "{label} {context} failed in TerminateJobObject: {}",
                 std::io::Error::last_os_error()
             ))
+        }
+    }
+
+    fn cleanup(&self, label: &str, context: &str) -> TreeCleanup {
+        let error = append_error(
+            self.terminate(label, context),
+            self.wait_until_empty(label, context),
+        );
+        TreeCleanup {
+            evidence: if error.is_none() {
+                ContainmentEvidence::VerifiedEmpty(ContainmentBackend::WindowsJobObject)
+            } else {
+                ContainmentEvidence::Unverified(ContainmentBackend::WindowsJobObject)
+            },
+            error,
+        }
+    }
+
+    fn wait_until_empty(&self, label: &str, context: &str) -> Option<String> {
+        use std::{mem::size_of, ptr};
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        let deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
+        loop {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: `accounting` is valid writable storage for the requested information class.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle.raw(),
+                    JobObjectBasicAccountingInformation,
+                    ptr::from_mut(&mut accounting).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    ptr::null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Some(format!(
+                    "{label} {context} failed to query Windows Job emptiness: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if accounting.ActiveProcesses == 0 {
+                return None;
+            }
+            if Instant::now() >= deadline {
+                return Some(format!(
+                    "{label} {context} Windows Job remained populated after {} ms",
+                    EXIT_AND_DRAIN_GRACE.as_millis()
+                ));
+            }
+            thread::sleep(IO_CANCEL_POLL_INTERVAL);
         }
     }
 }
@@ -1474,8 +3829,6 @@ enum IoThreadCleanupError {
         #[source]
         source: std::io::Error,
     },
-    #[error("{label} did not stop within {} ms after cancellation; joined after the cleanup deadline", THREAD_JOIN_GRACE.as_millis())]
-    Deadline { label: String },
     #[error("{label} thread panicked during cleanup")]
     Panicked { label: String },
 }
@@ -1504,16 +3857,12 @@ impl OwnedIoThread {
             }
         }
         let Self { handle, .. } = self;
-        if !completion_observed {
-            let deadline = Instant::now() + THREAD_JOIN_GRACE;
-            while !handle.is_finished() && Instant::now() < deadline {
-                thread::sleep(IO_CANCEL_POLL_INTERVAL);
-            }
-            if !handle.is_finished() {
-                errors.push(IoThreadCleanupError::Deadline {
-                    label: label.to_string(),
-                });
-            }
+        let deadline = Instant::now() + THREAD_JOIN_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(IO_CANCEL_POLL_INTERVAL);
+        }
+        if !handle.is_finished() {
+            fail_closed_stuck_owner(label);
         }
         if handle.join().is_err() {
             errors.push(IoThreadCleanupError::Panicked {
@@ -1807,6 +4156,7 @@ struct PipeReader {
     stream: &'static str,
     receiver: Option<Receiver<PipeReadEvent>>,
     thread: Option<OwnedIoThread>,
+    tee_helper: Option<TeeHelperHandle>,
     capture: BoundedBuffer,
     complete: bool,
     error: Option<String>,
@@ -1865,9 +4215,13 @@ impl PipeReader {
             cleanup_errors(thread.finish(self.complete, &format!("{label} {} reader", self.stream)))
         });
         self.drain_after_join();
+        let tee_error = self
+            .tee_helper
+            .take()
+            .and_then(|helper| helper.finish(label, self.stream));
         (
             self.capture.into_captured(),
-            append_error(self.error, cleanup_error),
+            append_error(append_error(self.error, cleanup_error), tee_error),
         )
     }
 
@@ -1898,13 +4252,20 @@ enum PipeReadEvent {
 fn start_pipe_reader<R>(
     stream: &'static str,
     mut reader: R,
-    mut tee: Option<TeeWriter>,
+    tee: Option<TeeWriter>,
     label: &str,
     capture_limit: usize,
 ) -> PipeReader
 where
     R: Read + Send + 'static,
 {
+    let (mut tee, tee_helper, tee_path) = match tee {
+        Some(tee) => {
+            let (sink, helper, path) = tee.split();
+            (Some(sink), helper, Some(path))
+        }
+        None => (None, None, None),
+    };
     let (sender, receiver) = mpsc::sync_channel(PIPE_CHANNEL_CAPACITY);
     let label = label.to_string();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1922,7 +4283,10 @@ where
             Ok(bytes_read) => {
                 buffer.truncate(bytes_read);
                 if let Some(tee) = tee.as_mut() {
-                    if let Err(error) = tee.file.write_all(&buffer) {
+                    if let Err(error) = tee.write_all_cancellable(&buffer, &thread_cancel) {
+                        if thread_cancel.load(Ordering::Acquire) {
+                            break;
+                        }
                         if send_pipe_event(&sender, &thread_cancel, PipeReadEvent::Chunk(buffer))
                             .is_ok()
                         {
@@ -1931,7 +4295,11 @@ where
                                 &thread_cancel,
                                 PipeReadEvent::Error(format!(
                                     "failed to write {label} {stream} tee {}: {error}",
-                                    tee.path.display()
+                                    tee_path
+                                        .as_deref()
+                                        .map(Path::display)
+                                        .map(|path| path.to_string())
+                                        .unwrap_or_else(|| "<unknown>".to_string())
                                 )),
                             );
                         }
@@ -1962,6 +4330,7 @@ where
         stream,
         receiver: Some(receiver),
         thread: Some(OwnedIoThread { handle, cancel }),
+        tee_helper,
         capture: BoundedBuffer::new(capture_limit),
         complete: false,
         error: None,
@@ -2052,10 +4421,19 @@ mod tests {
         assert_eq!(output.stdout.as_bytes().len(), 16 * 1024);
         assert_eq!(output.stderr.as_bytes().len(), 16 * 1024);
         assert!(
-            std::fs::metadata(output_log)
+            std::fs::metadata(&output_log)
                 .expect("stdout log metadata")
                 .len()
                 >= 256 * 4096
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&output_log)
+                .expect("stdout log permissions")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
     }
 
@@ -2070,6 +4448,7 @@ mod tests {
             temp.path(),
             1024,
         )
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_timeout(Some(Duration::from_secs(1)));
         let started = Instant::now();
 
@@ -2093,11 +4472,12 @@ mod tests {
         let spec = ProcessSpec::shell(
             "deadline-racing command",
             Shell::UnixSh,
-            "sleep 0.002",
+            "sleep 0.06",
             temp.path(),
             128,
         )
-        .with_timeout(Some(Duration::from_millis(1)));
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
+        .with_timeout(Some(Duration::from_millis(50)));
 
         let output = run_process(spec).expect("run deadline-racing command");
 
@@ -2120,7 +4500,7 @@ mod tests {
             temp.path(),
             8 * 1024,
         )
-        .with_timeout(Some(Duration::from_millis(200)));
+        .with_timeout(Some(Duration::from_secs(2)));
         let started = Instant::now();
 
         let output = run_process(spec).expect("run descendant-spawning command");
@@ -2184,12 +4564,714 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn required_containment_verifies_normal_nonzero_and_timeout_units_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let normal = run_process(
+            ProcessSpec::shell(
+                "normal contained command",
+                Shell::UnixSh,
+                "exit 0",
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("run normal contained command");
+        assert!(normal.status.is_some_and(|status| status.success()));
+        assert!(normal.containment.is_verified_empty());
+        assert_eq!(normal.process_error, None);
+
+        let nonzero = run_process(
+            ProcessSpec::shell(
+                "nonzero contained command",
+                Shell::UnixSh,
+                "exit 7",
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("run nonzero contained command");
+        assert_eq!(nonzero.status.and_then(|status| status.code()), Some(7));
+        assert!(nonzero.containment.is_verified_empty());
+        assert_eq!(nonzero.process_error, None);
+
+        let timed_out = run_process(
+            ProcessSpec::shell(
+                "timed out contained command",
+                Shell::UnixSh,
+                "sleep 30",
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("run timed out contained command");
+        assert!(timed_out.timed_out);
+        assert!(
+            timed_out.containment.is_verified_empty(),
+            "timed out strict run did not prove cleanup: {timed_out:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn required_containment_kills_setsid_delayed_mutation_with_closed_stdio() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("escaped-delayed-mutation");
+        let pid_file = temp.path().join("escaped-delayed.pid");
+        let command = format!(
+            "setsid sh -c 'echo $$ > \"{}\"; sleep 0.3; touch \"{}\"' >/dev/null 2>&1 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done",
+            pid_file.display(),
+            marker.display(),
+            pid_file.display()
+        );
+        let output = run_process(
+            ProcessSpec::shell(
+                "setsid delayed mutation",
+                Shell::UnixSh,
+                command,
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("run setsid delayed mutation");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(output.containment.is_verified_empty());
+        thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn required_containment_unavailable_refuses_before_spawn() {
+        const CHILD_ENV: &str = "MACO_TEST_CONTAINMENT_UNAVAILABLE_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let marker =
+                PathBuf::from(env::var_os("MACO_TEST_CONTAINMENT_MARKER").expect("marker"));
+            let spec = ProcessSpec::shell(
+                "unavailable strict containment",
+                Shell::UnixSh,
+                format!("touch '{}'", marker.display()),
+                marker.parent().expect("marker parent"),
+                128,
+            );
+            let error = run_process(spec).expect_err("strict containment must be unavailable");
+            assert!(matches!(
+                error,
+                ProcessRunError::ContainmentUnavailable { .. }
+            ));
+            assert!(!marker.exists());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("must-not-run");
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process_runner::tests::required_containment_unavailable_refuses_before_spawn",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("MACO_TEST_DISABLE_STRICT_CONTAINMENT", "1")
+            .env("MACO_TEST_CONTAINMENT_MARKER", &marker)
+            .current_dir(temp.path())
+            .status()
+            .expect("run unavailable-containment child test");
+        assert!(status.success());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exhausted_total_budget_returns_typed_setup_timeout_without_starting_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("must-not-run");
+        let error = run_process(
+            ProcessSpec::shell(
+                "expired setup budget",
+                Shell::UnixSh,
+                format!("touch '{}'", marker.display()),
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::ZERO)),
+        )
+        .expect_err("zero total budget must expire before target release");
+
+        assert!(matches!(error, ProcessRunError::SetupTimeout { .. }));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_runtime_files_ignore_ambient_tmpdir() {
+        const CHILD_ENV: &str = "MACO_TEST_AMBIENT_TMP_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let ambient =
+                PathBuf::from(env::var_os("MACO_TEST_AMBIENT_TMP_PATH").expect("ambient"));
+            let output = run_process(ProcessSpec::shell(
+                "ambient temp containment",
+                Shell::UnixSh,
+                ":",
+                &ambient,
+                128,
+            ))
+            .expect("run with ambient TMPDIR");
+            assert!(output.containment.is_verified_empty());
+            assert_eq!(fs::read_dir(&ambient).expect("ambient entries").count(), 0);
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ambient = temp.path().join("redirected-temp");
+        fs::create_dir(&ambient).expect("create redirected temp");
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process_runner::tests::strict_runtime_files_ignore_ambient_tmpdir",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("MACO_TEST_AMBIENT_TMP_PATH", &ambient)
+            .env("TMPDIR", &ambient)
+            .current_dir(temp.path())
+            .status()
+            .expect("run ambient-temp child test");
+        assert!(status.success());
+        assert_eq!(fs::read_dir(&ambient).expect("ambient entries").count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_death_around_launcher_spawn_leaves_no_runtime_or_secret() {
+        const CHILD_ENV: &str = "MACO_TEST_LAUNCHER_DEATH_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let root = PathBuf::from(env::var_os("MACO_TEST_LAUNCHER_DEATH_ROOT").expect("root"));
+            let marker = root.join("target-ran");
+            let mut environment = BTreeMap::new();
+            environment.insert(
+                "MACO_PRIVATE_LAUNCH_SECRET".to_string(),
+                "never-persist-before-service".to_string(),
+            );
+            let _ = run_process(
+                ProcessSpec::shell(
+                    "launcher death child",
+                    Shell::UnixSh,
+                    format!("touch '{}'", marker.display()),
+                    &root,
+                    128,
+                )
+                .with_environment(EnvironmentMode::ClearAndSet(environment))
+                .with_timeout(Some(Duration::from_secs(10))),
+            );
+            panic!("launcher death child unexpectedly returned");
+        }
+
+        for case in ["before-spawn", "after-spawn"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let spawned = temp.path().join("launcher-spawned");
+            let mut command =
+                Command::new(std::env::current_exe().expect("current test executable"));
+            command
+                .args([
+                    "--exact",
+                    "process_runner::tests::parent_death_around_launcher_spawn_leaves_no_runtime_or_secret",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("MACO_TEST_LAUNCHER_DEATH_ROOT", temp.path());
+            if case == "before-spawn" {
+                command.env("MACO_TEST_ABORT_BEFORE_CHILD_SPAWN", "1");
+            } else {
+                command
+                    .env("MACO_TEST_AFTER_CHILD_SPAWN_MARKER", &spawned)
+                    .env("MACO_TEST_HOLD_AFTER_CHILD_SPAWN", "1");
+            }
+            let mut child = command.spawn().expect("spawn launcher death child");
+            let runner_pid = child.id();
+            if case == "after-spawn" {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !spawned.exists() {
+                    assert!(child.try_wait().unwrap().is_none());
+                    assert!(Instant::now() < deadline, "launcher spawn marker missing");
+                    thread::sleep(POLL_INTERVAL);
+                }
+                let pid = libc::pid_t::try_from(runner_pid).expect("runner pid_t");
+                // SAFETY: pid identifies the live isolated test child.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+            }
+            let status = child.wait().expect("reap launcher death child");
+            assert!(!status.success());
+            assert!(!temp.path().join("target-ran").exists());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let residue = systemd_runner_residue(runner_pid);
+                if residue.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{case} runner left residue: {}",
+                    residue.join("; ")
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_sigkill_after_environment_publish_removes_secret_and_unit() {
+        const CHILD_ENV: &str = "MACO_TEST_PUBLISHED_ENV_DEATH_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let root = PathBuf::from(env::var_os("MACO_TEST_PUBLISHED_ENV_ROOT").expect("root"));
+            let marker = root.join("target-ran");
+            let mut environment = BTreeMap::new();
+            environment.insert(
+                "MACO_PUBLISHED_PRIVATE_SECRET".to_string(),
+                "remove-me-with-runtime-directory".to_string(),
+            );
+            let _ = run_process(
+                ProcessSpec::shell(
+                    "published environment death child",
+                    Shell::UnixSh,
+                    format!("touch '{}'", marker.display()),
+                    &root,
+                    128,
+                )
+                .with_environment(EnvironmentMode::ClearAndSet(environment))
+                .with_timeout(Some(Duration::from_secs(10))),
+            );
+            panic!("published environment death child unexpectedly returned");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let published = temp.path().join("environment-published");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process_runner::tests::parent_sigkill_after_environment_publish_removes_secret_and_unit",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("MACO_TEST_PUBLISHED_ENV_ROOT", temp.path())
+            .env("MACO_TEST_ENVIRONMENT_PUBLISHED_MARKER", &published)
+            .env("MACO_TEST_HOLD_AFTER_ENVIRONMENT_PUBLISH", "1")
+            .spawn()
+            .expect("spawn published environment death child");
+        let runner_pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !published.exists() {
+            assert!(child.try_wait().unwrap().is_none());
+            assert!(
+                Instant::now() < deadline,
+                "environment publish marker missing"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        let runtime_root = trusted_linux_runtime_root().expect("runtime root");
+        let prefix = format!("maco-process-{runner_pid}-");
+        let environment_path = fs::read_dir(&runtime_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .expect("managed runtime directory")
+            .path()
+            .join("environment");
+        assert!(fs::read_to_string(&environment_path)
+            .expect("published environment")
+            .contains("remove-me-with-runtime-directory"));
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&environment_path)
+                    .expect("published environment metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let pid = libc::pid_t::try_from(runner_pid).expect("runner pid_t");
+        // SAFETY: pid identifies the live isolated test child.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        assert!(!child
+            .wait()
+            .expect("reap published environment child")
+            .success());
+        assert!(!temp.path().join("target-ran").exists());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let residue = systemd_runner_residue(runner_pid);
+            if residue.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "published environment runner left residue: {}",
+                residue.join("; ")
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!environment_path.exists());
+        let next = run_process(
+            ProcessSpec::shell(
+                "post-publish-death slot probe",
+                Shell::UnixSh,
+                ":",
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("slot reusable after published environment owner death");
+        assert!(next.containment.is_verified_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_environment_cannot_overwrite_guardian_gate_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let preloaded_start = temp.path().join("preloaded-start");
+        let bogus_ready = temp.path().join("bogus-ready");
+        let malicious_sleep = temp.path().join("malicious-sleep");
+        fs::write(&preloaded_start, "start\n").expect("preload fake start gate");
+        let mut environment = BTreeMap::new();
+        environment.insert(
+            "start_fifo".to_string(),
+            preloaded_start.display().to_string(),
+        );
+        environment.insert("ready".to_string(), bogus_ready.display().to_string());
+        environment.insert(
+            "sleep_program".to_string(),
+            malicious_sleep.display().to_string(),
+        );
+        environment.insert("owner_pid".to_string(), "1".to_string());
+        let output = run_process(
+            ProcessSpec::shell(
+                "guardian environment collision",
+                Shell::UnixSh,
+                "printf '%s|%s|%s' \"$start_fifo\" \"$ready\" \"$sleep_program\"",
+                temp.path(),
+                1024,
+            )
+            .with_environment(EnvironmentMode::ClearAndSet(environment))
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("run guardian collision environment");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(output.containment.is_verified_empty());
+        assert!(output
+            .stdout
+            .summarize_chars(1024)
+            .text
+            .contains("preloaded-start"));
+        assert!(!bogus_ready.exists());
+        assert!(!malicious_sleep.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guardian_reaps_unit_when_runner_aborts_before_start_release() {
+        const CHILD_ENV: &str = "MACO_TEST_PRE_GATE_ABORT_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let marker = PathBuf::from(
+                env::var_os("MACO_TEST_PRE_GATE_MARKER").expect("pre-gate marker path"),
+            );
+            let _ = run_process(
+                ProcessSpec::shell(
+                    "pre-gate abort guardian child",
+                    Shell::UnixSh,
+                    format!("touch '{}'", marker.display()),
+                    marker.parent().expect("pre-gate marker parent"),
+                    128,
+                )
+                .with_timeout(Some(Duration::from_secs(10))),
+            );
+            panic!("pre-gate guardian child unexpectedly returned");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("must-not-run");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process_runner::tests::guardian_reaps_unit_when_runner_aborts_before_start_release",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("MACO_TEST_ABORT_BEFORE_START_RELEASE", "1")
+            .env("MACO_TEST_PRE_GATE_MARKER", &marker)
+            .current_dir(temp.path())
+            .spawn()
+            .expect("spawn isolated pre-gate guardian child test");
+        let runner_pid = child.id();
+        let exit_deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("query pre-gate guardian child") {
+                break status;
+            }
+            if Instant::now() >= exit_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pre-gate failpoint did not abort its isolated runner");
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
+        assert!(!status.success());
+        assert!(!marker.exists(), "target crossed the unreleased start gate");
+
+        let residue_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let residue = systemd_runner_residue(runner_pid);
+            if residue.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < residue_deadline,
+                "pre-gate runner abort left containment residue: {}",
+                residue.join("; ")
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let next = run_process(
+            ProcessSpec::shell(
+                "post-pre-gate-abort slot probe",
+                Shell::UnixSh,
+                ":",
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("kernel released the pre-gate aborted runner's slot lock");
+        assert!(next.status.is_some_and(|status| status.success()));
+        assert!(next.containment.is_verified_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guardian_reaps_unit_and_blocks_mutation_after_runner_sigabrt() {
+        const CHILD_ENV: &str = "MACO_TEST_ABORTED_GUARDIAN_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let started = PathBuf::from(
+                env::var_os("MACO_TEST_GUARDIAN_STARTED").expect("started marker path"),
+            );
+            let mutation = PathBuf::from(
+                env::var_os("MACO_TEST_GUARDIAN_MUTATION").expect("mutation marker path"),
+            );
+            let trigger = PathBuf::from(
+                env::var_os("MACO_TEST_GUARDIAN_TRIGGER").expect("mutation trigger path"),
+            );
+            let command = format!(
+                "touch '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; touch '{}'; sleep 30",
+                started.display(),
+                trigger.display(),
+                mutation.display()
+            );
+            let _ = run_process(
+                ProcessSpec::shell(
+                    "runner abort guardian child",
+                    Shell::UnixSh,
+                    command,
+                    started.parent().expect("started marker parent"),
+                    128,
+                )
+                .with_timeout(Some(Duration::from_secs(35))),
+            );
+            panic!("guardian child unexpectedly returned before its runner was aborted");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = temp.path().join("target-started");
+        let mutation = temp.path().join("delayed-mutation");
+        let trigger = temp.path().join("allow-mutation");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process_runner::tests::guardian_reaps_unit_and_blocks_mutation_after_runner_sigabrt",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("MACO_TEST_GUARDIAN_STARTED", &started)
+            .env("MACO_TEST_GUARDIAN_MUTATION", &mutation)
+            .env("MACO_TEST_GUARDIAN_TRIGGER", &trigger)
+            .current_dir(temp.path())
+            .spawn()
+            .expect("spawn isolated guardian child test");
+        let runner_pid = child.id();
+        let start_deadline = Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(
+                child.try_wait().expect("query guardian child").is_none(),
+                "guardian child exited before launching its target"
+            );
+            assert!(
+                Instant::now() < start_deadline,
+                "guardian child did not launch its target"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+
+        let runner_pid_t = libc::pid_t::try_from(runner_pid).expect("runner pid_t");
+        // SAFETY: runner_pid identifies the live isolated child owned by this test.
+        assert_eq!(unsafe { libc::kill(runner_pid_t, libc::SIGABRT) }, 0);
+        let status = child.wait().expect("reap aborted guardian child");
+        assert!(!status.success());
+
+        thread::sleep(Duration::from_millis(100));
+        fs::write(&trigger, "go").expect("release any surviving target mutation");
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !mutation.exists(),
+            "contained target mutated state after its runner was aborted"
+        );
+
+        let residue_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let residue = systemd_runner_residue(runner_pid);
+            if residue.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < residue_deadline,
+                "aborted runner left containment residue: {}",
+                residue.join("; ")
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let next = run_process(
+            ProcessSpec::shell(
+                "post-abort slot probe",
+                Shell::UnixSh,
+                ":",
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("kernel released the aborted runner's slot lock");
+        assert!(next.status.is_some_and(|status| status.success()));
+        assert!(next.containment.is_verified_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn systemd_runner_residue(runner_pid: u32) -> Vec<String> {
+        let prefix = format!("maco-process-{runner_pid}-");
+        let pattern = format!("{prefix}*");
+        let mut residue = Vec::new();
+        let systemctl = find_trusted_unix_executable(
+            "systemctl",
+            &[
+                "/usr/bin/systemctl",
+                "/bin/systemctl",
+                "/run/current-system/sw/bin/systemctl",
+            ],
+        )
+        .expect("trusted systemctl");
+        let units = Command::new(systemctl)
+            .args([
+                "--user",
+                "list-units",
+                &pattern,
+                "--all",
+                "--no-legend",
+                "--no-pager",
+                "--plain",
+            ])
+            .output()
+            .expect("list runner units");
+        if !units.status.success() {
+            residue.push(format!("systemctl exited with {}", units.status));
+        } else {
+            residue.extend(
+                String::from_utf8_lossy(&units.stdout)
+                    .lines()
+                    .map(|line| format!("unit {line}")),
+            );
+        }
+
+        let runtime_root = trusted_linux_runtime_root().expect("trusted runtime root");
+        residue.extend(
+            fs::read_dir(runtime_root)
+                .expect("read runtime root")
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with(&prefix))
+                .map(|name| format!("runtime {name}")),
+        );
+
+        let manager = systemd_user_manager_cgroup().expect("systemd user manager cgroup");
+        let app_slice = Path::new("/sys/fs/cgroup")
+            .join(manager.strip_prefix("/").unwrap_or(&manager))
+            .join("app.slice");
+        residue.extend(
+            fs::read_dir(app_slice)
+                .expect("read user app.slice")
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with(&prefix))
+                .map(|name| format!("cgroup {name}")),
+        );
+
+        for entry in fs::read_dir("/proc").expect("read proc") {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                continue;
+            }
+            let Ok(command_line) = fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            if String::from_utf8_lossy(&command_line).contains(&prefix) {
+                residue.push(format!("process {}", entry.file_name().to_string_lossy()));
+            }
+        }
+        residue
+    }
+
+    #[test]
+    fn stuck_owned_io_thread_aborts_instead_of_detaching() {
+        const CHILD_ENV: &str = "MACO_TEST_STUCK_IO_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let handle = thread::spawn(|| loop {
+                thread::sleep(Duration::from_secs(60));
+            });
+            let thread = OwnedIoThread { handle, cancel };
+            let _ = thread.finish(false, "synthetic stuck I/O owner");
+            panic!("stuck owner unexpectedly returned");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Instant::now();
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process_runner::tests::stuck_owned_io_thread_aborts_instead_of_detaching",
+            ])
+            .env(CHILD_ENV, "1")
+            .current_dir(temp.path())
+            .status()
+            .expect("run stuck-owner child test");
+        assert!(!status.success());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[cfg(unix)]
     #[test]
     fn absent_process_group_skips_termination_grace() {
+        use std::os::unix::process::CommandExt;
+
         let mut command = Command::new("sh");
         command.args(["-c", "exit 0"]);
-        configure_process_tree(&mut command);
+        command.process_group(0);
         let mut child = command.spawn().expect("spawn short-lived child");
         child.wait().expect("wait for short-lived child");
         let started = Instant::now();
@@ -2206,7 +5288,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn escaped_pipe_and_stdin_holders_are_cancelled_without_detaching_threads() {
+    fn required_containment_kills_setsid_pipe_and_stdin_holders() {
         let temp = tempfile::tempdir().expect("tempdir");
         let escaped_pid_path = temp.path().join("escaped.pid");
         let command = format!(
@@ -2232,24 +5314,17 @@ mod tests {
             .trim()
             .parse::<u32>()
             .expect("numeric escaped process pid");
-        let _ = send_unix_process_group_signal(escaped_pid, libc::SIGKILL);
         assert!(output.status.is_some_and(|status| status.success()));
         assert!(!output.timed_out);
-        assert!(
-            output
-                .process_error
-                .as_deref()
-                .is_some_and(|error| error.contains("output pipes did not close")),
-            "expected bounded output cleanup evidence: {:?}",
-            output.process_error
-        );
-        assert!(
-            output
-                .stdin_error
-                .as_deref()
-                .is_some_and(|error| error.contains("cancelled")),
-            "expected stdin cancellation evidence: {:?}",
-            output.stdin_error
+        assert_eq!(output.process_error, None);
+        assert!(output.containment.is_verified_empty());
+        let escaped_pid = libc::pid_t::try_from(escaped_pid).expect("pid_t escaped pid");
+        // SAFETY: signal 0 probes existence without delivering a signal.
+        assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "escaped descendant survived return"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
     }
@@ -2330,6 +5405,46 @@ mod tests {
 
         assert!(matches!(error, ProcessRunError::OpenTee { .. }));
         assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_tee_preflight_error_removes_only_created_inode() {
+        const CHILD_ENV: &str = "MACO_TEST_NEW_TEE_PREFLIGHT_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            let root = PathBuf::from(env::var_os("MACO_TEST_TEE_ROOT").expect("tee root"));
+            let tee = root.join("new-tee.log");
+            let marker = root.join("target-ran");
+            let error = run_process(
+                ProcessSpec::shell(
+                    "new tee preflight failure",
+                    Shell::UnixSh,
+                    format!("touch '{}'", marker.display()),
+                    &root,
+                    128,
+                )
+                .with_stdout(StreamCapture::bounded(128).tee_to(&tee)),
+            )
+            .expect_err("synthetic new tee preflight failure");
+            assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+            assert!(!tee.exists());
+            assert!(!marker.exists());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process_runner::tests::new_tee_preflight_error_removes_only_created_inode",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("MACO_TEST_TEE_ROOT", temp.path())
+            .env("MACO_TEST_FAIL_NEW_TEE_PREFLIGHT", "1")
+            .status()
+            .expect("run isolated new tee preflight failure");
+        assert!(status.success());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -2426,13 +5541,342 @@ mod tests {
         assert!(!new_stdout_path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tee_transaction_rolls_back_single_and_second_helper_start_failures() {
+        const CHILD_ENV: &str = "MACO_TEST_TEE_TRANSACTION_CHILD";
+        if let Some(case) = env::var_os(CHILD_ENV) {
+            let root = PathBuf::from(env::var_os("MACO_TEST_TEE_ROOT").expect("tee root"));
+            let stdout_path = root.join("stdout.log");
+            let stderr_path = root.join("stderr.log");
+            let marker = root.join("target-ran");
+            let mut stdout_before = None;
+            let mut spec = ProcessSpec::shell(
+                "transactional helper failure",
+                Shell::UnixSh,
+                format!("touch '{}'", marker.display()),
+                &root,
+                128,
+            )
+            .with_stdout(StreamCapture::bounded(128).tee_to(&stdout_path));
+            match case.to_string_lossy().as_ref() {
+                "single" => {
+                    fs::write(&stdout_path, "original stdout").expect("seed stdout");
+                }
+                "second" | "second-truncate" => {
+                    use std::os::unix::fs::MetadataExt;
+                    fs::write(&stdout_path, "original stdout").expect("seed stdout");
+                    fs::write(&stderr_path, "original stderr").expect("seed stderr");
+                    let metadata = fs::metadata(&stdout_path).expect("stdout metadata before");
+                    stdout_before = Some((
+                        metadata.ino(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec(),
+                        metadata.len(),
+                    ));
+                    spec = spec.with_stderr(StreamCapture::bounded(128).tee_to(&stderr_path));
+                }
+                "new-second" => {
+                    spec = spec.with_stderr(StreamCapture::bounded(128).tee_to(&stderr_path));
+                }
+                other => panic!("unexpected tee transaction case {other}"),
+            }
+
+            let error = run_process(spec).expect_err("synthetic tee helper failure");
+            assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+            assert!(!marker.exists());
+            match case.to_string_lossy().as_ref() {
+                "single" => {
+                    assert_eq!(fs::read_to_string(&stdout_path).unwrap(), "original stdout");
+                }
+                "second" | "second-truncate" => {
+                    use std::os::unix::fs::MetadataExt;
+                    assert_eq!(fs::read_to_string(&stdout_path).unwrap(), "original stdout");
+                    assert_eq!(fs::read_to_string(&stderr_path).unwrap(), "original stderr");
+                    let metadata = fs::metadata(&stdout_path).expect("stdout metadata after");
+                    if case == "second" {
+                        assert_eq!(
+                            stdout_before,
+                            Some((
+                                metadata.ino(),
+                                metadata.mtime(),
+                                metadata.mtime_nsec(),
+                                metadata.len(),
+                            )),
+                            "pre-truncate helper failure rewrote untouched stdout"
+                        );
+                    }
+                }
+                "new-second" => {
+                    assert!(!stdout_path.exists());
+                    assert!(!stderr_path.exists());
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                fs::read_dir(&root)
+                    .expect("tee root entries")
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with(".maco-tee"))
+                    .count(),
+                0
+            );
+            return;
+        }
+
+        for (case, failpoint, failed_stream) in [
+            ("single", "MACO_TEST_FAIL_TEE_HELPER_STREAM", "stdout"),
+            ("second", "MACO_TEST_FAIL_TEE_HELPER_STREAM", "stderr"),
+            (
+                "second-truncate",
+                "MACO_TEST_FAIL_TEE_TRUNCATE_STREAM",
+                "stderr",
+            ),
+            ("new-second", "MACO_TEST_FAIL_TEE_HELPER_STREAM", "stderr"),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut command =
+                Command::new(std::env::current_exe().expect("current test executable"));
+            command
+                .args([
+                    "--exact",
+                    "process_runner::tests::tee_transaction_rolls_back_single_and_second_helper_start_failures",
+                ])
+                .env(CHILD_ENV, case)
+                .env("MACO_TEST_TEE_ROOT", temp.path())
+                .env(failpoint, failed_stream);
+            if case == "second" {
+                command.env("MACO_TEST_FAIL_TEE_RESTORE", "1");
+            }
+            let status = command.status().expect("run isolated tee transaction case");
+            assert!(status.success(), "tee transaction child {case} failed");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tee_transaction_rolls_back_spawn_and_pre_release_io_failures() {
+        const CHILD_ENV: &str = "MACO_TEST_TEE_SETUP_ROLLBACK_CHILD";
+        if let Some(case) = env::var_os(CHILD_ENV) {
+            let root = PathBuf::from(env::var_os("MACO_TEST_TEE_ROOT").expect("tee root"));
+            let stdout_path = root.join("stdout.log");
+            let stderr_path = root.join("stderr.log");
+            let helper_pids = root.join("helper-pids");
+            let marker = root.join("target-ran");
+            fs::write(&stdout_path, "original stdout").expect("seed stdout");
+            fs::write(&stderr_path, "original stderr").expect("seed stderr");
+            let error = run_process(
+                ProcessSpec::shell(
+                    "tee setup rollback",
+                    Shell::UnixSh,
+                    format!("touch '{}'", marker.display()),
+                    &root,
+                    128,
+                )
+                .with_stdout(StreamCapture::bounded(128).tee_to(&stdout_path))
+                .with_stderr(StreamCapture::bounded(128).tee_to(&stderr_path))
+                .with_timeout(Some(Duration::from_secs(3))),
+            )
+            .expect_err("synthetic setup failure");
+            match case.to_string_lossy().as_ref() {
+                "spawn" => assert!(matches!(error, ProcessRunError::Spawn { .. })),
+                "io" => assert!(matches!(error, ProcessRunError::IoSetup { .. })),
+                other => panic!("unexpected setup rollback case {other}"),
+            }
+            assert!(!marker.exists());
+            assert_eq!(fs::read_to_string(&stdout_path).unwrap(), "original stdout");
+            assert_eq!(fs::read_to_string(&stderr_path).unwrap(), "original stderr");
+            for pid in fs::read_to_string(helper_pids)
+                .expect("helper pids")
+                .lines()
+            {
+                let pid = pid.parse::<libc::pid_t>().expect("helper pid");
+                // SAFETY: signal zero only probes a tee helper started by this isolated test.
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+            }
+            assert_eq!(
+                fs::read_dir(&root)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with(".maco-tee"))
+                    .count(),
+                0
+            );
+            return;
+        }
+
+        for (case, failpoint) in [
+            ("spawn", "MACO_TEST_FAIL_BEFORE_CHILD_SPAWN"),
+            ("io", "MACO_TEST_FAIL_PRE_RELEASE_IO_SETUP"),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let status = Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "process_runner::tests::tee_transaction_rolls_back_spawn_and_pre_release_io_failures",
+                ])
+                .env(CHILD_ENV, case)
+                .env("MACO_TEST_TEE_ROOT", temp.path())
+                .env(
+                    "MACO_TEST_TEE_HELPER_PID_FILE",
+                    temp.path().join("helper-pids"),
+                )
+                .env(failpoint, "1")
+                .status()
+                .expect("run isolated tee setup rollback case");
+            assert!(status.success(), "tee setup rollback child {case} failed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tee_preflight_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.log");
+        let link = temp.path().join("tee.log");
+        let marker = temp.path().join("target-ran");
+        fs::write(&target, "preserve target").expect("seed symlink target");
+        symlink(&target, &link).expect("create tee symlink");
+        let error = run_process(
+            ProcessSpec::shell(
+                "symlink tee",
+                Shell::UnixSh,
+                format!("touch '{}'", marker.display()),
+                temp.path(),
+                128,
+            )
+            .with_stdout(StreamCapture::bounded(128).tee_to(&link)),
+        )
+        .expect_err("symlink tee must fail before target start");
+
+        assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+        assert_eq!(fs::read_to_string(target).unwrap(), "preserve target");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tee_transaction_detects_path_swap_and_restores_pinned_inode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tee.log");
+        let moved = temp.path().join("original-inode.log");
+        fs::write(&path, "original contents").expect("seed tee");
+        let capture = StreamCapture::bounded(128).tee_to(&path);
+        let transaction = prepare_tees("path swap", &capture, &StreamCapture::bounded(128))
+            .expect("prepare tee transaction");
+        let helper_pid = transaction
+            .stdout
+            .as_ref()
+            .and_then(|tee| tee.writer.as_ref())
+            .map(|writer| writer.helper.child.id())
+            .expect("stdout helper pid");
+        fs::rename(&path, &moved).expect("move pinned tee inode");
+        fs::write(&path, "replacement contents").expect("install replacement path");
+
+        let error = transaction
+            .validate("path swap")
+            .expect_err("path swap must invalidate tee transaction");
+        assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+        drop(transaction);
+
+        assert_eq!(fs::read_to_string(moved).unwrap(), "original contents");
+        assert_eq!(fs::read_to_string(path).unwrap(), "replacement contents");
+        let helper_pid = libc::pid_t::try_from(helper_pid).expect("helper pid_t");
+        // SAFETY: signal zero only probes the helper PID captured above.
+        assert_eq!(unsafe { libc::kill(helper_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".maco-tee"))
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_tee_path_swap_never_unlinks_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tee.log");
+        let moved = temp.path().join("opened-inode.log");
+        let capture = StreamCapture::bounded(128).tee_to(&path);
+        let transaction = prepare_tees("created path swap", &capture, &StreamCapture::bounded(128))
+            .expect("prepare new tee transaction");
+        let helper_pid = transaction
+            .stdout
+            .as_ref()
+            .and_then(|tee| tee.writer.as_ref())
+            .map(|writer| writer.helper.child.id())
+            .expect("stdout helper pid");
+        fs::rename(&path, &moved).expect("move opened tee inode");
+        fs::write(&path, "replacement contents").expect("install replacement path");
+
+        let error = transaction
+            .validate("created path swap")
+            .expect_err("created path swap must invalidate transaction");
+        assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+        drop(transaction);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement contents");
+        assert_eq!(fs::metadata(&moved).unwrap().len(), 0);
+        let helper_pid = libc::pid_t::try_from(helper_pid).expect("helper pid_t");
+        // SAFETY: signal zero only probes the helper PID captured above.
+        assert_eq!(unsafe { libc::kill(helper_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".maco-tee"))
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn tee_backup_restores_content_and_removes_temporary_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("tee.log");
         std::fs::write(&path, "original tee contents").expect("write tee source");
-        let backup = TeeBackup::create(&path).expect("create tee backup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict tee source permissions");
+        }
+        let source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open tee source");
+        let backup = TeeBackup::create(&source, &path).expect("create tee backup");
         let backup_path = backup.path.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backup_path)
+                    .expect("backup metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let mut destination = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2459,21 +5903,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn wait_error_evidence_retains_captured_output_and_cleanup_diagnostics() {
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ProcessSpec::shell(
+            "evidence child",
+            Shell::UnixSh,
             "printf retained-stdout; printf retained-stderr >&2; sleep 30",
-        ]);
-        configure_process_tree(&mut command);
+            temp.path(),
+            1024,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_containment(ContainmentPolicy::TrustedBestEffort);
+        let mut prepared_tree =
+            PreparedProcessTree::prepare(spec.containment, "evidence child", "sh", None)
+                .expect("prepare evidence containment");
+        let mut command = prepared_tree
+            .build_command(&spec)
+            .expect("build evidence child");
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn evidence child");
-        let process_tree = ProcessTree::attach_and_start(&mut child, "evidence child", "sh")
+        let attached_tree = prepared_tree
+            .attach(&mut child, "evidence child", "sh", None)
             .expect("attach evidence child");
         let prepared = PreparedChildIo::take(&mut child, &StdinMode::Null)
             .expect("prepare evidence child I/O");
+        let mut process_tree = attached_tree
+            .release(&mut child, "evidence child", "sh", None)
+            .expect("release evidence child");
         let (input_writer, mut output_drainers) =
             prepared.start("evidence child", StdinMode::Null, 1024, 1024, None, None);
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -2487,7 +5945,7 @@ mod tests {
 
         let evidence = cleanup_after_wait_error(
             &mut child,
-            &process_tree,
+            &mut process_tree,
             "evidence child",
             output_drainers,
             input_writer,
@@ -2523,6 +5981,26 @@ mod tests {
         assert_ne!(WINDOWS_PROCESS_CREATION_FLAGS & CREATE_NEW_PROCESS_GROUP, 0);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_tee_identity_uses_volume_and_file_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tee.log");
+        let hard_link = temp.path().join("tee-hardlink.log");
+        let replacement = temp.path().join("replacement.log");
+        fs::write(&path, "tee").expect("write tee");
+        fs::hard_link(&path, &hard_link).expect("hard-link tee");
+        fs::write(&replacement, "replacement").expect("write replacement");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open tee");
+
+        assert!(tee_path_matches_file(&hard_link, &file).expect("hard-link identity"));
+        assert!(!tee_path_matches_file(&replacement, &file).expect("replacement identity"));
+    }
+
     #[test]
     fn bounded_buffer_never_grows_past_limit() {
         let mut buffer = BoundedBuffer::new(3);
@@ -2549,5 +6027,41 @@ mod tests {
                 args: vec![OsString::from("one"), OsString::from("two")],
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_best_effort_is_explicit_and_never_reported_as_verified() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = run_process(
+            ProcessSpec::shell(
+                "trusted compatibility command",
+                Shell::UnixSh,
+                ":",
+                temp.path(),
+                128,
+            )
+            .with_containment(ContainmentPolicy::TrustedBestEffort),
+        )
+        .expect("run trusted compatibility command");
+        assert_eq!(
+            output.containment,
+            ContainmentEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        );
+        assert!(!output.containment.is_verified_empty());
+    }
+
+    #[test]
+    fn ownership_setup_errors_preserve_cleanup_diagnostics() {
+        let error = ProcessRunError::ProcessOwnership {
+            label: "child".to_string(),
+            command: "command".to_string(),
+            source: std::io::Error::other("attach failed"),
+        };
+        let error =
+            append_process_run_error_cleanup(error, Some("kill failed; reap failed".to_string()));
+        let rendered = error.to_string();
+        assert!(rendered.contains("attach failed"));
+        assert!(rendered.contains("kill failed; reap failed"));
     }
 }
