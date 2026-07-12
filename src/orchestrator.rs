@@ -1,6 +1,8 @@
 use crate::{
     process_runner::{
-        run_process, CapturedBytes, EnvironmentMode, ProcessRunError, ProcessSpec, Shell,
+        read_bounded_regular_file_nofollow, run_process, trusted_system_executable, CapturedBytes,
+        EnvironmentMode, ProcessRunError, ProcessSpec, Shell, SideEffectConfinementProfile,
+        StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
     semantic_coord::{
         SemanticConflict, SemanticCoordinationReport, SemanticIntent, SemanticIntentRequest,
@@ -18,7 +20,7 @@ use std::{
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    process::{self, Command, ExitStatus},
+    process::{self, ExitStatus},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +28,35 @@ use std::{
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const CHECKPOINT_STATE_VERSION: u32 = 1;
+const GIT_COMMAND_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_ADMIN_SNAPSHOT_MAX_ENTRIES: usize = 4096;
+const GIT_ADMIN_SNAPSHOT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitAdminSnapshotEntry {
+    kind: &'static str,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    length: u64,
+    digest: Option<Oid>,
+}
+
+#[derive(Debug)]
+struct LinkedGitAdminWriteGuard {
+    directory: PathBuf,
+    device: u64,
+    inode: u64,
+    snapshot: BTreeMap<PathBuf, GitAdminSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchestrationExecutionRuntime {
+    Verified,
+    #[cfg(test)]
+    NonpublishableSimulation,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationPlan {
@@ -457,7 +488,31 @@ pub fn run_plan_file_with_controls(
     controls: OrchestrationRunControls,
 ) -> Result<OrchestrationSummary> {
     let plan = load_plan(&options.plan_file)?;
-    run_plan_with_controls(plan, options, controls)
+    run_plan_with_controls_runtime(
+        plan,
+        options,
+        controls,
+        OrchestrationExecutionRuntime::Verified,
+    )
+}
+
+#[cfg(test)]
+fn run_plan_file_with_controls_simulation(
+    options: OrchestrationRunOptions,
+    controls: OrchestrationRunControls,
+) -> Result<OrchestrationSummary> {
+    let plan = load_plan(&options.plan_file)?;
+    run_plan_with_controls_runtime(
+        plan,
+        options,
+        controls,
+        OrchestrationExecutionRuntime::NonpublishableSimulation,
+    )
+}
+
+#[cfg(test)]
+fn run_plan_file_simulation(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
+    run_plan_file_with_controls_simulation(options, OrchestrationRunControls::default())
 }
 
 pub fn run_plan(
@@ -471,6 +526,20 @@ pub fn run_plan_with_controls(
     plan: OrchestrationPlan,
     options: OrchestrationRunOptions,
     controls: OrchestrationRunControls,
+) -> Result<OrchestrationSummary> {
+    run_plan_with_controls_runtime(
+        plan,
+        options,
+        controls,
+        OrchestrationExecutionRuntime::Verified,
+    )
+}
+
+fn run_plan_with_controls_runtime(
+    plan: OrchestrationPlan,
+    options: OrchestrationRunOptions,
+    controls: OrchestrationRunControls,
+    runtime: OrchestrationExecutionRuntime,
 ) -> Result<OrchestrationSummary> {
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
@@ -677,12 +746,13 @@ pub fn run_plan_with_controls(
         options.jobs,
         options.patch_dir.as_deref(),
         &repo_head,
+        runtime,
     )?;
     if summaries
         .iter()
         .all(|summary| summary.status == AgentRunStatus::Succeeded)
     {
-        repo_validation = run_repo_validation_commands(&plan, &repo);
+        repo_validation = run_repo_validation_commands(&plan, &repo, runtime);
     }
     write_checkpoint_if_configured(
         &controls,
@@ -762,6 +832,23 @@ pub fn run_plan_with_controls(
 }
 
 pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<OrchestrationSummary> {
+    resume_plan_file_runtime(options, OrchestrationExecutionRuntime::Verified)
+}
+
+#[cfg(test)]
+fn resume_plan_file_simulation(
+    options: OrchestrationResumeOptions,
+) -> Result<OrchestrationSummary> {
+    resume_plan_file_runtime(
+        options,
+        OrchestrationExecutionRuntime::NonpublishableSimulation,
+    )
+}
+
+fn resume_plan_file_runtime(
+    options: OrchestrationResumeOptions,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<OrchestrationSummary> {
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
     }
@@ -943,13 +1030,14 @@ pub fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<Orchestra
         options.jobs,
         options.patch_dir.as_deref(),
         &repo_head,
+        runtime,
     )?;
     let repo_validation = if summaries
         .iter()
         .all(|summary| summary.status == AgentRunStatus::Succeeded)
     {
         if had_pending_agents || checkpoint.repo_validation.is_empty() {
-            run_repo_validation_commands(&plan, &repo)
+            run_repo_validation_commands(&plan, &repo, runtime)
         } else {
             checkpoint.repo_validation.clone()
         }
@@ -1980,6 +2068,7 @@ fn run_agent_schedule(
     jobs: usize,
     patch_dir: Option<&Path>,
     base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
 ) -> Result<()> {
     let jobs = jobs.max(1);
     let mut remaining = summaries
@@ -2028,19 +2117,20 @@ fn run_agent_schedule(
             break;
         }
 
-        let outcomes = run_ready_agents(plan, summaries, &ready)?;
+        let outcomes = run_ready_agents(plan, summaries, &ready, runtime)?;
         let mut failed_agent = None;
 
         for (index, run_result) in outcomes {
             apply_command_result(&mut summaries[index], run_result);
             if summaries[index].status == AgentRunStatus::Succeeded {
-                run_agent_validation_commands(&plan.agents[index], &mut summaries[index]);
+                run_agent_validation_commands(&plan.agents[index], &mut summaries[index], runtime);
             }
             inspect_agent_changes(
                 &plan.agents[index],
                 &mut summaries[index],
                 patch_dir,
                 base_oid,
+                runtime,
             );
             remaining.remove(&index);
 
@@ -2068,16 +2158,17 @@ fn run_ready_agents(
     plan: &OrchestrationPlan,
     summaries: &[AgentRunSummary],
     ready: &[usize],
+    runtime: OrchestrationExecutionRuntime,
 ) -> Result<Vec<(usize, Result<CommandRunResult, ProcessRunError>)>> {
     if ready.len() == 1 {
         let index = ready[0];
-        let spec = command_spec(&plan.agents[index], &summaries[index])?;
+        let spec = command_spec(&plan.agents[index], &summaries[index], runtime)?;
         return Ok(vec![(index, run_agent_command(spec))]);
     }
 
     let mut handles = Vec::with_capacity(ready.len());
     for index in ready {
-        let spec = command_spec(&plan.agents[*index], &summaries[*index])?;
+        let spec = command_spec(&plan.agents[*index], &summaries[*index], runtime)?;
         let index = *index;
         handles.push((
             index,
@@ -2112,6 +2203,7 @@ fn inspect_agent_changes(
     summary: &mut AgentRunSummary,
     patch_dir: Option<&Path>,
     base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
 ) {
     let Some(worktree) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree");
@@ -2168,7 +2260,7 @@ fn inspect_agent_changes(
     }
 
     if let Some(patch_dir) = patch_dir {
-        match write_agent_patch(&worktree_path, &agent.id, patch_dir, base_oid) {
+        match write_agent_patch(&worktree_path, &agent.id, patch_dir, base_oid, runtime) {
             Ok(Some(path)) => summary.patch_path = Some(path),
             Ok(None) => {}
             Err(error) => fail_summary(summary, format!("failed to write patch: {error}")),
@@ -2265,19 +2357,25 @@ fn write_agent_patch(
     agent_id: &str,
     patch_dir: &Path,
     base_oid: &Oid,
+    runtime: OrchestrationExecutionRuntime,
 ) -> Result<Option<PathBuf>> {
     fs::create_dir_all(patch_dir)
         .with_context(|| format!("failed to create patch directory {}", patch_dir.display()))?;
-    mark_untracked_intent_to_add(worktree_path)?;
+    mark_untracked_intent_to_add(worktree_path, runtime)?;
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("diff")
-        .arg("--binary")
-        .arg(base_oid.to_string())
-        .output()
-        .with_context(|| format!("failed to run git diff in {}", worktree_path.display()))?;
+    let output = run_fixed_git(
+        worktree_path,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            &base_oid.to_string(),
+        ],
+        WorkspaceAccess::ReadOnly,
+        runtime,
+    )
+    .with_context(|| format!("failed to run git diff in {}", worktree_path.display()))?;
     if !output.status.success() {
         bail!(
             "git diff failed: {}",
@@ -2294,21 +2392,22 @@ fn write_agent_patch(
     Ok(Some(patch_path))
 }
 
-fn mark_untracked_intent_to_add(worktree_path: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("ls-files")
-        .arg("--others")
-        .arg("--exclude-standard")
-        .arg("-z")
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to list untracked files in {}",
-                worktree_path.display()
-            )
-        })?;
+fn mark_untracked_intent_to_add(
+    worktree_path: &Path,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<()> {
+    let output = run_fixed_git(
+        worktree_path,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        WorkspaceAccess::ReadOnly,
+        runtime,
+    )
+    .with_context(|| {
+        format!(
+            "failed to list untracked files in {}",
+            worktree_path.display()
+        )
+    })?;
     if !output.status.success() {
         bail!(
             "git ls-files failed: {}",
@@ -2325,18 +2424,18 @@ fn mark_untracked_intent_to_add(worktree_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(worktree_path)
-        .arg("add")
-        .arg("-N")
-        .arg("--");
+    let mut arguments = vec!["add".to_string(), "-N".to_string(), "--".to_string()];
     for path in paths {
-        command.arg(String::from_utf8_lossy(path).as_ref());
+        arguments.push(String::from_utf8_lossy(path).into_owned());
     }
 
-    let output = command.output().with_context(|| {
+    let output = run_fixed_git(
+        worktree_path,
+        arguments,
+        WorkspaceAccess::ReadWrite,
+        runtime,
+    )
+    .with_context(|| {
         format!(
             "failed to mark untracked files in {}",
             worktree_path.display()
@@ -2352,7 +2451,332 @@ fn mark_untracked_intent_to_add(worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn command_spec(agent: &AgentPlan, summary: &AgentRunSummary) -> Result<CommandRunSpec> {
+impl LinkedGitAdminWriteGuard {
+    fn capture(worktree_path: &Path) -> Result<Option<Self>> {
+        let workspace = fs::canonicalize(worktree_path).with_context(|| {
+            format!(
+                "failed to canonicalize worktree before Git index write: {}",
+                worktree_path.display()
+            )
+        })?;
+        let repository = Repository::open(&workspace).with_context(|| {
+            format!(
+                "failed to open worktree before Git index write: {}",
+                workspace.display()
+            )
+        })?;
+        let directory = fs::canonicalize(repository.path()).with_context(|| {
+            format!(
+                "failed to canonicalize linked Git administrative directory: {}",
+                repository.path().display()
+            )
+        })?;
+        if directory.starts_with(&workspace) {
+            return Ok(None);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let metadata = fs::symlink_metadata(&directory)?;
+            // SAFETY: geteuid has no preconditions and does not access Rust memory.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                bail!(
+                    "linked Git administrative directory is not an owner-controlled non-writable-by-others directory: {}",
+                    directory.display()
+                );
+            }
+            validate_git_index_file(&directory.join("index"), false)?;
+            reject_git_index_lock(&directory.join("index.lock"))?;
+            let snapshot = snapshot_linked_git_admin(&directory)?;
+            Ok(Some(Self {
+                directory,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                snapshot,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("linked Git administrative index writes require Unix no-follow identity checks")
+        }
+    }
+
+    fn verify(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let metadata = fs::symlink_metadata(&self.directory)?;
+            // SAFETY: geteuid has no preconditions and does not access Rust memory.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o022 != 0
+                || metadata.dev() != self.device
+                || metadata.ino() != self.inode
+            {
+                bail!(
+                    "linked Git administrative directory identity changed during fixed index write: {}",
+                    self.directory.display()
+                );
+            }
+            reject_git_index_lock(&self.directory.join("index.lock"))?;
+            validate_git_index_file(&self.directory.join("index"), true)?;
+            let after = snapshot_linked_git_admin(&self.directory)?;
+            if after != self.snapshot {
+                bail!(
+                    "fixed git add -N changed linked Git administration outside the authorized index file: {}",
+                    self.directory.display()
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("linked Git administrative verification is unavailable on this platform")
+        }
+    }
+}
+
+#[cfg(unix)]
+fn validate_git_index_file(path: &Path, required: bool) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.nlink() != 1
+        || metadata.len() > GIT_ADMIN_SNAPSHOT_MAX_BYTES as u64
+    {
+        bail!(
+            "unsafe linked Git index identity, ownership, links, mode, or size: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_git_index_lock(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => bail!(
+            "linked Git index lock already exists or survived the fixed index write: {}",
+            path.display()
+        ),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_linked_git_admin(directory: &Path) -> Result<BTreeMap<PathBuf, GitAdminSnapshotEntry>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut snapshot = BTreeMap::new();
+    let mut pending = vec![(directory.to_path_buf(), PathBuf::new())];
+    let mut remaining_entries = GIT_ADMIN_SNAPSHOT_MAX_ENTRIES;
+    let mut remaining_bytes = GIT_ADMIN_SNAPSHOT_MAX_BYTES;
+    while let Some((path, relative)) = pending.pop() {
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("failed to enumerate linked Git admin {}", path.display()))?
+        {
+            if remaining_entries == 0 {
+                bail!(
+                    "linked Git administrative snapshot exceeded {} entries",
+                    GIT_ADMIN_SNAPSHOT_MAX_ENTRIES
+                );
+            }
+            remaining_entries -= 1;
+            let entry = entry?;
+            let child = entry.path();
+            let child_relative = relative.join(entry.file_name());
+            if child_relative == Path::new("index") {
+                continue;
+            }
+            if child_relative == Path::new("index.lock") {
+                bail!("linked Git index lock exists: {}", child.display());
+            }
+            let metadata = fs::symlink_metadata(&child)?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "linked Git administrative snapshot refuses symlink: {}",
+                    child.display()
+                );
+            }
+            let (kind, digest) = if metadata.is_dir() {
+                pending.push((child.clone(), child_relative.clone()));
+                ("directory", None)
+            } else if metadata.is_file() {
+                let length = usize::try_from(metadata.len()).context("Git admin file too large")?;
+                if length > remaining_bytes {
+                    bail!(
+                        "linked Git administrative snapshot exceeded {} bytes",
+                        GIT_ADMIN_SNAPSHOT_MAX_BYTES
+                    );
+                }
+                let bytes = read_bounded_regular_file_nofollow(&child, remaining_bytes)?;
+                remaining_bytes -= bytes.len();
+                (
+                    "file",
+                    Some(Oid::hash_object(git2::ObjectType::Blob, &bytes)?),
+                )
+            } else {
+                bail!(
+                    "linked Git administrative snapshot refuses special entry: {}",
+                    child.display()
+                );
+            };
+            snapshot.insert(
+                child_relative,
+                GitAdminSnapshotEntry {
+                    kind,
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    mode: metadata.permissions().mode(),
+                    length: metadata.len(),
+                    digest,
+                },
+            );
+        }
+    }
+    Ok(snapshot)
+}
+
+fn run_fixed_git(
+    worktree_path: &Path,
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+    access: WorkspaceAccess,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<std::process::Output> {
+    let git = trusted_system_executable(
+        "git",
+        &["/run/current-system/sw/bin/git", "/usr/bin/git", "/bin/git"],
+    )?;
+    let environment = BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("LANG".to_string(), "C".to_string()),
+        ("LC_ALL".to_string(), "C".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_GLOBAL".to_string(),
+            git_null_device().to_string(),
+        ),
+        ("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+    ]);
+    let mut profile = match access {
+        WorkspaceAccess::ReadOnly => StrictOfflineWorkspaceProfile::read_only(worktree_path),
+        WorkspaceAccess::ReadWrite => StrictOfflineWorkspaceProfile::read_write(worktree_path),
+    };
+    let admin_guard = if access == WorkspaceAccess::ReadWrite {
+        LinkedGitAdminWriteGuard::capture(worktree_path)?
+    } else {
+        None
+    };
+    if let Some(guard) = &admin_guard {
+        profile = profile.with_writable_artifact_root(&guard.directory);
+    }
+    let mut command_args = vec![
+        std::ffi::OsString::from("--no-pager"),
+        std::ffi::OsString::from("--no-optional-locks"),
+        std::ffi::OsString::from("--literal-pathspecs"),
+        std::ffi::OsString::from("-c"),
+        std::ffi::OsString::from("core.fsmonitor=false"),
+        std::ffi::OsString::from("-c"),
+        std::ffi::OsString::from("core.untrackedCache=false"),
+        std::ffi::OsString::from("-c"),
+        std::ffi::OsString::from("core.splitIndex=false"),
+        std::ffi::OsString::from("-c"),
+        std::ffi::OsString::from("core.hooksPath=/dev/null"),
+    ];
+    command_args.extend(args.into_iter().map(Into::into));
+    let process_spec = ProcessSpec::direct(
+        "orchestrator Git command",
+        git,
+        command_args,
+        worktree_path,
+        GIT_COMMAND_CAPTURE_LIMIT_BYTES,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(environment))
+    .with_stdin(StdinMode::Null)
+    .with_timeout(Some(GIT_COMMAND_TIMEOUT));
+    let run_result = run_process(match runtime {
+        OrchestrationExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                profile,
+            )),
+        #[cfg(test)]
+        OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    });
+    let admin_verification = admin_guard.as_ref().map(LinkedGitAdminWriteGuard::verify);
+    if let Some(verification) = admin_verification {
+        verification?;
+    }
+    let output = run_result?;
+    if output.timed_out
+        || output.process_error.is_some()
+        || output.stdin_error.is_some()
+        || (runtime == OrchestrationExecutionRuntime::Verified
+            && !output.safety_evidence_verified())
+        || output.stdout.is_truncated()
+        || output.stderr.is_truncated()
+    {
+        bail!(
+            "orchestrator Git command was not safely bounded: process_tree={:?}; side_effects={:?}; process_error={:?}; stdin_error={:?}",
+            output.process_tree,
+            output.side_effects,
+            output.process_error,
+            output.stdin_error
+        );
+    }
+    Ok(std::process::Output {
+        status: output
+            .status
+            .context("orchestrator Git command terminated without status")?,
+        stdout: output.stdout.as_bytes().to_vec(),
+        stderr: output.stderr.as_bytes().to_vec(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn git_null_device() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn git_null_device() -> &'static str {
+    "/dev/null"
+}
+
+fn command_spec(
+    agent: &AgentPlan,
+    summary: &AgentRunSummary,
+    runtime: OrchestrationExecutionRuntime,
+) -> Result<CommandRunSpec> {
     let worktree = summary
         .worktree
         .as_ref()
@@ -2365,13 +2789,19 @@ fn command_spec(agent: &AgentPlan, summary: &AgentRunSummary) -> Result<CommandR
 
     Ok(CommandRunSpec {
         command: agent.command.clone(),
+        workspace_root: worktree.path.clone(),
         working_directory,
         env: agent.env.clone(),
         timeout: agent.timeout,
+        runtime,
     })
 }
 
-fn run_agent_validation_commands(agent: &AgentPlan, summary: &mut AgentRunSummary) {
+fn run_agent_validation_commands(
+    agent: &AgentPlan,
+    summary: &mut AgentRunSummary,
+    runtime: OrchestrationExecutionRuntime,
+) {
     let Some(worktree) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree for validation");
         return;
@@ -2379,7 +2809,7 @@ fn run_agent_validation_commands(agent: &AgentPlan, summary: &mut AgentRunSummar
     let worktree_path = worktree.path.clone();
 
     for validation in &agent.validation_commands {
-        let run_summary = run_validation_command(validation, &worktree_path);
+        let run_summary = run_validation_command(validation, &worktree_path, runtime);
         if run_summary.status != AgentRunStatus::Succeeded {
             fail_summary(
                 summary,
@@ -2396,10 +2826,11 @@ fn run_agent_validation_commands(agent: &AgentPlan, summary: &mut AgentRunSummar
 fn run_repo_validation_commands(
     plan: &OrchestrationPlan,
     repo: &Path,
+    runtime: OrchestrationExecutionRuntime,
 ) -> Vec<ValidationRunSummary> {
     let mut summaries = Vec::new();
     for validation in &plan.repo_validation_commands {
-        let run_summary = run_validation_command(validation, repo);
+        let run_summary = run_validation_command(validation, repo, runtime);
         let failed = run_summary.status != AgentRunStatus::Succeeded;
         summaries.push(run_summary);
         if failed {
@@ -2409,7 +2840,11 @@ fn run_repo_validation_commands(
     summaries
 }
 
-fn run_validation_command(validation: &ValidationCommandPlan, root: &Path) -> ValidationRunSummary {
+fn run_validation_command(
+    validation: &ValidationCommandPlan,
+    root: &Path,
+    runtime: OrchestrationExecutionRuntime,
+) -> ValidationRunSummary {
     let working_directory = validation
         .working_directory
         .as_ref()
@@ -2417,9 +2852,11 @@ fn run_validation_command(validation: &ValidationCommandPlan, root: &Path) -> Va
         .unwrap_or_else(|| root.to_path_buf());
     let result = run_agent_command(CommandRunSpec {
         command: validation.command.clone(),
+        workspace_root: root.to_path_buf(),
         working_directory,
         env: validation.env.clone(),
         timeout: validation.timeout,
+        runtime,
     });
     validation_summary_from_result(validation, result)
 }
@@ -2491,23 +2928,55 @@ fn validation_failure_message(scope: &str, summary: &ValidationRunSummary) -> St
 #[derive(Debug, Clone)]
 struct CommandRunSpec {
     command: String,
+    workspace_root: PathBuf,
     working_directory: PathBuf,
     env: BTreeMap<String, String>,
     timeout: Option<Duration>,
+    runtime: OrchestrationExecutionRuntime,
 }
 
 fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRunError> {
-    let output = run_process(
-        ProcessSpec::shell(
-            "agent command",
-            Shell::for_current_platform(),
-            spec.command,
-            spec.working_directory,
-            OUTPUT_CAPTURE_LIMIT_BYTES,
-        )
-        .with_environment(EnvironmentMode::InheritAndSet(spec.env))
-        .with_timeout(spec.timeout),
-    )?;
+    let mut environment = sandbox_environment();
+    environment.extend(spec.env);
+    let process_spec = ProcessSpec::shell(
+        "agent command",
+        Shell::for_current_platform(),
+        spec.command,
+        spec.working_directory,
+        OUTPUT_CAPTURE_LIMIT_BYTES,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(environment))
+    .with_timeout(spec.timeout);
+    let mut output = run_process(match spec.runtime {
+        OrchestrationExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_write(spec.workspace_root),
+            )),
+        #[cfg(test)]
+        OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    })?;
+
+    let safety_verified = output.safety_evidence_verified();
+    let safety_evidence = (output.process_tree, output.side_effects);
+    let mut process_error = output.process_error.take();
+    if let Some(stdin_error) = output.stdin_error.take() {
+        process_error = Some(match process_error {
+            Some(existing) => format!("{existing}; {stdin_error}"),
+            None => stdin_error,
+        });
+    }
+    if spec.runtime == OrchestrationExecutionRuntime::Verified && !safety_verified {
+        let safety_error = format!(
+            "process safety evidence was not verified: process_tree={:?}; side_effects={:?}",
+            safety_evidence.0, safety_evidence.1
+        );
+        process_error = Some(match process_error {
+            Some(existing) => format!("{existing}; {safety_error}"),
+            None => safety_error,
+        });
+    }
 
     Ok(CommandRunResult {
         status: output.status,
@@ -2515,7 +2984,7 @@ fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRu
         timed_out: output.timed_out,
         stdout: summarize_output(&output.stdout),
         stderr: summarize_output(&output.stderr),
-        process_error: output.process_error,
+        process_error,
     })
 }
 
@@ -2582,6 +3051,18 @@ fn summarize_output(output: &CapturedBytes) -> OutputSummary {
         text: summary.text,
         truncated: summary.truncated,
     }
+}
+
+fn sandbox_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+    ])
 }
 
 struct CheckpointView<'a> {
@@ -2847,6 +3328,21 @@ mod tests {
     use crate::worktree::WorktreeManager;
     use git2::{Oid, Repository, Signature};
     use tempfile::TempDir;
+
+    fn run_plan_file(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
+        super::run_plan_file_simulation(options)
+    }
+
+    fn run_plan_file_with_controls(
+        options: OrchestrationRunOptions,
+        controls: OrchestrationRunControls,
+    ) -> Result<OrchestrationSummary> {
+        super::run_plan_file_with_controls_simulation(options, controls)
+    }
+
+    fn resume_plan_file(options: OrchestrationResumeOptions) -> Result<OrchestrationSummary> {
+        super::resume_plan_file_simulation(options)
+    }
 
     #[test]
     fn load_plan_normalizes_agent_ids_and_paths() {
@@ -4525,9 +5021,11 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let result = run_agent_command(CommandRunSpec {
             command: "i=0; while [ \"$i\" -lt 128 ]; do printf '%4096s' O; printf '%4096s' E >&2; i=$((i + 1)); done".to_string(),
+            workspace_root: temp.path().to_path_buf(),
             working_directory: temp.path().to_path_buf(),
             env: BTreeMap::new(),
             timeout: Some(Duration::from_secs(3)),
+            runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
         })
         .expect("run large-output agent command");
 
@@ -4536,6 +5034,41 @@ mod tests {
         assert!(result.stdout.truncated);
         assert!(result.stderr.truncated);
         assert_eq!(result.process_error, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_git_admin_guard_allows_only_safe_index_replacement() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        fs::write(repo_path.join("README.md"), "# guarded\n").expect("write readme");
+        commit_all(&repo, "initial commit").expect("commit");
+        let worktree = WorktreeManager::new(&repo_path)
+            .create(WorktreeCreateOptions {
+                agent_id: "guarded-agent".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+
+        let guard = LinkedGitAdminWriteGuard::capture(&worktree.path)
+            .expect("capture linked admin")
+            .expect("linked admin must be outside worktree");
+        let index_path = guard.directory.join("index");
+        let index = fs::read(&index_path).expect("read linked index");
+        fs::remove_file(&index_path).expect("remove linked index");
+        fs::write(&index_path, index).expect("replace linked index");
+        guard.verify().expect("safe index replacement");
+
+        let guard = LinkedGitAdminWriteGuard::capture(&worktree.path)
+            .expect("recapture linked admin")
+            .expect("linked admin must remain external");
+        fs::write(guard.directory.join("HEAD"), "ref: refs/heads/tampered\n")
+            .expect("tamper linked HEAD");
+        assert!(guard.verify().is_err());
     }
 
     fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {

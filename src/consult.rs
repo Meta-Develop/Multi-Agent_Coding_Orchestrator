@@ -3,6 +3,7 @@ use crate::{
     external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
     llm::Redactor,
     orchestrator::RunId,
+    process_runner::{read_bounded_regular_file_nofollow, resolve_existing_path_without_symlinks},
     sync::normalize_repo_relative_path,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -253,14 +254,13 @@ fn validate_context_paths(repo: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>
     for path in paths {
         let normalized = normalize_repo_relative_path(path)
             .with_context(|| format!("invalid context path {}", path.display()))?;
-        let absolute = repo.join(&normalized);
-        if !absolute.exists() {
-            bail!(
-                "context path '{}' does not exist under repository {}",
+        resolve_existing_path_without_symlinks(repo, &normalized).with_context(|| {
+            format!(
+                "context path '{}' must exist without symlink components under {}",
                 normalized.display(),
                 repo.display()
-            );
-        }
+            )
+        })?;
         normalized_paths.insert(normalized);
     }
     Ok(normalized_paths.into_iter().collect())
@@ -334,10 +334,11 @@ fn run_codex_consultant(
         timeout,
     );
     let external_run = run_external_agent(&command);
-    let report_text = match fs::read_to_string(&artifacts.report_path) {
-        Ok(contents) => contents,
-        Err(error) => format!("failed to read Codex consultant report: {error}"),
-    };
+    let report_text =
+        match read_bounded_regular_file_nofollow(&artifacts.report_path, ANSWER_LIMIT * 8) {
+            Ok(contents) => String::from_utf8_lossy(&contents).into_owned(),
+            Err(error) => format!("failed to read Codex consultant report: {error}"),
+        };
     Ok(report_from_external_text(
         ConsultantRuntime::Codex,
         run_id,

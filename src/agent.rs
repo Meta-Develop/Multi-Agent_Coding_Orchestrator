@@ -7,7 +7,11 @@ use crate::{
         self, MergeApplyPreview, MergeCandidate, MergeCollectOptions, MergeForceOptions,
         MergePreviewOptions, ValidationReport, ValidationStatus,
     },
-    process_runner::{run_process, CapturedBytes, ProcessSpec, Shell, StdinMode},
+    process_runner::{
+        read_bounded_regular_file_nofollow, resolve_existing_path_without_symlinks, run_process,
+        CapturedBytes, EnvironmentMode, ProcessSpec, Shell, SideEffectConfinementProfile,
+        StdinMode, StrictOfflineWorkspaceProfile,
+    },
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
     worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
@@ -16,8 +20,7 @@ use anyhow::{bail, Context, Result};
 use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
-    fs,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::ExitStatus,
     time::{Duration, Instant},
@@ -27,6 +30,14 @@ const DEFAULT_MODEL: &str = "deterministic-fake";
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PROMPT_EXCERPT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentExecutionRuntime {
+    Verified,
+    #[cfg(test)]
+    NonpublishableSimulation,
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRunOptions {
@@ -174,6 +185,32 @@ pub fn run_agent_with_provider<P>(
 where
     P: LlmProvider,
 {
+    run_agent_with_provider_runtime(options, provider, AgentExecutionRuntime::Verified)
+}
+
+#[cfg(test)]
+fn run_agent_with_provider_simulation<P>(
+    options: AgentRunOptions,
+    provider: &mut P,
+) -> Result<AgentRunReport>
+where
+    P: LlmProvider,
+{
+    run_agent_with_provider_runtime(
+        options,
+        provider,
+        AgentExecutionRuntime::NonpublishableSimulation,
+    )
+}
+
+fn run_agent_with_provider_runtime<P>(
+    options: AgentRunOptions,
+    provider: &mut P,
+    runtime: AgentExecutionRuntime,
+) -> Result<AgentRunReport>
+where
+    P: LlmProvider,
+{
     let repo = discover_repo_root(&options.repo)?;
     let agent_id = normalize_agent_id(&options.agent_id)?;
     let claimed_paths = normalize_claimed_paths(options.claimed_paths)?;
@@ -201,6 +238,7 @@ where
         claim: claim.clone(),
         provider_command_policy: options.provider_command_policy,
         command_timeout: options.command_timeout,
+        runtime,
         provider,
     });
 
@@ -247,6 +285,7 @@ where
     claim: PathClaim,
     provider_command_policy: ProviderCommandPolicy,
     command_timeout: Duration,
+    runtime: AgentExecutionRuntime,
     provider: &'a mut P,
 }
 
@@ -256,7 +295,7 @@ where
 {
     let capabilities = run.provider.capabilities();
     let prompt = build_prompt(
-        &run.repo,
+        &run.selected.record.path,
         &run.agent_id,
         &run.task,
         &run.claimed_paths,
@@ -276,7 +315,12 @@ where
     let mut execution_error = None;
 
     for patch in &response.proposal.patches {
-        let result = apply_proposed_patch(&run.selected.record.path, patch, &run.claimed_paths);
+        let result = apply_proposed_patch(
+            &run.selected.record.path,
+            patch,
+            &run.claimed_paths,
+            run.runtime,
+        );
         if !result.success && execution_error.is_none() {
             execution_error = result.error.clone();
         }
@@ -309,8 +353,12 @@ where
             .iter()
             .filter(|command| command.purpose != CommandPurpose::Validate)
         {
-            let result =
-                run_proposed_command(&run.selected.record.path, command, run.command_timeout);
+            let result = run_proposed_command(
+                &run.selected.record.path,
+                command,
+                run.command_timeout,
+                run.runtime,
+            );
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
             }
@@ -329,8 +377,12 @@ where
             .iter()
             .filter(|command| command.purpose == CommandPurpose::Validate)
         {
-            let result =
-                run_proposed_command(&run.selected.record.path, command, run.command_timeout);
+            let result = run_proposed_command(
+                &run.selected.record.path,
+                command,
+                run.command_timeout,
+                run.runtime,
+            );
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -344,8 +396,12 @@ where
 
     if execution_error.is_none() {
         for validation in &run.validation_commands {
-            let result =
-                run_validation_command(&run.selected.record.path, validation, run.command_timeout);
+            let result = run_validation_command(
+                &run.selected.record.path,
+                validation,
+                run.command_timeout,
+                run.runtime,
+            );
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -427,10 +483,20 @@ fn build_prompt(
 
     for path in claimed_paths {
         context = context.with_claimed_path(path.clone(), "agent run claim");
-        let full_path = repo.join(path);
+        let full_path = match resolve_existing_path_without_symlinks(repo, path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to resolve claimed prompt path {}", path.display())
+                });
+            }
+        };
         if full_path.is_file() {
-            let content = fs::read_to_string(&full_path)
+            let content = read_bounded_regular_file_nofollow(&full_path, MAX_PROMPT_EXCERPT_BYTES)
                 .with_context(|| format!("failed to read prompt path {}", path.display()))?;
+            let content = String::from_utf8(content)
+                .with_context(|| format!("prompt path is not UTF-8 text: {}", path.display()))?;
             context = context.with_repo_excerpt(RepoExcerpt::new(path.clone(), content));
         }
     }
@@ -539,6 +605,7 @@ fn apply_proposed_patch(
     worktree_path: &Path,
     patch: &ProposedPatch,
     claimed_paths: &[PathBuf],
+    runtime: AgentExecutionRuntime,
 ) -> PatchApplicationReport {
     let normalized_path = match normalize_repo_relative_path(&patch.path) {
         Ok(path) => path,
@@ -588,7 +655,7 @@ fn apply_proposed_patch(
         };
     }
 
-    match run_git_apply(worktree_path, &patch.unified_diff) {
+    match run_git_apply(worktree_path, &patch.unified_diff, runtime) {
         Ok(result) => PatchApplicationReport {
             path: normalized_path,
             success: result.status.is_some_and(|status| status.success()),
@@ -746,6 +813,7 @@ fn run_proposed_command(
     worktree_path: &Path,
     command: &ProposedCommand,
     timeout: Duration,
+    runtime: AgentExecutionRuntime,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -755,6 +823,7 @@ fn run_proposed_command(
             working_directory: command.working_directory.clone(),
             timeout,
         },
+        runtime,
     )
 }
 
@@ -762,6 +831,7 @@ fn run_validation_command(
     worktree_path: &Path,
     validation: &AgentValidationCommand,
     timeout: Duration,
+    runtime: AgentExecutionRuntime,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -771,10 +841,15 @@ fn run_validation_command(
             working_directory: validation.working_directory.clone(),
             timeout,
         },
+        runtime,
     )
 }
 
-fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionReport {
+fn run_command(
+    worktree_path: &Path,
+    spec: CommandSpec,
+    runtime: AgentExecutionRuntime,
+) -> CommandExecutionReport {
     let normalized_cwd = match normalize_optional_working_directory(spec.working_directory.as_ref())
     {
         Ok(path) => path,
@@ -799,22 +874,38 @@ fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionRepor
         .map(|path| worktree_path.join(path))
         .unwrap_or_else(|| worktree_path.to_path_buf());
     let started = Instant::now();
-    let result = run_process(
-        ProcessSpec::shell(
-            "agent command",
-            Shell::for_current_platform(),
-            spec.command.clone(),
-            full_cwd,
-            OUTPUT_CAPTURE_LIMIT_BYTES,
-        )
-        .with_timeout(Some(spec.timeout)),
-    );
+    let process_spec = ProcessSpec::shell(
+        "agent command",
+        Shell::for_current_platform(),
+        spec.command.clone(),
+        full_cwd,
+        OUTPUT_CAPTURE_LIMIT_BYTES,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
+    .with_timeout(Some(spec.timeout));
+    let result = run_process(match runtime {
+        AgentExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_write(worktree_path),
+            )),
+        #[cfg(test)]
+        AgentExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    });
 
     match result {
         Ok(output) => {
-            let success = output.status.is_some_and(|status| status.success())
-                && !output.timed_out
-                && output.process_error.is_none();
+            let success = match runtime {
+                AgentExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
+                #[cfg(test)]
+                AgentExecutionRuntime::NonpublishableSimulation => {
+                    output.status.is_some_and(|status| status.success())
+                        && !output.timed_out
+                        && output.process_error.is_none()
+                        && output.stdin_error.is_none()
+                }
+            };
             CommandExecutionReport {
                 command: spec.command,
                 purpose: spec.purpose,
@@ -830,6 +921,13 @@ fn run_command(worktree_path: &Path, spec: CommandSpec) -> CommandExecutionRepor
                     None
                 } else if let Some(error) = output.process_error {
                     Some(error)
+                } else if runtime == AgentExecutionRuntime::Verified
+                    && !output.safety_evidence_verified()
+                {
+                    Some(format!(
+                        "command safety evidence was not verified: process_tree={:?}; side_effects={:?}",
+                        output.process_tree, output.side_effects
+                    ))
                 } else if output.timed_out {
                     Some(format!(
                         "command timed out after {} seconds",
@@ -884,23 +982,55 @@ fn validation_report_for_command(result: &CommandExecutionReport) -> ValidationR
     }
 }
 
-fn run_git_apply(worktree_path: &Path, patch: &str) -> Result<ProcessOutput> {
-    let output = run_process(
-        ProcessSpec::direct(
-            "git apply",
-            "git",
-            ["apply", "--whitespace=nowarn", "--binary", "-"],
-            worktree_path,
-            OUTPUT_CAPTURE_LIMIT_BYTES,
-        )
-        .with_stdin(StdinMode::Bytes(patch.as_bytes().to_vec())),
+fn run_git_apply(
+    worktree_path: &Path,
+    patch: &str,
+    runtime: AgentExecutionRuntime,
+) -> Result<ProcessOutput> {
+    let process_spec = ProcessSpec::direct(
+        "git apply",
+        "git",
+        ["apply", "--whitespace=nowarn", "--binary", "-"],
+        worktree_path,
+        OUTPUT_CAPTURE_LIMIT_BYTES,
     )
+    .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
+    .with_stdin(StdinMode::Bytes(patch.as_bytes().to_vec()));
+    let output = run_process(match runtime {
+        AgentExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_write(worktree_path),
+            )),
+        #[cfg(test)]
+        AgentExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    })
     .with_context(|| format!("failed to run git apply in {}", worktree_path.display()))?;
-    if let Some(error) = output.stdin_error {
-        bail!(error);
-    }
-    if let Some(error) = output.process_error {
-        bail!(error);
+    let succeeded = match runtime {
+        AgentExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
+        #[cfg(test)]
+        AgentExecutionRuntime::NonpublishableSimulation => {
+            output.status.is_some_and(|status| status.success())
+                && !output.timed_out
+                && output.process_error.is_none()
+                && output.stdin_error.is_none()
+        }
+    };
+    if !succeeded {
+        if let Some(error) = output
+            .stdin_error
+            .as_deref()
+            .or(output.process_error.as_deref())
+        {
+            bail!("{error}");
+        }
+        bail!(
+            "git apply was not safely verified: exit={:?}; process_tree={:?}; side_effects={:?}",
+            output.status.and_then(|status| status.code()),
+            output.process_tree,
+            output.side_effects
+        );
     }
     Ok(ProcessOutput {
         status: output.status,
@@ -908,6 +1038,9 @@ fn run_git_apply(worktree_path: &Path, patch: &str) -> Result<ProcessOutput> {
         stderr: summarize_output(&output.stderr),
     })
 }
+
+#[cfg(test)]
+use std::fs;
 
 #[derive(Debug, Clone)]
 struct ProcessOutput {
@@ -922,6 +1055,18 @@ fn summarize_output(output: &CapturedBytes) -> OutputSummary {
         text: summary.text,
         truncated: summary.truncated,
     }
+}
+
+fn sandbox_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+    ])
 }
 
 fn duration_millis(duration: std::time::Duration) -> u64 {
@@ -973,7 +1118,7 @@ mod tests {
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1021,7 +1166,7 @@ mod tests {
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1070,7 +1215,7 @@ mod tests {
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1115,7 +1260,7 @@ mod tests {
                 .with_command(ProposedCommand::new("sleep 2", CommandPurpose::Implement)),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),
@@ -1170,7 +1315,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             )),
         );
 
-        let report = run_agent_with_provider(
+        let report = run_agent_with_provider_simulation(
             AgentRunOptions {
                 repo: repo_path.clone(),
                 agent_id: "agent-a".to_string(),

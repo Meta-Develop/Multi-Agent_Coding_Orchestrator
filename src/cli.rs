@@ -453,6 +453,7 @@ impl SuperviseCommand {
                     plan_file: args.supervisor_plan,
                     run_id: resolved.run_id,
                     codex_bin: args.codex_bin,
+                    runtime: args.runtime,
                     allow_dirty_primary: args.allow_dirty_primary,
                 })?;
                 print_query_report(&report, args.json)?;
@@ -515,9 +516,12 @@ struct RunSuperviseArgs {
     /// Stable run id for durable `.maco/o2/runs/<run-id>` artifacts. Omit to generate one.
     #[arg(long)]
     run_id: Option<String>,
-    /// Codex-compatible executable to invoke. Tests should pass a fake executable.
+    /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
+    /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
+    #[arg(long, value_enum, default_value_t = supervise::SupervisorRuntime::Codex)]
+    runtime: supervise::SupervisorRuntime,
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,

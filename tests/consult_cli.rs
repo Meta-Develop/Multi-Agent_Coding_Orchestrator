@@ -144,11 +144,11 @@ fn consult_artifacts_list_latest_prune_and_refuse_run_id_reuse() -> Result<()> {
 }
 
 #[test]
-fn consult_codex_adapter_uses_read_only_contract_without_delegation_flags() -> Result<()> {
+fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let fake_codex = write_fake_codex_consultant(temp.path())?;
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "consult",
         "ask",
         "--repo",
@@ -166,35 +166,71 @@ fn consult_codex_adapter_uses_read_only_contract_without_delegation_flags() -> R
         "--json",
     ])?;
 
-    assert_eq!(report["success"], true);
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
     assert_eq!(report["runtime"], "codex");
+    let verified_backend_available = report["exit_info"]["exit_code"] == 0;
+    if !verified_backend_available {
+        let error = report["exit_info"]["error"]
+            .as_str()
+            .context("fail-closed external error")?;
+        assert!(
+            error.contains("version preflight")
+                || error.contains("process-tree ownership")
+                || error.contains("containment"),
+            "unexpected fail-closed error: {error}"
+        );
+    } else {
+        assert!(report["caveats"]
+            .as_array()
+            .context("caveats")?
+            .iter()
+            .any(|caveat| caveat
+                .as_str()
+                .is_some_and(|text| text.contains("did not exit successfully"))));
+    }
     let command = report["exit_info"]["command"]
         .as_array()
         .context("command")?;
-    assert!(command_contains_sequence(
-        command,
-        &["--sandbox", "read-only"]
-    ));
+    assert!(command_contains_sequence(command, &["-a", "never"]));
+    assert!(command.iter().any(|arg| arg == "--strict-config"));
+    assert!(command
+        .iter()
+        .any(|arg| arg == "default_permissions=\"maco_external_codex\""));
+    assert!(command.iter().any(|arg| {
+        arg == "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\"}"
+    }));
+    assert!(command
+        .iter()
+        .any(|arg| { arg == "permissions.maco_external_codex.network={enabled=false}" }));
     assert!(command_contains_sequence(
         command,
         &["--output-last-message", "<redacted:local-path>"]
     ));
+    assert!(!command.iter().any(|arg| arg == "--sandbox"));
     assert!(!command.iter().any(|arg| arg == "--enable"));
-    let raw_log = fs::read_to_string(repo_path.join(".maco/consult/runs/consult-codex/raw.log"))
-        .context("read raw log")?;
-    assert!(raw_log.contains(r#""consultant_role_prefix":true"#));
-    assert!(raw_log.contains(r#""goals":false"#));
-    assert!(raw_log.contains(r#""multi_agent":false"#));
+    if verified_backend_available {
+        let raw_log =
+            fs::read_to_string(repo_path.join(".maco/consult/runs/consult-codex/raw.log"))
+                .context("read raw log")?;
+        assert!(raw_log.contains(r#""consultant_role_prefix":true"#));
+        assert!(raw_log.contains(r#""goals":false"#));
+        assert!(raw_log.contains(r#""multi_agent":false"#));
+    }
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md"))?,
+        "# Test Repo\n"
+    );
 
     Ok(())
 }
 
 #[test]
-fn consult_claude_adapter_parses_json_result_envelope() -> Result<()> {
+fn consult_claude_adapter_is_refused_before_launch() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let fake_claude = write_fake_claude_consultant(temp.path())?;
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "consult",
         "ask",
         "--repo",
@@ -212,9 +248,13 @@ fn consult_claude_adapter_parses_json_result_envelope() -> Result<()> {
         "--json",
     ])?;
 
-    assert_eq!(report["success"], true);
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
     assert_eq!(report["runtime"], "claude");
-    assert_eq!(report["answer"], "fake claude consultant answer");
+    assert!(report["exit_info"]["error"]
+        .as_str()
+        .context("external refusal")?
+        .contains("no enforceable inner read-only permission contract"));
     let command = report["exit_info"]["command"]
         .as_array()
         .context("command")?;
@@ -225,12 +265,15 @@ fn consult_claude_adapter_parses_json_result_envelope() -> Result<()> {
     assert!(!command
         .iter()
         .any(|arg| arg.as_str().is_some_and(|text| text.contains("danger"))));
+    assert!(!repo_path
+        .join(".maco/consult/runs/consult-claude/raw.log")
+        .exists());
 
     Ok(())
 }
 
 #[test]
-fn consult_claude_adapter_marks_missing_result_envelope_as_failed() -> Result<()> {
+fn consult_claude_refusal_precedes_result_envelope_parsing() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let fake_claude = write_fake_claude_missing_result(temp.path())?;
@@ -253,14 +296,13 @@ fn consult_claude_adapter_marks_missing_result_envelope_as_failed() -> Result<()
     assert_eq!(report["success"], false);
     assert_eq!(report["status"], "failed");
     assert_eq!(report["runtime"], "claude");
-    assert!(report["caveats"][0]
+    assert!(report["exit_info"]["error"]
         .as_str()
-        .context("parse caveat")?
-        .contains("failed to parse Claude JSON envelope"));
-    assert!(report["caveats"][0]
-        .as_str()
-        .context("parse caveat")?
-        .contains("result field"));
+        .context("external refusal")?
+        .contains("no enforceable inner read-only permission contract"));
+    assert!(!repo_path
+        .join(".maco/consult/runs/consult-claude-missing-result/raw.log")
+        .exists());
 
     Ok(())
 }
@@ -271,8 +313,11 @@ fn write_fake_codex_consultant(root: &Path) -> Result<std::path::PathBuf> {
         &path,
         r#"#!/bin/sh
 set -eu
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' 'codex-cli 0.142.3'
+  exit 0
+fi
 report=
-sandbox=
 cd_arg=
 goals=false
 multi_agent=false
@@ -281,10 +326,6 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     exec)
       shift
-      ;;
-    --sandbox)
-      sandbox="$2"
-      shift 2
       ;;
     --cd)
       cd_arg="$2"
@@ -311,10 +352,6 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
-if [ "$sandbox" != "read-only" ]; then
-  echo "expected read-only sandbox" >&2
-  exit 64
-fi
 if [ "$prompt_arg" != "-" ]; then
   echo "expected stdin prompt marker" >&2
   exit 64

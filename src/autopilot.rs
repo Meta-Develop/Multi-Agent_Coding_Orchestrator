@@ -8,7 +8,8 @@ use crate::{
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
     process_runner::{
-        run_process, CapturedBytes, ProcessOutput, ProcessRunError, ProcessSpec, Shell,
+        run_process, CapturedBytes, EnvironmentMode, ProcessOutput, ProcessRunError, ProcessSpec,
+        Shell, SideEffectConfinementProfile, StrictOfflineWorkspaceProfile,
     },
     publication::{
         self, ForgeKind, PrPublicationOptions, PrPublicationReport, PrPublicationStatus,
@@ -19,8 +20,8 @@ use crate::{
     semantic_coord::SemanticIntentStore,
     supervise::{
         self, AgentRole, FindingSeverity, OrchestratorAssignment, ReviewStatus,
-        SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions, ValidationResult,
-        WorkerAssignment,
+        SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions, SupervisorRuntime,
+        ValidationResult, WorkerAssignment,
     },
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
@@ -31,7 +32,7 @@ use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -325,6 +326,8 @@ pub struct AutopilotArtifactStatus {
 struct SanitizedSupervisorReport {
     version: u32,
     run_id: String,
+    runtime: String,
+    publishable: bool,
     success: bool,
     status: String,
     assigned_paths: Vec<PathBuf>,
@@ -457,15 +460,19 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             supervisor_plan_for_attempt(&plan, &agent_id, attempt, &repair_reasons);
         let supervisor_plan_path = run_dir.join(format!("supervisor-plan-attempt-{attempt}.json"));
         write_json_file(&supervisor_plan_path, &supervisor_plan)?;
-        let codex_bin = match &options.codex_bin {
-            Some(path) => path.clone(),
-            None => write_fake_codex(&run_dir, &plan, attempt)?,
+        let (codex_bin, runtime) = match &options.codex_bin {
+            Some(path) => (path.clone(), SupervisorRuntime::Codex),
+            None => (
+                write_fake_codex(&run_dir, &plan, attempt)?,
+                SupervisorRuntime::Fake,
+            ),
         };
         let supervisor = supervise::run_supervisor_plan_file(SupervisorRunOptions {
             repo: repo.clone(),
             plan_file: supervisor_plan_path,
             run_id: supervisor_run_id.clone(),
             codex_bin,
+            runtime,
             // Autopilot already ran the real primary-change preflight; nested
             // supervise should not reject autopilot's own runtime artifacts.
             allow_dirty_primary: true,
@@ -488,13 +495,17 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             repair_reason: None,
         };
 
-        if !supervisor.success {
+        if !supervisor.success || !supervisor.publishable {
             write_skipped_report(&run_dir.join("pr-report.json"), "supervisor_failed")?;
             write_skipped_report(&run_dir.join("review-report.json"), "supervisor_failed")?;
             attempts.push(attempt_summary);
-            next_action =
+            next_action = if supervisor.success {
+                "rerun with the trusted Codex runtime; fake supervisor evidence cannot be merged or published"
+                    .to_string()
+            } else {
                 "inspect the supervisor report and rerun after correcting the child failure; a human reviews and merges manually"
-                    .to_string();
+                    .to_string()
+            };
             break;
         }
 
@@ -851,9 +862,7 @@ fn run_validation_commands(worktree: &Path, plan: &AutopilotPlan) -> Result<Vec<
             validation.timeout_seconds.map(Duration::from_secs),
         )
         .with_context(|| format!("failed to run validation command {}", index + 1))?;
-        let passed = output.status.is_some_and(|status| status.success())
-            && !output.timed_out
-            && output.process_error.is_none();
+        let passed = output.safety_sensitive_succeeded();
         let mut message = validation_failure_message(&output, validation.timeout_seconds);
         if let Some(text) = message.as_mut() {
             *text = sanitize_validation_message(text);
@@ -892,6 +901,11 @@ fn run_validation_process(
             worktree,
             VALIDATION_CAPTURE_LIMIT_BYTES,
         )
+        .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
+        .with_private_runtime_home(true)
+        .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+            StrictOfflineWorkspaceProfile::read_write(worktree),
+        ))
         .with_timeout(timeout),
     )
 }
@@ -900,6 +914,12 @@ fn validation_failure_message(
     output: &ProcessOutput,
     timeout_seconds: Option<u64>,
 ) -> Option<String> {
+    if !output.safety_evidence_verified() {
+        return Some(format!(
+            "validation safety evidence was not verified: process_tree={:?}; side_effects={:?}",
+            output.process_tree, output.side_effects
+        ));
+    }
     if let Some(error) = &output.process_error {
         return Some(format!(
             "{error}; stdout: {}; stderr: {}",
@@ -930,6 +950,18 @@ fn validation_failure_message(
         summarize_validation_output(&output.stdout),
         summarize_validation_output(&output.stderr)
     ))
+}
+
+fn sandbox_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+    ])
 }
 
 fn summarize_validation_output(output: &CapturedBytes) -> String {
@@ -1163,6 +1195,12 @@ fn sanitize_supervisor_report(
     SanitizedSupervisorReport {
         version: report.version,
         run_id: report.run_id.as_str().to_string(),
+        runtime: match report.runtime {
+            SupervisorRuntime::Codex => "codex",
+            SupervisorRuntime::Fake => "fake",
+        }
+        .to_string(),
+        publishable: report.publishable,
         success: report.success,
         status: review_status_label(report.status).to_string(),
         assigned_paths: report.assigned_paths.clone(),

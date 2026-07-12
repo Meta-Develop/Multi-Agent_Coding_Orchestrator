@@ -24,7 +24,7 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
     )
     .context("write plan")?;
 
-    let run_summary = run_success_json(&[
+    let (run_summary, verified_backend_available) = run_json_regardless(&[
         "orchestrate",
         "run",
         plan_path.to_str().context("plan path utf8")?,
@@ -36,11 +36,29 @@ fn orchestrate_resume_uses_checkpoint_defaults_and_reports_json() -> Result<()> 
         run_id,
         "--json",
     ])?;
-    assert_eq!(run_summary["success"], true);
     assert_eq!(run_summary["run_id"], run_id);
 
     let checkpoint_path = checkpoint_dir.join(format!("{run_id}.json"));
     assert!(checkpoint_path.exists());
+
+    if !verified_backend_available {
+        assert_eq!(run_summary["success"], false);
+        assert_eq!(run_summary["agents"][0]["status"], "failed");
+        let error = run_summary["agents"][0]["error"]
+            .as_str()
+            .context("orchestration error")?;
+        assert!(
+            error.contains("process-tree ownership") || error.contains("containment"),
+            "unexpected fail-closed error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))?,
+            "# Smoke\n"
+        );
+        return Ok(());
+    }
+
+    assert_eq!(run_summary["success"], true);
 
     let resume_summary = run_success_json(&[
         "orchestrate",
@@ -94,6 +112,18 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
     }
 
     serde_json::from_slice(&output.stdout).context("parse json")
+}
+
+fn run_json_regardless(args: &[&str]) -> Result<(Value, bool)> {
+    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let report = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse orchestration json from stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    Ok((report, output.status.success()))
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

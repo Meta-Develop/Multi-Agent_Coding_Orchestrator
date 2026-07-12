@@ -10,6 +10,23 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
+// Handoff matrix for the later test-only injected verified-autopilot/effect-WAL slice. Public Fake
+// now stops as nonpublishable, so these former downstream-success assertions are intentionally
+// retained as named follow-up coverage rather than bypassing the production gate:
+// - run_processes_default_fake_items_and_writes_expected_artifacts: successful item aggregation
+// - status_and_collect_return_sanitized_repo_relative_reports: collect of a successful run
+// - github_local_reads_live_github_but_publishes_and_comments_locally: local publish completion
+// - github_git_permission_pushes_without_creating_github_pr_when_validated: Git push effect
+// - github_pr_permission_creates_draft_pr_only_when_explicit_and_validated: draft PR effect
+// - github_full_permission_comments_only_after_success_when_explicit_and_validated: comment effect
+// - run_passes_codex_bin_to_autopilot / watch_once_passes_codex_bin_to_autopilot: verified child
+// - workspace_run_non_strict_continues_and_strict_fails_on_refusal: successful peer repository
+// - workspace_run_permission_modes_keep_read_local_and_publish_boundaries: local/publish success
+// - repeated_workspace_run_suppresses_duplicate_items_for_same_repo: success-led deduplication
+// - non_overlapping_locks_do_not_refuse_inbox_run: successful downstream completion
+// - timeout_seconds_stops_hanging_validation_command: injected validation timeout
+// - auto_merge_is_never_performed: successful pipeline with auto-merge still disabled
+
 #[test]
 fn scan_emits_public_safe_fake_schema() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
@@ -75,7 +92,7 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "inbox",
         "run",
         "--repo",
@@ -90,8 +107,8 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert_eq!(report["repo"], ".");
     assert_eq!(report["action_policy"], "fake");
     assert_eq!(report["github_enabled"], false);
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["success"], true);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["success"], false);
     assert_eq!(report["selected_item_count"], 2);
     assert_eq!(report["auto_merge_performed"], false);
     assert_eq!(
@@ -102,8 +119,8 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     let item_reports = report["item_reports"].as_array().context("item reports")?;
     assert_eq!(item_reports.len(), 2);
     assert_eq!(item_reports[0]["kind"], "issue");
-    assert_eq!(item_reports[0]["success"], true);
-    assert_eq!(item_reports[0]["autopilot_success"], true);
+    assert_eq!(item_reports[0]["success"], false);
+    assert_eq!(item_reports[0]["autopilot_success"], false);
     assert_eq!(item_reports[0]["github_success"], true);
     assert_eq!(
         item_reports[0]["plan_path"],
@@ -150,7 +167,9 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert!(pr_body.contains("address failing check context: fake-ci"));
 
     let autopilot = read_json_file(&run_dir.join("item-1-autopilot-report.json"))?;
-    assert_eq!(autopilot["success"], true);
+    assert_eq!(autopilot["success"], false);
+    assert_eq!(autopilot["validation"]["status"], "skipped");
+    assert!(autopilot["pr"].is_null());
     assert_eq!(autopilot["auto_merge_performed"], false);
     assert_eq!(autopilot["check_status"]["ci_reaction_supported"], false);
 
@@ -253,7 +272,7 @@ fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
 
-    run_success_json(&[
+    run_failure_json(&[
         "inbox",
         "run",
         "--repo",
@@ -283,7 +302,7 @@ fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
     assert_eq!(status["artifacts"]["item_github_report_count"], 1);
     assert_eq!(status["final_report"]["repo"], ".");
 
-    let collected = run_success_json(&[
+    let collected = run_failure_json(&[
         "inbox",
         "collect",
         "collectable",
@@ -292,7 +311,7 @@ fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
         "--json",
     ])?;
     assert_eq!(collected["run_id"], "collectable");
-    assert_eq!(collected["status"], "succeeded");
+    assert_eq!(collected["status"], "failed");
     assert_eq!(collected["repo"], ".");
 
     let serialized = serde_json::to_string(&(status, collected)).context("serialize")?;
@@ -464,7 +483,7 @@ fn github_local_reads_live_github_but_publishes_and_comments_locally() -> Result
     commit_all(&Repository::open(&repo_path)?, "inbox github local config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_success_json_with_path(
+    let report = run_failure_json_with_path(
         &[
             "inbox",
             "run",
@@ -480,9 +499,7 @@ fn github_local_reads_live_github_but_publishes_and_comments_locally() -> Result
     )?;
 
     assert_eq!(report["permission_mode"], "github_local");
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["success"], true);
-    assert_eq!(report["item_reports"][0]["autopilot_success"], true);
+    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
 
     let plan = read_json_file(&repo_path.join(".maco/inbox/runs/github-local/item-1-plan.json"))?;
     assert_eq!(plan["forge_mode"], "fake");
@@ -612,7 +629,7 @@ fn github_git_permission_pushes_without_creating_github_pr_when_validated() -> R
     commit_all(&Repository::open(&repo_path)?, "inbox github git config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_success_json_with_path(
+    let report = run_failure_json_with_path(
         &[
             "inbox",
             "run",
@@ -628,17 +645,12 @@ fn github_git_permission_pushes_without_creating_github_pr_when_validated() -> R
     )?;
 
     assert_eq!(report["permission_mode"], "github_git");
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["success"], true);
+    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
     let autopilot = read_json_file(
         &repo_path.join(".maco/inbox/runs/github-git-publish/item-1-autopilot-report.json"),
     )?;
-    assert_eq!(autopilot["validation"]["status"], "passed");
-    assert_eq!(autopilot["pr"]["forge"], "git");
-    assert_eq!(autopilot["pr"]["draft"], true);
-    assert_eq!(autopilot["pr"]["pushed"], true);
-    assert_eq!(autopilot["pr"]["created"], false);
-    assert!(autopilot["pr"]["pr_url"].is_null());
+    assert_eq!(autopilot["validation"]["status"], "skipped");
+    assert!(autopilot["pr"].is_null());
     let github = read_json_file(
         &repo_path.join(".maco/inbox/runs/github-git-publish/item-1-github-report.json"),
     )?;
@@ -695,6 +707,7 @@ fn github_pr_permission_rejects_local_origin_before_creating_draft_pr() -> Resul
     assert_eq!(report["status"], "failed");
     assert_eq!(report["success"], false);
     assert_eq!(report["item_reports"][0]["autopilot_success"], false);
+    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
     let autopilot = read_json_file(
         &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-autopilot-report.json"),
     )?;
@@ -707,6 +720,8 @@ fn github_pr_permission_rejects_local_origin_before_creating_draft_pr() -> Resul
     assert!(!autopilot
         .to_string()
         .contains(&origin_path.display().to_string()));
+    assert_eq!(autopilot["validation"]["status"], "skipped");
+    assert!(autopilot["pr"].is_null());
     let github = read_json_file(
         &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-github-report.json"),
     )?;
@@ -818,6 +833,7 @@ fn github_full_permission_skips_comments_when_publication_or_validation_fails() 
         success_github["message"],
         "autopilot did not succeed; GitHub comment skipped"
     );
+    assert!(success_github["comment_url"].is_null());
 
     let failed_entry = workspace_repo_entry(&report, "failed-validation")?;
     assert_eq!(failed_entry["permission_mode"], "github_full");
@@ -857,7 +873,7 @@ fn run_passes_codex_bin_to_autopilot() -> Result<()> {
     let repo_path = create_committed_repo(temp.path())?;
     let codex = write_fake_codex(temp.path())?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "inbox",
         "run",
         "--repo",
@@ -871,11 +887,9 @@ fn run_passes_codex_bin_to_autopilot() -> Result<()> {
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["success"], true);
-    let codex_log = fs::read_to_string(&codex.log_path).context("read codex log")?;
-    assert!(codex_log.contains("exec"));
-    assert!(codex_log.contains("--output-last-message"));
+    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
+    let codex_log = fs::read_to_string(&codex.log_path).unwrap_or_default();
+    assert!(codex_log.is_empty());
 
     let serialized = serde_json::to_string(&report).context("serialize report")?;
     assert_public_json_is_sanitized(&serialized, &repo_path);
@@ -890,7 +904,7 @@ fn watch_once_passes_codex_bin_to_autopilot() -> Result<()> {
     let repo_path = create_committed_repo(temp.path())?;
     let codex = write_fake_codex(temp.path())?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "inbox",
         "watch",
         "--repo",
@@ -906,9 +920,10 @@ fn watch_once_passes_codex_bin_to_autopilot() -> Result<()> {
     ])?;
 
     assert_eq!(report["iteration_count"], 1);
-    assert_eq!(report["runs"][0]["status"], "succeeded");
-    let codex_log = fs::read_to_string(&codex.log_path).context("read codex log")?;
-    assert!(codex_log.contains("exec"));
+    assert_eq!(report["runs"][0]["status"], "failed");
+    assert_eq!(report["runs"][0]["success"], false);
+    let codex_log = fs::read_to_string(&codex.log_path).unwrap_or_default();
+    assert!(codex_log.is_empty());
 
     Ok(())
 }
@@ -1332,7 +1347,8 @@ fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()
     assert_eq!(report["strict"], false);
     assert_eq!(report["success"], true);
     assert_eq!(report["repo_counts"]["total"], 2);
-    assert_eq!(report["repo_counts"]["succeeded"], 1);
+    assert_eq!(report["repo_counts"]["succeeded"], 0);
+    assert_eq!(report["repo_counts"]["failed"], 1);
     assert_eq!(report["repo_counts"]["refused"], 1);
     assert_eq!(
         report["run_dir"],
@@ -1346,10 +1362,14 @@ fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()
         .exists());
 
     let good_entry = workspace_repo_entry(&report, "good")?;
-    assert_eq!(good_entry["status"], "succeeded");
-    assert_eq!(good_entry["success"], true);
+    assert_eq!(good_entry["status"], "failed");
+    assert_eq!(good_entry["success"], false);
     assert_eq!(good_entry["refused"], false);
     assert_eq!(good_entry["run_report"]["selected_item_count"], 1);
+    assert_eq!(
+        good_entry["run_report"]["item_reports"][0]["autopilot_success"],
+        false
+    );
     let good_final = good_entry["run_report"]["artifacts"]["final_report"]
         .as_str()
         .context("good final report path")?;
@@ -1410,6 +1430,7 @@ fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()
     )?;
     assert_eq!(strict_report["strict"], true);
     assert_eq!(strict_report["success"], false);
+    assert_eq!(strict_report["repo_counts"]["failed"], 1);
     assert_eq!(strict_report["repo_counts"]["refused"], 1);
     assert_eq!(
         workspace_repo_entry(&strict_report, "dirty")?["refused"],
@@ -1488,10 +1509,11 @@ fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Re
 
     let local_entry = workspace_repo_entry(&read_local, "local")?;
     assert_eq!(local_entry["permission_mode"], "github_local");
-    assert_eq!(local_entry["status"], "succeeded");
+    assert_eq!(local_entry["status"], "failed");
+    assert_eq!(local_entry["success"], false);
     assert_eq!(
         local_entry["run_report"]["item_reports"][0]["autopilot_success"],
-        true
+        false
     );
     assert!(local_repo.join(".maco/autopilot/runs").exists());
     let local_github_report = read_json_file(
@@ -1825,15 +1847,14 @@ fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<(
         temp.path(),
     )?;
     let scan_entry = workspace_repo_entry(&scan, "solo")?;
-    assert_eq!(scan_entry["scan_report"]["selected_count"], 0);
+    assert_eq!(scan_entry["scan_report"]["selected_count"], 1);
     assert!(scan_entry["scan_report"]["items"]
         .as_array()
-        .context("duplicate scan items")?
+        .context("retry scan items")?
         .iter()
-        .any(|item| item["skip_reason"] == "duplicate"
-            && item["duplicate"]["matched_run_id"]
-                .as_str()
-                .is_some_and(|run_id| run_id.starts_with("workspace-duplicates-1"))));
+        .filter(|item| item["selected"] == true)
+        .all(|item| item["skip_reason"] != "duplicate"
+            && item["duplicate"]["matched_run_id"].is_null()));
 
     let second = run_success_json_in_dir(
         &[
@@ -1849,10 +1870,18 @@ fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<(
         temp.path(),
     )?;
     let second_entry = workspace_repo_entry(&second, "solo")?;
-    assert_eq!(second_entry["status"], "no_items");
-    assert_eq!(second_entry["run_report"]["selected_item_count"], 0);
-    assert!(!repo_path
-        .join(".maco/autopilot/runs/workspace-duplicates-2")
+    assert_eq!(second_entry["status"], "failed");
+    assert_eq!(second_entry["run_report"]["selected_item_count"], 1);
+    assert_eq!(
+        second_entry["run_report"]["item_reports"][0]["autopilot_success"],
+        false
+    );
+    let retry_autopilot_run_id = second_entry["run_report"]["item_reports"][0]["autopilot_run_id"]
+        .as_str()
+        .context("retry autopilot run id")?;
+    assert!(repo_path
+        .join(".maco/autopilot/runs")
+        .join(retry_autopilot_run_id)
         .exists());
 
     let serialized = serde_json::to_string(&(first, scan, second)).context("serialize reports")?;
@@ -2021,7 +2050,7 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
         "track non-overlapping live claim",
     )?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "inbox",
         "run",
         "--repo",
@@ -2033,8 +2062,8 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["success"], true);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["success"], false);
     assert_eq!(report["selected_item_count"], 1);
     assert!(
         report.get("refusals").is_none()
@@ -2042,6 +2071,7 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
                 .as_array()
                 .is_some_and(|items| items.is_empty())
     );
+    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
 
     Ok(())
 }
@@ -2142,12 +2172,11 @@ fn timeout_seconds_stops_hanging_validation_command() -> Result<()> {
 
     let autopilot =
         read_json_file(&repo_path.join(".maco/inbox/runs/timeout/item-1-autopilot-report.json"))?;
-    assert_eq!(autopilot["validation"]["status"], "failed");
-    assert_eq!(autopilot["validation"]["reports"][0]["name"], "hang");
-    assert!(autopilot["validation"]["reports"][0]["message"]
-        .as_str()
-        .context("validation message")?
-        .contains("timed out"));
+    assert_eq!(autopilot["validation"]["status"], "skipped");
+    assert!(autopilot["validation"]["reports"]
+        .as_array()
+        .context("validation reports")?
+        .is_empty());
 
     Ok(())
 }
@@ -2157,7 +2186,7 @@ fn auto_merge_is_never_performed() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "inbox",
         "run",
         "--repo",
@@ -2175,10 +2204,8 @@ fn auto_merge_is_never_performed() -> Result<()> {
     )?;
     assert_eq!(autopilot["auto_merge_requested"], false);
     assert_eq!(autopilot["auto_merge_performed"], false);
-    assert!(autopilot["next_action"]
-        .as_str()
-        .context("next action")?
-        .contains("merge"));
+    assert_eq!(autopilot["success"], false);
+    assert!(autopilot["pr"].is_null());
 
     Ok(())
 }
@@ -2325,8 +2352,45 @@ fn run_failure_json(args: &[&str]) -> Result<Value> {
     run_json_command(args, None, None, false)
 }
 
+fn run_failure_json_with_path(args: &[&str], path_dir: &Path) -> Result<Value> {
+    run_json_command(args, None, Some(path_dir), false)
+}
+
 fn run_failure_json_in_dir(args: &[&str], cwd: &Path) -> Result<Value> {
     run_json_command(args, Some(cwd), None, false)
+}
+
+fn assert_nonpublishable_autopilot_stop(
+    report: &Value,
+    repo: &Path,
+    expected_items: usize,
+) -> Result<()> {
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(
+        report["selected_item_count"].as_u64(),
+        Some(expected_items as u64)
+    );
+    assert_eq!(report["auto_merge_performed"], false);
+    let items = report["item_reports"].as_array().context("item reports")?;
+    assert_eq!(items.len(), expected_items);
+    for item in items {
+        assert_eq!(item["success"], false);
+        assert_eq!(item["autopilot_success"], false);
+        let path = item["autopilot_report_path"]
+            .as_str()
+            .context("autopilot report path")?;
+        let autopilot = read_json_file(&repo.join(path))?;
+        assert_eq!(autopilot["success"], false);
+        if autopilot.get("validation").is_some() {
+            assert_eq!(autopilot["validation"]["status"], "skipped");
+            assert!(autopilot["pr"].is_null());
+            assert!(autopilot["review"].is_null());
+            assert_eq!(autopilot["auto_merge_performed"], false);
+        }
+    }
+    assert_eq!(fs::read_to_string(repo.join("README.md"))?, "# Smoke\n");
+    Ok(())
 }
 
 fn run_json_command(

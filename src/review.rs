@@ -1,16 +1,27 @@
 use crate::{
     llm::Redactor,
-    process_runner::{run_process, ProcessOutput, ProcessSpec, Shell, StdinMode},
+    process_runner::{
+        read_bounded_regular_file_nofollow, run_process, EnvironmentMode, ProcessOutput,
+        ProcessSpec, Shell, SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
+    },
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const REVIEW_OUTPUT_LIMIT: usize = 8 * 1024;
 const REVIEW_CAPTURE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewExecutionRuntime {
+    Verified,
+    #[cfg(test)]
+    NonpublishableSimulation,
+}
 
 #[derive(Debug, Clone)]
 pub struct ReviewPrOptions {
@@ -182,6 +193,18 @@ pub fn fake_review(options: ReviewPrOptions) -> ReviewReport {
 }
 
 fn external_review(options: ReviewPrOptions) -> Result<ReviewReport> {
+    external_review_runtime(options, ReviewExecutionRuntime::Verified)
+}
+
+#[cfg(test)]
+fn external_review_simulation(options: ReviewPrOptions) -> Result<ReviewReport> {
+    external_review_runtime(options, ReviewExecutionRuntime::NonpublishableSimulation)
+}
+
+fn external_review_runtime(
+    options: ReviewPrOptions,
+    runtime: ReviewExecutionRuntime,
+) -> Result<ReviewReport> {
     let command = options
         .reviewer
         .command
@@ -199,23 +222,41 @@ fn external_review(options: ReviewPrOptions) -> Result<ReviewReport> {
     })
     .context("failed to serialize external review input")?;
     let timeout = options.reviewer.timeout_seconds.map(Duration::from_secs);
-    let output = run_process(
-        ProcessSpec::shell(
-            "external reviewer command",
-            Shell::for_current_platform(),
-            command,
-            &options.repo,
-            REVIEW_CAPTURE_LIMIT_BYTES,
-        )
-        .with_stdin(StdinMode::Bytes(input))
-        .with_timeout(timeout),
+    let before = review_repo_snapshot(&options.repo)?;
+    let process_spec = ProcessSpec::shell(
+        "external reviewer command",
+        Shell::for_current_platform(),
+        command,
+        &options.repo,
+        REVIEW_CAPTURE_LIMIT_BYTES,
     )
+    .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
+    .with_stdin(StdinMode::Bytes(input))
+    .with_timeout(timeout);
+    let output = run_process(match runtime {
+        ReviewExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_only(&options.repo),
+            )),
+        #[cfg(test)]
+        ReviewExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    })
     .context("failed to run external reviewer command")?;
+    let after = review_repo_snapshot(&options.repo)?;
     if let Some(error) = &output.stdin_error {
         bail!(error.clone());
     }
     let diagnostics =
         diagnostics_from_output(&options.repo, &output, options.reviewer.timeout_seconds);
+    if after != before {
+        return Ok(failed_external_review(
+            options,
+            "external reviewer changed repository state despite its read-only contract",
+            diagnostics,
+        ));
+    }
     if output.timed_out {
         return Ok(failed_external_review(
             options,
@@ -223,7 +264,17 @@ fn external_review(options: ReviewPrOptions) -> Result<ReviewReport> {
             diagnostics,
         ));
     }
-    if output.process_error.is_some() || !output.status.is_some_and(|status| status.success()) {
+    let command_succeeded = match runtime {
+        ReviewExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
+        #[cfg(test)]
+        ReviewExecutionRuntime::NonpublishableSimulation => {
+            output.status.is_some_and(|status| status.success())
+                && !output.timed_out
+                && output.stdin_error.is_none()
+                && output.process_error.is_none()
+        }
+    };
+    if !command_succeeded {
         return Ok(failed_external_review(
             options,
             "external reviewer command failed",
@@ -242,6 +293,59 @@ fn external_review(options: ReviewPrOptions) -> Result<ReviewReport> {
     report.ci_reaction_supported = false;
     report.ci_reaction = "unsupported".to_string();
     Ok(report)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReviewRepoSnapshot {
+    head: Option<git2::Oid>,
+    index_digest: Option<git2::Oid>,
+    statuses: Vec<(PathBuf, u32)>,
+}
+
+fn review_repo_snapshot(path: &Path) -> Result<ReviewRepoSnapshot> {
+    let repo = git2::Repository::open(path)
+        .with_context(|| format!("failed to snapshot review repository {}", path.display()))?;
+    let head = repo.head().ok().and_then(|head| head.target());
+    let index_path = repo.path().join("index");
+    let index_digest = match read_bounded_regular_file_nofollow(&index_path, 64 * 1024 * 1024) {
+        Ok(bytes) => Some(
+            git2::Oid::hash_object(git2::ObjectType::Blob, &bytes)
+                .context("failed to hash review index")?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to read bounded review index"),
+    };
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let statuses = repo
+        .statuses(Some(&mut options))?
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .path()
+                .map(|path| (PathBuf::from(path), entry.status().bits()))
+        })
+        .collect();
+    Ok(ReviewRepoSnapshot {
+        head,
+        index_digest,
+        statuses,
+    })
+}
+
+fn sandbox_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+    ])
 }
 
 fn failed_external_review(
@@ -532,6 +636,7 @@ mod tests {
     #[test]
     fn external_review_drains_large_output_before_timeout() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
         let report_path = temp.path().join("review.json");
         let expected = fake_review(ReviewPrOptions {
             repo: temp.path().to_path_buf(),
@@ -547,7 +652,7 @@ mod tests {
             report_path.display()
         );
 
-        let report = external_review(ReviewPrOptions {
+        let report = external_review_simulation(ReviewPrOptions {
             repo: temp.path().to_path_buf(),
             target: "#44".to_string(),
             reviewer: ReviewerConfig {

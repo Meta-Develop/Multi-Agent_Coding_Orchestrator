@@ -42,7 +42,7 @@ fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
     ])?;
     assert_eq!(validation["agent_count"], 1);
 
-    let summary = run_success_json([
+    let (summary, verified_backend_available) = run_json_regardless([
         "orchestrate",
         "run",
         plan_path.to_str().context("plan path utf8")?,
@@ -50,6 +50,18 @@ fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
         repo_path.to_str().context("repo path utf8")?,
         "--json",
     ])?;
+    if !verified_backend_available {
+        assert_orchestration_failed_closed(&summary)?;
+        let status = run_success_json([
+            "sync",
+            "status",
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--json",
+        ])?;
+        assert_eq!(status.as_array().context("status array")?.len(), 0);
+        return Ok(());
+    }
     assert_eq!(summary["success"], true);
     assert_eq!(summary["agents"][0]["status"], "succeeded");
     assert_eq!(summary["agents"][0]["stdout"]["text"], "true\n");
@@ -97,10 +109,13 @@ fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
     let summary: Value = serde_json::from_slice(&output.stdout).context("parse summary json")?;
     assert_eq!(summary["success"], false);
     assert_eq!(summary["agents"][0]["status"], "failed");
-    assert!(summary["agents"][0]["error"]
+    let error = summary["agents"][0]["error"]
         .as_str()
-        .context("error string")?
-        .contains("command exited"));
+        .context("error string")?;
+    assert!(
+        error.contains("command exited") || error.contains("process-tree ownership"),
+        "unexpected orchestration failure: {error}"
+    );
 
     Ok(())
 }
@@ -125,7 +140,7 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
     )
     .context("write plan")?;
 
-    let summary = run_success_json([
+    let (summary, verified_backend_available) = run_json_regardless([
         "orchestrate",
         "run",
         plan_path.to_str().context("plan path utf8")?,
@@ -135,6 +150,15 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
         patch_dir.to_str().context("patch dir utf8")?,
         "--json",
     ])?;
+    if !verified_backend_available {
+        assert_orchestration_failed_closed(&summary)?;
+        assert!(!patch_dir.join("agent-a.patch").exists());
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))?,
+            "# Smoke\n"
+        );
+        return Ok(());
+    }
 
     assert_eq!(summary["success"], true);
     assert_eq!(summary["agents"][0]["status"], "succeeded");
@@ -469,6 +493,38 @@ fn run_success_json_args(args: &[&str]) -> Result<Value> {
     }
 
     serde_json::from_slice(&output.stdout).context("parse json")
+}
+
+fn run_json_regardless<const N: usize>(args: [&str; N]) -> Result<(Value, bool)> {
+    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let report = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse orchestration json from stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    Ok((report, output.status.success()))
+}
+
+fn assert_orchestration_failed_closed(summary: &Value) -> Result<()> {
+    assert_eq!(summary["success"], false);
+    assert_eq!(summary["agents"][0]["status"], "failed");
+    let error = summary["agents"][0]["error"]
+        .as_str()
+        .context("orchestration error")?;
+    assert!(
+        error.contains("process-tree ownership") || error.contains("containment"),
+        "unexpected fail-closed error: {error}"
+    );
+    assert_eq!(
+        summary["agents"][0]["changed_paths"]
+            .as_array()
+            .context("changed paths")?
+            .len(),
+        0
+    );
+    Ok(())
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

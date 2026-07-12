@@ -20,6 +20,12 @@ use thiserror::Error;
 const PIPE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const PIPE_CHANNEL_CAPACITY: usize = 8;
 const MAX_PIPE_EVENTS_PER_POLL: usize = PIPE_CHANNEL_CAPACITY * 2;
+const DEFAULT_MAX_STDIN_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_TEE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_PRIVATE_RUNTIME_FILE_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_SANDBOX_ENTRY_SCAN: usize = 200_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THREAD_JOIN_GRACE: Duration = Duration::from_millis(500);
 const IO_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -41,6 +47,48 @@ const SYSTEMD_RUNTIME_OVERHEAD: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const SYSTEMD_ORPHAN_SAFETY_FUSE: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(target_os = "linux")]
+const SYSTEMD_SANDBOX_SHOW_PROPERTIES: &[&str] = &[
+    "ProtectSystem",
+    "ProtectHome",
+    "NoNewPrivileges",
+    "RestrictSUIDSGID",
+    "LockPersonality",
+    "PrivateTmp",
+    "PrivateDevices",
+    "PrivateNetwork",
+    "PrivateIPC",
+    "ProtectKernelTunables",
+    "ProtectKernelModules",
+    "ProtectKernelLogs",
+    "ProtectClock",
+    "ProtectControlGroups",
+    "ProtectProc",
+    "ProcSubset",
+    "SystemCallArchitectures",
+    "SystemCallFilter",
+    "SystemCallErrorNumber",
+    "CapabilityBoundingSet",
+    "AmbientCapabilities",
+    "RestrictRealtime",
+    "RestrictNamespaces",
+    "KeyringMode",
+    "UMask",
+    "RestrictAddressFamilies",
+    "MemoryMax",
+    "MemorySwapMax",
+    "TasksMax",
+    "CPUQuotaPerSecUSec",
+    "LimitNOFILE",
+    "LimitCORE",
+    "LimitFSIZE",
+    "OOMPolicy",
+    "ReadOnlyPaths",
+    "ReadWritePaths",
+    "BindReadOnlyPaths",
+    "BindPaths",
+    "InaccessiblePaths",
+];
+#[cfg(target_os = "linux")]
 const SYSTEMD_GUARDIAN_SCRIPT: &str = r#"
 environment_file=$1
 shift
@@ -54,25 +102,18 @@ start_fifo=$1
 shift
 owner_fifo=$1
 shift
-owner_pid=$1
-shift
-owner_start=$1
+fifo_waiting=$1
 shift
 sleep_program=$1
 shift
-mkfifo_program=$1
+sandbox_report=$1
 shift
-
-owner_alive() {
-    owner_stat=
-    [ -r "/proc/$owner_pid/stat" ] || return 1
-    { IFS= read -r owner_stat < "/proc/$owner_pid/stat"; } 2>/dev/null || return 1
-    owner_fields=${owner_stat##*) }
-    set -- $owner_fields
-    [ "$#" -ge 20 ] || return 1
-    shift 19
-    [ "$1" = "$owner_start" ]
-}
+stat_program=$1
+shift
+findmnt_program=$1
+shift
+sandbox_check_count=$1
+shift
 
 child_running() {
     child_stat=
@@ -84,27 +125,69 @@ child_running() {
     [ "$1" != Z ] && [ "$1" != X ]
 }
 
+fail_guardian() {
+    printf 'maco containment guardian: %s\n' "$1" >&2
+    exit 125
+}
+
 guardian=$$
-(
-    while owner_alive; do
-        "$sleep_program" 0.01 || {
-            kill -KILL "$guardian"
-            exit 125
-        }
-    done
-    kill -KILL "$guardian"
-) &
 umask 077
-"$mkfifo_program" "$environment_fifo" "$start_fifo" "$owner_fifo" || exit 125
-exec 3<"$owner_fifo" || exit 125
+: > "$fifo_waiting" || fail_guardian "could not publish FIFO-wait marker"
+fifo_wait_count=0
+while [ ! -p "$environment_fifo" ] || [ ! -p "$start_fifo" ] || [ ! -p "$owner_fifo" ]; do
+    fifo_wait_count=$((fifo_wait_count + 1))
+    [ "$fifo_wait_count" -le 300 ] || fail_guardian "runner did not publish gate FIFOs"
+    "$sleep_program" 0.01 || fail_guardian "FIFO wait sleep failed"
+done
+exec 3<"$owner_fifo" || fail_guardian "could not open owner-liveness FIFO"
 (
     IFS= read -r _ <&3
     kill -KILL "$guardian"
 ) &
+: > "$sandbox_report" || fail_guardian "could not create sandbox report"
+cap_inh=missing
+cap_prm=missing
+cap_eff=missing
+cap_amb=missing
+no_new_privs=missing
+seccomp=missing
+while IFS= read -r status_line; do
+    case "$status_line" in
+        CapInh:*0000000000000000) cap_inh=0000000000000000 ;;
+        CapPrm:*0000000000000000) cap_prm=0000000000000000 ;;
+        CapEff:*0000000000000000) cap_eff=0000000000000000 ;;
+        CapAmb:*0000000000000000) cap_amb=0000000000000000 ;;
+        NoNewPrivs:*1) no_new_privs=1 ;;
+        Seccomp:*2) seccomp=2 ;;
+    esac
+done < /proc/self/status
+[ "$cap_inh" = 0000000000000000 ] || fail_guardian "inheritable capabilities remained enabled"
+[ "$cap_prm" = 0000000000000000 ] || fail_guardian "permitted capabilities remained enabled"
+[ "$cap_eff" = 0000000000000000 ] || fail_guardian "effective capabilities remained enabled"
+[ "$cap_amb" = 0000000000000000 ] || fail_guardian "ambient capabilities remained enabled"
+[ "$no_new_privs" = 1 ] || fail_guardian "NoNewPrivileges was not active"
+[ "$seccomp" = 2 ] || fail_guardian "seccomp filter mode was not active"
+printf 'security %s %s %s %s %s %s\n' "$cap_inh" "$cap_prm" "$cap_eff" "$cap_amb" "$no_new_privs" "$seccomp" >> "$sandbox_report" || fail_guardian "could not write security report"
+while [ "$sandbox_check_count" -gt 0 ]; do
+    sandbox_mode=$1
+    sandbox_path=$2
+    shift 2
+    if [ "$sandbox_mode" = inaccessible ]; then
+        if "$stat_program" -L -c '%d %i' -- "$sandbox_path" >/dev/null 2>&1; then
+            fail_guardian "inaccessible path remained visible: $sandbox_path"
+        fi
+        printf 'inaccessible\n' >> "$sandbox_report" || fail_guardian "could not write inaccessible-path report"
+        sandbox_check_count=$((sandbox_check_count - 1))
+        continue
+    fi
+    sandbox_identity=$("$stat_program" -L -c '%d %i' -- "$sandbox_path") || fail_guardian "could not stat sandbox path: $sandbox_path"
+    sandbox_options=$("$findmnt_program" --raw --noheadings --output VFS-OPTIONS --target "$sandbox_path") || fail_guardian "could not inspect sandbox mount: $sandbox_path"
+    printf 'mounted %s %s\n' "$sandbox_identity" "$sandbox_options" >> "$sandbox_report" || fail_guardian "could not write mount report"
+    sandbox_check_count=$((sandbox_check_count - 1))
+done
 : > "$waiting" || exit 125
 IFS= read -r environment_token < "$environment_fifo" || exit 125
 [ "$environment_token" = environment ] || exit 125
-owner_alive || exit 125
 
 target_launcher() {
     set -a
@@ -121,7 +204,6 @@ target_launcher "$environment_file" "$ready" "$start_fifo" "$@" <&4 &
 target=$!
 exec 4<&-
 while child_running "$target"; do
-    owner_alive || exit 125
     "$sleep_program" 0.01 || exit 125
 done
 wait "$target"
@@ -257,19 +339,256 @@ pub enum ContainmentBackend {
 
 /// Records whether the selected backend proved that no owned process remained at return.
 ///
-/// Safety-sensitive callers must accept only [`ContainmentEvidence::VerifiedEmpty`]. A successful
-/// exit status does not upgrade best-effort or failed verification evidence.
+/// Safety-sensitive callers must accept only [`ProcessTreeEvidence::VerifiedEmpty`]. A successful
+/// exit status does not upgrade best-effort or failed verification evidence. This is deliberately
+/// separate from [`SideEffectConfinementEvidence`]: an empty cgroup or Job Object does not prove
+/// that the command avoided filesystem, socket, or network side effects while it was running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "status", content = "backend", rename_all = "snake_case")]
-pub enum ContainmentEvidence {
+pub enum ProcessTreeEvidence {
     VerifiedEmpty(ContainmentBackend),
     TrustedBestEffort(ContainmentBackend),
     Unverified(ContainmentBackend),
 }
 
-impl ContainmentEvidence {
+impl ProcessTreeEvidence {
     pub const fn is_verified_empty(self) -> bool {
         matches!(self, Self::VerifiedEmpty(_))
+    }
+}
+
+/// Backwards-compatible name for callers that have not migrated their diagnostics yet.
+pub type ContainmentEvidence = ProcessTreeEvidence;
+
+/// Names the side-effect policy that was requested for a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffectConfinementProfileKind {
+    StrictOfflineWorkspace,
+    TrustedFixedNetwork,
+    ExternalCodex,
+    TrustedCompatibility,
+}
+
+/// Records whether the requested filesystem, socket, network, and resource policy was enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "status", content = "profile", rename_all = "snake_case")]
+pub enum SideEffectConfinementEvidence {
+    Verified(SideEffectConfinementProfileKind),
+    TrustedBestEffort(SideEffectConfinementProfileKind),
+    Unverified(SideEffectConfinementProfileKind),
+}
+
+impl SideEffectConfinementEvidence {
+    pub const fn is_verified(self) -> bool {
+        matches!(self, Self::Verified(_))
+    }
+
+    pub const fn publishable(self) -> bool {
+        self.is_verified()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Resource ceilings applied by the Linux systemd confinement backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessResourceLimits {
+    pub memory_max_bytes: u64,
+    pub tasks_max: u32,
+    pub cpu_quota_percent: u32,
+    pub open_files_max: u32,
+    pub file_size_max_bytes: u64,
+}
+
+impl Default for ProcessResourceLimits {
+    fn default() -> Self {
+        Self {
+            memory_max_bytes: 4 * 1024 * 1024 * 1024,
+            tasks_max: 256,
+            cpu_quota_percent: 400,
+            open_files_max: 8 * 1024,
+            file_size_max_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceSandboxConfig {
+    workspace_root: PathBuf,
+    workspace_access: WorkspaceAccess,
+    visible_read_only_roots: Vec<PathBuf>,
+    visible_read_only_files: Vec<PathBuf>,
+    writable_artifact_roots: Vec<PathBuf>,
+    hidden_roots: Vec<PathBuf>,
+    resource_limits: ProcessResourceLimits,
+}
+
+impl WorkspaceSandboxConfig {
+    fn new(workspace_root: impl Into<PathBuf>, workspace_access: WorkspaceAccess) -> Self {
+        Self {
+            workspace_root: workspace_root.into(),
+            workspace_access,
+            visible_read_only_roots: Vec::new(),
+            visible_read_only_files: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            resource_limits: ProcessResourceLimits::default(),
+        }
+    }
+
+    fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.writable_artifact_roots.push(root.into());
+        self
+    }
+
+    fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.visible_read_only_roots.push(root.into());
+        self
+    }
+
+    fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.visible_read_only_files.push(file.into());
+        self
+    }
+
+    fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.hidden_roots.push(root.into());
+        self
+    }
+
+    fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.resource_limits = limits;
+        self
+    }
+}
+
+/// Linux workspace profile for commands that must not use IPv4 or IPv6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictOfflineWorkspaceProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl StrictOfflineWorkspaceProfile {
+    pub fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+        }
+    }
+
+    pub fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
+        }
+    }
+
+    pub fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_writable_artifact_root(root);
+        self
+    }
+
+    pub fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+
+    pub fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.config = self.config.with_resource_limits(limits);
+        self
+    }
+}
+
+/// Linux profile for a fixed trusted command that needs parent-process network access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedFixedNetworkProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+/// Outer Linux profile for Codex. The parent CLI may reach its provider, while model-generated
+/// commands must additionally use the custom Codex permission profile assembled by
+/// `external_agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCodexProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl ExternalCodexProfile {
+    pub fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+        }
+    }
+
+    pub fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
+        }
+    }
+
+    pub fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_writable_artifact_root(root);
+        self
+    }
+
+    pub fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    pub fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+
+    pub fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.config = self.config.with_resource_limits(limits);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SideEffectConfinementProfile {
+    StrictOfflineWorkspace(StrictOfflineWorkspaceProfile),
+    TrustedFixedNetwork(TrustedFixedNetworkProfile),
+    ExternalCodex(ExternalCodexProfile),
+    /// Explicit legacy compatibility. Results are never publishable.
+    TrustedCompatibility,
+}
+
+impl SideEffectConfinementProfile {
+    pub const fn kind(&self) -> SideEffectConfinementProfileKind {
+        match self {
+            Self::StrictOfflineWorkspace(_) => {
+                SideEffectConfinementProfileKind::StrictOfflineWorkspace
+            }
+            Self::TrustedFixedNetwork(_) => SideEffectConfinementProfileKind::TrustedFixedNetwork,
+            Self::ExternalCodex(_) => SideEffectConfinementProfileKind::ExternalCodex,
+            Self::TrustedCompatibility => SideEffectConfinementProfileKind::TrustedCompatibility,
+        }
+    }
+
+    fn workspace_config(&self) -> Option<&WorkspaceSandboxConfig> {
+        match self {
+            Self::StrictOfflineWorkspace(profile) => Some(&profile.config),
+            Self::TrustedFixedNetwork(profile) => Some(&profile.config),
+            Self::ExternalCodex(profile) => Some(&profile.config),
+            Self::TrustedCompatibility => None,
+        }
     }
 }
 
@@ -277,6 +596,7 @@ impl ContainmentEvidence {
 pub struct StreamCapture {
     pub max_bytes: usize,
     pub tee_path: Option<PathBuf>,
+    pub max_tee_bytes: usize,
 }
 
 impl StreamCapture {
@@ -284,12 +604,39 @@ impl StreamCapture {
         Self {
             max_bytes,
             tee_path: None,
+            max_tee_bytes: DEFAULT_MAX_TEE_BYTES,
         }
     }
 
     pub fn tee_to(mut self, path: impl Into<PathBuf>) -> Self {
         self.tee_path = Some(path.into());
         self
+    }
+
+    pub const fn with_tee_limit(mut self, max_tee_bytes: usize) -> Self {
+        self.max_tee_bytes = max_tee_bytes;
+        self
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Eq)]
+struct PrivateRuntimeFile {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for PrivateRuntimeFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateRuntimeFile")
+            .field("name", &self.name)
+            .field(
+                "bytes",
+                &format_args!("<redacted:{} bytes>", self.bytes.len()),
+            )
+            .finish()
     }
 }
 
@@ -302,7 +649,18 @@ pub struct ProcessSpec {
     /// Required by default. Use [`ProcessSpec::with_containment`] to make a trusted compatibility
     /// decision explicit at the call site.
     pub containment: ContainmentPolicy,
+    /// Filesystem, socket, network, and resource confinement is independent of process-tree
+    /// ownership. Strict offline workspace confinement is the default.
+    pub side_effects: SideEffectConfinementProfile,
     pub stdin: StdinMode,
+    pub max_stdin_bytes: usize,
+    /// Replace HOME and TMPDIR with this run's owner-private systemd RuntimeDirectory. This is
+    /// available only with the strict Linux backend and avoids unmanaged temporary homes.
+    pub private_runtime_home: bool,
+    /// Point CODEX_HOME at the same owner-private RuntimeDirectory.
+    pub private_runtime_codex_home: bool,
+    #[cfg(target_os = "linux")]
+    private_runtime_files: Vec<PrivateRuntimeFile>,
     /// Total operation deadline starting at [`run_process`] entry. It covers containment-slot
     /// acquisition, pre-start setup, start-gate release, and command execution. Bounded cleanup may
     /// extend the return past this deadline to prove that no owned process remains. On strict Linux
@@ -320,16 +678,25 @@ impl ProcessSpec {
         current_dir: impl Into<PathBuf>,
         capture_limit_bytes: usize,
     ) -> Self {
+        let current_dir = current_dir.into();
         Self {
             label: label.into(),
             command: ProcessCommand::Shell {
                 shell,
                 command: command.into(),
             },
-            current_dir: current_dir.into(),
+            current_dir: current_dir.clone(),
             environment: EnvironmentMode::Inherit,
             containment: ContainmentPolicy::Required,
+            side_effects: SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_write(current_dir),
+            ),
             stdin: StdinMode::Inherit,
+            max_stdin_bytes: DEFAULT_MAX_STDIN_BYTES,
+            private_runtime_home: false,
+            private_runtime_codex_home: false,
+            #[cfg(target_os = "linux")]
+            private_runtime_files: Vec::new(),
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
@@ -343,16 +710,25 @@ impl ProcessSpec {
         current_dir: impl Into<PathBuf>,
         capture_limit_bytes: usize,
     ) -> Self {
+        let current_dir = current_dir.into();
         Self {
             label: label.into(),
             command: ProcessCommand::Direct {
                 program: program.into(),
                 args: args.into_iter().map(Into::into).collect(),
             },
-            current_dir: current_dir.into(),
+            current_dir: current_dir.clone(),
             environment: EnvironmentMode::Inherit,
             containment: ContainmentPolicy::Required,
+            side_effects: SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_write(current_dir),
+            ),
             stdin: StdinMode::Inherit,
+            max_stdin_bytes: DEFAULT_MAX_STDIN_BYTES,
+            private_runtime_home: false,
+            private_runtime_codex_home: false,
+            #[cfg(target_os = "linux")]
+            private_runtime_files: Vec::new(),
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
@@ -366,11 +742,50 @@ impl ProcessSpec {
 
     pub fn with_containment(mut self, containment: ContainmentPolicy) -> Self {
         self.containment = containment;
+        if containment == ContainmentPolicy::TrustedBestEffort {
+            self.side_effects = SideEffectConfinementProfile::TrustedCompatibility;
+        }
+        self
+    }
+
+    pub fn with_side_effect_confinement(
+        mut self,
+        side_effects: SideEffectConfinementProfile,
+    ) -> Self {
+        self.side_effects = side_effects;
         self
     }
 
     pub fn with_stdin(mut self, stdin: StdinMode) -> Self {
         self.stdin = stdin;
+        self
+    }
+
+    pub const fn with_stdin_limit(mut self, max_stdin_bytes: usize) -> Self {
+        self.max_stdin_bytes = max_stdin_bytes;
+        self
+    }
+
+    pub const fn with_private_runtime_home(mut self, enabled: bool) -> Self {
+        self.private_runtime_home = enabled;
+        self
+    }
+
+    pub const fn with_private_runtime_codex_home(mut self, enabled: bool) -> Self {
+        self.private_runtime_codex_home = enabled;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_private_runtime_file(
+        mut self,
+        name: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Self {
+        self.private_runtime_files.push(PrivateRuntimeFile {
+            name: name.into(),
+            bytes,
+        });
         self
     }
 
@@ -427,7 +842,8 @@ pub struct ProcessOutput {
     pub status: Option<ExitStatus>,
     pub duration: Duration,
     pub timed_out: bool,
-    pub containment: ContainmentEvidence,
+    pub process_tree: ProcessTreeEvidence,
+    pub side_effects: SideEffectConfinementEvidence,
     pub stdout: CapturedBytes,
     pub stderr: CapturedBytes,
     pub process_error: Option<String>,
@@ -438,7 +854,8 @@ pub struct ProcessOutput {
 pub struct ProcessFailureEvidence {
     pub stdout: CapturedBytes,
     pub stderr: CapturedBytes,
-    pub containment: ContainmentEvidence,
+    pub process_tree: ProcessTreeEvidence,
+    pub side_effects: SideEffectConfinementEvidence,
     pub process_error: Option<String>,
     pub stdin_error: Option<String>,
 }
@@ -455,7 +872,11 @@ impl fmt::Display for ProcessFailureEvidence {
             stderr.text,
             if stderr.truncated { " (truncated)" } else { "" }
         )?;
-        write!(formatter, "; containment={:?}", self.containment)?;
+        write!(
+            formatter,
+            "; process_tree={:?}; side_effects={:?}",
+            self.process_tree, self.side_effects
+        )?;
         if let Some(error) = &self.process_error {
             write!(formatter, "; process cleanup: {error}")?;
         }
@@ -469,6 +890,18 @@ impl fmt::Display for ProcessFailureEvidence {
 impl ProcessOutput {
     pub fn duration_ms(&self) -> u64 {
         duration_millis(self.duration)
+    }
+
+    pub fn safety_evidence_verified(&self) -> bool {
+        self.process_tree.is_verified_empty() && self.side_effects.is_verified()
+    }
+
+    pub fn safety_sensitive_succeeded(&self) -> bool {
+        self.status.is_some_and(|status| status.success())
+            && !self.timed_out
+            && self.process_error.is_none()
+            && self.stdin_error.is_none()
+            && self.safety_evidence_verified()
     }
 }
 
@@ -537,11 +970,26 @@ pub enum ProcessRunError {
         #[source]
         source: std::io::Error,
     },
+    #[error("stdin for {label} exceeds the configured {limit} byte limit ({actual} bytes)")]
+    StdinTooLarge {
+        label: String,
+        limit: usize,
+        actual: usize,
+    },
 }
 
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
     let command_display = spec.command.display();
+    if let StdinMode::Bytes(bytes) = &spec.stdin {
+        if bytes.len() > spec.max_stdin_bytes {
+            return Err(ProcessRunError::StdinTooLarge {
+                label: spec.label.clone(),
+                limit: spec.max_stdin_bytes,
+                actual: bytes.len(),
+            });
+        }
+    }
     let operation_deadline = spec
         .timeout
         .map(|timeout| {
@@ -567,13 +1015,21 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         &command_display,
         "preflight",
     )?;
+    let prepared_tees = prepare_tees(
+        &spec.label,
+        &spec.stdout,
+        &spec.stderr,
+        spec.containment == ContainmentPolicy::Required,
+        operation_deadline,
+        &command_display,
+    )?;
     let mut prepared_process_tree = PreparedProcessTree::prepare(
         spec.containment,
+        &spec.side_effects,
         &spec.label,
         &command_display,
         operation_deadline,
     )?;
-    let prepared_tees = prepare_tees(&spec.label, &spec.stdout, &spec.stderr)?;
     let mut command = prepared_process_tree
         .build_command(&spec)
         .map_err(|source| ProcessRunError::ContainmentUnavailable {
@@ -711,7 +1167,8 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
     let mut status = None;
     let mut timed_out = false;
     let mut process_error = None;
-    let containment;
+    let process_tree_evidence;
+    let side_effect_evidence;
 
     loop {
         let output_backlog = output_drainers.drain_ready();
@@ -746,7 +1203,8 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                 &spec.label,
                 "timeout termination",
             );
-            containment = cleanup.evidence;
+            process_tree_evidence = cleanup.process_tree;
+            side_effect_evidence = cleanup.side_effects;
             process_error = append_error(process_error, cleanup.error);
 
             let exit_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
@@ -802,7 +1260,8 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                 &spec.label,
                 "normal process-tree finalization",
             );
-            containment = cleanup.evidence;
+            process_tree_evidence = cleanup.process_tree;
+            side_effect_evidence = cleanup.side_effects;
             process_error = append_error(process_error, cleanup.error);
             finish_child_io(
                 &spec.label,
@@ -830,7 +1289,8 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         status,
         duration: started.elapsed(),
         timed_out,
-        containment,
+        process_tree: process_tree_evidence,
+        side_effects: side_effect_evidence,
         stdout,
         stderr,
         process_error,
@@ -846,6 +1306,115 @@ fn preflight_direct_program(command: &ProcessCommand) -> std::io::Result<()> {
         fs::metadata(program).map(|_| ())?;
     }
     Ok(())
+}
+
+/// Reads a regular file without following a final symlink and rejects oversized inputs before
+/// they can become unbounded process stdin or prompt context.
+pub fn read_bounded_regular_file_nofollow(
+    path: &Path,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        let (_, _, attributes) = windows_file_identity(&file)?;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} may not be a reparse point", path.display()),
+            ));
+        }
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "{} exceeds the configured {max_bytes} byte limit",
+                path.display()
+            ),
+        ));
+    }
+    let read_limit = max_bytes.saturating_add(1) as u64;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "{} grew beyond the configured {max_bytes} byte limit while being read",
+                path.display()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Resolves a repository-relative path while rejecting every symlink component.
+pub fn resolve_existing_path_without_symlinks(
+    root: &Path,
+    relative: &Path,
+) -> std::io::Result<PathBuf> {
+    if relative.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must be relative to its workspace root",
+        ));
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let mut current = canonical_root.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe relative path component in {}", relative.display()),
+            ));
+        };
+        current.push(component);
+        if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "symlink path component is not allowed: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    let canonical = fs::canonicalize(&current)?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} resolves outside workspace root {}",
+                relative.display(),
+                canonical_root.display()
+            ),
+        ));
+    }
+    Ok(canonical)
 }
 
 fn terminate_unowned_child(child: &mut Child, label: &str) -> Option<String> {
@@ -1004,7 +1573,8 @@ fn cleanup_after_wait_error(
     mut input_writer: InputWriter,
 ) -> ProcessFailureEvidence {
     let cleanup = process_tree.cleanup(child, false, label, "wait-error cleanup");
-    let containment = cleanup.evidence;
+    let process_tree = cleanup.process_tree;
+    let side_effects = cleanup.side_effects;
     let mut process_error = cleanup.error;
     process_error = append_error(
         process_error,
@@ -1024,7 +1594,8 @@ fn cleanup_after_wait_error(
     ProcessFailureEvidence {
         stdout,
         stderr,
-        containment,
+        process_tree,
+        side_effects,
         process_error,
         stdin_error,
     }
@@ -1068,7 +1639,13 @@ fn prepare_tees(
     label: &str,
     stdout: &StreamCapture,
     stderr: &StreamCapture,
+    reject_existing: bool,
+    operation_deadline: Option<Instant>,
+    command: &str,
 ) -> Result<PreparedTees, ProcessRunError> {
+    ensure_setup_budget(operation_deadline, label, command, "tee preflight")?;
+    let stdout_tee_limit = stdout.max_tee_bytes;
+    let stderr_tee_limit = stderr.max_tee_bytes;
     if let (Some(stdout), Some(stderr)) = (&stdout.tee_path, &stderr.tee_path) {
         if stdout == stderr {
             return Err(ProcessRunError::TeeConflict {
@@ -1080,11 +1657,11 @@ fn prepare_tees(
     }
 
     let mut stdout = match stdout.tee_path.as_ref() {
-        Some(path) => Some(preflight_tee(label, "stdout", path)?),
+        Some(path) => Some(preflight_tee(label, "stdout", path, reject_existing)?),
         None => None,
     };
     let mut stderr = match stderr.tee_path.as_ref() {
-        Some(path) => match preflight_tee(label, "stderr", path) {
+        Some(path) => match preflight_tee(label, "stderr", path, reject_existing) {
             Ok(tee) => Some(tee),
             Err(error) => {
                 rollback_created_tee(stdout.take());
@@ -1093,6 +1670,7 @@ fn prepare_tees(
         },
         None => None,
     };
+    ensure_setup_budget(operation_deadline, label, command, "tee preflight")?;
 
     if let (Some(stdout_tee), Some(stderr_tee)) = (&stdout, &stderr) {
         let same_file = match tee_files_are_same(stdout_tee, stderr_tee) {
@@ -1125,21 +1703,21 @@ fn prepare_tees(
     let stdout = match stdout.take() {
         Some(tee) => {
             let path = tee.path.clone();
-            Some(
-                PreparedTee::new(tee).map_err(|source| ProcessRunError::OpenTee {
+            Some(PreparedTee::new(tee, stdout_tee_limit).map_err(|source| {
+                ProcessRunError::OpenTee {
                     label: label.to_string(),
                     stream: "stdout",
                     path,
                     source,
-                })?,
-            )
+                }
+            })?)
         }
         None => None,
     };
     let stderr = match stderr.take() {
         Some(tee) => {
             let path = tee.path.clone();
-            match PreparedTee::new(tee) {
+            match PreparedTee::new(tee, stderr_tee_limit) {
                 Ok(tee) => Some(tee),
                 Err(source) => {
                     let mut transaction = PreparedTees {
@@ -1172,6 +1750,15 @@ fn prepare_tees(
             path,
             source: combine_tee_rollback_error(source, rollback),
         });
+    }
+    if let Err(error) =
+        ensure_setup_budget(operation_deadline, label, command, "tee initialization")
+    {
+        let rollback = transaction.rollback().err();
+        return Err(append_process_run_error_cleanup(
+            error,
+            rollback.map(|error| error.to_string()),
+        ));
     }
     #[cfg(all(test, unix))]
     if let Some(pid_path) = env::var_os("MACO_TEST_TEE_HELPER_PID_FILE") {
@@ -1345,10 +1932,19 @@ struct PreparedTee {
     path: PathBuf,
     created: bool,
     modified: bool,
+    max_bytes: usize,
 }
 
 impl PreparedTee {
-    fn new(tee: TeePreflight) -> std::io::Result<Self> {
+    fn new(tee: TeePreflight, max_bytes: usize) -> std::io::Result<Self> {
+        if tee.file.metadata()?.len() > max_bytes as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "existing tee file exceeds the configured {max_bytes} byte transactional limit"
+                ),
+            ));
+        }
         let backup = if tee.created {
             None
         } else {
@@ -1363,6 +1959,7 @@ impl PreparedTee {
             path: tee.path,
             created: tee.created,
             modified: false,
+            max_bytes,
         })
     }
 
@@ -1384,7 +1981,7 @@ impl PreparedTee {
             .startup_file
             .take()
             .ok_or_else(|| std::io::Error::other("tee helper file was already consumed"))?;
-        self.writer = Some(TeeWriter::start(file, self.path.clone())?);
+        self.writer = Some(TeeWriter::start(file, self.path.clone(), self.max_bytes)?);
         Ok(())
     }
 
@@ -1451,6 +2048,7 @@ fn preflight_tee(
     label: &str,
     stream: &'static str,
     path: &Path,
+    reject_existing: bool,
 ) -> Result<TeePreflight, ProcessRunError> {
     let mut create_options = OpenOptions::new();
     create_options.read(true).write(true).create_new(true);
@@ -1471,12 +2069,24 @@ fn preflight_tee(
     let (file, created) = match create_result {
         Ok(file) => (file, true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if reject_existing {
+                return Err(ProcessRunError::OpenTee {
+                    label: label.to_string(),
+                    stream,
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "required confinement refuses an existing tee target",
+                    ),
+                });
+            }
             let mut existing_options = OpenOptions::new();
             existing_options.read(true).write(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                existing_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+                existing_options
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
             #[cfg(target_os = "windows")]
             {
@@ -1739,17 +2349,29 @@ struct TeeWriter {
 }
 
 impl TeeWriter {
-    fn start(file: File, path: PathBuf) -> std::io::Result<Self> {
+    fn start(file: File, path: PathBuf, max_bytes: usize) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            let (helper, sink) = TeeHelper::start(file, &path)?;
-            Ok(Self { sink, helper, path })
+            let (helper, input) = TeeHelper::start(file, &path)?;
+            Ok(Self {
+                sink: TeeSink {
+                    input,
+                    remaining: max_bytes,
+                    limit_reported: false,
+                },
+                helper,
+                path,
+            })
         }
 
         #[cfg(not(unix))]
         {
             Ok(Self {
-                sink: TeeSink { file },
+                sink: TeeSink {
+                    file,
+                    remaining: max_bytes,
+                    limit_reported: false,
+                },
                 path,
             })
         }
@@ -1774,21 +2396,35 @@ struct TeeSink {
     input: ChildStdin,
     #[cfg(not(unix))]
     file: File,
+    remaining: usize,
+    limit_reported: bool,
 }
 
 impl TeeSink {
-    fn write_all_cancellable(&mut self, bytes: &[u8], cancel: &AtomicBool) -> std::io::Result<()> {
+    /// Returns `true` once when bytes were discarded because the configured tee cap was reached.
+    fn write_all_cancellable(
+        &mut self,
+        bytes: &[u8],
+        cancel: &AtomicBool,
+    ) -> std::io::Result<bool> {
+        let accepted = bytes.len().min(self.remaining);
+        let bytes_to_write = &bytes[..accepted];
+        self.remaining -= accepted;
+        let exceeded = accepted < bytes.len() && !self.limit_reported;
+        if exceeded {
+            self.limit_reported = true;
+        }
         #[cfg(unix)]
         {
             let mut written = 0;
-            while written < bytes.len() {
+            while written < bytes_to_write.len() {
                 if cancel.load(Ordering::Acquire) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "tee write cancelled",
                     ));
                 }
-                match self.input.write(&bytes[written..]) {
+                match self.input.write(&bytes_to_write[written..]) {
                     Ok(0) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::WriteZero,
@@ -1803,12 +2439,12 @@ impl TeeSink {
                     Err(error) => return Err(error),
                 }
             }
-            Ok(())
+            Ok(exceeded)
         }
 
         #[cfg(not(unix))]
         {
-            self.file.write_all(bytes)
+            self.file.write_all(bytes_to_write).map(|()| exceeded)
         }
     }
 }
@@ -1838,7 +2474,7 @@ struct TeeHelper {
 
 #[cfg(unix)]
 impl TeeHelper {
-    fn start(file: File, path: &Path) -> std::io::Result<(Self, TeeSink)> {
+    fn start(file: File, path: &Path) -> std::io::Result<(Self, ChildStdin)> {
         use std::os::unix::process::CommandExt;
 
         let cat = find_trusted_unix_executable(
@@ -1882,7 +2518,7 @@ impl TeeHelper {
                 path: path.to_path_buf(),
                 reaped: false,
             },
-            TeeSink { input },
+            input,
         ))
     }
 
@@ -2029,6 +2665,7 @@ const WINDOWS_PROCESS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
 
 struct PreparedProcessTree {
     backend: PreparedContainmentBackend,
+    side_effects: SideEffectConfinementEvidence,
 }
 
 enum PreparedContainmentBackend {
@@ -2045,6 +2682,7 @@ enum PreparedContainmentBackend {
 impl PreparedProcessTree {
     fn prepare(
         policy: ContainmentPolicy,
+        side_effect_profile: &SideEffectConfinementProfile,
         label: &str,
         command: &str,
         operation_deadline: Option<Instant>,
@@ -2054,6 +2692,27 @@ impl PreparedProcessTree {
             command: command.to_string(),
             source,
         };
+        if policy == ContainmentPolicy::TrustedBestEffort
+            && !matches!(
+                side_effect_profile,
+                SideEffectConfinementProfile::TrustedCompatibility
+            )
+        {
+            return Err(unavailable(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TrustedBestEffort process ownership cannot claim a strict side-effect profile",
+            )));
+        }
+        let side_effects = if matches!(
+            side_effect_profile,
+            SideEffectConfinementProfile::TrustedCompatibility
+        ) {
+            SideEffectConfinementEvidence::TrustedBestEffort(
+                SideEffectConfinementProfileKind::TrustedCompatibility,
+            )
+        } else {
+            SideEffectConfinementEvidence::Unverified(side_effect_profile.kind())
+        };
         match policy {
             ContainmentPolicy::Required => {
                 #[cfg(target_os = "linux")]
@@ -2061,6 +2720,7 @@ impl PreparedProcessTree {
                     match SystemdUnit::prepare(operation_deadline) {
                         Ok(unit) => Ok(Self {
                             backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
+                            side_effects,
                         }),
                         Err(source)
                             if operation_deadline
@@ -2078,8 +2738,18 @@ impl PreparedProcessTree {
                 }
                 #[cfg(target_os = "windows")]
                 {
+                    if !matches!(
+                        side_effect_profile,
+                        SideEffectConfinementProfile::TrustedCompatibility
+                    ) {
+                        return Err(unavailable(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "verified side-effect confinement is not implemented for Windows; use explicit trusted compatibility only for trusted commands",
+                        )));
+                    }
                     return Ok(Self {
                         backend: PreparedContainmentBackend::WindowsJob,
+                        side_effects,
                     });
                 }
                 #[cfg(all(unix, not(target_os = "linux")))]
@@ -2102,18 +2772,21 @@ impl PreparedProcessTree {
                 {
                     Ok(Self {
                         backend: PreparedContainmentBackend::UnixProcessGroup,
+                        side_effects,
                     })
                 }
                 #[cfg(target_os = "windows")]
                 {
                     Ok(Self {
                         backend: PreparedContainmentBackend::WindowsJob,
+                        side_effects,
                     })
                 }
                 #[cfg(not(any(unix, target_os = "windows")))]
                 {
                     Ok(Self {
                         backend: PreparedContainmentBackend::DirectChild,
+                        side_effects,
                     })
                 }
             }
@@ -2126,6 +2799,12 @@ impl PreparedProcessTree {
             PreparedContainmentBackend::Systemd(unit) => unit.build_command(spec),
             #[cfg(target_os = "windows")]
             PreparedContainmentBackend::WindowsJob => {
+                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "private runtime HOME requires the strict Linux systemd backend",
+                    ));
+                }
                 use std::os::windows::process::CommandExt;
                 let mut command = spec.command.build();
                 command.creation_flags(WINDOWS_PROCESS_CREATION_FLAGS);
@@ -2135,6 +2814,12 @@ impl PreparedProcessTree {
             }
             #[cfg(unix)]
             PreparedContainmentBackend::UnixProcessGroup => {
+                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "private runtime HOME requires the strict Linux systemd backend",
+                    ));
+                }
                 use std::os::unix::process::CommandExt;
                 let mut command = spec.command.build();
                 command.process_group(0);
@@ -2144,6 +2829,12 @@ impl PreparedProcessTree {
             }
             #[cfg(not(any(unix, target_os = "windows")))]
             PreparedContainmentBackend::DirectChild => {
+                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "private runtime HOME requires the strict Linux systemd backend",
+                    ));
+                }
                 let mut command = spec.command.build();
                 command.current_dir(&spec.current_dir);
                 configure_environment(&mut command, &spec.environment);
@@ -2185,8 +2876,10 @@ impl PreparedProcessTree {
                         })
                     };
                 }
+                let side_effects = unit.side_effect_evidence();
                 Ok(AttachedProcessTree {
                     backend: ProcessTreeBackend::Systemd(unit),
+                    side_effects,
                 })
             }
             #[cfg(target_os = "windows")]
@@ -2200,15 +2893,18 @@ impl PreparedProcessTree {
                 })?;
                 Ok(AttachedProcessTree {
                     backend: ProcessTreeBackend::WindowsJob(job),
+                    side_effects: self.side_effects,
                 })
             }
             #[cfg(unix)]
             PreparedContainmentBackend::UnixProcessGroup => Ok(AttachedProcessTree {
                 backend: ProcessTreeBackend::UnixProcessGroup,
+                side_effects: self.side_effects,
             }),
             #[cfg(not(any(unix, target_os = "windows")))]
             PreparedContainmentBackend::DirectChild => Ok(AttachedProcessTree {
                 backend: ProcessTreeBackend::DirectChild,
+                side_effects: self.side_effects,
             }),
         }
     }
@@ -2216,11 +2912,19 @@ impl PreparedProcessTree {
 
 struct AttachedProcessTree {
     backend: ProcessTreeBackend,
+    side_effects: SideEffectConfinementEvidence,
 }
 
 impl AttachedProcessTree {
     fn cleanup(&mut self, child: &mut Child, label: &str, context: &str) -> TreeCleanup {
-        cleanup_process_tree_backend(&mut self.backend, child, false, label, context)
+        cleanup_process_tree_backend(
+            &mut self.backend,
+            self.side_effects,
+            child,
+            false,
+            label,
+            context,
+        )
     }
 
     fn release(
@@ -2259,8 +2963,8 @@ impl AttachedProcessTree {
             #[cfg(target_os = "windows")]
             ProcessTreeBackend::WindowsJob(job) => {
                 if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    let cleanup = job.cleanup(label, "startup timeout rollback");
-                    if cleanup.error.is_some() || !cleanup.evidence.is_verified_empty() {
+                    let cleanup = job.cleanup(label, "startup timeout rollback", self.side_effects);
+                    if cleanup.error.is_some() || !cleanup.process_tree.is_verified_empty() {
                         fail_closed_stuck_owner(&format!(
                             "{label} Windows Job Object startup-timeout rollback: {}",
                             cleanup.error.unwrap_or_else(|| {
@@ -2276,8 +2980,8 @@ impl AttachedProcessTree {
                     ));
                 }
                 if let Err(source) = resume_suspended_child(child) {
-                    let cleanup = job.cleanup(label, "startup rollback");
-                    if cleanup.error.is_some() || !cleanup.evidence.is_verified_empty() {
+                    let cleanup = job.cleanup(label, "startup rollback", self.side_effects);
+                    if cleanup.error.is_some() || !cleanup.process_tree.is_verified_empty() {
                         fail_closed_stuck_owner(&format!(
                             "{label} Windows Job Object resume rollback: {}",
                             cleanup.error.unwrap_or_else(|| {
@@ -2299,12 +3003,14 @@ impl AttachedProcessTree {
         }
         Ok(ProcessTree {
             backend: self.backend,
+            side_effects: self.side_effects,
         })
     }
 }
 
 struct ProcessTree {
     backend: ProcessTreeBackend,
+    side_effects: SideEffectConfinementEvidence,
 }
 
 enum ProcessTreeBackend {
@@ -2320,7 +3026,8 @@ enum ProcessTreeBackend {
 
 struct TreeCleanup {
     error: Option<String>,
-    evidence: ContainmentEvidence,
+    process_tree: ProcessTreeEvidence,
+    side_effects: SideEffectConfinementEvidence,
 }
 
 impl ProcessTree {
@@ -2333,6 +3040,7 @@ impl ProcessTree {
     ) -> TreeCleanup {
         cleanup_process_tree_backend(
             &mut self.backend,
+            self.side_effects,
             child,
             child_already_exited,
             label,
@@ -2343,6 +3051,7 @@ impl ProcessTree {
 
 fn cleanup_process_tree_backend(
     backend: &mut ProcessTreeBackend,
+    side_effects: SideEffectConfinementEvidence,
     child: &mut Child,
     child_already_exited: bool,
     label: &str,
@@ -2350,13 +3059,20 @@ fn cleanup_process_tree_backend(
 ) -> TreeCleanup {
     match backend {
         #[cfg(target_os = "linux")]
-        ProcessTreeBackend::Systemd(unit) => unit.cleanup(child, label, context),
+        ProcessTreeBackend::Systemd(unit) => {
+            let mut cleanup = unit.cleanup(child, label, context);
+            cleanup.side_effects = side_effects;
+            cleanup
+        }
         #[cfg(target_os = "windows")]
-        ProcessTreeBackend::WindowsJob(job) => job.cleanup(label, context),
+        ProcessTreeBackend::WindowsJob(job) => job.cleanup(label, context, side_effects),
         #[cfg(unix)]
         ProcessTreeBackend::UnixProcessGroup => TreeCleanup {
             error: terminate_unix_process_group(child, child_already_exited, label),
-            evidence: ContainmentEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup),
+            process_tree: ProcessTreeEvidence::TrustedBestEffort(
+                ContainmentBackend::UnixProcessGroup,
+            ),
+            side_effects,
         },
         #[cfg(not(any(unix, target_os = "windows")))]
         ProcessTreeBackend::DirectChild => TreeCleanup {
@@ -2368,9 +3084,1174 @@ fn cleanup_process_tree_backend(
                     .err()
                     .map(|error| format!("{label} {context} direct process kill failed: {error}"))
             },
-            evidence: ContainmentEvidence::TrustedBestEffort(ContainmentBackend::DirectChild),
+            process_tree: ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::DirectChild),
+            side_effects,
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+struct ResolvedSystemdSandbox {
+    kind: SideEffectConfinementProfileKind,
+    workspace_root: PathBuf,
+    current_dir: PathBuf,
+    workspace_access: WorkspaceAccess,
+    visible_read_only_roots: Vec<PathBuf>,
+    visible_read_only_files: Vec<PathBuf>,
+    writable_artifact_roots: Vec<PathBuf>,
+    hidden_roots: Vec<PathBuf>,
+    resource_limits: ProcessResourceLimits,
+    path_identities: Vec<SandboxPathIdentity>,
+    mount_checks: Vec<SandboxMountCheck>,
+}
+
+#[cfg(target_os = "linux")]
+struct SandboxPathIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxMountAccess {
+    ReadOnly,
+    ReadWrite,
+    Inaccessible,
+}
+
+#[cfg(target_os = "linux")]
+struct SandboxMountCheck {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    access: SandboxMountAccess,
+}
+
+#[cfg(target_os = "linux")]
+impl ResolvedSystemdSandbox {
+    fn verify_path_identities(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        for identity in &self.path_identities {
+            let metadata = fs::symlink_metadata(&identity.path)?;
+            if metadata.file_type().is_symlink()
+                || metadata.dev() != identity.device
+                || metadata.ino() != identity.inode
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "sandbox path identity changed before target release: {}",
+                        identity.path.display()
+                    ),
+                ));
+            }
+        }
+        self.verify_no_special_entries()?;
+        Ok(())
+    }
+
+    fn verify_no_special_entries(&self) -> std::io::Result<()> {
+        let mut roots = vec![(
+            self.workspace_root.clone(),
+            self.workspace_access == WorkspaceAccess::ReadWrite,
+        )];
+        roots.extend(
+            self.writable_artifact_roots
+                .iter()
+                .cloned()
+                .map(|root| (root, true)),
+        );
+        roots.sort_by(|left, right| left.0.cmp(&right.0));
+        roots.dedup_by(|left, right| {
+            if left.0 == right.0 {
+                left.1 |= right.1;
+                true
+            } else {
+                false
+            }
+        });
+        let mut minimal_roots: Vec<(PathBuf, bool)> = Vec::new();
+        for (root, writable) in roots {
+            if let Some((_, ancestor_writable)) = minimal_roots
+                .iter()
+                .find(|(ancestor, _)| root.starts_with(ancestor))
+            {
+                if *ancestor_writable || !writable {
+                    continue;
+                }
+            }
+            minimal_roots.push((root, writable));
+        }
+        let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+        let mut writable_links: BTreeMap<(u64, u64), (u64, u64, PathBuf)> = BTreeMap::new();
+        for (root, writable) in minimal_roots {
+            scan_sandbox_tree(&root, writable, &mut remaining, &mut writable_links)?;
+        }
+        for (_, (expected, observed, path)) in writable_links {
+            if observed < expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "writable sandbox file has a hard-link alias outside the writable roots: {} ({observed}/{expected} links observed)",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scan_sandbox_tree(
+    root: &Path,
+    writable: bool,
+    remaining: &mut usize,
+    writable_links: &mut BTreeMap<(u64, u64), (u64, u64, PathBuf)>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_device = fs::symlink_metadata(root)?.dev();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if *remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox tree scan exceeded the fail-closed {MAX_SANDBOX_ENTRY_SCAN} entry limit"
+                ),
+            ));
+        }
+        *remaining -= 1;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect sandbox entry {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        let file_type = metadata.file_type();
+        if metadata.dev() != root_device {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "sandbox tree crosses a filesystem or mount boundary: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if file_type.is_symlink() {
+            let target = fs::metadata(&path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "sandbox symlink must resolve to a regular file or directory {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            if !target.is_file() && !target.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "sandbox symlink resolves to a special file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if target.dev() != root_device {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "sandbox symlink crosses a filesystem boundary: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            continue;
+        }
+        if file_type.is_dir() {
+            for entry in fs::read_dir(&path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to enumerate sandbox directory {}: {error}",
+                        path.display()
+                    ),
+                )
+            })? {
+                pending.push(entry?.path());
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "sandbox contains a socket, FIFO, or device node: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if writable && metadata.nlink() > 1 {
+            let entry = writable_links
+                .entry((metadata.dev(), metadata.ino()))
+                .or_insert_with(|| (metadata.nlink(), 0, path.clone()));
+            entry.0 = entry.0.max(metadata.nlink());
+            entry.1 = entry.1.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<ResolvedSystemdSandbox>> {
+    let Some(config) = spec.side_effects.workspace_config() else {
+        return Ok(None);
+    };
+    let workspace_root = canonical_sandbox_directory(&config.workspace_root, "workspace root")?;
+    if workspace_root == Path::new("/") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "strict workspace confinement refuses '/' as the workspace root",
+        ));
+    }
+    let current_dir = canonical_sandbox_directory(&spec.current_dir, "working directory")?;
+    if !current_dir.starts_with(&workspace_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "working directory {} resolves outside strict workspace root {}",
+                current_dir.display(),
+                workspace_root.display()
+            ),
+        ));
+    }
+
+    let mut visible_read_only_roots = config
+        .visible_read_only_roots
+        .iter()
+        .map(|root| canonical_sandbox_directory(root, "visible read-only root"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    visible_read_only_roots.sort();
+    visible_read_only_roots.dedup();
+    if visible_read_only_roots
+        .iter()
+        .any(|root| root == Path::new("/"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "strict workspace confinement refuses '/' as a visible read-only root",
+        ));
+    }
+    let mut visible_read_only_files = config
+        .visible_read_only_files
+        .iter()
+        .map(|file| canonical_sandbox_file(file, "visible read-only file"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    visible_read_only_files.sort();
+    visible_read_only_files.dedup();
+    let mut writable_artifact_roots = config
+        .writable_artifact_roots
+        .iter()
+        .map(|root| canonical_sandbox_directory(root, "writable artifact root"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    writable_artifact_roots.sort();
+    writable_artifact_roots.dedup();
+    if writable_artifact_roots
+        .iter()
+        .any(|root| root == Path::new("/"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "strict workspace confinement refuses '/' as a writable artifact root",
+        ));
+    }
+
+    let mut hidden_roots = config
+        .hidden_roots
+        .iter()
+        .map(|root| canonical_sandbox_directory(root, "hidden root"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    hidden_roots.sort();
+    hidden_roots.dedup();
+    if hidden_roots.iter().any(|root| root == Path::new("/")) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "strict workspace confinement refuses '/' as a hidden root",
+        ));
+    }
+
+    let mut identity_paths = vec![workspace_root.clone(), current_dir.clone()];
+    identity_paths.extend(visible_read_only_roots.iter().cloned());
+    identity_paths.extend(visible_read_only_files.iter().cloned());
+    identity_paths.extend(writable_artifact_roots.iter().cloned());
+    identity_paths.extend(hidden_roots.iter().cloned());
+    identity_paths.sort();
+    identity_paths.dedup();
+    let path_identities = identity_paths
+        .iter()
+        .map(|path| capture_sandbox_path_identity(path))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mount_checks = build_sandbox_mount_checks(
+        &workspace_root,
+        config.workspace_access,
+        &visible_read_only_roots,
+        &visible_read_only_files,
+        &writable_artifact_roots,
+        &hidden_roots,
+    )?;
+
+    let sandbox = ResolvedSystemdSandbox {
+        kind: spec.side_effects.kind(),
+        workspace_root,
+        current_dir,
+        workspace_access: config.workspace_access,
+        visible_read_only_roots,
+        visible_read_only_files,
+        writable_artifact_roots,
+        hidden_roots,
+        resource_limits: config.resource_limits,
+        path_identities,
+        mount_checks,
+    };
+    sandbox.verify_no_special_entries()?;
+    Ok(Some(sandbox))
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_sandbox_directory(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    validate_systemd_path_syntax(path, label)?;
+    reject_symlink_ancestors(path, label)?;
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to canonicalize {label} {}: {error}", path.display()),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{label} {} is not a directory", canonical.display()),
+        ));
+    }
+    validate_systemd_path_syntax(&canonical, label)?;
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_sandbox_file(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    validate_systemd_path_syntax(path, label)?;
+    reject_symlink_ancestors(path, label)?;
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to canonicalize {label} {}: {error}", path.display()),
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{label} {} is not a regular file", canonical.display()),
+        ));
+    }
+    validate_systemd_path_syntax(&canonical, label)?;
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_systemd_path_syntax(path: &Path, label: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if path.as_os_str().as_bytes().iter().any(|byte| {
+        byte.is_ascii_whitespace() || byte.is_ascii_control() || matches!(*byte, b':' | b'\\')
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{label} contains whitespace or systemd path-list syntax that cannot be verified exactly: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_symlink_ancestors(path: &Path, label: &str) -> std::io::Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) => current.push(component.as_os_str()),
+            std::path::Component::RootDir => current.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} may not contain '..': {}", path.display()),
+                ));
+            }
+            std::path::Component::Normal(component) => {
+                current.push(component);
+                let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to inspect {label} ancestor {}: {error}",
+                            current.display()
+                        ),
+                    )
+                })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "{label} may not traverse a symlink ancestor: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_sandbox_path_identity(path: &Path) -> std::io::Result<SandboxPathIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("sandbox path may not be a symlink: {}", path.display()),
+        ));
+    }
+    Ok(SandboxPathIdentity {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn build_sandbox_mount_checks(
+    workspace_root: &Path,
+    workspace_access: WorkspaceAccess,
+    visible_read_only_roots: &[PathBuf],
+    visible_read_only_files: &[PathBuf],
+    writable_artifact_roots: &[PathBuf],
+    hidden_roots: &[PathBuf],
+) -> std::io::Result<Vec<SandboxMountCheck>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut requested = BTreeMap::new();
+    // ProtectSystem=strict is the foundation that keeps same-filesystem symlink targets outside
+    // explicitly writable binds read-only. Verify the unit's actual root mount rather than
+    // trusting only the configured property.
+    requested.insert(PathBuf::from("/"), SandboxMountAccess::ReadOnly);
+    let workspace_mount_access = match workspace_access {
+        WorkspaceAccess::ReadOnly => SandboxMountAccess::ReadOnly,
+        WorkspaceAccess::ReadWrite => SandboxMountAccess::ReadWrite,
+    };
+    requested.insert(workspace_root.to_path_buf(), workspace_mount_access);
+    for path in visible_read_only_roots
+        .iter()
+        .chain(visible_read_only_files)
+    {
+        if requested
+            .insert(path.clone(), SandboxMountAccess::ReadOnly)
+            .is_some_and(|existing| existing != SandboxMountAccess::ReadOnly)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "sandbox path was requested both read-only and read-write: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    for path in writable_artifact_roots {
+        if requested
+            .insert(path.clone(), SandboxMountAccess::ReadWrite)
+            .is_some_and(|existing| existing != SandboxMountAccess::ReadWrite)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "sandbox path was requested both read-only and read-write: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let mut checks = requested
+        .into_iter()
+        .map(|(path, access)| {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("sandbox mount check path is a symlink: {}", path.display()),
+                ));
+            }
+            Ok(SandboxMountCheck {
+                path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                access,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut inaccessible = hidden_roots.to_vec();
+    inaccessible.extend(known_sensitive_socket_paths());
+    inaccessible.sort();
+    inaccessible.dedup();
+    for path in inaccessible {
+        checks.push(SandboxMountCheck {
+            path,
+            device: 0,
+            inode: 0,
+            access: SandboxMountAccess::Inaccessible,
+        });
+    }
+    Ok(checks)
+}
+
+#[cfg(target_os = "linux")]
+fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSystemdSandbox) {
+    command.args([
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=tmpfs",
+        "--property=NoNewPrivileges=yes",
+        "--property=RestrictSUIDSGID=yes",
+        "--property=LockPersonality=yes",
+        "--property=PrivateTmp=yes",
+        "--property=PrivateDevices=yes",
+        "--property=PrivateIPC=yes",
+        "--property=ProtectKernelTunables=yes",
+        "--property=ProtectKernelModules=yes",
+        "--property=ProtectKernelLogs=yes",
+        "--property=ProtectClock=yes",
+        "--property=ProtectControlGroups=yes",
+        "--property=ProtectProc=invisible",
+        "--property=ProcSubset=pid",
+        "--property=SystemCallArchitectures=native",
+        "--property=SystemCallErrorNumber=EPERM",
+        "--property=RestrictRealtime=yes",
+        "--property=KeyringMode=private",
+        "--property=UMask=0077",
+        "--property=MemorySwapMax=0",
+        "--property=LimitCORE=0",
+        "--property=OOMPolicy=kill",
+    ]);
+    command.arg("--property=RestrictNamespaces=yes");
+    if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+        command.args([
+            "--property=PrivateNetwork=yes",
+            "--property=RestrictAddressFamilies=AF_UNIX",
+            "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat socket socketpair socketcall",
+        ]);
+    } else {
+        command.args([
+            "--property=RestrictAddressFamilies=AF_INET AF_INET6",
+            "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
+        ]);
+    }
+
+    let limits = sandbox.resource_limits;
+    command
+        .arg(format!("--property=MemoryMax={}", limits.memory_max_bytes))
+        .arg(format!("--property=TasksMax={}", limits.tasks_max))
+        .arg(format!("--property=CPUQuota={}%", limits.cpu_quota_percent))
+        .arg(format!("--property=LimitNOFILE={}", limits.open_files_max))
+        .arg(format!(
+            "--property=LimitFSIZE={}",
+            limits.file_size_max_bytes
+        ));
+
+    for root in &sandbox.hidden_roots {
+        command.arg(systemd_path_property("InaccessiblePaths=", root, false));
+    }
+    for path in known_sensitive_socket_paths() {
+        command.arg(systemd_path_property("InaccessiblePaths=", &path, true));
+    }
+
+    for root in &sandbox.visible_read_only_roots {
+        command
+            .arg(systemd_path_property("BindReadOnlyPaths=", root, false))
+            .arg(systemd_path_property("ReadOnlyPaths=", root, false));
+    }
+    for file in &sandbox.visible_read_only_files {
+        command
+            .arg(systemd_path_property("BindReadOnlyPaths=", file, false))
+            .arg(systemd_path_property("ReadOnlyPaths=", file, false));
+    }
+
+    match sandbox.workspace_access {
+        WorkspaceAccess::ReadOnly => {
+            command
+                .arg(systemd_path_property(
+                    "BindReadOnlyPaths=",
+                    &sandbox.workspace_root,
+                    false,
+                ))
+                .arg(systemd_path_property(
+                    "ReadOnlyPaths=",
+                    &sandbox.workspace_root,
+                    false,
+                ));
+        }
+        WorkspaceAccess::ReadWrite => {
+            command
+                .arg(systemd_path_property(
+                    "BindPaths=",
+                    &sandbox.workspace_root,
+                    false,
+                ))
+                .arg(systemd_path_property(
+                    "ReadWritePaths=",
+                    &sandbox.workspace_root,
+                    false,
+                ));
+        }
+    }
+    for root in &sandbox.writable_artifact_roots {
+        command
+            .arg(systemd_path_property("BindPaths=", root, false))
+            .arg(systemd_path_property("ReadWritePaths=", root, false));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_systemd_sandbox_properties(
+    sandbox: &ResolvedSystemdSandbox,
+    properties: &BTreeMap<String, String>,
+    runtime_dir: &Path,
+) -> std::io::Result<()> {
+    for (name, expected) in [
+        ("ProtectSystem", "strict"),
+        ("ProtectHome", "tmpfs"),
+        ("NoNewPrivileges", "yes"),
+        ("RestrictSUIDSGID", "yes"),
+        ("LockPersonality", "yes"),
+        ("PrivateTmp", "yes"),
+        ("PrivateDevices", "yes"),
+        ("PrivateIPC", "yes"),
+        ("ProtectKernelTunables", "yes"),
+        ("ProtectKernelModules", "yes"),
+        ("ProtectKernelLogs", "yes"),
+        ("ProtectClock", "yes"),
+        ("ProtectControlGroups", "yes"),
+        ("ProtectProc", "invisible"),
+        ("ProcSubset", "pid"),
+        ("SystemCallArchitectures", "native"),
+        ("SystemCallErrorNumber", "EPERM"),
+        ("RestrictRealtime", "yes"),
+        ("KeyringMode", "private"),
+        ("UMask", "0077"),
+        ("MemorySwapMax", "0"),
+        ("LimitCORE", "0"),
+        ("OOMPolicy", "kill"),
+    ] {
+        require_effective_property(properties, name, |value| value == expected, expected)?;
+    }
+    require_effective_property(
+        properties,
+        "SystemCallFilter",
+        |value| !value.trim().is_empty(),
+        "a non-empty syscall filter",
+    )?;
+    verify_effective_system_call_filter(sandbox, property_value(properties, "SystemCallFilter")?)?;
+    require_effective_property(
+        properties,
+        "RestrictNamespaces",
+        |value| value == "yes",
+        "yes",
+    )?;
+
+    let address_families = property_value(properties, "RestrictAddressFamilies")?;
+    let has_family = |family: &str| {
+        address_families
+            .split_whitespace()
+            .any(|item| item == family)
+    };
+    if (sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace
+        && (!has_family("AF_UNIX") || has_family("AF_INET") || has_family("AF_INET6")))
+        || (sandbox.kind != SideEffectConfinementProfileKind::StrictOfflineWorkspace
+            && (has_family("AF_UNIX") || !has_family("AF_INET") || !has_family("AF_INET6")))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective RestrictAddressFamilies does not match {:?}: {address_families:?}",
+                sandbox.kind
+            ),
+        ));
+    }
+    if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+        require_effective_property(properties, "PrivateNetwork", |value| value == "yes", "yes")?;
+    }
+
+    let limits = sandbox.resource_limits;
+    for (name, expected) in [
+        ("MemoryMax", limits.memory_max_bytes.to_string()),
+        ("TasksMax", limits.tasks_max.to_string()),
+        ("LimitNOFILE", limits.open_files_max.to_string()),
+        ("LimitFSIZE", limits.file_size_max_bytes.to_string()),
+    ] {
+        require_effective_property(properties, name, |value| value == expected, &expected)?;
+    }
+    require_effective_property(
+        properties,
+        "CPUQuotaPerSecUSec",
+        |value| !value.is_empty() && value != "infinity",
+        "a finite quota",
+    )?;
+
+    let inaccessible = property_value(properties, "InaccessiblePaths")?;
+    for root in &sandbox.hidden_roots {
+        require_property_path("InaccessiblePaths", inaccessible, root)?;
+    }
+    // Mask known same-user IPC endpoints and the Nix daemon. The complete runtime root cannot be
+    // masked because it contains systemd's unit-lifetime guardian directory; AF_UNIX/socket
+    // restrictions are independently verified for target isolation.
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    for path in [
+        PathBuf::from(format!("/run/user/{uid}/bus")),
+        PathBuf::from(format!("/run/user/{uid}/systemd")),
+        PathBuf::from("/nix/var/nix/daemon-socket/socket"),
+    ] {
+        require_property_path("InaccessiblePaths", inaccessible, &path)?;
+    }
+    require_property_path(
+        "BindPaths",
+        property_value(properties, "BindPaths")?,
+        runtime_dir,
+    )?;
+    require_property_path(
+        "ReadWritePaths",
+        property_value(properties, "ReadWritePaths")?,
+        runtime_dir,
+    )?;
+
+    match sandbox.workspace_access {
+        WorkspaceAccess::ReadOnly => {
+            require_property_path(
+                "BindReadOnlyPaths",
+                property_value(properties, "BindReadOnlyPaths")?,
+                &sandbox.workspace_root,
+            )?;
+            require_property_path(
+                "ReadOnlyPaths",
+                property_value(properties, "ReadOnlyPaths")?,
+                &sandbox.workspace_root,
+            )?;
+        }
+        WorkspaceAccess::ReadWrite => {
+            require_property_path(
+                "BindPaths",
+                property_value(properties, "BindPaths")?,
+                &sandbox.workspace_root,
+            )?;
+            require_property_path(
+                "ReadWritePaths",
+                property_value(properties, "ReadWritePaths")?,
+                &sandbox.workspace_root,
+            )?;
+        }
+    }
+    for root in &sandbox.visible_read_only_roots {
+        require_property_path(
+            "BindReadOnlyPaths",
+            property_value(properties, "BindReadOnlyPaths")?,
+            root,
+        )?;
+    }
+    for file in &sandbox.visible_read_only_files {
+        require_property_path(
+            "BindReadOnlyPaths",
+            property_value(properties, "BindReadOnlyPaths")?,
+            file,
+        )?;
+        require_property_path(
+            "ReadOnlyPaths",
+            property_value(properties, "ReadOnlyPaths")?,
+            file,
+        )?;
+    }
+    for root in &sandbox.writable_artifact_roots {
+        require_property_path("BindPaths", property_value(properties, "BindPaths")?, root)?;
+        require_property_path(
+            "ReadWritePaths",
+            property_value(properties, "ReadWritePaths")?,
+            root,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("unsafe sandbox mount report {}", path.display()),
+        ));
+    }
+    let bytes = read_bounded_regular_file_nofollow(path, 64 * 1024)?;
+    let report = std::str::from_utf8(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sandbox mount report is not UTF-8: {error}"),
+        )
+    })?;
+    let lines = report.lines().collect::<Vec<_>>();
+    if lines.len() != checks.len() + 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "sandbox mount report has {} entries; expected {}",
+                lines.len(),
+                checks.len() + 1
+            ),
+        ));
+    }
+    let security = lines[0].split_whitespace().collect::<Vec<_>>();
+    if security.len() != 7
+        || security[0] != "security"
+        || security[1..=4]
+            .iter()
+            .any(|value| *value != "0000000000000000")
+        || security[5] != "1"
+        || security[6] != "2"
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("unit security state was not capability-free, no-new-privileges, and seccomp-filtered: {:?}", lines[0]),
+        ));
+    }
+    for (line, check) in lines[1..].iter().copied().zip(checks) {
+        if check.access == SandboxMountAccess::Inaccessible {
+            if line != "inaccessible" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "sandbox path remained visible inside unit mount namespace: {}",
+                        check.path.display()
+                    ),
+                ));
+            }
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 4 || fields[0] != "mounted" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("malformed sandbox mount report line: {line:?}"),
+            ));
+        }
+        let device = fields[1].parse::<u64>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid mount report device: {error}"),
+            )
+        })?;
+        let inode = fields[2].parse::<u64>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid mount report inode: {error}"),
+            )
+        })?;
+        if device != check.device || inode != check.inode {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "systemd bound the wrong inode for {}: expected {}:{}, observed {device}:{inode}",
+                    check.path.display(),
+                    check.device,
+                    check.inode
+                ),
+            ));
+        }
+        let options = fields[3].split(',').collect::<Vec<_>>();
+        let expected = match check.access {
+            SandboxMountAccess::ReadOnly => "ro",
+            SandboxMountAccess::ReadWrite => "rw",
+            SandboxMountAccess::Inaccessible => continue,
+        };
+        if !options.contains(&expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "sandbox mount access for {} was not {expected}: {:?}",
+                    check.path.display(),
+                    fields[3]
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn property_value<'a>(
+    properties: &'a BTreeMap<String, String>,
+    name: &str,
+) -> std::io::Result<&'a str> {
+    properties.get(name).map(String::as_str).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("systemd show omitted effective property {name}"),
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn require_effective_property(
+    properties: &BTreeMap<String, String>,
+    name: &str,
+    predicate: impl FnOnce(&str) -> bool,
+    expected: &str,
+) -> std::io::Result<()> {
+    let value = property_value(properties, name)?;
+    if predicate(value) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("effective {name}={value:?}; required {expected}"),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_property_path(name: &str, value: &str, path: &Path) -> std::io::Result<()> {
+    let path = path.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{name} path is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    let matches = value.split_whitespace().any(|entry| {
+        let entry = entry.strip_prefix('-').unwrap_or(entry);
+        let source = entry.split(':').next().unwrap_or(entry);
+        source == path
+    });
+    if matches {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("effective {name} omitted required path {path}"),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_effective_system_call_filter(
+    sandbox: &ResolvedSystemdSandbox,
+    value: &str,
+) -> std::io::Result<()> {
+    let tokens = value.split_whitespace().collect::<Vec<_>>();
+    let configured_as_deny_list = tokens.first().is_some_and(|token| token.starts_with('~'));
+    if configured_as_deny_list {
+        for group in [
+            "@clock",
+            "@debug",
+            "@module",
+            "@mount",
+            "@obsolete",
+            "@raw-io",
+            "@reboot",
+            "@swap",
+        ] {
+            if !tokens
+                .iter()
+                .any(|token| token.trim_start_matches('~') == group)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("effective SystemCallFilter omitted denied group {group}"),
+                ));
+            }
+        }
+        for syscall in [
+            "bpf",
+            "fanotify_init",
+            "fanotify_mark",
+            "ipc",
+            "mq_getsetattr",
+            "mq_notify",
+            "mq_open",
+            "mq_timedreceive",
+            "mq_timedreceive_time64",
+            "mq_timedsend",
+            "mq_timedsend_time64",
+            "mq_unlink",
+            "msgctl",
+            "msgget",
+            "msgrcv",
+            "msgsnd",
+            "open_by_handle_at",
+            "process_madvise",
+            "process_vm_readv",
+            "process_vm_writev",
+            "quotactl",
+            "quotactl_fd",
+            "semctl",
+            "semget",
+            "semop",
+            "semtimedop",
+            "semtimedop_time64",
+            "shmat",
+            "shmctl",
+            "shmdt",
+            "shmget",
+            "link",
+            "linkat",
+            "mknod",
+            "mknodat",
+        ] {
+            if !tokens
+                .iter()
+                .any(|token| token.trim_start_matches('~') == syscall)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("effective SystemCallFilter omitted denied syscall {syscall}"),
+                ));
+            }
+        }
+        if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+            for syscall in ["socket", "socketpair", "socketcall"] {
+                if !tokens
+                    .iter()
+                    .any(|token| token.trim_start_matches('~') == syscall)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("effective SystemCallFilter omitted denied syscall {syscall}"),
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    for blocked in [
+        "reboot",
+        "swapon",
+        "swapoff",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "kexec_load",
+        "ptrace",
+        "process_vm_writev",
+        "iopl",
+        "ioperm",
+    ] {
+        if tokens.contains(&blocked) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("effective SystemCallFilter still permits {blocked}"),
+            ));
+        }
+    }
+    for blocked in ["mount", "umount2", "pivot_root", "open_tree", "move_mount"] {
+        if tokens.contains(&blocked) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("effective SystemCallFilter still permits {blocked}"),
+            ));
+        }
+    }
+    for blocked in ["link", "linkat", "mknod", "mknodat"] {
+        if tokens.contains(&blocked) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("effective SystemCallFilter still permits {blocked}"),
+            ));
+        }
+    }
+    if sandbox.kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+        for blocked in ["socket", "socketpair", "socketcall"] {
+            if tokens.contains(&blocked) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("effective SystemCallFilter still permits {blocked}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
+    let mut property = OsString::from("--property=");
+    property.push(name);
+    if optional {
+        property.push("-");
+    }
+    property.push(path.as_os_str());
+    property
+}
+
+#[cfg(target_os = "linux")]
+fn known_sensitive_socket_paths() -> Vec<PathBuf> {
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    let user_runtime = PathBuf::from(format!("/run/user/{uid}"));
+    [
+        user_runtime.join("bus"),
+        user_runtime.join("systemd"),
+        user_runtime.join("gnupg"),
+        user_runtime.join("keyring"),
+        user_runtime.join("wayland-0"),
+        user_runtime.join("pipewire-0"),
+        user_runtime.join("pulse"),
+        user_runtime.join("ssh-agent"),
+        user_runtime.join("docker.sock"),
+        user_runtime.join("podman"),
+        user_runtime.join("libvirt"),
+        PathBuf::from("/run/dbus/system_bus_socket"),
+        PathBuf::from("/var/run/dbus/system_bus_socket"),
+        PathBuf::from("/run/docker.sock"),
+        PathBuf::from("/var/run/docker.sock"),
+        PathBuf::from("/run/podman"),
+        PathBuf::from("/run/libvirt"),
+        PathBuf::from("/var/run/libvirt"),
+        PathBuf::from("/run/credentials"),
+        PathBuf::from("/run/secrets"),
+        PathBuf::from("/run/keys"),
+        PathBuf::from("/nix/var/nix/daemon-socket/socket"),
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -2381,7 +4262,8 @@ struct SystemdUnit {
     env_program: PathBuf,
     shell: PathBuf,
     sleep_program: PathBuf,
-    mkfifo_program: PathBuf,
+    stat_program: PathBuf,
+    findmnt_program: PathBuf,
     name: String,
     cgroup_path: PathBuf,
     runtime_dir: PathBuf,
@@ -2392,12 +4274,17 @@ struct SystemdUnit {
     environment_fifo_path: PathBuf,
     start_fifo_path: PathBuf,
     owner_fifo_path: PathBuf,
+    fifo_waiting_path: PathBuf,
+    sandbox_report_path: PathBuf,
     owner_channel: Option<File>,
     pending_environment: Option<EnvironmentMode>,
+    pending_runtime_files: Vec<PrivateRuntimeFile>,
+    runtime_file_paths: Vec<PathBuf>,
+    sandbox: Option<ResolvedSystemdSandbox>,
+    sandbox_verified: bool,
     environment_published: bool,
     environment_released: bool,
-    runner_pid: u32,
-    runner_start_time: u64,
+    fifos_prepared: bool,
     launcher_spawned: bool,
     launcher_completed: bool,
     observed_owned: bool,
@@ -2571,18 +4458,32 @@ impl SystemdUnit {
                 "strict containment requires a root-owned, non-writable sleep helper at a trusted system path",
             )
         })?;
-        let mkfifo_program = find_trusted_unix_executable(
-            "mkfifo",
+        let stat_program = find_trusted_unix_executable(
+            "stat",
             &[
-                "/usr/bin/mkfifo",
-                "/bin/mkfifo",
-                "/run/current-system/sw/bin/mkfifo",
+                "/usr/bin/stat",
+                "/bin/stat",
+                "/run/current-system/sw/bin/stat",
             ],
         )
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "strict containment requires a root-owned, non-writable mkfifo helper at a trusted system path",
+                "strict containment requires a root-owned, non-writable stat helper at a trusted system path",
+            )
+        })?;
+        let findmnt_program = find_trusted_unix_executable(
+            "findmnt",
+            &[
+                "/usr/bin/findmnt",
+                "/bin/findmnt",
+                "/run/current-system/sw/bin/findmnt",
+            ],
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "strict containment requires a root-owned, non-writable findmnt helper at a trusted system path",
             )
         })?;
         let manager_cgroup = systemd_user_manager_cgroup()?;
@@ -2604,7 +4505,6 @@ impl SystemdUnit {
         }
         let sequence = NEXT_SYSTEMD_UNIT_ID.fetch_add(1, Ordering::Relaxed);
         let runner_pid = std::process::id();
-        let runner_start_time = linux_process_start_time(runner_pid)?;
         let name = format!("maco-process-{runner_pid}-{sequence}.service");
         let cgroup_path = manager_path.join("app.slice").join(&name);
         let runtime_dir = client_runtime
@@ -2616,6 +4516,8 @@ impl SystemdUnit {
         let environment_fifo_path = runtime_dir.join("environment-gate");
         let start_fifo_path = runtime_dir.join("start-gate");
         let owner_fifo_path = runtime_dir.join("owner-liveness");
+        let fifo_waiting_path = runtime_dir.join("fifo-waiting");
+        let sandbox_report_path = runtime_dir.join("sandbox-mount-report");
         Ok(Self {
             _permit: permit,
             systemd_run,
@@ -2623,7 +4525,8 @@ impl SystemdUnit {
             env_program,
             shell,
             sleep_program,
-            mkfifo_program,
+            stat_program,
+            findmnt_program,
             name,
             cgroup_path,
             runtime_dir,
@@ -2634,12 +4537,17 @@ impl SystemdUnit {
             environment_fifo_path,
             start_fifo_path,
             owner_fifo_path,
+            fifo_waiting_path,
+            sandbox_report_path,
             owner_channel: None,
             pending_environment: None,
+            pending_runtime_files: Vec::new(),
+            runtime_file_paths: Vec::new(),
+            sandbox: None,
+            sandbox_verified: false,
             environment_published: false,
             environment_released: false,
-            runner_pid,
-            runner_start_time,
+            fifos_prepared: false,
             launcher_spawned: false,
             launcher_completed: false,
             observed_owned: false,
@@ -2648,7 +4556,25 @@ impl SystemdUnit {
     }
 
     fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
-        self.pending_environment = Some(spec.environment.clone());
+        validate_private_runtime_files(&spec.private_runtime_files)?;
+        self.pending_runtime_files = spec.private_runtime_files.clone();
+        self.pending_environment = Some(
+            if spec.private_runtime_home || spec.private_runtime_codex_home {
+                environment_with_private_runtime_home(
+                    &spec.environment,
+                    &self.runtime_dir,
+                    spec.private_runtime_home,
+                    spec.private_runtime_codex_home,
+                )?
+            } else {
+                spec.environment.clone()
+            },
+        );
+        let sandbox = resolve_systemd_sandbox(spec)?;
+        let working_directory = sandbox
+            .as_ref()
+            .map(|sandbox| sandbox.current_dir.clone())
+            .unwrap_or_else(|| spec.current_dir.clone());
         let runtime_name = self
             .runtime_dir
             .file_name()
@@ -2685,11 +4611,27 @@ impl SystemdUnit {
             .arg(format!(
                 "--property=RuntimeMaxSec={}ms",
                 runtime_max.as_millis()
-            ))
+            ));
+        if let Some(sandbox) = &sandbox {
+            apply_systemd_sandbox_properties(&mut command, sandbox);
+            command
+                .arg(systemd_path_property(
+                    "BindPaths=",
+                    &self.runtime_dir,
+                    false,
+                ))
+                .arg(systemd_path_property(
+                    "ReadWritePaths=",
+                    &self.runtime_dir,
+                    false,
+                ));
+        }
+        self.sandbox = sandbox;
+        command
             .arg("--unit")
             .arg(&self.name)
             .arg("--working-directory")
-            .arg(&spec.current_dir)
+            .arg(&working_directory)
             .arg("--")
             .arg(&self.env_program)
             .arg("-i")
@@ -2705,10 +4647,28 @@ impl SystemdUnit {
             .arg(&self.environment_fifo_path)
             .arg(&self.start_fifo_path)
             .arg(&self.owner_fifo_path)
-            .arg(self.runner_pid.to_string())
-            .arg(self.runner_start_time.to_string())
+            .arg(&self.fifo_waiting_path)
             .arg(&self.sleep_program)
-            .arg(&self.mkfifo_program);
+            .arg(&self.sandbox_report_path)
+            .arg(&self.stat_program)
+            .arg(&self.findmnt_program)
+            .arg(
+                self.sandbox
+                    .as_ref()
+                    .map_or(0, |sandbox| sandbox.mount_checks.len())
+                    .to_string(),
+            );
+        if let Some(sandbox) = &self.sandbox {
+            for check in &sandbox.mount_checks {
+                command
+                    .arg(match check.access {
+                        SandboxMountAccess::ReadOnly => "ro",
+                        SandboxMountAccess::ReadWrite => "rw",
+                        SandboxMountAccess::Inaccessible => "inaccessible",
+                    })
+                    .arg(&check.path);
+            }
+        }
         match &spec.command {
             ProcessCommand::Shell {
                 shell,
@@ -2750,6 +4710,18 @@ impl SystemdUnit {
             if matches!(cgroup_populated(&self.cgroup_path)?, Some(true)) {
                 self.observed_owned = true;
             }
+            if !self.fifos_prepared && self.fifo_waiting_path.is_file() {
+                prepare_systemd_gate_fifos(
+                    &self.runtime_dir,
+                    &self.fifo_waiting_path,
+                    [
+                        &self.environment_fifo_path,
+                        &self.start_fifo_path,
+                        &self.owner_fifo_path,
+                    ],
+                )?;
+                self.fifos_prepared = true;
+            }
             if self.observed_owned && self.owner_channel.is_none() && self.owner_fifo_path.exists()
             {
                 match open_systemd_owner_fifo(&self.owner_fifo_path) {
@@ -2762,6 +4734,11 @@ impl SystemdUnit {
                 && self.waiting_path.is_file()
                 && !self.environment_published
             {
+                for private_file in std::mem::take(&mut self.pending_runtime_files) {
+                    let path = self.runtime_dir.join(&private_file.name);
+                    self.runtime_file_paths.push(path.clone());
+                    publish_private_runtime_file(&path, &private_file.bytes)?;
+                }
                 let environment = self.pending_environment.take().ok_or_else(|| {
                     std::io::Error::other("systemd containment omitted pending environment")
                 })?;
@@ -2783,6 +4760,10 @@ impl SystemdUnit {
                 }
             }
             if self.environment_released && self.ready_path.is_file() {
+                if self.sandbox.is_some() && !self.sandbox_verified {
+                    self.verify_effective_sandbox()?;
+                    self.sandbox_verified = true;
+                }
                 #[cfg(test)]
                 if env::var_os("MACO_TEST_ABORT_BEFORE_START_RELEASE").is_some() {
                     std::process::abort();
@@ -2798,6 +4779,33 @@ impl SystemdUnit {
             }
             thread::sleep(IO_CANCEL_POLL_INTERVAL);
         }
+    }
+
+    fn side_effect_evidence(&self) -> SideEffectConfinementEvidence {
+        match &self.sandbox {
+            Some(sandbox) if self.sandbox_verified => {
+                SideEffectConfinementEvidence::Verified(sandbox.kind)
+            }
+            Some(sandbox) => SideEffectConfinementEvidence::Unverified(sandbox.kind),
+            None => SideEffectConfinementEvidence::TrustedBestEffort(
+                SideEffectConfinementProfileKind::TrustedCompatibility,
+            ),
+        }
+    }
+
+    fn verify_effective_sandbox(&self) -> std::io::Result<()> {
+        let sandbox = self.sandbox.as_ref().ok_or_else(|| {
+            std::io::Error::other("strict sandbox verification omitted requested profile")
+        })?;
+        sandbox.verify_path_identities()?;
+        verify_sandbox_mount_report(&self.sandbox_report_path, &sandbox.mount_checks)?;
+        let properties = systemd_show_properties(
+            &self.systemctl,
+            &self.client_runtime,
+            &self.name,
+            SYSTEMD_SANDBOX_SHOW_PROPERTIES,
+        )?;
+        verify_systemd_sandbox_properties(sandbox, &properties, &self.runtime_dir)
     }
 
     fn release_start_gate(
@@ -2850,8 +4858,11 @@ impl SystemdUnit {
         if self.cleaned {
             return TreeCleanup {
                 error: None,
-                evidence: ContainmentEvidence::VerifiedEmpty(
+                process_tree: ProcessTreeEvidence::VerifiedEmpty(
                     ContainmentBackend::SystemdUserService,
+                ),
+                side_effects: SideEffectConfinementEvidence::Unverified(
+                    SideEffectConfinementProfileKind::TrustedCompatibility,
                 ),
             };
         }
@@ -2866,11 +4877,14 @@ impl SystemdUnit {
             self.remove_runtime_files();
         }
         TreeCleanup {
-            evidence: if error.is_none() && self.observed_owned {
-                ContainmentEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+            process_tree: if error.is_none() && self.observed_owned {
+                ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
             } else {
-                ContainmentEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService)
             },
+            side_effects: SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::TrustedCompatibility,
+            ),
             error,
         }
     }
@@ -2983,14 +4997,134 @@ impl SystemdUnit {
     }
 
     fn remove_runtime_files(&self) {
+        for path in &self.runtime_file_paths {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_file(&self.sandbox_report_path);
         let _ = fs::remove_file(&self.start_fifo_path);
         let _ = fs::remove_file(&self.owner_fifo_path);
         let _ = fs::remove_file(&self.environment_fifo_path);
+        let _ = fs::remove_file(&self.fifo_waiting_path);
         let _ = fs::remove_file(&self.waiting_path);
         let _ = fs::remove_file(&self.ready_path);
         let _ = fs::remove_file(&self.environment_file);
         let _ = fs::remove_dir(&self.runtime_dir);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_show_properties(
+    systemctl: &Path,
+    client_runtime: &Path,
+    unit: &str,
+    names: &[&str],
+) -> std::io::Result<BTreeMap<String, String>> {
+    let mut args = vec![
+        OsString::from("--user"),
+        OsString::from("show"),
+        OsString::from("--no-pager"),
+    ];
+    args.extend(
+        names
+            .iter()
+            .map(|name| OsString::from(format!("--property={name}"))),
+    );
+    args.push(OsString::from(unit));
+    let (status, stdout, stderr) = run_control_command_capture_bounded(
+        systemctl,
+        &args,
+        "systemctl sandbox verification",
+        client_runtime,
+    )?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "systemctl show for {unit} exited with {status}: {}",
+            String::from_utf8_lossy(stderr.as_bytes()).trim()
+        )));
+    }
+    if stdout.is_truncated() || stderr.is_truncated() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "systemctl sandbox verification output exceeded its bounded capture",
+        ));
+    }
+    let stdout = std::str::from_utf8(stdout.as_bytes()).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("systemctl sandbox verification output was not UTF-8: {error}"),
+        )
+    })?;
+    let properties = stdout
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    Ok(properties)
+}
+
+#[cfg(target_os = "linux")]
+fn run_control_command_capture_bounded(
+    program: &Path,
+    args: &[OsString],
+    label: &str,
+    client_runtime: &Path,
+) -> std::io::Result<(ExitStatus, CapturedBytes, CapturedBytes)> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("XDG_RUNTIME_DIR", client_runtime)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("systemctl stdout pipe was unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("systemctl stderr pipe was unavailable"))?;
+    configure_cancellable_io(&stdout)?;
+    configure_cancellable_io(&stderr)?;
+    let mut drainers =
+        OutputDrainers::start(stdout, stderr, label, 64 * 1024, 64 * 1024, None, None);
+    let deadline = Instant::now() + SYSTEMD_OPERATION_GRACE;
+    let status = loop {
+        let backlog = drainers.drain_ready();
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let cleanup = terminate_unix_process_group(&mut child, false, label);
+            let status = wait_for_exit_until(&mut child, Instant::now() + SYSTEMD_OPERATION_GRACE)?
+                .unwrap_or_else(|| fail_closed_stuck_owner(label));
+            let detail = cleanup.unwrap_or_else(|| {
+                format!("{label} exceeded its bounded deadline and was terminated with {status}")
+            });
+            let _ = drainers.finish_until(Instant::now() + EXIT_AND_DRAIN_GRACE);
+            let _ = drainers.cancel_incomplete(label);
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, detail));
+        }
+        if !backlog {
+            thread::sleep(POLL_INTERVAL);
+        }
+    };
+    if !drainers.finish_until(Instant::now() + EXIT_AND_DRAIN_GRACE) {
+        let cleanup = drainers.cancel_incomplete(label);
+        return Err(std::io::Error::other(
+            cleanup.unwrap_or_else(|| format!("{label} output pipes did not close")),
+        ));
+    }
+    let (stdout, stderr, output_error) = drainers.into_outputs();
+    if let Some(error) = output_error {
+        return Err(std::io::Error::other(error));
+    }
+    Ok((status, stdout, stderr))
 }
 
 #[cfg(target_os = "linux")]
@@ -3149,6 +5283,66 @@ fn find_trusted_unix_executable(_name: &str, candidates: &[&str]) -> Option<Path
     })
 }
 
+pub(crate) fn trusted_system_executable(
+    name: &str,
+    candidates: &[&str],
+) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        find_trusted_unix_executable(name, candidates).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "trusted root-owned, non-writable executable {name} was not found at a fixed path"
+                ),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, candidates);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "fixed trusted executable resolution is not implemented on this platform",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn environment_with_private_runtime_home(
+    mode: &EnvironmentMode,
+    runtime_dir: &Path,
+    set_home: bool,
+    set_codex_home: bool,
+) -> std::io::Result<EnvironmentMode> {
+    let runtime_dir = runtime_dir.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "private systemd runtime HOME is not valid UTF-8: {}",
+                runtime_dir.display()
+            ),
+        )
+    })?;
+    let (clear, mut values) = match mode {
+        EnvironmentMode::Inherit => (false, BTreeMap::new()),
+        EnvironmentMode::InheritAndSet(values) => (false, values.clone()),
+        EnvironmentMode::ClearAndSet(values) => (true, values.clone()),
+    };
+    if set_home {
+        values.insert("HOME".to_string(), runtime_dir.to_string());
+        values.insert("TMPDIR".to_string(), runtime_dir.to_string());
+    }
+    if set_codex_home {
+        values.insert("CODEX_HOME".to_string(), runtime_dir.to_string());
+    }
+    Ok(if clear {
+        EnvironmentMode::ClearAndSet(values)
+    } else {
+        EnvironmentMode::InheritAndSet(values)
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn effective_environment(mode: &EnvironmentMode) -> BTreeMap<OsString, OsString> {
     let mut environment = match mode {
@@ -3166,6 +5360,76 @@ fn effective_environment(mode: &EnvironmentMode) -> BTreeMap<OsString, OsString>
         }
     }
     environment
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_systemd_gate_fifos<'a>(
+    runtime_dir: &Path,
+    waiting_marker: &Path,
+    fifo_paths: impl IntoIterator<Item = &'a PathBuf>,
+) -> std::io::Result<()> {
+    use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt, fs::MetadataExt, fs::PermissionsExt};
+
+    let metadata = fs::symlink_metadata(runtime_dir)?;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("unsafe systemd runtime directory {}", runtime_dir.display()),
+        ));
+    }
+    let waiting_metadata = fs::symlink_metadata(waiting_marker)?;
+    if waiting_marker.parent() != Some(runtime_dir)
+        || waiting_metadata.file_type().is_symlink()
+        || !waiting_metadata.is_file()
+        || waiting_metadata.uid() != effective_uid
+        || waiting_metadata.permissions().mode() & 0o777 != 0o600
+        || waiting_metadata.nlink() != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "unsafe systemd FIFO-wait marker {}",
+                waiting_marker.display()
+            ),
+        ));
+    }
+
+    for path in fifo_paths {
+        if path.parent() != Some(runtime_dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "systemd gate FIFO escaped its private runtime directory",
+            ));
+        }
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "systemd gate FIFO path contains a NUL byte",
+            )
+        })?;
+        // SAFETY: fifo is a valid NUL-terminated path and the mode contains only permission bits.
+        if unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_fifo()
+            || metadata.uid() != effective_uid
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("unsafe systemd gate FIFO {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -3225,36 +5489,6 @@ fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_start_time(pid: u32) -> std::io::Result<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let fields = stat
-        .rsplit_once(") ")
-        .map(|(_, fields)| fields)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("/proc/{pid}/stat omitted the process name terminator"),
-            )
-        })?;
-    fields
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("/proc/{pid}/stat omitted process start time"),
-            )
-        })?
-        .parse::<u64>()
-        .map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid /proc/{pid}/stat process start time: {error}"),
-            )
-        })
-}
-
-#[cfg(target_os = "linux")]
 fn systemd_runtime_max(timeout: Option<Duration>) -> std::io::Result<Duration> {
     match timeout {
         Some(timeout) => timeout
@@ -3293,7 +5527,7 @@ fn bounded_operation_deadline(
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_linux_runtime_root() -> std::io::Result<PathBuf> {
+pub(crate) fn trusted_linux_runtime_root() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // SAFETY: geteuid has no preconditions and does not access Rust memory.
@@ -3310,6 +5544,89 @@ fn trusted_linux_runtime_root() -> std::io::Result<PathBuf> {
         std::io::ErrorKind::PermissionDenied,
         "strict systemd containment requires an owner-private /run/user/<uid> runtime root",
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_runtime_files(files: &[PrivateRuntimeFile]) -> std::io::Result<()> {
+    let mut names = std::collections::BTreeSet::new();
+    for file in files {
+        let path = Path::new(&file.name);
+        if file.name.is_empty()
+            || path.components().count() != 1
+            || !matches!(
+                path.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "private runtime filename must be one safe component: {:?}",
+                    file.name
+                ),
+            ));
+        }
+        if file.bytes.len() > MAX_PRIVATE_RUNTIME_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "private runtime file {:?} exceeds the {} byte limit",
+                    file.name, MAX_PRIVATE_RUNTIME_FILE_BYTES
+                ),
+            ));
+        }
+        if !names.insert(file.name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("duplicate private runtime filename {:?}", file.name),
+            ));
+        }
+        if matches!(
+            file.name.as_str(),
+            "environment"
+                | "environment-ready"
+                | "guardian-waiting"
+                | "environment-gate"
+                | "start-gate"
+                | "owner-liveness"
+                | "fifo-waiting"
+                | "sandbox-mount-report"
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("private runtime filename is reserved: {:?}", file.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_private_runtime_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("unsafe private runtime file {}", path.display()),
+        ));
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
 }
 
 #[cfg(target_os = "linux")]
@@ -3549,17 +5866,23 @@ impl WindowsJob {
         }
     }
 
-    fn cleanup(&self, label: &str, context: &str) -> TreeCleanup {
+    fn cleanup(
+        &self,
+        label: &str,
+        context: &str,
+        side_effects: SideEffectConfinementEvidence,
+    ) -> TreeCleanup {
         let error = append_error(
             self.terminate(label, context),
             self.wait_until_empty(label, context),
         );
         TreeCleanup {
-            evidence: if error.is_none() {
-                ContainmentEvidence::VerifiedEmpty(ContainmentBackend::WindowsJobObject)
+            process_tree: if error.is_none() {
+                ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::WindowsJobObject)
             } else {
-                ContainmentEvidence::Unverified(ContainmentBackend::WindowsJobObject)
+                ProcessTreeEvidence::Unverified(ContainmentBackend::WindowsJobObject)
             },
+            side_effects,
             error,
         }
     }
@@ -4197,6 +6520,10 @@ impl PipeReader {
                     self.error = Some(error);
                     self.complete = true;
                 }
+                Ok(PipeReadEvent::TeeLimitExceeded(error)) => {
+                    processed += 1;
+                    self.error = append_error(self.error.take(), Some(error));
+                }
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.error = Some(format!(
@@ -4237,6 +6564,9 @@ impl PipeReader {
                     self.error = Some(error);
                     self.complete = true;
                 }
+                Ok(PipeReadEvent::TeeLimitExceeded(error)) => {
+                    self.error = append_error(self.error.take(), Some(error));
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
@@ -4247,6 +6577,7 @@ enum PipeReadEvent {
     Chunk(Vec<u8>),
     Finished,
     Error(String),
+    TeeLimitExceeded(String),
 }
 
 fn start_pipe_reader<R>(
@@ -4283,18 +6614,13 @@ where
             Ok(bytes_read) => {
                 buffer.truncate(bytes_read);
                 if let Some(tee) = tee.as_mut() {
-                    if let Err(error) = tee.write_all_cancellable(&buffer, &thread_cancel) {
-                        if thread_cancel.load(Ordering::Acquire) {
-                            break;
-                        }
-                        if send_pipe_event(&sender, &thread_cancel, PipeReadEvent::Chunk(buffer))
-                            .is_ok()
-                        {
+                    match tee.write_all_cancellable(&buffer, &thread_cancel) {
+                        Ok(true) => {
                             let _ = send_pipe_event(
                                 &sender,
                                 &thread_cancel,
-                                PipeReadEvent::Error(format!(
-                                    "failed to write {label} {stream} tee {}: {error}",
+                                PipeReadEvent::TeeLimitExceeded(format!(
+                                    "{label} {stream} tee {} exceeded its configured byte limit",
                                     tee_path
                                         .as_deref()
                                         .map(Path::display)
@@ -4303,7 +6629,33 @@ where
                                 )),
                             );
                         }
-                        break;
+                        Ok(false) => {}
+                        Err(error) => {
+                            if thread_cancel.load(Ordering::Acquire) {
+                                break;
+                            }
+                            if send_pipe_event(
+                                &sender,
+                                &thread_cancel,
+                                PipeReadEvent::Chunk(buffer),
+                            )
+                            .is_ok()
+                            {
+                                let _ = send_pipe_event(
+                                    &sender,
+                                    &thread_cancel,
+                                    PipeReadEvent::Error(format!(
+                                        "failed to write {label} {stream} tee {}: {error}",
+                                        tee_path
+                                            .as_deref()
+                                            .map(Path::display)
+                                            .map(|path| path.to_string())
+                                            .unwrap_or_else(|| "<unknown>".to_string())
+                                    )),
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
                 if send_pipe_event(&sender, &thread_cancel, PipeReadEvent::Chunk(buffer)).is_err() {
@@ -4397,6 +6749,111 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn required_confinement_rejects_existing_tee_before_target_start() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tee = temp.path().join("existing.log");
+        let marker = temp.path().join("target-ran");
+        fs::write(&tee, "preserve").expect("seed existing tee");
+        let error = run_process(
+            ProcessSpec::shell(
+                "strict existing tee",
+                Shell::for_current_platform(),
+                format!("touch '{}'", marker.display()),
+                temp.path(),
+                128,
+            )
+            .with_stdout(StreamCapture::bounded(128).tee_to(&tee)),
+        )
+        .expect_err("required mode must reject an existing tee");
+
+        assert!(matches!(error, ProcessRunError::OpenTee { .. }));
+        assert_eq!(fs::read_to_string(tee).expect("preserved tee"), "preserve");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_scan_rejects_fifo_and_external_hardlink_alias() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let fifo = workspace.join("ipc");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+        // SAFETY: fifo_name is a valid NUL-terminated path and mode has no invalid bits.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let sandbox = ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            workspace_root: workspace.clone(),
+            current_dir: workspace.clone(),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            visible_read_only_roots: Vec::new(),
+            visible_read_only_files: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        };
+        assert!(sandbox.verify_no_special_entries().is_err());
+
+        fs::remove_file(&fifo).expect("remove fifo");
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "outside").expect("outside file");
+        fs::hard_link(&outside, workspace.join("alias")).expect("external hardlink alias");
+        assert!(sandbox.verify_no_special_entries().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unit_mount_report_binds_identity_access_and_inaccessibility() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let visible = temp.path().join("visible");
+        fs::write(&visible, "visible").expect("visible");
+        let metadata = fs::metadata(&visible).expect("visible metadata");
+        let report = temp.path().join("report");
+        fs::write(
+            &report,
+            format!(
+                "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nmounted {} {} ro\ninaccessible\n",
+                metadata.dev(),
+                metadata.ino()
+            ),
+        )
+        .expect("report");
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).expect("report mode");
+        let checks = vec![
+            SandboxMountCheck {
+                path: visible,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                access: SandboxMountAccess::ReadOnly,
+            },
+            SandboxMountCheck {
+                path: PathBuf::from("/masked"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::Inaccessible,
+            },
+        ];
+
+        verify_sandbox_mount_report(&report, &checks).expect("valid unit mount report");
+        fs::write(
+            &report,
+            format!(
+                "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nmounted {} {} rw\ninaccessible\n",
+                metadata.dev(),
+                metadata.ino()
+            ),
+        )
+        .expect("replace report");
+        assert!(verify_sandbox_mount_report(&report, &checks).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn drains_large_stdout_and_stderr_without_false_timeout() {
@@ -4409,6 +6866,7 @@ mod tests {
             temp.path(),
             16 * 1024,
         )
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_timeout(Some(Duration::from_secs(3)))
         .with_stdout(StreamCapture::bounded(16 * 1024).tee_to(&output_log));
 
@@ -4500,6 +6958,7 @@ mod tests {
             temp.path(),
             8 * 1024,
         )
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_timeout(Some(Duration::from_secs(2)));
         let started = Instant::now();
 
@@ -4554,6 +7013,7 @@ mod tests {
             temp.path(),
             1024,
         )
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_timeout(Some(Duration::from_secs(2)));
 
         let output = run_process(spec).expect("run delayed descendant command");
@@ -4568,7 +7028,7 @@ mod tests {
     #[test]
     fn required_containment_verifies_normal_nonzero_and_timeout_units_empty() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let normal = run_process(
+        let normal = match run_process(
             ProcessSpec::shell(
                 "normal contained command",
                 Shell::UnixSh,
@@ -4577,10 +7037,16 @@ mod tests {
                 128,
             )
             .with_timeout(Some(Duration::from_secs(2))),
-        )
-        .expect("run normal contained command");
+        ) {
+            Ok(output) => output,
+            Err(error) if is_verified_backend_unavailable(&error) => {
+                assert_current_runner_has_no_systemd_residue();
+                return;
+            }
+            Err(error) => panic!("run normal contained command: {error:?}"),
+        };
         assert!(normal.status.is_some_and(|status| status.success()));
-        assert!(normal.containment.is_verified_empty());
+        assert!(normal.process_tree.is_verified_empty());
         assert_eq!(normal.process_error, None);
 
         let nonzero = run_process(
@@ -4595,7 +7061,7 @@ mod tests {
         )
         .expect("run nonzero contained command");
         assert_eq!(nonzero.status.and_then(|status| status.code()), Some(7));
-        assert!(nonzero.containment.is_verified_empty());
+        assert!(nonzero.process_tree.is_verified_empty());
         assert_eq!(nonzero.process_error, None);
 
         let timed_out = run_process(
@@ -4611,14 +7077,219 @@ mod tests {
         .expect("run timed out contained command");
         assert!(timed_out.timed_out);
         assert!(
-            timed_out.containment.is_verified_empty(),
+            timed_out.process_tree.is_verified_empty(),
             "timed out strict run did not prove cleanup: {timed_out:?}"
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn unsupported_path_masking_refuses_before_target_and_leaves_no_residue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("target-ran");
+        let result = run_process(
+            ProcessSpec::shell(
+                "path-mask enforcement probe",
+                Shell::UnixSh,
+                format!("touch '{}'", marker.display()),
+                temp.path(),
+                256,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        );
+
+        match result {
+            Ok(output) => {
+                assert!(output.safety_evidence_verified());
+                assert!(marker.exists());
+            }
+            Err(error) if is_verified_backend_unavailable(&error) => {
+                assert!(!marker.exists());
+                assert_current_runner_has_no_systemd_residue();
+            }
+            Err(error) => panic!("unexpected strict backend probe failure: {error:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_target_cannot_launch_sibling_user_unit() {
+        if !strict_backend_available_for_tests() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("sibling-unit-ran");
+        let unit = format!(
+            "maco-escape-test-{}-{}",
+            std::process::id(),
+            NEXT_SYSTEMD_UNIT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let systemd_run = trusted_system_executable(
+            "systemd-run",
+            &[
+                "/run/current-system/sw/bin/systemd-run",
+                "/usr/bin/systemd-run",
+                "/bin/systemd-run",
+            ],
+        )
+        .expect("trusted systemd-run");
+        let shell = trusted_system_executable(
+            "sh",
+            &["/run/current-system/sw/bin/sh", "/usr/bin/sh", "/bin/sh"],
+        )
+        .expect("trusted shell");
+        let command = format!(
+            r#"'{}' --user --quiet --collect --unit '{}' -- '{}' -c "sleep 0.2; touch '{}'"#,
+            systemd_run.display(),
+            unit,
+            shell.display(),
+            marker.display()
+        );
+        let output = run_process(
+            ProcessSpec::shell(
+                "sibling systemd escape",
+                Shell::UnixSh,
+                command,
+                temp.path(),
+                4096,
+            )
+            .with_timeout(Some(Duration::from_secs(3))),
+        )
+        .expect("run blocked sibling-unit attempt");
+
+        assert!(!output.status.is_some_and(|status| status.success()));
+        assert!(output.process_tree.is_verified_empty());
+        assert!(output.side_effects.is_verified());
+        thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists());
+
+        let systemctl = trusted_system_executable(
+            "systemctl",
+            &[
+                "/run/current-system/sw/bin/systemctl",
+                "/usr/bin/systemctl",
+                "/bin/systemctl",
+            ],
+        )
+        .expect("trusted systemctl");
+        let status = Command::new(systemctl)
+            .args(["--user", "--quiet", "is-active", &unit])
+            .status()
+            .expect("query sibling unit");
+        assert!(!status.success(), "sibling transient unit survived");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_target_cannot_create_hardlinks_or_fifos_after_start_gate() {
+        if !strict_backend_available_for_tests() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("source"), "source").expect("source");
+        let output = run_process(
+            ProcessSpec::shell(
+                "post-gate IPC creation",
+                Shell::UnixSh,
+                "ln source alias >/dev/null 2>&1 || :; mkfifo fifo >/dev/null 2>&1 || :",
+                temp.path(),
+                128,
+            )
+            .with_timeout(Some(Duration::from_secs(2))),
+        )
+        .expect("run post-gate creation attempts");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(output.safety_evidence_verified());
+        assert!(!temp.path().join("alias").exists());
+        assert!(!temp.path().join("fifo").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_target_cannot_create_network_or_sysv_ipc_endpoints() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("all-blocked");
+        let python = trusted_system_executable(
+            "python3",
+            &[
+                "/run/current-system/sw/bin/python3",
+                "/usr/bin/python3",
+                "/bin/python3",
+            ],
+        )
+        .expect("trusted python3");
+        let probe = r#"
+import ctypes
+import errno
+import pathlib
+import socket
+import sys
+
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+except OSError as error:
+    if error.errno != errno.EPERM:
+        raise
+else:
+    raise SystemExit("IPv4 socket creation unexpectedly succeeded")
+
+libc = ctypes.CDLL(None, use_errno=True)
+probes = [
+    ("shmget", (0, 4096, 0o600), libc.shmctl),
+    ("msgget", (0, 0o600), libc.msgctl),
+    ("semget", (0, 1, 0o600), libc.semctl),
+]
+for name, arguments, cleanup in probes:
+    ctypes.set_errno(0)
+    identifier = getattr(libc, name)(*arguments)
+    error = ctypes.get_errno()
+    if identifier != -1:
+        cleanup(identifier, 0, 0)
+        raise SystemExit(f"{name} unexpectedly succeeded")
+    if error != errno.EPERM:
+        raise OSError(error, f"{name} returned an unexpected error")
+
+pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
+"#;
+        let result = run_process(
+            ProcessSpec::direct(
+                "network and SysV IPC denial probe",
+                python,
+                vec![
+                    OsString::from("-c"),
+                    OsString::from(probe),
+                    marker.as_os_str().to_os_string(),
+                ],
+                temp.path(),
+                4096,
+            )
+            .with_timeout(Some(Duration::from_secs(3))),
+        );
+
+        match result {
+            Ok(output) => {
+                assert!(
+                    output.status.is_some_and(|status| status.success()),
+                    "denial probe failed unexpectedly: {output:?}"
+                );
+                assert!(output.safety_evidence_verified());
+                assert!(marker.exists());
+            }
+            Err(error) if is_verified_backend_unavailable(&error) => {
+                assert!(!marker.exists());
+                assert_current_runner_has_no_systemd_residue();
+            }
+            Err(error) => panic!("unexpected denial probe failure: {error:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn required_containment_kills_setsid_delayed_mutation_with_closed_stdio() {
+        if !strict_backend_available_for_tests() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("escaped-delayed-mutation");
         let pid_file = temp.path().join("escaped-delayed.pid");
@@ -4641,7 +7312,7 @@ mod tests {
         .expect("run setsid delayed mutation");
 
         assert!(output.status.is_some_and(|status| status.success()));
-        assert!(output.containment.is_verified_empty());
+        assert!(output.process_tree.is_verified_empty());
         thread::sleep(Duration::from_millis(400));
         assert!(!marker.exists());
     }
@@ -4722,8 +7393,12 @@ mod tests {
                 128,
             ))
             .expect("run with ambient TMPDIR");
-            assert!(output.containment.is_verified_empty());
+            assert!(output.process_tree.is_verified_empty());
             assert_eq!(fs::read_dir(&ambient).expect("ambient entries").count(), 0);
+            return;
+        }
+
+        if !strict_backend_available_for_tests() {
             return;
         }
 
@@ -4769,6 +7444,10 @@ mod tests {
                 .with_timeout(Some(Duration::from_secs(10))),
             );
             panic!("launcher death child unexpectedly returned");
+        }
+
+        if !strict_backend_available_for_tests() {
+            return;
         }
 
         for case in ["before-spawn", "after-spawn"] {
@@ -4846,6 +7525,10 @@ mod tests {
                 .with_timeout(Some(Duration::from_secs(10))),
             );
             panic!("published environment death child unexpectedly returned");
+        }
+
+        if !strict_backend_available_for_tests() {
+            return;
         }
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4929,12 +7612,15 @@ mod tests {
             .with_timeout(Some(Duration::from_secs(2))),
         )
         .expect("slot reusable after published environment owner death");
-        assert!(next.containment.is_verified_empty());
+        assert!(next.process_tree.is_verified_empty());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn target_environment_cannot_overwrite_guardian_gate_state() {
+        if !strict_backend_available_for_tests() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let preloaded_start = temp.path().join("preloaded-start");
         let bogus_ready = temp.path().join("bogus-ready");
@@ -4965,7 +7651,7 @@ mod tests {
         .expect("run guardian collision environment");
 
         assert!(output.status.is_some_and(|status| status.success()));
-        assert!(output.containment.is_verified_empty());
+        assert!(output.process_tree.is_verified_empty());
         assert!(output
             .stdout
             .summarize_chars(1024)
@@ -4994,6 +7680,10 @@ mod tests {
                 .with_timeout(Some(Duration::from_secs(10))),
             );
             panic!("pre-gate guardian child unexpectedly returned");
+        }
+
+        if !strict_backend_available_for_tests() {
+            return;
         }
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5051,7 +7741,7 @@ mod tests {
         )
         .expect("kernel released the pre-gate aborted runner's slot lock");
         assert!(next.status.is_some_and(|status| status.success()));
-        assert!(next.containment.is_verified_empty());
+        assert!(next.process_tree.is_verified_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -5085,6 +7775,10 @@ mod tests {
                 .with_timeout(Some(Duration::from_secs(35))),
             );
             panic!("guardian child unexpectedly returned before its runner was aborted");
+        }
+
+        if !strict_backend_available_for_tests() {
+            return;
         }
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5157,7 +7851,63 @@ mod tests {
         )
         .expect("kernel released the aborted runner's slot lock");
         assert!(next.status.is_some_and(|status| status.success()));
-        assert!(next.containment.is_verified_empty());
+        assert!(next.process_tree.is_verified_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn strict_backend_available_for_tests() -> bool {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let temp = tempfile::tempdir().expect("strict backend probe tempdir");
+            let marker = temp.path().join("target-ran");
+            match run_process(
+                ProcessSpec::shell(
+                    "cached strict backend capability probe",
+                    Shell::UnixSh,
+                    format!("touch '{}'", marker.display()),
+                    temp.path(),
+                    128,
+                )
+                .with_timeout(Some(Duration::from_secs(2))),
+            ) {
+                Ok(output) => {
+                    assert!(output.safety_evidence_verified());
+                    assert!(marker.exists());
+                    true
+                }
+                Err(error) if is_verified_backend_unavailable(&error) => {
+                    assert!(!marker.exists());
+                    assert_current_runner_has_no_systemd_residue();
+                    false
+                }
+                Err(error) => panic!("unexpected strict backend capability failure: {error:?}"),
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
+        matches!(error, ProcessRunError::ProcessOwnership { .. })
+            && error
+                .to_string()
+                .contains("inaccessible path remained visible")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_current_runner_has_no_systemd_residue() {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let residue = systemd_runner_residue(std::process::id());
+            if residue.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "strict backend refusal left containment residue: {}",
+                residue.join("; ")
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5289,6 +8039,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn required_containment_kills_setsid_pipe_and_stdin_holders() {
+        if !strict_backend_available_for_tests() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let escaped_pid_path = temp.path().join("escaped.pid");
         let command = format!(
@@ -5317,7 +8070,7 @@ mod tests {
         assert!(output.status.is_some_and(|status| status.success()));
         assert!(!output.timed_out);
         assert_eq!(output.process_error, None);
-        assert!(output.containment.is_verified_empty());
+        assert!(output.process_tree.is_verified_empty());
         let escaped_pid = libc::pid_t::try_from(escaped_pid).expect("pid_t escaped pid");
         // SAFETY: signal 0 probes existence without delivering a signal.
         assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, -1);
@@ -5342,6 +8095,7 @@ mod tests {
             temp.path(),
             1024,
         )
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_environment(EnvironmentMode::ClearAndSet(environment))
         .with_stdin(StdinMode::Bytes(b"payload\n".to_vec()))
         .with_timeout(Some(Duration::from_secs(1)));
@@ -5489,7 +8243,7 @@ mod tests {
 
         let error = run_process(spec).expect_err("hard-linked tees must be rejected");
 
-        assert!(matches!(error, ProcessRunError::TeeConflict { .. }));
+        assert!(matches!(error, ProcessRunError::OpenTee { .. }));
         assert_eq!(
             std::fs::read_to_string(&stdout_path).expect("read preserved tee"),
             "preserve me"
@@ -5673,6 +8427,7 @@ mod tests {
                     &root,
                     128,
                 )
+                .with_containment(ContainmentPolicy::TrustedBestEffort)
                 .with_stdout(StreamCapture::bounded(128).tee_to(&stdout_path))
                 .with_stderr(StreamCapture::bounded(128).tee_to(&stderr_path))
                 .with_timeout(Some(Duration::from_secs(3))),
@@ -5768,8 +8523,15 @@ mod tests {
         let moved = temp.path().join("original-inode.log");
         fs::write(&path, "original contents").expect("seed tee");
         let capture = StreamCapture::bounded(128).tee_to(&path);
-        let transaction = prepare_tees("path swap", &capture, &StreamCapture::bounded(128))
-            .expect("prepare tee transaction");
+        let transaction = prepare_tees(
+            "path swap",
+            &capture,
+            &StreamCapture::bounded(128),
+            false,
+            None,
+            "test",
+        )
+        .expect("prepare tee transaction");
         let helper_pid = transaction
             .stdout
             .as_ref()
@@ -5811,8 +8573,15 @@ mod tests {
         let path = temp.path().join("tee.log");
         let moved = temp.path().join("opened-inode.log");
         let capture = StreamCapture::bounded(128).tee_to(&path);
-        let transaction = prepare_tees("created path swap", &capture, &StreamCapture::bounded(128))
-            .expect("prepare new tee transaction");
+        let transaction = prepare_tees(
+            "created path swap",
+            &capture,
+            &StreamCapture::bounded(128),
+            false,
+            None,
+            "test",
+        )
+        .expect("prepare new tee transaction");
         let helper_pid = transaction
             .stdout
             .as_ref()
@@ -5913,9 +8682,14 @@ mod tests {
         )
         .with_stdin(StdinMode::Null)
         .with_containment(ContainmentPolicy::TrustedBestEffort);
-        let mut prepared_tree =
-            PreparedProcessTree::prepare(spec.containment, "evidence child", "sh", None)
-                .expect("prepare evidence containment");
+        let mut prepared_tree = PreparedProcessTree::prepare(
+            spec.containment,
+            &spec.side_effects,
+            "evidence child",
+            "sh",
+            None,
+        )
+        .expect("prepare evidence containment");
         let mut command = prepared_tree
             .build_command(&spec)
             .expect("build evidence child");
@@ -6045,10 +8819,10 @@ mod tests {
         )
         .expect("run trusted compatibility command");
         assert_eq!(
-            output.containment,
+            output.process_tree,
             ContainmentEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
         );
-        assert!(!output.containment.is_verified_empty());
+        assert!(!output.process_tree.is_verified_empty());
     }
 
     #[test]

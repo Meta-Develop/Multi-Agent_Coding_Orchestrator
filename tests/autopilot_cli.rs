@@ -107,13 +107,13 @@ fn autopilot_plan_proposes_paths_from_plain_and_empty_tasks() -> Result<()> {
 }
 
 #[test]
-fn fake_autopilot_run_creates_durable_reports() -> Result<()> {
+fn fake_autopilot_run_creates_durable_nonpublishable_reports() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("task.md");
     write_file(&task_path, "Update the README through fake autopilot.\n")?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&task_path)?,
@@ -124,7 +124,8 @@ fn fake_autopilot_run_creates_durable_reports() -> Result<()> {
         "--json",
     ])?;
 
-    assert_eq!(report["success"], true);
+    assert_eq!(report["success"], false);
+    assert_eq!(report["status"], "failed");
     assert_eq!(report["attempt_count"], 1);
     let run_dir = repo_path.join(".maco/autopilot/runs/durable");
     for artifact in [
@@ -157,9 +158,9 @@ fn fake_autopilot_run_creates_durable_reports() -> Result<()> {
         "--json",
     ])?;
     assert_eq!(status["artifacts"]["final_report"], true);
-    assert_eq!(status["final_report"]["success"], true);
+    assert_eq!(status["final_report"]["success"], false);
 
-    let collected = run_success_json(&[
+    let collected = run_failure_json(&[
         "autopilot",
         "collect",
         "durable",
@@ -168,7 +169,7 @@ fn fake_autopilot_run_creates_durable_reports() -> Result<()> {
         "--json",
     ])?;
     assert_eq!(collected["run_id"], "durable");
-    assert_eq!(collected["success"], true);
+    assert_eq!(collected["success"], false);
 
     Ok(())
 }
@@ -183,7 +184,7 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
         "Update the README through generated autopilot.\n",
     )?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&task_path)?,
@@ -208,8 +209,8 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
         "--json",
     ])?;
     assert_eq!(latest["run"]["run_id"], run_id);
-    assert_eq!(latest["run"]["final_report_status"], "succeeded");
-    assert_eq!(latest["run"]["final_report_success"], true);
+    assert_eq!(latest["run"]["final_report_status"], "failed");
+    assert_eq!(latest["run"]["final_report_success"], false);
 
     let refused = run_failure_json(&[
         "autopilot",
@@ -266,7 +267,8 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
 }
 
 #[test]
-fn fake_autopilot_run_ignores_local_runtime_state_without_gitignore_entry() -> Result<()> {
+fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitignore_entry(
+) -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
     let readme_before = fs::read_to_string(repo_path.join("README.md")).context("read readme")?;
@@ -277,7 +279,7 @@ fn fake_autopilot_run_ignores_local_runtime_state_without_gitignore_entry() -> R
         "Run fake autopilot when runtime files are not ignored.\n",
     )?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&task_path)?,
@@ -288,8 +290,9 @@ fn fake_autopilot_run_ignores_local_runtime_state_without_gitignore_entry() -> R
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["success"], true);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["success"], false);
+    assert_eq!(report["safety"]["refused"], false);
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         readme_before
@@ -303,7 +306,7 @@ fn fake_autopilot_run_ignores_local_runtime_state_without_gitignore_entry() -> R
 }
 
 #[test]
-fn successful_fake_supervise_pr_review_flow_is_local_only() -> Result<()> {
+fn fake_supervise_flow_is_nonpublishable_and_stops_before_pr_review() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -317,7 +320,7 @@ fn successful_fake_supervise_pr_review_flow_is_local_only() -> Result<()> {
         }"#,
     )?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&plan_path)?,
@@ -328,18 +331,16 @@ fn successful_fake_supervise_pr_review_flow_is_local_only() -> Result<()> {
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "succeeded");
-    assert_eq!(report["validation"]["status"], "passed");
-    assert_eq!(report["pr"]["status"], "published");
-    assert_eq!(report["pr"]["forge"], "fake");
-    assert_eq!(report["pr"]["created"], true);
-    assert_eq!(report["pr"]["pushed"], false);
-    assert_eq!(report["review"]["status"], "passed");
-    assert_eq!(
-        report["review"]["reviewer"]["reviewer_id"],
-        "autopilot-fake-reviewer"
-    );
-    assert_eq!(report["review"]["ci_reaction_supported"], false);
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["validation"]["status"], "skipped");
+    assert_eq!(report["pr"], Value::Null);
+    assert_eq!(report["review"], Value::Null);
+    let supervisor: Value = serde_json::from_str(&fs::read_to_string(
+        repo_path.join(".maco/autopilot/runs/local-flow/supervisor-report.json"),
+    )?)?;
+    assert_eq!(supervisor["runtime"], "fake");
+    assert_eq!(supervisor["success"], true);
+    assert_eq!(supervisor["publishable"], false);
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         "# Smoke\n"
@@ -349,7 +350,7 @@ fn successful_fake_supervise_pr_review_flow_is_local_only() -> Result<()> {
 }
 
 #[test]
-fn blocking_fake_review_triggers_one_repair_attempt() -> Result<()> {
+fn fake_supervisor_stops_before_blocking_review_or_repair() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("blocking-review.json");
@@ -373,7 +374,7 @@ fn blocking_fake_review_triggers_one_repair_attempt() -> Result<()> {
         }"#,
     )?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&plan_path)?,
@@ -384,21 +385,17 @@ fn blocking_fake_review_triggers_one_repair_attempt() -> Result<()> {
         "--json",
     ])?;
 
-    assert_eq!(report["success"], true);
-    assert_eq!(report["attempt_count"], 2);
-    assert_eq!(report["repair_attempts_used"], 1);
-    assert_eq!(report["attempts"][0]["blocking_findings"], 1);
-    assert_eq!(
-        report["attempts"][0]["repair_reason"],
-        "review blocking findings: first attempt must be repaired"
-    );
-    assert_eq!(report["attempts"][1]["review_status"], "passed");
+    assert_eq!(report["success"], false);
+    assert_eq!(report["attempt_count"], 1);
+    assert_eq!(report["repair_attempts_used"], 0);
+    assert_eq!(report["attempts"][0]["blocking_findings"], 0);
+    assert_eq!(report["attempts"][0]["review_status"], Value::Null);
 
     Ok(())
 }
 
 #[test]
-fn max_repair_attempts_stop_after_repeated_validation_failure() -> Result<()> {
+fn fake_supervisor_stops_before_validation_repair_loop() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("validation-fails.json");
@@ -428,9 +425,9 @@ fn max_repair_attempts_stop_after_repeated_validation_failure() -> Result<()> {
 
     assert_eq!(report["success"], false);
     assert_eq!(report["status"], "failed");
-    assert_eq!(report["attempt_count"], 2);
-    assert_eq!(report["repair_attempts_used"], 1);
-    assert_eq!(report["validation"]["status"], "failed");
+    assert_eq!(report["attempt_count"], 1);
+    assert_eq!(report["repair_attempts_used"], 0);
+    assert_eq!(report["validation"]["status"], "skipped");
     assert_eq!(report["pr"], Value::Null);
     assert_eq!(report["auto_merge_performed"], false);
 
@@ -528,7 +525,7 @@ fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
 }
 
 #[test]
-fn non_overlapping_locks_do_not_refuse_autopilot() -> Result<()> {
+fn non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     run_success_json(&[
@@ -558,7 +555,7 @@ fn non_overlapping_locks_do_not_refuse_autopilot() -> Result<()> {
 
     let task_path = temp.path().join("readme-task.md");
     write_file(&task_path, "Update README.md through fake autopilot.\n")?;
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&task_path)?,
@@ -569,7 +566,7 @@ fn non_overlapping_locks_do_not_refuse_autopilot() -> Result<()> {
         "--json",
     ])?;
 
-    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["status"], "failed");
     assert_eq!(report["safety"]["refused"], false);
     assert_eq!(
         report["plan"]["assigned_paths"],
@@ -594,7 +591,7 @@ fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
         }"#,
     )?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&plan_path)?,
@@ -610,7 +607,7 @@ fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
     assert!(report["next_action"]
         .as_str()
         .context("next action")?
-        .contains("never auto-merges"));
+        .contains("trusted Codex runtime"));
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         "# Smoke\n"
@@ -626,7 +623,7 @@ fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
     let task_path = temp.path().join("task.md");
     write_file(&task_path, "Check public shape.\n")?;
 
-    let report = run_success_json(&[
+    let report = run_failure_json(&[
         "autopilot",
         "run",
         path_str(&task_path)?,
@@ -645,9 +642,8 @@ fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
     );
     assert_eq!(report["reports_created"]["final_report"], true);
     assert_eq!(report["plan"]["forge_mode"], "fake");
-    assert_eq!(report["pr"]["readiness"], "safe");
-    assert!(report["pr"].get("preview").is_none());
-    assert!(report["pr"].get("preview_path").is_none());
+    assert_eq!(report["status"], "failed");
+    assert_eq!(report["pr"], Value::Null);
     assert_eq!(report["ci_reaction_supported"], false);
     assert_eq!(report["check_status"]["state"], "not_supported");
     let serialized = serde_json::to_string(&report).context("serialize report")?;

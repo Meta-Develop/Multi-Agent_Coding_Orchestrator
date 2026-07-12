@@ -1,18 +1,33 @@
 use crate::process_runner::{
-    run_process, CapturedBytes, ContainmentEvidence, EnvironmentMode, ProcessRunError, ProcessSpec,
-    StdinMode, StreamCapture,
+    read_bounded_regular_file_nofollow, run_process, CapturedBytes, EnvironmentMode,
+    ExternalCodexProfile, ProcessRunError, ProcessSpec, ProcessTreeEvidence,
+    SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode, StreamCapture,
+    StrictOfflineWorkspaceProfile, WorkspaceAccess,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env, fs,
+    fs::{File, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
+const OUTPUT_TEE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
+const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalExecutionRuntime {
+    Verified,
+    #[cfg(test)]
+    NonpublishableSimulation,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAgentCommand {
@@ -24,9 +39,8 @@ pub struct ExternalAgentCommand {
     pub output_last_message: PathBuf,
     pub output_schema: Option<PathBuf>,
     pub timeout: Duration,
-    pub env_allowlist: Vec<String>,
-    pub sandbox_mode: String,
-    pub approval_mode: Option<String>,
+    pub workspace_access: WorkspaceAccess,
+    pub hidden_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +48,24 @@ pub enum ExternalAgentInvocation {
     CodexSupervisor,
     CodexConsultant,
     ClaudeConsultant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalProgramTrust {
+    TrustedSystemCodex,
+    ExplicitCustom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CodexPermissionEvidence {
+    pub codex_version: String,
+    pub minimum_version: String,
+    pub permission_profile: String,
+    pub workspace_access: WorkspaceAccess,
+    pub network_enabled: bool,
+    pub argv_digest: String,
+    pub executable_identity: String,
 }
 
 impl ExternalAgentCommand {
@@ -54,9 +86,8 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             timeout,
-            env_allowlist: default_env_allowlist(),
-            sandbox_mode: "danger-full-access".to_string(),
-            approval_mode: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            hidden_roots: Vec::new(),
         }
     }
 
@@ -77,9 +108,8 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             timeout,
-            env_allowlist: default_env_allowlist(),
-            sandbox_mode: "read-only".to_string(),
-            approval_mode: None,
+            workspace_access: WorkspaceAccess::ReadOnly,
+            hidden_roots: Vec::new(),
         }
     }
 
@@ -100,10 +130,19 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             timeout,
-            env_allowlist: default_env_allowlist(),
-            sandbox_mode: "read-only".to_string(),
-            approval_mode: None,
+            workspace_access: WorkspaceAccess::ReadOnly,
+            hidden_roots: Vec::new(),
         }
+    }
+
+    pub fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.hidden_roots.push(root.into());
+        self
+    }
+
+    pub fn with_workspace_access(mut self, access: WorkspaceAccess) -> Self {
+        self.workspace_access = access;
+        self
     }
 }
 
@@ -116,22 +155,39 @@ pub struct ExternalAgentRun {
     pub duration_ms: u64,
     pub timed_out: bool,
     /// Present only after the shared runner starts and closes the owned execution boundary.
-    /// [`ExternalAgentRun::succeeded`] accepts only verified-empty evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub containment: Option<ContainmentEvidence>,
+    pub process_tree: Option<ProcessTreeEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_effects: Option<SideEffectConfinementEvidence>,
+    pub publishable: bool,
+    pub program_trust: ExternalProgramTrust,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_permissions: Option<CodexPermissionEvidence>,
     pub stdout: CapturedOutput,
     pub stderr: CapturedOutput,
     pub error: Option<String>,
 }
 
 impl ExternalAgentRun {
-    pub fn succeeded(&self) -> bool {
+    pub fn safely_executed(&self) -> bool {
         self.exit_code == Some(0)
             && !self.timed_out
             && self.error.is_none()
             && self
-                .containment
-                .is_some_and(ContainmentEvidence::is_verified_empty)
+                .process_tree
+                .is_some_and(ProcessTreeEvidence::is_verified_empty)
+            && self
+                .side_effects
+                .is_some_and(SideEffectConfinementEvidence::is_verified)
+            && self.codex_permissions.is_some()
+    }
+
+    pub fn succeeded(&self) -> bool {
+        self.safely_executed() && self.publishable
+    }
+
+    pub(crate) fn simulation_succeeded(&self) -> bool {
+        self.exit_code == Some(0) && !self.timed_out && self.error.is_none() && !self.publishable
     }
 }
 
@@ -141,45 +197,132 @@ pub struct CapturedOutput {
     pub truncated: bool,
 }
 
-pub fn default_env_allowlist() -> Vec<String> {
-    [
-        "HOME", "PATH", "USER", "USERNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "RUST_LOG",
-    ]
-    .into_iter()
-    .map(ToOwned::to_owned)
-    .collect()
+pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
+    run_external_agent_runtime(spec, ExternalExecutionRuntime::Verified)
 }
 
-pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
+#[cfg(test)]
+pub(crate) fn run_external_agent_nonpublishable_simulation(
+    spec: &ExternalAgentCommand,
+) -> ExternalAgentRun {
+    run_external_agent_runtime(spec, ExternalExecutionRuntime::NonpublishableSimulation)
+}
+
+fn run_external_agent_runtime(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> ExternalAgentRun {
     let started = Instant::now();
+    let program_trust = external_program_trust(spec);
+    let resolved_program = match resolve_external_program(&spec.program, &spec.cwd) {
+        Ok(program) => program,
+        Err(error) => {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                format!(
+                    "failed to resolve external agent executable {}: {error}",
+                    spec.program.display()
+                ),
+            );
+        }
+    };
+    let program_identity = match external_program_identity(&resolved_program) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&resolved_program, &[]),
+                false,
+                format!("failed to capture external executable identity: {error}"),
+            );
+        }
+    };
     let argv = command_argv(spec);
+    let argv_digest = match argv_digest(&argv) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&resolved_program, &argv),
+                false,
+                format!("failed to bind external-agent permission evidence to argv: {error}"),
+            );
+        }
+    };
 
     let mut report = ExternalAgentRun {
-        command: command_display(&spec.program, &argv),
+        command: command_display(&resolved_program, &argv),
         cwd: spec.cwd.clone(),
         timeout_seconds: spec.timeout.as_secs(),
         exit_code: None,
         duration_ms: 0,
         timed_out: false,
-        containment: None,
+        process_tree: None,
+        side_effects: None,
+        publishable: false,
+        program_trust,
+        codex_permissions: None,
         stdout: CapturedOutput::default(),
         stderr: CapturedOutput::default(),
         error: None,
     };
 
-    if let Err(error) = ensure_parent_dir(&spec.json_log)
-        .and_then(|_| ensure_parent_dir(&spec.output_last_message))
+    let codex_version = if runtime == ExternalExecutionRuntime::Verified
+        && matches!(
+            spec.invocation,
+            ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+        ) {
+        let remaining = spec.timeout.saturating_sub(started.elapsed());
+        match preflight_codex_version(&resolved_program, &spec.cwd, remaining) {
+            Ok(version) => Some(version),
+            Err(failure) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                report.timed_out = failure.timed_out;
+                report.error = Some(failure.message);
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(error) = ensure_existing_output_parent(&spec.json_log)
+        .and_then(|_| ensure_existing_output_parent(&spec.output_last_message))
         .and_then(|_| match &spec.output_schema {
-            Some(path) => ensure_parent_dir(path),
+            Some(path) => ensure_safe_read_target(path),
             None => Ok(()),
         })
+        .and_then(|_| ensure_safe_read_target(&spec.prompt))
     {
         report.duration_ms = duration_millis(started.elapsed());
         report.error = Some(error.to_string());
         return report;
     }
 
-    let prompt = match fs::read(&spec.prompt) {
+    if spec.invocation == ExternalAgentInvocation::ClaudeConsultant {
+        report.duration_ms = duration_millis(started.elapsed());
+        report.error = Some(
+            "external Claude runtime is refused because no enforceable inner read-only permission contract is available"
+                .to_string(),
+        );
+        return report;
+    }
+
+    let output_reservation = match ReservedOutputFile::create(&spec.output_last_message) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            report.error = Some(format!("failed to reserve external-agent output: {error}"));
+            return report;
+        }
+    };
+
+    let prompt = match read_bounded_regular_file_nofollow(&spec.prompt, MAX_PROMPT_BYTES) {
         Ok(prompt) => prompt,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
@@ -191,26 +334,115 @@ pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
         }
     };
 
+    let codex_auth = if runtime == ExternalExecutionRuntime::Verified {
+        match ValidatedCodexAuth::load() {
+            Ok(auth) => auth,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                report.error = Some(format!("failed to validate Codex auth source: {error}"));
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+
+    let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified {
+        match external_side_effect_profile(spec, &resolved_program) {
+            Ok(profile) => Some(profile),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                report.error = Some(format!("failed to prepare external-agent sandbox: {error}"));
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) =
+        validate_external_program_identity(&resolved_program, spec.program == Path::new("codex"))
+            .and_then(|()| {
+                let current = external_program_identity(&resolved_program)?;
+                if current == program_identity {
+                    Ok(())
+                } else {
+                    bail!("external executable identity changed after version preflight")
+                }
+            })
+    {
+        report.duration_ms = duration_millis(started.elapsed());
+        report.error = Some(format!(
+            "external executable changed before target release: {error}"
+        ));
+        return report;
+    }
+    if let Some(auth) = &codex_auth {
+        if let Err(error) = auth.verify_source_unchanged() {
+            report.duration_ms = duration_millis(started.elapsed());
+            report.error = Some(format!(
+                "Codex auth source changed before unit setup: {error}"
+            ));
+            return report;
+        }
+    }
+
     let timeout = spec.timeout.saturating_sub(started.elapsed());
     let process_spec = ProcessSpec::direct(
         "external agent",
-        &spec.program,
+        &resolved_program,
         argv.clone(),
         &spec.cwd,
         OUTPUT_CAPTURE_LIMIT_BYTES,
     )
-    .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
-        &spec.env_allowlist,
-    )))
+    .with_environment(EnvironmentMode::ClearAndSet(allowed_env(spec.invocation)))
     .with_stdin(StdinMode::Bytes(prompt))
+    .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
-    .with_stdout(StreamCapture::bounded(OUTPUT_CAPTURE_LIMIT_BYTES).tee_to(&spec.json_log));
+    .with_stdout(
+        StreamCapture::bounded(OUTPUT_CAPTURE_LIMIT_BYTES)
+            .tee_to(&spec.json_log)
+            .with_tee_limit(OUTPUT_TEE_LIMIT_BYTES),
+    );
+    let process_spec = match runtime {
+        ExternalExecutionRuntime::Verified => {
+            let Some(side_effect_profile) = side_effect_profile else {
+                report.duration_ms = duration_millis(started.elapsed());
+                report.error = Some(
+                    "verified external-agent runtime did not prepare a side-effect profile"
+                        .to_string(),
+                );
+                return report;
+            };
+            let mut verified = process_spec
+                .with_private_runtime_home(true)
+                .with_private_runtime_codex_home(true)
+                .with_side_effect_confinement(side_effect_profile);
+            #[cfg(target_os = "linux")]
+            if let Some(auth) = codex_auth {
+                verified = verified.with_private_runtime_file("auth.json", auth.bytes);
+            }
+            verified
+        }
+        #[cfg(test)]
+        ExternalExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    };
 
     match run_process(process_spec) {
         Ok(output) => {
+            let safety_verified = output.safety_evidence_verified();
             report.exit_code = output.status.and_then(|status| status.code());
             report.timed_out = output.timed_out;
-            report.containment = Some(output.containment);
+            report.process_tree = Some(output.process_tree);
+            report.side_effects = Some(output.side_effects);
+            if runtime == ExternalExecutionRuntime::Verified
+                && safety_verified
+                && output.status.is_some_and(|status| status.success())
+            {
+                report.codex_permissions = codex_version.map(|version| {
+                    codex_permission_evidence(version, spec, &argv_digest, &program_identity)
+                });
+            }
             report.stdout = summarize_output(&output.stdout);
             report.stderr = summarize_output(&output.stderr);
             report.error = append_external_error(output.stdin_error, output.process_error);
@@ -229,6 +461,19 @@ pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
                 };
                 report.error = append_external_error(report.error.take(), Some(status_error));
             }
+            if let Err(error) = output_reservation.verify_unchanged() {
+                report.error = append_external_error(
+                    report.error.take(),
+                    Some(format!(
+                        "external-agent output reservation changed: {error}"
+                    )),
+                );
+            }
+            report.publishable = runtime == ExternalExecutionRuntime::Verified
+                && safety_verified
+                && report.program_trust == ExternalProgramTrust::TrustedSystemCodex
+                && report.codex_permissions.is_some()
+                && report.error.is_none();
         }
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
@@ -237,6 +482,564 @@ pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
     }
     report.duration_ms = duration_millis(started.elapsed());
     report
+}
+
+fn failed_external_run(
+    spec: &ExternalAgentCommand,
+    started: Instant,
+    command: Vec<String>,
+    timed_out: bool,
+    error: String,
+) -> ExternalAgentRun {
+    ExternalAgentRun {
+        command,
+        cwd: spec.cwd.clone(),
+        timeout_seconds: spec.timeout.as_secs(),
+        exit_code: None,
+        duration_ms: duration_millis(started.elapsed()),
+        timed_out,
+        process_tree: None,
+        side_effects: None,
+        publishable: false,
+        program_trust: external_program_trust(spec),
+        codex_permissions: None,
+        stdout: CapturedOutput::default(),
+        stderr: CapturedOutput::default(),
+        error: Some(error),
+    }
+}
+
+#[derive(Debug)]
+struct CodexPreflightFailure {
+    message: String,
+    timed_out: bool,
+}
+
+fn preflight_codex_version(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::result::Result<(u64, u64, u64), CodexPreflightFailure> {
+    let program_parent = program.parent().ok_or_else(|| CodexPreflightFailure {
+        message: format!(
+            "Codex executable has no parent directory: {}",
+            program.display()
+        ),
+        timed_out: false,
+    })?;
+    let mut environment = BTreeMap::new();
+    environment.insert("PATH".to_string(), TRUSTED_PATH.to_string());
+    let output = run_process(
+        ProcessSpec::direct("Codex version preflight", program, ["--version"], cwd, 4096)
+            .with_environment(EnvironmentMode::ClearAndSet(environment))
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_only(cwd)
+                    .with_visible_read_only_root(program_parent),
+            ))
+            .with_stdin(StdinMode::Null)
+            .with_timeout(Some(timeout)),
+    )
+    .map_err(|error| CodexPreflightFailure {
+        timed_out: matches!(error, ProcessRunError::SetupTimeout { .. }),
+        message: format!("Codex version preflight failed before target execution: {error}"),
+    })?;
+    if !output.safety_sensitive_succeeded() {
+        return Err(CodexPreflightFailure {
+            timed_out: output.timed_out,
+            message: format!(
+                "Codex version preflight was not safely verified: exit={:?}, process_tree={:?}, side_effects={:?}, error={:?}",
+                output.status.and_then(|status| status.code()),
+                output.process_tree,
+                output.side_effects,
+                output.process_error
+            ),
+        });
+    }
+    let stdout = output.stdout.summarize_chars(4096).text;
+    let stderr = output.stderr.summarize_chars(4096).text;
+    let version_text = format!("{stdout}\n{stderr}");
+    let version = parse_codex_version(&version_text).ok_or_else(|| CodexPreflightFailure {
+        message:
+            "Codex version preflight returned an unknown version; 0.138.0 or newer is required"
+                .to_string(),
+        timed_out: false,
+    })?;
+    if version < CODEX_MINIMUM_VERSION {
+        return Err(CodexPreflightFailure {
+            message: format!(
+                "Codex {}.{}.{} is too old; 0.138.0 or newer custom permissions are required",
+                version.0, version.1, version.2
+            ),
+            timed_out: false,
+        });
+    }
+    Ok(version)
+}
+
+fn parse_codex_version(text: &str) -> Option<(u64, u64, u64)> {
+    if !text.to_ascii_lowercase().contains("codex") {
+        return None;
+    }
+    text.split_whitespace().find_map(|word| {
+        let candidate =
+            word.trim_matches(|character: char| !character.is_ascii_digit() && character != '.');
+        let mut components = candidate.split('.');
+        let major = components.next()?.parse().ok()?;
+        let minor = components.next()?.parse().ok()?;
+        let patch = components.next()?.parse().ok()?;
+        components.next().is_none().then_some((major, minor, patch))
+    })
+}
+
+fn external_program_trust(spec: &ExternalAgentCommand) -> ExternalProgramTrust {
+    if spec.program == Path::new("codex") {
+        ExternalProgramTrust::TrustedSystemCodex
+    } else {
+        ExternalProgramTrust::ExplicitCustom
+    }
+}
+
+fn codex_permission_evidence(
+    version: (u64, u64, u64),
+    spec: &ExternalAgentCommand,
+    argv_digest: &str,
+    identity: &ExternalProgramIdentity,
+) -> CodexPermissionEvidence {
+    CodexPermissionEvidence {
+        codex_version: format!("{}.{}.{}", version.0, version.1, version.2),
+        minimum_version: format!(
+            "{}.{}.{}",
+            CODEX_MINIMUM_VERSION.0, CODEX_MINIMUM_VERSION.1, CODEX_MINIMUM_VERSION.2
+        ),
+        permission_profile: "maco_external_codex".to_string(),
+        workspace_access: spec.workspace_access,
+        network_enabled: false,
+        argv_digest: argv_digest.to_string(),
+        executable_identity: identity.display(),
+    }
+}
+
+fn argv_digest(argv: &[String]) -> Result<String> {
+    let mut bytes = Vec::new();
+    for argument in argv {
+        bytes.extend_from_slice(&(argument.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(argument.as_bytes());
+    }
+    git2::Oid::hash_object(git2::ObjectType::Blob, &bytes)
+        .map(|oid| oid.to_string())
+        .context("failed to hash external-agent argv")
+}
+
+fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
+    let require_root_owned = program == Path::new("codex");
+    let candidate = if require_root_owned {
+        [
+            "/run/current-system/sw/bin/codex",
+            "/usr/bin/codex",
+            "/bin/codex",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.exists())
+        .context("trusted Codex executable was not found at a fixed system path")?
+    } else if program.is_absolute() {
+        if fs::symlink_metadata(program)?.file_type().is_symlink() {
+            bail!(
+                "explicit external executable may not be a symlink: {}",
+                program.display()
+            );
+        }
+        program.to_path_buf()
+    } else {
+        bail!(
+            "explicit external executable must be an absolute path; ambient PATH and relative resolution are refused (requested {} from {})",
+            program.display(),
+            cwd.display()
+        );
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("failed to canonicalize {}", candidate.display()))?;
+    validate_external_program_identity(&canonical, require_root_owned)?;
+    Ok(canonical)
+}
+
+fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "external executable is not a non-symlink regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0 || mode & 0o022 != 0 {
+            bail!(
+                "external executable must be executable and not group/world-writable: {}",
+                path.display()
+            );
+        }
+        if require_root_owned && metadata.uid() != 0 {
+            bail!(
+                "default Codex executable must be root-owned: {}",
+                path.display()
+            );
+        }
+        for ancestor in path.ancestors().skip(1) {
+            let metadata = fs::symlink_metadata(ancestor).with_context(|| {
+                format!(
+                    "failed to inspect executable ancestor {}",
+                    ancestor.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "external executable ancestor may not be a symlink: {}",
+                    ancestor.display()
+                );
+            }
+            let mode = metadata.permissions().mode();
+            let root_sticky_directory =
+                metadata.uid() == 0 && metadata.is_dir() && mode & libc::S_ISVTX != 0;
+            if (require_root_owned || !root_sticky_directory) && mode & 0o022 != 0 {
+                bail!(
+                    "external executable ancestor is group/world-writable: {}",
+                    ancestor.display()
+                );
+            }
+            if require_root_owned && metadata.uid() != 0 {
+                bail!(
+                    "default Codex executable ancestor is not root-owned: {}",
+                    ancestor.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalProgramIdentity {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ExternalProgramIdentity {
+    fn display(&self) -> String {
+        let modified = self
+            .modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        #[cfg(unix)]
+        {
+            format!(
+                "dev={};ino={};len={};mtime_ns={modified}",
+                self.device, self.inode, self.length
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            format!("len={};mtime_ns={modified}", self.length)
+        }
+    }
+}
+
+fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect executable identity {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("external executable identity is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(ExternalProgramIdentity {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ExternalProgramIdentity {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn external_side_effect_profile(
+    spec: &ExternalAgentCommand,
+    program: &Path,
+) -> Result<SideEffectConfinementProfile> {
+    let program_parent = program
+        .parent()
+        .with_context(|| format!("executable has no parent: {}", program.display()))?;
+    let artifact_roots = vec![
+        required_parent(&spec.json_log)?,
+        required_parent(&spec.output_last_message)?,
+    ];
+    match spec.invocation {
+        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant => {
+            let mut profile = match spec.workspace_access {
+                WorkspaceAccess::ReadOnly => ExternalCodexProfile::read_only(&spec.cwd),
+                WorkspaceAccess::ReadWrite => ExternalCodexProfile::read_write(&spec.cwd),
+            };
+            let canonical_workspace = fs::canonicalize(&spec.cwd)?;
+            if !program.starts_with(&canonical_workspace) {
+                profile = profile.with_visible_read_only_root(program_parent);
+            }
+            if let Some(schema) = &spec.output_schema {
+                profile = profile.with_visible_read_only_file(schema);
+            }
+            for root in artifact_roots {
+                profile = profile.with_writable_artifact_root(root);
+            }
+            for root in &spec.hidden_roots {
+                profile = profile.with_hidden_root(root);
+            }
+            Ok(SideEffectConfinementProfile::ExternalCodex(profile))
+        }
+        ExternalAgentInvocation::ClaudeConsultant => {
+            bail!("Claude consultant has no enforceable fixed-network capability")
+        }
+    }
+}
+
+fn required_parent(path: &Path) -> Result<&Path> {
+    path.parent()
+        .with_context(|| format!("path must have a parent directory: {}", path.display()))
+}
+
+#[derive(Debug)]
+struct ValidatedCodexAuth {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ValidatedCodexAuth {
+    fn load() -> Result<Option<Self>> {
+        let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".codex"))
+        }) else {
+            return Ok(None);
+        };
+        Self::load_from_home(&home)
+    }
+
+    fn load_from_home(home: &Path) -> Result<Option<Self>> {
+        if !home.is_absolute() {
+            bail!("Codex auth home must be absolute: {}", home.display());
+        }
+        match fs::symlink_metadata(home) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                bail!(
+                    "Codex auth home must be a non-symlink directory: {}",
+                    home.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("failed to inspect Codex auth home"),
+        }
+        ensure_existing_directory_without_symlinks(home)?;
+        let path = home.join("auth.json");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("Codex auth file may not be a symlink: {}", path.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("failed to inspect Codex auth file"),
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("failed to open Codex auth file {}", path.display()))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_PROMPT_BYTES as u64 {
+            bail!(
+                "Codex auth file must be a bounded regular file: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: geteuid has no preconditions and does not access Rust memory.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.nlink() != 1
+            {
+                bail!(
+                    "Codex auth file must be current-user-owned, single-link, and mode 0600 or stricter: {}",
+                    path.display()
+                );
+            }
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.by_ref()
+            .take((MAX_PROMPT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_PROMPT_BYTES {
+            bail!("Codex auth file grew beyond the bounded read limit");
+        }
+        let after = file.metadata()?;
+        if after.len() != metadata.len() || after.modified().ok() != metadata.modified().ok() {
+            bail!("Codex auth file changed while it was read");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if after.dev() != metadata.dev() || after.ino() != metadata.ino() {
+                bail!("Codex auth file identity changed while it was read");
+            }
+            Ok(Some(Self {
+                path,
+                bytes,
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("verified Codex auth injection is not implemented on this platform")
+        }
+    }
+
+    fn verify_source_unchanged(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != self.length
+            || metadata.modified().ok() != self.modified
+        {
+            bail!("Codex auth file metadata changed");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // SAFETY: geteuid has no preconditions and does not access Rust memory.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.uid() != effective_uid
+                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.nlink() != 1
+                || metadata.dev() != self.device
+                || metadata.ino() != self.inode
+            {
+                bail!("Codex auth file ownership, links, mode, or inode changed");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ensure_safe_read_target(path: &Path) -> Result<()> {
+    ensure_existing_output_parent(path)?;
+    read_bounded_regular_file_nofollow(path, MAX_PROMPT_BYTES)
+        .map(|_| ())
+        .with_context(|| format!("unsafe external-agent input {}", path.display()))
+}
+
+#[derive(Debug)]
+struct ReservedOutputFile {
+    path: PathBuf,
+    _file: File,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ReservedOutputFile {
+    fn create(path: &Path) -> Result<Self> {
+        ensure_existing_output_parent(path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("output target must be newly created: {}", path.display()))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!(
+                "reserved output target is not a regular file: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.permissions().mode() & 0o777 != 0o600 {
+                bail!(
+                    "reserved output target is not owner-private: {}",
+                    path.display()
+                );
+            }
+            Ok(Self {
+                path: path.to_path_buf(),
+                _file: file,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                path: path.to_path_buf(),
+                _file: file,
+            })
+        }
+    }
+
+    fn verify_unchanged(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.path).with_context(|| {
+            format!("failed to inspect reserved output {}", self.path.display())
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("reserved output is no longer a non-symlink regular file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.dev() != self.device || metadata.ino() != self.inode {
+                bail!("reserved output inode was replaced");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn append_external_error(existing: Option<String>, next: Option<String>) -> Option<String> {
@@ -257,22 +1060,12 @@ fn command_argv(spec: &ExternalAgentCommand) -> Vec<String> {
 }
 
 fn codex_supervisor_argv(spec: &ExternalAgentCommand) -> Vec<String> {
-    let mut argv = vec![
-        "exec".to_string(),
-        "--cd".to_string(),
-        spec.cwd.display().to_string(),
-        "--sandbox".to_string(),
-        spec.sandbox_mode.clone(),
+    let mut argv = codex_hardened_argv(spec);
+    argv.extend([
         "--enable".to_string(),
         "goals".to_string(),
         "--enable".to_string(),
         "multi_agent".to_string(),
-    ];
-    if let Some(approval_mode) = &spec.approval_mode {
-        argv.push("-c".to_string());
-        argv.push(format!("approval_policy=\"{approval_mode}\""));
-    }
-    argv.extend([
         "--json".to_string(),
         "--output-last-message".to_string(),
         spec.output_last_message.display().to_string(),
@@ -286,16 +1079,63 @@ fn codex_supervisor_argv(spec: &ExternalAgentCommand) -> Vec<String> {
 }
 
 fn codex_consultant_argv(spec: &ExternalAgentCommand) -> Vec<String> {
-    vec![
-        "exec".to_string(),
-        "--sandbox".to_string(),
-        spec.sandbox_mode.clone(),
-        "--cd".to_string(),
-        spec.cwd.display().to_string(),
+    let mut argv = codex_hardened_argv(spec);
+    argv.extend([
         "--output-last-message".to_string(),
         spec.output_last_message.display().to_string(),
         "-".to_string(),
-    ]
+    ]);
+    argv
+}
+
+fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<String> {
+    let filesystem_permissions = match spec.workspace_access {
+        WorkspaceAccess::ReadOnly => {
+            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\"}"
+        }
+        WorkspaceAccess::ReadWrite => {
+            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"}}"
+        }
+    };
+    let mut argv = vec![
+        "-a".to_string(),
+        "never".to_string(),
+        "exec".to_string(),
+        "--strict-config".to_string(),
+        "--ignore-user-config".to_string(),
+        "--ignore-rules".to_string(),
+        "--ephemeral".to_string(),
+        "--cd".to_string(),
+        spec.cwd.display().to_string(),
+        "-c".to_string(),
+        "default_permissions=\"maco_external_codex\"".to_string(),
+        "-c".to_string(),
+        "permissions.maco_external_codex.network={enabled=false}".to_string(),
+        "-c".to_string(),
+        filesystem_permissions.to_string(),
+        "-c".to_string(),
+        "shell_environment_policy.inherit=\"none\"".to_string(),
+        "-c".to_string(),
+        "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}"
+            .to_string(),
+        "-c".to_string(),
+        "web_search=\"disabled\"".to_string(),
+    ];
+    for feature in [
+        "apps",
+        "plugins",
+        "hooks",
+        "in_app_browser",
+        "browser_use",
+        "browser_use_full_cdp_access",
+        "browser_use_external",
+        "computer_use",
+        "image_generation",
+    ] {
+        argv.push("--disable".to_string());
+        argv.push(feature.to_string());
+    }
+    argv
 }
 
 fn claude_consultant_argv() -> Vec<String> {
@@ -306,11 +1146,37 @@ fn claude_consultant_argv() -> Vec<String> {
     ]
 }
 
-fn allowed_env(allowlist: &[String]) -> BTreeMap<String, String> {
-    allowlist
-        .iter()
-        .filter_map(|key| env::var(key).ok().map(|value| (key.clone(), value)))
-        .collect()
+fn allowed_env(invocation: ExternalAgentInvocation) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+    ]);
+    if matches!(
+        invocation,
+        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+    ) {
+        for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            if let Ok(value) = env::var(key) {
+                if !value.is_empty() && !value.contains(['\n', '\r', '\0']) {
+                    environment.insert(key.to_string(), value);
+                }
+            }
+        }
+    }
+    environment.insert("PATH".to_string(), TRUSTED_PATH.to_string());
+    let trusted_ca = Path::new("/etc/ssl/certs/ca-bundle.crt");
+    if trusted_ca.is_file() {
+        environment.insert(
+            "SSL_CERT_FILE".to_string(),
+            trusted_ca.display().to_string(),
+        );
+        environment.insert(
+            "NIX_SSL_CERT_FILE".to_string(),
+            trusted_ca.display().to_string(),
+        );
+    }
+    environment
 }
 
 fn command_display(program: &Path, argv: &[String]) -> Vec<String> {
@@ -320,12 +1186,48 @@ fn command_display(program: &Path, argv: &[String]) -> Vec<String> {
     command
 }
 
-fn ensure_parent_dir(path: &Path) -> Result<()> {
+fn ensure_existing_output_parent(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!(
+            "external-agent artifact path must be absolute: {}",
+            path.display()
+        );
+    }
     let parent = path
         .parent()
         .with_context(|| format!("path must have a parent directory: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create directory {}", parent.display()))
+    ensure_existing_directory_without_symlinks(parent)
+}
+
+fn ensure_existing_directory_without_symlinks(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                current.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                bail!(
+                    "external-agent path may not contain '..': {}",
+                    path.display()
+                );
+            }
+            std::path::Component::Normal(component) => {
+                current.push(component);
+                let metadata = fs::symlink_metadata(&current).with_context(|| {
+                    format!("failed to inspect artifact ancestor {}", current.display())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!(
+                        "external-agent artifact ancestor is not a non-symlink directory: {}",
+                        current.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn summarize_output(output: &CapturedBytes) -> CapturedOutput {
@@ -348,7 +1250,7 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_runner::ContainmentBackend;
+    use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
 
     #[test]
     fn external_errors_are_composed_and_success_requires_verified_empty_containment() {
@@ -367,24 +1269,71 @@ mod tests {
             exit_code: Some(0),
             duration_ms: 1,
             timed_out: false,
-            containment: None,
+            process_tree: None,
+            side_effects: None,
+            publishable: false,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
             stdout: CapturedOutput::default(),
             stderr: CapturedOutput::default(),
             error: None,
         };
         assert!(!report.succeeded());
-        report.containment = Some(ContainmentEvidence::TrustedBestEffort(
+        report.process_tree = Some(ProcessTreeEvidence::TrustedBestEffort(
             ContainmentBackend::UnixProcessGroup,
         ));
         assert!(!report.succeeded());
-        report.containment = Some(ContainmentEvidence::Unverified(
+        report.process_tree = Some(ProcessTreeEvidence::Unverified(
             ContainmentBackend::SystemdUserService,
         ));
         assert!(!report.succeeded());
-        report.containment = Some(ContainmentEvidence::VerifiedEmpty(
+        report.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
             ContainmentBackend::SystemdUserService,
         ));
+        report.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCodex,
+        ));
+        report.publishable = true;
+        report.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+        report.codex_permissions = Some(CodexPermissionEvidence {
+            codex_version: "0.142.3".to_string(),
+            minimum_version: "0.138.0".to_string(),
+            permission_profile: "maco_external_codex".to_string(),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            network_enabled: false,
+            argv_digest: "digest".to_string(),
+            executable_identity: "identity".to_string(),
+        });
         assert!(report.succeeded());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_accepts_only_bounded_private_single_link_regular_file() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("codex-home");
+        fs::create_dir(&home)?;
+        let auth = home.join("auth.json");
+        fs::write(&auth, br#"{"token":"redacted"}"#)?;
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+        let validated =
+            ValidatedCodexAuth::load_from_home(&home)?.context("validated auth source")?;
+        assert_eq!(validated.bytes, br#"{"token":"redacted"}"#);
+        validated.verify_source_unchanged()?;
+
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644))?;
+        assert!(ValidatedCodexAuth::load_from_home(&home).is_err());
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+        let alias = home.join("auth-alias");
+        fs::hard_link(&auth, &alias)?;
+        assert!(ValidatedCodexAuth::load_from_home(&home).is_err());
+        fs::remove_file(&alias)?;
+        fs::remove_file(&auth)?;
+        std::os::unix::fs::symlink("missing-auth", &auth)?;
+        assert!(ValidatedCodexAuth::load_from_home(&home).is_err());
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -414,7 +1363,7 @@ mod tests {
 
         assert!(report.timed_out);
         assert_eq!(report.exit_code, None);
-        assert_eq!(report.containment, None);
+        assert_eq!(report.process_tree, None);
         assert!(report
             .error
             .as_deref()
@@ -465,7 +1414,7 @@ printf '\n{"type":"done"}\n'
             Duration::from_secs(3),
         );
 
-        let report = run_external_agent(&spec);
+        let report = run_external_agent_nonpublishable_simulation(&spec);
 
         assert_eq!(report.exit_code, Some(0));
         assert!(
@@ -473,7 +1422,8 @@ printf '\n{"type":"done"}\n'
             "large output child should exit before timeout: {report:?}"
         );
         assert_eq!(report.error, None);
-        assert!(report.succeeded());
+        assert!(report.simulation_succeeded());
+        assert!(!report.succeeded());
         assert!(report.stdout.truncated);
         assert!(report.stderr.truncated);
         assert!(report.stdout.text.len() >= OUTPUT_CHAR_LIMIT);
@@ -525,7 +1475,7 @@ exit 0
         );
 
         let started = Instant::now();
-        let report = run_external_agent(&spec);
+        let report = run_external_agent_nonpublishable_simulation(&spec);
 
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -537,6 +1487,8 @@ exit 0
         );
         assert_eq!(report.exit_code, Some(0));
         assert_eq!(report.error, None);
+        assert!(report.simulation_succeeded());
+        assert!(!report.succeeded());
         assert!(report.stdout.text.contains("parent exiting"));
         assert!(report.stdout.text.contains("descendant started"));
         assert!(report.stderr.text.contains("descendant stderr started"));

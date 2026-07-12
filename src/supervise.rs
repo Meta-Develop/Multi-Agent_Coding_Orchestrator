@@ -1,8 +1,14 @@
 use crate::{
     artifacts::{self, RunArtifactFamily},
-    external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
+    external_agent::{
+        run_external_agent, ExternalAgentCommand, ExternalAgentRun, ExternalProgramTrust,
+    },
     orchestrator::{RunId, SemanticCoordinationMode},
-    process_runner::ContainmentEvidence,
+    process_runner::{
+        read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
+        EnvironmentMode, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
+    },
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
@@ -17,12 +23,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     ffi::OsStr,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,6 +37,9 @@ const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
+const PRIMARY_INDEX_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SNAPSHOT_GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
@@ -50,7 +57,22 @@ pub struct SupervisorRunOptions {
     pub plan_file: PathBuf,
     pub run_id: RunId,
     pub codex_bin: PathBuf,
+    pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorRuntime {
+    #[default]
+    Codex,
+    Fake,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorExecutionRuntime {
+    Verified,
+    NonpublishableSimulation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -269,6 +291,9 @@ pub struct SupervisorFinalReport {
     pub plan_file: PathBuf,
     #[serde(serialize_with = "serialize_path")]
     pub run_dir: PathBuf,
+    #[serde(default)]
+    pub runtime: SupervisorRuntime,
+    pub publishable: bool,
     pub success: bool,
     pub accepted: bool,
     pub rejected: bool,
@@ -532,6 +557,8 @@ pub fn collect_supervisor_run(
         repo,
         plan_file: PathBuf::new(),
         run_dir,
+        runtime: SupervisorRuntime::Codex,
+        publishable: false,
         success: false,
         accepted: false,
         rejected: true,
@@ -675,12 +702,11 @@ Runtime hierarchy:
 - The user-root O2 or an autonomous O2 durable queue may launch bounded peer O2 supervisors through MACO/Codex CLI subprocess orchestration. Autonomous O2-to-O2 follow-up must go through durable queue state such as NEXT_O2_TASKS.tsv, not native SubAgent.
 
 Runtime boundary:
-- You were launched as a Codex CLI subprocess with this O1/O2 orchestration boundary:
-  - --sandbox danger-full-access
-  - --enable goals
-  - --enable multi_agent
-- Nested O2/O1 subprocess chains must preserve this boundary for orchestrator roles.
-- Do not use workspace-write for O2/O1 subprocess chains because nested Codex state DB access can collide, corrupt, or fail under workspace-write style restrictions.
+- MACO launched this Codex CLI with strict/ephemeral configuration, approval policy never, goals and multi-agent enabled, and the named maco_external_codex permission profile.
+- The inner permission profile grants only minimal reads plus writes in this assigned workspace root; model-generated network access, user config/rules, web search, plugins, apps, hooks, browser/computer use, and inherited shell environment are disabled.
+- An outer MACO systemd boundary separately verifies the exact workspace/artifact mounts, blocked host IPC sockets, resource limits, and empty owned cgroup before the result can be published.
+- Never launch a raw Codex subprocess or request danger-full-access. Any nested role must go through a MACO-approved runner and a least-privilege profile whose process-tree and side-effect evidence is verified.
+- If an approved nested runner/profile is unavailable, stop and report the blocked delegation instead of weakening this boundary.
 
 Required behavior:
 - First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
@@ -918,8 +944,9 @@ Your parent is MACO/O2. You are not an O1 child orchestrator, worker, researcher
 Do not launch further workers, delegate, mutate files, run mutating commands, claim paths, apply patches, or change Git state.
 
 Runtime boundary:
-- MACO requested the Codex CLI read-only sandbox for this subprocess with --sandbox read-only.
-- Stay read-only even if the local runtime cannot enforce stronger filesystem isolation.
+- MACO launched this Codex CLI with the read-only maco_external_codex permission profile, model-generated network disabled, and strict/ephemeral configuration.
+- An outer MACO systemd boundary independently verifies the exact read-only workspace mount, writable report/log destinations, blocked host IPC sockets, resource limits, and empty owned cgroup.
+- Never request danger-full-access or launch a raw nested Codex subprocess. Stay read-only and fail closed if either verified boundary is unavailable.
 - Return AuditorReport JSON as your final response. Codex CLI --output-last-message records that final response at the auditor report path.
 
 Evidence to review:
@@ -1062,18 +1089,31 @@ fn run_supervisor_plan(
     consultant: SupervisorConsultantPlan,
     options: SupervisorRunOptions,
 ) -> Result<SupervisorFinalReport> {
-    run_supervisor_plan_with_runner(plan, consultant, options, &mut run_external_agent)
+    let execution_runtime = match options.runtime {
+        SupervisorRuntime::Codex => SupervisorExecutionRuntime::Verified,
+        SupervisorRuntime::Fake => SupervisorExecutionRuntime::NonpublishableSimulation,
+    };
+    let mut external_runner = run_external_agent;
+    run_supervisor_plan_with_runner(
+        plan,
+        consultant,
+        options,
+        execution_runtime,
+        &mut external_runner,
+    )
 }
 
 fn run_supervisor_plan_with_runner(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
     options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
     external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 ) -> Result<SupervisorFinalReport> {
+    let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
     if !options.allow_dirty_primary {
-        ensure_clean_primary(&repo)?;
+        ensure_clean_primary(&repo, execution_runtime)?;
     }
 
     let run_dir = run_dir(&repo, &options.run_id);
@@ -1088,6 +1128,15 @@ fn run_supervisor_plan_with_runner(
     let mut command_records = Vec::new();
     let mut orchestrator_reports = Vec::new();
     let mut findings = Vec::new();
+    if runtime == SupervisorRuntime::Fake {
+        findings.push(Finding {
+            severity: FindingSeverity::Warning,
+            message:
+                "explicit fake supervisor runtime is simulation-only and cannot publish acceptance"
+                    .to_string(),
+            paths: Vec::new(),
+        });
+    }
     let mut primary_run_baseline = None;
     let mut external_containment_failed = false;
 
@@ -1101,7 +1150,7 @@ fn run_supervisor_plan_with_runner(
         write_worker_schema(&dirs.schemas.join("worker-report.schema.json"))?;
         write_auditor_schema(&dirs.schemas.join("auditor-report.schema.json"))?;
 
-        let baseline = primary_worktree_snapshot(&repo)?;
+        let baseline = primary_worktree_snapshot(&repo, execution_runtime)?;
         if let Some(error) = baseline.inspection_problem() {
             bail!(
                 "refusing to launch supervised work without a complete primary integrity snapshot: {error}"
@@ -1204,7 +1253,7 @@ fn run_supervisor_plan_with_runner(
                     )
                 })?;
 
-                let primary_before = primary_worktree_snapshot(&repo)?;
+                let primary_before = primary_worktree_snapshot(&repo, execution_runtime)?;
                 if let Some(error) = primary_before.inspection_problem() {
                     bail!("refusing to launch child without a complete primary integrity snapshot: {error}");
                 }
@@ -1217,10 +1266,18 @@ fn run_supervisor_plan_with_runner(
                     Duration::from_secs(plan.child_timeout_seconds),
                 );
                 command.output_schema = Some(schema_path.clone());
+                command = command.with_hidden_root(&repo);
 
-                let external_run = external_runner(&command);
-                let attempt_containment_verified =
-                    external_containment_verified_empty(external_run.containment);
+                let external_run = match runtime {
+                    SupervisorRuntime::Codex => external_runner(&command),
+                    SupervisorRuntime::Fake => deterministic_fake_child_run(
+                        &command,
+                        assignment,
+                        claim.token.get(),
+                        semantic_token,
+                    )?,
+                };
+                let attempt_containment_verified = external_safety_verified(&external_run, runtime);
                 if !attempt_containment_verified {
                     external_containment_failed = true;
                     findings.push(Finding {
@@ -1228,14 +1285,14 @@ fn run_supervisor_plan_with_runner(
                         message: format!(
                             "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
                             assignment.id,
-                            external_run.containment,
+                            (external_run.process_tree, external_run.side_effects),
                             attempt_artifacts.report_path.display()
                         ),
                         paths: vec![attempt_artifacts.report_path.clone()],
                     });
                 }
                 command_records.push(command_record_from_external(&external_run, &command));
-                let primary_after = primary_worktree_snapshot(&repo)?;
+                let primary_after = primary_worktree_snapshot(&repo, execution_runtime)?;
                 let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
                 let (mut attempt_report, report_shape_problems) = collect_child_report(
                     assignment,
@@ -1256,7 +1313,8 @@ fn run_supervisor_plan_with_runner(
                     mark_child_containment_violation(
                         assignment,
                         &attempt_artifacts.report_path,
-                        external_run.containment,
+                        external_run.process_tree,
+                        external_run.side_effects,
                         &mut attempt_report,
                     );
                     attempt_history.push(ChildAttemptHistory {
@@ -1344,17 +1402,23 @@ fn run_supervisor_plan_with_runner(
                     Duration::from_secs(plan.child_timeout_seconds),
                 );
                 auditor_command.output_schema = Some(auditor_schema_path);
-                auditor_command.sandbox_mode = "read-only".to_string();
+                auditor_command = auditor_command
+                    .with_workspace_access(WorkspaceAccess::ReadOnly)
+                    .with_hidden_root(&repo);
 
-                let primary_before_auditor = primary_worktree_snapshot(&repo)?;
+                let primary_before_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
                 if let Some(error) = primary_before_auditor.inspection_problem() {
                     bail!(
                         "refusing to launch parent review auditor without a complete primary integrity snapshot: {error}"
                     );
                 }
-                let auditor_run = external_runner(&auditor_command);
-                let auditor_containment_verified =
-                    external_containment_verified_empty(auditor_run.containment);
+                let auditor_run = match runtime {
+                    SupervisorRuntime::Codex => external_runner(&auditor_command),
+                    SupervisorRuntime::Fake => {
+                        deterministic_fake_auditor_run(&auditor_command, assignment, &child_report)?
+                    }
+                };
+                let auditor_containment_verified = external_safety_verified(&auditor_run, runtime);
                 if !auditor_containment_verified {
                     assignment_containment_verified = false;
                     external_containment_failed = true;
@@ -1363,7 +1427,7 @@ fn run_supervisor_plan_with_runner(
                         message: format!(
                             "external parent auditor process containment was not verified empty for '{}'; evidence: {:?}; report: {}",
                             auditor_id,
-                            auditor_run.containment,
+                            (auditor_run.process_tree, auditor_run.side_effects),
                             auditor_report_path.display()
                         ),
                         paths: vec![auditor_report_path.clone()],
@@ -1373,7 +1437,7 @@ fn run_supervisor_plan_with_runner(
                     command_record_from_external(&auditor_run, &auditor_command);
                 command_records.push(auditor_command_record.clone());
                 child_report.commands_run.push(auditor_command_record);
-                let primary_after_auditor = primary_worktree_snapshot(&repo)?;
+                let primary_after_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
                 let primary_auditor_changes =
                     primary_integrity_changes(&primary_before_auditor, &primary_after_auditor);
                 let mut auditor_report = collect_parent_auditor_report(
@@ -1442,7 +1506,7 @@ fn run_supervisor_plan_with_runner(
     let (released_semantic_intents, semantic_release_errors) =
         release_semantic_intents(&semantic_store, acquired_semantic_tokens);
     let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
-        Some(baseline) => match primary_worktree_snapshot(&repo) {
+        Some(baseline) => match primary_worktree_snapshot(&repo, execution_runtime) {
             Ok(final_snapshot) => {
                 if let Some(error) = final_snapshot.inspection_problem() {
                     findings.push(Finding {
@@ -1487,6 +1551,7 @@ fn run_supervisor_plan_with_runner(
         || final_primary_integrity_failed
         || orchestrator_reports.iter().any(report_failed);
     let success = !failed;
+    let publishable = success && runtime == SupervisorRuntime::Codex;
     let final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -1494,8 +1559,10 @@ fn run_supervisor_plan_with_runner(
         repo: repo.clone(),
         plan_file: options.plan_file,
         run_dir: run_dir.clone(),
+        runtime,
+        publishable,
         success,
-        accepted: success,
+        accepted: publishable,
         rejected: !success,
         status: if success {
             ReviewStatus::Succeeded
@@ -1548,7 +1615,10 @@ fn run_supervisor_plan_with_runner(
         release_errors,
         released_semantic_intents,
         semantic_release_errors,
-        remaining_risk: if success {
+        remaining_risk: if success && !publishable {
+            "fake supervisor simulation succeeded but is not publishable or acceptable as real model evidence"
+                .to_string()
+        } else if success {
             "no failed child orchestrator reports; worker changes remain isolated in child worktrees"
                 .to_string()
         } else if external_containment_failed {
@@ -1559,7 +1629,10 @@ fn run_supervisor_plan_with_runner(
         } else {
             "one or more child or worker reports failed, were rejected, or were missing".to_string()
         },
-        next_safe_action: if success {
+        next_safe_action: if success && !publishable {
+            "rerun with the trusted system Codex runtime before any real acceptance, merge, or publication"
+                .to_string()
+        } else if success {
             "review child worktree diffs before any separate merge preview or apply step"
                 .to_string()
         } else if external_containment_failed {
@@ -1827,7 +1900,8 @@ fn collect_child_report(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
-            if !external_run.succeeded() && report.status == ReviewStatus::Succeeded {
+            if !external_process_completed(external_run) && report.status == ReviewStatus::Succeeded
+            {
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
                 report.rejected = true;
@@ -1887,7 +1961,8 @@ fn collect_parent_auditor_report(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
-            if !external_run.succeeded() && report.status == ReviewStatus::Succeeded {
+            if !external_process_completed(external_run) && report.status == ReviewStatus::Succeeded
+            {
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
                 report.rejected = true;
@@ -2528,7 +2603,8 @@ fn validation_failed(result: &ValidationResult) -> bool {
 fn mark_child_containment_violation(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
-    evidence: Option<ContainmentEvidence>,
+    process_tree: Option<ProcessTreeEvidence>,
+    side_effects: Option<SideEffectConfinementEvidence>,
     report: &mut OrchestratorReviewReport,
 ) {
     report.status = ReviewStatus::Failed;
@@ -2537,8 +2613,8 @@ fn mark_child_containment_violation(
     report.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: format!(
-            "child orchestrator '{}' process containment was not verified empty; evidence: {evidence:?}",
-            assignment.id
+            "child orchestrator '{}' process safety was not verified; process_tree={process_tree:?}; side_effects={side_effects:?}",
+            assignment.id,
         ),
         paths: vec![report_path.to_path_buf()],
     });
@@ -2710,15 +2786,19 @@ impl PrimaryWorktreeSnapshot {
     }
 }
 
-fn primary_worktree_snapshot(repo_path: &Path) -> Result<PrimaryWorktreeSnapshot> {
+fn primary_worktree_snapshot(
+    repo_path: &Path,
+    runtime: SupervisorExecutionRuntime,
+) -> Result<PrimaryWorktreeSnapshot> {
     let mut visited_gitdirs = BTreeSet::new();
-    primary_worktree_snapshot_at_depth(repo_path, 0, &mut visited_gitdirs)
+    primary_worktree_snapshot_at_depth(repo_path, 0, &mut visited_gitdirs, runtime)
 }
 
 fn primary_worktree_snapshot_at_depth(
     repo_path: &Path,
     depth: usize,
     visited_gitdirs: &mut BTreeSet<PathBuf>,
+    runtime: SupervisorExecutionRuntime,
 ) -> Result<PrimaryWorktreeSnapshot> {
     if depth > MAX_NESTED_REPOSITORY_DEPTH {
         bail!(
@@ -2749,10 +2829,10 @@ fn primary_worktree_snapshot_at_depth(
             .context("primary integrity snapshot requires a non-bare repository")?
             .to_path_buf();
         let head = primary_head_snapshot(&repo)?;
-        let index_storage_before = primary_index_storage_snapshot(&repo)?;
-        let status = primary_status_snapshot(&workdir)?;
-        let index = primary_index_snapshot(&workdir)?;
-        let index_storage = primary_index_storage_snapshot(&repo)?;
+        let index_storage_before = primary_index_storage_snapshot(&repo, runtime)?;
+        let status = primary_status_snapshot(&workdir, runtime)?;
+        let index = primary_index_snapshot(&workdir, runtime)?;
+        let index_storage = primary_index_storage_snapshot(&repo, runtime)?;
         let inspection_error = (index_storage_before != index_storage).then(|| {
             "primary index storage changed while the Git CLI integrity snapshot was being captured"
                 .to_string()
@@ -2792,6 +2872,7 @@ fn primary_worktree_snapshot_at_depth(
                 sparse_directory_paths.contains(&path),
                 depth,
                 visited_gitdirs,
+                runtime,
             )
             .with_context(|| {
                 format!(
@@ -2836,10 +2917,14 @@ fn primary_head_snapshot(repo: &Repository) -> Result<PrimaryHeadSnapshot> {
     }
 }
 
-fn primary_status_snapshot(workdir: &Path) -> Result<BTreeMap<Vec<u8>, PrimaryStatusState>> {
+fn primary_status_snapshot(
+    workdir: &Path,
+    runtime: SupervisorExecutionRuntime,
+) -> Result<BTreeMap<Vec<u8>, PrimaryStatusState>> {
     let output = sanitized_git_output(
         workdir,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        runtime,
     )
     .context("failed to run Git CLI primary status snapshot")?;
     if !output.status.success() {
@@ -2890,9 +2975,14 @@ fn primary_status_snapshot(workdir: &Path) -> Result<BTreeMap<Vec<u8>, PrimarySt
 
 fn primary_index_snapshot(
     workdir: &Path,
+    runtime: SupervisorExecutionRuntime,
 ) -> Result<BTreeMap<PrimaryIndexEntryKey, PrimaryIndexEntryState>> {
-    let output = sanitized_git_output(workdir, &["ls-files", "--stage", "-v", "-z", "--sparse"])
-        .context("failed to run Git CLI primary index snapshot")?;
+    let output = sanitized_git_output(
+        workdir,
+        &["ls-files", "--stage", "-v", "-z", "--sparse"],
+        runtime,
+    )
+    .context("failed to run Git CLI primary index snapshot")?;
     if !output.status.success() {
         bail!(
             "Git CLI primary index snapshot failed: {}",
@@ -2954,9 +3044,12 @@ fn index_entry_requires_fingerprint(state: &PrimaryIndexEntryState) -> bool {
         || matches!(state.mode, GITLINK_MODE | SPARSE_DIRECTORY_MODE)
 }
 
-fn primary_index_storage_snapshot(repo: &Repository) -> Result<PrimaryIndexStorageSnapshot> {
+fn primary_index_storage_snapshot(
+    repo: &Repository,
+    runtime: SupervisorExecutionRuntime,
+) -> Result<PrimaryIndexStorageSnapshot> {
     let worktree_index = index_file_snapshot(&repo.path().join("index"))?;
-    let shared_index = shared_index_path(repo)?
+    let shared_index = shared_index_path(repo, runtime)?
         .map(|path| {
             let storage = index_file_snapshot(&path)?;
             if storage == IndexFileSnapshot::Missing {
@@ -2975,7 +3068,7 @@ fn primary_index_storage_snapshot(repo: &Repository) -> Result<PrimaryIndexStora
 }
 
 fn index_file_snapshot(path: &Path) -> Result<IndexFileSnapshot> {
-    let bytes = match fs::read(path) {
+    let bytes = match read_bounded_regular_file_nofollow(path, PRIMARY_INDEX_MAX_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(IndexFileSnapshot::Missing);
@@ -2992,13 +3085,17 @@ fn index_file_snapshot(path: &Path) -> Result<IndexFileSnapshot> {
     })
 }
 
-fn shared_index_path(repo: &Repository) -> Result<Option<PathBuf>> {
+fn shared_index_path(
+    repo: &Repository,
+    runtime: SupervisorExecutionRuntime,
+) -> Result<Option<PathBuf>> {
     let workdir = repo
         .workdir()
         .context("shared-index discovery requires a non-bare repository")?;
     let output = sanitized_git_output(
         workdir,
         &["rev-parse", "--path-format=absolute", "--shared-index-path"],
+        runtime,
     )
     .context("failed to inspect split-index dependency")?;
     if !output.status.success() {
@@ -3025,32 +3122,86 @@ fn shared_index_path(repo: &Repository) -> Result<Option<PathBuf>> {
     }))
 }
 
-fn sanitized_git_output(workdir: &Path, args: &[&str]) -> Result<std::process::Output> {
-    const SNAPSHOT_ENV_ALLOWLIST: &[&str] = &["PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC"];
-    let mut command = Command::new("git");
-    command
-        .env_clear()
-        .env("LC_ALL", "C")
-        .env("LANG", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", git_null_device())
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("--no-pager")
-        .arg("--no-optional-locks")
-        .arg("-c")
-        .arg("core.fsmonitor=false")
-        .arg("-c")
-        .arg("core.untrackedCache=false")
-        .arg("-C")
-        .arg(workdir)
-        .args(args);
-    for name in SNAPSHOT_ENV_ALLOWLIST {
-        if let Some(value) = env::var_os(name) {
-            command.env(name, value);
-        }
+fn sanitized_git_output(
+    workdir: &Path,
+    args: &[&str],
+    runtime: SupervisorExecutionRuntime,
+) -> Result<std::process::Output> {
+    let git = trusted_system_executable(
+        "git",
+        &["/run/current-system/sw/bin/git", "/usr/bin/git", "/bin/git"],
+    )?;
+    let environment = BTreeMap::from([
+        (
+            "PATH".to_string(),
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("LANG".to_string(), "C".to_string()),
+        ("LC_ALL".to_string(), "C".to_string()),
+        ("TERM".to_string(), "dumb".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_GLOBAL".to_string(),
+            git_null_device().to_string(),
+        ),
+        ("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+    ]);
+    let mut command_args = vec![
+        "--no-pager".to_string(),
+        "--no-optional-locks".to_string(),
+        "-c".to_string(),
+        "core.fsmonitor=false".to_string(),
+        "-c".to_string(),
+        "core.untrackedCache=false".to_string(),
+    ];
+    command_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    let process_spec = ProcessSpec::direct(
+        "supervisor Git snapshot",
+        git,
+        command_args,
+        workdir,
+        SNAPSHOT_GIT_CAPTURE_MAX_BYTES,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(environment))
+    .with_stdin(StdinMode::Null)
+    .with_timeout(Some(SNAPSHOT_GIT_TIMEOUT));
+    let output = run_process(match runtime {
+        SupervisorExecutionRuntime::Verified => process_spec
+            .with_private_runtime_home(true)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_only(workdir),
+            )),
+        SupervisorExecutionRuntime::NonpublishableSimulation => process_spec
+            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+    })?;
+    if output.timed_out
+        || output.process_error.is_some()
+        || output.stdin_error.is_some()
+        || (runtime == SupervisorExecutionRuntime::Verified && !output.safety_evidence_verified())
+    {
+        bail!(
+            "supervisor Git snapshot was not safely verified: process_tree={:?}; side_effects={:?}; process_error={:?}; stdin_error={:?}",
+            output.process_tree,
+            output.side_effects,
+            output.process_error,
+            output.stdin_error
+        );
     }
-    command.output().map_err(Into::into)
+    if output.stdout.is_truncated() || output.stderr.is_truncated() {
+        bail!(
+            "supervisor Git snapshot output exceeded the {} byte limit",
+            SNAPSHOT_GIT_CAPTURE_MAX_BYTES
+        );
+    }
+    let status = output
+        .status
+        .context("supervisor Git snapshot terminated without status")?;
+    Ok(std::process::Output {
+        status,
+        stdout: output.stdout.as_bytes().to_vec(),
+        stderr: output.stderr.as_bytes().to_vec(),
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -3069,6 +3220,7 @@ fn primary_path_state(
     fingerprint_directory_contents: bool,
     depth: usize,
     visited_gitdirs: &mut BTreeSet<PathBuf>,
+    runtime: SupervisorExecutionRuntime,
 ) -> Result<PrimaryPathState> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -3098,6 +3250,7 @@ fn primary_path_state(
                     path,
                     depth.saturating_add(1),
                     visited_gitdirs,
+                    runtime,
                 )?)),
                 Err(error) if error.code() == ErrorCode::NotFound => None,
                 Err(error) => {
@@ -3720,8 +3873,147 @@ impl ReportStatus for AuditorReport {
     }
 }
 
-fn external_containment_verified_empty(evidence: Option<ContainmentEvidence>) -> bool {
-    matches!(evidence, Some(ContainmentEvidence::VerifiedEmpty(_)))
+fn deterministic_fake_child_run(
+    command: &ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    claim_token: u64,
+    semantic_intent_token: Option<u64>,
+) -> Result<ExternalAgentRun> {
+    let worker_reports = assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| WorkerReport {
+            id: worker.id.clone(),
+            role: AgentRole::Worker,
+            assigned_paths: worker.assigned_paths.clone(),
+            semantic_symbols: worker.semantic_symbols.clone(),
+            semantic_modules: worker.semantic_modules.clone(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: vec![ValidationResult {
+                name: "deterministic fake worker validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: None,
+            }],
+            findings: Vec::new(),
+            no_further_delegation: Some(true),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "simulation-only evidence".to_string(),
+            next_safe_action: "rerun with the verified Codex runtime".to_string(),
+        })
+        .collect();
+    let report = OrchestratorReviewReport {
+        id: assignment.id.clone(),
+        role: AgentRole::ChildOrchestrator,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: Some(claim_token),
+        semantic_intent_token,
+        commands_run: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "deterministic fake child validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        worker_reports,
+        audit_reports: Vec::new(),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "simulation-only evidence".to_string(),
+        next_safe_action: "rerun with the verified Codex runtime".to_string(),
+    };
+    write_child_report(&command.output_last_message, &report)?;
+    Ok(deterministic_fake_run(command))
+}
+
+fn deterministic_fake_auditor_run(
+    command: &ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    child_report: &OrchestratorReviewReport,
+) -> Result<ExternalAgentRun> {
+    let report = AuditorReport {
+        id: parent_auditor_id(assignment),
+        role: AgentRole::Auditor,
+        reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child_report),
+        reviewed_paths: required_auditor_review_paths(assignment, child_report),
+        commands_run: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "deterministic fake auditor validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        no_further_delegation: Some(true),
+        read_only: true,
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "simulation-only evidence".to_string(),
+        next_safe_action: "rerun with the verified Codex runtime".to_string(),
+    };
+    let mut file = File::create(&command.output_last_message).with_context(|| {
+        format!(
+            "failed to create deterministic fake auditor report {}",
+            command.output_last_message.display()
+        )
+    })?;
+    serde_json::to_writer_pretty(&mut file, &report).with_context(|| {
+        format!(
+            "failed to write deterministic fake auditor report {}",
+            command.output_last_message.display()
+        )
+    })?;
+    file.write_all(b"\n").with_context(|| {
+        format!(
+            "failed to finish deterministic fake auditor report {}",
+            command.output_last_message.display()
+        )
+    })?;
+    Ok(deterministic_fake_run(command))
+}
+
+fn deterministic_fake_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
+    ExternalAgentRun {
+        command: vec!["maco-internal-deterministic-fake".to_string()],
+        cwd: command.cwd.clone(),
+        timeout_seconds: command.timeout.as_secs(),
+        exit_code: Some(0),
+        duration_ms: 0,
+        timed_out: false,
+        process_tree: None,
+        side_effects: None,
+        publishable: false,
+        program_trust: ExternalProgramTrust::ExplicitCustom,
+        codex_permissions: None,
+        stdout: crate::external_agent::CapturedOutput::default(),
+        stderr: crate::external_agent::CapturedOutput::default(),
+        error: None,
+    }
+}
+
+fn external_safety_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) -> bool {
+    match runtime {
+        SupervisorRuntime::Codex => run.succeeded(),
+        SupervisorRuntime::Fake => {
+            run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom
+        }
+    }
+}
+
+fn external_process_completed(run: &ExternalAgentRun) -> bool {
+    run.succeeded()
+        || (run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom)
 }
 
 fn command_record_from_external(
@@ -3732,7 +4024,7 @@ fn command_record_from_external(
         command: serializable_external_command(&run.command, command),
         cwd: run.cwd.clone(),
         exit_code: run.exit_code,
-        status: if run.succeeded() {
+        status: if external_process_completed(run) {
             ReviewStatus::Succeeded
         } else {
             ReviewStatus::Failed
@@ -3822,15 +4114,15 @@ fn serializable_path_buf(path: &Path) -> PathBuf {
     PathBuf::from(serializable_path(path))
 }
 
-fn ensure_clean_primary(repo: &Path) -> Result<()> {
-    if primary_is_dirty(repo)? {
+fn ensure_clean_primary(repo: &Path, runtime: SupervisorExecutionRuntime) -> Result<()> {
+    if primary_is_dirty(repo, runtime)? {
         bail!("refusing to run supervise with a dirty primary worktree; rerun with --allow-dirty-primary to override");
     }
     Ok(())
 }
 
-fn primary_is_dirty(repo: &Path) -> Result<bool> {
-    Ok(!primary_status_snapshot(repo)?.is_empty())
+fn primary_is_dirty(repo: &Path, runtime: SupervisorExecutionRuntime) -> Result<bool> {
+    Ok(!primary_status_snapshot(repo, runtime)?.is_empty())
 }
 
 fn ensure_reusable_child_worktree(record: &WorktreeRecord, primary_head: &Oid) -> Result<()> {
@@ -4023,55 +4315,56 @@ fn write_plan_snapshot(
 }
 
 fn write_orchestrator_schema(path: &Path) -> Result<()> {
-    write_schema(
-        path,
-        json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "title": "OrchestratorReviewReport",
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "id",
-                "role",
-                "assigned_paths",
-                "semantic_symbols",
-                "semantic_modules",
-                "claim_token",
-                "semantic_intent_token",
-                "commands_run",
-                "files_changed",
-                "validation_results",
-                "findings",
-                "worker_reports",
-                "audit_reports",
-                "accepted",
-                "rejected",
-                "status",
-                "remaining_risk",
-                "next_safe_action"
-            ],
-            "properties": {
-                "id": {"type": "string"},
-                "role": {"type": "string", "const": "child_orchestrator"},
-                "assigned_paths": {"type": "array", "items": {"type": "string"}},
-                "semantic_symbols": {"type": "array", "items": {"type": "string"}},
-                "semantic_modules": {"type": "array", "items": {"type": "string"}},
-                "claim_token": {"type": ["integer", "null"]},
-                "semantic_intent_token": {"type": ["integer", "null"]},
-                "commands_run": {"type": "array", "items": command_run_record_schema_value()},
-                "files_changed": {"type": "array", "items": {"type": "string"}},
-                "validation_results": {"type": "array", "items": validation_result_schema_value()},
-                "findings": {"type": "array", "items": finding_schema_value()},
-                "worker_reports": {"type": "array", "items": worker_report_schema_value()},
-                "audit_reports": {"type": "array", "items": auditor_report_schema_value()},
-                "accepted": {"type": "boolean"},
-                "rejected": {"type": "boolean"},
-                "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
-                "remaining_risk": {"type": "string"},
-                "next_safe_action": {"type": "string"}
-            }
-        }),
-    )
+    write_schema(path, orchestrator_report_schema_value())
+}
+
+fn orchestrator_report_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "OrchestratorReviewReport",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "id",
+            "role",
+            "assigned_paths",
+            "semantic_symbols",
+            "semantic_modules",
+            "claim_token",
+            "semantic_intent_token",
+            "commands_run",
+            "files_changed",
+            "validation_results",
+            "findings",
+            "worker_reports",
+            "audit_reports",
+            "accepted",
+            "rejected",
+            "status",
+            "remaining_risk",
+            "next_safe_action"
+        ],
+        "properties": {
+            "id": {"type": "string"},
+            "role": {"type": "string", "const": "child_orchestrator"},
+            "assigned_paths": {"type": "array", "items": {"type": "string"}},
+            "semantic_symbols": {"type": "array", "items": {"type": "string"}},
+            "semantic_modules": {"type": "array", "items": {"type": "string"}},
+            "claim_token": {"type": ["integer", "null"]},
+            "semantic_intent_token": {"type": ["integer", "null"]},
+            "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
+            "validation_results": {"type": "array", "items": validation_result_schema_value()},
+            "findings": {"type": "array", "items": finding_schema_value()},
+            "worker_reports": {"type": "array", "items": worker_report_schema_value()},
+            "audit_reports": {"type": "array", "items": auditor_report_schema_value()},
+            "accepted": {"type": "boolean"},
+            "rejected": {"type": "boolean"},
+            "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
+            "remaining_risk": {"type": "string"},
+            "next_safe_action": {"type": "string"}
+        }
+    })
 }
 
 fn write_worker_schema(path: &Path) -> Result<()> {
@@ -4433,30 +4726,30 @@ pub fn generated_run_id() -> Result<RunId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_runner::ContainmentBackend;
+    use crate::{
+        external_agent::{CapturedOutput, CodexPermissionEvidence},
+        process_runner::{ContainmentBackend, SideEffectConfinementProfileKind},
+    };
+    use git2::Signature;
 
     #[test]
     fn external_containment_gate_accepts_only_verified_empty_evidence() {
-        assert!(external_containment_verified_empty(Some(
-            ContainmentEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
-        )));
-        assert!(!external_containment_verified_empty(Some(
-            ContainmentEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
-        )));
-        assert!(!external_containment_verified_empty(Some(
-            ContainmentEvidence::Unverified(ContainmentBackend::WindowsJobObject)
-        )));
-        assert!(!external_containment_verified_empty(None));
+        assert!(
+            ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+                .is_verified_empty()
+        );
+        assert!(
+            !ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+                .is_verified_empty()
+        );
+        assert!(
+            !ProcessTreeEvidence::Unverified(ContainmentBackend::WindowsJobObject)
+                .is_verified_empty()
+        );
     }
 
     #[test]
     fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
-        use crate::{
-            external_agent::CapturedOutput,
-            process_runner::{ContainmentBackend, ContainmentEvidence},
-        };
-        use git2::Signature;
-
         let temp = tempfile::tempdir().expect("temporary repository");
         let repo = Repository::init(temp.path()).expect("initialize repository");
         fs::write(temp.path().join("README.md"), "baseline\n").expect("write baseline");
@@ -4509,6 +4802,7 @@ mod tests {
             plan_file: temp.path().join("plan.json"),
             run_id: RunId::new("unverified-containment-stops-followups").expect("valid run id"),
             codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
         };
 
@@ -4594,10 +4888,24 @@ mod tests {
                     exit_code: Some(0),
                     duration_ms: 1,
                     timed_out: false,
-                    containment: Some(if first_attempt {
-                        ContainmentEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                    process_tree: Some(if first_attempt {
+                        ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService)
                     } else {
-                        ContainmentEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+                        ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+                    }),
+                    side_effects: Some(SideEffectConfinementEvidence::Verified(
+                        SideEffectConfinementProfileKind::ExternalCodex,
+                    )),
+                    publishable: !first_attempt,
+                    program_trust: ExternalProgramTrust::TrustedSystemCodex,
+                    codex_permissions: (!first_attempt).then_some(CodexPermissionEvidence {
+                        codex_version: "0.142.3".to_string(),
+                        minimum_version: "0.138.0".to_string(),
+                        permission_profile: "maco_external_codex".to_string(),
+                        workspace_access: command.workspace_access,
+                        network_enabled: false,
+                        argv_digest: "digest".to_string(),
+                        executable_identity: "identity".to_string(),
                     }),
                     stdout: CapturedOutput::default(),
                     stderr: CapturedOutput::default(),
@@ -4609,6 +4917,7 @@ mod tests {
                 plan,
                 SupervisorConsultantPlan::default(),
                 options,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
                 &mut runner,
             )
             .expect("collect failed supervisor report")
@@ -4637,6 +4946,893 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.message.contains("Unverified")));
+    }
+
+    #[test]
+    fn injected_report_validation_preserves_worker_and_auditor_failure_coverage() {
+        let assignment = injected_assignment(true);
+
+        let mut missing_worker = injected_child_report(&assignment);
+        missing_worker.worker_reports.clear();
+        validate_worker_report_delegation_attestations(
+            &assignment,
+            Path::new("missing-worker.json"),
+            &mut missing_worker,
+        );
+        assert_eq!(missing_worker.status, ReviewStatus::Failed);
+        assert!(finding_messages(&missing_worker).contains("omitted required worker reports"));
+
+        let mut delegated = injected_child_report(&assignment);
+        delegated.worker_reports[0].no_further_delegation = Some(false);
+        validate_worker_report_delegation_attestations(
+            &assignment,
+            Path::new("delegated-worker.json"),
+            &mut delegated,
+        );
+        assert_eq!(delegated.status, ReviewStatus::Failed);
+        assert!(finding_messages(&delegated).contains("no-delegation attestation"));
+
+        let mut unauthorized = injected_child_report(&assignment);
+        unauthorized.files_changed = vec![PathBuf::from("Cargo.toml")];
+        unauthorized.worker_reports[0].files_changed = vec![PathBuf::from("Cargo.toml")];
+        validate_worker_report_evidence(
+            &assignment,
+            Path::new("unauthorized-worker.json"),
+            &mut unauthorized,
+        );
+        assert_eq!(unauthorized.status, ReviewStatus::Failed);
+        assert!(finding_messages(&unauthorized).contains("outside its assigned_paths"));
+
+        let mut inconsistent_validation = injected_child_report(&assignment);
+        inconsistent_validation.worker_reports[0].validation_results[0].status =
+            ReviewStatus::Failed;
+        validate_worker_report_evidence(
+            &assignment,
+            Path::new("failed-validation.json"),
+            &mut inconsistent_validation,
+        );
+        assert_eq!(inconsistent_validation.status, ReviewStatus::Failed);
+        assert!(finding_messages(&inconsistent_validation).contains("failed validation"));
+
+        let mut missing_auditor = injected_child_report(&assignment);
+        validate_auditor_reports(
+            &assignment,
+            Path::new("missing-auditor.json"),
+            &mut missing_auditor,
+        );
+        assert_eq!(missing_auditor.status, ReviewStatus::Failed);
+        assert!(finding_messages(&missing_auditor).contains("omitted required review auditor"));
+
+        let mut bad_auditor = injected_child_report(&assignment);
+        let mut auditor = injected_auditor_report(&assignment, &bad_auditor);
+        auditor.reviewed_paths = vec![PathBuf::from("Cargo.toml")];
+        auditor.commands_run.push(injected_command_record());
+        bad_auditor.audit_reports.push(auditor);
+        validate_auditor_reports(&assignment, Path::new("bad-auditor.json"), &mut bad_auditor);
+        assert_eq!(bad_auditor.status, ReviewStatus::Failed);
+        assert!(bad_auditor.audit_reports[0]
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("reviewed_paths omitted")));
+    }
+
+    #[test]
+    fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 1);
+        let options = injected_options(&repo_path, temp.path(), "injected-retry");
+        let mut invocations = Vec::new();
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .to_string();
+            invocations.push(name.clone());
+            if name.contains("review-auditor") {
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+            } else {
+                let mut child = injected_child_report(&assignment);
+                if name.ends_with("attempt-1.json") {
+                    child.id = "wrong-id".to_string();
+                }
+                write_injected_json(&command.output_last_message, &child);
+            }
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run injected retry");
+
+        assert!(report.success);
+        assert_eq!(invocations.len(), 3);
+        assert!(invocations
+            .iter()
+            .any(|name| name.ends_with("attempt-2.json")));
+        assert!(invocations
+            .iter()
+            .any(|name| name.contains("review-auditor")));
+        assert!(finding_messages(&report.orchestrator_reports[0])
+            .contains("corrective retry attempt 2"));
+
+        let run_root = repo_path.join(".maco/o2/runs/injected-retry");
+        for relative in [
+            "assignments/child-a.attempt-1.prompt.md",
+            "assignments/child-a.attempt-2.prompt.md",
+            "reports/child-a.attempt-1.json",
+            "reports/child-a.attempt-2.json",
+            "reports/child-a.json",
+            "reports/supervisor-final.json",
+        ] {
+            assert!(run_root.join(relative).exists(), "missing {relative}");
+        }
+        let corrective_prompt =
+            fs::read_to_string(run_root.join("assignments/child-a.attempt-2.prompt.md"))
+                .expect("read corrective prompt");
+        assert!(corrective_prompt.contains("CORRECTIVE FEEDBACK:"));
+        assert!(corrective_prompt.contains("does not match assignment"));
+        let history = finding_messages(&report.orchestrator_reports[0]);
+        assert!(history.contains("child attempt 1 history"));
+        assert!(history.contains("child attempt 2 history"));
+        assert!(history.contains("corrective_retry_used=true"));
+    }
+
+    #[test]
+    fn injected_runner_path_violation_blocks_retry_and_primary_mutations_fail_integrity_gate() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(false);
+        let plan = injected_plan(assignment.clone(), 1);
+        let options = injected_options(&repo_path, temp.path(), "injected-path-violation");
+        let mut invocations = Vec::new();
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations.push(
+                command
+                    .output_last_message
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            fs::write(command.cwd.join("outside.txt"), "unauthorized\n")
+                .expect("write unauthorized child path");
+            let mut child = injected_child_report(&assignment);
+            child.id = "wrong-id".to_string();
+            child.files_changed = vec![PathBuf::from("outside.txt")];
+            write_injected_json(&command.output_last_message, &child);
+            injected_verified_run(command)
+        };
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run injected path violation");
+        assert!(!report.success);
+        assert!(!invocations
+            .iter()
+            .any(|name| name.ends_with("attempt-2.json")));
+        assert!(finding_messages(&report.orchestrator_reports[0])
+            .contains("outside its assigned paths"));
+
+        for scenario in ["tracked", "untracked", "index", "commit"] {
+            let (temp, repo_path) = injected_repository();
+            let assignment = injected_assignment(false);
+            let plan = injected_plan(assignment.clone(), 0);
+            let options = injected_options(
+                &repo_path,
+                temp.path(),
+                &format!("injected-primary-{scenario}"),
+            );
+            let primary = repo_path.clone();
+            let mut runner = |command: &ExternalAgentCommand| {
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_child_report(&assignment),
+                );
+                match scenario {
+                    "tracked" => fs::write(primary.join("README.md"), "mutated\n")
+                        .expect("mutate tracked primary"),
+                    "untracked" => fs::write(primary.join("rogue.txt"), "mutated\n")
+                        .expect("mutate untracked primary"),
+                    "index" => fs::write(primary.join(".git/index"), b"invalid-index")
+                        .expect("mutate primary index"),
+                    "commit" => {
+                        fs::write(primary.join("README.md"), "committed mutation\n")
+                            .expect("write commit mutation");
+                        commit_injected_repository(&primary, "primary mutation");
+                    }
+                    _ => unreachable!(),
+                }
+                injected_verified_run(command)
+            };
+            let report = run_supervisor_plan_with_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
+                &mut runner,
+            )
+            .expect("run injected primary mutation");
+            assert!(
+                !report.success,
+                "scenario {scenario} escaped integrity gate"
+            );
+            assert!(report
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("primary")));
+            assert!(report.release_errors.is_empty());
+        }
+    }
+
+    #[test]
+    fn injected_parent_auditor_primary_mutation_is_rejected() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "injected-auditor-mutation");
+        let primary = repo_path.clone();
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            let child = injected_child_report(&assignment);
+            if name.contains("review-auditor") {
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+                fs::write(primary.join("README.md"), "auditor mutation\n")
+                    .expect("mutate primary during auditor");
+            } else {
+                write_injected_json(&command.output_last_message, &child);
+            }
+            injected_verified_run(command)
+        };
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run injected auditor mutation");
+        assert!(!report.success);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("primary")));
+    }
+
+    #[test]
+    fn injected_missing_child_or_auditor_and_failed_child_propagate_final_failure() {
+        for scenario in [
+            "missing-child",
+            "failed-child",
+            "failed-worker",
+            "missing-auditor",
+        ] {
+            let (temp, repo_path) = injected_repository();
+            let with_worker = matches!(
+                scenario,
+                "missing-child" | "failed-worker" | "missing-auditor"
+            );
+            let assignment = injected_assignment(with_worker);
+            let plan = injected_plan(assignment.clone(), 0);
+            let options =
+                injected_options(&repo_path, temp.path(), &format!("injected-{scenario}"));
+            let mut invocations = Vec::new();
+            let mut runner = |command: &ExternalAgentCommand| {
+                let name = command
+                    .output_last_message
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or_default()
+                    .to_string();
+                invocations.push(name.clone());
+                match scenario {
+                    "missing-child" => {}
+                    "failed-child" => {
+                        let mut child = injected_child_report(&assignment);
+                        child.status = ReviewStatus::Failed;
+                        child.accepted = false;
+                        child.rejected = true;
+                        child.remaining_risk = "injected child failure".to_string();
+                        write_injected_json(&command.output_last_message, &child);
+                    }
+                    "failed-worker" if name.contains("review-auditor") => {
+                        let child = injected_child_report(&assignment);
+                        write_injected_json(
+                            &command.output_last_message,
+                            &injected_auditor_report(&assignment, &child),
+                        );
+                    }
+                    "failed-worker" => {
+                        let mut child = injected_child_report(&assignment);
+                        child.status = ReviewStatus::Failed;
+                        child.accepted = false;
+                        child.rejected = true;
+                        child.worker_reports[0].status = ReviewStatus::Failed;
+                        child.worker_reports[0].accepted = false;
+                        child.worker_reports[0].rejected = true;
+                        child.remaining_risk = "injected worker failure".to_string();
+                        write_injected_json(&command.output_last_message, &child);
+                    }
+                    "missing-auditor" if !name.contains("review-auditor") => {
+                        write_injected_json(
+                            &command.output_last_message,
+                            &injected_child_report(&assignment),
+                        );
+                    }
+                    "missing-auditor" => {}
+                    _ => unreachable!(),
+                }
+                injected_verified_run(command)
+            };
+
+            let report = run_supervisor_plan_with_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
+                &mut runner,
+            )
+            .expect("collect injected missing or failed report");
+
+            assert!(
+                !report.success,
+                "scenario {scenario} unexpectedly succeeded"
+            );
+            assert!(!report.accepted);
+            assert!(report.rejected);
+            assert_eq!(report.status, ReviewStatus::Failed);
+            assert_eq!(
+                invocations
+                    .iter()
+                    .filter(|name| name.contains("review-auditor"))
+                    .count(),
+                usize::from(matches!(scenario, "failed-worker" | "missing-auditor")),
+                "scenario {scenario} launched the wrong follow-ups"
+            );
+            if scenario == "missing-child" {
+                assert!(finding_messages(&report.orchestrator_reports[0])
+                    .contains("required child report is missing or invalid"));
+            }
+            if scenario == "missing-auditor" {
+                assert!(report.orchestrator_reports[0]
+                    .audit_reports
+                    .iter()
+                    .any(report_failed));
+            }
+        }
+    }
+
+    #[test]
+    fn injected_diff_reconciliation_uses_git_observed_paths_and_warns_on_worker_union() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "injected-diff-reconciliation");
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            let child = injected_child_report(&assignment);
+            if name.contains("review-auditor") {
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+            } else {
+                fs::write(command.cwd.join("README.md"), "child worktree edit\n")
+                    .expect("write assigned child diff");
+                write_injected_json(&command.output_last_message, &child);
+            }
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run injected diff reconciliation");
+
+        assert!(report.success);
+        assert_eq!(report.files_changed, vec![PathBuf::from("README.md")]);
+        let child = &report.orchestrator_reports[0];
+        assert_eq!(child.files_changed, vec![PathBuf::from("README.md")]);
+        let messages = finding_messages(child);
+        assert!(messages.contains("child-reported files_changed does not match actual"));
+        assert!(messages.contains("worker files_changed union differs from actual"));
+        assert!(messages.contains("observed-but-not-reported: README.md"));
+    }
+
+    #[test]
+    fn injected_schema_and_evidence_matrix_rejects_missing_fields_and_extra_workers() {
+        let assignment = injected_assignment(true);
+        let mut extra_worker = injected_child_report(&assignment);
+        let mut undeclared = extra_worker.worker_reports[0].clone();
+        undeclared.id = "worker-extra".to_string();
+        undeclared.files_changed = vec![PathBuf::from("README.md")];
+        extra_worker.worker_reports.push(undeclared);
+        validate_worker_report_evidence(
+            &assignment,
+            Path::new("extra-worker.json"),
+            &mut extra_worker,
+        );
+        assert_eq!(extra_worker.status, ReviewStatus::Failed);
+        assert!(finding_messages(&extra_worker).contains("is not declared in assignment"));
+
+        for scenario in [
+            "reviewed-worker-ids",
+            "reviewed-paths",
+            "commands",
+            "validation",
+            "terminal-attestation",
+            "read-only",
+            "remaining-risk",
+            "next-action",
+        ] {
+            let mut child = injected_child_report(&assignment);
+            let mut auditor = injected_auditor_report(&assignment, &child);
+            auditor.commands_run.push(injected_command_record());
+            match scenario {
+                "reviewed-worker-ids" => auditor.reviewed_worker_ids.clear(),
+                "reviewed-paths" => auditor.reviewed_paths.clear(),
+                "commands" => auditor.commands_run.clear(),
+                "validation" => auditor.validation_results.clear(),
+                "terminal-attestation" => auditor.no_further_delegation = None,
+                "read-only" => auditor.read_only = false,
+                "remaining-risk" => auditor.remaining_risk.clear(),
+                "next-action" => auditor.next_safe_action.clear(),
+                _ => unreachable!(),
+            }
+            child.audit_reports.push(auditor);
+            validate_auditor_reports(&assignment, Path::new("auditor-evidence.json"), &mut child);
+            assert_eq!(
+                child.status,
+                ReviewStatus::Failed,
+                "missing {scenario} evidence was accepted"
+            );
+            assert!(child.audit_reports[0].findings.iter().any(|finding| {
+                finding.severity == FindingSeverity::Error && finding.message.contains("omitted")
+            }));
+        }
+
+        for (label, schema, required) in [
+            (
+                "orchestrator",
+                orchestrator_report_schema_value(),
+                &[
+                    "worker_reports",
+                    "audit_reports",
+                    "remaining_risk",
+                    "next_safe_action",
+                ][..],
+            ),
+            (
+                "worker",
+                worker_report_schema_value(),
+                &[
+                    "no_further_delegation",
+                    "validation_results",
+                    "remaining_risk",
+                ][..],
+            ),
+            (
+                "auditor",
+                auditor_report_schema_value(),
+                &[
+                    "reviewed_worker_ids",
+                    "reviewed_paths",
+                    "commands_run",
+                    "validation_results",
+                    "no_further_delegation",
+                    "read_only",
+                    "remaining_risk",
+                    "next_safe_action",
+                ][..],
+            ),
+        ] {
+            assert_eq!(schema["additionalProperties"], false, "{label} schema open");
+            let required_fields = schema["required"]
+                .as_array()
+                .expect("schema required array");
+            for field in required {
+                assert!(
+                    required_fields.iter().any(|value| value == field),
+                    "{label} schema omitted required field {field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn primary_integrity_matrix_covers_index_flags_split_sparse_submodule_non_utf8_and_runtime_roots(
+    ) {
+        let base = injected_primary_snapshot();
+        let replacement = injected_oid("replacement");
+        let mut cases = Vec::new();
+
+        for (name, tag) in [("assume-unchanged", b'h'), ("skip-worktree", b'S')] {
+            let mut before = base.clone();
+            before
+                .index
+                .get_mut(&injected_index_key("README.md"))
+                .unwrap()
+                .tag = tag;
+            let mut after = before.clone();
+            after.worktree.insert(
+                b"README.md".to_vec(),
+                PrimaryPathState::File {
+                    id: replacement,
+                    mode: 0o100644,
+                },
+            );
+            cases.push((
+                name,
+                before,
+                after,
+                "worktree content/type changed",
+                PathBuf::from("README.md"),
+            ));
+        }
+
+        let before = base.clone();
+        let mut after = before.clone();
+        after.index_storage.worktree_index = IndexFileSnapshot::Present {
+            bytes: 9,
+            digest: replacement,
+        };
+        cases.push((
+            "raw-index",
+            before,
+            after,
+            "raw worktree index",
+            PathBuf::from(".git/index"),
+        ));
+
+        let mut before = base.clone();
+        before.index_storage.shared_index = Some(SharedIndexFileSnapshot {
+            path: PathBuf::from(".git/sharedindex.test"),
+            storage: IndexFileSnapshot::Present {
+                bytes: 7,
+                digest: injected_oid("shared"),
+            },
+        });
+        let mut after = before.clone();
+        after.index_storage.shared_index = None;
+        cases.push((
+            "split-index",
+            before,
+            after,
+            "split-index storage changed",
+            PathBuf::from(".git/index"),
+        ));
+
+        let mut before = base.clone();
+        before.index.insert(
+            injected_index_key("other"),
+            PrimaryIndexEntryState {
+                id: injected_oid("sparse-tree"),
+                mode: SPARSE_DIRECTORY_MODE,
+                tag: b'S',
+            },
+        );
+        before.worktree.insert(
+            b"other".to_vec(),
+            PrimaryPathState::Directory {
+                nested_repository: None,
+                contents_digest: Some(injected_oid("sparse-before")),
+                mode: 0o040755,
+            },
+        );
+        let mut after = before.clone();
+        after.worktree.insert(
+            b"other".to_vec(),
+            PrimaryPathState::Directory {
+                nested_repository: None,
+                contents_digest: Some(injected_oid("sparse-after")),
+                mode: 0o040755,
+            },
+        );
+        cases.push((
+            "sparse-directory",
+            before,
+            after,
+            "worktree content/type changed",
+            PathBuf::from("other"),
+        ));
+
+        let nested_before = base.clone();
+        let mut nested_after = nested_before.clone();
+        nested_after.worktree.insert(
+            b"README.md".to_vec(),
+            PrimaryPathState::File {
+                id: replacement,
+                mode: 0o100644,
+            },
+        );
+        let mut before = base.clone();
+        before.index.insert(
+            injected_index_key("deps/nested"),
+            PrimaryIndexEntryState {
+                id: injected_oid("gitlink"),
+                mode: GITLINK_MODE,
+                tag: b'H',
+            },
+        );
+        before.worktree.insert(
+            b"deps/nested".to_vec(),
+            PrimaryPathState::Directory {
+                nested_repository: Some(Box::new(nested_before)),
+                contents_digest: None,
+                mode: 0o040755,
+            },
+        );
+        let mut after = before.clone();
+        after.worktree.insert(
+            b"deps/nested".to_vec(),
+            PrimaryPathState::Directory {
+                nested_repository: Some(Box::new(nested_after)),
+                contents_digest: None,
+                mode: 0o040755,
+            },
+        );
+        cases.push((
+            "submodule",
+            before,
+            after,
+            "worktree content/type changed",
+            PathBuf::from("deps/nested"),
+        ));
+
+        let non_utf8 = vec![b'o', b'p', b'-', 0x80];
+        let before = base.clone();
+        let mut after = before.clone();
+        after.worktree.insert(
+            non_utf8.clone(),
+            PrimaryPathState::File {
+                id: replacement,
+                mode: 0o100644,
+            },
+        );
+        cases.push((
+            "non-utf8",
+            before,
+            after,
+            "worktree content/type changed",
+            finding_path_from_git_bytes(&non_utf8),
+        ));
+
+        let mut before = base.clone();
+        before.status.insert(
+            b".maco-cache/tracked.txt".to_vec(),
+            PrimaryStatusState {
+                code: *b" M",
+                original_path: None,
+            },
+        );
+        let mut after = before.clone();
+        after
+            .status
+            .get_mut(b".maco-cache/tracked.txt".as_slice())
+            .unwrap()
+            .code = *b"MM";
+        cases.push((
+            "tracked-runtime-root",
+            before,
+            after,
+            "Git status changed",
+            PathBuf::from(".maco-cache/tracked.txt"),
+        ));
+
+        for (name, before, after, detail, path) in cases {
+            let changes = primary_integrity_changes(&before, &after);
+            assert!(!changes.is_empty(), "scenario {name} was not detected");
+            assert!(
+                changes.details.iter().any(|value| value.contains(detail)),
+                "scenario {name} lacked detail {detail}: {:?}",
+                changes.details
+            );
+            assert!(
+                changes.paths.contains(&path),
+                "scenario {name} lacked path {path:?}"
+            );
+        }
+
+        let mut stable_flagged = base.clone();
+        stable_flagged
+            .index
+            .get_mut(&injected_index_key("README.md"))
+            .unwrap()
+            .tag = b'h';
+        assert!(primary_integrity_changes(&stable_flagged, &stable_flagged).is_empty());
+        for path in [
+            b".maco/run.json".as_slice(),
+            b".maco-cache/state.json".as_slice(),
+            b".agents/live/claims/test.md".as_slice(),
+        ] {
+            assert!(is_untracked_runtime_artifact_bytes(path));
+        }
+        assert!(!is_untracked_runtime_artifact_bytes(b".maco-visible"));
+        assert!(!is_untracked_runtime_artifact_bytes(b".agents/config.json"));
+    }
+
+    #[test]
+    fn primary_snapshot_captures_real_index_flags_split_storage_and_ignores_untracked_runtime() {
+        let (_temp, repo_path) = injected_repository();
+        run_injected_git(
+            &repo_path,
+            &["update-index", "--assume-unchanged", "README.md"],
+        );
+        let assumed = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("snapshot assume-unchanged index");
+        assert!(assumed.index[&injected_index_key("README.md")]
+            .tag
+            .is_ascii_lowercase());
+
+        run_injected_git(
+            &repo_path,
+            &["update-index", "--no-assume-unchanged", "README.md"],
+        );
+        run_injected_git(
+            &repo_path,
+            &["update-index", "--skip-worktree", "README.md"],
+        );
+        let skipped = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("snapshot skip-worktree index");
+        assert_eq!(skipped.index[&injected_index_key("README.md")].tag, b'S');
+
+        run_injected_git(
+            &repo_path,
+            &["update-index", "--no-skip-worktree", "README.md"],
+        );
+        let ordinary = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("snapshot ordinary index");
+        run_injected_git(&repo_path, &["update-index", "--split-index"]);
+        let split = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("snapshot split index");
+        assert!(split.index_storage.shared_index.is_some());
+        let split_changes = primary_integrity_changes(&ordinary, &split);
+        assert!(split_changes
+            .details
+            .iter()
+            .any(|detail| detail.contains("split-index storage changed")));
+        let split_stable = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("repeat stable split-index snapshot");
+        assert!(primary_integrity_changes(&split, &split_stable).is_empty());
+
+        fs::create_dir_all(repo_path.join(".maco-cache")).expect("create runtime root");
+        fs::write(repo_path.join(".maco-cache/runtime.json"), "{}\n")
+            .expect("write runtime artifact");
+        let runtime = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("snapshot runtime artifact");
+        assert!(!runtime
+            .status
+            .contains_key(b".maco-cache/runtime.json".as_slice()));
+    }
+
+    #[test]
+    fn primary_snapshot_detects_changes_to_preexisting_dirty_untracked_and_tracked_runtime_paths() {
+        let (_temp, repo_path) = injected_repository();
+        fs::create_dir_all(repo_path.join(".maco-cache")).expect("create tracked runtime root");
+        fs::write(
+            repo_path.join(".maco-cache/tracked.txt"),
+            "tracked runtime\n",
+        )
+        .expect("write tracked runtime file");
+        commit_injected_repository(&repo_path, "track runtime file");
+        fs::write(repo_path.join("README.md"), "preexisting dirty\n")
+            .expect("write dirty tracked path");
+        fs::write(
+            repo_path.join("operator-notes.txt"),
+            "preexisting untracked\n",
+        )
+        .expect("write preexisting untracked path");
+
+        let before = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("snapshot preexisting state");
+        let unchanged = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("repeat unchanged preexisting snapshot");
+        assert!(primary_integrity_changes(&before, &unchanged).is_empty());
+
+        fs::write(repo_path.join("README.md"), "changed dirty path\n")
+            .expect("mutate dirty tracked path");
+        fs::write(
+            repo_path.join("operator-notes.txt"),
+            "changed untracked path\n",
+        )
+        .expect("mutate untracked path");
+        fs::write(
+            repo_path.join(".maco-cache/tracked.txt"),
+            "changed tracked runtime\n",
+        )
+        .expect("mutate tracked runtime path");
+        let after = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("snapshot changed preexisting state");
+        let changes = primary_integrity_changes(&before, &after);
+        for path in [
+            PathBuf::from("README.md"),
+            PathBuf::from("operator-notes.txt"),
+            PathBuf::from(".maco-cache/tracked.txt"),
+        ] {
+            assert!(
+                changes.paths.contains(&path),
+                "missing changed path {path:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn primary_snapshot_supports_non_utf8_repository_root_without_lossy_git_arguments() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let temp = tempfile::tempdir().expect("temporary non-UTF-8 root");
+        let repo_path = temp.path().join(OsString::from_vec(b"repo-\x80".to_vec()));
+        Repository::init(&repo_path).expect("initialize non-UTF-8 repository");
+        fs::write(repo_path.join("README.md"), "baseline\n").expect("write baseline");
+        commit_injected_repository(&repo_path, "baseline");
+
+        let snapshot = primary_worktree_snapshot(
+            &repo_path,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        )
+        .expect("capture non-UTF-8 primary snapshot");
+        assert!(snapshot.inspection_problem().is_none());
+        let serialized = serializable_path(&repo_path);
+        assert!(serialized.starts_with("<non-utf8-git-path>/"));
+        assert!(serialized.is_ascii());
+        assert!(!serialized.contains('\u{fffd}'));
     }
 
     #[test]
@@ -4782,6 +5978,295 @@ mod tests {
         assert!(runtime_labeled_worker.starts_with("ROLE: TERMINAL_WORKER\n"));
         assert!(runtime_labeled_worker.contains("AGENT_LABEL: expert-coder\n"));
         assert!(!runtime_labeled_worker.contains("ROLE: expert-coder"));
+    }
+
+    fn injected_repository() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary repository root");
+        let path = temp.path().join("repo");
+        Repository::init(&path).expect("initialize injected repository");
+        fs::write(path.join("README.md"), "baseline\n").expect("write injected baseline");
+        commit_injected_repository(&path, "baseline");
+        (temp, path)
+    }
+
+    fn commit_injected_repository(path: &Path, message: &str) {
+        let repo = Repository::open(path).expect("open injected repository");
+        let mut index = repo.index().expect("open injected index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("stage injected repository");
+        index.write().expect("write injected index");
+        let tree_id = index.write_tree().expect("write injected tree");
+        let tree = repo.find_tree(tree_id).expect("find injected tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .expect("commit injected repository");
+    }
+
+    fn run_injected_git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("run injected Git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: "child-a".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: with_worker
+                .then(|| WorkerAssignment {
+                    id: "worker-a".to_string(),
+                    role: AgentRole::Worker,
+                    assigned_paths: vec![PathBuf::from("README.md")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    task: None,
+                    report_path: None,
+                })
+                .into_iter()
+                .collect(),
+            notes: None,
+        }
+    }
+
+    fn injected_plan(assignment: OrchestratorAssignment, max_child_retries: u8) -> SupervisorPlan {
+        SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "injected supervisor fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            assignments: vec![assignment],
+        }
+    }
+
+    fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOptions {
+        SupervisorRunOptions {
+            repo: repo.to_path_buf(),
+            plan_file: root.join(format!("{run_id}.json")),
+            run_id: RunId::new(run_id).expect("valid injected run id"),
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: true,
+        }
+    }
+
+    fn injected_child_report(assignment: &OrchestratorAssignment) -> OrchestratorReviewReport {
+        let worker_reports = assignment
+            .worker_assignments
+            .iter()
+            .map(|worker| WorkerReport {
+                id: worker.id.clone(),
+                role: AgentRole::Worker,
+                assigned_paths: worker.assigned_paths.clone(),
+                semantic_symbols: worker.semantic_symbols.clone(),
+                semantic_modules: worker.semantic_modules.clone(),
+                claim_token: None,
+                semantic_intent_token: None,
+                commands_run: Vec::new(),
+                files_changed: Vec::new(),
+                validation_results: vec![ValidationResult {
+                    name: "injected worker validation".to_string(),
+                    status: ReviewStatus::Succeeded,
+                    command: Vec::new(),
+                    message: None,
+                }],
+                findings: Vec::new(),
+                no_further_delegation: Some(true),
+                accepted: true,
+                rejected: false,
+                status: ReviewStatus::Succeeded,
+                remaining_risk: "none".to_string(),
+                next_safe_action: "review".to_string(),
+            })
+            .collect();
+        OrchestratorReviewReport {
+            id: assignment.id.clone(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: assignment.semantic_symbols.clone(),
+            semantic_modules: assignment.semantic_modules.clone(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: vec![ValidationResult {
+                name: "injected child validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: None,
+            }],
+            findings: Vec::new(),
+            worker_reports,
+            audit_reports: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "review".to_string(),
+        }
+    }
+
+    fn injected_auditor_report(
+        assignment: &OrchestratorAssignment,
+        child: &OrchestratorReviewReport,
+    ) -> AuditorReport {
+        AuditorReport {
+            id: parent_auditor_id(assignment),
+            role: AgentRole::Auditor,
+            reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child),
+            reviewed_paths: required_auditor_review_paths(assignment, child),
+            commands_run: Vec::new(),
+            validation_results: vec![ValidationResult {
+                name: "injected auditor validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: None,
+            }],
+            findings: Vec::new(),
+            no_further_delegation: Some(true),
+            read_only: true,
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "review".to_string(),
+        }
+    }
+
+    fn injected_oid(value: &str) -> Oid {
+        Oid::hash_object(ObjectType::Blob, value.as_bytes()).expect("hash injected object")
+    }
+
+    fn injected_index_key(path: &str) -> PrimaryIndexEntryKey {
+        PrimaryIndexEntryKey {
+            path: path.as_bytes().to_vec(),
+            stage: 0,
+        }
+    }
+
+    fn injected_primary_snapshot() -> PrimaryWorktreeSnapshot {
+        let baseline = injected_oid("baseline");
+        PrimaryWorktreeSnapshot {
+            head: PrimaryHeadSnapshot {
+                detached: false,
+                reference_name: Some(b"refs/heads/master".to_vec()),
+                symbolic_target: None,
+                target: Some(injected_oid("head")),
+            },
+            index: BTreeMap::from([(
+                injected_index_key("README.md"),
+                PrimaryIndexEntryState {
+                    id: baseline,
+                    mode: 0o100644,
+                    tag: b'H',
+                },
+            )]),
+            index_storage: PrimaryIndexStorageSnapshot {
+                worktree_index: IndexFileSnapshot::Present {
+                    bytes: 8,
+                    digest: injected_oid("index"),
+                },
+                shared_index: None,
+            },
+            status: BTreeMap::new(),
+            worktree: BTreeMap::from([(
+                b"README.md".to_vec(),
+                PrimaryPathState::File {
+                    id: baseline,
+                    mode: 0o100644,
+                },
+            )]),
+            inspection_error: None,
+        }
+    }
+
+    fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
+        ExternalAgentRun {
+            command: vec!["injected-runner".to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: command.timeout.as_secs(),
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            )),
+            side_effects: Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            )),
+            publishable: true,
+            program_trust: ExternalProgramTrust::TrustedSystemCodex,
+            codex_permissions: Some(CodexPermissionEvidence {
+                codex_version: "0.142.3".to_string(),
+                minimum_version: "0.138.0".to_string(),
+                permission_profile: "maco_external_codex".to_string(),
+                workspace_access: command.workspace_access,
+                network_enabled: false,
+                argv_digest: "injected-digest".to_string(),
+                executable_identity: "injected-identity".to_string(),
+            }),
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+        }
+    }
+
+    fn injected_command_record() -> CommandRunRecord {
+        CommandRunRecord {
+            command: vec!["injected-runner".to_string()],
+            cwd: PathBuf::from("."),
+            exit_code: Some(0),
+            status: ReviewStatus::Succeeded,
+            timeout_seconds: 1,
+            duration_ms: 1,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+        }
+    }
+
+    fn write_injected_json(path: &Path, value: &impl Serialize) {
+        fs::write(
+            path,
+            serde_json::to_vec(value).expect("serialize injected report"),
+        )
+        .expect("write injected report");
+    }
+
+    fn finding_messages(report: &OrchestratorReviewReport) -> String {
+        report
+            .findings
+            .iter()
+            .map(|finding| finding.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     fn sample_child_report_json(id: &str) -> String {

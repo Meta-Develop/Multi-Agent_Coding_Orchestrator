@@ -31,7 +31,7 @@ fn cli_agent_run_uses_fake_proposal_in_isolated_worktree() -> Result<()> {
     )
     .context("write proposal")?;
 
-    let report = run_success_json([
+    let (report, verified_backend_available) = run_agent_json([
         "agent",
         "run",
         task_path.to_str().context("task path utf8")?,
@@ -45,6 +45,13 @@ fn cli_agent_run_uses_fake_proposal_in_isolated_worktree() -> Result<()> {
         repo,
         "--json",
     ])?;
+
+    if !verified_backend_available {
+        assert_agent_run_failed_closed(&report, &repo_path)?;
+        let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+        assert_eq!(status.as_array().context("status array")?.len(), 0);
+        return Ok(());
+    }
 
     assert_eq!(report["success"], true);
     assert_eq!(report["provider_id"], "fake");
@@ -317,7 +324,7 @@ fn cli_agent_run_allows_provider_command_to_edit_claimed_path() -> Result<()> {
     )
     .context("write proposal")?;
 
-    let report = run_success_json([
+    let (report, verified_backend_available) = run_agent_json([
         "agent",
         "run",
         task_path.to_str().context("task path utf8")?,
@@ -332,6 +339,13 @@ fn cli_agent_run_allows_provider_command_to_edit_claimed_path() -> Result<()> {
         repo,
         "--json",
     ])?;
+
+    if !verified_backend_available {
+        assert_agent_run_failed_closed(&report, &repo_path)?;
+        let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+        assert_eq!(status.as_array().context("status array")?.len(), 0);
+        return Ok(());
+    }
 
     assert_eq!(report["success"], true);
     assert_eq!(report["provider_id"], "fake");
@@ -394,6 +408,50 @@ fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     }
 
     serde_json::from_slice(&output.stdout).context("parse json")
+}
+
+fn run_agent_json<const N: usize>(args: [&str; N]) -> Result<(Value, bool)> {
+    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let report: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse agent json from stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    Ok((report, output.status.success()))
+}
+
+fn assert_agent_run_failed_closed(report: &Value, repo_path: &Path) -> Result<()> {
+    assert_eq!(report["success"], false);
+    let error = report["error"].as_str().context("agent error string")?;
+    assert!(
+        error.contains("containment")
+            || error.contains("failed to establish process-tree ownership")
+            || error.contains("failed to apply provider patch"),
+        "unexpected fail-closed error: {error}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md"))?,
+        "# Smoke\n"
+    );
+    let worktree_path = Path::new(
+        report["worktree"]["path"]
+            .as_str()
+            .context("failed run worktree path")?,
+    );
+    assert_eq!(
+        fs::read_to_string(worktree_path.join("README.md"))?,
+        "# Smoke\n"
+    );
+    assert_eq!(
+        report["candidate"]["changed_paths"]
+            .as_array()
+            .context("failed run changed paths")?
+            .len(),
+        0
+    );
+    Ok(())
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
