@@ -11,6 +11,7 @@ use crate::{
     orchestrator::RunId,
     planning,
     review::{ReviewerConfig, ReviewerMode},
+    safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
     semantic_coord::SemanticIntentStore,
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
@@ -33,6 +34,38 @@ const INBOX_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "maco-inbox.json";
 const DEFAULT_MAX_ITEMS: usize = 4;
 const DEFAULT_BODY_LIMIT: usize = 12 * 1024;
+const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+const MAX_CONFIG_SERIALIZED_BYTES: usize = 256 * 1024;
+const MAX_WORKSPACE_REPOSITORIES: usize = 64;
+const MAX_WORKSPACE_REPOSITORY_ID_BYTES: usize = 128;
+const MAX_CONFIG_PATH_BYTES: usize = 4 * 1024;
+const MAX_SELECTION_ITEMS: usize = 100;
+const MAX_LABELS: usize = 32;
+const MAX_LABEL_BYTES: usize = 100;
+const MAX_REPAIR_ATTEMPTS: usize = 8;
+const MAX_VALIDATION_COMMANDS: usize = 32;
+const MAX_VALIDATION_NAME_BYTES: usize = 128;
+const MAX_VALIDATION_COMMAND_BYTES: usize = 8 * 1024;
+const MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const MAX_ASSIGNED_PATHS: usize = 128;
+const MAX_PRIVACY_TERMS: usize = 64;
+const MAX_PRIVACY_TERM_BYTES: usize = 128;
+const MAX_BODY_LIMIT: usize = 64 * 1024;
+const MAX_CODEX_PATH_BYTES: usize = 4 * 1024;
+const MAX_GITHUB_TITLE_BYTES: usize = 512;
+const MAX_GITHUB_BODY_BYTES: usize = 128 * 1024;
+const MAX_GITHUB_URL_BYTES: usize = 2 * 1024;
+const MAX_GITHUB_LOGIN_BYTES: usize = 128;
+const MAX_GITHUB_REF_BYTES: usize = 512;
+const MAX_GITHUB_ITEMS: usize = MAX_SELECTION_ITEMS;
+const MAX_GITHUB_FILES: usize = MAX_ASSIGNED_PATHS;
+const MAX_GITHUB_CHECKS: usize = 512;
+const MAX_GITHUB_REVIEWS: usize = 512;
+const MAX_GITHUB_REVIEW_BODY_BYTES: usize = 64 * 1024;
+const MAX_GITHUB_STATUS_BYTES: usize = 128;
+const MAX_TIMESTAMP_BYTES: usize = 64;
+const SOURCE_SNAPSHOT_VERSION: u32 = 1;
+const SOURCE_SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"MACO\0inbox-source-snapshot\0v1\0";
 const GH_OUTPUT_LIMIT: usize = 512 * 1024;
 const GH_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMENT_BODY_LIMIT: usize = 6 * 1024;
@@ -93,7 +126,10 @@ pub struct InboxWorkspaceWatchOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxConfig {
+    #[serde(default = "default_inbox_schema_version")]
+    pub version: u32,
     #[serde(default)]
     pub repository: InboxRepositoryConfig,
     #[serde(default)]
@@ -105,7 +141,7 @@ pub struct InboxConfig {
     #[serde(default = "default_max_repair_attempts")]
     pub max_repair_attempts: usize,
     #[serde(default)]
-    pub default_validation_commands: Vec<AutopilotValidationCommand>,
+    pub default_validation_commands: Vec<InboxValidationCommandConfig>,
     #[serde(default = "default_assigned_paths")]
     pub default_assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -119,6 +155,7 @@ pub struct InboxConfig {
 impl Default for InboxConfig {
     fn default() -> Self {
         Self {
+            version: INBOX_SCHEMA_VERSION,
             repository: InboxRepositoryConfig::default(),
             selection: InboxSelectionConfig::default(),
             action_policy: InboxActionPolicy::default(),
@@ -133,8 +170,10 @@ impl Default for InboxConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxWorkspaceConfig {
+    #[serde(default = "default_inbox_schema_version")]
     pub version: u32,
     #[serde(default = "default_workspace_permission_mode")]
     pub default_permission_mode: InboxPermissionMode,
@@ -148,8 +187,11 @@ pub struct InboxWorkspaceConfig {
     pub safety: InboxWorkspaceSafetyConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxWorkspaceRepositoryConfig {
+    #[serde(default = "default_inbox_schema_version")]
+    pub version: u32,
     pub id: String,
     pub path: PathBuf,
     #[serde(default = "default_true")]
@@ -166,8 +208,11 @@ pub struct InboxWorkspaceRepositoryConfig {
     pub include_issues: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxWorkspaceSafetyConfig {
+    #[serde(default = "default_inbox_schema_version")]
+    pub version: u32,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -183,6 +228,7 @@ pub struct InboxWorkspaceSafetyConfig {
 impl Default for InboxWorkspaceSafetyConfig {
     fn default() -> Self {
         Self {
+            version: INBOX_SCHEMA_VERSION,
             dry_run: false,
             allow_auto_approval: false,
             allow_auto_merge: false,
@@ -192,8 +238,11 @@ impl Default for InboxWorkspaceSafetyConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxRepositoryConfig {
+    #[serde(default = "default_inbox_schema_version")]
+    pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,8 +251,22 @@ pub struct InboxRepositoryConfig {
     pub default_branch: Option<String>,
 }
 
+impl Default for InboxRepositoryConfig {
+    fn default() -> Self {
+        Self {
+            version: INBOX_SCHEMA_VERSION,
+            owner: None,
+            name: None,
+            default_branch: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxSelectionConfig {
+    #[serde(default = "default_inbox_schema_version")]
+    pub version: u32,
     #[serde(default = "default_true")]
     pub issues: bool,
     #[serde(default = "default_true", alias = "prs")]
@@ -219,6 +282,7 @@ pub struct InboxSelectionConfig {
 impl Default for InboxSelectionConfig {
     fn default() -> Self {
         Self {
+            version: INBOX_SCHEMA_VERSION,
             issues: true,
             pull_requests: true,
             max_items: DEFAULT_MAX_ITEMS,
@@ -303,7 +367,10 @@ impl InboxPermissionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InboxPrivacyPolicy {
+    #[serde(default = "default_inbox_schema_version")]
+    pub version: u32,
     #[serde(default)]
     pub allow_private_bodies: bool,
     #[serde(default = "default_blocked_terms")]
@@ -315,9 +382,72 @@ pub struct InboxPrivacyPolicy {
 impl Default for InboxPrivacyPolicy {
     fn default() -> Self {
         Self {
+            version: INBOX_SCHEMA_VERSION,
             allow_private_bodies: false,
             blocked_terms: default_blocked_terms(),
             max_body_chars: DEFAULT_BODY_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxValidationCommandConfig {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InboxValidationCommandInput {
+    Legacy(String),
+    Object(InboxValidationCommandObject),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxValidationCommandObject {
+    #[serde(default = "default_inbox_schema_version")]
+    version: u32,
+    #[serde(default)]
+    name: Option<String>,
+    command: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for InboxValidationCommandConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = InboxValidationCommandInput::deserialize(deserializer)?;
+        Ok(match input {
+            InboxValidationCommandInput::Legacy(command) => Self {
+                version: INBOX_SCHEMA_VERSION,
+                name: None,
+                command,
+                timeout_seconds: None,
+            },
+            InboxValidationCommandInput::Object(object) => Self {
+                version: object.version,
+                name: object.name,
+                command: object.command,
+                timeout_seconds: object.timeout_seconds,
+            },
+        })
+    }
+}
+
+impl From<&InboxValidationCommandConfig> for AutopilotValidationCommand {
+    fn from(command: &InboxValidationCommandConfig) -> Self {
+        Self {
+            name: command.name.clone(),
+            command: command.command.clone(),
+            timeout_seconds: command.timeout_seconds,
         }
     }
 }
@@ -364,6 +494,7 @@ pub struct InboxLockRefusalDetail {
 pub struct InboxItem {
     pub item_id: String,
     pub source_key: String,
+    pub source_snapshot: InboxSourceSnapshotBinding,
     pub kind: InboxItemKind,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,6 +515,272 @@ pub struct InboxItem {
 pub enum InboxItemKind {
     Issue,
     PullRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxSourceProvider {
+    Github,
+    Fake,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxSourceSnapshotBinding {
+    version: u32,
+    provider: InboxSourceProvider,
+    repository_selector: String,
+    repository_identity: String,
+    kind: InboxItemKind,
+    number: u64,
+    source_key: String,
+    updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_oid: Option<String>,
+    digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxSourceSnapshotBindingWire {
+    version: u32,
+    provider: InboxSourceProvider,
+    repository_selector: String,
+    repository_identity: String,
+    kind: InboxItemKind,
+    number: u64,
+    source_key: String,
+    updated_at: String,
+    #[serde(default)]
+    head_oid: Option<String>,
+    #[serde(default)]
+    base_oid: Option<String>,
+    digest: String,
+}
+
+#[derive(Serialize)]
+struct InboxSourceSnapshotDigestPayload<'a> {
+    version: u32,
+    provider: InboxSourceProvider,
+    repository_selector: &'a str,
+    repository_identity: &'a str,
+    kind: InboxItemKind,
+    number: u64,
+    source_key: &'a str,
+    updated_at: &'a str,
+    head_oid: Option<&'a str>,
+    base_oid: Option<&'a str>,
+}
+
+struct InboxSourceSnapshotObservation {
+    provider: InboxSourceProvider,
+    repository_selector: String,
+    repository_identity: String,
+    kind: InboxItemKind,
+    number: u64,
+    updated_at: String,
+    head_oid: Option<String>,
+    base_oid: Option<String>,
+}
+
+impl InboxSourceSnapshotBinding {
+    pub fn for_issue(
+        provider: InboxSourceProvider,
+        repository_selector: impl Into<String>,
+        repository_identity: impl Into<String>,
+        number: u64,
+        updated_at: impl Into<String>,
+    ) -> Result<Self> {
+        Self::from_observation(InboxSourceSnapshotObservation {
+            provider,
+            repository_selector: repository_selector.into(),
+            repository_identity: repository_identity.into(),
+            kind: InboxItemKind::Issue,
+            number,
+            updated_at: updated_at.into(),
+            head_oid: None,
+            base_oid: None,
+        })
+    }
+
+    pub fn for_pull_request(
+        provider: InboxSourceProvider,
+        repository_selector: impl Into<String>,
+        repository_identity: impl Into<String>,
+        number: u64,
+        updated_at: impl Into<String>,
+        head_oid: String,
+        base_oid: String,
+    ) -> Result<Self> {
+        Self::from_observation(InboxSourceSnapshotObservation {
+            provider,
+            repository_selector: repository_selector.into(),
+            repository_identity: repository_identity.into(),
+            kind: InboxItemKind::PullRequest,
+            number,
+            updated_at: updated_at.into(),
+            head_oid: Some(head_oid),
+            base_oid: Some(base_oid),
+        })
+    }
+
+    fn from_observation(observation: InboxSourceSnapshotObservation) -> Result<Self> {
+        let mut binding = Self {
+            version: SOURCE_SNAPSHOT_VERSION,
+            provider: observation.provider,
+            repository_selector: observation.repository_selector,
+            repository_identity: observation.repository_identity,
+            kind: observation.kind,
+            number: observation.number,
+            source_key: source_key(observation.kind, observation.number),
+            updated_at: observation.updated_at,
+            head_oid: observation.head_oid,
+            base_oid: observation.base_oid,
+            digest: String::new(),
+        };
+        binding.digest = binding.deterministic_digest()?;
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub fn deterministic_digest(&self) -> Result<String> {
+        let payload = InboxSourceSnapshotDigestPayload {
+            version: self.version,
+            provider: self.provider,
+            repository_selector: &self.repository_selector,
+            repository_identity: &self.repository_identity,
+            kind: self.kind,
+            number: self.number,
+            source_key: &self.source_key,
+            updated_at: &self.updated_at,
+            head_oid: self.head_oid.as_deref(),
+            base_oid: self.base_oid.as_deref(),
+        };
+        let mut bytes = SOURCE_SNAPSHOT_DIGEST_DOMAIN.to_vec();
+        bytes.extend(
+            serde_json::to_vec(&payload)
+                .context("failed to serialize inbox source snapshot digest payload")?,
+        );
+        Ok(stable_checksum(&bytes))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_schema_version("inbox source snapshot", self.version)?;
+        validate_repository_selector(&self.repository_selector)?;
+        validate_bounded_text(
+            &self.repository_identity,
+            "inbox source snapshot repository_identity",
+            128,
+            false,
+        )?;
+        if !self.repository_identity.starts_with("maco-v1-") {
+            bail!("inbox source snapshot repository_identity is not canonical");
+        }
+        if self.number == 0 {
+            bail!("inbox source snapshot number must be positive");
+        }
+        let expected_key = source_key(self.kind, self.number);
+        if self.source_key != expected_key {
+            bail!("inbox source snapshot source_key does not match kind and number");
+        }
+        validate_timestamp(&self.updated_at)?;
+        match self.kind {
+            InboxItemKind::Issue => {
+                if self.head_oid.is_some() || self.base_oid.is_some() {
+                    bail!("inbox issue source snapshot must not contain PR OIDs");
+                }
+            }
+            InboxItemKind::PullRequest => {
+                validate_git_oid(
+                    self.head_oid
+                        .as_deref()
+                        .context("inbox PR source snapshot requires head_oid")?,
+                    "head_oid",
+                )?;
+                validate_git_oid(
+                    self.base_oid
+                        .as_deref()
+                        .context("inbox PR source snapshot requires base_oid")?,
+                    "base_oid",
+                )?;
+            }
+        }
+        if self.digest != self.deterministic_digest()? {
+            bail!("inbox source snapshot digest does not match its canonical fields");
+        }
+        Ok(())
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn provider(&self) -> InboxSourceProvider {
+        self.provider
+    }
+
+    pub fn repository_selector(&self) -> &str {
+        &self.repository_selector
+    }
+
+    pub fn repository_identity(&self) -> &str {
+        &self.repository_identity
+    }
+
+    pub fn kind(&self) -> InboxItemKind {
+        self.kind
+    }
+
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
+
+    pub fn updated_at(&self) -> &str {
+        &self.updated_at
+    }
+
+    pub fn head_oid(&self) -> Option<&str> {
+        self.head_oid.as_deref()
+    }
+
+    pub fn base_oid(&self) -> Option<&str> {
+        self.base_oid.as_deref()
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+impl<'de> Deserialize<'de> for InboxSourceSnapshotBinding {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = InboxSourceSnapshotBindingWire::deserialize(deserializer)?;
+        let binding = Self {
+            version: wire.version,
+            provider: wire.provider,
+            repository_selector: wire.repository_selector,
+            repository_identity: wire.repository_identity,
+            kind: wire.kind,
+            number: wire.number,
+            source_key: wire.source_key,
+            updated_at: wire.updated_at,
+            head_oid: wire.head_oid,
+            base_oid: wire.base_oid,
+            digest: wire.digest,
+        };
+        binding
+            .validate()
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+        Ok(binding)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -690,31 +1087,42 @@ struct InboxConfigOverrides {
 
 #[derive(Debug, Clone)]
 struct RawIssueCandidate {
+    provider: InboxSourceProvider,
     number: u64,
     title: String,
     body: String,
     url: Option<String>,
     author: Option<String>,
     labels: Vec<String>,
-    updated_at: Option<String>,
+    updated_at: String,
     assigned_paths: Vec<PathBuf>,
     path_proposal: planning::TaskPathProposalDiagnostics,
 }
 
 #[derive(Debug, Clone)]
 struct RawPrCandidate {
+    provider: InboxSourceProvider,
     number: u64,
     title: String,
     body: String,
     url: Option<String>,
     author: Option<String>,
     labels: Vec<String>,
-    updated_at: Option<String>,
+    updated_at: String,
     head_ref: Option<String>,
     base_ref: Option<String>,
+    head_oid: String,
+    base_oid: String,
+    is_draft: bool,
     changed_files: Vec<PathBuf>,
     checks: Vec<GithubCheckSummary>,
     review_feedback: GithubReviewFeedbackSummary,
+}
+
+#[derive(Debug, Clone)]
+struct SourceRepositoryBindingContext {
+    selector: String,
+    identity: String,
 }
 
 pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
@@ -725,6 +1133,12 @@ fn scan_inbox_with_overrides(
     options: InboxScanOptions,
     mut overrides: InboxConfigOverrides,
 ) -> Result<InboxScanReport> {
+    validate_cli_source_options(
+        options.github,
+        options.permission_mode,
+        options.max_items,
+        None,
+    )?;
     let repo = discover_repo_root(&options.repo)?;
     if options.max_items.is_some() {
         overrides.max_items = options.max_items;
@@ -738,6 +1152,8 @@ fn scan_inbox_with_overrides(
     let action_policy = effective_action_policy(loaded.config.action_policy, permission_mode);
     let github_enabled = permission_mode.uses_github_intake();
     let duplicate_keys = load_duplicate_keys(&repo)?;
+    let source_repository =
+        source_repository_binding_context(&repo, &loaded.config, github_enabled)?;
     let mut items = Vec::new();
     if loaded.config.selection.issues {
         let issues = if github_enabled {
@@ -746,7 +1162,12 @@ fn scan_inbox_with_overrides(
             fake_issue_candidates(&loaded.config)
         };
         for issue in issues {
-            items.push(issue_item(issue, &loaded.config, &duplicate_keys)?);
+            items.push(issue_item(
+                issue,
+                &loaded.config,
+                &source_repository,
+                &duplicate_keys,
+            )?);
         }
     }
     if loaded.config.selection.pull_requests {
@@ -756,18 +1177,18 @@ fn scan_inbox_with_overrides(
             fake_pr_candidates(&loaded.config)
         };
         for pull_request in pull_requests {
-            if !loaded.config.selection.include_draft_prs
-                && pull_request
-                    .review_feedback
-                    .review_decision
-                    .as_deref()
-                    .is_some_and(|decision| decision.eq_ignore_ascii_case("DRAFT"))
-            {
+            if !loaded.config.selection.include_draft_prs && pull_request.is_draft {
                 continue;
             }
-            items.push(pr_item(pull_request, &loaded.config, &duplicate_keys)?);
+            items.push(pr_item(
+                pull_request,
+                &loaded.config,
+                &source_repository,
+                &duplicate_keys,
+            )?);
         }
     }
+    validate_count(items.len(), "inbox candidate items", MAX_GITHUB_ITEMS)?;
     items.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
@@ -825,6 +1246,12 @@ fn run_inbox_with_overrides(
     options: InboxRunOptions,
     mut overrides: InboxConfigOverrides,
 ) -> Result<InboxRunReport> {
+    validate_cli_source_options(
+        options.github,
+        options.permission_mode,
+        options.max_items,
+        options.codex_bin.as_deref(),
+    )?;
     let repo = discover_repo_root(&options.repo)?;
     if options.max_items.is_some() {
         overrides.max_items = options.max_items;
@@ -837,6 +1264,13 @@ fn run_inbox_with_overrides(
         effective_permission_mode(&loaded.config, options.github, options.permission_mode);
     let preflight_action_policy =
         effective_action_policy(loaded.config.action_policy, preflight_permission_mode);
+    if preflight_permission_mode.publishes_real_branch_or_pr()
+        && preflight_action_policy != InboxActionPolicy::DryRun
+    {
+        bail!(
+            "real Inbox publication requires an explicitly bound external reviewer; the deterministic fake reviewer is not publication authority"
+        );
+    }
     let artifacts = run_artifacts(&options.run_id);
     let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
@@ -1053,9 +1487,13 @@ pub fn collect_inbox_run(repo: impl AsRef<Path>, run_id: RunId) -> Result<Value>
 }
 
 pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
-    if options.poll_seconds == 0 {
-        bail!("poll-seconds must be greater than zero");
-    }
+    validate_poll_seconds(options.poll_seconds)?;
+    validate_cli_source_options(
+        options.github,
+        options.permission_mode,
+        options.max_items,
+        options.codex_bin.as_deref(),
+    )?;
     let repo = discover_repo_root(&options.repo)?;
     let mut runs = Vec::new();
     let mut iteration = 0usize;
@@ -1098,6 +1536,9 @@ pub fn scan_workspace_inbox(
 }
 
 pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWorkspaceRunReport> {
+    if let Some(codex_bin) = &options.codex_bin {
+        validate_path_text(codex_bin, "workspace codex-bin", MAX_CODEX_PATH_BYTES)?;
+    }
     let loaded = load_workspace_config(&options.config)?;
     let specs = workspace_repo_specs(&loaded)?;
     let run_dir = workspace_run_dir(&loaded.config_dir, &options.run_id);
@@ -1249,8 +1690,9 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
 pub fn watch_workspace_inbox(
     options: InboxWorkspaceWatchOptions,
 ) -> Result<InboxWorkspaceWatchReport> {
-    if options.poll_seconds == 0 {
-        bail!("poll-seconds must be greater than zero");
+    validate_poll_seconds(options.poll_seconds)?;
+    if let Some(codex_bin) = &options.codex_bin {
+        validate_path_text(codex_bin, "workspace codex-bin", MAX_CODEX_PATH_BYTES)?;
     }
     let public_config_path = public_config_path(&options.config);
     let mut runs = Vec::new();
@@ -1354,6 +1796,7 @@ fn scan_workspace_specs(
 }
 
 fn load_workspace_config(path: &Path) -> Result<LoadedWorkspaceConfig> {
+    validate_path_text(path, "workspace inbox config path", MAX_CONFIG_PATH_BYTES)?;
     let absolute_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1361,37 +1804,59 @@ fn load_workspace_config(path: &Path) -> Result<LoadedWorkspaceConfig> {
             .context("failed to read current directory")?
             .join(path)
     };
-    let contents = fs::read_to_string(&absolute_path)
-        .with_context(|| format!("failed to read workspace inbox config {}", path.display()))?;
-    let config = serde_json::from_str::<InboxWorkspaceConfig>(&contents)
-        .with_context(|| format!("failed to parse workspace inbox config {}", path.display()))?;
-    let canonical_path = fs::canonicalize(&absolute_path).with_context(|| {
+    let parent = absolute_path
+        .parent()
+        .context("workspace inbox config path must have a parent directory")?;
+    let file_name = absolute_path
+        .file_name()
+        .context("workspace inbox config path must have a file name")?;
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
         format!(
-            "failed to resolve workspace inbox config {}",
-            path.display()
+            "failed to resolve workspace inbox config parent {}",
+            public_config_path(path).display()
         )
     })?;
-    let config_dir = canonical_path
-        .parent()
-        .map(Path::to_path_buf)
-        .context("workspace inbox config path must have a parent directory")?;
+    let root = SafeRoot::open_existing(&canonical_parent)
+        .context("failed to bind workspace inbox config directory")?;
+    let contents = BoundedRegularReader::read_direct(&root, file_name, MAX_CONFIG_BYTES)
+        .with_context(|| {
+            format!(
+                "failed to read bounded no-follow workspace inbox config {}",
+                public_config_path(path).display()
+            )
+        })?;
+    root.verify()
+        .context("workspace inbox config directory changed during read")?;
+    let contents =
+        String::from_utf8(contents).context("workspace inbox config is not valid UTF-8")?;
+    let config = serde_json::from_str::<InboxWorkspaceConfig>(&contents).with_context(|| {
+        format!(
+            "failed to parse workspace inbox config {}",
+            public_config_path(path).display()
+        )
+    })?;
     Ok(LoadedWorkspaceConfig {
         config: validate_workspace_config(config)?,
-        config_dir,
+        config_dir: root.path().to_path_buf(),
         public_config_path: public_config_path(path),
     })
 }
 
 fn validate_workspace_config(mut config: InboxWorkspaceConfig) -> Result<InboxWorkspaceConfig> {
-    if config.version != INBOX_SCHEMA_VERSION {
-        bail!(
-            "workspace inbox config version must be {}; got {}",
-            INBOX_SCHEMA_VERSION,
-            config.version
-        );
+    validate_schema_version("workspace inbox config", config.version)?;
+    validate_schema_version("workspace inbox safety", config.safety.version)?;
+    validate_item_limit(
+        config.default_max_items_per_repo,
+        "workspace default_max_items_per_repo",
+    )?;
+    if config.repositories.is_empty() {
+        bail!("workspace inbox config must contain at least one repository");
     }
-    if config.default_max_items_per_repo == 0 {
-        bail!("workspace default_max_items_per_repo must be greater than zero");
+    if config.repositories.len() > MAX_WORKSPACE_REPOSITORIES {
+        bail!(
+            "workspace inbox config exceeds its {} repository limit",
+            MAX_WORKSPACE_REPOSITORIES
+        );
     }
     if config.safety.allow_auto_approval {
         bail!("workspace inbox safety.allow_auto_approval=true is not supported");
@@ -1409,15 +1874,21 @@ fn validate_workspace_config(mut config: InboxWorkspaceConfig) -> Result<InboxWo
     let mut ids = BTreeSet::new();
     let mut artifact_ids = BTreeSet::new();
     for (index, repository) in config.repositories.iter_mut().enumerate() {
+        validate_schema_version(
+            &format!("workspace repository {}", index + 1),
+            repository.version,
+        )?;
         repository.id = repository.id.trim().to_string();
-        if repository.id.is_empty() {
-            bail!("workspace repository {} id cannot be empty", index + 1);
-        }
-        if !ids.insert(repository.id.clone()) {
+        validate_identifier(
+            &repository.id,
+            &format!("workspace repository {} id", index + 1),
+            MAX_WORKSPACE_REPOSITORY_ID_BYTES,
+        )?;
+        if !ids.insert(repository.id.to_ascii_lowercase()) {
             bail!("workspace repository id '{}' is duplicated", repository.id);
         }
         let artifact_id = sanitize_workspace_repo_id(&repository.id);
-        if !artifact_ids.insert(artifact_id.clone()) {
+        if !artifact_ids.insert(artifact_id.to_ascii_lowercase()) {
             bail!(
                 "workspace repository id '{}' collides with another sanitized id '{}'",
                 repository.id,
@@ -1430,25 +1901,48 @@ fn validate_workspace_config(mut config: InboxWorkspaceConfig) -> Result<InboxWo
                 repository.id
             );
         }
-        if matches!(repository.max_items, Some(0)) {
+        validate_path_text(
+            &repository.path,
+            &format!("workspace repository '{}' path", repository.id),
+            MAX_CONFIG_PATH_BYTES,
+        )?;
+        if let Some(max_items) = repository.max_items {
+            validate_item_limit(
+                max_items,
+                &format!("workspace repository '{}' max_items", repository.id),
+            )?;
+        }
+        if repository.enabled && !repository.include_issues && !repository.include_pull_requests {
             bail!(
-                "workspace repository '{}' max_items must be greater than zero",
+                "workspace repository '{}' must enable issues or pull requests",
                 repository.id
             );
         }
-        repository.labels = sorted_unique_strings(std::mem::take(&mut repository.labels));
+        repository.labels = validate_labels(
+            std::mem::take(&mut repository.labels),
+            &format!("workspace repository '{}' labels", repository.id),
+        )?;
     }
+    validate_serialized_config_size(&config, "workspace inbox config")?;
     Ok(config)
 }
 
 fn workspace_repo_specs(loaded: &LoadedWorkspaceConfig) -> Result<Vec<WorkspaceRepoSpec>> {
     let mut specs = Vec::new();
+    let mut canonical_paths = BTreeSet::new();
     for repository in &loaded.config.repositories {
-        let repo_path = if repository.path.is_absolute() {
+        let configured_path = if repository.path.is_absolute() {
             repository.path.clone()
         } else {
             loaded.config_dir.join(&repository.path)
         };
+        let repo_path = canonical_or_lexical_path(&configured_path)?;
+        if !canonical_paths.insert(repo_path.clone()) {
+            bail!(
+                "workspace repository '{}' resolves to the same canonical path as another repository",
+                repository.id
+            );
+        }
         specs.push(WorkspaceRepoSpec {
             id: repository.id.clone(),
             artifact_id: sanitize_workspace_repo_id(&repository.id),
@@ -1642,20 +2136,7 @@ fn sanitize_workspace_repo_id(id: &str) -> String {
 }
 
 fn public_config_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return public_config_file_name(path);
-    }
-    let mut public_path = PathBuf::new();
-    for component in path.components() {
-        if let Component::Normal(part) = component {
-            public_path.push(part);
-        }
-    }
-    if public_path.as_os_str().is_empty() {
-        public_config_file_name(path)
-    } else {
-        public_path
-    }
+    public_config_file_name(path)
 }
 
 fn public_config_file_name(path: &Path) -> PathBuf {
@@ -1892,7 +2373,11 @@ fn autopilot_plan_for_item(
         .as_ref()
         .map(|issue| issue.path_proposal.clone())
         .unwrap_or_default();
-    let mut validation_commands = config.default_validation_commands.clone();
+    let mut validation_commands = config
+        .default_validation_commands
+        .iter()
+        .map(AutopilotValidationCommand::from)
+        .collect::<Vec<_>>();
     for command in &mut validation_commands {
         if command.timeout_seconds.is_none() {
             command.timeout_seconds = config.timeout_seconds;
@@ -2105,9 +2590,24 @@ fn github_action_for_item(
 fn issue_item(
     raw: RawIssueCandidate,
     config: &InboxConfig,
+    source_repository: &SourceRepositoryBindingContext,
     duplicates: &BTreeMap<String, String>,
 ) -> Result<InboxItem> {
     let source_key = format!("github_issue:{}", raw.number);
+    validate_candidate_repository_url(
+        raw.provider,
+        raw.url.as_deref(),
+        &source_repository.selector,
+        InboxItemKind::Issue,
+        raw.number,
+    )?;
+    let source_snapshot = InboxSourceSnapshotBinding::for_issue(
+        raw.provider,
+        source_repository.selector.clone(),
+        source_repository.identity.clone(),
+        raw.number,
+        raw.updated_at.clone(),
+    )?;
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
     let duplicate = duplicate_result(&source_key, duplicates);
@@ -2122,15 +2622,16 @@ fn issue_item(
     let url = raw
         .url
         .as_ref()
-        .map(|value| sanitize_public_field(value, 1024));
+        .map(|value| sanitize_public_field(value, MAX_GITHUB_URL_BYTES));
     let author = raw
         .author
         .as_ref()
-        .map(|value| sanitize_public_field(value, 256));
-    let labels = sanitize_public_fields(&raw.labels, 128);
+        .map(|value| sanitize_public_field(value, MAX_GITHUB_LOGIN_BYTES));
+    let labels = sanitize_public_fields(&raw.labels, MAX_LABEL_BYTES);
     Ok(InboxItem {
         item_id: format!("issue-{}", raw.number),
         source_key,
+        source_snapshot,
         kind: InboxItemKind::Issue,
         title: title.clone(),
         url: url.clone(),
@@ -2140,7 +2641,7 @@ fn issue_item(
             url,
             author,
             labels,
-            updated_at: raw.updated_at,
+            updated_at: Some(raw.updated_at),
             body_summary: privacy.body_summary.clone(),
             body_truncated: privacy.body_truncated,
             assigned_paths: normalize_or_default(raw.assigned_paths, config)?,
@@ -2157,9 +2658,26 @@ fn issue_item(
 fn pr_item(
     raw: RawPrCandidate,
     config: &InboxConfig,
+    source_repository: &SourceRepositoryBindingContext,
     duplicates: &BTreeMap<String, String>,
 ) -> Result<InboxItem> {
     let source_key = format!("github_pr:{}", raw.number);
+    validate_candidate_repository_url(
+        raw.provider,
+        raw.url.as_deref(),
+        &source_repository.selector,
+        InboxItemKind::PullRequest,
+        raw.number,
+    )?;
+    let source_snapshot = InboxSourceSnapshotBinding::for_pull_request(
+        raw.provider,
+        source_repository.selector.clone(),
+        source_repository.identity.clone(),
+        raw.number,
+        raw.updated_at.clone(),
+        raw.head_oid.clone(),
+        raw.base_oid.clone(),
+    )?;
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
     let duplicate = duplicate_result(&source_key, duplicates);
@@ -2181,15 +2699,51 @@ fn pr_item(
     let url = raw
         .url
         .as_ref()
-        .map(|value| sanitize_public_field(value, 1024));
+        .map(|value| sanitize_public_field(value, MAX_GITHUB_URL_BYTES));
     let author = raw
         .author
         .as_ref()
-        .map(|value| sanitize_public_field(value, 256));
-    let labels = sanitize_public_fields(&raw.labels, 128);
+        .map(|value| sanitize_public_field(value, MAX_GITHUB_LOGIN_BYTES));
+    let labels = sanitize_public_fields(&raw.labels, MAX_LABEL_BYTES);
+    let checks = raw
+        .checks
+        .into_iter()
+        .map(|check| {
+            let name = sanitize_public_field(&check.name, MAX_GITHUB_TITLE_BYTES);
+            let status = check
+                .status
+                .map(|value| sanitize_public_field(&value, MAX_GITHUB_STATUS_BYTES));
+            let conclusion = check
+                .conclusion
+                .map(|value| sanitize_public_field(&value, MAX_GITHUB_STATUS_BYTES));
+            GithubCheckSummary {
+                summary: check_summary(&name, status.as_deref(), conclusion.as_deref()),
+                name,
+                status,
+                conclusion,
+                details_url: check
+                    .details_url
+                    .map(|value| sanitize_public_field(&value, MAX_GITHUB_URL_BYTES)),
+            }
+        })
+        .collect();
+    let review_feedback = GithubReviewFeedbackSummary {
+        review_decision: raw
+            .review_feedback
+            .review_decision
+            .map(|value| sanitize_public_field(&value, MAX_GITHUB_STATUS_BYTES)),
+        requested_changes: raw.review_feedback.requested_changes,
+        unresolved_thread_count: raw.review_feedback.unresolved_thread_count,
+        reviewer_logins: sanitize_public_fields(
+            &raw.review_feedback.reviewer_logins,
+            MAX_GITHUB_LOGIN_BYTES,
+        ),
+        summaries: sanitize_public_fields(&raw.review_feedback.summaries, 512),
+    };
     Ok(InboxItem {
         item_id: format!("pr-{}", raw.number),
         source_key,
+        source_snapshot,
         kind: InboxItemKind::PullRequest,
         title: title.clone(),
         url: url.clone(),
@@ -2200,12 +2754,16 @@ fn pr_item(
             url,
             author,
             labels,
-            updated_at: raw.updated_at,
-            head_ref: raw.head_ref,
-            base_ref: raw.base_ref,
+            updated_at: Some(raw.updated_at),
+            head_ref: raw
+                .head_ref
+                .map(|value| sanitize_public_field(&value, MAX_GITHUB_REF_BYTES)),
+            base_ref: raw
+                .base_ref
+                .map(|value| sanitize_public_field(&value, MAX_GITHUB_REF_BYTES)),
             changed_files: normalize_or_default(raw.changed_files, config)?,
-            checks: raw.checks,
-            review_feedback: raw.review_feedback,
+            checks,
+            review_feedback,
             body_summary: privacy.body_summary.clone(),
             body_truncated: privacy.body_truncated,
         }),
@@ -2248,6 +2806,7 @@ fn apply_scan_decisions(items: &mut [InboxItem], max_items: usize) {
 fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
     vec![
         RawIssueCandidate {
+            provider: InboxSourceProvider::Fake,
             number: 101,
             title: "Fake inbox issue: implement a focused local task".to_string(),
             body: "Implement the smallest safe code change for this deterministic fake issue."
@@ -2255,11 +2814,12 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             url: Some("fake://github/issues/101".to_string()),
             author: Some("maco-fake".to_string()),
             labels: config.selection.labels.clone(),
-            updated_at: Some("1970-01-01T00:00:00Z".to_string()),
+            updated_at: "1970-01-01T00:00:00Z".to_string(),
             assigned_paths: config.default_assigned_paths.clone(),
             path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
         RawIssueCandidate {
+            provider: InboxSourceProvider::Fake,
             number: 101,
             title: "Fake inbox issue: duplicate local task".to_string(),
             body: "Duplicate copy of the deterministic fake issue; it should be skipped."
@@ -2267,11 +2827,12 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             url: Some("fake://github/issues/101#duplicate".to_string()),
             author: Some("maco-fake".to_string()),
             labels: config.selection.labels.clone(),
-            updated_at: Some("1970-01-01T00:00:00Z".to_string()),
+            updated_at: "1970-01-01T00:00:00Z".to_string(),
             assigned_paths: config.default_assigned_paths.clone(),
             path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
         RawIssueCandidate {
+            provider: InboxSourceProvider::Fake,
             number: 303,
             title: "Fake inbox issue: unsafe private context".to_string(),
             body: "Do not publish local path /home/example/project or API_TOKEN=secret-value."
@@ -2279,7 +2840,7 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
             url: Some("fake://github/issues/303".to_string()),
             author: Some("maco-fake".to_string()),
             labels: config.selection.labels.clone(),
-            updated_at: Some("1970-01-01T00:00:00Z".to_string()),
+            updated_at: "1970-01-01T00:00:00Z".to_string(),
             assigned_paths: config.default_assigned_paths.clone(),
             path_proposal: planning::TaskPathProposalDiagnostics::default(),
         },
@@ -2288,6 +2849,7 @@ fn fake_issue_candidates(config: &InboxConfig) -> Vec<RawIssueCandidate> {
 
 fn fake_pr_candidates(config: &InboxConfig) -> Vec<RawPrCandidate> {
     vec![RawPrCandidate {
+        provider: InboxSourceProvider::Fake,
         number: 202,
         title: "Fake inbox PR: repair requested changes and failing checks".to_string(),
         body: "A deterministic fake pull request with requested changes and a failing check."
@@ -2295,9 +2857,12 @@ fn fake_pr_candidates(config: &InboxConfig) -> Vec<RawPrCandidate> {
         url: Some("fake://github/pulls/202".to_string()),
         author: Some("maco-fake".to_string()),
         labels: config.selection.labels.clone(),
-        updated_at: Some("1970-01-01T00:00:00Z".to_string()),
+        updated_at: "1970-01-01T00:00:00Z".to_string(),
         head_ref: Some("fake/inbox-pr".to_string()),
         base_ref: config.repository.default_branch.clone(),
+        head_oid: "1111111111111111111111111111111111111111".to_string(),
+        base_oid: "2222222222222222222222222222222222222222".to_string(),
+        is_draft: false,
         changed_files: config.default_assigned_paths.clone(),
         checks: vec![GithubCheckSummary {
             name: "fake-ci".to_string(),
@@ -2335,10 +2900,15 @@ fn github_issue_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawI
     let Some(values) = output.as_array() else {
         bail!("gh issue list did not return a JSON array");
     };
-    Ok(values
+    validate_count(values.len(), "gh issue list items", MAX_GITHUB_ITEMS)?;
+    values
         .iter()
-        .filter_map(|value| raw_issue_from_value(repo, value, config))
-        .collect())
+        .enumerate()
+        .map(|(index, value)| {
+            raw_issue_from_value(repo, value, config)
+                .with_context(|| format!("invalid gh issue list item {}", index + 1))
+        })
+        .collect()
 }
 
 fn github_pr_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawPrCandidate>> {
@@ -2348,7 +2918,7 @@ fn github_pr_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawPrCa
         "--state".to_string(),
         "open".to_string(),
         "--json".to_string(),
-        "number,title,body,labels,author,url,updatedAt,headRefName,baseRefName,isDraft,files,reviewDecision,latestReviews,statusCheckRollup".to_string(),
+        "number,title,body,labels,author,url,updatedAt,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup".to_string(),
         "--limit".to_string(),
         config.selection.max_items.to_string(),
     ];
@@ -2360,34 +2930,63 @@ fn github_pr_candidates(repo: &Path, config: &InboxConfig) -> Result<Vec<RawPrCa
     let Some(values) = output.as_array() else {
         bail!("gh pr list did not return a JSON array");
     };
-    Ok(values
+    validate_count(values.len(), "gh pr list items", MAX_GITHUB_ITEMS)?;
+    values
         .iter()
-        .filter(|value| {
-            config.selection.include_draft_prs || !value["isDraft"].as_bool().unwrap_or(false)
+        .enumerate()
+        .map(|(index, value)| {
+            raw_pr_from_value(value, config)
+                .with_context(|| format!("invalid gh pr list item {}", index + 1))
         })
-        .filter_map(|value| raw_pr_from_value(value, config))
-        .collect())
+        .collect()
 }
 
 fn raw_issue_from_value(
     repo: &Path,
     value: &Value,
     config: &InboxConfig,
-) -> Option<RawIssueCandidate> {
-    let title = value["title"]
-        .as_str()
-        .unwrap_or("untitled issue")
-        .to_string();
-    let body = value["body"].as_str().unwrap_or("").to_string();
+) -> Result<RawIssueCandidate> {
+    let object = value
+        .as_object()
+        .context("GitHub issue candidate must be an object")?;
+    let number = object
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("GitHub issue candidate requires an unsigned number")?;
+    if number == 0 {
+        bail!("GitHub issue number must be positive");
+    }
+    let title = required_input_string(
+        object.get("title"),
+        "GitHub issue title",
+        MAX_GITHUB_TITLE_BYTES,
+    )?;
+    let body = optional_input_body(
+        object.get("body"),
+        "GitHub issue body",
+        MAX_GITHUB_BODY_BYTES,
+    )?
+    .unwrap_or_default();
+    let updated_at = required_input_string(
+        object.get("updatedAt"),
+        "GitHub issue updatedAt",
+        MAX_TIMESTAMP_BYTES,
+    )?;
+    validate_timestamp(&updated_at)?;
     let (assigned_paths, path_proposal) = issue_path_proposal(repo, &title, &body, config);
-    Some(RawIssueCandidate {
-        number: value["number"].as_u64()?,
+    Ok(RawIssueCandidate {
+        provider: InboxSourceProvider::Github,
+        number,
         title,
         body,
-        url: value["url"].as_str().map(ToOwned::to_owned),
-        author: value["author"]["login"].as_str().map(ToOwned::to_owned),
-        labels: labels_from_value(&value["labels"]),
-        updated_at: value["updatedAt"].as_str().map(ToOwned::to_owned),
+        url: Some(required_input_string(
+            object.get("url"),
+            "GitHub issue URL",
+            MAX_GITHUB_URL_BYTES,
+        )?),
+        author: optional_nested_login(object.get("author"), "GitHub issue author")?,
+        labels: labels_from_value(object.get("labels"))?,
+        updated_at,
         assigned_paths,
         path_proposal,
     })
@@ -2421,110 +3020,209 @@ fn issue_path_proposal(
     }
 }
 
-fn raw_pr_from_value(value: &Value, _config: &InboxConfig) -> Option<RawPrCandidate> {
-    Some(RawPrCandidate {
-        number: value["number"].as_u64()?,
-        title: value["title"]
-            .as_str()
-            .unwrap_or("untitled pull request")
-            .to_string(),
-        body: value["body"].as_str().unwrap_or("").to_string(),
-        url: value["url"].as_str().map(ToOwned::to_owned),
-        author: value["author"]["login"].as_str().map(ToOwned::to_owned),
-        labels: labels_from_value(&value["labels"]),
-        updated_at: value["updatedAt"].as_str().map(ToOwned::to_owned),
-        head_ref: value["headRefName"].as_str().map(ToOwned::to_owned),
-        base_ref: value["baseRefName"].as_str().map(ToOwned::to_owned),
-        changed_files: files_from_value(&value["files"]),
-        checks: checks_from_value(&value["statusCheckRollup"]),
-        review_feedback: review_feedback_from_value(value),
+fn raw_pr_from_value(value: &Value, _config: &InboxConfig) -> Result<RawPrCandidate> {
+    let object = value
+        .as_object()
+        .context("GitHub PR candidate must be an object")?;
+    let number = object
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("GitHub PR candidate requires an unsigned number")?;
+    if number == 0 {
+        bail!("GitHub PR number must be positive");
+    }
+    let updated_at = required_input_string(
+        object.get("updatedAt"),
+        "GitHub PR updatedAt",
+        MAX_TIMESTAMP_BYTES,
+    )?;
+    validate_timestamp(&updated_at)?;
+    let head_oid = required_input_string(object.get("headRefOid"), "GitHub PR headRefOid", 64)?;
+    let base_oid = required_input_string(object.get("baseRefOid"), "GitHub PR baseRefOid", 64)?;
+    validate_git_oid(&head_oid, "headRefOid")?;
+    validate_git_oid(&base_oid, "baseRefOid")?;
+    let is_draft = match object.get("isDraft") {
+        None | Some(Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .context("GitHub PR isDraft must be a boolean")?,
+    };
+    Ok(RawPrCandidate {
+        provider: InboxSourceProvider::Github,
+        number,
+        title: required_input_string(
+            object.get("title"),
+            "GitHub PR title",
+            MAX_GITHUB_TITLE_BYTES,
+        )?,
+        body: optional_input_body(object.get("body"), "GitHub PR body", MAX_GITHUB_BODY_BYTES)?
+            .unwrap_or_default(),
+        url: Some(required_input_string(
+            object.get("url"),
+            "GitHub PR URL",
+            MAX_GITHUB_URL_BYTES,
+        )?),
+        author: optional_nested_login(object.get("author"), "GitHub PR author")?,
+        labels: labels_from_value(object.get("labels"))?,
+        updated_at,
+        head_ref: optional_input_string(
+            object.get("headRefName"),
+            "GitHub PR headRefName",
+            MAX_GITHUB_REF_BYTES,
+        )?,
+        base_ref: optional_input_string(
+            object.get("baseRefName"),
+            "GitHub PR baseRefName",
+            MAX_GITHUB_REF_BYTES,
+        )?,
+        head_oid,
+        base_oid,
+        is_draft,
+        changed_files: files_from_value(object.get("files"))?,
+        checks: checks_from_value(object.get("statusCheckRollup"))?,
+        review_feedback: review_feedback_from_value(value)?,
     })
 }
 
-fn labels_from_value(value: &Value) -> Vec<String> {
-    let mut labels = value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|label| label["name"].as_str())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    labels.sort();
-    labels.dedup();
-    labels
+fn labels_from_value(value: Option<&Value>) -> Result<Vec<String>> {
+    let values = optional_input_array(value, "GitHub labels", MAX_LABELS)?;
+    let mut labels = Vec::with_capacity(values.len());
+    for (index, label) in values.iter().enumerate() {
+        let object = label
+            .as_object()
+            .with_context(|| format!("GitHub label {} must be an object", index + 1))?;
+        labels.push(required_input_string(
+            object.get("name"),
+            &format!("GitHub label {} name", index + 1),
+            MAX_LABEL_BYTES,
+        )?);
+    }
+    validate_labels(labels, "GitHub labels")
 }
 
-fn files_from_value(value: &Value) -> Vec<PathBuf> {
-    let mut files = value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|file| file["path"].as_str())
-        .filter_map(|path| normalize_repo_relative_path(path).ok())
-        .collect::<Vec<_>>();
+fn files_from_value(value: Option<&Value>) -> Result<Vec<PathBuf>> {
+    let values = optional_input_array(value, "GitHub changed files", MAX_GITHUB_FILES)?;
+    let mut files = Vec::with_capacity(values.len());
+    for (index, file) in values.iter().enumerate() {
+        let object = file
+            .as_object()
+            .with_context(|| format!("GitHub changed file {} must be an object", index + 1))?;
+        let path = required_input_string(
+            object.get("path"),
+            &format!("GitHub changed file {} path", index + 1),
+            MAX_CONFIG_PATH_BYTES,
+        )?;
+        files.push(
+            normalize_repo_relative_path(&path)
+                .with_context(|| format!("GitHub changed file {} path is invalid", index + 1))?,
+        );
+    }
     files.sort();
     files.dedup();
-    files
+    Ok(files)
 }
 
-fn checks_from_value(value: &Value) -> Vec<GithubCheckSummary> {
-    let mut checks = value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|check| {
-            let name = first_string_field(check, &["name", "workflowName", "context"])
-                .unwrap_or_else(|| "github-check".to_string());
-            let status = first_string_field(check, &["status", "state"]);
-            let conclusion = first_string_field(check, &["conclusion"]);
-            GithubCheckSummary {
-                summary: check_summary(&name, status.as_deref(), conclusion.as_deref()),
-                name,
-                status,
-                conclusion,
-                details_url: first_string_field(check, &["detailsUrl", "targetUrl", "url"]),
-            }
-        })
-        .collect::<Vec<_>>();
+fn checks_from_value(value: Option<&Value>) -> Result<Vec<GithubCheckSummary>> {
+    let values = optional_input_array(value, "GitHub checks", MAX_GITHUB_CHECKS)?;
+    let mut checks = Vec::with_capacity(values.len());
+    for (index, check) in values.iter().enumerate() {
+        let object = check
+            .as_object()
+            .with_context(|| format!("GitHub check {} must be an object", index + 1))?;
+        let name = first_required_input_string(
+            object,
+            &["name", "workflowName", "context"],
+            &format!("GitHub check {} name", index + 1),
+            MAX_GITHUB_TITLE_BYTES,
+        )?;
+        let status = first_optional_input_string(
+            object,
+            &["status", "state"],
+            &format!("GitHub check {} status", index + 1),
+            MAX_GITHUB_STATUS_BYTES,
+        )?;
+        let conclusion = first_optional_input_string(
+            object,
+            &["conclusion"],
+            &format!("GitHub check {} conclusion", index + 1),
+            MAX_GITHUB_STATUS_BYTES,
+        )?;
+        checks.push(GithubCheckSummary {
+            summary: check_summary(&name, status.as_deref(), conclusion.as_deref()),
+            name,
+            status,
+            conclusion,
+            details_url: first_optional_input_string(
+                object,
+                &["detailsUrl", "targetUrl", "url"],
+                &format!("GitHub check {} details URL", index + 1),
+                MAX_GITHUB_URL_BYTES,
+            )?,
+        });
+    }
     checks.sort_by(|left, right| left.name.cmp(&right.name));
-    checks
+    Ok(checks)
 }
 
-fn review_feedback_from_value(value: &Value) -> GithubReviewFeedbackSummary {
-    let review_decision = value["reviewDecision"].as_str().map(ToOwned::to_owned);
+fn review_feedback_from_value(value: &Value) -> Result<GithubReviewFeedbackSummary> {
+    let object = value
+        .as_object()
+        .context("GitHub PR review payload must be an object")?;
+    let review_decision = optional_input_string(
+        object.get("reviewDecision"),
+        "GitHub PR reviewDecision",
+        MAX_GITHUB_STATUS_BYTES,
+    )?;
     let mut reviewer_logins = Vec::new();
     let mut summaries = Vec::new();
     let mut requested_changes = review_decision
         .as_deref()
         .is_some_and(|decision| decision.eq_ignore_ascii_case("CHANGES_REQUESTED"));
-    if let Some(reviews) = value["latestReviews"].as_array() {
-        for review in reviews {
-            if let Some(login) = review["author"]["login"].as_str() {
-                reviewer_logins.push(login.to_string());
-            }
-            if review["state"]
-                .as_str()
-                .is_some_and(|state| state.eq_ignore_ascii_case("CHANGES_REQUESTED"))
-            {
-                requested_changes = true;
-            }
-            if let Some(body) = review["body"].as_str() {
-                let summary = summarize_text(body, 512).text;
-                if !summary.trim().is_empty() {
-                    summaries.push(summary);
-                }
+    let reviews = optional_input_array(
+        object.get("latestReviews"),
+        "GitHub latest reviews",
+        MAX_GITHUB_REVIEWS,
+    )?;
+    for (index, review) in reviews.iter().enumerate() {
+        let review = review
+            .as_object()
+            .with_context(|| format!("GitHub review {} must be an object", index + 1))?;
+        if let Some(login) = optional_nested_login(
+            review.get("author"),
+            &format!("GitHub review {} author", index + 1),
+        )? {
+            reviewer_logins.push(login);
+        }
+        if optional_input_string(
+            review.get("state"),
+            &format!("GitHub review {} state", index + 1),
+            MAX_GITHUB_STATUS_BYTES,
+        )?
+        .as_deref()
+        .is_some_and(|state| state.eq_ignore_ascii_case("CHANGES_REQUESTED"))
+        {
+            requested_changes = true;
+        }
+        if let Some(body) = optional_input_body(
+            review.get("body"),
+            &format!("GitHub review {} body", index + 1),
+            MAX_GITHUB_REVIEW_BODY_BYTES,
+        )? {
+            let summary = summarize_text(&body, 512).text;
+            if !summary.trim().is_empty() {
+                summaries.push(summary);
             }
         }
     }
     reviewer_logins.sort();
     reviewer_logins.dedup();
-    GithubReviewFeedbackSummary {
+    Ok(GithubReviewFeedbackSummary {
         review_decision,
         requested_changes,
         unresolved_thread_count: None,
         reviewer_logins,
         summaries,
-    }
+    })
 }
 
 fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<InboxRefusal>> {
@@ -2655,13 +3353,16 @@ fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn load_config(repo: &Path) -> Result<LoadedConfig> {
-    let path = repo.join(CONFIG_FILE);
-    let (config, config_path) = if path.exists() {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+    let root = SafeRoot::open_existing(repo).context("failed to bind inbox repository root")?;
+    let (config, config_path) = if root.direct_child_exists(CONFIG_FILE)? {
+        let contents = BoundedRegularReader::read_direct(&root, CONFIG_FILE, MAX_CONFIG_BYTES)
+            .context("failed to read bounded no-follow inbox config maco-inbox.json")?;
+        root.verify()
+            .context("inbox repository root changed during config read")?;
+        let contents = String::from_utf8(contents).context("inbox config is not valid UTF-8")?;
         (
             serde_json::from_str::<InboxConfig>(&contents)
-                .with_context(|| format!("failed to parse {}", path.display()))?,
+                .context("failed to parse inbox config maco-inbox.json")?,
             Some(PathBuf::from(CONFIG_FILE)),
         )
     } else {
@@ -2679,16 +3380,13 @@ fn load_config_with_config_overrides(
 ) -> Result<LoadedConfig> {
     let mut loaded = load_config(repo)?;
     if let Some(max_items) = overrides.max_items {
-        if max_items == 0 {
-            bail!("inbox max-items must be greater than zero");
-        }
         loaded.config.selection.max_items = max_items;
     }
     if let Some(action_policy) = overrides.action_policy {
         loaded.config.action_policy = action_policy;
     }
     if let Some(labels) = overrides.labels {
-        loaded.config.selection.labels = sorted_unique_strings(labels);
+        loaded.config.selection.labels = labels;
     }
     if let Some(issues) = overrides.issues {
         loaded.config.selection.issues = issues;
@@ -2696,39 +3394,95 @@ fn load_config_with_config_overrides(
     if let Some(pull_requests) = overrides.pull_requests {
         loaded.config.selection.pull_requests = pull_requests;
     }
+    loaded.config = validate_config(loaded.config)?;
     Ok(loaded)
 }
 
 fn validate_config(mut config: InboxConfig) -> Result<InboxConfig> {
-    if config.selection.max_items == 0 {
-        bail!("inbox selection max_items must be greater than zero");
+    validate_schema_version("inbox config", config.version)?;
+    validate_schema_version("inbox repository config", config.repository.version)?;
+    validate_schema_version("inbox selection config", config.selection.version)?;
+    validate_schema_version("inbox privacy config", config.privacy.version)?;
+    validate_repository_config(&mut config.repository)?;
+    validate_item_limit(config.selection.max_items, "inbox selection max_items")?;
+    if !config.selection.issues && !config.selection.pull_requests {
+        bail!("inbox selection must enable issues or pull_requests");
     }
-    if matches!(config.timeout_seconds, Some(0)) {
-        bail!("inbox timeout_seconds must be greater than zero when set");
+    config.selection.labels = validate_labels(
+        std::mem::take(&mut config.selection.labels),
+        "inbox selection labels",
+    )?;
+    if config.action_policy == InboxActionPolicy::Github
+        && config.permission_mode == Some(InboxPermissionMode::Fake)
+    {
+        bail!("inbox action_policy github conflicts with permission_mode fake");
     }
-    config.selection.labels = sorted_unique_strings(std::mem::take(&mut config.selection.labels));
-    config.privacy.blocked_terms =
-        sorted_unique_strings(std::mem::take(&mut config.privacy.blocked_terms));
-    if config.privacy.max_body_chars == 0 {
-        config.privacy.max_body_chars = DEFAULT_BODY_LIMIT;
+    if config.max_repair_attempts > MAX_REPAIR_ATTEMPTS {
+        bail!(
+            "inbox max_repair_attempts exceeds its {} attempt limit",
+            MAX_REPAIR_ATTEMPTS
+        );
+    }
+    validate_optional_timeout(config.timeout_seconds, "inbox timeout_seconds")?;
+    if config.default_validation_commands.len() > MAX_VALIDATION_COMMANDS {
+        bail!(
+            "inbox default_validation_commands exceeds its {} command limit",
+            MAX_VALIDATION_COMMANDS
+        );
+    }
+    config.privacy.blocked_terms = validate_bounded_string_set(
+        std::mem::take(&mut config.privacy.blocked_terms),
+        "inbox privacy blocked_terms",
+        MAX_PRIVACY_TERMS,
+        MAX_PRIVACY_TERM_BYTES,
+    )?;
+    if config.privacy.max_body_chars == 0 || config.privacy.max_body_chars > MAX_BODY_LIMIT {
+        bail!(
+            "inbox privacy max_body_chars must be between 1 and {}",
+            MAX_BODY_LIMIT
+        );
+    }
+    if config.default_assigned_paths.len() > MAX_ASSIGNED_PATHS {
+        bail!(
+            "inbox default_assigned_paths exceeds its {} path limit",
+            MAX_ASSIGNED_PATHS
+        );
     }
     config.default_assigned_paths =
         normalize_or_default(std::mem::take(&mut config.default_assigned_paths), &config)?;
     for (index, command) in config.default_validation_commands.iter_mut().enumerate() {
+        validate_schema_version(
+            &format!("default validation command {}", index + 1),
+            command.version,
+        )?;
         command.command = command.command.trim().to_string();
-        if command.command.is_empty() {
-            bail!("default validation command {} cannot be empty", index + 1);
+        validate_bounded_text(
+            &command.command,
+            &format!("default validation command {} command", index + 1),
+            MAX_VALIDATION_COMMAND_BYTES,
+            false,
+        )?;
+        if let Some(name) = command.name.as_mut() {
+            *name = name.trim().to_string();
+            validate_bounded_text(
+                name,
+                &format!("default validation command {} name", index + 1),
+                MAX_VALIDATION_NAME_BYTES,
+                false,
+            )?;
         }
-        if matches!(command.timeout_seconds, Some(0)) {
-            bail!(
-                "default validation command {} timeout_seconds must be greater than zero",
-                index + 1
-            );
-        }
+        validate_optional_timeout(
+            command.timeout_seconds,
+            &format!("default validation command {} timeout_seconds", index + 1),
+        )?;
         if command.timeout_seconds.is_none() {
             command.timeout_seconds = config.timeout_seconds;
         }
     }
+    if let Some(codex_bin) = &config.codex_bin {
+        validate_path_text(codex_bin, "inbox codex_bin", MAX_CODEX_PATH_BYTES)?;
+    }
+    validate_serialized_config_size(&config, "inbox config")?;
     Ok(config)
 }
 
@@ -2739,14 +3493,38 @@ fn normalize_or_default(paths: Vec<PathBuf>, config: &InboxConfig) -> Result<Vec
         config.default_assigned_paths.clone()
     };
     let source = if paths.is_empty() { fallback } else { paths };
+    if source.len() > MAX_ASSIGNED_PATHS {
+        bail!(
+            "inbox assigned paths exceed the {} path limit",
+            MAX_ASSIGNED_PATHS
+        );
+    }
     let normalized = source
         .into_iter()
-        .map(|path| normalize_repo_relative_path(&path))
+        .map(|path| -> Result<PathBuf> {
+            validate_path_text(&path, "inbox assigned path", MAX_CONFIG_PATH_BYTES)?;
+            Ok(normalize_repo_relative_path(&path)?)
+        })
         .collect::<std::result::Result<BTreeSet<_>, _>>()?;
     Ok(normalized.into_iter().collect())
 }
 
 fn assigned_paths_for_item(item: &InboxItem, config: &InboxConfig) -> Result<Vec<PathBuf>> {
+    item.source_snapshot.validate()?;
+    let (number, updated_at) = match (item.kind, &item.issue, &item.pull_request) {
+        (InboxItemKind::Issue, Some(issue), None) => (issue.number, issue.updated_at.as_deref()),
+        (InboxItemKind::PullRequest, None, Some(pull_request)) => {
+            (pull_request.number, pull_request.updated_at.as_deref())
+        }
+        _ => bail!("inbox item kind does not match its issue/PR payload"),
+    };
+    if item.source_snapshot.kind() != item.kind
+        || item.source_snapshot.source_key() != item.source_key
+        || number != item.source_snapshot.number()
+        || updated_at != Some(item.source_snapshot.updated_at())
+    {
+        bail!("inbox item source snapshot does not match the item identity");
+    }
     match (&item.issue, &item.pull_request) {
         (Some(issue), _) => normalize_or_default(issue.assigned_paths.clone(), config),
         (_, Some(pr)) => normalize_or_default(pr.changed_files.clone(), config),
@@ -2881,8 +3659,21 @@ fn load_duplicate_keys(repo: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 fn run_gh_json(repo: &Path, config: &InboxConfig, args: &[String], label: &str) -> Result<Value> {
-    let output = run_gh_text(repo, config, args, label)?;
-    serde_json::from_str(&output.text).with_context(|| format!("{label} returned invalid JSON"))
+    let bytes = run_gh_bytes(repo, config, args, label)?;
+    parse_gh_json_bytes(bytes, label)
+}
+
+fn parse_gh_json_bytes(bytes: Vec<u8>, label: &str) -> Result<Value> {
+    if bytes.len() > GH_OUTPUT_LIMIT {
+        bail!("{label} exceeded its {GH_OUTPUT_LIMIT} byte JSON limit");
+    }
+    let text =
+        String::from_utf8(bytes).with_context(|| format!("{label} returned non-UTF-8 JSON"))?;
+    let bounded = summarize_text(&text, GH_OUTPUT_LIMIT);
+    if bounded.truncated {
+        bail!("{label} exceeded its {GH_OUTPUT_LIMIT} character JSON limit");
+    }
+    serde_json::from_str(&bounded.text).with_context(|| format!("{label} returned invalid JSON"))
 }
 
 fn run_gh_text(
@@ -2891,6 +3682,18 @@ fn run_gh_text(
     args: &[String],
     label: &str,
 ) -> Result<BoundedText> {
+    let bytes = run_gh_bytes(repo, config, args, label)?;
+    let text =
+        String::from_utf8(bytes).with_context(|| format!("{label} returned non-UTF-8 text"))?;
+    Ok(sanitize_public_text(repo, &text, GH_OUTPUT_LIMIT))
+}
+
+fn run_gh_bytes(
+    repo: &Path,
+    config: &InboxConfig,
+    args: &[String],
+    label: &str,
+) -> Result<Vec<u8>> {
     let mut command = Command::new("gh");
     command.current_dir(repo).args(args);
     if let Some(repository) = github_repository_arg(config) {
@@ -2899,11 +3702,6 @@ fn run_gh_text(
     let output = command
         .output()
         .with_context(|| format!("failed to run {label}"))?;
-    let stdout = sanitize_public_text(
-        repo,
-        &String::from_utf8_lossy(&output.stdout),
-        GH_OUTPUT_LIMIT,
-    );
     let stderr = sanitize_public_text(
         repo,
         &String::from_utf8_lossy(&output.stderr),
@@ -2919,7 +3717,7 @@ fn run_gh_text(
             }
         );
     }
-    Ok(stdout)
+    Ok(output.stdout)
 }
 
 fn github_repository_arg(config: &InboxConfig) -> Option<String> {
@@ -3165,14 +3963,532 @@ fn is_ignored_runtime_path(path: &Path) -> bool {
         || path.starts_with(".agents/storage")
 }
 
-fn sorted_unique_strings(values: Vec<String>) -> Vec<String> {
-    values
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+fn validate_schema_version(label: &str, version: u32) -> Result<()> {
+    if version != INBOX_SCHEMA_VERSION {
+        bail!(
+            "{label} version must be {}; got {version}",
+            INBOX_SCHEMA_VERSION
+        );
+    }
+    Ok(())
+}
+
+fn validate_count(count: usize, label: &str, limit: usize) -> Result<()> {
+    if count > limit {
+        bail!("{label} exceeds its {limit} item limit");
+    }
+    Ok(())
+}
+
+fn validate_item_limit(value: usize, label: &str) -> Result<()> {
+    if value == 0 || value > MAX_SELECTION_ITEMS {
+        bail!("{label} must be between 1 and {}", MAX_SELECTION_ITEMS);
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    value: &str,
+    label: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<()> {
+    if (!allow_empty && value.is_empty()) || value.len() > max_bytes {
+        bail!(
+            "{label} must contain between {} and {max_bytes} bytes",
+            usize::from(!allow_empty)
+        );
+    }
+    if value.chars().any(char::is_control) {
+        bail!("{label} must not contain control characters");
+    }
+    Ok(())
+}
+
+fn validate_multiline_text(value: &str, label: &str, max_bytes: usize) -> Result<()> {
+    if value.len() > max_bytes {
+        bail!("{label} exceeds its {max_bytes} byte limit");
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        bail!("{label} contains an unsupported control character");
+    }
+    Ok(())
+}
+
+fn validate_identifier(value: &str, label: &str, max_bytes: usize) -> Result<()> {
+    validate_bounded_text(value, label, max_bytes, false)?;
+    let mut characters = value.chars();
+    if !characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+        || !characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+    {
+        bail!(
+            "{label} must start with an ASCII letter or digit and contain only letters, digits, '.', '_' or '-'"
+        );
+    }
+    Ok(())
+}
+
+fn validate_path_text(path: &Path, label: &str, max_bytes: usize) -> Result<()> {
+    let value = path
+        .to_str()
+        .with_context(|| format!("{label} must be valid UTF-8"))?;
+    validate_bounded_text(value, label, max_bytes, false)
+}
+
+fn validate_labels(values: Vec<String>, label: &str) -> Result<Vec<String>> {
+    validate_bounded_string_set(values, label, MAX_LABELS, MAX_LABEL_BYTES)
+}
+
+fn validate_bounded_string_set(
+    values: Vec<String>,
+    label: &str,
+    max_count: usize,
+    max_bytes: usize,
+) -> Result<Vec<String>> {
+    validate_count(values.len(), label, max_count)?;
+    let mut normalized = BTreeSet::new();
+    for (index, value) in values.into_iter().enumerate() {
+        let value = value.trim().to_string();
+        validate_bounded_text(
+            &value,
+            &format!("{label} item {}", index + 1),
+            max_bytes,
+            false,
+        )?;
+        normalized.insert(value);
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn validate_optional_timeout(value: Option<u64>, label: &str) -> Result<()> {
+    if value.is_some_and(|seconds| seconds == 0 || seconds > MAX_TIMEOUT_SECONDS) {
+        bail!(
+            "{label} must be between 1 and {} seconds when set",
+            MAX_TIMEOUT_SECONDS
+        );
+    }
+    Ok(())
+}
+
+fn validate_poll_seconds(value: u64) -> Result<()> {
+    if value == 0 || value > MAX_TIMEOUT_SECONDS {
+        bail!("poll-seconds must be between 1 and {}", MAX_TIMEOUT_SECONDS);
+    }
+    Ok(())
+}
+
+fn validate_serialized_config_size<T: Serialize>(value: &T, label: &str) -> Result<()> {
+    let bytes =
+        serde_json::to_vec(value).with_context(|| format!("failed to serialize {label}"))?;
+    if bytes.len() > MAX_CONFIG_SERIALIZED_BYTES {
+        bail!(
+            "{label} exceeds its {} byte serialized limit",
+            MAX_CONFIG_SERIALIZED_BYTES
+        );
+    }
+    Ok(())
+}
+
+fn validate_repository_config(repository: &mut InboxRepositoryConfig) -> Result<()> {
+    match (&mut repository.owner, &mut repository.name) {
+        (Some(owner), Some(name)) => {
+            *owner = owner.trim().to_ascii_lowercase();
+            *name = name.trim().to_ascii_lowercase();
+            validate_github_owner(owner)?;
+            validate_github_repository_name(name)?;
+        }
+        (None, None) => {}
+        _ => bail!("inbox repository owner and name must be configured together"),
+    }
+    if let Some(branch) = repository.default_branch.as_mut() {
+        *branch = branch.trim().to_string();
+        validate_git_branch(branch)?;
+    }
+    Ok(())
+}
+
+fn validate_github_owner(owner: &str) -> Result<()> {
+    validate_bounded_text(owner, "GitHub repository owner", 39, false)?;
+    if owner.starts_with('-')
+        || owner.ends_with('-')
+        || !owner
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        bail!("GitHub repository owner is not canonical");
+    }
+    Ok(())
+}
+
+fn validate_github_repository_name(name: &str) -> Result<()> {
+    validate_bounded_text(name, "GitHub repository name", 100, false)?;
+    if matches!(name, "." | "..")
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+    {
+        bail!("GitHub repository name is not canonical");
+    }
+    Ok(())
+}
+
+fn validate_git_branch(branch: &str) -> Result<()> {
+    validate_bounded_text(branch, "inbox default_branch", 255, false)?;
+    if branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains("@{")
+        || branch
+            .chars()
+            .any(|character| matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        || branch.split('/').any(|component| {
+            component.is_empty() || component.starts_with('.') || component.ends_with(".lock")
+        })
+    {
+        bail!("inbox default_branch is not a canonical Git ref name");
+    }
+    Ok(())
+}
+
+fn validate_repository_selector(selector: &str) -> Result<()> {
+    if selector == "." {
+        return Ok(());
+    }
+    validate_bounded_text(selector, "inbox repository selector", 256, false)?;
+    let mut parts = selector.split('/');
+    let owner = parts
+        .next()
+        .context("repository selector requires an owner")?;
+    let name = parts
+        .next()
+        .context("repository selector requires a name")?;
+    if parts.next().is_some() {
+        bail!("inbox repository selector must contain exactly owner/name");
+    }
+    validate_github_owner(owner)?;
+    validate_github_repository_name(name)
+}
+
+fn validate_git_oid(oid: &str, label: &str) -> Result<()> {
+    if !matches!(oid.len(), 40 | 64)
+        || !oid
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    {
+        bail!("{label} must be a canonical lowercase 40- or 64-hex Git OID");
+    }
+    Ok(())
+}
+
+fn validate_timestamp(timestamp: &str) -> Result<()> {
+    validate_bounded_text(
+        timestamp,
+        "inbox source updatedAt",
+        MAX_TIMESTAMP_BYTES,
+        false,
+    )?;
+    let bytes = timestamp.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || !bytes[0..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..10].iter().all(u8::is_ascii_digit)
+        || !bytes[11..13].iter().all(u8::is_ascii_digit)
+        || !bytes[14..16].iter().all(u8::is_ascii_digit)
+        || !bytes[17..19].iter().all(u8::is_ascii_digit)
+    {
+        bail!("inbox source updatedAt must be a canonical RFC3339 timestamp");
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        std::str::from_utf8(&bytes[range]).ok()?.parse().ok()
+    };
+    if !matches!(number(5..7), Some(1..=12))
+        || !matches!(number(8..10), Some(1..=31))
+        || !matches!(number(11..13), Some(0..=23))
+        || !matches!(number(14..16), Some(0..=59))
+        || !matches!(number(17..19), Some(0..=59))
+        || !timestamp.ends_with('Z')
+        || (bytes.len() > 20
+            && (bytes.get(19) != Some(&b'.')
+                || !bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit)))
+    {
+        bail!("inbox source updatedAt must be a canonical UTC RFC3339 timestamp");
+    }
+    Ok(())
+}
+
+fn source_key(kind: InboxItemKind, number: u64) -> String {
+    match kind {
+        InboxItemKind::Issue => format!("github_issue:{number}"),
+        InboxItemKind::PullRequest => format!("github_pr:{number}"),
+    }
+}
+
+fn source_repository_binding_context(
+    repo_path: &Path,
+    config: &InboxConfig,
+    require_remote_match: bool,
+) -> Result<SourceRepositoryBindingContext> {
+    let repo = Repository::open(repo_path).context("failed to bind inbox source repository")?;
+    let common = SafeRoot::open_existing(repo.commondir())
+        .context("failed to bind inbox source repository common directory")?;
+    let mut identity_payload = b"MACO\0inbox-source-repository\0v1\0".to_vec();
+    identity_payload.extend_from_slice(&common.identity().device.to_be_bytes());
+    identity_payload.extend_from_slice(&common.identity().file.to_be_bytes());
+    let identity = stable_checksum(&identity_payload);
+    let origin_selector = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().and_then(remote_repository_selector));
+    let configured_selector = match (&config.repository.owner, &config.repository.name) {
+        (Some(owner), Some(name)) => Some(format!("{owner}/{name}")),
+        _ => None,
+    };
+    if require_remote_match {
+        if let Some(configured) = &configured_selector {
+            let observed = origin_selector
+                .as_deref()
+                .context("configured GitHub repository requires a canonical origin remote")?;
+            if !configured.eq_ignore_ascii_case(observed) {
+                bail!(
+                    "configured GitHub repository does not match the execution repository origin"
+                );
+            }
+        }
+    }
+    let selector = configured_selector
+        .or(origin_selector)
+        .unwrap_or_else(|| ".".to_string());
+    validate_repository_selector(&selector)?;
+    common.verify()?;
+    Ok(SourceRepositoryBindingContext { selector, identity })
+}
+
+fn remote_repository_selector(url: &str) -> Option<String> {
+    if url.starts_with('/') || url.starts_with("file:") {
+        return None;
+    }
+    let path = if let Some((_, remainder)) = url.split_once("://") {
+        remainder.split_once('/')?.1
+    } else if let Some((_, remainder)) = url.split_once(':') {
+        remainder
+    } else {
+        return None;
+    };
+    let mut components = path
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.len() < 2 {
+        return None;
+    }
+    let name = components.pop()?;
+    let owner = components.pop()?;
+    let selector = format!("{owner}/{name}").to_ascii_lowercase();
+    validate_repository_selector(&selector).ok()?;
+    Some(selector)
+}
+
+fn validate_candidate_repository_url(
+    provider: InboxSourceProvider,
+    url: Option<&str>,
+    repository_selector: &str,
+    kind: InboxItemKind,
+    number: u64,
+) -> Result<()> {
+    if provider == InboxSourceProvider::Fake {
+        return Ok(());
+    }
+    let url = url.context("GitHub candidate requires a canonical URL")?;
+    let (_, remainder) = url
+        .split_once("://")
+        .context("GitHub candidate URL requires a scheme")?;
+    let path = remainder
+        .split_once('/')
+        .map(|(_, path)| path)
+        .context("GitHub candidate URL requires a repository path")?;
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let components = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.len() < 4 {
+        bail!("GitHub candidate URL does not contain owner/name/kind/number");
+    }
+    let tail = components.len();
+    let observed_selector =
+        format!("{}/{}", components[tail - 4], components[tail - 3]).to_ascii_lowercase();
+    validate_repository_selector(&observed_selector)?;
+    let expected_kind = match kind {
+        InboxItemKind::Issue => "issues",
+        InboxItemKind::PullRequest => "pull",
+    };
+    if components[tail - 2] != expected_kind
+        || components[tail - 1].parse::<u64>().ok() != Some(number)
+    {
+        bail!("GitHub candidate URL does not match its kind and number");
+    }
+    if repository_selector != "." && observed_selector != repository_selector {
+        bail!("GitHub candidate URL does not match the bound repository selector");
+    }
+    Ok(())
+}
+
+fn canonical_or_lexical_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path).with_context(|| {
+            format!(
+                "failed to resolve workspace repository path {}",
+                path.display()
+            )
+        });
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("workspace repository path escapes its filesystem root");
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn validate_cli_source_options(
+    github: bool,
+    permission_mode: Option<InboxPermissionMode>,
+    max_items: Option<usize>,
+    codex_bin: Option<&Path>,
+) -> Result<()> {
+    if github && permission_mode == Some(InboxPermissionMode::Fake) {
+        bail!("--github conflicts with --permission fake");
+    }
+    if let Some(max_items) = max_items {
+        validate_item_limit(max_items, "inbox --max-items")?;
+    }
+    if let Some(codex_bin) = codex_bin {
+        validate_path_text(codex_bin, "inbox --codex-bin", MAX_CODEX_PATH_BYTES)?;
+    }
+    Ok(())
+}
+
+fn required_input_string(value: Option<&Value>, label: &str, max_bytes: usize) -> Result<String> {
+    let value = value
+        .and_then(Value::as_str)
+        .with_context(|| format!("{label} must be a string"))?;
+    validate_bounded_text(value, label, max_bytes, false)?;
+    Ok(value.to_string())
+}
+
+fn optional_input_string(
+    value: Option<&Value>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .with_context(|| format!("{label} must be a string or null"))?;
+    validate_bounded_text(value, label, max_bytes, false)?;
+    Ok(Some(value.to_string()))
+}
+
+fn optional_input_body(
+    value: Option<&Value>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .with_context(|| format!("{label} must be a string or null"))?;
+    validate_multiline_text(value, label, max_bytes)?;
+    Ok(Some(value.to_string()))
+}
+
+fn optional_input_array<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+    max_count: usize,
+) -> Result<&'a [Value]> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(&[]);
+    };
+    let values = value
+        .as_array()
+        .with_context(|| format!("{label} must be an array or null"))?;
+    validate_count(values.len(), label, max_count)?;
+    Ok(values)
+}
+
+fn optional_nested_login(value: Option<&Value>, label: &str) -> Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .with_context(|| format!("{label} must be an object or null"))?;
+    optional_input_string(
+        object.get("login"),
+        &format!("{label} login"),
+        MAX_GITHUB_LOGIN_BYTES,
+    )
+}
+
+fn first_optional_input_string(
+    object: &serde_json::Map<String, Value>,
+    fields: &[&str],
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    for field in fields {
+        if object.get(*field).is_some_and(|value| !value.is_null()) {
+            return optional_input_string(object.get(*field), label, max_bytes);
+        }
+    }
+    Ok(None)
+}
+
+fn first_required_input_string(
+    object: &serde_json::Map<String, Value>,
+    fields: &[&str],
+    label: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    first_optional_input_string(object, fields, label, max_bytes)?
+        .with_context(|| format!("{label} is required"))
 }
 
 fn item_target(item: &InboxItem) -> String {
@@ -3213,12 +4529,6 @@ fn path_list(paths: &[PathBuf]) -> String {
         .map(|path| format!("- {}", path.display()))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn first_string_field(value: &Value, fields: &[&str]) -> Option<String> {
-    fields
-        .iter()
-        .find_map(|field| value[*field].as_str().map(ToOwned::to_owned))
 }
 
 fn check_summary(name: &str, status: Option<&str>, conclusion: Option<&str>) -> String {
@@ -3423,6 +4733,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_inbox_schema_version() -> u32 {
+    INBOX_SCHEMA_VERSION
+}
+
 fn default_max_items() -> usize {
     DEFAULT_MAX_ITEMS
 }
@@ -3469,6 +4783,494 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+    };
+
+    #[test]
+    fn config_schema_defaults_versions_and_rejects_unknown_fields_at_every_level() {
+        let compatible: InboxConfig = serde_json::from_value(json!({
+            "default_validation_commands": ["true", {"command": "cargo test"}]
+        }))
+        .expect("legacy-compatible config");
+        let compatible = validate_config(compatible).expect("validate compatible config");
+        assert_eq!(compatible.version, INBOX_SCHEMA_VERSION);
+        assert_eq!(compatible.repository.version, INBOX_SCHEMA_VERSION);
+        assert_eq!(compatible.selection.version, INBOX_SCHEMA_VERSION);
+        assert_eq!(compatible.privacy.version, INBOX_SCHEMA_VERSION);
+        assert!(compatible
+            .default_validation_commands
+            .iter()
+            .all(|command| command.version == INBOX_SCHEMA_VERSION));
+
+        for (label, value) in [
+            ("top", json!({"unknown": true})),
+            ("repository", json!({"repository": {"unknown": true}})),
+            ("selection", json!({"selection": {"unknown": true}})),
+            ("privacy", json!({"privacy": {"unknown": true}})),
+            (
+                "validation command",
+                json!({"default_validation_commands": [{"command": "true", "unknown": true}]}),
+            ),
+        ] {
+            assert!(
+                serde_json::from_value::<InboxConfig>(value).is_err(),
+                "{label} unknown field was accepted"
+            );
+        }
+
+        for (label, value) in [
+            (
+                "workspace top",
+                json!({"repositories": [{"id": "repo", "path": "."}], "unknown": true}),
+            ),
+            (
+                "workspace repository",
+                json!({"repositories": [{"id": "repo", "path": ".", "unknown": true}]}),
+            ),
+            (
+                "workspace safety",
+                json!({"repositories": [{"id": "repo", "path": "."}], "safety": {"unknown": true}}),
+            ),
+        ] {
+            assert!(
+                serde_json::from_value::<InboxWorkspaceConfig>(value).is_err(),
+                "{label} unknown field was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn config_schema_rejects_unsupported_versions_at_every_level() {
+        for value in [
+            json!({"version": 2}),
+            json!({"repository": {"version": 2}}),
+            json!({"selection": {"version": 2}}),
+            json!({"privacy": {"version": 2}}),
+            json!({"default_validation_commands": [{"version": 2, "command": "true"}]}),
+        ] {
+            let config: InboxConfig = serde_json::from_value(value).expect("parse version fixture");
+            assert!(validate_config(config).is_err());
+        }
+
+        for value in [
+            json!({"version": 2, "repositories": [{"id": "repo", "path": "."}]}),
+            json!({"repositories": [{"version": 2, "id": "repo", "path": "."}]}),
+            json!({"repositories": [{"id": "repo", "path": "."}], "safety": {"version": 2}}),
+        ] {
+            let config: InboxWorkspaceConfig =
+                serde_json::from_value(value).expect("parse workspace version fixture");
+            assert!(validate_workspace_config(config).is_err());
+        }
+    }
+
+    #[test]
+    fn repository_config_and_cli_overrides_enforce_bounded_canonical_values() {
+        let oversized_commands = (0..MAX_VALIDATION_COMMANDS)
+            .map(|_| json!({"command": "x".repeat(MAX_VALIDATION_COMMAND_BYTES)}))
+            .collect::<Vec<_>>();
+        for (label, value) in [
+            (
+                "owner without name",
+                json!({"repository": {"owner": "acme"}}),
+            ),
+            (
+                "invalid owner",
+                json!({"repository": {"owner": "-acme", "name": "repo"}}),
+            ),
+            (
+                "invalid branch",
+                json!({"repository": {"default_branch": "refs/../main"}}),
+            ),
+            (
+                "selection count",
+                json!({"selection": {"max_items": MAX_SELECTION_ITEMS + 1}}),
+            ),
+            (
+                "selection disabled",
+                json!({"selection": {"issues": false, "pull_requests": false}}),
+            ),
+            (
+                "action permission conflict",
+                json!({"action_policy": "github", "permission_mode": "fake"}),
+            ),
+            (
+                "label control",
+                json!({"selection": {"labels": ["bad\nlabel"]}}),
+            ),
+            (
+                "repair attempts",
+                json!({"max_repair_attempts": MAX_REPAIR_ATTEMPTS + 1}),
+            ),
+            (
+                "validation count",
+                json!({"default_validation_commands": vec!["true"; MAX_VALIDATION_COMMANDS + 1]}),
+            ),
+            (
+                "validation timeout",
+                json!({"default_validation_commands": [{"command": "true", "timeout_seconds": MAX_TIMEOUT_SECONDS + 1}]}),
+            ),
+            (
+                "assigned path count",
+                json!({"default_assigned_paths": vec!["README.md"; MAX_ASSIGNED_PATHS + 1]}),
+            ),
+            (
+                "absolute assigned path",
+                json!({"default_assigned_paths": ["/tmp/outside"]}),
+            ),
+            (
+                "privacy term count",
+                json!({"privacy": {"blocked_terms": vec!["term"; MAX_PRIVACY_TERMS + 1]}}),
+            ),
+            (
+                "privacy body limit",
+                json!({"privacy": {"max_body_chars": MAX_BODY_LIMIT + 1}}),
+            ),
+            (
+                "codex path",
+                json!({"codex_bin": "x".repeat(MAX_CODEX_PATH_BYTES + 1)}),
+            ),
+            (
+                "serialized total",
+                json!({"default_validation_commands": oversized_commands}),
+            ),
+        ] {
+            let config: InboxConfig = serde_json::from_value(value).expect("parse bound fixture");
+            assert!(validate_config(config).is_err(), "{label} was accepted");
+        }
+
+        assert!(
+            validate_cli_source_options(false, None, Some(MAX_SELECTION_ITEMS + 1), None).is_err()
+        );
+        assert!(
+            validate_cli_source_options(true, Some(InboxPermissionMode::Fake), None, None).is_err()
+        );
+        assert!(validate_cli_source_options(
+            false,
+            None,
+            None,
+            Some(Path::new(&"x".repeat(MAX_CODEX_PATH_BYTES + 1)))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn workspace_config_enforces_counts_ids_paths_labels_and_strict_safety() {
+        for (label, value) in [
+            ("empty repositories", json!({"repositories": []})),
+            (
+                "repository count",
+                json!({"repositories": (0..=MAX_WORKSPACE_REPOSITORIES).map(|index| json!({"id": format!("repo-{index}"), "path": format!("repo-{index}")})).collect::<Vec<_>>() }),
+            ),
+            (
+                "invalid id",
+                json!({"repositories": [{"id": "../repo", "path": "."}]}),
+            ),
+            (
+                "case-folded duplicate id",
+                json!({"repositories": [{"id": "Repo", "path": "one"}, {"id": "repo", "path": "two"}]}),
+            ),
+            (
+                "disabled selectors",
+                json!({"repositories": [{"id": "repo", "path": ".", "include_issues": false, "include_pull_requests": false}]}),
+            ),
+            (
+                "max items",
+                json!({"default_max_items_per_repo": MAX_SELECTION_ITEMS + 1, "repositories": [{"id": "repo", "path": "."}]}),
+            ),
+            (
+                "label count",
+                json!({"repositories": [{"id": "repo", "path": ".", "labels": vec!["bug"; MAX_LABELS + 1]}]}),
+            ),
+            (
+                "auto approval",
+                json!({"repositories": [{"id": "repo", "path": "."}], "safety": {"allow_auto_approval": true}}),
+            ),
+            (
+                "unclean primary",
+                json!({"repositories": [{"id": "repo", "path": "."}], "safety": {"require_clean_primary": false}}),
+            ),
+        ] {
+            let config: InboxWorkspaceConfig =
+                serde_json::from_value(value).expect("parse workspace bound fixture");
+            assert!(
+                validate_workspace_config(config).is_err(),
+                "{label} was accepted"
+            );
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let config = validate_workspace_config(
+            serde_json::from_value(json!({
+                "repositories": [
+                    {"id": "first", "path": "."},
+                    {"id": "second", "path": "."}
+                ]
+            }))
+            .expect("parse collision fixture"),
+        )
+        .expect("validate collision fixture shape");
+        let loaded = LoadedWorkspaceConfig {
+            config,
+            config_dir: temp.path().to_path_buf(),
+            public_config_path: PathBuf::from("workspace.json"),
+        };
+        assert!(workspace_repo_specs(&loaded).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_and_workspace_configs_reject_links_special_files_oversize_and_non_utf8() {
+        let (temp, repo) = temp_repo();
+        let config = repo.join(CONFIG_FILE);
+        let external = temp.path().join("external-config.json");
+        fs::write(&external, b"{}\n").expect("external config");
+        symlink(&external, &config).expect("config symlink");
+        assert!(load_config(&repo).is_err());
+        fs::remove_file(&config).expect("remove symlink");
+
+        let fifo = CString::new(config.as_os_str().as_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(load_config(&repo).is_err());
+        fs::remove_file(&config).expect("remove FIFO");
+
+        fs::create_dir(&config).expect("config directory");
+        assert!(load_config(&repo).is_err());
+        fs::remove_dir(&config).expect("remove config directory");
+
+        fs::write(&config, vec![b'x'; MAX_CONFIG_BYTES as usize + 1]).expect("oversized config");
+        assert!(load_config(&repo).is_err());
+        fs::write(&config, [0xff, 0xfe]).expect("non-UTF8 config");
+        assert!(load_config(&repo).is_err());
+
+        let workspace = temp.path().join("workspace.json");
+        fs::remove_file(&config).expect("remove repo config");
+        symlink(&external, &workspace).expect("workspace symlink");
+        assert!(load_workspace_config(&workspace).is_err());
+        fs::remove_file(&workspace).expect("remove workspace symlink");
+        let fifo = CString::new(workspace.as_os_str().as_bytes()).expect("workspace FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(load_workspace_config(&workspace).is_err());
+        fs::remove_file(&workspace).expect("remove workspace FIFO");
+        fs::create_dir(&workspace).expect("workspace directory");
+        assert!(load_workspace_config(&workspace).is_err());
+        fs::remove_dir(&workspace).expect("remove workspace directory");
+        fs::write(&workspace, vec![b'x'; MAX_CONFIG_BYTES as usize + 1])
+            .expect("oversized workspace config");
+        assert!(load_workspace_config(&workspace).is_err());
+        fs::write(&workspace, [0xff, 0xfe]).expect("non-UTF8 workspace config");
+        assert!(load_workspace_config(&workspace).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_config_binds_the_canonical_parent_before_resolving_repo_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let real = temp.path().join("real");
+        fs::create_dir(&real).expect("real config directory");
+        let alias = temp.path().join("alias");
+        symlink(&real, &alias).expect("parent alias");
+        let config = real.join("workspace.json");
+        fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "repositories": [{"id": "repo", "path": "missing-repo"}]
+            }))
+            .expect("workspace JSON"),
+        )
+        .expect("workspace config");
+
+        let loaded = load_workspace_config(&alias.join("workspace.json")).expect("load config");
+        assert_eq!(
+            loaded.config_dir,
+            fs::canonicalize(&real).expect("canonical real")
+        );
+    }
+
+    #[test]
+    fn source_snapshot_binding_is_deterministic_validated_and_identity_stable() {
+        let identity = stable_checksum(b"repository-identity");
+        let first = InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Github,
+            "acme/repo",
+            identity.clone(),
+            42,
+            "2026-07-08T00:00:00Z",
+            "1".repeat(40),
+            "2".repeat(40),
+        )
+        .expect("first binding");
+        let second = InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Github,
+            "acme/repo",
+            identity,
+            42,
+            "2026-07-08T00:00:00Z",
+            "1".repeat(40),
+            "2".repeat(40),
+        )
+        .expect("second binding");
+        assert_eq!(first, second);
+        assert_eq!(first.source_key(), "github_pr:42");
+        assert_eq!(first.digest(), first.deterministic_digest().unwrap());
+
+        let encoded = serde_json::to_value(&first).expect("serialize binding");
+        let decoded: InboxSourceSnapshotBinding =
+            serde_json::from_value(encoded.clone()).expect("deserialize binding");
+        assert_eq!(decoded, first);
+        let mut tampered = encoded;
+        tampered["updated_at"] = json!("not-a-timestamp");
+        assert!(serde_json::from_value::<InboxSourceSnapshotBinding>(tampered).is_err());
+
+        assert!(InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Github,
+            "acme/repo",
+            stable_checksum(b"repository-identity"),
+            42,
+            "2026-07-08T00:00:00Z",
+            "not-an-oid".to_string(),
+            "2".repeat(40),
+        )
+        .is_err());
+
+        let config = InboxConfig::default();
+        let context = SourceRepositoryBindingContext {
+            selector: ".".to_string(),
+            identity: stable_checksum(b"fake-repository"),
+        };
+        let mut candidates = fake_issue_candidates(&config).into_iter();
+        let first_item = issue_item(
+            candidates.next().expect("first fake issue"),
+            &config,
+            &context,
+            &BTreeMap::new(),
+        )
+        .expect("first fake item");
+        let duplicate_item = issue_item(
+            candidates.next().expect("duplicate fake issue"),
+            &config,
+            &context,
+            &BTreeMap::new(),
+        )
+        .expect("duplicate fake item");
+        assert_eq!(first_item.source_key, duplicate_item.source_key);
+        assert_eq!(first_item.source_snapshot, duplicate_item.source_snapshot);
+    }
+
+    #[test]
+    fn source_repository_binding_matches_configured_owner_name_and_is_locally_durable() {
+        let (temp, repo_path) = temp_repo();
+        let repo = Repository::open(&repo_path).expect("open repository");
+        repo.remote("origin", "https://github.com/acme/inbox.git")
+            .expect("create origin");
+        let mut config = InboxConfig::default();
+        config.repository.owner = Some("acme".to_string());
+        config.repository.name = Some("inbox".to_string());
+        let config = validate_config(config).expect("validate repository config");
+
+        let first = source_repository_binding_context(&repo_path, &config, true)
+            .expect("first repository binding");
+        let second = source_repository_binding_context(&repo_path, &config, true)
+            .expect("second repository binding");
+        assert_eq!(first.selector, "acme/inbox");
+        assert_eq!(first.identity, second.identity);
+        assert!(first.identity.starts_with("maco-v1-"));
+
+        drop(repo);
+        let moved_repo = temp.path().join("moved-repo");
+        fs::rename(&repo_path, &moved_repo).expect("move repository");
+        let moved = source_repository_binding_context(&moved_repo, &config, true)
+            .expect("moved repository binding");
+        assert_eq!(first.identity, moved.identity);
+
+        let wrong_url = json!({
+            "number": 7,
+            "title": "wrong repository",
+            "body": "body",
+            "url": "https://github.com/acme/different/issues/7",
+            "updatedAt": "2026-07-08T00:00:00Z",
+            "labels": []
+        });
+        let raw = raw_issue_from_value(&moved_repo, &wrong_url, &config).expect("raw issue");
+        assert!(issue_item(raw, &config, &moved, &BTreeMap::new()).is_err());
+
+        let mut mismatch = config;
+        mismatch.repository.name = Some("different".to_string());
+        assert!(source_repository_binding_context(&moved_repo, &mismatch, true).is_err());
+    }
+
+    #[test]
+    fn raw_github_candidates_fail_closed_on_malformed_identity_and_nested_values() {
+        let mut pr = valid_raw_pr_value();
+        pr.as_object_mut().unwrap().remove("headRefOid");
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        let mut pr = valid_raw_pr_value();
+        pr["updatedAt"] = json!("invalid");
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        let mut pr = valid_raw_pr_value();
+        pr["files"] = json!([{"path": "/tmp/outside"}]);
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        let mut pr = valid_raw_pr_value();
+        pr["labels"] = json!((0..=MAX_LABELS)
+            .map(|index| json!({"name": format!("label-{index}")}))
+            .collect::<Vec<_>>());
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        let mut pr = valid_raw_pr_value();
+        pr["title"] = json!("x".repeat(MAX_GITHUB_TITLE_BYTES + 1));
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        let mut pr = valid_raw_pr_value();
+        pr["author"] = json!({"login": "bad\nlogin"});
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        let mut pr = valid_raw_pr_value();
+        pr["statusCheckRollup"] = json!(vec![json!({"name": "ci"}); MAX_GITHUB_CHECKS + 1]);
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        let mut pr = valid_raw_pr_value();
+        pr["latestReviews"] = json!(vec![json!({"state": "APPROVED"}); MAX_GITHUB_REVIEWS + 1]);
+        assert!(raw_pr_from_value(&pr, &InboxConfig::default()).is_err());
+
+        assert!(validate_count(
+            MAX_GITHUB_ITEMS + 1,
+            "gh issue list items",
+            MAX_GITHUB_ITEMS
+        )
+        .is_err());
+
+        let (_temp, repo) = temp_repo();
+        let issue = json!({
+            "number": 0,
+            "title": "issue",
+            "body": "body",
+            "updatedAt": "2026-07-08T00:00:00Z"
+        });
+        assert!(raw_issue_from_value(&repo, &issue, &InboxConfig::default()).is_err());
+    }
+
+    #[test]
+    fn real_publication_mode_refuses_fake_reviewer_authority_before_intake_or_artifacts() {
+        let (_temp, repo) = temp_repo();
+        let error = run_inbox(InboxRunOptions {
+            repo: repo.clone(),
+            run_id: RunId::new("reviewer-refusal").expect("run id"),
+            github: false,
+            permission_mode: Some(InboxPermissionMode::GithubGit),
+            dry_run: false,
+            max_items: Some(1),
+            codex_bin: None,
+        })
+        .expect_err("fake reviewer must not authorize real publication");
+        assert!(error.to_string().contains("external reviewer"));
+        assert!(!repo.join(".maco/inbox/runs/reviewer-refusal").exists());
+    }
+
     #[test]
     fn assigned_paths_for_issue_falls_back_to_config_default() {
         let config = InboxConfig::default();
@@ -3490,6 +5292,16 @@ mod tests {
 
         assert_eq!(exact.text, "abc");
         assert!(!exact.truncated);
+    }
+
+    #[test]
+    fn github_json_parser_rejects_oversized_truncated_and_non_utf8_source() {
+        assert!(parse_gh_json_bytes(vec![b' '; GH_OUTPUT_LIMIT + 1], "gh test").is_err());
+        assert!(parse_gh_json_bytes(vec![0xff, 0xfe], "gh test").is_err());
+        assert_eq!(
+            parse_gh_json_bytes(b"[]".to_vec(), "gh test").expect("bounded JSON"),
+            json!([])
+        );
     }
 
     #[test]
@@ -3691,7 +5503,6 @@ mod tests {
                     "needs-work".to_string(),
                     " bug ".to_string(),
                     "needs-work".to_string(),
-                    String::new(),
                 ]),
                 ..InboxConfigOverrides::default()
             },
@@ -3795,6 +5606,10 @@ mod tests {
         let public_json = serde_json::to_string(&report).expect("serialize report");
 
         assert_eq!(report.repo, PathBuf::from("."));
+        let snapshot = &report.items[0].source_snapshot;
+        snapshot.validate().expect("public snapshot binding");
+        assert_eq!(snapshot.repository_selector(), ".");
+        assert!(snapshot.repository_identity().starts_with("maco-v1-"));
         assert!(!public_json.contains(repo.to_str().expect("utf8 repo path")));
         assert!(!public_json.contains(temp.path().to_str().expect("utf8 temp path")));
     }
@@ -3843,8 +5658,13 @@ mod tests {
             "number": 9,
             "title": "PR title",
             "body": "body",
+            "url": "https://github.example/acme/repo/pull/9",
+            "updatedAt": "2026-07-08T00:00:00Z",
+            "headRefOid": "1111111111111111111111111111111111111111",
+            "baseRefOid": "2222222222222222222222222222222222222222",
+            "isDraft": false,
             "labels": [{"name": "z"}, {"name": "a"}, {"name": "a"}],
-            "files": [{"path": "src/../src/inbox.rs"}, {"path": "src/inbox.rs"}, {"path": "/tmp/outside"}],
+            "files": [{"path": "src/../src/inbox.rs"}, {"path": "src/inbox.rs"}],
             "statusCheckRollup": [
                 {"name": "ci", "status": "completed", "conclusion": "failure", "detailsUrl": "fake://ci"}
             ],
@@ -3877,6 +5697,7 @@ mod tests {
         InboxItem {
             item_id: format!("issue-{number}"),
             source_key: source_key.clone(),
+            source_snapshot: test_source_snapshot(InboxItemKind::Issue, number),
             kind: InboxItemKind::Issue,
             title: title.to_string(),
             url: None,
@@ -3886,7 +5707,7 @@ mod tests {
                 url: None,
                 author: None,
                 labels: Vec::new(),
-                updated_at: None,
+                updated_at: Some("1970-01-01T00:00:00Z".to_string()),
                 body_summary: String::new(),
                 body_truncated: false,
                 assigned_paths,
@@ -3905,6 +5726,7 @@ mod tests {
         InboxItem {
             item_id: format!("pr-{number}"),
             source_key: source_key.clone(),
+            source_snapshot: test_source_snapshot(InboxItemKind::PullRequest, number),
             kind: InboxItemKind::PullRequest,
             title: title.to_string(),
             url: Some(format!("https://github.example/repo/pull/{number}")),
@@ -3941,6 +5763,54 @@ mod tests {
             selected: true,
             skip_reason: None,
         }
+    }
+
+    fn test_source_snapshot(kind: InboxItemKind, number: u64) -> InboxSourceSnapshotBinding {
+        match kind {
+            InboxItemKind::Issue => InboxSourceSnapshotBinding::for_issue(
+                InboxSourceProvider::Fake,
+                ".",
+                stable_checksum(b"inbox-test-repository"),
+                number,
+                "1970-01-01T00:00:00Z",
+            ),
+            InboxItemKind::PullRequest => InboxSourceSnapshotBinding::for_pull_request(
+                InboxSourceProvider::Fake,
+                ".",
+                stable_checksum(b"inbox-test-repository"),
+                number,
+                "1970-01-01T00:00:00Z",
+                "1111111111111111111111111111111111111111".to_string(),
+                "2222222222222222222222222222222222222222".to_string(),
+            ),
+        }
+        .expect("test source snapshot")
+    }
+
+    fn valid_raw_pr_value() -> Value {
+        json!({
+            "number": 42,
+            "title": "Bounded PR",
+            "body": "Please repair the failing check.",
+            "url": "https://github.example/acme/repo/pull/42",
+            "author": {"login": "reviewer"},
+            "labels": [{"name": "bug"}],
+            "updatedAt": "2026-07-08T00:00:00Z",
+            "headRefName": "feature/inbox",
+            "baseRefName": "main",
+            "headRefOid": "1111111111111111111111111111111111111111",
+            "baseRefOid": "2222222222222222222222222222222222222222",
+            "isDraft": false,
+            "files": [{"path": "src/inbox.rs"}],
+            "reviewDecision": "CHANGES_REQUESTED",
+            "latestReviews": [],
+            "statusCheckRollup": [{
+                "name": "ci",
+                "status": "completed",
+                "conclusion": "failure",
+                "detailsUrl": "https://github.example/acme/repo/actions/1"
+            }]
+        })
     }
 
     fn safe_privacy() -> PrivacyScanResult {

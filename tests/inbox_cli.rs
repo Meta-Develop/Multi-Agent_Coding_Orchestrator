@@ -16,9 +16,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 // - run_processes_default_fake_items_and_writes_expected_artifacts: successful item aggregation
 // - status_and_collect_return_sanitized_repo_relative_reports: collect of a successful run
 // - github_local_reads_live_github_but_publishes_and_comments_locally: local publish completion
-// - github_git_permission_pushes_without_creating_github_pr_when_validated: Git push effect
-// - github_pr_permission_creates_draft_pr_only_when_explicit_and_validated: draft PR effect
-// - github_full_permission_comments_only_after_success_when_explicit_and_validated: comment effect
+// - real Git push, draft-PR, and source-comment success paths require an injected bound external
+//   reviewer fixture; production currently refuses the unbound Fake reviewer before effects
 // - run_passes_codex_bin_to_autopilot / watch_once_passes_codex_bin_to_autopilot: verified child
 // - workspace_run_non_strict_continues_and_strict_fails_on_refusal: successful peer repository
 // - workspace_run_permission_modes_keep_read_local_and_publish_boundaries: local/publish success
@@ -45,6 +44,17 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
 
     let items = scan["items"].as_array().context("items")?;
     assert_eq!(items.len(), 4);
+    assert!(items.iter().all(|item| {
+        item["source_snapshot"]["version"] == 1
+            && item["source_snapshot"]["provider"] == "fake"
+            && item["source_snapshot"]["repository_selector"] == "."
+            && item["source_snapshot"]["repository_identity"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("maco-v1-"))
+            && item["source_snapshot"]["digest"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("maco-v1-"))
+    }));
     assert!(items
         .iter()
         .any(|item| item["kind"] == "issue" && item["selected"] == true));
@@ -60,6 +70,23 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
     assert_eq!(
         duplicate["duplicate"]["reason"],
         "duplicate inbox candidate in current scan"
+    );
+    let original = items
+        .iter()
+        .find(|item| item["source_key"] == duplicate["source_key"] && item["selected"] == true)
+        .context("original duplicate identity")?;
+    assert_eq!(original["source_snapshot"], duplicate["source_snapshot"]);
+    let pull_request = items
+        .iter()
+        .find(|item| item["kind"] == "pull_request")
+        .context("fake pull request")?;
+    assert_eq!(
+        pull_request["source_snapshot"]["head_oid"],
+        "1111111111111111111111111111111111111111"
+    );
+    assert_eq!(
+        pull_request["source_snapshot"]["base_oid"],
+        "2222222222222222222222222222222222222222"
     );
 
     let unsafe_item = items
@@ -149,6 +176,20 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     ] {
         assert!(run_dir.join(artifact).exists(), "missing {artifact}");
     }
+
+    let selected = read_json_file(&run_dir.join("selected-items.json"))?;
+    let selected = selected.as_array().context("selected items")?;
+    assert_eq!(selected.len(), 2);
+    assert!(selected.iter().all(|item| {
+        item["source_snapshot"]["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("maco-v1-"))
+    }));
+    assert!(selected.iter().any(|item| {
+        item["kind"] == "pull_request"
+            && item["source_snapshot"]["head_oid"] == "1111111111111111111111111111111111111111"
+            && item["source_snapshot"]["base_oid"] == "2222222222222222222222222222222222222222"
+    }));
 
     let plan = read_json_file(&run_dir.join("item-1-plan.json"))?;
     assert_eq!(plan["version"], 1);
@@ -538,6 +579,67 @@ fn dry_run_config_does_not_require_cli_flag() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn invalid_repository_configs_fail_before_run_artifact_creation() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let config_path = repo_path.join("maco-inbox.json");
+    let run_dir = repo_path.join(".maco/inbox/runs/invalid-config");
+
+    for value in [
+        json!({"selection": {"unknown": "do-not-expose-this-value"}}),
+        json!({"version": 2}),
+        json!({"selection": {"max_items": 101}}),
+    ] {
+        write_json_file(&config_path, &value)?;
+        let error = run_failure_stderr(&[
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "invalid-config",
+            "--json",
+        ])?;
+        assert!(!error.contains("do-not-expose-this-value"));
+        assert!(!run_dir.exists());
+    }
+
+    fs::write(&config_path, vec![b'x'; 256 * 1024 + 1])?;
+    assert!(!run_failure_stderr(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "invalid-config",
+        "--json",
+    ])?
+    .is_empty());
+    assert!(!run_dir.exists());
+
+    fs::remove_file(&config_path)?;
+    let external = temp.path().join("external-inbox-config.json");
+    write_json_file(&external, &json!({}))?;
+    symlink(&external, &config_path)?;
+    assert!(!run_failure_stderr(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "invalid-config",
+        "--json",
+    ])?
+    .is_empty());
+    assert!(!run_dir.exists());
+
+    Ok(())
+}
+
 #[test]
 fn permission_config_overrides_legacy_action_policy() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
@@ -757,7 +859,7 @@ fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Resul
 }
 
 #[test]
-fn github_git_permission_pushes_without_creating_github_pr_when_validated() -> Result<()> {
+fn github_git_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path(), "github-git-origin.git")?;
@@ -779,7 +881,7 @@ fn github_git_permission_pushes_without_creating_github_pr_when_validated() -> R
     commit_all(&Repository::open(&repo_path)?, "inbox github git config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_failure_json_with_path(
+    let error = run_failure_stderr_with_path(
         &[
             "inbox",
             "run",
@@ -794,29 +896,20 @@ fn github_git_permission_pushes_without_creating_github_pr_when_validated() -> R
         &gh.path_dir,
     )?;
 
-    assert_eq!(report["permission_mode"], "github_git");
-    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
-    let autopilot = read_json_file(
-        &repo_path.join(".maco/inbox/runs/github-git-publish/item-1-autopilot-report.json"),
-    )?;
-    assert_eq!(autopilot["validation"]["status"], "skipped");
-    assert!(autopilot["pr"].is_null());
-    let github = read_json_file(
-        &repo_path.join(".maco/inbox/runs/github-git-publish/item-1-github-report.json"),
-    )?;
-    assert_eq!(github["status"], "local_report_only");
-
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert!(gh_log.contains("issue list"));
-    assert!(!gh_log.contains("comment"));
-    assert!(!gh_log.contains("pr create"));
-    assert_no_approval_or_merge_in_gh_log(&gh_log);
+    assert!(error.contains("external reviewer"));
+    assert!(!repo_path
+        .join(".maco/inbox/runs/github-git-publish")
+        .exists());
+    assert!(
+        !gh.log_path.exists(),
+        "GitHub intake must not run before refusal"
+    );
 
     Ok(())
 }
 
 #[test]
-fn github_pr_permission_rejects_local_origin_before_creating_draft_pr() -> Result<()> {
+fn github_pr_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let origin_path = init_bare_origin(temp.path(), "github-pr-origin.git")?;
@@ -838,7 +931,7 @@ fn github_pr_permission_rejects_local_origin_before_creating_draft_pr() -> Resul
     commit_all(&Repository::open(&repo_path)?, "inbox github pr config")?;
     let gh = write_fake_gh(temp.path())?;
 
-    let report = run_failure_json_with_path(
+    let error = run_failure_stderr_with_path(
         &[
             "inbox",
             "run",
@@ -853,41 +946,20 @@ fn github_pr_permission_rejects_local_origin_before_creating_draft_pr() -> Resul
         &gh.path_dir,
     )?;
 
-    assert_eq!(report["permission_mode"], "github_pr");
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["success"], false);
-    assert_eq!(report["item_reports"][0]["autopilot_success"], false);
-    assert_nonpublishable_autopilot_stop(&report, &repo_path, 1)?;
-    let autopilot = read_json_file(
-        &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-autopilot-report.json"),
-    )?;
-    assert_eq!(autopilot["status"], "failed");
-    assert_eq!(autopilot["success"], false);
-    assert!(autopilot["error"]
-        .as_str()
-        .context("autopilot error")?
-        .contains("supported HTTPS, SSH, or SCP-style origin URL"));
-    assert!(!autopilot
-        .to_string()
-        .contains(&origin_path.display().to_string()));
-    assert_eq!(autopilot["validation"]["status"], "skipped");
-    assert!(autopilot["pr"].is_null());
-    let github = read_json_file(
-        &repo_path.join(".maco/inbox/runs/github-pr-publish/item-1-github-report.json"),
-    )?;
-    assert_eq!(github["status"], "local_report_only");
-
-    let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert!(gh_log.contains("issue list"));
-    assert!(!gh_log.contains("pr create"));
-    assert!(!gh_log.contains("comment"));
-    assert_no_approval_or_merge_in_gh_log(&gh_log);
+    assert!(error.contains("external reviewer"));
+    assert!(!repo_path
+        .join(".maco/inbox/runs/github-pr-publish")
+        .exists());
+    assert!(
+        !gh.log_path.exists(),
+        "GitHub intake must not run before refusal"
+    );
 
     Ok(())
 }
 
 #[test]
-fn github_full_permission_skips_comments_when_publication_or_validation_fails() -> Result<()> {
+fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let success_repo = create_named_committed_repo(temp.path(), "github-full-success")?;
     let fail_repo = create_named_committed_repo(temp.path(), "github-full-fail")?;
@@ -963,50 +1035,23 @@ fn github_full_permission_skips_comments_when_publication_or_validation_fails() 
     let success_entry = workspace_repo_entry(&report, "success")?;
     assert_eq!(success_entry["permission_mode"], "github_full");
     assert_eq!(success_entry["status"], "failed");
-    assert_eq!(
-        success_entry["run_report"]["item_reports"][0]["autopilot_success"],
-        false
-    );
-    assert_eq!(
-        success_entry["run_report"]["item_reports"][0]["github_success"],
-        true
-    );
-    let success_github = read_json_file(
-        &success_repo.join(
-            success_entry["run_report"]["item_reports"][0]["github_report_path"]
-                .as_str()
-                .context("success github report path")?,
-        ),
-    )?;
-    assert_eq!(success_github["status"], "skipped");
-    assert_eq!(
-        success_github["message"],
-        "autopilot did not succeed; GitHub comment skipped"
-    );
-    assert!(success_github["comment_url"].is_null());
+    assert!(success_entry["run_report"].is_null());
+    assert!(success_entry["message"]
+        .as_str()
+        .context("success refusal message")?
+        .contains("external reviewer"));
 
     let failed_entry = workspace_repo_entry(&report, "failed-validation")?;
     assert_eq!(failed_entry["permission_mode"], "github_full");
     assert_eq!(failed_entry["status"], "failed");
-    assert_eq!(
-        failed_entry["run_report"]["item_reports"][0]["autopilot_success"],
-        false
-    );
-    let failed_github = read_json_file(
-        &fail_repo.join(
-            failed_entry["run_report"]["item_reports"][0]["github_report_path"]
-                .as_str()
-                .context("failed github report path")?,
-        ),
-    )?;
-    assert_eq!(failed_github["status"], "skipped");
-    assert_eq!(
-        failed_github["message"],
-        "autopilot did not succeed; GitHub comment skipped"
-    );
+    assert!(failed_entry["run_report"].is_null());
+    assert!(failed_entry["message"]
+        .as_str()
+        .context("failed refusal message")?
+        .contains("external reviewer"));
 
     let gh_log = fs::read_to_string(&gh.log_path).context("read gh log")?;
-    assert_eq!(gh_log.matches("issue list").count(), 4);
+    assert_eq!(gh_log.matches("issue list").count(), 2);
     assert_eq!(gh_log.matches("pr create").count(), 0);
     assert_eq!(gh_log.matches("issue comment").count(), 0);
     assert_no_approval_or_merge_in_gh_log(&gh_log);
@@ -2514,7 +2559,20 @@ fn run_failure_json(args: &[&str]) -> Result<Value> {
 }
 
 fn run_failure_stderr(args: &[&str]) -> Result<String> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    run_failure_stderr_with_optional_path(args, None)
+}
+
+fn run_failure_stderr_with_path(args: &[&str], path_dir: &Path) -> Result<String> {
+    run_failure_stderr_with_optional_path(args, Some(path_dir))
+}
+
+fn run_failure_stderr_with_optional_path(args: &[&str], path_dir: Option<&Path>) -> Result<String> {
+    let mut command = Command::new(BIN);
+    command.args(args);
+    if let Some(path_dir) = path_dir {
+        command.env("PATH", path_with_prefix(path_dir)?);
+    }
+    let output = command.output().context("run maco")?;
     if output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }

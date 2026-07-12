@@ -979,14 +979,16 @@ Run the fake-first inbox reaction loop:
 
 ```json
 {
+  "version": 1,
+  "repository": {"version": 1},
   "permission_mode": "fake",
-  "selection": {"max_items": 2},
+  "selection": {"version": 1, "max_items": 2},
   "max_repair_attempts": 1,
   "default_validation_commands": [
-    {"name": "smoke", "command": "cargo test", "timeout_seconds": 60}
+    {"version": 1, "name": "smoke", "command": "cargo test", "timeout_seconds": 60}
   ],
   "default_assigned_paths": ["README.md"],
-  "privacy": {"allow_private_bodies": false}
+  "privacy": {"version": 1, "allow_private_bodies": false}
 }
 ```
 
@@ -1010,6 +1012,25 @@ public `"."` placeholder rather than a local absolute path. Item bodies are
 bounded summaries with token-like values redacted, private key material refused,
 and local absolute paths such as `/mnt/...`, `/home/...`, or `C:\Users\...`
 rejected.
+
+Inbox config files are bounded to 256 KiB, must be regular UTF-8 files, and are
+opened without following a link. Unknown fields and unsupported schema versions
+are rejected at every config level before scanning or acting. Omitted versions
+remain compatible with version 1, and legacy validation-command strings remain
+accepted. Selection is limited to 100 items, 32 labels, 32 validation commands,
+128 assigned paths, 64 privacy terms, and 8 repair attempts; individual labels,
+commands, paths, timeouts, body-summary limits, repository selectors, and
+`codex_bin` paths are also bounded and reject control characters or noncanonical
+values. CLI overrides pass through the same validation.
+
+Each issue or pull request includes a versioned `source_snapshot` binding. It
+binds the source provider, canonical repository selector, opaque durable local
+repository identity, issue/PR kind and positive number, stable `source_key`,
+`updatedAt`, and—for pull requests—the exact `headRefOid` and `baseRefOid`.
+The deterministic digest is validated when deserialized and again before an
+item is used. Duplicate detection remains stable by repository, kind, and number
+while the snapshot digest separately identifies the observed source revision.
+Fake fixtures use fixed timestamps and canonical fake OIDs for reproducibility.
 
 `maco inbox run` processes selected candidates through the same fake-first
 autopilot flow unless config `action_policy` or CLI `--dry-run` selects dry-run
@@ -1044,6 +1065,9 @@ active/blocked live claim locks only when they overlap selected target paths,
 while ignoring its own `.maco/**` and `.maco-cache/**` runtime artifacts.
 Refusal JSON includes paths and lock details. Inbox never performs automatic
 merge; human review remains the next action after a successful reaction.
+Until an external reviewer identity and result are explicitly bound into the
+publication evidence, non-dry-run `github_git`, `github_pr`, and `github_full`
+runs fail closed; their dry-run plans and read-only intake remain available.
 
 Run the cross-repository inbox workspace supervisor:
 
@@ -1055,6 +1079,7 @@ Run the cross-repository inbox workspace supervisor:
   "strict": false,
   "repositories": [
     {
+      "version": 1,
       "id": "orchestrator",
       "path": "../Multi-Agent_Coding_Orchestrator",
       "enabled": true,
@@ -1065,6 +1090,7 @@ Run the cross-repository inbox workspace supervisor:
       "include_issues": true
     },
     {
+      "version": 1,
       "id": "docs",
       "path": "../project-docs",
       "enabled": false,
@@ -1073,6 +1099,7 @@ Run the cross-repository inbox workspace supervisor:
     }
   ],
   "safety": {
+    "version": 1,
     "require_clean_primary": true,
     "require_validation_for_publication": true,
     "allow_auto_approval": false,
@@ -1096,6 +1123,10 @@ embedded `scan_report` or `run_report`. Workspace run artifacts are written
 under `.maco/inbox-workspace/runs/<run-id>/`, while per-repo repair artifacts
 remain under each repository's `.maco/inbox/runs/<run-id>/` tree. Public reports
 must not expose local temp paths, credentials, raw secrets, or private bodies.
+Workspace configs use the same 256 KiB bounded, no-follow UTF-8 loading and
+strict unknown-field/version rules. They support at most 64 uniquely identified
+repositories; repository IDs, paths, labels, per-repository item counts, and
+canonical resolved-path collisions are validated before any repository scan.
 
 `strict: false` keeps scanning or running later repositories when one repository
 is disabled, empty, dirty, or refused; the per-repo entry records the failure.
