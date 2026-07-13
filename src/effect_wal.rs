@@ -1,33 +1,26 @@
-//! Generic authenticated write-ahead journal for externally visible effects.
+//! Authenticated write-ahead state for externally visible effects.
 //!
-//! Provider-specific reconciliation belongs to consumers. This module only
-//! enforces the durable phase machine: an effect is planned before it starts,
-//! a started effect must be observed before completion, and ambiguous started
-//! effects are never silently converted back into a retryable plan.
+//! Each stable source-action key owns one logical authenticated snapshot. The
+//! complete event sequence and phase index are committed together, so effect
+//! recovery shares the same signed locator, root-wide inventory, capacity,
+//! rollover, and lock-order model as every other authenticated snapshot.
 
-// Provider integrations consume this crate-private foundation in follow-up
-// changes; focused tests exercise the complete durable phase API now.
 #![allow(dead_code)]
 
 use crate::{
-    artifacts::state_auth::{
-        random_identifier, sha256_hex, AuthenticationDomain, AuthenticationTag, BoundStateLock,
-        RepositoryAuthenticator,
-    },
-    authenticated_snapshot::SnapshotSpec,
-    safe_state::{AtomicStateWriter, BoundedRegularReader, SafeRoot},
-    state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalRecord, JournalSpec},
+    artifacts::state_auth::{AuthenticationDomain, RepositoryAuthenticator},
+    authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
+    state_journal::{JournalIdentity, JournalSpec},
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fs, fs::File};
+use std::collections::BTreeMap;
 
 pub(crate) const EFFECT_WAL_ROOT_NAME: &str = "authenticated-effect-wals-v1";
 
-pub(crate) trait EffectWalSpec: JournalSpec {
+pub(crate) trait EffectWalSpec: SnapshotSpec {
     const EFFECT_FORMAT_VERSION: u32;
-    const LOCATOR_DOMAIN: AuthenticationDomain;
 }
 
 pub(crate) enum DefaultEffectWalSpec {}
@@ -40,9 +33,9 @@ impl JournalSpec for DefaultEffectWalSpec {
     const INSTANCE_LOCK_NAME: &'static str = ".effect-wal.lock";
     const HEAD_FILE_NAME: &'static str = ".head.json";
     const RECORD_DOMAIN: AuthenticationDomain =
-        AuthenticationDomain::new(b"MACO\0effect-wal-record\0v1\0");
+        AuthenticationDomain::new(b"MACO\0effect-wal-record\0v2\0");
     const HEAD_DOMAIN: AuthenticationDomain =
-        AuthenticationDomain::new(b"MACO\0effect-wal-head\0v1\0");
+        AuthenticationDomain::new(b"MACO\0effect-wal-head\0v2\0");
     const MAX_RECORDS: usize = 4096;
     const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
     const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
@@ -51,16 +44,6 @@ impl JournalSpec for DefaultEffectWalSpec {
     const MAX_INSTANCE_ID_BYTES: usize = 128;
 }
 
-impl EffectWalSpec for DefaultEffectWalSpec {
-    const EFFECT_FORMAT_VERSION: u32 = 1;
-    const LOCATOR_DOMAIN: AuthenticationDomain =
-        AuthenticationDomain::new(b"MACO\0effect-wal-locator\0v1\0");
-}
-
-// External-effect integration stores one authenticated logical snapshot per
-// stable source-action key in this shared namespace. The independent EffectWal
-// compatibility API remains available during the migration, but new snapshot
-// users receive an explicit namespace-wide finite retention budget.
 impl SnapshotSpec for DefaultEffectWalSpec {
     const SNAPSHOT_FORMAT_VERSION: u32 = 1;
     const LOCATOR_DOMAIN: AuthenticationDomain =
@@ -68,6 +51,10 @@ impl SnapshotSpec for DefaultEffectWalSpec {
     const MAX_LOGICAL_STORES: usize = 4_096;
     const MAX_ROOT_ENTRIES: usize = 16_384;
     const MAX_PHYSICAL_INSTANCES: usize = 8_192;
+}
+
+impl EffectWalSpec for DefaultEffectWalSpec {
+    const EFFECT_FORMAT_VERSION: u32 = 1;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -80,25 +67,6 @@ pub(crate) enum EffectPhase {
 }
 
 impl EffectPhase {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Planned => "planned",
-            Self::Started => "started",
-            Self::Observed => "observed",
-            Self::Completed => "completed",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "planned" => Ok(Self::Planned),
-            "started" => Ok(Self::Started),
-            "observed" => Ok(Self::Observed),
-            "completed" => Ok(Self::Completed),
-            _ => bail!("effect WAL contains an unsupported phase"),
-        }
-    }
-
     fn follows(self, previous: Option<Self>) -> bool {
         matches!(
             (previous, self),
@@ -120,48 +88,17 @@ pub(crate) struct EffectEvent {
     pub data: Value,
 }
 
-#[derive(Serialize)]
-struct EffectPayload<'a, T> {
-    version: u32,
-    data: &'a T,
-}
-
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct EffectPayloadWire {
-    version: u32,
-    data: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EffectWalLocator {
+struct EffectWalState {
     version: u32,
     logical_id: String,
-    active_identity: JournalIdentity,
-    sequence: u64,
-    terminal_mac: AuthenticationTag,
-    mac: AuthenticationTag,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EffectWalInitIntent {
-    version: u32,
-    logical_id: String,
-    attempt: u32,
-    physical_id: String,
-    mac: AuthenticationTag,
+    events: Vec<EffectEvent>,
+    phases: BTreeMap<String, EffectPhase>,
 }
 
 pub(crate) struct EffectWal<S: EffectWalSpec = DefaultEffectWalSpec> {
-    journal: AuthenticatedStateJournal<S>,
-    store_root: SafeRoot,
-    store_lock: BoundStateLock,
-    logical_id: String,
-    locator: EffectWalLocator,
-    events: Vec<EffectEvent>,
-    phases: BTreeMap<String, EffectPhase>,
+    store: AuthenticatedSnapshotStore<S, EffectWalState>,
 }
 
 impl<S: EffectWalSpec> EffectWal<S> {
@@ -193,154 +130,55 @@ impl<S: EffectWalSpec> EffectWal<S> {
         effect_id: &str,
         data: &T,
     ) -> Result<Self> {
-        let (store_root, store_lock, intent) =
-            begin_effect_initialization::<S>(&authenticator, logical_id)?;
-        let mut journal =
-            AuthenticatedStateJournal::<S>::create(authenticator, &intent.physical_id)?;
-        if journal.root().identity() != store_root.identity() {
-            bail!("effect WAL initialization changed its journal root identity");
-        }
-        if take_effect_fault(EffectWalFaultPoint::AfterPhysicalReservation) {
-            bail!("injected effect WAL fault after physical journal reservation");
-        }
-        let payload = EffectPayload {
+        validate_effect_logical_id::<S>(logical_id)?;
+        validate_effect_id::<S>(effect_id)?;
+        let event = EffectEvent {
             version: S::EFFECT_FORMAT_VERSION,
-            data,
-        };
-        let (event, terminal_mac) = {
-            let record = journal.append("planned", Some(effect_id), &payload)?;
-            (decode_event::<S>(record)?, record.mac.clone())
-        };
-        let mut locator = EffectWalLocator {
-            version: S::EFFECT_FORMAT_VERSION,
-            logical_id: logical_id.to_string(),
-            active_identity: journal.identity().clone(),
             sequence: 1,
-            terminal_mac,
-            mac: AuthenticationTag::zero(),
+            effect_id: effect_id.to_string(),
+            phase: EffectPhase::Planned,
+            data: serde_json::to_value(data).context("failed to encode planned effect payload")?,
         };
-        if take_effect_fault(EffectWalFaultPoint::BeforeInitialLocator) {
-            bail!("injected effect WAL fault before initial locator publication");
-        }
-        write_effect_locator::<S>(
-            journal.authenticator(),
-            &store_root,
-            &store_lock,
-            &mut locator,
-        )?;
-        if take_effect_fault(EffectWalFaultPoint::AfterInitialLocator) {
-            bail!("injected effect WAL fault after initial locator publication");
-        }
-        remove_effect_init::<S>(journal.authenticator(), &store_root, &store_lock, &intent)?;
         let mut phases = BTreeMap::new();
         phases.insert(effect_id.to_string(), EffectPhase::Planned);
-        Ok(Self {
-            journal,
-            store_root,
-            store_lock,
+        let state = EffectWalState {
+            version: S::EFFECT_FORMAT_VERSION,
             logical_id: logical_id.to_string(),
-            locator,
             events: vec![event],
             phases,
-        })
+        };
+        validate_effect_state::<S>(&state, logical_id)?;
+        let store = AuthenticatedSnapshotStore::create(authenticator, logical_id, 1, state)?;
+        let wal = Self { store };
+        wal.validate()?;
+        Ok(wal)
     }
 
     pub(crate) fn open_instance(
         authenticator: RepositoryAuthenticator,
         logical_id: &str,
     ) -> Result<Self> {
-        let store_root = AuthenticatedStateJournal::<S>::existing_root(&authenticator)?;
-        let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
-        if !store_root.direct_child_exists(effect_locator_name(logical_id))? {
-            bail!("initialized effect WAL '{logical_id}' has no signed locator");
-        }
-        root_lock.verify(&store_root)?;
-        drop(root_lock);
-        let store_lock =
-            BoundStateLock::try_acquire_exclusive(&store_root, &effect_store_lock_name(logical_id))
-                .context("effect WAL is active elsewhere")?;
-        let mut locator = read_effect_locator::<S>(&authenticator, &store_root, logical_id)?;
-        recover_effect_init_after_locator::<S>(&authenticator, &store_root, &store_lock, &locator)?;
-        let journal =
-            AuthenticatedStateJournal::<S>::open(authenticator, &locator.active_identity)?;
-        Self::from_journal(
-            journal,
-            store_root,
-            store_lock,
-            logical_id.to_string(),
-            &mut locator,
-        )
-    }
-
-    fn from_journal(
-        journal: AuthenticatedStateJournal<S>,
-        store_root: SafeRoot,
-        store_lock: BoundStateLock,
-        logical_id: String,
-        locator: &mut EffectWalLocator,
-    ) -> Result<Self> {
-        let mut events = Vec::with_capacity(journal.records().len());
-        let mut phases = BTreeMap::new();
-        for record in journal.records() {
-            let event = decode_event::<S>(record)?;
-            let previous = phases.get(&event.effect_id).copied();
-            if !event.phase.follows(previous) {
-                bail!("effect WAL phase transition is invalid or ambiguous");
-            }
-            phases.insert(event.effect_id.clone(), event.phase);
-            events.push(event);
-        }
-        let sequence = u64::try_from(events.len()).context("effect WAL sequence overflowed")?;
-        let terminal_mac = journal
-            .records()
-            .last()
-            .map(|record| record.mac.clone())
-            .context("initialized effect WAL is empty")?;
-        if sequence == locator.sequence {
-            if terminal_mac != locator.terminal_mac {
-                bail!("effect WAL locator does not match its journal tail");
-            }
-        } else if sequence == locator.sequence.saturating_add(1) {
-            let anchor_index = usize::try_from(locator.sequence.saturating_sub(1))
-                .context("effect WAL locator index overflowed")?;
-            if journal
-                .records()
-                .get(anchor_index)
-                .is_none_or(|record| record.mac != locator.terminal_mac)
-            {
-                bail!("effect WAL one-record locator recovery anchor is inconsistent");
-            }
-            locator.sequence = sequence;
-            locator.terminal_mac = terminal_mac;
-            write_effect_locator::<S>(journal.authenticator(), &store_root, &store_lock, locator)?;
-        } else {
-            bail!("effect WAL locator rollback exceeds the one-record crash window");
-        }
-        Ok(Self {
-            journal,
-            store_root,
-            store_lock,
-            logical_id,
-            locator: locator.clone(),
-            events,
-            phases,
-        })
+        validate_effect_logical_id::<S>(logical_id)?;
+        let store = AuthenticatedSnapshotStore::open_instance(authenticator, logical_id)?;
+        let wal = Self { store };
+        wal.validate()?;
+        Ok(wal)
     }
 
     pub(crate) fn identity(&self) -> &JournalIdentity {
-        self.journal.identity()
+        self.store.identity()
     }
 
     pub(crate) fn logical_id(&self) -> &str {
-        &self.logical_id
+        &self.store.current().value.logical_id
     }
 
     pub(crate) fn events(&self) -> &[EffectEvent] {
-        &self.events
+        &self.store.current().value.events
     }
 
     pub(crate) fn phase(&self, effect_id: &str) -> Option<EffectPhase> {
-        self.phases.get(effect_id).copied()
+        self.store.current().value.phases.get(effect_id).copied()
     }
 
     pub(crate) fn planned<T: Serialize>(&mut self, effect_id: &str, data: &T) -> Result<()> {
@@ -365,47 +203,44 @@ impl<S: EffectWalSpec> EffectWal<S> {
         phase: EffectPhase,
         data: &T,
     ) -> Result<()> {
-        let previous = self.phases.get(effect_id).copied();
+        validate_effect_id::<S>(effect_id)?;
+        let previous = self.phase(effect_id);
         if !phase.follows(previous) {
             bail!("effect WAL transition would skip, repeat, or retry an ambiguous phase");
         }
-        let payload = EffectPayload {
+        let sequence = u64::try_from(self.events().len())
+            .context("effect WAL sequence overflowed")?
+            .checked_add(1)
+            .context("effect WAL sequence exhausted")?;
+        if sequence > u64::try_from(S::MAX_RECORDS).unwrap_or(u64::MAX) {
+            bail!("effect WAL exceeds its bounded event count");
+        }
+        let event = EffectEvent {
             version: S::EFFECT_FORMAT_VERSION,
-            data,
+            sequence,
+            effect_id: effect_id.to_string(),
+            phase,
+            data: serde_json::to_value(data)
+                .context("failed to encode effect transition payload")?,
         };
-        let record = self
-            .journal
-            .append(phase.as_str(), Some(effect_id), &payload)?;
-        let event = decode_event::<S>(record)?;
-        self.phases.insert(effect_id.to_string(), phase);
-        self.events.push(event);
-        self.locator.sequence = u64::try_from(self.events.len())?;
-        self.locator.terminal_mac = self
-            .journal
-            .records()
-            .last()
-            .map(|record| record.mac.clone())
-            .context("effect WAL transition lost its terminal MAC")?;
-        write_effect_locator::<S>(
-            self.journal.authenticator(),
-            &self.store_root,
-            &self.store_lock,
-            &mut self.locator,
-        )?;
+        let mut next = self.store.current().value.clone();
+        next.events.push(event);
+        next.phases.insert(effect_id.to_string(), phase);
+        validate_effect_state::<S>(&next, self.logical_id())?;
+        self.store.commit(sequence, next)?;
+        self.validate()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let current = self.store.current();
+        validate_effect_state::<S>(&current.value, self.store.logical_id())?;
+        let expected =
+            u64::try_from(current.value.events.len()).context("effect WAL sequence overflowed")?;
+        if current.token != expected {
+            bail!("effect WAL snapshot token does not match its event sequence");
+        }
         Ok(())
     }
-}
-
-fn effect_locator_name(logical_id: &str) -> String {
-    format!(".effect-locator-{}.json", sha256_hex(logical_id.as_bytes()))
-}
-
-fn effect_init_name(logical_id: &str) -> String {
-    format!(".effect-init-{}.json", sha256_hex(logical_id.as_bytes()))
-}
-
-fn effect_store_lock_name(logical_id: &str) -> String {
-    format!(".effect-store-{}.lock", sha256_hex(logical_id.as_bytes()))
 }
 
 fn validate_effect_logical_id<S: EffectWalSpec>(logical_id: &str) -> Result<()> {
@@ -421,286 +256,88 @@ fn validate_effect_logical_id<S: EffectWalSpec>(logical_id: &str) -> Result<()> 
     Ok(())
 }
 
-fn begin_effect_initialization<S: EffectWalSpec>(
-    authenticator: &RepositoryAuthenticator,
-    logical_id: &str,
-) -> Result<(SafeRoot, BoundStateLock, EffectWalInitIntent)> {
-    validate_effect_logical_id::<S>(logical_id)?;
-    let root = AuthenticatedStateJournal::<S>::create_root(authenticator)?;
-    let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
-    if root.direct_child_exists(effect_locator_name(logical_id))? {
-        bail!("effect WAL logical store is already initialized");
+fn validate_effect_id<S: EffectWalSpec>(effect_id: &str) -> Result<()> {
+    if effect_id.is_empty() || effect_id.len() > S::MAX_SUBJECT_BYTES {
+        bail!("effect WAL effect id is empty or exceeds its byte bound");
     }
-    let init_name = effect_init_name(logical_id);
-    let lock_name = effect_store_lock_name(logical_id);
-    let init_exists = root.direct_child_exists(&init_name)?;
-    let lock_exists = root.direct_child_exists(&lock_name)?;
-    let (store_lock, mut intent) = if init_exists {
-        let store_lock = BoundStateLock::try_acquire_exclusive(&root, &lock_name)
-            .context("effect WAL initialization is active elsewhere")?;
-        let mut intent = read_effect_init::<S>(authenticator, &root, logical_id)?;
-        intent.attempt = intent
-            .attempt
+    Ok(())
+}
+
+fn validate_effect_state<S: EffectWalSpec>(state: &EffectWalState, logical_id: &str) -> Result<()> {
+    validate_effect_logical_id::<S>(logical_id)?;
+    if state.version != S::EFFECT_FORMAT_VERSION
+        || state.logical_id != logical_id
+        || state.events.is_empty()
+        || state.events.len() > S::MAX_RECORDS
+        || state.phases.len() > S::MAX_RECORDS
+    {
+        bail!("effect WAL snapshot is malformed or exceeds its bounds");
+    }
+    let mut phases = BTreeMap::new();
+    for (index, event) in state.events.iter().enumerate() {
+        validate_effect_id::<S>(&event.effect_id)?;
+        let sequence = u64::try_from(index)
+            .context("effect WAL sequence overflowed")?
             .checked_add(1)
-            .context("effect WAL initialization attempt overflowed")?;
-        if intent.attempt > 8 {
-            bail!("effect WAL initialization exceeded its bounded retry count");
+            .context("effect WAL sequence exhausted")?;
+        let previous = phases.get(&event.effect_id).copied();
+        if event.version != S::EFFECT_FORMAT_VERSION
+            || event.sequence != sequence
+            || !event.phase.follows(previous)
+        {
+            bail!("effect WAL event sequence or phase transition is invalid");
         }
-        intent.physical_id = random_identifier()?;
-        (store_lock, intent)
-    } else {
-        if lock_exists {
-            bail!("effect WAL locator is missing after initialization; refusing recreation");
-        }
-        let mut intent = EffectWalInitIntent {
-            version: S::EFFECT_FORMAT_VERSION,
-            logical_id: logical_id.to_string(),
-            attempt: 1,
-            physical_id: random_identifier()?,
-            mac: AuthenticationTag::zero(),
-        };
-        write_effect_init::<S>(authenticator, &root, &root_lock, &mut intent)?;
-        let store_lock = BoundStateLock::try_acquire_exclusive(&root, &lock_name)
-            .context("effect WAL initialization lock could not be acquired")?;
-        (store_lock, intent)
-    };
-    if init_exists {
-        write_effect_init::<S>(authenticator, &root, &root_lock, &mut intent)?;
+        phases.insert(event.effect_id.clone(), event.phase);
     }
-    root_lock.verify(&root)?;
-    store_lock.verify(&root)?;
-    drop(root_lock);
-    Ok((root, store_lock, intent))
-}
-
-fn effect_init_payload(intent: &EffectWalInitIntent) -> Result<Vec<u8>> {
-    serde_json::to_vec(&(
-        "effect_wal_initialization",
-        intent.version,
-        &intent.logical_id,
-        intent.attempt,
-        &intent.physical_id,
-    ))
-    .context("failed to encode effect WAL initialization intent")
-}
-
-fn validate_effect_init<S: EffectWalSpec>(
-    intent: &EffectWalInitIntent,
-    logical_id: &str,
-) -> Result<()> {
-    validate_effect_logical_id::<S>(logical_id)?;
-    intent.mac.validate()?;
-    if intent.version != S::EFFECT_FORMAT_VERSION
-        || intent.logical_id != logical_id
-        || intent.attempt == 0
-        || intent.attempt > 8
-        || intent.physical_id.len() != 64
-        || !intent
-            .physical_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        bail!("effect WAL initialization intent is malformed");
+    if phases != state.phases {
+        bail!("effect WAL phase index does not match its authenticated event sequence");
     }
     Ok(())
-}
-
-fn read_effect_init<S: EffectWalSpec>(
-    authenticator: &RepositoryAuthenticator,
-    root: &SafeRoot,
-    logical_id: &str,
-) -> Result<EffectWalInitIntent> {
-    let bytes =
-        BoundedRegularReader::read_direct(root, effect_init_name(logical_id), S::MAX_RECORD_BYTES)?;
-    let intent: EffectWalInitIntent =
-        serde_json::from_slice(&bytes).context("effect WAL initialization intent is malformed")?;
-    validate_effect_init::<S>(&intent, logical_id)?;
-    authenticator.verify_tag(
-        S::LOCATOR_DOMAIN,
-        &effect_init_payload(&intent)?,
-        &intent.mac,
-    )?;
-    Ok(intent)
-}
-
-fn write_effect_init<S: EffectWalSpec>(
-    authenticator: &RepositoryAuthenticator,
-    root: &SafeRoot,
-    lock: &BoundStateLock,
-    intent: &mut EffectWalInitIntent,
-) -> Result<()> {
-    validate_effect_init::<S>(intent, &intent.logical_id)?;
-    intent.mac = authenticator.sign(S::LOCATOR_DOMAIN, &effect_init_payload(intent)?)?;
-    let mut bytes = serde_json::to_vec(intent)?;
-    bytes.push(b'\n');
-    let name = effect_init_name(&intent.logical_id);
-    AtomicStateWriter::scavenge_direct_temps(root, &name)?;
-    AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || lock.verify(root))
-}
-
-fn remove_effect_init<S: EffectWalSpec>(
-    authenticator: &RepositoryAuthenticator,
-    root: &SafeRoot,
-    lock: &BoundStateLock,
-    expected: &EffectWalInitIntent,
-) -> Result<()> {
-    let observed = read_effect_init::<S>(authenticator, root, &expected.logical_id)?;
-    if &observed != expected {
-        bail!("effect WAL initialization intent changed before cleanup");
-    }
-    lock.verify(root)?;
-    fs::remove_file(root.direct_child(effect_init_name(&expected.logical_id))?)?;
-    File::open(root.path())?.sync_all()?;
-    lock.verify(root)
-}
-
-fn recover_effect_init_after_locator<S: EffectWalSpec>(
-    authenticator: &RepositoryAuthenticator,
-    root: &SafeRoot,
-    store_lock: &BoundStateLock,
-    locator: &EffectWalLocator,
-) -> Result<()> {
-    let name = effect_init_name(&locator.logical_id);
-    if !root.direct_child_exists(&name)? {
-        return Ok(());
-    }
-    let root_lock = BoundStateLock::acquire(root, S::ROOT_LOCK_NAME)?;
-    let intent = read_effect_init::<S>(authenticator, root, &locator.logical_id)?;
-    if intent.physical_id != locator.active_identity.run_id {
-        bail!("effect WAL locator has a mismatched initialization intent");
-    }
-    remove_effect_init::<S>(authenticator, root, store_lock, &intent)?;
-    root_lock.verify(root)
-}
-
-fn effect_locator_payload(locator: &EffectWalLocator) -> Result<Vec<u8>> {
-    serde_json::to_vec(&(
-        locator.version,
-        &locator.logical_id,
-        &locator.active_identity,
-        locator.sequence,
-        &locator.terminal_mac,
-    ))
-    .context("failed to encode effect WAL locator payload")
-}
-
-fn validate_effect_locator<S: EffectWalSpec>(
-    locator: &EffectWalLocator,
-    logical_id: &str,
-) -> Result<()> {
-    validate_effect_logical_id::<S>(logical_id)?;
-    locator.mac.validate()?;
-    locator.terminal_mac.validate()?;
-    if locator.version != S::EFFECT_FORMAT_VERSION
-        || locator.logical_id != logical_id
-        || locator.sequence == 0
-        || locator.sequence > u64::try_from(S::MAX_RECORDS).unwrap_or(u64::MAX)
-    {
-        bail!("effect WAL locator is malformed or unsupported");
-    }
-    Ok(())
-}
-
-fn read_effect_locator<S: EffectWalSpec>(
-    authenticator: &RepositoryAuthenticator,
-    root: &SafeRoot,
-    logical_id: &str,
-) -> Result<EffectWalLocator> {
-    let bytes = BoundedRegularReader::read_direct(
-        root,
-        effect_locator_name(logical_id),
-        S::MAX_RECORD_BYTES,
-    )?;
-    let locator: EffectWalLocator =
-        serde_json::from_slice(&bytes).context("effect WAL locator is malformed")?;
-    validate_effect_locator::<S>(&locator, logical_id)?;
-    authenticator.verify_repository_binding(&locator.active_identity.repository)?;
-    authenticator.verify_tag(
-        S::LOCATOR_DOMAIN,
-        &effect_locator_payload(&locator)?,
-        &locator.mac,
-    )?;
-    Ok(locator)
-}
-
-fn write_effect_locator<S: EffectWalSpec>(
-    authenticator: &RepositoryAuthenticator,
-    root: &SafeRoot,
-    lock: &BoundStateLock,
-    locator: &mut EffectWalLocator,
-) -> Result<()> {
-    validate_effect_locator::<S>(locator, &locator.logical_id)?;
-    locator.mac = authenticator.sign(S::LOCATOR_DOMAIN, &effect_locator_payload(locator)?)?;
-    let mut bytes = serde_json::to_vec(locator)?;
-    bytes.push(b'\n');
-    let name = effect_locator_name(&locator.logical_id);
-    AtomicStateWriter::scavenge_direct_temps(root, &name)?;
-    AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || lock.verify(root))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffectWalFaultPoint {
-    AfterPhysicalReservation,
-    BeforeInitialLocator,
-    AfterInitialLocator,
-}
-
-#[cfg(test)]
-thread_local! {
-    static EFFECT_WAL_FAULT: std::cell::Cell<Option<EffectWalFaultPoint>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-fn set_effect_fault(point: EffectWalFaultPoint) {
-    EFFECT_WAL_FAULT.with(|slot| slot.set(Some(point)));
-}
-
-#[cfg(test)]
-fn take_effect_fault(point: EffectWalFaultPoint) -> bool {
-    EFFECT_WAL_FAULT.with(|slot| {
-        if slot.get() == Some(point) {
-            slot.set(None);
-            true
-        } else {
-            false
-        }
-    })
-}
-
-#[cfg(not(test))]
-fn take_effect_fault(_point: EffectWalFaultPoint) -> bool {
-    false
-}
-
-fn decode_event<S: EffectWalSpec>(record: &JournalRecord) -> Result<EffectEvent> {
-    let effect_id = record
-        .subject
-        .clone()
-        .context("effect WAL record is missing its effect id")?;
-    let phase = EffectPhase::parse(&record.phase)?;
-    let payload: EffectPayloadWire = serde_json::from_value(record.payload.clone())
-        .context("effect WAL payload is malformed")?;
-    if payload.version != S::EFFECT_FORMAT_VERSION {
-        bail!("effect WAL payload version is unsupported");
-    }
-    Ok(EffectEvent {
-        version: payload.version,
-        sequence: record.sequence,
-        effect_id,
-        phase,
-        data: payload.data,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::err_expect)]
+
     use super::*;
     use crate::artifacts::repository_auth_writer;
     use git2::Repository;
     use std::fs;
     use tempfile::TempDir;
+
+    enum TinyEffectWalSpec {}
+
+    impl JournalSpec for TinyEffectWalSpec {
+        const FORMAT_VERSION: u32 = 1;
+        const NAMESPACE: &'static str = "tiny_effect_wal";
+        const ROOT_NAME: &'static str = "tiny-authenticated-effect-wals-v1";
+        const ROOT_LOCK_NAME: &'static str = ".tiny-effect-wals.lock";
+        const INSTANCE_LOCK_NAME: &'static str = ".tiny-effect-wal.lock";
+        const HEAD_FILE_NAME: &'static str = ".head.json";
+        const RECORD_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0tiny-effect-wal-record\0v1\0");
+        const HEAD_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0tiny-effect-wal-head\0v1\0");
+        const MAX_RECORDS: usize = 8;
+        const MAX_RECORD_BYTES: u64 = 64 * 1024;
+        const MAX_TOTAL_BYTES: u64 = 256 * 1024;
+        const MAX_PHASE_BYTES: usize = 32;
+        const MAX_SUBJECT_BYTES: usize = 64;
+        const MAX_INSTANCE_ID_BYTES: usize = 64;
+    }
+
+    impl SnapshotSpec for TinyEffectWalSpec {
+        const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+        const LOCATOR_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0tiny-effect-snapshot-locator\0v1\0");
+        const MAX_LOGICAL_STORES: usize = 2;
+        const MAX_ROOT_ENTRIES: usize = 7;
+        const MAX_PHYSICAL_INSTANCES: usize = 2;
+    }
+
+    impl EffectWalSpec for TinyEffectWalSpec {
+        const EFFECT_FORMAT_VERSION: u32 = 1;
+    }
 
     fn repository() -> (TempDir, std::path::PathBuf) {
         let temp = TempDir::new().expect("tempdir");
@@ -765,71 +402,105 @@ mod tests {
     }
 
     #[test]
-    fn empty_physical_reservation_crash_retries_without_exposing_empty_wal() {
+    fn default_effect_wals_share_one_snapshot_inventory_without_legacy_metadata() {
         let (_temp, path) = repository();
-        set_effect_fault(EffectWalFaultPoint::AfterPhysicalReservation);
-        EffectWal::<DefaultEffectWalSpec>::create_planned(
+        let first = EffectWal::<DefaultEffectWalSpec>::create_planned(
             authenticator(&path),
-            "reservation-crash",
-            "effect-c",
+            "source-a",
+            "effect-a",
             &(),
         )
-        .err()
-        .expect("injected reservation crash");
-
-        let wal = EffectWal::<DefaultEffectWalSpec>::create_planned(
+        .expect("first logical WAL");
+        let first_identity = first.identity().clone();
+        drop(first);
+        let second = EffectWal::<DefaultEffectWalSpec>::create_planned(
             authenticator(&path),
-            "reservation-crash",
-            "effect-c",
-            &serde_json::json!({"retry": 1}),
+            "source-b",
+            "effect-b",
+            &(),
         )
-        .expect("retry with new physical journal");
-        assert_eq!(wal.logical_id(), "reservation-crash");
-        assert_ne!(wal.identity().run_id, "reservation-crash");
-        assert_eq!(wal.events().len(), 1);
-        assert_eq!(wal.phase("effect-c"), Some(EffectPhase::Planned));
+        .expect("second logical WAL");
+        assert_ne!(second.identity(), &first_identity);
+        drop(second);
+
+        let first =
+            EffectWal::<DefaultEffectWalSpec>::open_instance(authenticator(&path), "source-a")
+                .expect("reopen first logical WAL");
+        assert_eq!(first.phase("effect-a"), Some(EffectPhase::Planned));
+        let root = path.join(".git/maco/state").join(EFFECT_WAL_ROOT_NAME);
+        for entry in std::fs::read_dir(root).expect("effect root") {
+            let name = entry
+                .expect("effect root entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8 entry");
+            assert!(!name.starts_with(".effect-locator-"));
+            assert!(!name.starts_with(".effect-init-"));
+            assert!(!name.starts_with(".effect-store-"));
+        }
     }
 
     #[test]
-    fn planned_record_without_locator_retries_from_signed_init_intent() {
+    fn effect_wal_rejects_multi_generation_locator_replay() {
         let (_temp, path) = repository();
-        set_effect_fault(EffectWalFaultPoint::BeforeInitialLocator);
-        EffectWal::<DefaultEffectWalSpec>::create_planned(
+        let mut wal = EffectWal::<DefaultEffectWalSpec>::create_planned(
             authenticator(&path),
-            "planned-crash",
-            "effect-d",
+            "source-replay",
+            "effect-replay",
             &(),
         )
-        .err()
-        .expect("injected pre-locator crash");
-        let wal = EffectWal::<DefaultEffectWalSpec>::create_planned(
-            authenticator(&path),
-            "planned-crash",
-            "effect-d",
-            &(),
-        )
-        .expect("retry planned WAL");
-        assert_eq!(wal.phase("effect-d"), Some(EffectPhase::Planned));
+        .expect("create effect WAL");
+        let root = path.join(".git/maco/state").join(EFFECT_WAL_ROOT_NAME);
+        let logical_hash = crate::artifacts::state_auth::sha256_hex(b"source-replay");
+        let locator = root.join(format!(".snapshot-locator-{logical_hash}.json"));
+        let generation_one = std::fs::read(&locator).expect("generation-one locator");
+        wal.started("effect-replay", &()).expect("started");
+        wal.observed("effect-replay", &()).expect("observed");
+        drop(wal);
+
+        std::fs::write(locator, generation_one).expect("replay old signed locator");
+        let error =
+            EffectWal::<DefaultEffectWalSpec>::open_instance(authenticator(&path), "source-replay")
+                .err()
+                .expect("multi-generation replay must fail closed");
+        assert!(error.to_string().contains("rollback exceeds"));
     }
 
     #[test]
-    fn open_cleans_matching_init_tail_after_effect_locator_publication() {
+    fn effect_wal_creation_obeys_snapshot_logical_and_root_quotas_without_residue() {
         let (_temp, path) = repository();
-        set_effect_fault(EffectWalFaultPoint::AfterInitialLocator);
-        EffectWal::<DefaultEffectWalSpec>::create_planned(
+        for logical_id in ["tiny-a", "tiny-b"] {
+            EffectWal::<TinyEffectWalSpec>::create_planned(
+                authenticator(&path),
+                logical_id,
+                "effect",
+                &(),
+            )
+            .expect("logical store within quota");
+        }
+        let error = EffectWal::<TinyEffectWalSpec>::create_planned(
             authenticator(&path),
-            "effect-init-tail",
-            "effect-e",
+            "tiny-c",
+            "effect",
             &(),
         )
         .err()
-        .expect("injected post-locator crash");
-        let wal = EffectWal::<DefaultEffectWalSpec>::open_instance(
-            authenticator(&path),
-            "effect-init-tail",
-        )
-        .expect("open recovers exact init tail");
-        assert_eq!(wal.phase("effect-e"), Some(EffectPhase::Planned));
+        .expect("quota+1 must fail");
+        assert!(error.to_string().contains("no capacity"));
+        let root = path
+            .join(".git/maco/state")
+            .join(TinyEffectWalSpec::ROOT_NAME);
+        assert_eq!(std::fs::read_dir(&root).expect("tiny root").count(), 7);
+        let rejected_hash = crate::artifacts::state_auth::sha256_hex(b"tiny-c");
+        assert!(!root
+            .join(format!(".snapshot-locator-{rejected_hash}.json"))
+            .exists());
+    }
+
+    #[test]
+    fn default_effect_capacity_exceeds_the_legacy_scavenge_ceiling() {
+        assert_eq!(DefaultEffectWalSpec::MAX_LOGICAL_STORES, 4_096);
+        assert_eq!(DefaultEffectWalSpec::MAX_ROOT_ENTRIES, 16_384);
     }
 
     fn planned_wal_record_path(path: &std::path::Path, logical_id: &str) -> std::path::PathBuf {

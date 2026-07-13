@@ -785,8 +785,23 @@ impl AtomicStateWriter {
         root: &SafeRoot,
         file_name: impl AsRef<OsStr>,
     ) -> Result<usize> {
+        Self::scavenge_direct_temps_bounded(root, file_name, 4096)
+    }
+
+    /// Removes crash residue for one exact state-file namespace while allowing
+    /// the caller to bind directory-enumeration work to its own finite root
+    /// capacity. Large shared authenticated namespaces must not inherit the
+    /// legacy 4,096-entry scan ceiling from single-file state stores.
+    pub(crate) fn scavenge_direct_temps_bounded(
+        root: &SafeRoot,
+        file_name: impl AsRef<OsStr>,
+        max_root_entries: usize,
+    ) -> Result<usize> {
         let file_name = file_name.as_ref();
         validate_single_component(file_name)?;
+        if max_root_entries == 0 {
+            bail!("state temp scavenging entry budget must be positive");
+        }
         root.verify()?;
         #[cfg(target_os = "linux")]
         {
@@ -796,7 +811,7 @@ impl AtomicStateWriter {
             prefix.push(b'.');
             let quarantine_prefix = temp_quarantine_namespace(file_name);
             let mut budget = TreeBudget {
-                remaining_entries: 4096,
+                remaining_entries: max_root_entries,
             };
             let mut removed = 0usize;
             for entry in directory_entries(root.directory.as_raw_fd(), &mut budget)? {
@@ -4223,6 +4238,29 @@ mod tests {
             BoundedRegularReader::read_direct(&root, "claims.json", 32).expect("read"),
             b"complete\n"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn caller_bounded_temp_scavenge_can_cover_a_large_finite_namespace() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("large-state")).expect("state root");
+        for index in 0..=4096_u32 {
+            fs::write(root.path().join(format!("filler-{index:04}")), b"").expect("filler entry");
+        }
+        let residue = root.path().join(".locator.json.crashed.tmp");
+        fs::write(&residue, b"partial").expect("temp residue");
+        fs::set_permissions(&residue, fs::Permissions::from_mode(0o600)).expect("private temp");
+
+        let legacy_error = AtomicStateWriter::scavenge_direct_temps(&root, "locator.json")
+            .expect_err("legacy scan budget is intentionally too small");
+        assert!(legacy_error.to_string().contains("entry budget"));
+        assert_eq!(
+            AtomicStateWriter::scavenge_direct_temps_bounded(&root, "locator.json", 4_100)
+                .expect("caller capacity covers complete root"),
+            1
+        );
+        assert!(!residue.exists());
     }
 
     #[cfg(target_os = "linux")]
