@@ -21,7 +21,10 @@ use crate::{
         identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader,
         DirectChildType, FileIdentity, KernelStateLock, ReservedDirectory, SafeRoot,
     },
-    semantic_coord::{SemanticIntent, SemanticSnapshotSpec},
+    semantic_coord::{
+        validate_legacy_semantic_payload, ResolvedSemanticSymbol, SemanticIntent,
+        SemanticIntentToken, SemanticSnapshotSpec,
+    },
     state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
     sync::PathClaim,
     sync_store::ClaimsSnapshotSpec,
@@ -1519,6 +1522,86 @@ struct LegacySemanticState {
     intents: Vec<SemanticIntent>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChecksumlessLegacySemanticStateWire {
+    version: u32,
+    next_token: u64,
+    intents: Vec<ChecksumlessLegacySemanticIntentWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChecksumlessLegacySemanticIntentWire {
+    token: u64,
+    agent_id: String,
+    paths: Vec<PathBuf>,
+    symbols: Vec<ChecksumlessLegacyResolvedSymbolWire>,
+    modules: Vec<String>,
+    impacted_files: Vec<PathBuf>,
+    task_digest: Option<String>,
+    task_excerpt: Option<String>,
+    notes: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChecksumlessLegacyResolvedSymbolWire {
+    id: String,
+    qualified_path: String,
+    name: String,
+    kind: String,
+    file: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChecksumlessLegacySemanticState {
+    pub(crate) next_token: u64,
+    pub(crate) intents: Vec<SemanticIntent>,
+}
+
+pub(crate) fn decode_checksumless_legacy_semantic_state(
+    bytes: &[u8],
+) -> Result<ChecksumlessLegacySemanticState> {
+    let wire: ChecksumlessLegacySemanticStateWire = serde_json::from_slice(bytes)
+        .context("failed to decode strict checksum-less semantic intent state")?;
+    if wire.version != 1 {
+        bail!("checksum-less semantic intent state is not supported version 1");
+    }
+    let intents = wire
+        .intents
+        .into_iter()
+        .map(|intent| SemanticIntent {
+            token: SemanticIntentToken::from_u64(intent.token),
+            agent_id: intent.agent_id,
+            paths: intent.paths,
+            symbols: intent
+                .symbols
+                .into_iter()
+                .map(|symbol| ResolvedSemanticSymbol {
+                    id: symbol.id,
+                    qualified_path: symbol.qualified_path,
+                    name: symbol.name,
+                    kind: symbol.kind,
+                    file: symbol.file,
+                })
+                .collect(),
+            modules: intent.modules,
+            impacted_files: intent.impacted_files,
+            task_digest: intent.task_digest,
+            task_excerpt: intent.task_excerpt,
+            notes: intent.notes,
+            warnings: intent.warnings,
+        })
+        .collect::<Vec<_>>();
+    validate_legacy_semantic_payload(wire.next_token, &intents)?;
+    Ok(ChecksumlessLegacySemanticState {
+        next_token: wire.next_token,
+        intents,
+    })
+}
+
 fn validate_legacy_checksum(
     file_name: &str,
     bytes: &[u8],
@@ -1542,25 +1625,31 @@ fn validate_legacy_checksum(
             ))?;
             verify_legacy_checksum(&state.checksum, &payload, file_name)
         }
-        "semantic_intents.json" => {
-            let state: LegacySemanticState = serde_json::from_slice(bytes)
-                .context("failed to decode checksummed semantic intent state")?;
-            if state.version != 2 || state.next_token == 0 {
-                bail!("semantic intent state is not supported checksummed version 2");
+        "semantic_intents.json" => match serde_json::from_slice::<LegacySemanticState>(bytes) {
+            Ok(state) => {
+                if state.version != 2 || state.next_token == 0 {
+                    bail!("semantic intent state is not supported checksummed version 2");
+                }
+                if state.repository != expected.repository_state {
+                    bail!(
+                            "semantic intent state repository binding does not match the migration repository"
+                        );
+                }
+                validate_legacy_semantic_payload(state.next_token, &state.intents)?;
+                let payload = serde_json::to_vec(&(
+                    state.version,
+                    &state.repository,
+                    state.next_token,
+                    &state.intents,
+                ))?;
+                verify_legacy_checksum(&state.checksum, &payload, file_name)
             }
-            if state.repository != expected.repository_state {
-                bail!(
-                    "semantic intent state repository binding does not match the migration repository"
-                );
+            Err(_) => {
+                let state = decode_checksumless_legacy_semantic_state(bytes)?;
+                let payload = serde_json::to_vec(&(1_u32, state.next_token, &state.intents))?;
+                Ok(stable_checksum(&payload))
             }
-            let payload = serde_json::to_vec(&(
-                state.version,
-                &state.repository,
-                state.next_token,
-                &state.intents,
-            ))?;
-            verify_legacy_checksum(&state.checksum, &payload, file_name)
-        }
+        },
         "managed_worktrees.json" => validate_managed_worktree_checksum(
             bytes,
             expected
@@ -3073,7 +3162,7 @@ fn take_migration_fault(_point: MigrationFaultPoint) -> Option<MigrationFaultAct
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sync::ClaimToken, sync_store::SyncStore};
+    use crate::{semantic_coord::SemanticIntentStore, sync::ClaimToken, sync_store::SyncStore};
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -3123,6 +3212,31 @@ mod tests {
         let state = SafeRoot::open_or_create(repository.commondir().join("maco/state"))
             .expect("state root");
         (temp, path, state)
+    }
+
+    fn repository_with_checksumless_semantic() -> (TempDir, PathBuf, PathBuf, SemanticIntent) {
+        let (temp, path, state) = empty_repository_state();
+        let intent = SemanticIntent {
+            token: SemanticIntentToken::from_u64(1),
+            agent_id: "migration-semantic".to_string(),
+            paths: vec![PathBuf::from("src/lib.rs")],
+            symbols: Vec::new(),
+            modules: Vec::new(),
+            impacted_files: Vec::new(),
+            task_digest: None,
+            task_excerpt: None,
+            notes: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "next_token": 2,
+            "intents": [&intent],
+        }))
+        .expect("checksum-less semantic JSON");
+        AtomicStateWriter::write_direct(&state, "semantic_intents.json", &bytes)
+            .expect("checksum-less semantic state");
+        (temp, path, state.path().to_path_buf(), intent)
     }
 
     fn expected_bindings_for(path: &Path) -> ExpectedLegacyBindings {
@@ -3233,6 +3347,119 @@ mod tests {
         let repeated = migrate_repository_state(&path, true).expect("idempotent apply");
         assert_eq!(repeated.status, StateMigrationStatus::AlreadyApplied);
         assert_eq!(repeated.transaction_phase, Some(MigrationPhase::Completed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checksumless_semantic_requires_offline_manifest_then_adopts_authenticated_snapshot() {
+        let (_temp, path, state, expected_intent) = repository_with_checksumless_semantic();
+        let repository = Repository::open(&path).expect("repository");
+        let transaction_root = repository.commondir().join(TRANSACTION_ROOT_NAME);
+
+        let direct_error = SemanticIntentStore::open(&path)
+            .expect_err("normal runtime must reject unmanifested checksum-less state");
+        assert!(direct_error
+            .to_string()
+            .contains("signed migration manifest"));
+        assert!(!state.join(SemanticSnapshotSpec::ROOT_NAME).exists());
+
+        let dry = migrate_repository_state(&path, false).expect("checksum-less dry run");
+        assert_eq!(dry.status, StateMigrationStatus::Ready);
+        assert_eq!(dry.mode, StateMigrationMode::DryRun);
+        assert!(!transaction_root.exists());
+        assert!(!state.join(MANIFEST_ROOT_NAME).exists());
+
+        let applied = migrate_repository_state(&path, true).expect("offline migration apply");
+        assert_eq!(applied.status, StateMigrationStatus::Applied);
+        assert_eq!(applied.manifest_generation, Some(1));
+
+        let store = SemanticIntentStore::open(&path)
+            .expect("signed checksum-less state must adopt into authenticated storage");
+        assert_eq!(
+            store.snapshot().expect("authenticated snapshot"),
+            vec![expected_intent]
+        );
+        assert!(state.join(SemanticSnapshotSpec::ROOT_NAME).is_dir());
+        let tombstone: serde_json::Value = serde_json::from_slice(
+            &fs::read(state.join("semantic_intents.json")).expect("active tombstone"),
+        )
+        .expect("tombstone JSON");
+        assert_eq!(tombstone["version"], 3);
+        assert_eq!(tombstone["phase"], "active");
+
+        let repeated =
+            migrate_repository_state(&path, false).expect("post-adoption manifest verification");
+        assert_eq!(repeated.status, StateMigrationStatus::AlreadyApplied);
+    }
+
+    #[test]
+    fn checksumless_semantic_decoder_is_strict_and_bounded() {
+        let (_temp, path, state) = empty_repository_state();
+        let invalid_states = [
+            serde_json::json!({
+                "version": 1,
+                "next_token": 1,
+                "intents": [],
+                "unexpected": true,
+            }),
+            serde_json::json!({
+                "version": 1,
+                "next_token": 0,
+                "intents": [],
+            }),
+            serde_json::json!({
+                "version": 2,
+                "next_token": 1,
+                "intents": [],
+            }),
+        ];
+        let repository = Repository::open(&path).expect("repository");
+        let transaction_root = repository.commondir().join(TRANSACTION_ROOT_NAME);
+
+        for value in invalid_states {
+            AtomicStateWriter::write_direct(
+                &state,
+                "semantic_intents.json",
+                &serde_json::to_vec_pretty(&value).expect("invalid semantic JSON"),
+            )
+            .expect("replace invalid semantic state");
+            assert!(migrate_repository_state(&path, false).is_err());
+            assert!(!transaction_root.exists());
+            assert!(!state.path().join(MANIFEST_ROOT_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn checksumless_semantic_decoder_rejects_unknown_nested_intent_fields() {
+        let (_temp, path, state) = empty_repository_state();
+        let intent = serde_json::json!({
+            "token": 1,
+            "agent_id": "migration-semantic",
+            "paths": ["src/lib.rs"],
+            "symbols": [],
+            "modules": [],
+            "impacted_files": [],
+            "task_digest": null,
+            "task_excerpt": null,
+            "notes": [],
+            "warnings": [],
+            "unexpected": true,
+        });
+        AtomicStateWriter::write_direct(
+            &state,
+            "semantic_intents.json",
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "next_token": 2,
+                "intents": [intent],
+            }))
+            .expect("invalid nested semantic JSON"),
+        )
+        .expect("invalid nested semantic state");
+
+        let error = migrate_repository_state(&path, false)
+            .expect_err("unknown nested fields must fail closed");
+        assert!(error.to_string().contains("strict checksum-less"));
     }
 
     #[cfg(unix)]

@@ -8,8 +8,8 @@ use crate::{
     safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
     state_journal::JournalSpec,
     state_migration::{
-        finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
-        LEGACY_RETIREMENT_DOMAIN,
+        decode_checksumless_legacy_semantic_state, finalize_legacy_retirement,
+        prepare_legacy_retirement, LegacyAdoption, LEGACY_RETIREMENT_DOMAIN,
     },
     sync::normalize_repo_relative_path,
     sync_store::{
@@ -412,21 +412,37 @@ impl SemanticIntentStore {
                 intents: Vec::new(),
             },
             LegacyAdoption::Present(bytes) => {
-                let legacy: PersistedSemanticState = serde_json::from_slice(&bytes)
-                    .context("signed legacy semantic state is malformed")?;
-                if legacy.version != STATE_VERSION
-                    || legacy.repository != *self.state.binding()
-                    || legacy.checksum != semantic_state_checksum(&legacy)?
-                {
-                    bail!("signed legacy semantic state failed repository/checksum validation");
-                }
-                validate_semantic_state(&legacy)?;
+                let (next_token, intents) = match serde_json::from_slice::<PersistedSemanticState>(
+                    &bytes,
+                ) {
+                    Ok(legacy) => {
+                        if legacy.version != STATE_VERSION
+                            || legacy.repository != *self.state.binding()
+                            || legacy.checksum != semantic_state_checksum(&legacy)?
+                        {
+                            bail!(
+                                    "signed legacy semantic state failed repository/checksum validation"
+                                );
+                        }
+                        validate_semantic_state(&legacy)?;
+                        (legacy.next_token, legacy.intents)
+                    }
+                    Err(_) => {
+                        // The checksum-less generation-one decoder is reachable only after
+                        // `prepare_legacy_retirement` has verified a repository-bound signed
+                        // migration manifest for these exact bytes. Normal runtime opening of
+                        // an unmanifested checksum-less file remains fail closed.
+                        let legacy = decode_checksumless_legacy_semantic_state(&bytes)
+                            .context("signed legacy semantic state is malformed")?;
+                        (legacy.next_token, legacy.intents)
+                    }
+                };
                 AuthenticatedSemanticState {
                     version: 1,
                     snapshot_revision: 1,
                     repository: binding,
-                    next_token: legacy.next_token,
-                    intents: legacy.intents,
+                    next_token,
+                    intents,
                 }
             }
         };
@@ -1196,10 +1212,17 @@ fn semantic_state_checksum(state: &PersistedSemanticState) -> Result<String> {
 }
 
 fn validate_semantic_state(state: &PersistedSemanticState) -> Result<()> {
-    if state.next_token == 0 {
+    validate_legacy_semantic_payload(state.next_token, &state.intents)
+}
+
+pub(crate) fn validate_legacy_semantic_payload(
+    next_token: u64,
+    intents: &[SemanticIntent],
+) -> Result<()> {
+    if next_token == 0 {
         bail!("semantic intent state next_token must be nonzero");
     }
-    if state.intents.len() > MAX_SEMANTIC_INTENTS {
+    if intents.len() > MAX_SEMANTIC_INTENTS {
         bail!(
             "semantic intent state exceeds its intent budget of {}",
             MAX_SEMANTIC_INTENTS
@@ -1207,9 +1230,9 @@ fn validate_semantic_state(state: &PersistedSemanticState) -> Result<()> {
     }
 
     let mut seen_tokens = BTreeSet::new();
-    let mut record_count = state.intents.len();
+    let mut record_count = intents.len();
     let mut max_token = 0u64;
-    for intent in &state.intents {
+    for intent in intents {
         if intent.token.get() == 0 {
             bail!("semantic intent token must be nonzero");
         }
@@ -1276,10 +1299,10 @@ fn validate_semantic_state(state: &PersistedSemanticState) -> Result<()> {
             validate_semantic_string("warning", warning, MAX_SEMANTIC_STRING_BYTES, true)?;
         }
     }
-    if max_token > 0 && state.next_token <= max_token {
+    if max_token > 0 && next_token <= max_token {
         bail!(
             "semantic intent next_token {} does not advance past active token {}",
-            state.next_token,
+            next_token,
             max_token
         );
     }
