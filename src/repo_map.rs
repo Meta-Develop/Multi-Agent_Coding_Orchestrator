@@ -9,7 +9,7 @@ use std::{
 
 use crate::safe_state::{
     BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
-    BoundedTreeWalker, DirectoryBindingGuard,
+    BoundedTreeWalker,
 };
 
 const REPOSITORY_MAP_MAX_DEPTH: usize = 128;
@@ -17,6 +17,7 @@ const REPOSITORY_MAP_MAX_ENTRIES: usize = 100_000;
 const REPOSITORY_MAP_MAX_PATH_BYTES: usize = 4096;
 const REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
 const REPOSITORY_MAP_MAX_DURATION: Duration = Duration::from_secs(10);
+type RepositoryMapSnapshot = (BTreeMap<PathBuf, [u8; 2]>, Vec<BoundedTreeEntry>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepoMap {
@@ -66,23 +67,45 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
         .workdir()
         .context("repository map requires a non-bare repository")?
         .to_path_buf();
-    let worktree_binding = DirectoryBindingGuard::bind(&root)?;
-    let git_dir_binding = DirectoryBindingGuard::bind(repo.path())?;
-    let common_dir_binding = DirectoryBindingGuard::bind(repo.commondir())?;
+    let repository_binding = crate::worktree::RepositoryBindingGuard::bind(&root)?;
     let deadline = Instant::now()
         .checked_add(REPOSITORY_MAP_MAX_DURATION)
         .context("repository map deadline overflowed")?;
-    let statuses = crate::worktree::bounded_repository_status_paths(
-        &root,
+    let first = capture_repository_map_snapshot(&repository_binding, deadline)?;
+    let second = capture_repository_map_snapshot(&repository_binding, deadline)?;
+    let (statuses, inventory) = if first == second {
+        second
+    } else {
+        let retry = capture_repository_map_snapshot(&repository_binding, deadline)?;
+        if second != retry {
+            anyhow::bail!("repository map changed across its bounded retry");
+        }
+        retry
+    };
+    let entries = inventory
+        .into_iter()
+        .map(|entry| map_inventory_entry(&statuses, entry, deadline))
+        .collect::<Result<Vec<_>>>()?;
+    repository_binding.verify()?;
+    remaining_map_time(deadline, "after repository map")?;
+
+    Ok(RepoMap { root, entries })
+}
+
+fn capture_repository_map_snapshot(
+    binding: &crate::worktree::RepositoryBindingGuard,
+    deadline: Instant,
+) -> Result<RepositoryMapSnapshot> {
+    let statuses = crate::worktree::bounded_repository_status_paths_bound(
+        binding,
         REPOSITORY_MAP_MAX_ENTRIES,
         REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
         remaining_map_time(deadline, "before bounded Git status")?,
     )?
     .into_iter()
     .collect::<BTreeMap<_, _>>();
-
-    let inventory = BoundedTreeWalker::walk_with(
-        &root,
+    let inventory = BoundedTreeWalker::walk_bound_with(
+        binding.worktree_binding(),
         BoundedTreeWalkLimits {
             max_depth: REPOSITORY_MAP_MAX_DEPTH,
             max_entries: REPOSITORY_MAP_MAX_ENTRIES,
@@ -101,16 +124,8 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
             })
         },
     )?;
-    let entries = inventory
-        .into_iter()
-        .map(|entry| map_inventory_entry(&statuses, entry, deadline))
-        .collect::<Result<Vec<_>>>()?;
-    worktree_binding.verify()?;
-    git_dir_binding.verify()?;
-    common_dir_binding.verify()?;
-    remaining_map_time(deadline, "after repository map")?;
-
-    Ok(RepoMap { root, entries })
+    binding.verify()?;
+    Ok((statuses, inventory))
 }
 
 fn remaining_map_time(deadline: Instant, phase: &str) -> Result<Duration> {

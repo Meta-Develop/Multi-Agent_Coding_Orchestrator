@@ -74,6 +74,8 @@ const AUTOPILOT_STATUS_MAX_DURATION: Duration = Duration::from_secs(10);
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_ENTRIES: usize = 256;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_TOTAL_PATH_BYTES: usize = 1024 * 1024;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_DURATION: Duration = Duration::from_secs(2);
+const AUTOPILOT_EFFECTFUL_UNAVAILABLE_MESSAGE: &str =
+    "autopilot effectful execution is temporarily unsupported: the capability-bound supervisor input bridge is not implemented";
 
 #[derive(Debug, Clone)]
 pub struct AutopilotRunOptions {
@@ -473,7 +475,18 @@ pub fn autopilot_plan_from_task_file(
     )
 }
 
-pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
+pub fn run_autopilot_plan_file(_options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
+    Err(effectful_autopilot_unavailable_error())
+}
+
+pub(crate) fn effectful_autopilot_unavailable_error() -> anyhow::Error {
+    anyhow::anyhow!(AUTOPILOT_EFFECTFUL_UNAVAILABLE_MESSAGE)
+}
+
+#[allow(dead_code)]
+fn run_autopilot_plan_file_disabled_legacy(
+    options: AutopilotRunOptions,
+) -> Result<AutopilotFinalReport> {
     let repo = discover_repo_root(&options.repo)?;
     let mut plan = autopilot_plan_from_task_file(&repo, &options.plan_file)?;
     if let Some(command) = options.reviewer_command.clone() {
@@ -2811,10 +2824,48 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         fs::File,
+        rc::Rc,
         sync::mpsc,
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn effectful_autopilot_fails_closed_before_any_repository_or_runtime_side_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("sentinel");
+        fs::write(&sentinel, b"unchanged").expect("write sentinel");
+        let safety_hook_called = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&safety_hook_called);
+        set_after_autopilot_safety_hook(move || observed.set(true));
+        let before = fs::read_dir(temp.path())
+            .expect("read temp before")
+            .map(|entry| entry.expect("temp entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let error = run_autopilot_plan_file(AutopilotRunOptions {
+            repo: temp.path().join("repository-must-not-be-opened"),
+            plan_file: temp.path().join("plan-must-not-be-read"),
+            run_id: RunId::new("failclosed-no-effects").expect("run id"),
+            codex_bin: Some(temp.path().join("worker-must-not-run")),
+            reviewer_command: Some("must-not-run".to_string()),
+            allow_dirty_primary: true,
+        })
+        .expect_err("effectful autopilot must be unconditionally unavailable");
+
+        let after = fs::read_dir(temp.path())
+            .expect("read temp after")
+            .map(|entry| entry.expect("temp entry").file_name())
+            .collect::<BTreeSet<_>>();
+        AFTER_AUTOPILOT_SAFETY_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        assert_eq!(before, after);
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"unchanged");
+        assert!(!safety_hook_called.get());
+        assert!(!temp.path().join(".maco").exists());
+        assert!(format!("{error:#}").contains("capability-bound supervisor input bridge"));
+    }
 
     #[cfg(unix)]
     #[test]

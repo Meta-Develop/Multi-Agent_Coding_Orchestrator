@@ -4,12 +4,9 @@ use crate::{
         ProviderCommandPolicy,
     },
     artifacts::{self, ResolvedRunId, RunArtifactFamily},
-    autopilot::{self, AutopilotRunOptions},
+    autopilot,
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
-    inbox::{
-        self, InboxPermissionMode, InboxRunOptions, InboxScanOptions, InboxWatchOptions,
-        InboxWorkspaceRunOptions, InboxWorkspaceScanOptions, InboxWorkspaceWatchOptions,
-    },
+    inbox::{self, InboxPermissionMode, InboxScanOptions, InboxWorkspaceScanOptions},
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     merge::{
@@ -726,28 +723,7 @@ impl InboxCommand {
                 }
                 Ok(())
             }
-            InboxSubcommand::Run(args) => {
-                let resolved = resolve_run_id_for_run(
-                    &args.repo,
-                    RunArtifactFamily::Inbox,
-                    args.run_id.as_deref(),
-                    args.json,
-                )?;
-                let report = inbox::run_inbox(InboxRunOptions {
-                    repo: resolved.repo,
-                    run_id: resolved.run_id,
-                    github: args.github,
-                    permission_mode: args.permission,
-                    dry_run: args.dry_run,
-                    max_items: args.max_items,
-                    codex_bin: args.codex_bin,
-                })?;
-                print_query_report(&report, args.json)?;
-                if !report.success {
-                    bail!("inbox run failed");
-                }
-                Ok(())
-            }
+            InboxSubcommand::Run(_) => Err(autopilot::effectful_autopilot_unavailable_error()),
             InboxSubcommand::Status(args) => {
                 let report = inbox::inbox_status(args.repo, RunId::new(&args.run_id)?)?;
                 print_query_report(&report, args.json)
@@ -764,23 +740,7 @@ impl InboxCommand {
                 }
                 Ok(())
             }
-            InboxSubcommand::Watch(args) => {
-                let report = inbox::watch_inbox(InboxWatchOptions {
-                    repo: args.repo,
-                    poll_seconds: args.poll_seconds,
-                    once: args.once,
-                    github: args.github,
-                    permission_mode: args.permission,
-                    dry_run: args.dry_run,
-                    max_items: args.max_items,
-                    codex_bin: args.codex_bin,
-                })?;
-                print_query_report(&report, args.json)?;
-                if report.runs.iter().any(|run| !run.success) {
-                    bail!("inbox watch observed a failed run");
-                }
-                Ok(())
-            }
+            InboxSubcommand::Watch(_) => Err(autopilot::effectful_autopilot_unavailable_error()),
             InboxSubcommand::Workspace(command) => command.run(),
             InboxSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Inbox),
         }
@@ -824,32 +784,11 @@ impl WorkspaceInboxCommand {
                 }
                 Ok(())
             }
-            WorkspaceInboxSubcommand::Run(args) => {
-                let report = inbox::run_workspace_inbox(InboxWorkspaceRunOptions {
-                    config: args.config,
-                    run_id: RunId::new(&args.run_id)?,
-                    dry_run: args.dry_run,
-                    codex_bin: args.codex_bin,
-                })?;
-                print_query_report(&report, args.json)?;
-                if !report.success {
-                    bail!("inbox workspace run failed");
-                }
-                Ok(())
+            WorkspaceInboxSubcommand::Run(_) => {
+                Err(autopilot::effectful_autopilot_unavailable_error())
             }
-            WorkspaceInboxSubcommand::Watch(args) => {
-                let report = inbox::watch_workspace_inbox(InboxWorkspaceWatchOptions {
-                    config: args.config,
-                    poll_seconds: args.poll_seconds,
-                    once: args.once,
-                    dry_run: args.dry_run,
-                    codex_bin: args.codex_bin,
-                })?;
-                print_query_report(&report, args.json)?;
-                if report.runs.iter().any(|run| !run.success) {
-                    bail!("inbox workspace watch observed a failed run");
-                }
-                Ok(())
+            WorkspaceInboxSubcommand::Watch(_) => {
+                Err(autopilot::effectful_autopilot_unavailable_error())
             }
         }
     }
@@ -1031,27 +970,7 @@ impl AutopilotCommand {
                 let plan = autopilot::autopilot_plan_from_task_file(args.repo, args.task_file)?;
                 print_query_report(&plan, args.json)
             }
-            AutopilotSubcommand::Run(args) => {
-                let resolved = resolve_run_id_for_run(
-                    &args.repo,
-                    RunArtifactFamily::Autopilot,
-                    args.run_id.as_deref(),
-                    args.json,
-                )?;
-                let report = autopilot::run_autopilot_plan_file(AutopilotRunOptions {
-                    repo: resolved.repo,
-                    plan_file: args.task_file,
-                    run_id: resolved.run_id,
-                    codex_bin: args.codex_bin,
-                    reviewer_command: args.reviewer_command,
-                    allow_dirty_primary: args.allow_dirty_primary,
-                })?;
-                print_query_report(&report, args.json)?;
-                if !report.success {
-                    bail!("autopilot run failed");
-                }
-                Ok(())
-            }
+            AutopilotSubcommand::Run(_) => Err(autopilot::effectful_autopilot_unavailable_error()),
             AutopilotSubcommand::Status(args) => {
                 let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
                 print_query_report(&report, args.json)
@@ -1462,6 +1381,27 @@ impl WorktreeCommand {
                             record.name,
                             record.branch,
                             record.path.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            WorktreeSubcommand::Pending(args) => {
+                let manager = WorktreeManager::new(args.repo);
+                let operations = manager.pending_operations()?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&operations)?);
+                } else if operations.is_empty() {
+                    println!("No pending worktree operations.");
+                } else {
+                    for operation in operations {
+                        println!(
+                            "{}\t{}\t{}\t{}\tforce={}",
+                            operation.name,
+                            operation.kind,
+                            operation.phase,
+                            operation.path.display(),
+                            operation.force
                         );
                     }
                 }
@@ -1971,6 +1911,8 @@ enum WorktreeSubcommand {
     Remove(RemoveWorktreeArgs),
     /// List registered worktrees.
     List(ListWorktreesArgs),
+    /// Inspect authenticated pending worktree operations without recovering them.
+    Pending(ListWorktreesArgs),
 }
 
 #[derive(Debug, Args)]

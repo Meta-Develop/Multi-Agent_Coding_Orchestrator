@@ -1,8 +1,8 @@
 use crate::{
     repo_semantic,
     safe_state::{
-        BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits, BoundedTreeWalker,
-        DirectoryBindingGuard,
+        BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
+        BoundedTreeWalker, DirectoryBindingGuard,
     },
 };
 use anyhow::{Context, Result};
@@ -296,24 +296,58 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
     let deadline = Instant::now()
         .checked_add(REPOSITORY_INVENTORY_MAX_DURATION)
         .context("repository inventory deadline overflowed")?;
-    let worktree_binding = DirectoryBindingGuard::bind(repo)?;
-    let git_bindings_and_visible = match git2::Repository::open(repo) {
-        Ok(git_repo) => Some((
-            DirectoryBindingGuard::bind(git_repo.path())?,
-            DirectoryBindingGuard::bind(git_repo.commondir())?,
-            crate::worktree::bounded_repository_visible_paths(
-                repo,
-                REPOSITORY_INVENTORY_MAX_ENTRIES,
-                REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
-                remaining_inventory_time(deadline, "before bounded Git inventory")?,
-            )?
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
-        )),
-        Err(_) => None,
+    let binding = crate::worktree::RepositoryBindingGuard::bind(repo)?;
+    let first = collect_git_inventory_snapshot(&binding, deadline)?;
+    let second = collect_git_inventory_snapshot(&binding, deadline)?;
+    let stable = if first == second {
+        second
+    } else {
+        let retry = collect_git_inventory_snapshot(&binding, deadline)?;
+        if second != retry {
+            anyhow::bail!("repository inventory changed across its bounded retry");
+        }
+        retry
     };
-    let inventory = BoundedTreeWalker::walk_with(
-        repo,
+    binding.verify()?;
+    remaining_inventory_time(deadline, "after repository inventory")?;
+    let visible = stable.0;
+    let mut files = stable
+        .1
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == BoundedTreeEntryKind::RegularFile
+                && visible.contains(&entry.relative_path)
+        })
+        .map(|entry| entry.relative_path)
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn collect_git_inventory_snapshot(
+    binding: &crate::worktree::RepositoryBindingGuard,
+    deadline: Instant,
+) -> Result<(BTreeSet<PathBuf>, Vec<BoundedTreeEntry>)> {
+    let visible = crate::worktree::bounded_repository_visible_paths_bound(
+        binding,
+        REPOSITORY_INVENTORY_MAX_ENTRIES,
+        REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
+        remaining_inventory_time(deadline, "before bounded Git inventory")?,
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let inventory = collect_descriptor_inventory(binding.worktree_binding(), deadline)?;
+    binding.verify()?;
+    Ok((visible, inventory))
+}
+
+fn collect_descriptor_inventory(
+    binding: &DirectoryBindingGuard,
+    deadline: Instant,
+) -> Result<Vec<BoundedTreeEntry>> {
+    BoundedTreeWalker::walk_bound_with(
+        binding,
         BoundedTreeWalkLimits {
             max_depth: REPOSITORY_INVENTORY_MAX_DEPTH,
             max_entries: REPOSITORY_INVENTORY_MAX_ENTRIES,
@@ -347,26 +381,7 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
                 | BoundedTreeEntryKind::Special => BoundedTreeWalkAction::Skip,
             })
         },
-    )?;
-    worktree_binding.verify()?;
-    if let Some((git_dir_binding, common_dir_binding, _)) = &git_bindings_and_visible {
-        git_dir_binding.verify()?;
-        common_dir_binding.verify()?;
-    }
-    remaining_inventory_time(deadline, "after repository inventory")?;
-    let mut files = inventory
-        .into_iter()
-        .filter(|entry| {
-            entry.kind == BoundedTreeEntryKind::RegularFile
-                && git_bindings_and_visible
-                    .as_ref()
-                    .is_none_or(|(_, _, visible)| visible.contains(&entry.relative_path))
-        })
-        .map(|entry| entry.relative_path)
-        .collect::<Vec<_>>();
-    files.sort();
-    files.dedup();
-    Ok(files)
+    )
 }
 
 fn remaining_inventory_time(deadline: Instant, phase: &str) -> Result<Duration> {

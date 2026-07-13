@@ -477,6 +477,10 @@ pub struct BoundedTreeEntry {
     pub hard_link_count: u64,
     pub unix_mode: u32,
     pub identity: FileIdentity,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
 }
 
 impl BoundedTreeEntry {
@@ -532,6 +536,72 @@ pub struct DirectoryBindingGuard {
     generation: fs::Metadata,
 }
 
+/// Retains an opened regular file and its exact bounded contents so a caller
+/// can fence pathname-based association metadata (for example Git gitfiles
+/// and `commondir`) across a multi-phase operation.
+#[derive(Debug)]
+pub struct RegularFileBindingGuard {
+    path: PathBuf,
+    file: File,
+    identity: FileIdentity,
+    generation: fs::Metadata,
+    contents: Vec<u8>,
+    max_bytes: u64,
+}
+
+impl RegularFileBindingGuard {
+    pub fn bind(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self> {
+        let path = absolute_normalized(path.as_ref())?;
+        let mut file = open_regular_no_follow(&path, false)?;
+        let contents = read_bounded_file(&mut file, &path, max_bytes)?;
+        let generation = file.metadata()?;
+        let identity = identity_from_file(&file, &path)?;
+        Ok(Self {
+            path,
+            file,
+            identity,
+            generation,
+            contents,
+            max_bytes,
+        })
+    }
+
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+
+    pub fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let held = self.file.metadata()?;
+        if identity_from_file(&self.file, &self.path)? != self.identity
+            || !same_file_generation(&self.generation, &held)
+        {
+            bail!("held regular-file binding changed: {}", self.path.display());
+        }
+        let mut rebound = open_regular_no_follow(&self.path, false).with_context(|| {
+            format!(
+                "regular-file pathname binding disappeared: {}",
+                self.path.display()
+            )
+        })?;
+        let rebound_contents = read_bounded_file(&mut rebound, &self.path, self.max_bytes)?;
+        let rebound_generation = rebound.metadata()?;
+        if identity_from_file(&rebound, &self.path)? != self.identity
+            || !same_file_generation(&self.generation, &rebound_generation)
+            || rebound_contents != self.contents
+        {
+            bail!(
+                "regular-file pathname binding changed: {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
 impl DirectoryBindingGuard {
     pub fn bind(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_normalized(path.as_ref())?;
@@ -565,6 +635,51 @@ impl DirectoryBindingGuard {
 
     pub fn identity(&self) -> &FileIdentity {
         &self.identity
+    }
+
+    pub(crate) fn read_relative(&self, relative: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+        let relative = validated_relative_path(relative)?;
+        #[cfg(target_os = "linux")]
+        {
+            let mut file =
+                open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative)?;
+            read_bounded_file(&mut file, &self.path.join(&relative), max_bytes)
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("descriptor-relative mount-confined reads require Linux openat2")
+    }
+
+    pub(crate) fn read_relative_optional(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let relative = validated_relative_path(relative)?;
+        #[cfg(target_os = "linux")]
+        {
+            let file =
+                match open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative) {
+                    Ok(file) => file,
+                    Err(error)
+                        if error
+                            .root_cause()
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+            let metadata = file.metadata()?;
+            if metadata.is_dir() {
+                return Ok(None);
+            }
+            ensure_regular_single_link_metadata(&self.path.join(&relative), &metadata)?;
+            let mut file = file;
+            read_bounded_file(&mut file, &self.path.join(&relative), max_bytes).map(Some)
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("descriptor-relative mount-confined reads require Linux openat2")
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -619,18 +734,39 @@ impl BoundedTreeWalker {
     pub fn walk_with<F>(
         root: impl AsRef<Path>,
         limits: BoundedTreeWalkLimits,
+        action: F,
+    ) -> Result<Vec<BoundedTreeEntry>>
+    where
+        F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+    {
+        let root = absolute_normalized(root.as_ref())?;
+        let root_binding = DirectoryBindingGuard::bind(&root)?;
+        Self::walk_bound_with(&root_binding, limits, action)
+    }
+
+    pub(crate) fn walk_bound_with<F>(
+        root_binding: &DirectoryBindingGuard,
+        limits: BoundedTreeWalkLimits,
         mut action: F,
     ) -> Result<Vec<BoundedTreeEntry>>
     where
         F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
     {
         let limits = limits.validate()?;
-        let root = absolute_normalized(root.as_ref())?;
 
         #[cfg(unix)]
         {
-            let root_binding = DirectoryBindingGuard::bind(&root)?;
             let root_stat = fstat(root_binding.directory.as_raw_fd())?;
+            #[cfg(target_os = "linux")]
+            let root_mount_id = if limits.same_device {
+                Some(linux_mount_identity_for_fd(root_binding.directory.as_raw_fd())?.mount_id)
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            if limits.same_device {
+                bail!("mount-confined bounded tree walks require Linux statx mount identities");
+            }
             let deadline = Instant::now()
                 .checked_add(limits.max_duration)
                 .context("bounded tree walk deadline overflowed")?;
@@ -642,6 +778,8 @@ impl BoundedTreeWalker {
             let mut entries = Vec::new();
             let mut walker = InventoryWalkState {
                 root_device: root_stat.st_dev,
+                #[cfg(target_os = "linux")]
+                root_mount_id,
                 limits,
                 budget: &mut budget,
                 action: &mut action,
@@ -655,7 +793,7 @@ impl BoundedTreeWalker {
 
         #[cfg(not(unix))]
         {
-            let _ = (&root, limits, &mut action);
+            let _ = (root_binding, limits, &mut action);
             bail!("descriptor-relative bounded tree walks are unsupported on this platform")
         }
     }
@@ -2124,8 +2262,80 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxMountIdentity {
+    mount_id: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_identity_for_fd(fd: RawFd) -> Result<LinuxMountIdentity> {
+    let expected = fstat(fd)?;
+    linux_mount_identity(
+        fd,
+        c"",
+        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        &expected,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_identity_at(
+    directory_fd: RawFd,
+    name: &std::ffi::CStr,
+    expected: &libc::stat,
+) -> Result<LinuxMountIdentity> {
+    linux_mount_identity(
+        directory_fd,
+        name,
+        libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+        expected,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_identity(
+    directory_fd: RawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+    expected: &libc::stat,
+) -> Result<LinuxMountIdentity> {
+    let mut observed = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            directory_fd,
+            name.as_ptr(),
+            flags,
+            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+            observed.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect filesystem mount identity with statx");
+    }
+    let observed = unsafe { observed.assume_init() };
+    if observed.stx_mask & libc::STATX_MNT_ID == 0 {
+        bail!("statx did not report a filesystem mount identity");
+    }
+    if observed.stx_ino != unsigned_to_u64(expected.st_ino)
+        || observed.stx_dev_major != libc::major(expected.st_dev)
+        || observed.stx_dev_minor != libc::minor(expected.st_dev)
+    {
+        bail!("filesystem entry changed while its mount identity was inspected");
+    }
+    Ok(LinuxMountIdentity {
+        mount_id: observed.stx_mnt_id,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn open_repository_relative_linux(root: &Path, relative: &Path) -> Result<File> {
     let root = open_unix_directory(root)?;
+    open_repository_relative_linux_fd(root.as_raw_fd(), relative)
+}
+
+#[cfg(target_os = "linux")]
+fn open_repository_relative_linux_fd(root_fd: RawFd, relative: &Path) -> Result<File> {
     let relative = c_string(relative.as_os_str())?;
     let how = LinuxOpenHow {
         flags: u64::try_from(libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -2136,7 +2346,7 @@ fn open_repository_relative_linux(root: &Path, relative: &Path) -> Result<File> 
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
-            root.as_raw_fd(),
+            root_fd,
             relative.as_ptr(),
             &how as *const LinuxOpenHow,
             std::mem::size_of::<LinuxOpenHow>(),
@@ -3458,6 +3668,8 @@ impl InventoryBudget {
 #[cfg(unix)]
 struct InventoryWalkState<'a, F> {
     root_device: libc::dev_t,
+    #[cfg(target_os = "linux")]
+    root_mount_id: Option<u64>,
     limits: BoundedTreeWalkLimits,
     budget: &'a mut InventoryBudget,
     action: &'a mut F,
@@ -3478,6 +3690,46 @@ where
     T: TryInto<u32>,
 {
     value.try_into().unwrap_or(u32::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn stat_mtime_seconds(stat: &libc::stat) -> i64 {
+    stat.st_mtime
+}
+
+#[cfg(target_os = "linux")]
+fn stat_mtime_nanoseconds(stat: &libc::stat) -> i64 {
+    stat.st_mtime_nsec
+}
+
+#[cfg(target_os = "linux")]
+fn stat_ctime_seconds(stat: &libc::stat) -> i64 {
+    stat.st_ctime
+}
+
+#[cfg(target_os = "linux")]
+fn stat_ctime_nanoseconds(stat: &libc::stat) -> i64 {
+    stat.st_ctime_nsec
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stat_mtime_seconds(_stat: &libc::stat) -> i64 {
+    0
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stat_mtime_nanoseconds(_stat: &libc::stat) -> i64 {
+    0
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stat_ctime_seconds(_stat: &libc::stat) -> i64 {
+    0
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stat_ctime_nanoseconds(_stat: &libc::stat) -> i64 {
+    0
 }
 
 #[cfg(unix)]
@@ -3511,6 +3763,16 @@ where
                     relative.display()
                 );
             }
+            #[cfg(target_os = "linux")]
+            if let Some(root_mount_id) = self.root_mount_id {
+                let entry_mount = linux_mount_identity_at(directory_fd, &name_c, &stat)?;
+                if entry_mount.mount_id != root_mount_id {
+                    bail!(
+                        "repository inventory refused a mounted entry: {}",
+                        relative.display()
+                    );
+                }
+            }
             let file_kind = stat.st_mode & libc::S_IFMT;
             let kind = if file_kind == libc::S_IFDIR {
                 BoundedTreeEntryKind::Directory
@@ -3528,6 +3790,10 @@ where
                 hard_link_count: unsigned_to_u64(stat.st_nlink),
                 unix_mode: unsigned_to_u32(stat.st_mode & 0o7777),
                 identity: identity_from_stat(&stat),
+                modified_seconds: stat_mtime_seconds(&stat),
+                modified_nanoseconds: stat_mtime_nanoseconds(&stat),
+                changed_seconds: stat_ctime_seconds(&stat),
+                changed_nanoseconds: stat_ctime_nanoseconds(&stat),
             };
             let decision = (self.action)(&entry)?;
             self.budget
@@ -3568,6 +3834,15 @@ where
                         relative.display()
                     );
                 }
+                #[cfg(target_os = "linux")]
+                if let Some(root_mount_id) = self.root_mount_id {
+                    if linux_mount_identity_for_fd(child.as_raw_fd())?.mount_id != root_mount_id {
+                        bail!(
+                            "repository directory crossed a mount boundary while opening: {}",
+                            relative.display()
+                        );
+                    }
+                }
                 self.walk(child.as_raw_fd(), &relative, entry_depth)?;
             }
             let rebound = fstatat_no_follow(directory_fd, &name_c).with_context(|| {
@@ -3583,6 +3858,17 @@ where
                     "repository entry changed during bounded traversal: {}",
                     relative.display()
                 );
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(root_mount_id) = self.root_mount_id {
+                if linux_mount_identity_at(directory_fd, &name_c, &rebound)?.mount_id
+                    != root_mount_id
+                {
+                    bail!(
+                        "repository entry crossed a mount boundary during traversal: {}",
+                        relative.display()
+                    );
+                }
             }
         }
         Ok(())
@@ -4074,6 +4360,21 @@ mod tests {
             .expect_err("repository-relative reader must not cross into procfs");
 
         assert!(format!("{error:#}").contains("mount-confined"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn statx_mount_identity_distinguishes_procfs_boundary() {
+        let root = open_unix_directory(Path::new("/")).expect("open filesystem root");
+        let root_mount =
+            linux_mount_identity_for_fd(root.as_raw_fd()).expect("root mount identity");
+        let proc_name = c"proc";
+        let proc_stat =
+            fstatat_no_follow(root.as_raw_fd(), proc_name).expect("inspect proc mountpoint");
+        let proc_mount = linux_mount_identity_at(root.as_raw_fd(), proc_name, &proc_stat)
+            .expect("proc mount identity");
+
+        assert_ne!(root_mount, proc_mount);
     }
 
     #[cfg(unix)]

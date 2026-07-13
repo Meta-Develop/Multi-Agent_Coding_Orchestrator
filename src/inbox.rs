@@ -1361,11 +1361,19 @@ fn scan_inbox_with_overrides(
     })
 }
 
-pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
-    run_inbox_with_overrides(options, InboxConfigOverrides::default())
+pub fn run_inbox(_options: InboxRunOptions) -> Result<InboxRunReport> {
+    Err(autopilot::effectful_autopilot_unavailable_error())
 }
 
 fn run_inbox_with_overrides(
+    _options: InboxRunOptions,
+    _overrides: InboxConfigOverrides,
+) -> Result<InboxRunReport> {
+    Err(autopilot::effectful_autopilot_unavailable_error())
+}
+
+#[allow(dead_code)]
+fn run_inbox_with_overrides_disabled_legacy(
     options: InboxRunOptions,
     mut overrides: InboxConfigOverrides,
 ) -> Result<InboxRunReport> {
@@ -1609,7 +1617,12 @@ pub fn collect_inbox_run(repo: impl AsRef<Path>, run_id: RunId) -> Result<Value>
     }
 }
 
-pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
+pub fn watch_inbox(_options: InboxWatchOptions) -> Result<InboxWatchReport> {
+    Err(autopilot::effectful_autopilot_unavailable_error())
+}
+
+#[allow(dead_code)]
+fn watch_inbox_disabled_legacy(options: InboxWatchOptions) -> Result<InboxWatchReport> {
     validate_poll_seconds(options.poll_seconds)?;
     validate_cli_source_options(
         options.github,
@@ -1658,7 +1671,14 @@ pub fn scan_workspace_inbox(
     Ok(scan_workspace_specs(&loaded, &specs))
 }
 
-pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWorkspaceRunReport> {
+pub fn run_workspace_inbox(_options: InboxWorkspaceRunOptions) -> Result<InboxWorkspaceRunReport> {
+    Err(autopilot::effectful_autopilot_unavailable_error())
+}
+
+#[allow(dead_code)]
+fn run_workspace_inbox_disabled_legacy(
+    options: InboxWorkspaceRunOptions,
+) -> Result<InboxWorkspaceRunReport> {
     if let Some(codex_bin) = &options.codex_bin {
         validate_path_text(codex_bin, "workspace codex-bin", MAX_CODEX_PATH_BYTES)?;
     }
@@ -1811,6 +1831,13 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
 }
 
 pub fn watch_workspace_inbox(
+    _options: InboxWorkspaceWatchOptions,
+) -> Result<InboxWorkspaceWatchReport> {
+    Err(autopilot::effectful_autopilot_unavailable_error())
+}
+
+#[allow(dead_code)]
+fn watch_workspace_inbox_disabled_legacy(
     options: InboxWorkspaceWatchOptions,
 ) -> Result<InboxWorkspaceWatchReport> {
     validate_poll_seconds(options.poll_seconds)?;
@@ -4900,6 +4927,60 @@ mod tests {
         ffi::CString,
         os::unix::{ffi::OsStrExt, fs::symlink},
     };
+
+    #[test]
+    fn effectful_inbox_library_entries_fail_closed_before_input_or_artifact_access() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing_repo = temp.path().join("repo-must-not-be-opened");
+        let missing_config = temp.path().join("config-must-not-be-read");
+        let run_id = RunId::new("inbox-failclosed").expect("run id");
+        let errors = [
+            run_inbox(InboxRunOptions {
+                repo: missing_repo.clone(),
+                run_id: run_id.clone(),
+                github: true,
+                permission_mode: None,
+                dry_run: false,
+                max_items: None,
+                codex_bin: Some(temp.path().join("worker-must-not-run")),
+            })
+            .expect_err("inbox run must fail closed"),
+            watch_inbox(InboxWatchOptions {
+                repo: missing_repo,
+                poll_seconds: 1,
+                once: false,
+                github: true,
+                permission_mode: None,
+                dry_run: false,
+                max_items: None,
+                codex_bin: None,
+            })
+            .expect_err("inbox watch must fail closed"),
+            run_workspace_inbox(InboxWorkspaceRunOptions {
+                config: missing_config.clone(),
+                run_id,
+                dry_run: false,
+                codex_bin: None,
+            })
+            .expect_err("workspace inbox run must fail closed"),
+            watch_workspace_inbox(InboxWorkspaceWatchOptions {
+                config: missing_config,
+                poll_seconds: 1,
+                once: false,
+                dry_run: false,
+                codex_bin: None,
+            })
+            .expect_err("workspace inbox watch must fail closed"),
+        ];
+
+        assert!(
+            errors
+                .iter()
+                .all(|error| format!("{error:#}")
+                    .contains("capability-bound supervisor input bridge"))
+        );
+        assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
+    }
 
     #[test]
     fn config_schema_defaults_versions_and_rejects_unknown_fields_at_every_level() {

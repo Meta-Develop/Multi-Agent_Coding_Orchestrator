@@ -25,9 +25,9 @@ reviewable and recoverable:
 The current implementation covers a local-first command-line slice:
 
 - `maco init` initializes a Git repository.
-- `maco worktree create <agent-id>` creates a linked Git worktree for branch `maco/<agent-id>`.
-- `maco worktree list` lists registered agent worktrees.
-- `maco worktree remove <agent-id>` removes an agent worktree, refusing dirty worktrees unless `--force` is passed.
+- `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
+- `maco worktree list` lists verified registered agent worktrees without recovering pending operations; `maco worktree pending` inspects those operations.
+- `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
 - `maco sync release <token>` releases one durable claim.
@@ -1112,6 +1112,34 @@ credentials, or a real Codex login.
 
 Run the fake-first autopilot workflow:
 
+> **Temporary safety limitation:** `maco autopilot run` currently fails closed
+> before opening the repository, reading the plan, reserving artifacts or
+> claims, creating a worktree, starting a supervisor, or publishing anything.
+> Effectful execution remains disabled until the supervisor receives repository
+> inputs through a capability-bound bridge. `autopilot plan`, `status`,
+> `collect`, artifact `list`/`latest`, and `prune --dry-run` remain read-only
+> entry points; non-dry-run prune is separate explicit maintenance. Unsupported
+> effectful CLI commands follow the global CLI contract and return the fixed
+> error on stderr even when `--json` is present. The bounded
+> repository inventory rejects mount crossings, unsafe Git index state,
+> submodules, object alternates, and pathname-association changes, but it does
+> not claim to prevent a hostile same-UID process from performing undetectable
+> in-place writes or ABA changes. Inventory and map output is discarded when
+> the bounded before/after captures differ, but matching captures are not a
+> same-UID safety guarantee. Effectful Inbox run/watch entry points, managed
+> worktree creation, and non-force managed worktree removal are disabled at
+> their public entry points for the same reason; Inbox scan/status and forced
+> removal under the existing explicit operator override remain available.
+> Supervisor assignments that require creating a managed worktree are therefore
+> temporarily unsupported. `maco worktree pending` inspects durable pending
+> operations without recovering them; operators can use authenticated state and
+> `remove --force` for explicitly authorized pending or managed-state cleanup.
+> The read-only Git
+> subprocess still lacks descriptor transfer, so matching captures do not raise
+> its pathname inputs above the documented same-UID trust boundary. A
+> future descriptor-transfer design is kept separate from this temporary
+> fail-closed boundary.
+
 ```json
 {
   "version": 1,
@@ -1154,11 +1182,11 @@ Autopilot stores
 and `final-report.json` under `.maco/autopilot/runs/<run-id>/`. These reports
 use repo-relative paths and omit nested merge-preview paths and full diffs.
 
-By default, autopilot creates a deterministic fake child subprocess locally, uses
-the fake forge, and runs the fake reviewer. It does not require network access,
-credentials, or a real Codex binary. Passing `--codex-bin` opts into an external
-Codex-compatible executable. Setting `forge_mode` to `github` in the plan opts
-into `git push` and `gh pr create`; fake remains the default. The legacy
+The disabled effectful implementation is designed around a deterministic fake
+child subprocess, fake forge, and fake reviewer, while `--codex-bin` and
+`forge_mode: github` describe future opt-in execution surfaces. None of those
+workers, subprocesses, pushes, or PR operations are currently reached by
+`autopilot run`. The legacy
 `--reviewer-command` shell-string option is retained only for an explicit
 fail-closed compatibility error and cannot grant real review authority. A JSON
 reviewer configuration opts in with `mode: "external_command"`, a canonical
@@ -1264,10 +1292,11 @@ API VFS surface. Those remain confidentiality boundaries; the source worktree
 and ignored files are instead required to stay behind verified inaccessible
 masks.
 
-Autopilot refuses to launch when the primary worktree is dirty unless
-`--allow-dirty-primary` is supplied, when active sync claims overlap its target
-paths, when active semantic intents overlap those paths, or when active/blocked
-live claim locks overlap those paths. Refusal JSON includes the refusal kind,
+When effectful execution is re-enabled, Autopilot is designed to refuse launch
+when the primary worktree is dirty unless `--allow-dirty-primary` is supplied,
+when active sync claims overlap its target paths, when active semantic intents
+overlap those paths, or when active/blocked live claim locks overlap those
+paths. Refusal JSON includes the refusal kind,
 paths, and lock details such as owner, sync or semantic token, or live claim id
 when available. It also relies on the existing supervise and PR safety gates for
 stale/dirty child worktree reuse and unclaimed edits. Blocking review findings

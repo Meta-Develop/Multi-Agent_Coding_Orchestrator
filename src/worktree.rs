@@ -16,7 +16,8 @@ use crate::{
         scavenge_private_random_directories_until, stable_checksum, AtomicStateWriter,
         BoundedRegularReader, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
         BoundedTreeWalker, DirectoryBindingGuard, ExistingExclusiveLock, FileIdentity,
-        KernelStateLock, PrivateDirectoryScavengeLimits, SafeRoot, TreeLinkPolicy,
+        KernelStateLock, PrivateDirectoryScavengeLimits, RegularFileBindingGuard, SafeRoot,
+        TreeLinkPolicy,
     },
     state_journal::JournalSpec,
     state_migration::{
@@ -75,6 +76,7 @@ const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 // commands, and resumable cleanup. Individual Git commands remain bounded by
 // the same absolute deadline; this larger envelope prevents unrelated local
 // repositories from spuriously exhausting the shared runtime-lock budget.
+#[cfg(test)]
 const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 const MANAGED_LOGICAL_ID: &str = "managed-worktrees";
@@ -118,6 +120,15 @@ pub struct WorktreeRecord {
     pub name: String,
     pub path: PathBuf,
     pub branch: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingWorktreeOperation {
+    pub name: String,
+    pub kind: String,
+    pub phase: String,
+    pub path: PathBuf,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +298,28 @@ enum ManagedWorktreeOperationPhase {
     BranchDeleted,
 }
 
+fn managed_operation_kind_label(kind: ManagedWorktreeOperationKind) -> &'static str {
+    match kind {
+        ManagedWorktreeOperationKind::Create => "create",
+        ManagedWorktreeOperationKind::Remove => "remove",
+    }
+}
+
+fn managed_operation_phase_label(phase: ManagedWorktreeOperationPhase) -> &'static str {
+    match phase {
+        ManagedWorktreeOperationPhase::CreateIntent => "create_intent",
+        ManagedWorktreeOperationPhase::CreatePrepared => "create_prepared",
+        ManagedWorktreeOperationPhase::CreateStaged => "create_staged",
+        ManagedWorktreeOperationPhase::CreateObserved => "create_observed",
+        ManagedWorktreeOperationPhase::RemovePrepared => "remove_prepared",
+        ManagedWorktreeOperationPhase::WorktreeQuarantined => "worktree_quarantined",
+        ManagedWorktreeOperationPhase::MetadataQuarantined => "metadata_quarantined",
+        ManagedWorktreeOperationPhase::WorktreeDeleted => "worktree_deleted",
+        ManagedWorktreeOperationPhase::MetadataDeleted => "metadata_deleted",
+        ManagedWorktreeOperationPhase::BranchDeleted => "branch_deleted",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ManagedBranchOwnership {
@@ -362,6 +395,7 @@ struct PersistedPathWire {
 
 fn encode_persisted_path(path: &Path) -> std::result::Result<PersistedPathWire, String> {
     validate_persisted_path(path)?;
+
     #[cfg(unix)]
     {
         let bytes = path.as_os_str().as_bytes();
@@ -554,7 +588,14 @@ impl WorktreeManager {
         repository_info(&repo)
     }
 
-    pub fn create(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
+    pub fn create(&self, _options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
+        bail!(
+            "managed worktree creation is unsupported without a capability-bound repository cleanliness input"
+        );
+    }
+
+    #[allow(dead_code)]
+    fn create_disabled_legacy(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
         let registry_lock = registry_store.lock()?;
@@ -746,7 +787,7 @@ impl WorktreeManager {
                 reserved.verify(&root)?;
                 staging_reserved.verify(&root)?;
                 let staged = staging_root.bind_existing_managed_direct_child_directory(&name)?;
-                verify_worktree_clean_at(&staging_path, &branch_name, branch_oid)?;
+                verify_worktree_clean_at(&staging_path, &branch_name, branch_oid, false)?;
                 let staged_metadata = capture_staged_worktree_metadata(
                     &registry_store.repository,
                     &name,
@@ -796,11 +837,23 @@ impl WorktreeManager {
         force: bool,
         delete_branch: bool,
     ) -> Result<WorktreeRecord> {
+        if !force {
+            bail!(
+                "non-force managed worktree removal is unsupported without a capability-bound repository cleanliness input"
+            );
+        }
         let repo = self.open_repository()?;
         let name = normalize_agent_id(agent_id)?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
         let registry_lock = registry_store.lock()?;
         let mut registry = registry_store.load(&registry_lock)?;
+        if let Some(operation) = registry.operations.get_mut(&name) {
+            operation.force = true;
+            if operation.kind == ManagedWorktreeOperationKind::Remove {
+                operation.delete_branch |= delete_branch;
+            }
+            registry_store.save(&registry_lock, &mut registry)?;
+        }
         recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
         let binding = registry.records.get(&name).cloned().with_context(|| {
             format!(
@@ -821,9 +874,6 @@ impl WorktreeManager {
                 )
             })?;
 
-        if !force {
-            ensure_clean_worktree(&verified.path)?;
-        }
         if registry.operations.len() >= MAX_MANAGED_OPERATIONS {
             bail!("managed worktree registry has no remaining operation capacity");
         }
@@ -903,10 +953,12 @@ impl WorktreeManager {
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
         let registry_lock = registry_store.lock()?;
-        let mut registry = registry_store.load(&registry_lock)?;
-        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+        let registry = registry_store.load(&registry_lock)?;
         let mut records = Vec::with_capacity(registry.records.len());
         for binding in registry.records.values() {
+            if registry.operations.contains_key(&binding.name) {
+                continue;
+            }
             records.push(verified_worktree_record(
                 &repo,
                 &registry_store.repository,
@@ -915,6 +967,28 @@ impl WorktreeManager {
         }
         records.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(records)
+    }
+
+    /// Lists authenticated durable operations without attempting recovery or
+    /// making a pathname-based cleanliness decision.
+    pub fn pending_operations(&self) -> Result<Vec<PendingWorktreeOperation>> {
+        let repo = self.open_repository()?;
+        let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
+        let registry_lock = registry_store.lock()?;
+        let registry = registry_store.load(&registry_lock)?;
+        let mut operations = registry
+            .operations
+            .values()
+            .map(|operation| PendingWorktreeOperation {
+                name: operation.name.clone(),
+                kind: managed_operation_kind_label(operation.kind).to_string(),
+                phase: managed_operation_phase_label(operation.phase).to_string(),
+                path: operation.path.clone(),
+                force: operation.force,
+            })
+            .collect::<Vec<_>>();
+        operations.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(operations)
     }
 
     /// Resolves one execution-facing worktree through the durable MACO
@@ -1990,7 +2064,12 @@ fn recover_create_operation(
         ensure_creation_worktree_locked(repo, &operation.name)?;
         let _branch_guard = lock_branch_reference(repo, &operation.branch)?;
         let expected_branch_oid = verify_create_branch_exact(repo, &operation)?;
-        verify_worktree_clean_at(&staging_path, &operation.branch, expected_branch_oid)?;
+        verify_worktree_clean_at(
+            &staging_path,
+            &operation.branch,
+            expected_branch_oid,
+            operation.force,
+        )?;
         let staged = staging_root.bind_existing_managed_direct_child_directory(&operation.name)?;
         let staged_metadata = capture_staged_worktree_metadata(
             &store.repository,
@@ -2107,7 +2186,12 @@ fn recover_create_operation(
             &metadata_gitdir_file,
             &operation.path,
         )?;
-        verify_worktree_clean_at(&operation.path, &operation.branch, expected_branch_oid)?;
+        verify_worktree_clean_at(
+            &operation.path,
+            &operation.branch,
+            expected_branch_oid,
+            operation.force,
+        )?;
         verify_local_branch_oid(repo, &operation.branch, expected_branch_oid)?;
         let base_oid =
             Oid::from_str(&operation.base_oid).context("create operation base OID is malformed")?;
@@ -2134,7 +2218,12 @@ fn recover_create_operation(
         ensure_creation_worktree_locked(repo, &operation.name)?;
         let _branch_guard = lock_branch_reference(repo, &operation.branch)?;
         let expected_branch_oid = verify_create_branch_exact(repo, &operation)?;
-        verify_worktree_clean_at(&operation.path, &operation.branch, expected_branch_oid)?;
+        verify_worktree_clean_at(
+            &operation.path,
+            &operation.branch,
+            expected_branch_oid,
+            operation.force,
+        )?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity {
             bail!("create-observed root identity changed before finalization");
@@ -2187,7 +2276,14 @@ fn recover_create_operation(
         }
         registry.operations.remove(&operation.name);
         store.save(lock, registry)?;
-        complete_creation_lock(repo, store, lock, registry, &operation.name)?;
+        complete_creation_lock(
+            repo,
+            store,
+            lock,
+            registry,
+            &operation.name,
+            operation.force,
+        )?;
         return Ok(());
     }
 
@@ -2346,7 +2442,12 @@ fn ensure_creation_worktree_locked(repo: &Repository, name: &str) -> Result<()> 
     }
 }
 
-fn verify_worktree_clean_at(path: &Path, branch: &str, expected: Oid) -> Result<()> {
+fn verify_worktree_clean_at(
+    path: &Path,
+    branch: &str,
+    expected: Oid,
+    allow_unbound_cleanliness: bool,
+) -> Result<()> {
     let worktree_repo = Repository::open(path)
         .with_context(|| format!("failed to open created worktree {}", path.display()))?;
     let expected_reference = format!("refs/heads/{branch}");
@@ -2368,8 +2469,10 @@ fn verify_worktree_clean_at(path: &Path, branch: &str, expected: Oid) -> Result<
         Ok(())
     };
     verify_head()?;
-    ensure_clean_worktree(path)
-        .context("created worktree is not clean at its persisted branch OID")?;
+    if !allow_unbound_cleanliness {
+        ensure_clean_worktree(path)
+            .context("created worktree is not clean at its persisted branch OID")?;
+    }
 
     let mut index = worktree_repo
         .index()
@@ -2400,6 +2503,7 @@ fn complete_creation_lock(
     lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     name: &str,
+    allow_unbound_cleanliness: bool,
 ) -> Result<()> {
     let binding = registry
         .records
@@ -2413,7 +2517,12 @@ fn complete_creation_lock(
     let expected = Oid::from_str(&binding.created_branch_oid)
         .context("managed creation-lock branch OID is malformed")?;
     verify_local_branch_oid(repo, &binding.branch, expected)?;
-    verify_worktree_clean_at(&verified.path, &binding.branch, expected)?;
+    verify_worktree_clean_at(
+        &verified.path,
+        &binding.branch,
+        expected,
+        allow_unbound_cleanliness,
+    )?;
     let worktree = repo
         .find_worktree(name)
         .with_context(|| format!("failed to find finalized worktree '{name}'"))?;
@@ -2454,7 +2563,7 @@ fn reconcile_creation_locks(
             .branch
             .clone();
         let _branch_guard = lock_branch_reference(repo, &branch)?;
-        complete_creation_lock(repo, store, lock, registry, &name)?;
+        complete_creation_lock(repo, store, lock, registry, &name, false)?;
     }
     Ok(())
 }
@@ -3397,18 +3506,221 @@ fn find_worktree(repo: &Repository, name: &str) -> Result<Option<git2::Worktree>
     }
 }
 
-fn ensure_clean_worktree(path: &Path) -> Result<()> {
-    if !bounded_worktree_is_clean(
-        path,
-        MAX_WORKTREE_STATUS_ENTRIES,
-        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
-        WORKTREE_STATUS_TIMEOUT,
-    )? {
-        bail!("worktree is dirty; rerun with --force to remove it anyway");
-    }
-    Ok(())
+fn ensure_clean_worktree(_path: &Path) -> Result<()> {
+    bail!(
+        "effectful worktree cleanliness decisions are unsupported without a capability-bound repository input"
+    )
 }
 
+#[derive(Debug)]
+enum GitAssociationMarker {
+    Directory(DirectoryBindingGuard),
+    File(RegularFileBindingGuard),
+}
+
+impl GitAssociationMarker {
+    fn bind(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path).with_context(|| {
+            format!(
+                "failed to inspect Git association marker {}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "Git association marker must not be a symbolic link: {}",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            return DirectoryBindingGuard::bind(path).map(Self::Directory);
+        }
+        if metadata.is_file() {
+            return RegularFileBindingGuard::bind(path, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)
+                .map(Self::File);
+        }
+        bail!(
+            "Git association marker has an unsupported file type: {}",
+            path.display()
+        )
+    }
+
+    fn verify(&self) -> Result<()> {
+        match self {
+            Self::Directory(binding) => {
+                if identity_for_path(binding.path())? != *binding.identity() {
+                    bail!("Git directory association marker changed");
+                }
+                Ok(())
+            }
+            Self::File(binding) => binding.verify(),
+        }
+    }
+}
+
+/// Binds the complete repository pathname association, including the
+/// worktree `.git` marker and an optional linked-worktree `commondir` file.
+/// Reopening the repository must resolve to the exact held Git and common
+/// directories before any security decision may be accepted.
+#[derive(Debug)]
+pub(crate) struct RepositoryBindingGuard {
+    worktree: DirectoryBindingGuard,
+    git_marker: GitAssociationMarker,
+    git_dir: DirectoryBindingGuard,
+    common_dir: DirectoryBindingGuard,
+    objects_dir: DirectoryBindingGuard,
+    commondir_marker: Option<RegularFileBindingGuard>,
+}
+
+impl RepositoryBindingGuard {
+    pub(crate) fn bind(path: &Path) -> Result<Self> {
+        let worktree =
+            DirectoryBindingGuard::bind(path).context("failed to bind repository worktree")?;
+        let git_marker = GitAssociationMarker::bind(&worktree.path().join(".git"))?;
+        let repository = Repository::open(worktree.path()).with_context(|| {
+            format!(
+                "failed to open bound repository {}",
+                worktree.path().display()
+            )
+        })?;
+        let repository_worktree = repository
+            .workdir()
+            .context("repository binding requires a non-bare worktree")?;
+        if identity_for_path(repository_worktree)? != *worktree.identity() {
+            bail!("Git repository worktree does not match the bound worktree directory");
+        }
+        let git_dir = DirectoryBindingGuard::bind(repository.path())?;
+        let common_dir = DirectoryBindingGuard::bind(repository.commondir())?;
+        let objects_dir = DirectoryBindingGuard::bind(repository.commondir().join("objects"))?;
+        let commondir_path = git_dir.path().join("commondir");
+        let commondir_marker = match fs::symlink_metadata(&commondir_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Some(
+                RegularFileBindingGuard::bind(&commondir_path, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?,
+            ),
+            Ok(_) => bail!(
+                "Git commondir association marker has an unsupported file type: {}",
+                commondir_path.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect Git commondir marker {}",
+                        commondir_path.display()
+                    )
+                })
+            }
+        };
+        let binding = Self {
+            worktree,
+            git_marker,
+            git_dir,
+            common_dir,
+            objects_dir,
+            commondir_marker,
+        };
+        binding.verify()?;
+        Ok(binding)
+    }
+
+    pub(crate) fn worktree(&self) -> &Path {
+        self.worktree.path()
+    }
+
+    pub(crate) fn worktree_binding(&self) -> &DirectoryBindingGuard {
+        &self.worktree
+    }
+
+    pub(crate) fn git_dir(&self) -> &Path {
+        self.git_dir.path()
+    }
+
+    pub(crate) fn common_dir(&self) -> &Path {
+        self.common_dir.path()
+    }
+
+    pub(crate) fn read_git_relative(&self, relative: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+        self.git_dir.read_relative(relative, max_bytes)
+    }
+
+    pub(crate) fn read_git_relative_optional(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.git_dir.read_relative_optional(relative, max_bytes)
+    }
+
+    pub(crate) fn read_common_relative_optional(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.common_dir.read_relative_optional(relative, max_bytes)
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        self.worktree
+            .verify()
+            .context("repository worktree changed")?;
+        self.git_marker
+            .verify()
+            .context("repository .git association changed")?;
+        if identity_for_path(self.git_dir.path())? != *self.git_dir.identity()
+            || identity_for_path(self.common_dir.path())? != *self.common_dir.identity()
+            || identity_for_path(self.objects_dir.path())? != *self.objects_dir.identity()
+        {
+            bail!("repository Git directory association changed");
+        }
+        let commondir_path = self.git_dir.path().join("commondir");
+        match &self.commondir_marker {
+            Some(binding) => binding
+                .verify()
+                .context("repository commondir association changed")?,
+            None => match fs::symlink_metadata(&commondir_path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Ok(_) => bail!("repository commondir association appeared during operation"),
+                Err(error) => return Err(error).context("failed to recheck repository commondir"),
+            },
+        }
+        let reopened = Repository::open(self.worktree.path())
+            .context("failed to reopen bound repository association")?;
+        let reopened_worktree = reopened
+            .workdir()
+            .context("reopened repository is unexpectedly bare")?;
+        if identity_for_path(reopened_worktree)? != *self.worktree.identity()
+            || identity_for_path(reopened.path())? != *self.git_dir.identity()
+            || identity_for_path(reopened.commondir())? != *self.common_dir.identity()
+            || identity_for_path(reopened.commondir().join("objects"))?
+                != *self.objects_dir.identity()
+        {
+            bail!("repository pathname association resolved to different filesystem objects");
+        }
+        self.git_marker
+            .verify()
+            .context("repository .git association changed after reopen")?;
+        if let Some(binding) = &self.commondir_marker {
+            binding
+                .verify()
+                .context("repository commondir association changed after reopen")?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_status_generation(&self) -> Result<()> {
+        self.worktree.verify()?;
+        self.git_dir.verify()?;
+        self.common_dir.verify()?;
+        self.objects_dir.verify()?;
+        self.git_marker.verify()?;
+        if let Some(binding) = &self.commondir_marker {
+            binding.verify()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn bounded_worktree_is_clean(
     path: &Path,
     max_entries: usize,
@@ -3431,17 +3743,33 @@ pub(crate) fn bounded_repository_status_paths(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<Vec<(PathBuf, [u8; 2])>> {
-    let records = bounded_worktree_records(path, max_entries, max_output_bytes, timeout)?;
+    let binding = RepositoryBindingGuard::bind(path)?;
+    bounded_repository_status_paths_bound(&binding, max_entries, max_output_bytes, timeout)
+}
+
+pub(crate) fn bounded_repository_status_paths_bound(
+    binding: &RepositoryBindingGuard,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<(PathBuf, [u8; 2])>> {
+    binding.verify()?;
+    let records =
+        bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
+    binding.verify()?;
     parse_porcelain_v1_z(&records.status, max_entries)
 }
 
-pub(crate) fn bounded_repository_visible_paths(
-    path: &Path,
+pub(crate) fn bounded_repository_visible_paths_bound(
+    binding: &RepositoryBindingGuard,
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<Vec<PathBuf>> {
-    let records = bounded_worktree_records(path, max_entries, max_output_bytes, timeout)?;
+    binding.verify()?;
+    let records =
+        bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
+    binding.verify()?;
     parse_nul_paths(&records.visible, max_entries)
 }
 
@@ -3505,8 +3833,9 @@ fn bounded_worktree_status_in_runtime_until<F>(
 where
     F: FnOnce(&SafeRoot) -> Result<()>,
 {
-    let worktree_binding = DirectoryBindingGuard::bind(path)
-        .context("failed to bind bounded-status worktree pathname")?;
+    let repository_binding = RepositoryBindingGuard::bind(path)
+        .context("failed to bind bounded-status repository association")?;
+    let worktree_binding = repository_binding.worktree_binding();
     let lock_timeout = remaining_worktree_status_time(
         deadline,
         "before global bounded-status runtime lock acquisition",
@@ -3524,47 +3853,27 @@ where
         .context("failed to scavenge bounded-status crash residue")?;
     status_lock.verify_direct_binding(state_root)?;
     ensure_worktree_status_deadline(deadline, "after bounded-status startup cleanup")?;
-    let repository = Repository::open(path).with_context(|| {
-        format!(
-            "failed to open bounded-status repository {}",
-            path.display()
-        )
-    })?;
-    let git_dir_binding = DirectoryBindingGuard::bind(repository.path())
+    let git_dir_binding = DirectoryBindingGuard::bind(repository_binding.git_dir())
         .context("failed to bind bounded-status Git directory")?;
-    let common_dir_binding = DirectoryBindingGuard::bind(repository.commondir())
+    let common_dir_binding = DirectoryBindingGuard::bind(repository_binding.common_dir())
         .context("failed to bind bounded-status Git common directory")?;
-    verify_repository_status_bindings(&worktree_binding, &git_dir_binding, &common_dir_binding)?;
-    let git_text_inputs = validate_bounded_git_text_inputs(
-        path,
-        repository.path(),
-        repository.commondir(),
-        deadline,
-    )?;
+    verify_repository_status_bindings(worktree_binding, &git_dir_binding, &common_dir_binding)?;
+    let git_text_inputs = validate_bounded_git_text_inputs_bound(&repository_binding, deadline)?;
     ensure_worktree_status_deadline(deadline, "after opening bounded-status repository")?;
-    let head = match repository.head() {
-        Ok(head) => {
-            let target = head
-                .target()
-                .context("bounded-status HEAD has no direct target")?;
-            format!("{target}\n").into_bytes()
-        }
-        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
-            BoundedRegularReader::read_relative(repository.path(), "HEAD", MAX_WORKTREE_HEAD_BYTES)
-                .context("failed to capture unborn bounded-status HEAD")?
-        }
-        Err(error) => return Err(error).context("failed to inspect bounded-status HEAD"),
-    };
-    validate_bounded_head(&head)?;
+    let raw_head = repository_binding
+        .read_git_relative(Path::new("HEAD"), MAX_WORKTREE_HEAD_BYTES)
+        .context("failed to capture bounded-status HEAD")?;
+    validate_bounded_head(&raw_head)?;
+    let head = resolve_bounded_head(&repository_binding, &raw_head)?;
     ensure_worktree_status_deadline(deadline, "after capturing bounded-status HEAD")?;
-    let index = BoundedRegularReader::read_relative_optional(
-        repository.path(),
-        "index",
-        MAX_WORKTREE_INDEX_BYTES,
-    )
-    .context("failed to capture bounded-status index")?;
+    let index = repository_binding
+        .read_git_relative_optional(Path::new("index"), MAX_WORKTREE_INDEX_BYTES)
+        .context("failed to capture bounded-status index")?;
+    if let Some(index) = &index {
+        validate_bounded_index_bytes(index)?;
+    }
     ensure_worktree_status_deadline(deadline, "after capturing bounded-status index")?;
-    let common_objects = SafeRoot::open_existing(repository.commondir().join("objects"))?;
+    let common_objects = SafeRoot::open_existing(repository_binding.common_dir().join("objects"))?;
     ensure_worktree_status_deadline(deadline, "after binding bounded-status objects")?;
     let runtime = state_root.reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)?;
     ensure_worktree_status_deadline(deadline, "after reserving bounded-status runtime")?;
@@ -3619,6 +3928,38 @@ where
             "bounded managed-worktree index listing",
         )?;
         ensure_worktree_status_deadline(deadline, "after bounded managed-worktree index listing")?;
+        let index_flags = run_bounded_git_records(
+            &git_context,
+            [
+                "--no-optional-locks",
+                "ls-files",
+                "--stage",
+                "-v",
+                "-z",
+                "--sparse",
+            ],
+            max_entries,
+            max_output_bytes,
+            deadline,
+            "bounded managed-worktree index flag validation",
+        )?;
+        validate_bounded_git_index_records(&index_flags, max_entries)?;
+        let fsmonitor_flags = run_bounded_git_records(
+            &git_context,
+            [
+                "--no-optional-locks",
+                "ls-files",
+                "--stage",
+                "-f",
+                "-z",
+                "--sparse",
+            ],
+            max_entries,
+            max_output_bytes,
+            deadline,
+            "bounded managed-worktree fsmonitor flag validation",
+        )?;
+        validate_bounded_git_index_records(&fsmonitor_flags, max_entries)?;
         let bytes = run_bounded_git_records(
             &git_context,
             [
@@ -3628,6 +3969,7 @@ where
                 "-z",
                 "--untracked-files=all",
                 "--no-renames",
+                "--ignore-submodules=all",
             ],
             max_entries,
             max_output_bytes,
@@ -3635,11 +3977,7 @@ where
             "bounded managed-worktree status",
         )?;
         ensure_worktree_status_deadline(deadline, "after bounded managed-worktree status")?;
-        verify_repository_status_bindings(
-            &worktree_binding,
-            &git_dir_binding,
-            &common_dir_binding,
-        )?;
+        verify_repository_status_bindings(worktree_binding, &git_dir_binding, &common_dir_binding)?;
         Ok(BoundedWorktreeRecords {
             visible,
             status: bytes,
@@ -3670,7 +4008,7 @@ where
     );
     finish_with_repository_binding_verification(
         finished,
-        verify_repository_status_bindings(&worktree_binding, &git_dir_binding, &common_dir_binding),
+        repository_binding.verify_status_generation(),
     )
 }
 
@@ -3678,10 +4016,11 @@ fn validate_bounded_head(bytes: &[u8]) -> Result<()> {
     let value = std::str::from_utf8(bytes)
         .context("bounded-status HEAD is not UTF-8")?
         .trim();
-    if (value.len() == 40 || value.len() == 64)
-        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Ok(());
+    }
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("bounded-status supports only SHA-1 repositories");
     }
     let Some(reference) = value.strip_prefix("ref: ") else {
         bail!("bounded-status HEAD is neither an object id nor symbolic reference");
@@ -3732,6 +4071,317 @@ fn finish_with_repository_binding_verification<T>(
     }
 }
 
+fn resolve_bounded_head(repository: &RepositoryBindingGuard, head: &[u8]) -> Result<Vec<u8>> {
+    let value = std::str::from_utf8(head)
+        .context("bounded-status HEAD is not UTF-8")?
+        .trim();
+    if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(format!("{}\n", value.to_ascii_lowercase()).into_bytes());
+    }
+    let reference = value
+        .strip_prefix("ref: ")
+        .context("bounded-status HEAD has no supported target")?;
+    let reference_path = Path::new(reference);
+    if repository.git_dir() != repository.common_dir()
+        && repository
+            .read_git_relative_optional(reference_path, MAX_WORKTREE_HEAD_BYTES)?
+            .is_some()
+    {
+        bail!("bounded-status rejects a linked-worktree shadow branch reference");
+    }
+    let loose =
+        repository.read_common_relative_optional(reference_path, MAX_WORKTREE_HEAD_BYTES)?;
+    if let Some(loose) = loose {
+        let oid = parse_bounded_loose_reference(&loose)?;
+        return Ok(format!("{oid}\n").into_bytes());
+    }
+    if let Some(packed) = repository
+        .read_common_relative_optional(Path::new("packed-refs"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?
+    {
+        if let Some(oid) = parse_bounded_packed_reference(&packed, reference)? {
+            return Ok(format!("{oid}\n").into_bytes());
+        }
+    }
+    // A symbolic target absent from both loose and packed refs is the exact
+    // unborn-branch representation. Preserve it only after bounded lookup.
+    Ok(format!("ref: {reference}\n").into_bytes())
+}
+
+fn parse_bounded_loose_reference(bytes: &[u8]) -> Result<String> {
+    let value = std::str::from_utf8(bytes)
+        .context("bounded-status loose reference is not UTF-8")?
+        .trim();
+    if value.starts_with("ref: ") {
+        bail!("bounded-status rejects symbolic loose-reference chains");
+    }
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("bounded-status loose reference is not a SHA-1 object id");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn parse_bounded_packed_reference(bytes: &[u8], reference: &str) -> Result<Option<String>> {
+    let contents = std::str::from_utf8(bytes).context("bounded-status packed-refs is not UTF-8")?;
+    let mut found = None;
+    for line in contents.lines() {
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        let mut fields = line.split(' ');
+        let oid = fields
+            .next()
+            .context("packed-refs entry omitted object id")?;
+        let name = fields
+            .next()
+            .context("packed-refs entry omitted reference name")?;
+        if fields.next().is_some()
+            || oid.len() != 40
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !name.starts_with("refs/")
+        {
+            bail!("bounded-status packed-refs contains a malformed entry");
+        }
+        if name == reference && found.replace(oid.to_ascii_lowercase()).is_some() {
+            bail!("bounded-status packed-refs contains a duplicate reference");
+        }
+    }
+    Ok(found)
+}
+
+fn validate_bounded_index_bytes(bytes: &[u8]) -> Result<()> {
+    const HEADER_BYTES: usize = 12;
+    const ENTRY_FIXED_BYTES: usize = 62;
+    const CHECKSUM_BYTES: usize = 20;
+    const CE_EXTENDED: u16 = 0x4000;
+    const CE_VALID: u16 = 0x8000;
+    const GITLINK_MODE: u32 = 0o160000;
+    const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
+
+    if bytes.len() < HEADER_BYTES.saturating_add(CHECKSUM_BYTES) || &bytes[..4] != b"DIRC" {
+        bail!("bounded-status SHA-1 index has an invalid header");
+    }
+    let payload_end = bytes.len() - CHECKSUM_BYTES;
+    let expected_checksum = sha1_digest(&bytes[..payload_end])?;
+    let checksum_mismatch = expected_checksum
+        .iter()
+        .zip(&bytes[payload_end..])
+        .fold(0_u8, |difference, (expected, observed)| {
+            difference | (expected ^ observed)
+        });
+    if checksum_mismatch != 0 {
+        bail!("bounded-status index checksum is invalid");
+    }
+    let version = bounded_index_u32(bytes, 4)?;
+    if !matches!(version, 2 | 3) {
+        bail!("bounded-status index version {version} is unsupported");
+    }
+    let entry_count = usize::try_from(bounded_index_u32(bytes, 8)?)
+        .context("bounded-status index entry count overflowed")?;
+    if entry_count > MAX_WORKTREE_STATUS_ENTRIES {
+        bail!("bounded-status index exceeds its entry limit");
+    }
+    let mut cursor = HEADER_BYTES;
+    for _ in 0..entry_count {
+        let fixed_end = cursor
+            .checked_add(ENTRY_FIXED_BYTES)
+            .context("bounded-status index entry offset overflowed")?;
+        if fixed_end > payload_end {
+            bail!("bounded-status index entry is truncated");
+        }
+        let mode = bounded_index_u32(bytes, cursor + 24)?;
+        if matches!(mode, GITLINK_MODE | SPARSE_DIRECTORY_MODE) {
+            bail!("bounded-status rejects gitlink and sparse-directory index entries");
+        }
+        let flags = bounded_index_u16(bytes, cursor + 60)?;
+        if flags & CE_VALID != 0 {
+            bail!("bounded-status rejects assume-unchanged index entries");
+        }
+        if flags & CE_EXTENDED != 0 {
+            bail!("bounded-status rejects extended index flags");
+        }
+        let path_end = bytes[fixed_end..payload_end]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| fixed_end + offset)
+            .context("bounded-status index entry path is not terminated")?;
+        let path_len = path_end.saturating_sub(fixed_end);
+        let encoded_len = usize::from(flags & 0x0fff);
+        if path_len == 0 || (encoded_len < 0x0fff && encoded_len != path_len) {
+            bail!("bounded-status index entry path length is invalid");
+        }
+        let unpadded = path_end
+            .checked_add(1)
+            .and_then(|end| end.checked_sub(cursor))
+            .context("bounded-status index entry length overflowed")?;
+        let padded = unpadded
+            .checked_add((8 - (unpadded % 8)) % 8)
+            .context("bounded-status index padding overflowed")?;
+        cursor = cursor
+            .checked_add(padded)
+            .context("bounded-status index cursor overflowed")?;
+        if cursor > payload_end {
+            bail!("bounded-status index entry padding is truncated");
+        }
+    }
+    let mut saw_tree = false;
+    while cursor < payload_end {
+        let header_end = cursor
+            .checked_add(8)
+            .context("bounded-status index extension offset overflowed")?;
+        if header_end > payload_end {
+            bail!("bounded-status index extension header is truncated");
+        }
+        let signature = &bytes[cursor..cursor + 4];
+        let length = usize::try_from(bounded_index_u32(bytes, cursor + 4)?)
+            .context("bounded-status index extension length overflowed")?;
+        let extension_end = header_end
+            .checked_add(length)
+            .context("bounded-status index extension length overflowed")?;
+        if extension_end > payload_end {
+            bail!("bounded-status index extension payload is truncated");
+        }
+        if signature != b"TREE" || saw_tree {
+            bail!("bounded-status rejects unsupported, duplicate, or stateful index extensions");
+        }
+        saw_tree = true;
+        cursor = extension_end;
+    }
+    Ok(())
+}
+
+fn sha1_digest(bytes: &[u8]) -> Result<[u8; 20]> {
+    let byte_length = u64::try_from(bytes.len()).context("SHA-1 input length overflowed")?;
+    let bit_length = byte_length
+        .checked_mul(8)
+        .context("SHA-1 bit length overflowed")?;
+    let mut state = [
+        0x6745_2301_u32,
+        0xefcd_ab89,
+        0x98ba_dcfe,
+        0x1032_5476,
+        0xc3d2_e1f0,
+    ];
+    let mut chunks = bytes.chunks_exact(64);
+    for chunk in &mut chunks {
+        let mut block = [0_u8; 64];
+        block.copy_from_slice(chunk);
+        sha1_compress(&mut state, &block);
+    }
+    let remainder = chunks.remainder();
+    let tail_blocks = if remainder.len() < 56 { 1 } else { 2 };
+    let tail_len = tail_blocks * 64;
+    let mut tail = [0_u8; 128];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    tail[remainder.len()] = 0x80;
+    tail[tail_len - 8..tail_len].copy_from_slice(&bit_length.to_be_bytes());
+    for block in tail[..tail_len].chunks_exact(64) {
+        let mut block_array = [0_u8; 64];
+        block_array.copy_from_slice(block);
+        sha1_compress(&mut state, &block_array);
+    }
+    let mut digest = [0_u8; 20];
+    for (word, output) in state.iter().zip(digest.chunks_exact_mut(4)) {
+        output.copy_from_slice(&word.to_be_bytes());
+    }
+    Ok(digest)
+}
+
+fn sha1_compress(state: &mut [u32; 5], block: &[u8; 64]) {
+    let mut words = [0_u32; 80];
+    for (index, bytes) in block.chunks_exact(4).enumerate() {
+        words[index] = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
+    for index in 16..80 {
+        words[index] =
+            (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                .rotate_left(1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e] = *state;
+    for (index, word) in words.iter().enumerate() {
+        let (function, constant) = match index {
+            0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
+            20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+            _ => (b ^ c ^ d, 0xca62_c1d6),
+        };
+        let next = a
+            .rotate_left(5)
+            .wrapping_add(function)
+            .wrapping_add(e)
+            .wrapping_add(constant)
+            .wrapping_add(*word);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = next;
+    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+}
+
+fn bounded_index_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .context("bounded-status index integer offset overflowed")?;
+    let raw: [u8; 4] = bytes
+        .get(offset..end)
+        .context("bounded-status index integer is truncated")?
+        .try_into()
+        .context("bounded-status index integer has the wrong width")?;
+    Ok(u32::from_be_bytes(raw))
+}
+
+fn bounded_index_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let end = offset
+        .checked_add(2)
+        .context("bounded-status index integer offset overflowed")?;
+    let raw: [u8; 2] = bytes
+        .get(offset..end)
+        .context("bounded-status index integer is truncated")?
+        .try_into()
+        .context("bounded-status index integer has the wrong width")?;
+    Ok(u16::from_be_bytes(raw))
+}
+
+fn validate_bounded_git_index_records(bytes: &[u8], max_entries: usize) -> Result<()> {
+    let mut entries = 0usize;
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        entries = entries.saturating_add(1);
+        if entries > max_entries {
+            bail!("bounded-status index validation exceeded its entry limit");
+        }
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("bounded-status index validation omitted a path separator")?;
+        let header = &record[..separator];
+        if header.len() < 3 || header[1] != b' ' {
+            bail!("bounded-status index validation returned a malformed header");
+        }
+        let tag = header[0];
+        if tag == b'S' || tag.is_ascii_lowercase() {
+            bail!("bounded-status rejects hidden index-entry state");
+        }
+        let header = std::str::from_utf8(&header[2..])
+            .context("bounded-status index validation header is not ASCII")?;
+        let mode = header
+            .split_ascii_whitespace()
+            .next()
+            .context("bounded-status index validation omitted an entry mode")?;
+        if matches!(mode, "160000" | "040000") {
+            bail!("bounded-status rejects gitlink and sparse-directory index entries");
+        }
+    }
+    Ok(())
+}
+
 struct BoundedGitTextInputs {
     info_exclude: Option<Vec<u8>>,
 }
@@ -3749,14 +4399,37 @@ fn is_bounded_status_runtime_path(path: &Path) -> bool {
         || path.starts_with(".agents/storage")
 }
 
+#[cfg(test)]
 fn validate_bounded_git_text_inputs(
     worktree: &Path,
     git_dir: &Path,
     common_dir: &Path,
     deadline: Instant,
 ) -> Result<BoundedGitTextInputs> {
-    let inventory = BoundedTreeWalker::walk_with(
-        worktree,
+    let binding = RepositoryBindingGuard::bind(worktree)?;
+    if binding.git_dir() != git_dir || binding.common_dir() != common_dir {
+        bail!("bounded-status repository metadata paths changed before prevalidation");
+    }
+    validate_bounded_git_text_inputs_bound(&binding, deadline)
+}
+
+fn validate_bounded_git_text_inputs_bound(
+    repository: &RepositoryBindingGuard,
+    deadline: Instant,
+) -> Result<BoundedGitTextInputs> {
+    let git_dir = repository.git_dir();
+    let common_dir = repository.common_dir();
+    if repository
+        .read_common_relative_optional(
+            Path::new("objects/info/alternates"),
+            MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+        )?
+        .is_some_and(|bytes| !bytes.is_empty())
+    {
+        bail!("bounded-status rejects Git object alternates");
+    }
+    let inventory = BoundedTreeWalker::walk_bound_with(
+        repository.worktree_binding(),
         BoundedTreeWalkLimits {
             max_depth: 128,
             max_entries: MAX_WORKTREE_STATUS_ENTRIES,
@@ -3769,10 +4442,16 @@ fn validate_bounded_git_text_inputs(
             same_device: true,
         },
         |entry| {
-            if entry.relative_path == Path::new(".git")
-                || entry.relative_path.starts_with(".git")
-                || is_bounded_status_runtime_path(&entry.relative_path)
-            {
+            if entry.relative_path == Path::new(".git") {
+                return Ok(BoundedTreeWalkAction::Skip);
+            }
+            if entry.relative_path.file_name() == Some(OsStr::new(".git")) {
+                bail!("bounded-status rejects nested Git repository markers");
+            }
+            if entry.relative_path.file_name() == Some(OsStr::new(".gitmodules")) {
+                bail!("bounded-status rejects submodule metadata");
+            }
+            if is_bounded_status_runtime_path(&entry.relative_path) {
                 return Ok(BoundedTreeWalkAction::Skip);
             }
             if entry.kind == BoundedTreeEntryKind::Directory {
@@ -3800,11 +4479,9 @@ fn validate_bounded_git_text_inputs(
         .iter()
         .filter(|entry| entry.kind == BoundedTreeEntryKind::RegularFile)
     {
-        let bytes = BoundedRegularReader::read_relative(
-            worktree,
-            &entry.relative_path,
-            MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
-        )?;
+        let bytes = repository
+            .worktree_binding()
+            .read_relative(&entry.relative_path, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?;
         total = total
             .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
             .context("Git ignore aggregate byte count overflowed")?;
@@ -3813,41 +4490,44 @@ fn validate_bounded_git_text_inputs(
         }
         ensure_worktree_status_deadline(deadline, "during Git ignore prevalidation")?;
     }
-    let mut info_exclude = BoundedRegularReader::read_relative_optional_utf8(
-        git_dir,
-        "info/exclude",
-        MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
-    )?
-    .map(String::into_bytes);
-    if info_exclude.is_none() && common_dir != git_dir {
-        info_exclude = BoundedRegularReader::read_relative_optional_utf8(
-            common_dir,
-            "info/exclude",
-            MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
-        )?
-        .map(String::into_bytes);
+    if common_dir != git_dir
+        && repository
+            .read_git_relative_optional(
+                Path::new("info/exclude"),
+                MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+            )?
+            .is_some()
+    {
+        bail!("bounded-status rejects a linked-worktree shadow info/exclude");
     }
+    let info_exclude = repository
+        .read_common_relative_optional(Path::new("info/exclude"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?
+        .map(|bytes| String::from_utf8(bytes).context("Git exclude file is not UTF-8"))
+        .transpose()?
+        .map(String::into_bytes);
     for bytes in info_exclude.iter() {
         total = total
             .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
             .context("Git metadata aggregate byte count overflowed")?;
     }
-    for (root, relative) in [
-        (git_dir, Path::new("config")),
-        (common_dir, Path::new("config")),
-        (common_dir, Path::new("config.worktree")),
-    ] {
-        if let Some(bytes) = BoundedRegularReader::read_relative_optional_utf8(
-            root,
-            relative,
+    for bytes in [
+        repository
+            .read_git_relative_optional(Path::new("config"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?,
+        repository
+            .read_common_relative_optional(Path::new("config"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?,
+        repository.read_common_relative_optional(
+            Path::new("config.worktree"),
             MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
-        )? {
-            total = total
-                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-                .context("Git metadata aggregate byte count overflowed")?;
-            if total > MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES {
-                bail!("repository exceeds its Git metadata aggregate byte limit");
-            }
+        )?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        total = total
+            .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .context("Git metadata aggregate byte count overflowed")?;
+        if total > MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES {
+            bail!("repository exceeds its Git metadata aggregate byte limit");
         }
     }
     if total > MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES {
@@ -4120,7 +4800,20 @@ fn run_bounded_git_records<const N: usize>(
     environment.insert("TMPDIR".to_string(), "tmp".to_string());
     environment.insert("XDG_CACHE_HOME".to_string(), "home/cache".to_string());
     environment.insert("XDG_CONFIG_HOME".to_string(), "home/config".to_string());
-    let mut command_args = Vec::with_capacity(args.len().saturating_add(4));
+    let mut command_args = Vec::with_capacity(args.len().saturating_add(20));
+    for config in [
+        "core.fsmonitor=false",
+        "core.untrackedCache=false",
+        "core.splitIndex=false",
+        "index.sparse=false",
+        "submodule.recurse=false",
+        "fetch.recurseSubmodules=false",
+        "status.submoduleSummary=false",
+        "extensions.objectFormat=sha1",
+    ] {
+        command_args.push(std::ffi::OsString::from("-c"));
+        command_args.push(std::ffi::OsString::from(config));
+    }
     command_args.push(std::ffi::OsString::from("--git-dir"));
     command_args.push(context.git_dir.as_os_str().to_os_string());
     command_args.push(std::ffi::OsString::from("--work-tree"));
@@ -4208,6 +4901,289 @@ mod tests {
         assert!(parse_nul_paths(b"../escape\0", 2).is_err());
     }
 
+    #[test]
+    fn bounded_index_accepts_only_plain_sha1_entries_and_tree_cache() {
+        fn empty_index(extension: Option<(&[u8; 4], &[u8])>) -> Vec<u8> {
+            let mut bytes = b"DIRC\0\0\0\x02\0\0\0\0".to_vec();
+            if let Some((signature, payload)) = extension {
+                bytes.extend_from_slice(signature);
+                bytes.extend_from_slice(
+                    &u32::try_from(payload.len())
+                        .expect("extension length")
+                        .to_be_bytes(),
+                );
+                bytes.extend_from_slice(payload);
+            }
+            let checksum = sha1_digest(&bytes).expect("index checksum");
+            bytes.extend_from_slice(&checksum);
+            bytes
+        }
+
+        fn refresh_checksum(bytes: &mut Vec<u8>) {
+            bytes.truncate(bytes.len() - 20);
+            let checksum = sha1_digest(bytes).expect("refresh index checksum");
+            bytes.extend_from_slice(&checksum);
+        }
+
+        validate_bounded_index_bytes(&empty_index(None)).expect("plain empty index");
+        validate_bounded_index_bytes(&empty_index(Some((b"TREE", b""))))
+            .expect("ordinary TREE cache extension");
+        assert!(validate_bounded_index_bytes(&empty_index(Some((b"FSMN", b"")))).is_err());
+        assert!(validate_bounded_index_bytes(&empty_index(Some((b"link", b"")))).is_err());
+
+        let mut entry = b"DIRC\0\0\0\x02\0\0\0\x01".to_vec();
+        entry.extend_from_slice(&[0; 62]);
+        entry[12 + 24..12 + 28].copy_from_slice(&0o100644_u32.to_be_bytes());
+        entry[12 + 60..12 + 62].copy_from_slice(&1_u16.to_be_bytes());
+        entry.push(b'a');
+        entry.push(0);
+        let checksum = sha1_digest(&entry).expect("entry checksum");
+        entry.extend_from_slice(&checksum);
+        validate_bounded_index_bytes(&entry).expect("ordinary SHA-1 index entry");
+
+        let mut all_zero_checksum = entry.clone();
+        let checksum_start = all_zero_checksum.len() - 20;
+        all_zero_checksum[checksum_start..].fill(0);
+        assert!(validate_bounded_index_bytes(&all_zero_checksum).is_err());
+
+        let mut tampered = entry.clone();
+        tampered[12 + 24] ^= 1;
+        assert!(validate_bounded_index_bytes(&tampered).is_err());
+
+        let mut assume_unchanged = entry.clone();
+        assume_unchanged[12 + 60..12 + 62].copy_from_slice(&(0x8000_u16 | 1).to_be_bytes());
+        refresh_checksum(&mut assume_unchanged);
+        assert!(validate_bounded_index_bytes(&assume_unchanged).is_err());
+
+        let mut extended = entry;
+        extended[12 + 60..12 + 62].copy_from_slice(&(0x4000_u16 | 1).to_be_bytes());
+        refresh_checksum(&mut extended);
+        assert!(validate_bounded_index_bytes(&extended).is_err());
+    }
+
+    #[test]
+    fn internal_sha1_matches_nist_abc_vector() {
+        assert_eq!(
+            sha1_digest(b"abc").expect("SHA-1 digest"),
+            [
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+                0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_head_resolution_distinguishes_normal_and_unborn_branches() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let unborn = RepositoryBindingGuard::bind(&repo_path).expect("bind unborn repo");
+        let unborn_head = unborn
+            .read_git_relative(Path::new("HEAD"), MAX_WORKTREE_HEAD_BYTES)
+            .expect("read unborn HEAD");
+        assert!(std::str::from_utf8(
+            &resolve_bounded_head(&unborn, &unborn_head).expect("resolve unborn HEAD")
+        )
+        .expect("UTF-8 unborn HEAD")
+        .starts_with("ref: refs/heads/main"));
+
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let oid = commit_readme(&repo).expect("commit README");
+        let committed = RepositoryBindingGuard::bind(&repo_path).expect("bind committed repo");
+        let committed_head = committed
+            .read_git_relative(Path::new("HEAD"), MAX_WORKTREE_HEAD_BYTES)
+            .expect("read committed HEAD");
+        assert_eq!(
+            std::str::from_utf8(
+                &resolve_bounded_head(&committed, &committed_head).expect("resolve committed HEAD")
+            )
+            .expect("UTF-8 committed HEAD")
+            .trim(),
+            oid.to_string()
+        );
+    }
+
+    #[test]
+    fn repository_binding_rejects_git_association_replacement() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let binding = RepositoryBindingGuard::bind(&repo_path).expect("bind repository");
+        fs::rename(repo_path.join(".git"), repo_path.join(".git-displaced"))
+            .expect("displace git marker");
+        fs::create_dir(repo_path.join(".git")).expect("replace git marker");
+
+        assert!(binding.verify().is_err());
+    }
+
+    #[test]
+    fn effectful_worktree_cleanliness_entries_fail_closed_before_repository_access() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo-must-not-be-opened");
+        let manager = WorktreeManager::new(&repo_path);
+        let create_error = manager
+            .create(WorktreeCreateOptions {
+                agent_id: "worker".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(temp.path().join("must-not-be-created")),
+            })
+            .expect_err("worktree create must fail closed");
+        let remove_error = manager
+            .remove("worker", false, true)
+            .expect_err("non-force removal must fail closed");
+
+        assert!(create_error.to_string().contains("capability-bound"));
+        assert!(remove_error.to_string().contains("capability-bound"));
+        assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
+    }
+
+    #[test]
+    fn pending_inspection_is_read_only_and_force_cleanup_is_explicit() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let oid = commit_readme(&repo).expect("initial commit");
+        let root = SafeRoot::open_or_create_managed(&worktree_root).expect("worktree root");
+        let manager = WorktreeManager::new(&repo_path);
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let lock = store.lock().expect("registry lock");
+        let mut registry = store.load(&lock).expect("registry");
+        let name = "agent-pending".to_string();
+        let staging_root = root.path().join("pending-stage");
+        registry.operations.insert(
+            name.clone(),
+            ManagedWorktreeOperation {
+                kind: ManagedWorktreeOperationKind::Create,
+                phase: ManagedWorktreeOperationPhase::CreateIntent,
+                name: name.clone(),
+                root: root.path().to_path_buf(),
+                root_identity: root.identity().clone(),
+                path: root.path().join(&name),
+                prepared_path_identity: None,
+                staging_root: Some(staging_root.clone()),
+                staging_root_identity: None,
+                staging_path: Some(staging_root.join(&name)),
+                staged_path_identity: None,
+                staged_metadata: None,
+                branch: "maco/agent-pending".to_string(),
+                base_oid: oid.to_string(),
+                branch_preexisting_oid: None,
+                branch_ownership: ManagedBranchOwnership::Unknown,
+                owned_branch_oid: None,
+                binding: None,
+                delete_branch: false,
+                force: false,
+                expected_branch_oid: None,
+                worktree_quarantine_path: None,
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: None,
+                metadata_quarantine_identity: None,
+            },
+        );
+        store.save(&lock, &mut registry).expect("save intent");
+        drop(lock);
+        drop(store);
+        drop(repo);
+
+        let pending = manager
+            .pending_operations()
+            .expect("inspect pending intent");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, name);
+        assert_eq!(pending[0].kind, "create");
+        assert_eq!(pending[0].phase, "create_intent");
+        assert!(!pending[0].force);
+        assert!(manager
+            .list_managed_verified()
+            .expect("list without recovery")
+            .is_empty());
+        assert_eq!(
+            manager
+                .pending_operations()
+                .expect("intent must remain pending"),
+            pending
+        );
+        assert!(!root.path().join(&name).exists());
+        assert!(!staging_root.exists());
+
+        let cleanup_error = manager
+            .remove(&name, true, false)
+            .expect_err("force must recover the intent before reporting no binding");
+        assert!(cleanup_error
+            .to_string()
+            .contains("has no create-time managed binding"));
+        assert!(manager
+            .pending_operations()
+            .expect("inspect cleaned operations")
+            .is_empty());
+    }
+
+    #[test]
+    fn linked_worktree_rejects_shadow_branch_and_exclude_authority() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let linked_path = temp.path().join("linked");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let first = commit_readme(&repo).expect("first commit");
+        let second = commit_descendant(&repo, "README.md", "# Second\n").expect("second commit");
+        let first_commit = repo.find_commit(first).expect("find first commit");
+        let branch = repo
+            .branch("topic", &first_commit, false)
+            .expect("create topic");
+        let reference = branch.into_reference();
+        let mut options = WorktreeAddOptions::new();
+        options.reference(Some(&reference));
+        repo.worktree("linked-authority", &linked_path, Some(&options))
+            .expect("create linked worktree");
+        repo.find_reference("refs/heads/topic")
+            .expect("find topic")
+            .set_target(second, "advance authoritative topic")
+            .expect("advance topic");
+        let binding = RepositoryBindingGuard::bind(&linked_path).expect("bind linked worktree");
+        let shadow_ref = binding.git_dir().join("refs/heads/topic");
+        fs::create_dir_all(shadow_ref.parent().expect("shadow ref parent"))
+            .expect("create shadow ref parent");
+        fs::write(&shadow_ref, format!("{first}\n")).expect("write shadow ref");
+        let head = binding
+            .read_git_relative(Path::new("HEAD"), MAX_WORKTREE_HEAD_BYTES)
+            .expect("read linked HEAD");
+        assert!(resolve_bounded_head(&binding, &head).is_err());
+
+        fs::remove_file(&shadow_ref).expect("remove shadow ref");
+        let common_exclude = binding.common_dir().join("info/exclude");
+        fs::create_dir_all(common_exclude.parent().expect("common exclude parent"))
+            .expect("create common exclude parent");
+        fs::write(&common_exclude, b"common-only\n").expect("write common exclude");
+        let shadow_exclude = binding.git_dir().join("info/exclude");
+        fs::create_dir_all(shadow_exclude.parent().expect("shadow exclude parent"))
+            .expect("create shadow exclude parent");
+        fs::write(&shadow_exclude, b"shadow\n").expect("write shadow exclude");
+        assert!(validate_bounded_git_text_inputs(
+            &linked_path,
+            binding.git_dir(),
+            binding.common_dir(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .is_err());
+
+        fs::remove_file(&shadow_exclude).expect("remove shadow exclude");
+        let inputs = validate_bounded_git_text_inputs(
+            &linked_path,
+            binding.git_dir(),
+            binding.common_dir(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("accept common exclude");
+        assert!(inputs
+            .info_exclude
+            .expect("effective exclude")
+            .starts_with(b"common-only\n"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_git_input_preflight_rejects_oversized_and_linked_ignore_files() {
@@ -4241,6 +5217,30 @@ mod tests {
             repo.path(),
             repo.commondir(),
             deadline,
+        )
+        .is_err());
+
+        fs::remove_file(&ignore).expect("remove linked ignore");
+        let gitmodules = repo_path.join(".gitmodules");
+        fs::write(&gitmodules, b"[submodule \"unsafe\"]\n").expect("write gitmodules");
+        assert!(validate_bounded_git_text_inputs(
+            &repo_path,
+            repo.path(),
+            repo.commondir(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .is_err());
+
+        fs::remove_file(&gitmodules).expect("remove gitmodules");
+        let alternates = repo.commondir().join("objects/info/alternates");
+        fs::create_dir_all(alternates.parent().expect("alternates parent"))
+            .expect("create alternates parent");
+        fs::write(&alternates, b"/tmp/objects\n").expect("write alternates");
+        assert!(validate_bounded_git_text_inputs(
+            &repo_path,
+            repo.path(),
+            repo.commondir(),
+            Instant::now() + Duration::from_secs(2),
         )
         .is_err());
     }

@@ -10,6 +10,57 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
+#[test]
+fn effectful_inbox_cli_entries_fail_closed_before_repo_config_or_artifacts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo = temp.path().join("repo-must-not-be-opened");
+    let config = temp.path().join("config-must-not-be-read");
+    let commands = [
+        vec![
+            "inbox",
+            "run",
+            "--repo",
+            path_str(&repo)?,
+            "--run-id",
+            "failclosed",
+            "--json",
+        ],
+        vec![
+            "inbox",
+            "watch",
+            "--repo",
+            path_str(&repo)?,
+            "--once",
+            "--json",
+        ],
+        vec![
+            "inbox",
+            "workspace",
+            "run",
+            "--config",
+            path_str(&config)?,
+            "--run-id",
+            "failclosed",
+            "--json",
+        ],
+        vec![
+            "inbox",
+            "workspace",
+            "watch",
+            "--config",
+            path_str(&config)?,
+            "--once",
+            "--json",
+        ],
+    ];
+    for command in commands {
+        let error = run_failure_stderr(&command)?;
+        assert!(error.contains("capability-bound supervisor input bridge"));
+    }
+    assert_eq!(fs::read_dir(temp.path())?.count(), 0);
+    Ok(())
+}
+
 // Handoff matrix for the later test-only injected verified-autopilot/effect-WAL slice. Public Fake
 // now stops as nonpublishable, so these former downstream-success assertions are intentionally
 // retained as named follow-up coverage rather than bypassing the production gate:

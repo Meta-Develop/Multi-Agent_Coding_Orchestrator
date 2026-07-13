@@ -7,6 +7,40 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
+fn autopilot_run_cli_fails_closed_without_creating_effect_artifacts() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let mut before = fs::read_dir(&repo_path)
+        .context("read repository before refusal")?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    before.sort();
+
+    let error = run_failure_stderr(&[
+        "autopilot",
+        "run",
+        path_str(&temp.path().join("plan-must-not-be-read"))?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "failclosed-no-effects",
+        "--json",
+    ])?;
+
+    let mut after = fs::read_dir(&repo_path)
+        .context("read repository after refusal")?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    after.sort();
+    assert_eq!(before, after);
+    assert!(error.contains("capability-bound supervisor input bridge"));
+    assert!(!repo_path.join(".maco/autopilot").exists());
+    assert!(!repo_path.join(".maco/o2").exists());
+    assert!(!repo_path.join(".agents/live").exists());
+    Ok(())
+}
+
+#[test]
 fn autopilot_plan_json_normalizes_defaults_and_aliases() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
