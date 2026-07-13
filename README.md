@@ -800,11 +800,12 @@ title/body/label/head/base checks. Comment discovery reads every bounded REST
 page and then exact-views each marker candidate; truncation or bounds failure is
 fail closed.
 
-The effect WAL bounds each record and validates every namespace it opens, but
-the total number of completed effect namespaces and their retention lifetime
-are not yet globally capped. Long-lived repositories should monitor the
-repo-common `maco/state/effects` inventory; a quota and explicit retention or
-pruning policy remain future work.
+The effect WAL bounds each record and enforces finite namespace-wide logical
+store, root-entry, and retained-journal quotas. It deliberately performs no
+automatic garbage collection or retry of exactly-once effects. Reaching
+capacity fails closed. Any operator-managed archival or recovery must preserve
+the authenticated receipt evidence; deleting that evidence can forfeit the
+exactly-once guarantee.
 
 The new path does not create plaintext records under
 `.git/maco/state/publication-transactions/`. If any legacy plaintext publication
