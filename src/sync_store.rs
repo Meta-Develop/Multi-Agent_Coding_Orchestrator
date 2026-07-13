@@ -689,12 +689,67 @@ fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
 mod tests {
     use super::*;
     use crate::{
-        artifacts::state_auth::authentication_key_file_name,
+        artifacts::state_auth::{authentication_key_file_name, sha256_hex},
         state_migration::{set_legacy_retirement_fault, LegacyRetirementFaultPoint},
         worktree::WorktreeManager,
     };
     use git2::{Oid, Repository, Signature};
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claims_wrapper_recovers_nine_residues_beyond_a_full_snapshot_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        drop(SyncStore::open(&repo_path).expect("initialize claims wrapper"));
+        let root_path = repo_path
+            .join(".git/maco/state")
+            .join(ClaimsSnapshotSpec::ROOT_NAME);
+        let root = SafeRoot::open_existing(&root_path).expect("claims snapshot root");
+        let durable_entries = fs::read_dir(&root_path).expect("durable root").count();
+        for index in durable_entries..ClaimsSnapshotSpec::MAX_ROOT_ENTRIES {
+            let filler = root_path.join(format!("capacity-filler-{index:03}"));
+            fs::write(&filler, b"").expect("capacity filler");
+            fs::set_permissions(&filler, fs::Permissions::from_mode(0o600))
+                .expect("private filler");
+        }
+        assert_eq!(
+            fs::read_dir(&root_path).expect("full root").count(),
+            ClaimsSnapshotSpec::MAX_ROOT_ENTRIES
+        );
+        let logical_hash = sha256_hex(CLAIMS_LOGICAL_ID.as_bytes());
+        let targets = [
+            format!(".snapshot-locator-{logical_hash}.json"),
+            format!(".snapshot-init-{logical_hash}.json"),
+            format!(".snapshot-rollover-{logical_hash}.json"),
+        ];
+        for target in &targets {
+            for _ in 0..3 {
+                AtomicStateWriter::write_direct_fenced(&root, target, b"partial", || {
+                    bail!("injected claims metadata crash")
+                })
+                .expect_err("leave claims residue");
+            }
+        }
+        assert_eq!(
+            fs::read_dir(&root_path)
+                .expect("full root plus residues")
+                .count(),
+            ClaimsSnapshotSpec::MAX_ROOT_ENTRIES + 9
+        );
+
+        let reopened =
+            SyncStore::open(&repo_path).expect("claims wrapper scavenges before inventory");
+
+        assert!(reopened.snapshot().expect("claims snapshot").is_empty());
+        assert_eq!(
+            fs::read_dir(root_path)
+                .expect("recovered full root")
+                .count(),
+            ClaimsSnapshotSpec::MAX_ROOT_ENTRIES
+        );
+    }
 
     #[test]
     fn retirement_faults_recover_without_an_empty_or_split_brain_window() {

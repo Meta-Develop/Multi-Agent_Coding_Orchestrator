@@ -34,6 +34,9 @@ use std::{
 
 const SNAPSHOT_METADATA_FILES_PER_LOGICAL: usize = 3;
 const SNAPSHOT_RESIDUE_FORMS_PER_FILE: usize = 2;
+// Mutation-capable discovery wrappers must still recover when each metadata
+// file contributes three interrupted writes beyond a completely full root.
+const SNAPSHOT_MIN_RECOVERABLE_RESIDUES: usize = 9;
 
 pub(crate) trait SnapshotSpec: JournalSpec {
     const SNAPSHOT_FORMAT_VERSION: u32;
@@ -156,6 +159,7 @@ where
         }
         let root = AuthenticatedStateJournal::<S>::existing_root(authenticator)?;
         let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&root, logical_id)?;
         let initialized = root.direct_child_exists(snapshot_locator_name(logical_id))?;
         if initialized {
             let _ = read_locator::<S>(authenticator, &root, logical_id)?;
@@ -206,6 +210,7 @@ where
         }
         let root = AuthenticatedStateJournal::<S>::existing_root(authenticator)?;
         let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&root, logical_id)?;
         let pending = if root.direct_child_exists(snapshot_locator_name(logical_id))? {
             false
         } else if root.direct_child_exists(snapshot_init_name(logical_id))? {
@@ -1454,7 +1459,8 @@ fn snapshot_temp_scan_budget<S: SnapshotSpec>() -> Result<usize> {
     let crash_entries = S::MAX_LOGICAL_STORES
         .checked_mul(SNAPSHOT_METADATA_FILES_PER_LOGICAL)
         .and_then(|entries| entries.checked_mul(SNAPSHOT_RESIDUE_FORMS_PER_FILE))
-        .context("authenticated snapshot crash-residue capacity overflowed")?;
+        .context("authenticated snapshot crash-residue capacity overflowed")?
+        .max(SNAPSHOT_MIN_RECOVERABLE_RESIDUES);
     S::MAX_ROOT_ENTRIES
         .checked_add(crash_entries)
         .context("authenticated snapshot temp scan capacity overflowed")
@@ -1485,7 +1491,7 @@ fn snapshot_metadata_temp_targets<S: SnapshotSpec>(
         if let Some(hash) = snapshot_logical_hash_from_root_entry(name)? {
             logical_hashes.insert(hash.to_string());
         }
-        if let Some(target) = AtomicStateWriter::canonical_direct_temp_target(entry) {
+        if let Some(target) = AtomicStateWriter::canonical_direct_temp_target(entry)? {
             let target = target
                 .to_str()
                 .context("authenticated snapshot temp target is not UTF-8")?;
@@ -1865,6 +1871,7 @@ mod tests {
     use crate::{
         artifacts::{repository_auth_writer, state_auth::AuthenticationDomain},
         effect_wal::{DefaultEffectWalSpec, EFFECT_WAL_ROOT_NAME},
+        safe_state::set_temp_scavenge_after_quarantine_fault,
         state_journal::JournalSpec,
     };
     use git2::Repository;
@@ -2240,6 +2247,60 @@ mod tests {
     }
 
     #[test]
+    fn anchorless_logical_quarantine_survives_two_crashes_and_is_recovered_by_another_logical() {
+        let (_temp, path) = repository();
+        let store = AuthenticatedSnapshotStore::<ManyQuotaSnapshotSpec, u64>::create(
+            authenticator(&path),
+            "logical-a",
+            1,
+            1,
+        )
+        .expect("create anchored logical A");
+        let root_path = store.store_root.path().to_path_buf();
+        let root = SafeRoot::open_existing(&root_path).expect("snapshot root");
+        drop(store);
+        let baseline_entries = fs::read_dir(&root_path).expect("baseline root").count();
+        let orphan_target = snapshot_locator_name("anchorless-logical-b");
+        AtomicStateWriter::write_direct_fenced(&root, &orphan_target, b"partial", || {
+            bail!("injected logical B write crash")
+        })
+        .err()
+        .expect("leave anchorless logical B live temp");
+
+        set_temp_scavenge_after_quarantine_fault();
+        let first_restart =
+            AuthenticatedSnapshotStore::<ManyQuotaSnapshotSpec, u64>::open_instance(
+                authenticator(&path),
+                "logical-a",
+            )
+            .err()
+            .expect("logical A crashes after quarantining logical B");
+        assert!(first_restart
+            .to_string()
+            .contains("injected state temp scavenging crash after quarantine"));
+        assert_eq!(
+            fs::read_dir(&root_path)
+                .expect("root after first restart")
+                .count(),
+            baseline_entries + 1
+        );
+
+        let reopened = AuthenticatedSnapshotStore::<ManyQuotaSnapshotSpec, u64>::open_instance(
+            authenticator(&path),
+            "logical-a",
+        )
+        .expect("logical A recovers reversible logical B quarantine");
+
+        assert_eq!(reopened.current().value, 1);
+        assert_eq!(
+            fs::read_dir(root_path)
+                .expect("root after second restart")
+                .count(),
+            baseline_entries
+        );
+    }
+
+    #[test]
     fn initialized_empty_instance_is_not_treated_as_empty_state() {
         let (_temp, path) = repository();
         let auth = authenticator(&path);
@@ -2466,6 +2527,92 @@ mod tests {
         assert_ne!(store.instance_id(), "initial-crash");
         assert_eq!(store.current().generation, 1);
         assert_eq!(store.current().token, 2);
+    }
+
+    #[test]
+    fn initialization_pending_scavenges_metadata_residue_before_inventory() {
+        let (_temp, path) = repository();
+        set_snapshot_fault(SnapshotFaultPoint::BeforeInitial);
+        AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::create(
+            authenticator(&path),
+            "pending-scavenge",
+            1,
+            1,
+        )
+        .err()
+        .expect("leave pending initialization");
+        let repo = Repository::open(&path).expect("repo");
+        let root_path = repo
+            .commondir()
+            .join("maco/state")
+            .join(TestSnapshotSpec::ROOT_NAME);
+        let root = SafeRoot::open_existing(&root_path).expect("snapshot root");
+        let baseline_entries = fs::read_dir(&root_path).expect("pending root").count();
+        for _ in 0..3 {
+            AtomicStateWriter::write_direct_fenced(
+                &root,
+                snapshot_init_name("pending-scavenge"),
+                b"partial",
+                || bail!("injected pending metadata crash"),
+            )
+            .err()
+            .expect("leave pending temp");
+        }
+
+        assert!(
+            AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::initialization_pending(
+                &authenticator(&path),
+                "pending-scavenge",
+            )
+            .expect("pending inspection recovers residue")
+        );
+        assert_eq!(
+            fs::read_dir(root_path)
+                .expect("recovered pending root")
+                .count(),
+            baseline_entries
+        );
+    }
+
+    #[test]
+    fn locator_anchor_verification_remains_nonmutating_with_temp_residue() {
+        let (_temp, path) = repository();
+        let store = AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::create(
+            authenticator(&path),
+            "read-only-anchor",
+            1,
+            1,
+        )
+        .expect("create anchored store");
+        let identity = store.identity().clone();
+        let generation = store.current().generation;
+        let root_path = store.store_root.path().to_path_buf();
+        let root = SafeRoot::open_existing(&root_path).expect("snapshot root");
+        drop(store);
+        let baseline_entries = fs::read_dir(&root_path).expect("baseline root").count();
+        AtomicStateWriter::write_direct_fenced(
+            &root,
+            snapshot_locator_name("read-only-anchor"),
+            b"partial",
+            || bail!("injected read-only residue"),
+        )
+        .err()
+        .expect("leave locator temp");
+
+        AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::verify_locator_anchor(
+            &authenticator(&path),
+            "read-only-anchor",
+            &identity,
+            generation,
+        )
+        .expect("read-only locator verification");
+
+        assert_eq!(
+            fs::read_dir(root_path)
+                .expect("unmodified read-only root")
+                .count(),
+            baseline_entries + 1
+        );
     }
 
     #[test]

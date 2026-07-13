@@ -44,6 +44,10 @@ const ENTRY_QUARANTINE_PREFIX: &str = ".maco-entry-quarantine-";
 #[cfg(target_os = "linux")]
 const TEMP_QUARANTINE_PREFIX: &str = ".maco-temp-quarantine-";
 #[cfg(target_os = "linux")]
+const TEMP_QUARANTINE_V2_PREFIX: &str = ".maco-temp-quarantine-v2-";
+#[cfg(target_os = "linux")]
+const TEMP_QUARANTINE_V2_DOMAIN: &[u8] = b"MACO\0temp-quarantine\0v2\0";
+#[cfg(target_os = "linux")]
 const DELETION_QUARANTINE_PREFIX: &str = ".maco-delete-";
 #[cfg(target_os = "linux")]
 const DELETION_QUARANTINE_V2_PREFIX: &str = ".maco-delete-v2-";
@@ -951,8 +955,11 @@ pub struct AtomicStateWriter;
 
 impl AtomicStateWriter {
     #[cfg(target_os = "linux")]
-    pub(crate) fn canonical_direct_temp_target(name: &OsStr) -> Option<OsString> {
-        canonical_random_temp_target(name)
+    pub(crate) fn canonical_direct_temp_target(name: &OsStr) -> Result<Option<OsString>> {
+        if let Some(target) = canonical_random_temp_target(name) {
+            return Ok(Some(target));
+        }
+        Ok(canonical_temp_quarantine_binding(name)?.map(|binding| binding.target))
     }
 
     pub fn write(path: impl AsRef<Path>, contents: &[u8]) -> Result<()> {
@@ -1071,18 +1078,15 @@ impl AtomicStateWriter {
             for file_name in &file_names {
                 validate_single_component(file_name)?;
             }
-            let quarantine_namespaces = file_names
-                .iter()
-                .map(|file_name| (temp_quarantine_namespace(file_name), file_name))
-                .collect::<BTreeMap<_, _>>();
             let mut removed = 0usize;
             for entry in entries {
                 let live_target = canonical_random_temp_target(&entry)
                     .filter(|target| file_names.contains(target));
-                let quarantine_binding = canonical_temp_quarantine_binding(&entry);
+                let quarantine_binding = canonical_temp_quarantine_binding(&entry)?;
                 let quarantine_target = quarantine_binding
                     .as_ref()
-                    .and_then(|binding| quarantine_namespaces.get(binding.namespace).copied());
+                    .map(|binding| &binding.target)
+                    .filter(|target| file_names.contains(*target));
                 let Some(file_name) = live_target.as_ref().or(quarantine_target) else {
                     continue;
                 };
@@ -1111,6 +1115,9 @@ impl AtomicStateWriter {
                 let quarantine = temp_quarantine_name(file_name, &entry, &expected);
                 quarantine_regular_file(root, &entry, &quarantine, &expected)?;
                 sync_directory(root)?;
+                if take_temp_scavenge_after_quarantine_fault() {
+                    bail!("injected state temp scavenging crash after quarantine");
+                }
                 let quarantine_c = c_string(&quarantine)?;
                 let rebound = fstatat_no_follow(root.directory.as_raw_fd(), &quarantine_c)?;
                 if identity_from_stat(&rebound) != expected
@@ -1147,6 +1154,27 @@ impl AtomicStateWriter {
         contents.push(b'\n');
         Self::write(path, &contents)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEMP_SCAVENGE_AFTER_QUARANTINE_FAULT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_temp_scavenge_after_quarantine_fault() {
+    TEMP_SCAVENGE_AFTER_QUARANTINE_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn take_temp_scavenge_after_quarantine_fault() -> bool {
+    TEMP_SCAVENGE_AFTER_QUARANTINE_FAULT.with(|fault| fault.replace(false))
+}
+
+#[cfg(not(test))]
+fn take_temp_scavenge_after_quarantine_fault() -> bool {
+    false
 }
 
 /// A stable lock file guarded by the operating system. The file is never
@@ -3415,19 +3443,46 @@ fn entry_quarantine_name(name: &OsStr, identity: &FileIdentity) -> OsString {
 }
 
 #[cfg(target_os = "linux")]
-fn temp_quarantine_namespace(file_name: &OsStr) -> String {
-    format!("{TEMP_QUARANTINE_PREFIX}{}-", component_checksum(file_name))
+fn temp_quarantine_name(file_name: &OsStr, source: &OsStr, identity: &FileIdentity) -> OsString {
+    let encoded_target = base64url_encode(file_name.as_bytes());
+    let source_checksum = component_checksum_tag(source);
+    let binding = temp_quarantine_binding_tag(file_name, &source_checksum, identity);
+    OsString::from(format!(
+        "{TEMP_QUARANTINE_V2_PREFIX}{encoded_target}-{source_checksum}-{binding}-{:016x}-{:016x}",
+        identity.device, identity.file
+    ))
 }
 
 #[cfg(target_os = "linux")]
-fn temp_quarantine_name(file_name: &OsStr, source: &OsStr, identity: &FileIdentity) -> OsString {
-    OsString::from(format!(
-        "{}{}-{:016x}-{:016x}",
-        temp_quarantine_namespace(file_name),
-        component_checksum(source),
-        identity.device,
-        identity.file
-    ))
+fn component_checksum_tag(name: &OsStr) -> String {
+    component_checksum(name)[8..40].to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn temp_quarantine_binding_tag(
+    file_name: &OsStr,
+    source_checksum: &str,
+    identity: &FileIdentity,
+) -> String {
+    let mut payload = Vec::with_capacity(
+        TEMP_QUARANTINE_V2_DOMAIN
+            .len()
+            .saturating_add(8)
+            .saturating_add(file_name.as_bytes().len())
+            .saturating_add(source_checksum.len())
+            .saturating_add(16),
+    );
+    payload.extend_from_slice(TEMP_QUARANTINE_V2_DOMAIN);
+    payload.extend_from_slice(
+        &u64::try_from(file_name.as_bytes().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    payload.extend_from_slice(file_name.as_bytes());
+    payload.extend_from_slice(source_checksum.as_bytes());
+    payload.extend_from_slice(&identity.device.to_be_bytes());
+    payload.extend_from_slice(&identity.file.to_be_bytes());
+    stable_checksum(&payload)[8..40].to_string()
 }
 
 #[cfg(target_os = "linux")]
@@ -3461,56 +3516,68 @@ fn is_canonical_decimal_u64(value: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-struct TempQuarantineBinding<'a> {
-    namespace: &'a str,
+struct TempQuarantineBinding {
+    target: OsString,
     identity: FileIdentity,
 }
 
 #[cfg(target_os = "linux")]
-fn canonical_temp_quarantine_binding(name: &OsStr) -> Option<TempQuarantineBinding<'_>> {
-    let value = name.to_str()?;
-    let remainder = value.strip_prefix(TEMP_QUARANTINE_PREFIX)?;
-    let (without_inode, inode) = remainder.rsplit_once('-')?;
-    let (without_device, device) = without_inode.rsplit_once('-')?;
-    if !is_lower_hex_width(device, 16) || !is_lower_hex_width(inode, 16) {
-        return None;
+fn canonical_temp_quarantine_binding(name: &OsStr) -> Result<Option<TempQuarantineBinding>> {
+    let bytes = name.as_bytes();
+    if !bytes.starts_with(TEMP_QUARANTINE_PREFIX.as_bytes()) {
+        return Ok(None);
     }
-    let after_target_magic = without_device.strip_prefix("maco-v1-")?;
-    let target_digest = after_target_magic.get(..32)?;
-    let after_target_digest = after_target_magic.get(32..)?.strip_prefix('-')?;
-    let (target_len, source_checksum) = after_target_digest.split_once('-')?;
-    if !is_lower_hex_width(target_digest, 32) || !is_canonical_decimal_u64(target_len) {
-        return None;
-    }
-    let after_source_magic = source_checksum.strip_prefix("maco-v1-")?;
-    let source_digest = after_source_magic.get(..32)?;
-    let source_len = after_source_magic.get(32..)?.strip_prefix('-')?;
-    if !is_lower_hex_width(source_digest, 32) || !is_canonical_decimal_u64(source_len) {
-        return None;
-    }
-    let namespace_end = TEMP_QUARANTINE_PREFIX
+    let body = bytes
+        .strip_prefix(TEMP_QUARANTINE_V2_PREFIX.as_bytes())
+        .context("state temp quarantine version is unsupported")?;
+    let inode_separator = body
         .len()
-        .checked_add("maco-v1-".len())?
-        .checked_add(32)?
-        .checked_add(1)?
-        .checked_add(target_len.len())?
-        .checked_add(1)?;
-    let namespace = value.get(..namespace_end)?;
-    let identity = FileIdentity {
-        device: u64::from_str_radix(device, 16).ok()?,
-        file: u64::from_str_radix(inode, 16).ok()?,
-    };
-    Some(TempQuarantineBinding {
-        namespace,
-        identity,
-    })
+        .checked_sub(17)
+        .context("state temp quarantine name is malformed")?;
+    let device_separator = inode_separator
+        .checked_sub(17)
+        .context("state temp quarantine identity is malformed")?;
+    let binding_separator = device_separator
+        .checked_sub(33)
+        .context("state temp quarantine binding is malformed")?;
+    let source_separator = binding_separator
+        .checked_sub(33)
+        .context("state temp quarantine source checksum is malformed")?;
+    for separator in [
+        source_separator,
+        binding_separator,
+        device_separator,
+        inode_separator,
+    ] {
+        if body.get(separator) != Some(&b'-') {
+            bail!("state temp quarantine framing is malformed");
+        }
+    }
+    let encoded_target = &body[..source_separator];
+    let source_checksum = &body[source_separator + 1..binding_separator];
+    let binding = &body[binding_separator + 1..device_separator];
+    if !is_lower_hex_bytes_width(source_checksum, 32) || !is_lower_hex_bytes_width(binding, 32) {
+        bail!("state temp quarantine checksums are not canonical lowercase hex");
+    }
+    let target = OsString::from_vec(base64url_decode(encoded_target)?);
+    validate_single_component(&target)?;
+    let device = parse_fixed_lower_hex_u64(&body[device_separator + 1..inode_separator])?;
+    let file = parse_fixed_lower_hex_u64(&body[inode_separator + 1..])?;
+    let identity = FileIdentity { device, file };
+    let source_checksum = std::str::from_utf8(source_checksum)?;
+    let expected_binding = temp_quarantine_binding_tag(&target, source_checksum, &identity);
+    if expected_binding.as_bytes() != binding {
+        bail!("state temp quarantine target/source/identity binding does not match");
+    }
+    Ok(Some(TempQuarantineBinding { target, identity }))
 }
 
 #[cfg(target_os = "linux")]
-fn is_lower_hex_width(value: &str, width: usize) -> bool {
+fn is_lower_hex_bytes_width(value: &[u8], width: usize) -> bool {
     value.len() == width
         && value
-            .bytes()
+            .iter()
+            .copied()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
@@ -4886,6 +4953,33 @@ mod tests {
             .to_string()
             .contains("identity is malformed or changed"));
         assert!(root.path().join(forged).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_wide_temp_scavenge_rejects_legacy_quarantine_format() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("state")).expect("state root");
+        let _lock = KernelStateLock::acquire_direct(&root, "root.lock").expect("lock");
+        let target = OsString::from("locator.json");
+        let source = random_temp_name(&target);
+        let legacy = OsString::from(format!(
+            "{TEMP_QUARANTINE_PREFIX}{}-{}-0000000000000001-0000000000000001",
+            component_checksum(&target),
+            component_checksum(&source)
+        ));
+        let legacy_path = root.path().join(&legacy);
+        fs::write(&legacy_path, b"legacy").expect("legacy quarantine");
+        fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o600))
+            .expect("private legacy quarantine");
+
+        let error = AtomicStateWriter::scavenge_direct_temp_namespaces_bounded(&root, 4, |_| {
+            Ok(BTreeSet::from([target.clone()]))
+        })
+        .expect_err("unreleased legacy quarantine format must fail closed");
+
+        assert!(error.to_string().contains("version is unsupported"));
+        assert!(legacy_path.exists());
     }
 
     #[cfg(target_os = "linux")]
