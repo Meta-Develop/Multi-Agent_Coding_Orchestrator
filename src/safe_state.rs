@@ -141,33 +141,47 @@ impl DirectChildBinding {
     }
 
     pub(crate) fn unlink_fenced(self, root: &SafeRoot) -> Result<()> {
-        self.verify(root)?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            let name = c_string(&self.name)?;
-            if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            self.verify(root)?;
+            let root_stat = fstat(root.directory.as_raw_fd())?;
+            validate_owned_direct_child_stat(
+                &root_stat,
+                root.identity(),
+                DirectChildType::Directory,
+            )?;
+            if root_stat.st_mode & 0o777 != 0o700 {
+                bail!("direct child quarantine requires an owner-private root");
+            }
+            let handle_before = fstat(self.file.as_raw_fd())?;
+            if handle_before.st_mode & 0o777 != 0o600 {
+                bail!("direct child must be owner-private before quarantine unlink");
+            }
+            let quarantine_name = entry_quarantine_name(&self.name, &self.identity);
+            quarantine_regular_file(root, &self.name, &quarantine_name, &self.identity)?;
+            sync_directory(root)?;
+            run_direct_child_before_quarantine_unlink_hook();
+
+            let source = c_string(&self.name)?;
+            if fstatat_optional_no_follow(root.directory.as_raw_fd(), &source)?.is_some() {
+                bail!("direct child source name reappeared after quarantine");
+            }
+            let quarantine = c_string(&quarantine_name)?;
+            let quarantined = fstatat_no_follow(root.directory.as_raw_fd(), &quarantine)?;
+            validate_private_regular_quarantine(&quarantined, &self.identity)?;
+            if unsafe { libc::unlinkat(root.directory.as_raw_fd(), quarantine.as_ptr(), 0) } != 0 {
                 return Err(std::io::Error::last_os_error()).with_context(|| {
                     format!(
-                        "failed to unlink bound direct child {}",
-                        root.path().join(&self.name).display()
+                        "failed to unlink quarantined direct child {}",
+                        root.path().join(&quarantine_name).display()
                     )
                 });
             }
-            let mut rebound: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe {
-                libc::fstatat(
-                    root.directory.as_raw_fd(),
-                    name.as_ptr(),
-                    &mut rebound,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } == 0
-            {
-                bail!("unlinked direct child pathname still exists");
+            if fstatat_optional_no_follow(root.directory.as_raw_fd(), &quarantine)?.is_some() {
+                bail!("quarantined direct child pathname still exists after unlink");
             }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error).context("failed to verify bound direct child unlink");
+            if fstatat_optional_no_follow(root.directory.as_raw_fd(), &source)?.is_some() {
+                bail!("direct child source name reappeared during quarantine unlink");
             }
             let handle = fstat(self.file.as_raw_fd())?;
             if identity_from_stat(&handle) != self.identity
@@ -177,12 +191,43 @@ impl DirectChildBinding {
             {
                 bail!("unlinked direct child descriptor changed unexpectedly");
             }
+            sync_directory(root)?;
             root.verify()
         }
-        #[cfg(not(unix))]
-        bail!("identity-bound direct child unlink is unsupported on this platform")
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, root);
+            bail!("atomic quarantine direct child unlink is unsupported on this platform")
+        }
     }
 }
+
+#[cfg(test)]
+type DirectChildBeforeQuarantineUnlinkHook = Option<Box<dyn FnOnce()>>;
+
+#[cfg(test)]
+thread_local! {
+    static DIRECT_CHILD_BEFORE_QUARANTINE_UNLINK_HOOK: std::cell::RefCell<DirectChildBeforeQuarantineUnlinkHook> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_direct_child_before_quarantine_unlink_hook(hook: impl FnOnce() + 'static) {
+    DIRECT_CHILD_BEFORE_QUARANTINE_UNLINK_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_direct_child_before_quarantine_unlink_hook() {
+    let hook = DIRECT_CHILD_BEFORE_QUARANTINE_UNLINK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_direct_child_before_quarantine_unlink_hook() {}
 
 impl ReservedDirectory {
     pub fn path(&self) -> &Path {
@@ -4720,6 +4765,50 @@ fn identity_from_stat(stat: &libc::stat) -> FileIdentity {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quarantined_direct_child_unlink_refuses_reappeared_source_without_deleting_replacement() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("state")).expect("safe root");
+        let source = root.path().join("created.lock");
+        fs::write(&source, b"original").expect("original source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+            .expect("owner-private source");
+        let identity = identity_for_path(&source).expect("source identity");
+        let binding = root
+            .bind_owned_direct_child(
+                "created.lock",
+                &identity,
+                DirectChildType::SingleLinkRegularFile,
+            )
+            .expect("direct child binding");
+        set_direct_child_before_quarantine_unlink_hook({
+            let source = source.clone();
+            move || {
+                fs::write(&source, b"replacement").expect("replacement source");
+                fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+                    .expect("replacement mode");
+            }
+        });
+
+        let error = binding
+            .unlink_fenced(&root)
+            .expect_err("reappeared source must refuse unlink");
+
+        assert!(error.to_string().contains("reappeared"));
+        assert_eq!(
+            fs::read(&source).expect("replacement remains"),
+            b"replacement"
+        );
+        let quarantine = root
+            .path()
+            .join(entry_quarantine_name(OsStr::new("created.lock"), &identity));
+        assert_eq!(
+            fs::read(quarantine).expect("original quarantine"),
+            b"original"
+        );
+    }
 
     #[test]
     fn atomic_writer_uses_private_regular_files_and_preserves_lock_inode() {

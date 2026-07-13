@@ -462,6 +462,10 @@ where
         self.journal.identity()
     }
 
+    pub(crate) fn authenticator(&self) -> &RepositoryAuthenticator {
+        self.journal.authenticator()
+    }
+
     pub(crate) fn instance_id(&self) -> &str {
         self.journal.instance_id()
     }

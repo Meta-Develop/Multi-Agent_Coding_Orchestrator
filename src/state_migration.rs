@@ -19,7 +19,7 @@ use crate::{
     authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
     safe_state::{
         identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader,
-        DirectChildType, FileIdentity, KernelStateLock, SafeRoot,
+        DirectChildType, FileIdentity, KernelStateLock, ReservedDirectory, SafeRoot,
     },
     semantic_coord::{SemanticIntent, SemanticSnapshotSpec},
     state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
@@ -839,10 +839,20 @@ struct MigrationReceipt {
     entries: Vec<LegacyStateEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct LoadedMigrationTransaction {
     value: MigrationTransaction,
     root_identity: FileIdentity,
+    root: SafeRoot,
+    root_binding: ReservedDirectory,
+}
+
+struct MigrationTransactionBoundary<'a> {
+    root: &'a SafeRoot,
+    binding: &'a ReservedDirectory,
+    lock: &'a KernelStateLock,
+    expected: &'a MigrationTransaction,
+    identity: &'a FileIdentity,
 }
 
 #[derive(Debug)]
@@ -916,18 +926,30 @@ pub(crate) fn migrate_repository_state(
         });
     }
 
-    verify_preflight_repository_binding(&preflight)?;
-    let transaction_root =
-        SafeRoot::open_or_create(preflight.common_root.path().join(TRANSACTION_ROOT_NAME))
-            .context("failed to open owner-private state migration transaction root")?;
-    verify_preflight_repository_binding(&preflight)?;
-    transaction_root.verify()?;
-    if transaction
-        .as_ref()
-        .is_some_and(|loaded| loaded.root_identity != *transaction_root.identity())
-    {
-        bail!("migration transaction root identity changed after preflight");
-    }
+    let (transaction_root, transaction_binding, existing_transaction) = match transaction {
+        Some(loaded) => {
+            verify_transaction_root_binding(
+                &preflight,
+                &loaded.root,
+                &loaded.root_binding,
+                &loaded.root_identity,
+            )?;
+            (loaded.root, loaded.root_binding, Some(loaded.value))
+        }
+        None => {
+            verify_preflight_repository_binding(&preflight)?;
+            let root =
+                SafeRoot::open_or_create(preflight.common_root.path().join(TRANSACTION_ROOT_NAME))
+                    .context("failed to open owner-private state migration transaction root")?;
+            let binding = preflight
+                .common_root
+                .bind_existing_direct_child_directory(TRANSACTION_ROOT_NAME)
+                .context("failed to bind the new migration transaction root")?;
+            let identity = root.identity().clone();
+            verify_transaction_root_binding(&preflight, &root, &binding, &identity)?;
+            (root, binding, None)
+        }
+    };
     let transaction_lock = KernelStateLock::acquire_direct(&transaction_root, TRANSACTION_LOCK)?;
     transaction_lock.verify_direct_binding(&transaction_root)?;
 
@@ -938,7 +960,8 @@ pub(crate) fn migrate_repository_state(
         repo_path,
         &preflight,
         &transaction_root,
-        transaction.map(|loaded| loaded.value),
+        &transaction_binding,
+        existing_transaction,
         locks,
         transaction_lock,
     )
@@ -1007,6 +1030,33 @@ fn run_migration_after_child_bind_hook(name: &str) {
 
 #[cfg(not(test))]
 fn run_migration_after_child_bind_hook(_name: &str) {}
+
+#[cfg(test)]
+type MigrationBeforeFinalVerificationHook = Option<Box<dyn FnOnce()>>;
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_BEFORE_FINAL_VERIFICATION_HOOK: std::cell::RefCell<MigrationBeforeFinalVerificationHook> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_migration_before_final_verification_hook(hook: impl FnOnce() + 'static) {
+    MIGRATION_BEFORE_FINAL_VERIFICATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_migration_before_final_verification_hook() {
+    let hook = MIGRATION_BEFORE_FINAL_VERIFICATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_migration_before_final_verification_hook() {}
 
 fn preflight_legacy_state(
     repo_path: &Path,
@@ -2181,19 +2231,28 @@ fn manifest_exists(state_root: &SafeRoot) -> Result<bool> {
 fn load_transaction_if_present(
     preflight: &LegacyPreflight,
 ) -> Result<Option<LoadedMigrationTransaction>> {
-    let root_path = preflight.common_dir.join(TRANSACTION_ROOT_NAME);
-    let metadata = match fs::symlink_metadata(&root_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("failed to inspect migration transaction root"),
-    };
-    validate_owned_directory(&metadata, &root_path)?;
+    verify_preflight_repository_binding(preflight)?;
+    if !preflight
+        .common_root
+        .direct_child_exists(TRANSACTION_ROOT_NAME)?
+    {
+        return Ok(None);
+    }
+    let root_binding = preflight
+        .common_root
+        .bind_existing_direct_child_directory(TRANSACTION_ROOT_NAME)
+        .context("failed to bind migration transaction root to the Git common directory")?;
+    let root_path = root_binding.path();
+    let metadata = fs::symlink_metadata(root_path)?;
+    validate_owned_directory(&metadata, root_path)?;
     if file_mode(&metadata) != 0o700 {
         bail!("migration transaction root is not owner-private mode 0700");
     }
-    let root = SafeRoot::open_existing(&root_path)?;
-    for entry in fs::read_dir(root.path())? {
-        let name = entry?.file_name();
+    let root = SafeRoot::open_existing(root_path)?;
+    if root.identity() != root_binding.identity() {
+        bail!("migration transaction root changed while opening its capability");
+    }
+    for name in root.direct_child_names_bounded(3)? {
         if !matches!(
             name.to_str(),
             Some(TRANSACTION_FILE | RECEIPT_FILE | TRANSACTION_LOCK)
@@ -2211,11 +2270,34 @@ fn load_transaction_if_present(
     if transaction.checksum != expected {
         bail!("migration transaction checksum mismatch");
     }
+    root_binding.verify(&preflight.common_root)?;
     root.verify()?;
     Ok(Some(LoadedMigrationTransaction {
         value: transaction,
         root_identity: root.identity().clone(),
+        root,
+        root_binding,
     }))
+}
+
+fn verify_transaction_root_binding(
+    preflight: &LegacyPreflight,
+    root: &SafeRoot,
+    binding: &ReservedDirectory,
+    expected_identity: &FileIdentity,
+) -> Result<()> {
+    verify_preflight_repository_binding(preflight)?;
+    binding.verify(&preflight.common_root)?;
+    root.verify()?;
+    if binding.path() != preflight.common_root.path().join(TRANSACTION_ROOT_NAME)
+        || binding.identity() != expected_identity
+        || root.identity() != expected_identity
+        || root.path() != binding.path()
+    {
+        bail!("migration transaction root is no longer bound to the preflight common directory");
+    }
+    binding.verify(&preflight.common_root)?;
+    verify_preflight_repository_binding(preflight)
 }
 
 fn validate_transaction(
@@ -2268,6 +2350,7 @@ fn apply_migration(
     repo_path: &Path,
     preflight: &LegacyPreflight,
     transaction_root: &SafeRoot,
+    transaction_binding: &ReservedDirectory,
     existing_transaction: Option<MigrationTransaction>,
     mut locks: Vec<MigrationHeldLock>,
     transaction_lock: KernelStateLock,
@@ -2370,7 +2453,7 @@ fn apply_migration(
     };
     let authenticator = writer.into_authenticator()?;
     verify_migration_authenticator_binding(preflight, &authenticator)?;
-    revalidate_exact_state_root_inventory(preflight, &locks, true)?;
+    revalidate_exact_state_root_inventory(preflight, &locks, true, false)?;
     revalidate_preflight(preflight)?;
     verify_preflight_repository_binding(preflight)?;
     let store = match AuthenticatedSnapshotStore::<
@@ -2406,10 +2489,21 @@ fn apply_migration(
     )?;
     transaction.phase = MigrationPhase::Completed;
     write_transaction(transaction_root, &transaction_lock, &mut transaction)?;
-    transaction_lock.verify_direct_binding(transaction_root)?;
-    for lock in &locks {
-        lock.verify(&preflight.state_root)?;
-    }
+    run_migration_before_final_verification_hook();
+    let transaction_boundary = MigrationTransactionBoundary {
+        root: transaction_root,
+        binding: transaction_binding,
+        lock: &transaction_lock,
+        expected: &transaction,
+        identity: transaction_root.identity(),
+    };
+    verify_completed_migration_boundaries(
+        repo_path,
+        preflight,
+        &locks,
+        &transaction_boundary,
+        &store,
+    )?;
 
     Ok(StateMigrationReport {
         version: MIGRATION_VERSION,
@@ -2423,6 +2517,56 @@ fn apply_migration(
     })
 }
 
+fn verify_completed_migration_boundaries(
+    repo_path: &Path,
+    preflight: &LegacyPreflight,
+    locks: &[MigrationHeldLock],
+    transaction: &MigrationTransactionBoundary<'_>,
+    store: &AuthenticatedSnapshotStore<StateMigrationManifestSpec, StateMigrationManifest>,
+) -> Result<()> {
+    if transaction.expected.phase != MigrationPhase::Completed {
+        bail!("final migration verification requires a completed transaction");
+    }
+    verify_transaction_root_binding(
+        preflight,
+        transaction.root,
+        transaction.binding,
+        transaction.identity,
+    )?;
+    transaction.lock.verify_direct_binding(transaction.root)?;
+    verify_all_legacy_locks(preflight, locks)?;
+    verify_migration_authenticator_binding(preflight, store.authenticator())?;
+    let snapshot = store.current();
+    AuthenticatedSnapshotStore::<StateMigrationManifestSpec, StateMigrationManifest>::verify_locator_anchor(
+        store.authenticator(),
+        MANIFEST_INSTANCE_ID,
+        store.identity(),
+        snapshot.generation,
+    )?;
+    revalidate_exact_state_root_inventory(preflight, locks, true, true)?;
+    revalidate_preflight(preflight)?;
+    revalidate_retired_tombstones(repo_path, preflight, Some(&snapshot.value))?;
+    let observed = load_transaction_if_present(preflight)?
+        .context("completed migration transaction disappeared before return")?;
+    if &observed.root_identity != transaction.identity || &observed.value != transaction.expected {
+        bail!("completed migration transaction changed before return");
+    }
+    verify_migration_receipt(
+        transaction.root,
+        &snapshot.value,
+        snapshot.generation,
+        snapshot.token,
+    )?;
+    transaction.lock.verify_direct_binding(transaction.root)?;
+    verify_transaction_root_binding(
+        preflight,
+        transaction.root,
+        transaction.binding,
+        transaction.identity,
+    )?;
+    verify_migration_authenticator_binding(preflight, store.authenticator())
+}
+
 fn verify_existing_manifest(
     repo_path: &Path,
     apply: bool,
@@ -2433,20 +2577,28 @@ fn verify_existing_manifest(
     let transaction =
         transaction.context("signed migration manifest is missing its durable transaction")?;
     verify_all_legacy_locks(preflight, locks)?;
-    let transaction_root =
-        SafeRoot::open_existing(preflight.common_dir.join(TRANSACTION_ROOT_NAME))?;
-    if transaction.root_identity != *transaction_root.identity() {
-        bail!("migration transaction root identity changed after preflight");
-    }
+    let transaction_root = &transaction.root;
+    verify_transaction_root_binding(
+        preflight,
+        transaction_root,
+        &transaction.root_binding,
+        &transaction.root_identity,
+    )?;
     let transaction_lock =
-        KernelStateLock::acquire_existing_direct(&transaction_root, TRANSACTION_LOCK)?;
+        KernelStateLock::acquire_existing_direct(transaction_root, TRANSACTION_LOCK)?;
+    let initial_transaction_boundary = MigrationTransactionBoundary {
+        root: transaction_root,
+        binding: &transaction.root_binding,
+        lock: &transaction_lock,
+        expected: &transaction.value,
+        identity: &transaction.root_identity,
+    };
     verify_existing_manifest_boundaries(
         repo_path,
         preflight,
         locks,
-        &transaction_root,
-        &transaction_lock,
-        transaction,
+        &initial_transaction_boundary,
+        None,
         None,
     )?;
 
@@ -2473,13 +2625,12 @@ fn verify_existing_manifest(
             repo_path,
             preflight,
             locks,
-            &transaction_root,
-            &transaction_lock,
-            transaction,
+            &initial_transaction_boundary,
             Some(&snapshot.value),
+            Some(&store),
         )?;
         write_receipt(
-            &transaction_root,
+            transaction_root,
             &transaction_lock,
             &snapshot.value,
             snapshot.generation,
@@ -2487,29 +2638,31 @@ fn verify_existing_manifest(
         )?;
         durable_transaction.phase = MigrationPhase::Completed;
         write_transaction(
-            &transaction_root,
+            transaction_root,
             &transaction_lock,
             &mut durable_transaction,
         )?;
         phase = Some(MigrationPhase::Completed);
     }
 
-    let expected_transaction = LoadedMigrationTransaction {
-        value: durable_transaction,
-        root_identity: transaction.root_identity.clone(),
+    let durable_transaction_boundary = MigrationTransactionBoundary {
+        root: transaction_root,
+        binding: &transaction.root_binding,
+        lock: &transaction_lock,
+        expected: &durable_transaction,
+        identity: &transaction.root_identity,
     };
     verify_existing_manifest_boundaries(
         repo_path,
         preflight,
         locks,
-        &transaction_root,
-        &transaction_lock,
-        &expected_transaction,
+        &durable_transaction_boundary,
         Some(&snapshot.value),
+        Some(&store),
     )?;
     if phase == Some(MigrationPhase::Completed) {
         verify_migration_receipt(
-            &transaction_root,
+            transaction_root,
             &snapshot.value,
             snapshot.generation,
             snapshot.token,
@@ -2520,10 +2673,9 @@ fn verify_existing_manifest(
         repo_path,
         preflight,
         locks,
-        &transaction_root,
-        &transaction_lock,
-        &expected_transaction,
+        &durable_transaction_boundary,
         Some(&snapshot.value),
+        Some(&store),
     )?;
 
     Ok(StateMigrationReport {
@@ -2556,37 +2708,55 @@ fn verify_existing_manifest_boundaries(
     repo_path: &Path,
     preflight: &LegacyPreflight,
     locks: &[MigrationHeldLock],
-    transaction_root: &SafeRoot,
-    transaction_lock: &KernelStateLock,
-    expected_transaction: &LoadedMigrationTransaction,
+    transaction: &MigrationTransactionBoundary<'_>,
     manifest: Option<&StateMigrationManifest>,
+    store: Option<&AuthenticatedSnapshotStore<StateMigrationManifestSpec, StateMigrationManifest>>,
 ) -> Result<()> {
-    verify_preflight_repository_binding(preflight)?;
-    if transaction_root.identity() != &expected_transaction.root_identity {
-        bail!("migration repository or transaction root identity changed");
-    }
+    verify_transaction_root_binding(
+        preflight,
+        transaction.root,
+        transaction.binding,
+        transaction.identity,
+    )?;
     verify_all_legacy_locks(preflight, locks)?;
-    transaction_lock.verify_direct_binding(transaction_root)?;
-    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    transaction.lock.verify_direct_binding(transaction.root)?;
+    revalidate_exact_state_root_inventory(preflight, locks, false, false)?;
     revalidate_preflight(preflight)?;
     revalidate_retired_tombstones(repo_path, preflight, manifest)?;
     let observed = load_transaction_if_present(preflight)?
         .context("migration transaction disappeared while its lock was held")?;
-    if observed.root_identity != expected_transaction.root_identity
-        || observed.value != expected_transaction.value
-    {
+    if &observed.root_identity != transaction.identity || &observed.value != transaction.expected {
         bail!("migration transaction changed while its lock was held");
     }
-    transaction_lock.verify_direct_binding(transaction_root)?;
-    verify_preflight_repository_binding(preflight)?;
+    if let Some(store) = store {
+        verify_migration_authenticator_binding(preflight, store.authenticator())?;
+        let snapshot = store.current();
+        AuthenticatedSnapshotStore::<
+            StateMigrationManifestSpec,
+            StateMigrationManifest,
+        >::verify_locator_anchor(
+            store.authenticator(),
+            MANIFEST_INSTANCE_ID,
+            store.identity(),
+            snapshot.generation,
+        )?;
+    }
+    transaction.lock.verify_direct_binding(transaction.root)?;
+    verify_transaction_root_binding(
+        preflight,
+        transaction.root,
+        transaction.binding,
+        transaction.identity,
+    )?;
     preflight.state_root.verify()?;
-    transaction_root.verify()
+    transaction.root.verify()
 }
 
 fn revalidate_exact_state_root_inventory(
     preflight: &LegacyPreflight,
     locks: &[MigrationHeldLock],
     allow_auth_bootstrap_entries: bool,
+    allow_manifest_entries: bool,
 ) -> Result<()> {
     let mut expected = expected_state_root_inventory(preflight, locks)?;
     let mut observed = BTreeMap::new();
@@ -2607,13 +2777,14 @@ fn revalidate_exact_state_root_inventory(
             bail!("unknown entry in migration state root: {name}");
         }
         let identity = identity_for_path(&path)?;
-        if !expected.contains_key(&name)
-            && allow_auth_bootstrap_entries
+        let allowed_auth_entry = allow_auth_bootstrap_entries
             && matches!(
                 name.as_str(),
                 AUTH_KEY_FILE | AUTH_EPOCH_FILE | AUTH_KEY_LOCK
-            )
-        {
+            );
+        let allowed_manifest_entry = allow_manifest_entries
+            && matches!(name.as_str(), MANIFEST_ROOT_NAME | ".state-migrations.lock");
+        if !expected.contains_key(&name) && (allowed_auth_entry || allowed_manifest_entry) {
             expected.insert(name.clone(), identity.clone());
         }
         if observed.insert(name, identity).is_some() {
@@ -2712,7 +2883,7 @@ fn write_receipt(
 fn harden_state(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Result<()> {
     verify_preflight_repository_binding(preflight)?;
     revalidate_preflight(preflight)?;
-    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    revalidate_exact_state_root_inventory(preflight, locks, false, false)?;
     let expected = expected_state_root_inventory(preflight, locks)?;
     for (name, identity) in &expected {
         let (kind, mode) = if is_known_authenticated_directory(name) {
@@ -2735,7 +2906,7 @@ fn harden_state(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Res
     for lock in locks {
         lock.verify(&preflight.state_root)?;
     }
-    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    revalidate_exact_state_root_inventory(preflight, locks, false, false)?;
     revalidate_preflight(preflight)?;
     verify_preflight_repository_binding(preflight)?;
     ensure_hardened_state(preflight, locks)
@@ -2755,7 +2926,7 @@ fn ensure_hardened_state(preflight: &LegacyPreflight, locks: &[MigrationHeldLock
 
 fn state_is_hardened(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Result<bool> {
     verify_preflight_repository_binding(preflight)?;
-    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    revalidate_exact_state_root_inventory(preflight, locks, false, false)?;
     let state_metadata = fs::symlink_metadata(preflight.state_root.path())?;
     validate_owned_directory(&state_metadata, preflight.state_root.path())?;
     if file_mode(&state_metadata) != 0o700 {
@@ -2778,7 +2949,7 @@ fn state_is_hardened(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -
             bail!("unknown entry in hardened migration state root: {name}");
         }
     }
-    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    revalidate_exact_state_root_inventory(preflight, locks, false, false)?;
     verify_preflight_repository_binding(preflight)?;
     Ok(true)
 }
@@ -3120,7 +3291,13 @@ mod tests {
 
         let error = migrate_repository_state(&path, false)
             .expect_err("transaction root replacement must fail closed");
-        assert!(error.to_string().contains("identity changed"));
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("identity changed")
+                || chain.contains("no longer identifies")
+                || chain.contains("transaction root"),
+            "unexpected error: {chain}"
+        );
     }
 
     #[cfg(unix)]
@@ -3163,6 +3340,80 @@ mod tests {
             state_identity
         );
         assert!(!common_dir.join(TRANSACTION_ROOT_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_apply_refuses_common_replacement_with_same_state_and_transaction_inodes() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        let repository = Repository::open(&path).expect("repository");
+        let common_dir = repository.commondir().to_path_buf();
+        let displaced_common = path.join("post-manifest-displaced-common");
+        let state_identity = identity_for_path(&state).expect("state identity");
+        let transaction_identity = std::rc::Rc::new(std::cell::RefCell::new(None));
+        set_migration_before_final_verification_hook({
+            let common_dir = common_dir.clone();
+            let displaced_common = displaced_common.clone();
+            let transaction_identity = std::rc::Rc::clone(&transaction_identity);
+            move || {
+                *transaction_identity.borrow_mut() = Some(
+                    identity_for_path(common_dir.join(TRANSACTION_ROOT_NAME))
+                        .expect("transaction identity"),
+                );
+                fs::rename(&common_dir, &displaced_common).expect("displace original common dir");
+                fs::create_dir(&common_dir).expect("replacement common dir");
+                fs::set_permissions(&common_dir, fs::Permissions::from_mode(0o700))
+                    .expect("replacement common mode");
+                fs::create_dir(common_dir.join("maco")).expect("replacement state parent");
+                fs::set_permissions(common_dir.join("maco"), fs::Permissions::from_mode(0o700))
+                    .expect("replacement state parent mode");
+                fs::rename(
+                    displaced_common.join("maco/state"),
+                    common_dir.join("maco/state"),
+                )
+                .expect("return state inode");
+                fs::rename(
+                    displaced_common.join(TRANSACTION_ROOT_NAME),
+                    common_dir.join(TRANSACTION_ROOT_NAME),
+                )
+                .expect("return transaction inode");
+            }
+        });
+
+        let error = migrate_repository_state(&path, true)
+            .expect_err("post-manifest common replacement must fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("safe root path was replaced") || chain.contains("common"),
+            "unexpected error: {chain}"
+        );
+        assert_eq!(
+            identity_for_path(common_dir.join("maco/state")).expect("returned state"),
+            state_identity
+        );
+        assert_eq!(
+            identity_for_path(common_dir.join(TRANSACTION_ROOT_NAME))
+                .expect("returned transaction"),
+            transaction_identity
+                .borrow()
+                .clone()
+                .expect("captured transaction identity")
+        );
+        let transaction: MigrationTransaction = serde_json::from_slice(
+            &fs::read(
+                common_dir
+                    .join(TRANSACTION_ROOT_NAME)
+                    .join(TRANSACTION_FILE),
+            )
+            .expect("completed transaction"),
+        )
+        .expect("transaction JSON");
+        assert_eq!(transaction.phase, MigrationPhase::Completed);
+        assert!(common_dir
+            .join(TRANSACTION_ROOT_NAME)
+            .join(RECEIPT_FILE)
+            .is_file());
     }
 
     #[cfg(unix)]
