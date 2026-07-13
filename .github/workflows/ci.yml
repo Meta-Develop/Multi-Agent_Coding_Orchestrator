@@ -1,0 +1,76 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Match the flake.lock development shell used for local verification.
+  RUSTUP_TOOLCHAIN: "1.94.1"
+
+jobs:
+  linux:
+    name: Linux fmt, check, clippy, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Select stable Rust with required components
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets against Cargo.lock
+        run: cargo check --locked --all-targets
+
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run all tests
+        run: cargo test --locked --all-targets
+
+  portable-build:
+    name: ${{ matrix.os }} compile and test build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Select stable Rust
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Check all targets against Cargo.lock
+        run: cargo check --locked --all-targets
+
+      - name: Compile all tests without running them
+        run: cargo test --locked --all-targets --no-run

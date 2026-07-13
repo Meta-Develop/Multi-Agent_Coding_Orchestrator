@@ -77,18 +77,76 @@ rebind attempts fail closed without following an attacker-selected target.
 Patch directories and checkpoint directories must be current-user-owned `0700` directories;
 their leaves are `0600` single-link regular files. Patch leaves are reserved for every pending
 agent before the schedule starts, are rejected if the output root overlaps any child worktree, and
-are removed through identity-checked cleanup when unused. Checkpoint v1 retains one root/file
-capability across every stage write, uses bounded descriptor reads for resume, and is protected
-against path-confusion and link-following attacks.
+are removed through identity-checked cleanup when unused. Checkpoint output retains one root/file
+capability across every stage write, uses bounded descriptor reads, and is protected against
+path-confusion and link-following attacks. Version 1 and version 2 checkpoints are unauthenticated
+legacy formats and are refused for resume; operators must start a new version 3 run.
 
-Checkpoint v1 is not authenticated state: it has no MAC, signature, monotonic sequence, or external
-authority binding. A same-user actor who can write the valid file contents before or after MACO
-captures its descriptor can forge a syntactically valid checkpoint. Authenticated checkpoint
-v2/WAL authority is a future boundary and is not claimed here. Likewise, the current artifact
-`prune` implementation
-is intended for quiescent, operator-owned run roots; finalized-only descriptor-relative bounded
-deletion and crash scavenging remain part of the pending state-writer integration. Do not prune a
-family concurrently with an active run or a hostile same-UID path mutator.
+A version 3 checkpoint file is only a bounded repository-locator envelope. MACO verifies its
+repository binding and MAC before trusting its run ID, plan path, or saved state. The authoritative
+owner-private journal is repository-bound, holds a full-lifecycle exclusive run lock, and consists
+of immutable contiguous records linked by their previous MAC plus an authenticated durable head.
+This detects mutation, truncation, duplication, and reordering relative to the retained head. A
+durable `command_started` without completion is an uncertain external outcome and is never retried
+automatically. A completed command records an exact worktree-state binding; resume checks that
+binding, reruns validation, and recaptures the candidate without rerunning the command. Completed
+candidates and repository validation are recaptured before success is restored.
+
+Claims, semantic intents, and the managed-worktree registry use repository-authenticated snapshot
+namespaces rather than treating their legacy JSON paths as mutable authority. The snapshot layer
+uses HMAC-chained journals, signed atomic heads, signed stable locators, full-lifecycle locks, and
+prepared rollover intents. Retained terminal anchors and a bounded physical-journal inventory make
+missing or substituted journals, unbound generations, and stale locator replay fail closed.
+Namespace-wide limits bound logical stores, root entries, and retained journals before creating a
+new store or rollover candidate.
+
+Repositories with legacy durable state require the explicit offline migration path. `maco state
+migrate` is a non-mutating validation by default; `--apply` requires every known consumer lock to
+be idle, validates bounded no-follow entries for each supported legacy schema, verifies checksums
+where that schema carries them, hardens modes, and publishes a signed migration manifest and audit
+receipt. First use then retires each legacy consumer through a recoverable signed transaction and
+leaves a versioned tombstone that makes old writers fail closed. Unrecognized variants, missing
+integrity evidence required by a recognized variant, filesystems whose ownership, permission, or
+locking evidence cannot be verified, and unexpected state entries require operator recovery rather
+than automatic adoption.
+
+Git pushes, pull requests, issues, and source-item comments use an authenticated repository-local
+effect write-ahead log. A stable effect identity binds the transport, source provider, canonical
+repository, source action revision, operation, target, and payload. The only valid sequence is
+`planned -> started -> observed -> completed`, with `started` durable immediately before a provider
+call. Recovery from `started` performs lookup only: it adopts exactly one marker- and
+provenance-bound receipt, while zero, multiple, or malformed matches require manual reconciliation
+and never resend the effect. Observed and completed receipts are re-fetched and checked against the
+exact request; deletion or remote mutation blocks instead of recreating the effect.
+
+Effect-log capacity is finite and there is deliberately no automatic receipt garbage collection or
+retry to regain space. Reaching a logical-store, root-entry, or retained-journal quota fails closed;
+operator archival must preserve authenticated receipt evidence or the exactly-once guarantee can be
+lost. Legacy plaintext publication transaction entries are not adopted, overwritten, or deleted and
+still require a dedicated signed migration path.
+
+All local authentication guarantees depend on keeping the owner-private key and state root secret
+from untrusted children. Without an external monotonic anchor, MACO cannot detect coherent rollback
+of an entire older valid key/epoch together with every matching locator, journal, head, tombstone,
+and transaction artifact.
+
+Run-artifact pruning deletes only a run whose repository-bound finalization MAC, manifest, file
+digests, and writer-lock identity all verify. It holds the family-root lock, waits for the per-run
+writer lock, revalidates the run identity and finalization after that wait, moves the exact directory
+into an identity-bound quarantine, and performs bounded no-follow deletion that rejects links and
+special files. Unfinalized, rebound, or tampered runs are retained and reported instead of deleted,
+so cooperating active MACO writers do not require an operator race window. These locks do not make
+progress under an uncooperative hostile same-UID mutator: such a root must still be quiescent and
+operator-controlled, and a quarantined deletion failure requires manual inspection.
+
+## Dependency assurance
+
+Continuous checks require an unchanged `Cargo.lock`, run Linux formatting, compilation, linting,
+and tests, and compile all tests without executing them on native macOS and Windows hosts. Separate
+policy checks run RustSec auditing and `cargo-deny` advisory, duplicate-version, license, and source
+rules. Tool versions and the repository policy are pinned, but the project does not vendor a RustSec
+database or a complete crate mirror; a fresh or newly updated advisory check has an explicit network
+dependency and does not make a previously fetched offline closure current.
 
 ## Resource limits and residual risk
 

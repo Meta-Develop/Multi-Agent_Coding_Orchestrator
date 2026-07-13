@@ -1,0 +1,54 @@
+name: Supply-chain policy
+
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match the flake.lock development shell used for local verification.
+  RUSTUP_TOOLCHAIN: "1.94.1"
+
+jobs:
+  audit:
+    name: Cargo.lock, RustSec, licenses, bans, and sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Select stable Rust
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Verify Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Verify the locked release package
+        run: cargo package --locked
+
+      - name: Install pinned supply-chain tools
+        run: |
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo install --locked --version 0.20.2 cargo-deny
+
+      - name: Check RustSec advisories
+        run: cargo audit --deny warnings
+
+      - name: Enforce dependency policy
+        run: cargo deny --locked check -D warnings advisories bans licenses sources
