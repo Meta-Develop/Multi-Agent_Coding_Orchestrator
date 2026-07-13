@@ -1384,7 +1384,9 @@ fn registered_artifact_repositories(
     }
     let mut listed_names = BTreeSet::new();
     for name in listed.iter() {
-        let name = name.context("registered linked worktree name is not valid UTF-8")?;
+        let name = name
+            .context("failed to decode registered linked worktree name")?
+            .context("registered linked worktree name is missing")?;
         if name.is_empty() || name.len() > MAX_REGISTERED_WORKTREE_NAME_BYTES {
             bail!("registered linked worktree name exceeds its bounded format");
         }

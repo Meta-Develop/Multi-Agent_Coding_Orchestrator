@@ -1148,7 +1148,10 @@ fn verified_worktree_record(
     worktree
         .validate()
         .with_context(|| format!("managed worktree '{}' failed Git validation", binding.name))?;
-    if worktree.name() != Some(binding.name.as_str()) {
+    let registered_name = worktree
+        .name()
+        .context("managed worktree registration name is not valid UTF-8")?;
+    if registered_name != Some(binding.name.as_str()) {
         bail!("managed worktree registration name changed");
     }
     let registered_path = fs::canonicalize(worktree.path()).with_context(|| {
@@ -2455,7 +2458,10 @@ fn verify_worktree_clean_at(
         let head = worktree_repo
             .head()
             .context("failed to inspect created worktree HEAD")?;
-        if !head.is_branch() || head.name() != Some(expected_reference.as_str()) {
+        let head_name = head
+            .name()
+            .context("created worktree HEAD name is not valid UTF-8")?;
+        if !head.is_branch() || head_name != expected_reference {
             bail!("created worktree HEAD is not bound to '{expected_reference}'");
         }
         let observed = head
@@ -3377,10 +3383,17 @@ fn repository_info(repo: &Repository) -> Result<RepositoryInfo> {
         .workdir()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.path().to_path_buf());
+    repo.find_reference("HEAD")
+        .context("failed to inspect repository HEAD backlink")?
+        .symbolic_target()
+        .context("repository HEAD symbolic target is not valid UTF-8")?;
     let head = match repo.head() {
-        Ok(head) => head.shorthand().map(ToOwned::to_owned),
+        Ok(head) => Some(
+            head.shorthand()
+                .map(ToOwned::to_owned)
+                .context("repository HEAD shorthand is not valid UTF-8")?,
+        ),
         Err(error) if error.code() == ErrorCode::UnbornBranch => None,
-        Err(error) if error.code() == ErrorCode::NotFound => None,
         Err(error) => return Err(error).context("failed to read repository HEAD"),
     };
 
@@ -5280,6 +5293,21 @@ mod tests {
         assert_eq!(info.path, repo_path);
         assert_eq!(info.head, None);
         assert!(info.git_dir.ends_with(".git"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_info_fails_closed_on_non_utf8_head_target() -> Result<()> {
+        let temp = TempDir::new()?;
+        let repository = Repository::init(temp.path())?;
+        assert_eq!(repository_info(&repository)?.head, None);
+        fs::write(repository.path().join("HEAD"), b"ref: refs/heads/non\xff\n")?;
+
+        let error = repository_info(&repository).expect_err("non-UTF-8 HEAD must fail");
+        assert!(error
+            .to_string()
+            .contains("repository HEAD symbolic target is not valid UTF-8"));
+        Ok(())
     }
 
     #[test]

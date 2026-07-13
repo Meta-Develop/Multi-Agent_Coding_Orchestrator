@@ -374,6 +374,42 @@ nix develop path:$PWD -c cargo test
 nix develop path:$PWD -c cargo clippy --all-targets -- -D warnings
 ```
 
+The Nix development shell also pins the supply-chain tools through
+`flake.lock`. Audit the exact Cargo lockfile and enforce the repository policy
+with:
+
+```bash
+nix develop path:$PWD -c cargo audit --deny warnings
+nix develop path:$PWD -c cargo deny --locked check -D warnings advisories bans licenses sources
+```
+
+`cargo fetch --locked` is the explicit online boundary for Rust dependencies in
+a fresh checkout. Once that checksum-verified closure is present in the Cargo
+cache, the build can be repeated without dependency resolution or network
+access:
+
+```bash
+cargo fetch --locked
+cargo check --locked --offline --all-targets
+```
+
+The Nix shell pins the Rust/native toolchain, while `Cargo.lock` pins crates.io
+versions and checksums. The Cargo configuration forces the checksum-verified
+`libgit2` and zlib sources from that closure instead of ambient system copies.
+The project does not keep a separate crate mirror or RustSec database snapshot,
+so a completely empty machine still needs the explicit fetch steps before
+offline verification.
+
+### Platform boundary
+
+Linux is the fully supported security-sensitive runtime path. macOS and Windows
+adapters cover portable Git, process, and state operations, but commands that
+depend on Linux-only primitives such as `renameat2`, descriptor-confined review
+views, or systemd containment return an explicit unsupported-platform error.
+They do not silently fall back to weaker path or process checks. The Nix flake
+evaluates Linux and Darwin development shells; Windows builds require a separate
+Rust target/toolchain and are not provided by this flake.
+
 ## CLI Examples
 
 Inspect a repository:

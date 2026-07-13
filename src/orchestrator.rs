@@ -3686,12 +3686,12 @@ fn collect_status_paths(repo: &Repository) -> Result<Vec<PathBuf>> {
     let statuses = repo
         .statuses(Some(&mut options))
         .context("failed to inspect git status")?;
-    let mut paths = statuses
-        .iter()
-        .filter_map(|entry| entry.path().map(PathBuf::from))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut paths = BTreeSet::new();
+    for entry in statuses.iter() {
+        let path = entry.path().context("git status path is not valid UTF-8")?;
+        paths.insert(PathBuf::from(path));
+    }
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
 }
@@ -6230,6 +6230,26 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_status_paths_fails_closed_on_non_utf8_path() -> Result<()> {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let temp = tempfile::tempdir()?;
+        let repository = Repository::init(temp.path())?;
+        fs::write(
+            temp.path()
+                .join(OsString::from_vec(vec![b'n', b'o', b'n', 0xff])),
+            b"untracked",
+        )?;
+
+        let error = collect_status_paths(&repository).expect_err("non-UTF-8 status must fail");
+        assert!(error
+            .to_string()
+            .contains("git status path is not valid UTF-8"));
+        Ok(())
+    }
 
     fn run_plan_file(options: OrchestrationRunOptions) -> Result<OrchestrationSummary> {
         super::run_plan_file_simulation(options)

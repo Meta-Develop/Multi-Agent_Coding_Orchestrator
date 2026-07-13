@@ -23,15 +23,11 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
+              cargo-audit
+              cargo-deny
               rustc
               rustfmt
               clippy
-              pkg-config
-              openssl
-              zlib
-              libssh2
-              libgit2
-              cmake
             ];
 
             RUST_BACKTRACE = "1";

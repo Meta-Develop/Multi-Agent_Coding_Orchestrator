@@ -3577,11 +3577,17 @@ fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
     let statuses = repo
         .statuses(Some(&mut options))
         .context("failed to inspect primary worktree status")?;
-    let mut paths = statuses
-        .iter()
-        .filter_map(|entry| entry.path().map(PathBuf::from))
-        .filter(|path| !is_ignored_runtime_path(path))
-        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for entry in statuses.iter() {
+        let path = PathBuf::from(
+            entry
+                .path()
+                .context("primary worktree status path is not valid UTF-8")?,
+        );
+        if !is_ignored_runtime_path(&path) {
+            paths.push(path);
+        }
+    }
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -4427,11 +4433,16 @@ fn source_repository_binding_context(
         common.identity().device,
         common.identity().file,
     );
-    let origin_binding = repo.find_remote("origin").ok().and_then(|remote| {
-        remote
-            .url()
-            .and_then(|url| publication::canonical_github_source_repository(url).ok())
-    });
+    let origin_binding = match repo.find_remote("origin") {
+        Ok(remote) => {
+            let url = remote
+                .url()
+                .context("origin remote URL is not valid UTF-8")?;
+            publication::canonical_github_source_repository(url).ok()
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+        Err(error) => return Err(error).context("failed to inspect origin remote"),
+    };
     let configured_selector = match (&config.repository.owner, &config.repository.name) {
         (Some(owner), Some(name)) => Some(format!("{owner}/{name}")),
         _ => None,
@@ -4921,6 +4932,26 @@ mod tests {
     use crate::worktree::WorktreeManager;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn dirty_primary_paths_fails_closed_on_non_utf8_git_status_path() -> Result<()> {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let temp = tempfile::tempdir()?;
+        Repository::init(temp.path())?;
+        fs::write(
+            temp.path()
+                .join(OsString::from_vec(vec![b'n', b'o', b'n', 0xff])),
+            b"untracked",
+        )?;
+
+        let error = dirty_primary_paths(temp.path()).expect_err("non-UTF-8 status must fail");
+        assert!(error
+            .to_string()
+            .contains("primary worktree status path is not valid UTF-8"));
+        Ok(())
+    }
 
     #[cfg(unix)]
     use std::{

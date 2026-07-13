@@ -1961,7 +1961,7 @@ fn publication_report_from_preview(
 ) -> Result<PrPublicationReport> {
     let primary_repo = Repository::open(&preview.candidate.metadata.primary_repo_root)
         .context("failed to open primary repository")?;
-    let base = current_branch_name(&primary_repo).unwrap_or_else(|| "HEAD".to_string());
+    let base = current_branch_name(&primary_repo)?.unwrap_or_else(|| "HEAD".to_string());
     let body = pr_body(&preview);
     let status = if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         PrPublicationStatus::Blocked
@@ -2739,10 +2739,19 @@ fn commit_message(agent_id: &str, preview: &MergeApplyPreview) -> String {
     )
 }
 
-fn current_branch_name(repo: &Repository) -> Option<String> {
-    repo.head()
-        .ok()
-        .and_then(|head| head.shorthand().map(ToOwned::to_owned))
+fn current_branch_name(repo: &Repository) -> Result<Option<String>> {
+    repo.find_reference("HEAD")
+        .context("failed to inspect current HEAD backlink")?
+        .symbolic_target()
+        .context("current HEAD symbolic target is not valid UTF-8")?;
+    match repo.head() {
+        Ok(head) => head
+            .shorthand()
+            .map(|name| Some(name.to_owned()))
+            .context("current branch shorthand is not valid UTF-8"),
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => Ok(None),
+        Err(error) => Err(error).context("failed to inspect current branch"),
+    }
 }
 
 fn remote_url(repo: &Repository, name: &str) -> Result<String> {
@@ -2752,7 +2761,7 @@ fn remote_url(repo: &Repository, name: &str) -> Result<String> {
     remote
         .url()
         .map(ToOwned::to_owned)
-        .with_context(|| format!("remote '{name}' has no URL"))
+        .with_context(|| format!("remote '{name}' URL is not valid UTF-8"))
 }
 
 fn redact_remote_url(url: &str) -> String {
@@ -8058,6 +8067,28 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn git_identity_helpers_fail_closed_on_non_utf8_names_and_urls() -> Result<()> {
+        let branch_repo = tempfile::tempdir()?;
+        let repository = Repository::init(branch_repo.path())?;
+        assert_eq!(current_branch_name(&repository)?, None);
+        fs::write(repository.path().join("HEAD"), b"ref: refs/heads/non\xff\n")?;
+        assert!(current_branch_name(&repository).is_err());
+
+        let remote_repo = tempfile::tempdir()?;
+        let repository = Repository::init(remote_repo.path())?;
+        fs::write(
+            repository.path().join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n[remote \"origin\"]\n\turl = https://example.invalid/non\xff\n",
+        )?;
+        let error = remote_url(&repository, "origin").expect_err("non-UTF-8 URL must fail");
+        assert!(error
+            .to_string()
+            .contains("remote 'origin' URL is not valid UTF-8"));
+        Ok(())
+    }
 
     #[derive(Default)]
     struct FakeExternalRemote {

@@ -2308,22 +2308,21 @@ impl ReviewRepositoryBinding {
         let repository = git2::Repository::open(self.worktree_root.path())
             .context("failed to open bound review repository")?;
         let (head, head_name) = match repository.head() {
-            Ok(head) => (
-                head.target().map(|oid| oid.to_string()),
-                head.name().map(ToString::to_string),
-            ),
-            Err(error)
-                if matches!(
-                    error.code(),
-                    git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
-                ) =>
-            {
-                (None, None)
+            Ok(head) => {
+                let name = head
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .context("review HEAD name is not valid UTF-8")?;
+                (head.target().map(|oid| oid.to_string()), Some(name))
             }
+            Err(error) if error.code() == git2::ErrorCode::UnbornBranch => (None, None),
             Err(error) => return Err(error).context("failed to read review HEAD"),
         };
         let head_symbolic_target = match repository.find_reference("HEAD") {
-            Ok(reference) => reference.symbolic_target().map(ToString::to_string),
+            Ok(reference) => reference
+                .symbolic_target()
+                .context("review HEAD symbolic target is not valid UTF-8")?
+                .map(ToOwned::to_owned),
             Err(error) if error.code() == git2::ErrorCode::NotFound => None,
             Err(error) => return Err(error).context("failed to read review HEAD backlink"),
         };
@@ -4274,6 +4273,22 @@ pub fn repo_path_for_review(repo: impl AsRef<Path>) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn review_snapshot_fails_closed_on_non_utf8_head_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repository = git2::Repository::init(temp.path())?;
+        let binding = ReviewRepositoryBinding::bind(temp.path())?;
+        binding.snapshot()?;
+        std::fs::write(repository.path().join("HEAD"), b"ref: refs/heads/non\xff\n")?;
+
+        let error = binding.snapshot().expect_err("non-UTF-8 HEAD must fail");
+        assert!(error
+            .to_string()
+            .contains("review HEAD symbolic target is not valid UTF-8"));
+        Ok(())
+    }
+
     #[test]
     fn fake_review_constructs_passed_report_with_deterministic_identity() {
         let report = fake_review(ReviewPrOptions {
@@ -4706,7 +4721,7 @@ mod tests {
             uid: 0,
             gid: 0,
             file_size: 0,
-            id: git2::Oid::zero(),
+            id: git2::Oid::ZERO_SHA1,
             flags: 0,
             flags_extended: 0,
             path: b"submodule".to_vec(),
@@ -5488,7 +5503,7 @@ mod tests {
             uid: 0,
             gid: 0,
             file_size: 0,
-            id: git2::Oid::zero(),
+            id: git2::Oid::ZERO_SHA1,
             flags: 0,
             flags_extended: 0,
             path: b"submodule".to_vec(),

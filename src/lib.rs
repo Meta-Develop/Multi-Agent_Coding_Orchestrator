@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod agent;
 pub mod artifacts;
 pub(crate) mod authenticated_snapshot;

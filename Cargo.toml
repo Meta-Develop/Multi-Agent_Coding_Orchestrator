@@ -27,10 +27,10 @@ name = "maco"
 path = "src/bin/maco.rs"
 
 [dependencies]
-anyhow = "1"
+anyhow = "1.0.103"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 libc = "0.2"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
