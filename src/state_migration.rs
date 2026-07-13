@@ -13,13 +13,13 @@ use crate::{
         repository_auth_writer, repository_authenticator_key_only,
         state_auth::{
             sha256_hex, AuthenticationDomain, AuthenticationTag, BoundStateLock,
-            RepositoryAuthBinding, RepositoryAuthWriter,
+            RepositoryAuthBinding, RepositoryAuthWriter, RepositoryAuthenticator,
         },
     },
     authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
     safe_state::{
-        identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity,
-        KernelStateLock, SafeRoot,
+        identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader,
+        DirectChildType, FileIdentity, KernelStateLock, SafeRoot,
     },
     semantic_coord::{SemanticIntent, SemanticSnapshotSpec},
     state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
@@ -849,6 +849,7 @@ struct LoadedMigrationTransaction {
 struct LegacyPreflight {
     common_dir: PathBuf,
     common_dir_identity: FileIdentity,
+    common_root: SafeRoot,
     state_root: SafeRoot,
     original_state_mode: u32,
     original_file_modes: BTreeMap<String, u32>,
@@ -894,6 +895,7 @@ pub(crate) fn migrate_repository_state(
         validate_transaction(&transaction.value, &preflight)?;
     }
     run_migration_after_preflight_hook();
+    verify_preflight_repository_binding(&preflight)?;
 
     if manifest_exists(&preflight.state_root)? {
         let report =
@@ -909,13 +911,17 @@ pub(crate) fn migrate_repository_state(
             legacy_state_root: ".git/maco/state".to_string(),
             transaction_phase: transaction.as_ref().map(|loaded| loaded.value.phase),
             entries: preflight.entries.clone(),
-            hardened: state_is_hardened(&preflight)?,
+            hardened: state_is_hardened(&preflight, &locks)?,
             manifest_generation: None,
         });
     }
 
-    let transaction_root = SafeRoot::open_or_create(common_dir.join(TRANSACTION_ROOT_NAME))
-        .context("failed to open owner-private state migration transaction root")?;
+    verify_preflight_repository_binding(&preflight)?;
+    let transaction_root =
+        SafeRoot::open_or_create(preflight.common_root.path().join(TRANSACTION_ROOT_NAME))
+            .context("failed to open owner-private state migration transaction root")?;
+    verify_preflight_repository_binding(&preflight)?;
+    transaction_root.verify()?;
     if transaction
         .as_ref()
         .is_some_and(|loaded| loaded.root_identity != *transaction_root.identity())
@@ -968,6 +974,40 @@ fn run_migration_after_preflight_hook() {
 #[cfg(not(test))]
 fn run_migration_after_preflight_hook() {}
 
+#[cfg(test)]
+type MigrationAfterChildBindHook = Option<(String, Box<dyn FnOnce()>)>;
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_AFTER_CHILD_BIND_HOOK: std::cell::RefCell<MigrationAfterChildBindHook> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_migration_after_child_bind_hook(name: &str, hook: impl FnOnce() + 'static) {
+    MIGRATION_AFTER_CHILD_BIND_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some((name.to_string(), Box::new(hook)));
+    });
+}
+
+#[cfg(test)]
+fn run_migration_after_child_bind_hook(name: &str) {
+    let hook = MIGRATION_AFTER_CHILD_BIND_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(expected, _)| expected == name) {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_migration_after_child_bind_hook(_name: &str) {}
+
 fn preflight_legacy_state(
     repo_path: &Path,
     common_dir: &Path,
@@ -984,17 +1024,8 @@ fn preflight_legacy_state(
     let mut existing_lock_names = Vec::new();
     let mut observed_files = BTreeSet::new();
     let mut root_entries = BTreeMap::new();
-    let mut count = 0_usize;
-    for entry in fs::read_dir(state_root.path()).context("failed to enumerate legacy state root")? {
-        let entry = entry.context("failed to inspect legacy state entry")?;
-        count = count
-            .checked_add(1)
-            .context("legacy state entry count overflowed")?;
-        if count > MAX_STATE_ENTRIES {
-            bail!("legacy state root exceeds its bounded entry count");
-        }
-        let name = entry
-            .file_name()
+    for name in state_root.direct_child_names_bounded(MAX_STATE_ENTRIES)? {
+        let name = name
             .into_string()
             .map_err(|_| anyhow::anyhow!("legacy state entry name is not UTF-8"))?;
         let path = state_root.direct_child(&name)?;
@@ -1093,6 +1124,7 @@ fn preflight_legacy_state(
     Ok(LegacyPreflight {
         common_dir: common_dir.to_path_buf(),
         common_dir_identity: common_root.identity().clone(),
+        common_root,
         state_root,
         original_state_mode: file_mode(&state_metadata),
         original_file_modes,
@@ -1102,6 +1134,52 @@ fn preflight_legacy_state(
         existing_lock_names,
         expected_bindings,
     })
+}
+
+fn verify_preflight_repository_binding(preflight: &LegacyPreflight) -> Result<()> {
+    preflight.common_root.verify()?;
+    preflight.state_root.verify()?;
+    if preflight.common_root.identity() != &preflight.common_dir_identity
+        || preflight.common_root.path() != preflight.common_dir
+    {
+        bail!("migration Git common-directory capability changed after preflight");
+    }
+
+    let maco_binding = preflight
+        .common_root
+        .bind_existing_managed_direct_child_directory("maco")
+        .context("migration state parent is no longer bound to the Git common directory")?;
+    let maco_root = SafeRoot::open_existing(maco_binding.path())?;
+    if maco_root.identity() != maco_binding.identity() {
+        bail!("migration state parent binding changed while it was opened");
+    }
+    let state_binding = maco_root
+        .bind_existing_managed_direct_child_directory("state")
+        .context("migration state root is no longer bound to its state parent")?;
+    if state_binding.identity() != preflight.state_root.identity()
+        || state_binding.path() != preflight.state_root.path()
+    {
+        bail!("migration state root is no longer associated with the preflight repository");
+    }
+    state_binding.verify(&maco_root)?;
+    maco_root.verify()?;
+    maco_binding.verify(&preflight.common_root)?;
+    preflight.state_root.verify()?;
+    preflight.common_root.verify()
+}
+
+fn verify_migration_authenticator_binding(
+    preflight: &LegacyPreflight,
+    authenticator: &RepositoryAuthenticator,
+) -> Result<()> {
+    verify_preflight_repository_binding(preflight)?;
+    authenticator.verify()?;
+    if authenticator.binding().common_dir_identity != preflight.common_dir_identity
+        || authenticator.state_root().identity() != preflight.state_root.identity()
+    {
+        bail!("migration authentication writer is bound to a different repository state root");
+    }
+    verify_preflight_repository_binding(preflight)
 }
 
 fn missing_manifest_entries() -> Vec<LegacyStateEntry> {
@@ -1969,7 +2047,7 @@ impl MigrationHeldLock {
             created: true,
         };
         lock.verify(root)?;
-        sync_directory(root.path())?;
+        root.sync_directory_fenced()?;
         Ok(lock)
     }
 
@@ -2238,7 +2316,7 @@ fn apply_migration(
             );
         }
     } else {
-        ensure_hardened_state(preflight)?;
+        ensure_hardened_state(preflight, &locks)?;
     }
 
     if let Some(action) = take_migration_fault(MigrationFaultPoint::AfterPermissions) {
@@ -2262,6 +2340,7 @@ fn apply_migration(
     if let Some(index) = locks.iter().position(|lock| lock.name == AUTH_KEY_LOCK) {
         locks.remove(index);
     }
+    verify_preflight_repository_binding(preflight)?;
     let key_preexisted = preflight.state_root.direct_child_exists(AUTH_KEY_FILE)?;
     let writer = match repository_auth_writer(repo_path) {
         Ok(writer) => writer,
@@ -2282,6 +2361,7 @@ fn apply_migration(
             );
         }
     };
+    verify_migration_authenticator_binding(preflight, writer.authenticator())?;
     let binding = writer.authenticator().binding().clone();
     let manifest = StateMigrationManifest {
         version: MIGRATION_VERSION,
@@ -2289,6 +2369,10 @@ fn apply_migration(
         entries: preflight.entries.clone(),
     };
     let authenticator = writer.into_authenticator()?;
+    verify_migration_authenticator_binding(preflight, &authenticator)?;
+    revalidate_exact_state_root_inventory(preflight, &locks, true)?;
+    revalidate_preflight(preflight)?;
+    verify_preflight_repository_binding(preflight)?;
     let store = match AuthenticatedSnapshotStore::<
         StateMigrationManifestSpec,
         StateMigrationManifest,
@@ -2301,6 +2385,7 @@ fn apply_migration(
             ));
         }
     };
+    verify_preflight_repository_binding(preflight)?;
     transaction.phase = MigrationPhase::ManifestPublished;
     write_transaction(transaction_root, &transaction_lock, &mut transaction)?;
 
@@ -2430,7 +2515,7 @@ fn verify_existing_manifest(
             snapshot.token,
         )?;
     }
-    let hardened = state_is_hardened(preflight)?;
+    let hardened = state_is_hardened(preflight, locks)?;
     verify_existing_manifest_boundaries(
         repo_path,
         preflight,
@@ -2476,15 +2561,13 @@ fn verify_existing_manifest_boundaries(
     expected_transaction: &LoadedMigrationTransaction,
     manifest: Option<&StateMigrationManifest>,
 ) -> Result<()> {
-    let common_root = SafeRoot::open_existing(&preflight.common_dir)?;
-    if common_root.identity() != &preflight.common_dir_identity
-        || transaction_root.identity() != &expected_transaction.root_identity
-    {
+    verify_preflight_repository_binding(preflight)?;
+    if transaction_root.identity() != &expected_transaction.root_identity {
         bail!("migration repository or transaction root identity changed");
     }
     verify_all_legacy_locks(preflight, locks)?;
     transaction_lock.verify_direct_binding(transaction_root)?;
-    revalidate_exact_state_root_inventory(preflight)?;
+    revalidate_exact_state_root_inventory(preflight, locks, false)?;
     revalidate_preflight(preflight)?;
     revalidate_retired_tombstones(repo_path, preflight, manifest)?;
     let observed = load_transaction_if_present(preflight)?
@@ -2495,38 +2578,68 @@ fn verify_existing_manifest_boundaries(
         bail!("migration transaction changed while its lock was held");
     }
     transaction_lock.verify_direct_binding(transaction_root)?;
-    common_root.verify()?;
+    verify_preflight_repository_binding(preflight)?;
     preflight.state_root.verify()?;
     transaction_root.verify()
 }
 
-fn revalidate_exact_state_root_inventory(preflight: &LegacyPreflight) -> Result<()> {
+fn revalidate_exact_state_root_inventory(
+    preflight: &LegacyPreflight,
+    locks: &[MigrationHeldLock],
+    allow_auth_bootstrap_entries: bool,
+) -> Result<()> {
+    let mut expected = expected_state_root_inventory(preflight, locks)?;
     let mut observed = BTreeMap::new();
-    let mut count = 0_usize;
-    for entry in fs::read_dir(preflight.state_root.path())
-        .context("failed to re-enumerate migration state root")?
+    for name in preflight
+        .state_root
+        .direct_child_names_bounded(MAX_STATE_ENTRIES)?
     {
-        let entry = entry.context("failed to inspect migration state entry")?;
-        count = count
-            .checked_add(1)
-            .context("migration state entry count overflowed")?;
-        if count > MAX_STATE_ENTRIES {
-            bail!("migration state root exceeds its bounded entry count");
-        }
-        let name = entry
-            .file_name()
+        let name = name
             .into_string()
             .map_err(|_| anyhow::anyhow!("migration state entry name is not UTF-8"))?;
         let path = preflight.state_root.direct_child(&name)?;
-        if observed.insert(name, identity_for_path(path)?).is_some() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if is_known_authenticated_directory(&name) {
+            validate_owned_directory(&metadata, &path)?;
+        } else if is_known_state_file(&name) {
+            validate_owned_regular_file(&metadata, &path, file_bound(&name))?;
+        } else {
+            bail!("unknown entry in migration state root: {name}");
+        }
+        let identity = identity_for_path(&path)?;
+        if !expected.contains_key(&name)
+            && allow_auth_bootstrap_entries
+            && matches!(
+                name.as_str(),
+                AUTH_KEY_FILE | AUTH_EPOCH_FILE | AUTH_KEY_LOCK
+            )
+        {
+            expected.insert(name.clone(), identity.clone());
+        }
+        if observed.insert(name, identity).is_some() {
             bail!("migration state root contains a duplicate entry name");
         }
     }
     preflight.state_root.verify()?;
-    if observed != preflight.root_entries {
+    if observed != expected {
         bail!("migration state root inventory changed after preflight");
     }
     Ok(())
+}
+
+fn expected_state_root_inventory(
+    preflight: &LegacyPreflight,
+    locks: &[MigrationHeldLock],
+) -> Result<BTreeMap<String, FileIdentity>> {
+    let mut expected = preflight.root_entries.clone();
+    for lock in locks {
+        if let Some(previous) = expected.insert(lock.name.clone(), lock.identity.clone()) {
+            if previous != lock.identity {
+                bail!("held migration lock does not match its preflight inventory identity");
+            }
+        }
+    }
+    Ok(expected)
 }
 
 fn revalidate_retired_tombstones(
@@ -2597,34 +2710,35 @@ fn write_receipt(
 
 #[cfg(unix)]
 fn harden_state(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Result<()> {
+    verify_preflight_repository_binding(preflight)?;
     revalidate_preflight(preflight)?;
-    for entry in fs::read_dir(preflight.state_root.path())? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_file() {
-            validate_owned_regular_file(
-                &metadata,
-                &path,
-                file_bound(entry.file_name().to_str().unwrap_or("")),
-            )?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        } else if metadata.file_type().is_dir() {
-            validate_owned_directory(&metadata, &path)?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    let expected = expected_state_root_inventory(preflight, locks)?;
+    for (name, identity) in &expected {
+        let (kind, mode) = if is_known_authenticated_directory(name) {
+            (DirectChildType::Directory, 0o700)
+        } else if is_known_state_file(name) {
+            (DirectChildType::SingleLinkRegularFile, 0o600)
         } else {
-            bail!("unsafe state entry appeared during permission hardening");
-        }
+            bail!("unknown state entry appeared during permission hardening: {name}");
+        };
+        let binding = preflight
+            .state_root
+            .bind_owned_direct_child(name, identity, kind)?;
+        run_migration_after_child_bind_hook(name);
+        binding.set_permissions_fenced(&preflight.state_root, mode)?;
     }
-    fs::set_permissions(
-        preflight.state_root.path(),
-        fs::Permissions::from_mode(0o700),
-    )?;
-    sync_directory(preflight.state_root.path())?;
+    preflight
+        .state_root
+        .set_directory_permissions_fenced(0o700)?;
+    preflight.state_root.sync_directory_fenced()?;
     for lock in locks {
         lock.verify(&preflight.state_root)?;
     }
-    ensure_hardened_state(preflight)
+    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    revalidate_preflight(preflight)?;
+    verify_preflight_repository_binding(preflight)?;
+    ensure_hardened_state(preflight, locks)
 }
 
 #[cfg(not(unix))]
@@ -2632,26 +2746,40 @@ fn harden_state(_preflight: &LegacyPreflight, _locks: &[MigrationHeldLock]) -> R
     bail!("state permission hardening is unsupported on this platform")
 }
 
-fn ensure_hardened_state(preflight: &LegacyPreflight) -> Result<()> {
-    if !state_is_hardened(preflight)? {
+fn ensure_hardened_state(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Result<()> {
+    if !state_is_hardened(preflight, locks)? {
         bail!("migration transaction says permissions are hardened but state is not private");
     }
     Ok(())
 }
 
-fn state_is_hardened(preflight: &LegacyPreflight) -> Result<bool> {
-    if file_mode(&fs::symlink_metadata(preflight.state_root.path())?) != 0o700 {
+fn state_is_hardened(preflight: &LegacyPreflight, locks: &[MigrationHeldLock]) -> Result<bool> {
+    verify_preflight_repository_binding(preflight)?;
+    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    let state_metadata = fs::symlink_metadata(preflight.state_root.path())?;
+    validate_owned_directory(&state_metadata, preflight.state_root.path())?;
+    if file_mode(&state_metadata) != 0o700 {
         return Ok(false);
     }
-    for entry in fs::read_dir(preflight.state_root.path())? {
-        let metadata = fs::symlink_metadata(entry?.path())?;
-        if metadata.file_type().is_file() && file_mode(&metadata) != 0o600 {
-            return Ok(false);
-        }
-        if metadata.file_type().is_dir() && file_mode(&metadata) != 0o700 {
-            return Ok(false);
+    for (name, identity) in expected_state_root_inventory(preflight, locks)? {
+        let path = preflight.state_root.direct_child(&name)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if is_known_authenticated_directory(&name) {
+            validate_owned_directory(&metadata, &path)?;
+            if identity_for_path(&path)? != identity || file_mode(&metadata) != 0o700 {
+                return Ok(false);
+            }
+        } else if is_known_state_file(&name) {
+            validate_owned_regular_file(&metadata, &path, file_bound(&name))?;
+            if identity_for_path(&path)? != identity || file_mode(&metadata) != 0o600 {
+                return Ok(false);
+            }
+        } else {
+            bail!("unknown entry in hardened migration state root: {name}");
         }
     }
+    revalidate_exact_state_root_inventory(preflight, locks, false)?;
+    verify_preflight_repository_binding(preflight)?;
     Ok(true)
 }
 
@@ -2689,25 +2817,35 @@ fn rollback_permissions(
     locks: &[MigrationHeldLock],
 ) -> Result<()> {
     for (name, mode) in &transaction.original_file_modes {
-        let path = preflight.state_root.direct_child(name)?;
-        if fs::symlink_metadata(&path).is_ok() {
-            fs::set_permissions(path, fs::Permissions::from_mode(*mode))?;
-        }
+        let identity = preflight
+            .root_entries
+            .get(name)
+            .with_context(|| format!("rollback state entry was absent from preflight: {name}"))?;
+        let binding = preflight.state_root.bind_owned_direct_child(
+            name,
+            identity,
+            DirectChildType::SingleLinkRegularFile,
+        )?;
+        binding.set_permissions_fenced(&preflight.state_root, *mode)?;
     }
     for name in &transaction.created_locks {
-        if let Some(lock) = locks.iter().find(|lock| &lock.name == name) {
-            lock.verify(&preflight.state_root)?;
-        }
-        let path = preflight.state_root.direct_child(name)?;
-        if fs::symlink_metadata(&path).is_ok() {
-            fs::remove_file(path)?;
-        }
+        let lock = locks
+            .iter()
+            .find(|lock| &lock.name == name)
+            .with_context(|| format!("created migration lock is no longer held: {name}"))?;
+        lock.verify(&preflight.state_root)?;
+        let binding = preflight.state_root.bind_owned_direct_child(
+            name,
+            &lock.identity,
+            DirectChildType::SingleLinkRegularFile,
+        )?;
+        binding.unlink_fenced(&preflight.state_root)?;
     }
-    fs::set_permissions(
-        preflight.state_root.path(),
-        fs::Permissions::from_mode(transaction.original_state_mode),
-    )?;
-    sync_directory(preflight.state_root.path())
+    preflight
+        .state_root
+        .set_directory_permissions_fenced(transaction.original_state_mode)?;
+    preflight.state_root.sync_directory_fenced()?;
+    verify_preflight_repository_binding(preflight)
 }
 
 #[cfg(not(unix))]
@@ -2717,17 +2855,6 @@ fn rollback_permissions(
     _locks: &[MigrationHeldLock],
 ) -> Result<()> {
     bail!("state permission rollback is unsupported on this platform")
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
-    bail!("directory durability is unsupported on this platform")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2994,6 +3121,97 @@ mod tests {
         let error = migrate_repository_state(&path, false)
             .expect_err("transaction root replacement must fail closed");
         assert!(error.to_string().contains("identity changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_apply_refuses_common_directory_replacement_with_same_state_inode() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        let repository = Repository::open(&path).expect("repository");
+        let common_dir = repository.commondir().to_path_buf();
+        let displaced_common = path.join("displaced-common-dir");
+        let state_identity = identity_for_path(&state).expect("state identity");
+        set_migration_after_preflight_hook({
+            let common_dir = common_dir.clone();
+            let displaced_common = displaced_common.clone();
+            move || {
+                fs::rename(&common_dir, &displaced_common).expect("displace original common dir");
+                fs::create_dir(&common_dir).expect("replacement common dir");
+                fs::set_permissions(&common_dir, fs::Permissions::from_mode(0o700))
+                    .expect("replacement common mode");
+                fs::create_dir(common_dir.join("maco")).expect("replacement state parent");
+                fs::set_permissions(common_dir.join("maco"), fs::Permissions::from_mode(0o700))
+                    .expect("replacement state parent mode");
+                fs::rename(
+                    displaced_common.join("maco/state"),
+                    common_dir.join("maco/state"),
+                )
+                .expect("return the same state inode under the replacement common dir");
+            }
+        });
+
+        let error = migrate_repository_state(&path, true)
+            .expect_err("common-directory replacement must fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("common") || chain.contains("safe root path was replaced"),
+            "unexpected error: {chain}"
+        );
+        assert_eq!(
+            identity_for_path(common_dir.join("maco/state")).expect("returned state identity"),
+            state_identity
+        );
+        assert!(!common_dir.join(TRANSACTION_ROOT_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardening_refuses_child_replacement_without_chmodding_replacement() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        let claims = state.join("claims.json");
+        let displaced = state.join("claims.json.displaced");
+        set_migration_after_child_bind_hook("claims.json", {
+            let claims = claims.clone();
+            let displaced = displaced.clone();
+            move || {
+                fs::rename(&claims, &displaced).expect("displace bound claims file");
+                fs::write(&claims, b"replacement").expect("replacement claims file");
+                fs::set_permissions(&claims, fs::Permissions::from_mode(0o660))
+                    .expect("replacement claims mode");
+            }
+        });
+
+        let error = migrate_repository_state(&path, true)
+            .expect_err("child pathname replacement must fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("binding") || chain.contains("identity"),
+            "unexpected error: {chain}"
+        );
+        assert_eq!(mode(&claims), 0o660);
+        assert_eq!(mode(&displaced), 0o644);
+        assert!(!state.join(AUTH_KEY_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardened_state_check_rejects_special_or_unknown_entries() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        set_migration_after_preflight_hook({
+            let special = state.join("unexpected-special");
+            move || {
+                let name =
+                    std::ffi::CString::new(special.as_os_str().as_bytes()).expect("special path");
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+        });
+
+        let error = migrate_repository_state(&path, false)
+            .expect_err("special state entry must fail closed");
+        assert!(error.to_string().contains("unknown entry"));
     }
 
     #[cfg(unix)]

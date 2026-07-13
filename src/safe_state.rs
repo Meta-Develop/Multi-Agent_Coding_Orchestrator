@@ -81,6 +81,109 @@ pub struct ReservedDirectory {
     directory: File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectChildType {
+    SingleLinkRegularFile,
+    Directory,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectChildBinding {
+    name: OsString,
+    identity: FileIdentity,
+    root_identity: FileIdentity,
+    kind: DirectChildType,
+    file: File,
+}
+
+impl DirectChildBinding {
+    pub(crate) fn verify(&self, root: &SafeRoot) -> Result<()> {
+        root.verify()?;
+        if self.root_identity != *root.identity() {
+            bail!("direct child binding was presented with a different root inode");
+        }
+        #[cfg(unix)]
+        {
+            let handle = fstat(self.file.as_raw_fd())?;
+            validate_owned_direct_child_stat(&handle, &self.identity, self.kind)?;
+            let name = c_string(&self.name)?;
+            let rebound = fstatat_no_follow(root.directory.as_raw_fd(), &name)?;
+            validate_owned_direct_child_stat(&rebound, &self.identity, self.kind)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        bail!("identity-bound direct child verification is unsupported on this platform")
+    }
+
+    pub(crate) fn set_permissions_fenced(&self, root: &SafeRoot, mode: u32) -> Result<()> {
+        self.verify(root)?;
+        #[cfg(unix)]
+        {
+            self.file
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .with_context(|| {
+                    format!(
+                        "failed to set permissions on bound direct child {}",
+                        root.path().join(&self.name).display()
+                    )
+                })?;
+            let after = fstat(self.file.as_raw_fd())?;
+            if after.st_mode & 0o777 != mode & 0o777 {
+                bail!("bound direct child permissions did not reach the requested mode");
+            }
+            self.verify(root)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            bail!("descriptor-relative permission changes are unsupported on this platform")
+        }
+    }
+
+    pub(crate) fn unlink_fenced(self, root: &SafeRoot) -> Result<()> {
+        self.verify(root)?;
+        #[cfg(unix)]
+        {
+            let name = c_string(&self.name)?;
+            if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to unlink bound direct child {}",
+                        root.path().join(&self.name).display()
+                    )
+                });
+            }
+            let mut rebound: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    root.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut rebound,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                bail!("unlinked direct child pathname still exists");
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("failed to verify bound direct child unlink");
+            }
+            let handle = fstat(self.file.as_raw_fd())?;
+            if identity_from_stat(&handle) != self.identity
+                || handle.st_mode & libc::S_IFMT != libc::S_IFREG
+                || handle.st_uid != unsafe { libc::geteuid() }
+                || handle.st_nlink != 0
+            {
+                bail!("unlinked direct child descriptor changed unexpectedly");
+            }
+            root.verify()
+        }
+        #[cfg(not(unix))]
+        bail!("identity-bound direct child unlink is unsupported on this platform")
+    }
+}
+
 impl ReservedDirectory {
     pub fn path(&self) -> &Path {
         &self.path
@@ -310,6 +413,95 @@ impl SafeRoot {
         bail!("handle-relative direct-child inspection is unsupported on this platform")
     }
 
+    pub(crate) fn bind_owned_direct_child(
+        &self,
+        name: impl AsRef<OsStr>,
+        expected_identity: &FileIdentity,
+        kind: DirectChildType,
+    ) -> Result<DirectChildBinding> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        self.verify()?;
+        #[cfg(unix)]
+        {
+            let name_c = c_string(name)?;
+            let flags = match kind {
+                DirectChildType::SingleLinkRegularFile => {
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+                }
+                DirectChildType::Directory => {
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK
+                }
+            };
+            let fd = unsafe { libc::openat(self.directory.as_raw_fd(), name_c.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "failed to bind direct child without following links: {}",
+                        self.path.join(name).display()
+                    )
+                });
+            }
+            let binding = DirectChildBinding {
+                name: name.to_os_string(),
+                identity: expected_identity.clone(),
+                root_identity: self.identity.clone(),
+                kind,
+                file: unsafe { File::from_raw_fd(fd) },
+            };
+            binding.verify(self)?;
+            Ok(binding)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (expected_identity, kind);
+            bail!("identity-bound direct child opens are unsupported on this platform")
+        }
+    }
+
+    pub(crate) fn set_directory_permissions_fenced(&self, mode: u32) -> Result<()> {
+        self.verify()?;
+        #[cfg(unix)]
+        {
+            let before = fstat(self.directory.as_raw_fd())?;
+            validate_owned_direct_child_stat(&before, &self.identity, DirectChildType::Directory)?;
+            self.directory
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .with_context(|| {
+                    format!(
+                        "failed to set permissions on bound directory {}",
+                        self.path.display()
+                    )
+                })?;
+            self.verify()?;
+            let after = fstat(self.directory.as_raw_fd())?;
+            validate_owned_direct_child_stat(&after, &self.identity, DirectChildType::Directory)?;
+            if after.st_mode & 0o777 != mode & 0o777 {
+                bail!("bound directory permissions did not reach the requested mode");
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            bail!(
+                "descriptor-relative directory permission changes are unsupported on this platform"
+            )
+        }
+    }
+
+    pub(crate) fn sync_directory_fenced(&self) -> Result<()> {
+        self.verify()?;
+        self.directory
+            .sync_all()
+            .with_context(|| format!("failed to flush state directory {}", self.path.display()))?;
+        self.verify()
+    }
+
     pub fn reserve_direct_child_directory(
         &self,
         name: impl AsRef<OsStr>,
@@ -462,6 +654,28 @@ impl SafeRoot {
         }
         #[cfg(not(unix))]
         bail!("handle-relative directory inspection is unsupported on this platform")
+    }
+
+    pub(crate) fn direct_child_names_bounded(&self, max_entries: usize) -> Result<Vec<OsString>> {
+        self.verify()?;
+        if max_entries == 0 {
+            bail!("direct child inventory requires a positive entry bound");
+        }
+        #[cfg(unix)]
+        {
+            let mut budget = TreeBudget {
+                remaining_entries: max_entries.saturating_add(1),
+            };
+            let entries = directory_entries(self.directory.as_raw_fd(), &mut budget)
+                .context("safe root direct child inventory exceeded its bound")?;
+            if entries.len() > max_entries {
+                bail!("safe root exceeds its bounded direct child count");
+            }
+            self.verify()?;
+            Ok(entries)
+        }
+        #[cfg(not(unix))]
+        bail!("handle-relative directory inventory is unsupported on this platform")
     }
 }
 
@@ -4437,6 +4651,28 @@ fn openat_directory(fd: RawFd, name: &std::ffi::CStr) -> Result<File> {
             .context("failed to open directory entry without following links");
     }
     Ok(unsafe { File::from_raw_fd(opened) })
+}
+
+#[cfg(unix)]
+fn validate_owned_direct_child_stat(
+    stat: &libc::stat,
+    expected_identity: &FileIdentity,
+    kind: DirectChildType,
+) -> Result<()> {
+    let observed_kind = stat.st_mode & libc::S_IFMT;
+    let kind_is_safe = match kind {
+        DirectChildType::SingleLinkRegularFile => {
+            observed_kind == libc::S_IFREG && stat.st_nlink == 1
+        }
+        DirectChildType::Directory => observed_kind == libc::S_IFDIR && stat.st_nlink != 0,
+    };
+    if !kind_is_safe
+        || stat.st_uid != unsafe { libc::geteuid() }
+        || identity_from_stat(stat) != *expected_identity
+    {
+        bail!("bound direct child type, ownership, linkage, or identity changed");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
