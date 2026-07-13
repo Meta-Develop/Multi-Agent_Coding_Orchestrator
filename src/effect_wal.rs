@@ -511,11 +511,13 @@ mod tests {
             &serde_json::json!({"payload": "exact"}),
         )
         .expect("create tamper WAL");
-        let record = wal
-            .journal
-            .root()
-            .path()
-            .join(&wal.identity().run_id)
+        let physical_id = wal.identity().run_id.clone();
+        let repository = Repository::open(path).expect("reopen tamper repository");
+        let record = repository
+            .commondir()
+            .join("maco/state")
+            .join(EFFECT_WAL_ROOT_NAME)
+            .join(physical_id)
             .join("00000000000000000001.json");
         drop(wal);
         record

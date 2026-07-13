@@ -8436,6 +8436,44 @@ mod tests {
     }
 
     #[test]
+    fn external_effect_call_uses_snapshot_metadata_without_legacy_effect_metadata() {
+        let repo = fake_effect_repo();
+        let request = fake_effect_request(
+            repo.path(),
+            fake_source_guard("2026-07-13T00:00:00Z", '3', '4'),
+            "snapshot-backed effect",
+        );
+        let remote = Arc::new(Mutex::new(FakeExternalRemote::default()));
+        let mut provider = FakeExternalProvider::new(remote);
+        execute_external_effect_exactly_once(repo.path(), request, &mut provider)
+            .expect("snapshot-backed external effect");
+
+        let repository = Repository::open(repo.path()).expect("open effect repository");
+        let root = repository
+            .commondir()
+            .join("maco/state")
+            .join(crate::effect_wal::EFFECT_WAL_ROOT_NAME);
+        let names = std::fs::read_dir(root)
+            .expect("effect snapshot root")
+            .map(|entry| {
+                entry
+                    .expect("effect snapshot entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 effect snapshot entry")
+            })
+            .collect::<Vec<_>>();
+        assert!(names
+            .iter()
+            .any(|name| name.starts_with(".snapshot-locator-")));
+        assert!(!names.iter().any(|name| {
+            name.starts_with(".effect-locator-")
+                || name.starts_with(".effect-init-")
+                || name.starts_with(".effect-store-")
+        }));
+    }
+
+    #[test]
     fn external_effect_planned_payload_and_stable_source_revision_are_exact() {
         let repo = fake_effect_repo();
         let first = fake_effect_request(
