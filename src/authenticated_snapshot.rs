@@ -1483,7 +1483,11 @@ fn snapshot_metadata_temp_targets<S: SnapshotSpec>(
     entries: &[OsString],
     current_hash: &str,
 ) -> Result<BTreeSet<OsString>> {
-    let mut logical_hashes = BTreeSet::from([current_hash.to_string()]);
+    // Bound namespaces that are actually present before adding the caller's
+    // prospective logical id. A create at quota must still be able to
+    // scavenge safely and reach `ensure_new_logical_capacity`, which owns the
+    // quota refusal and guarantees that no locator/init residue is created.
+    let mut logical_hashes = BTreeSet::new();
     for entry in entries {
         let name = entry
             .to_str()
@@ -1503,6 +1507,7 @@ fn snapshot_metadata_temp_targets<S: SnapshotSpec>(
     if logical_hashes.len() > S::MAX_LOGICAL_STORES {
         bail!("authenticated snapshot crash residue exceeds its logical-store capacity");
     }
+    logical_hashes.insert(current_hash.to_string());
     let mut targets = BTreeSet::new();
     for hash in logical_hashes {
         targets.insert(OsString::from(format!(".snapshot-locator-{hash}.json")));
