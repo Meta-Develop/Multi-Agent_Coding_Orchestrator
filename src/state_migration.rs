@@ -1270,18 +1270,45 @@ fn file_bound(name: &str) -> u64 {
 
 #[cfg(unix)]
 fn validate_owned_directory(metadata: &fs::Metadata, path: &Path) -> Result<()> {
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.nlink() < 2
-        || metadata.permissions().mode() & 0o022 != 0
-    {
+    let attributes = OwnedDirectoryAttributes::from_metadata(metadata);
+    if !attributes.are_safe_for(unsafe { libc::geteuid() }) {
         bail!(
             "state migration directory is not a current-user-owned, non-writable no-follow directory: {}",
             path.display()
         );
     }
     Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnedDirectoryAttributes {
+    is_symlink: bool,
+    is_directory: bool,
+    owner: u32,
+    hard_link_count: u64,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl OwnedDirectoryAttributes {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            is_symlink: metadata.file_type().is_symlink(),
+            is_directory: metadata.file_type().is_dir(),
+            owner: metadata.uid(),
+            hard_link_count: metadata.nlink(),
+            mode: metadata.permissions().mode() & 0o777,
+        }
+    }
+
+    fn are_safe_for(self, expected_owner: u32) -> bool {
+        !self.is_symlink
+            && self.is_directory
+            && self.owner == expected_owner
+            && self.hard_link_count != 0
+            && self.mode & 0o022 == 0
+    }
 }
 
 #[cfg(not(unix))]
@@ -2837,6 +2864,39 @@ mod tests {
             .permissions()
             .mode()
             & 0o777
+    }
+
+    #[cfg(unix)]
+    fn owned_directory_attributes(hard_link_count: u64) -> OwnedDirectoryAttributes {
+        OwnedDirectoryAttributes {
+            is_symlink: false,
+            is_directory: true,
+            owner: unsafe { libc::geteuid() },
+            hard_link_count,
+            mode: 0o700,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_directory_validation_accepts_drvfs_link_count_one_and_rejects_zero() {
+        let owner = unsafe { libc::geteuid() };
+        assert!(owned_directory_attributes(1).are_safe_for(owner));
+        assert!(!owned_directory_attributes(0).are_safe_for(owner));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_preflight_accepts_isolated_legacy_state_directory() {
+        let (_temp, path, state) = repository_with_claims();
+        make_legacy_permissions(&state);
+        let repository = Repository::open(&path).expect("repository");
+
+        let preflight = preflight_legacy_state(&path, repository.commondir(), &state)
+            .expect("isolated legacy state preflight");
+
+        assert_eq!(preflight.state_root.path(), state);
+        assert!(preflight.entries.iter().any(|entry| entry.present));
     }
 
     #[cfg(unix)]
