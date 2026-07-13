@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::{
-    collections::{hash_map::RandomState, BTreeMap},
+    collections::{hash_map::RandomState, BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     hash::{BuildHasher, Hash, Hasher},
@@ -950,6 +950,11 @@ impl BoundedRegularReader {
 pub struct AtomicStateWriter;
 
 impl AtomicStateWriter {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn canonical_direct_temp_target(name: &OsStr) -> Option<OsString> {
+        canonical_random_temp_target(name)
+    }
+
     pub fn write(path: impl AsRef<Path>, contents: &[u8]) -> Result<()> {
         let path = absolute_normalized(path.as_ref())?;
         let parent = path
@@ -1034,28 +1039,53 @@ impl AtomicStateWriter {
     ) -> Result<usize> {
         let file_name = file_name.as_ref();
         validate_single_component(file_name)?;
+        let file_name = file_name.to_os_string();
+        Self::scavenge_direct_temp_namespaces_bounded(root, max_root_entries, move |_| {
+            Ok(BTreeSet::from([file_name]))
+        })
+    }
+
+    /// Enumerates a shared state root once, derives every exact state-file
+    /// namespace from that immutable entry list, and removes only canonical
+    /// atomic-writer temps or resumable quarantines for those namespaces.
+    /// Callers must hold the root-wide writer lock for every derived target.
+    pub(crate) fn scavenge_direct_temp_namespaces_bounded<F>(
+        root: &SafeRoot,
+        max_root_entries: usize,
+        derive_file_names: F,
+    ) -> Result<usize>
+    where
+        F: FnOnce(&[OsString]) -> Result<BTreeSet<OsString>>,
+    {
         if max_root_entries == 0 {
             bail!("state temp scavenging entry budget must be positive");
         }
         root.verify()?;
         #[cfg(target_os = "linux")]
         {
-            let mut prefix = Vec::with_capacity(file_name.as_bytes().len() + 2);
-            prefix.push(b'.');
-            prefix.extend_from_slice(file_name.as_bytes());
-            prefix.push(b'.');
-            let quarantine_prefix = temp_quarantine_namespace(file_name);
             let mut budget = TreeBudget {
                 remaining_entries: max_root_entries,
             };
+            let entries = directory_entries(root.directory.as_raw_fd(), &mut budget)?;
+            let file_names = derive_file_names(&entries)?;
+            for file_name in &file_names {
+                validate_single_component(file_name)?;
+            }
+            let quarantine_namespaces = file_names
+                .iter()
+                .map(|file_name| (temp_quarantine_namespace(file_name), file_name))
+                .collect::<BTreeMap<_, _>>();
             let mut removed = 0usize;
-            for entry in directory_entries(root.directory.as_raw_fd(), &mut budget)? {
-                let bytes = entry.as_bytes();
-                let is_live_temp = bytes.starts_with(&prefix) && bytes.ends_with(b".tmp");
-                let is_quarantine = bytes.starts_with(quarantine_prefix.as_bytes());
-                if !is_live_temp && !is_quarantine {
+            for entry in entries {
+                let live_target = canonical_random_temp_target(&entry)
+                    .filter(|target| file_names.contains(target));
+                let quarantine_binding = canonical_temp_quarantine_binding(&entry);
+                let quarantine_target = quarantine_binding
+                    .as_ref()
+                    .and_then(|binding| quarantine_namespaces.get(binding.namespace).copied());
+                let Some(file_name) = live_target.as_ref().or(quarantine_target) else {
                     continue;
-                }
+                };
                 let name = c_string(&entry)?;
                 let stat = fstatat_no_follow(root.directory.as_raw_fd(), &name)?;
                 if stat.st_mode & libc::S_IFMT != libc::S_IFREG
@@ -1069,6 +1099,15 @@ impl AtomicStateWriter {
                     );
                 }
                 let expected = identity_from_stat(&stat);
+                if quarantine_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.identity != expected)
+                {
+                    bail!(
+                        "state temp quarantine identity is malformed or changed: {}",
+                        root.path().join(&entry).display()
+                    );
+                }
                 let quarantine = temp_quarantine_name(file_name, &entry, &expected);
                 quarantine_regular_file(root, &entry, &quarantine, &expected)?;
                 sync_directory(root)?;
@@ -3391,6 +3430,90 @@ fn temp_quarantine_name(file_name: &OsStr, source: &OsStr, identity: &FileIdenti
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn canonical_random_temp_target(name: &OsStr) -> Option<OsString> {
+    let bytes = name.as_bytes();
+    let body = bytes.strip_prefix(b".")?.strip_suffix(b".tmp")?;
+    let separator = body.iter().rposition(|byte| *byte == b'.')?;
+    let target = body.get(..separator)?;
+    let random = body.get(separator + 1..)?;
+    if target.is_empty() || random.is_empty() {
+        return None;
+    }
+    let dash = random.iter().position(|byte| *byte == b'-')?;
+    if random.get(dash + 1..)?.contains(&b'-') {
+        return None;
+    }
+    let first = std::str::from_utf8(random.get(..dash)?).ok()?;
+    let second = std::str::from_utf8(random.get(dash + 1..)?).ok()?;
+    if !is_canonical_decimal_u64(first) || !is_canonical_decimal_u64(second) {
+        return None;
+    }
+    Some(OsString::from_vec(target.to_vec()))
+}
+
+#[cfg(target_os = "linux")]
+fn is_canonical_decimal_u64(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|parsed| parsed.to_string() == value)
+}
+
+#[cfg(target_os = "linux")]
+struct TempQuarantineBinding<'a> {
+    namespace: &'a str,
+    identity: FileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_temp_quarantine_binding(name: &OsStr) -> Option<TempQuarantineBinding<'_>> {
+    let value = name.to_str()?;
+    let remainder = value.strip_prefix(TEMP_QUARANTINE_PREFIX)?;
+    let (without_inode, inode) = remainder.rsplit_once('-')?;
+    let (without_device, device) = without_inode.rsplit_once('-')?;
+    if !is_lower_hex_width(device, 16) || !is_lower_hex_width(inode, 16) {
+        return None;
+    }
+    let after_target_magic = without_device.strip_prefix("maco-v1-")?;
+    let target_digest = after_target_magic.get(..32)?;
+    let after_target_digest = after_target_magic.get(32..)?.strip_prefix('-')?;
+    let (target_len, source_checksum) = after_target_digest.split_once('-')?;
+    if !is_lower_hex_width(target_digest, 32) || !is_canonical_decimal_u64(target_len) {
+        return None;
+    }
+    let after_source_magic = source_checksum.strip_prefix("maco-v1-")?;
+    let source_digest = after_source_magic.get(..32)?;
+    let source_len = after_source_magic.get(32..)?.strip_prefix('-')?;
+    if !is_lower_hex_width(source_digest, 32) || !is_canonical_decimal_u64(source_len) {
+        return None;
+    }
+    let namespace_end = TEMP_QUARANTINE_PREFIX
+        .len()
+        .checked_add("maco-v1-".len())?
+        .checked_add(32)?
+        .checked_add(1)?
+        .checked_add(target_len.len())?
+        .checked_add(1)?;
+    let namespace = value.get(..namespace_end)?;
+    let identity = FileIdentity {
+        device: u64::from_str_radix(device, 16).ok()?,
+        file: u64::from_str_radix(inode, 16).ok()?,
+    };
+    Some(TempQuarantineBinding {
+        namespace,
+        identity,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_lower_hex_width(value: &str, width: usize) -> bool {
+    value.len() == width
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 #[cfg(not(unix))]
 fn atomic_replace_at(root: &SafeRoot, source: &OsStr, destination: &OsStr) -> Result<()> {
     let _ = source;
@@ -4665,22 +4788,14 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let root = SafeRoot::open_or_create(temp.path().join("state")).expect("state root");
         let _lock = KernelStateLock::acquire_direct(&root, "claims.lock").expect("lock");
-        let residue = root.path().join(".claims.json.crashed.tmp");
+        let residue_name = random_temp_name(OsStr::new("claims.json"));
+        let residue = root.path().join(&residue_name);
         fs::write(&residue, "partial").expect("residue");
         fs::set_permissions(&residue, fs::Permissions::from_mode(0o600)).expect("private mode");
         let expected = BoundedRegularReader::identity(&residue).expect("residue identity");
-        let quarantine = temp_quarantine_name(
-            OsStr::new("claims.json"),
-            OsStr::new(".claims.json.crashed.tmp"),
-            &expected,
-        );
-        quarantine_regular_file(
-            &root,
-            OsStr::new(".claims.json.crashed.tmp"),
-            &quarantine,
-            &expected,
-        )
-        .expect("simulate crash after temp quarantine rename");
+        let quarantine = temp_quarantine_name(OsStr::new("claims.json"), &residue_name, &expected);
+        quarantine_regular_file(&root, &residue_name, &quarantine, &expected)
+            .expect("simulate crash after temp quarantine rename");
         assert!(!residue.exists());
         assert!(root.path().join(&quarantine).exists());
 
@@ -4699,13 +4814,91 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn root_wide_temp_scavenge_recovers_interrupted_quarantine_and_live_temp() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("state")).expect("state root");
+        let _lock = KernelStateLock::acquire_direct(&root, "root.lock").expect("lock");
+        let quarantined_target = OsString::from("locator-a.json");
+        let quarantined_source = random_temp_name(&quarantined_target);
+        let quarantined_path = root.path().join(&quarantined_source);
+        fs::write(&quarantined_path, b"partial-a").expect("quarantined source");
+        fs::set_permissions(&quarantined_path, fs::Permissions::from_mode(0o600))
+            .expect("private quarantine source");
+        let identity = BoundedRegularReader::identity(&quarantined_path).expect("source identity");
+        let quarantine = temp_quarantine_name(&quarantined_target, &quarantined_source, &identity);
+        quarantine_regular_file(&root, &quarantined_source, &quarantine, &identity)
+            .expect("simulate interrupted quarantine cleanup");
+
+        let live_target = OsString::from("locator-b.json");
+        let live_source = random_temp_name(&live_target);
+        let live_path = root.path().join(&live_source);
+        fs::write(&live_path, b"partial-b").expect("live source");
+        fs::set_permissions(&live_path, fs::Permissions::from_mode(0o600))
+            .expect("private live source");
+
+        let foreign_target = OsString::from("foreign.json");
+        let foreign_source = random_temp_name(&foreign_target);
+        let foreign_path = root.path().join(&foreign_source);
+        fs::write(&foreign_path, b"foreign").expect("foreign source");
+        fs::set_permissions(&foreign_path, fs::Permissions::from_mode(0o600))
+            .expect("private foreign source");
+
+        let removed = AtomicStateWriter::scavenge_direct_temp_namespaces_bounded(&root, 8, |_| {
+            Ok(BTreeSet::from([
+                quarantined_target.clone(),
+                live_target.clone(),
+            ]))
+        })
+        .expect("root-wide recovery");
+
+        assert_eq!(removed, 2);
+        assert!(!root.path().join(quarantine).exists());
+        assert!(!live_path.exists());
+        assert!(foreign_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_wide_temp_scavenge_rejects_rebound_quarantine_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("state")).expect("state root");
+        let _lock = KernelStateLock::acquire_direct(&root, "root.lock").expect("lock");
+        let target = OsString::from("locator.json");
+        let source = random_temp_name(&target);
+        let source_path = root.path().join(&source);
+        fs::write(&source_path, b"partial").expect("source");
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600))
+            .expect("private source");
+        let identity = BoundedRegularReader::identity(&source_path).expect("source identity");
+        let forged_identity = FileIdentity {
+            device: identity.device,
+            file: identity.file.wrapping_add(1),
+        };
+        let forged = temp_quarantine_name(&target, &source, &forged_identity);
+        fs::rename(&source_path, root.path().join(&forged)).expect("forge rebound quarantine");
+
+        let error = AtomicStateWriter::scavenge_direct_temp_namespaces_bounded(&root, 4, |_| {
+            Ok(BTreeSet::from([target.clone()]))
+        })
+        .expect_err("encoded quarantine identity must bind its inode");
+
+        assert!(error
+            .to_string()
+            .contains("identity is malformed or changed"));
+        assert!(root.path().join(forged).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn caller_bounded_temp_scavenge_can_cover_a_large_finite_namespace() {
         let temp = TempDir::new().expect("tempdir");
         let root = SafeRoot::open_or_create(temp.path().join("large-state")).expect("state root");
         for index in 0..=4096_u32 {
             fs::write(root.path().join(format!("filler-{index:04}")), b"").expect("filler entry");
         }
-        let residue = root.path().join(".locator.json.crashed.tmp");
+        let residue = root
+            .path()
+            .join(random_temp_name(OsStr::new("locator.json")));
         fs::write(&residue, b"partial").expect("temp residue");
         fs::set_permissions(&residue, fs::Permissions::from_mode(0o600)).expect("private temp");
 

@@ -24,13 +24,16 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fs, fs::File, marker::PhantomData};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    fs,
+    fs::File,
+    marker::PhantomData,
+};
 
-// One logical store has three independently replaced metadata files. Each can
-// leave at most one live temp and one deterministic quarantine when a process
-// dies mid-scavenge. Keep that bounded crash allowance outside the durable
-// namespace quota so recovery can still enumerate and remove its own residue.
-const SNAPSHOT_TEMP_ENTRY_SLACK: usize = 8;
+const SNAPSHOT_METADATA_FILES_PER_LOGICAL: usize = 3;
+const SNAPSHOT_RESIDUE_FORMS_PER_FILE: usize = 2;
 
 pub(crate) trait SnapshotSpec: JournalSpec {
     const SNAPSHOT_FORMAT_VERSION: u32;
@@ -265,6 +268,7 @@ where
             mac: AuthenticationTag::zero(),
         };
         let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&store_root, logical_id)?;
         write_locator::<S>(
             journal.authenticator(),
             &store_root,
@@ -312,6 +316,7 @@ where
                 // root-only inspection can therefore distinguish an empty
                 // namespace from a locator whose stable logical lock vanished.
                 let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
+                scavenge_snapshot_metadata_temps::<S>(&store_root, logical_id)?;
                 root_lock.verify(&store_root)?;
                 if !store_root.direct_child_exists(snapshot_locator_name(logical_id))? {
                     bail!(
@@ -359,6 +364,7 @@ where
             &mut locator,
         )?;
         let root_lock = BoundStateLock::acquire(&store.store_root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&store.store_root, logical_id)?;
         verify_root_inventory::<S>(store.journal.authenticator(), &store.store_root, &root_lock)?;
         Ok(store)
     }
@@ -424,6 +430,7 @@ where
             locator.token = current.token;
             locator.terminal_mac = terminal_mac;
             let root_lock = BoundStateLock::acquire(&store_root, S::ROOT_LOCK_NAME)?;
+            scavenge_snapshot_metadata_temps::<S>(&store_root, &logical_id)?;
             write_locator::<S>(
                 journal.authenticator(),
                 &store_root,
@@ -498,6 +505,7 @@ where
             .map(|record| record.mac.clone())
             .context("authenticated snapshot commit lost its terminal MAC")?;
         let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&self.store_root, &self.logical_id)?;
         write_locator::<S>(
             self.journal.authenticator(),
             &self.store_root,
@@ -555,6 +563,7 @@ where
             mac: AuthenticationTag::zero(),
         };
         let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&self.store_root, &self.logical_id)?;
         let usage =
             verify_root_inventory::<S>(self.journal.authenticator(), &self.store_root, &root_lock)?;
         ensure_rollover_capacity::<S>(usage)?;
@@ -589,6 +598,7 @@ where
         intent.next_identity = Some(journal.identity().clone());
         intent.next_terminal_mac = Some(terminal_mac.clone());
         let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&self.store_root, &self.logical_id)?;
         write_rollover_intent::<S>(
             journal.authenticator(),
             &self.store_root,
@@ -626,6 +636,7 @@ where
             mac: AuthenticationTag::zero(),
         };
         let root_lock = BoundStateLock::acquire(&self.store_root, S::ROOT_LOCK_NAME)?;
+        scavenge_snapshot_metadata_temps::<S>(&self.store_root, &self.logical_id)?;
         write_locator::<S>(
             journal.authenticator(),
             &self.store_root,
@@ -705,6 +716,7 @@ fn begin_snapshot_initialization<S: SnapshotSpec>(
     let store_lock = BoundStateLock::try_acquire_existing_exclusive(&root, &store_lock_name)
         .context("authenticated snapshot initialization is active elsewhere")?;
     let root_lock = BoundStateLock::acquire(&root, S::ROOT_LOCK_NAME)?;
+    scavenge_snapshot_metadata_temps::<S>(&root, logical_id)?;
     verify_root_inventory::<S>(authenticator, &root, &root_lock)?;
     if root.direct_child_exists(&locator_name)? {
         bail!("authenticated snapshot logical store is already initialized");
@@ -864,7 +876,6 @@ fn write_init_intent<S: SnapshotSpec>(
     let mut bytes = serde_json::to_vec(intent)?;
     bytes.push(b'\n');
     let name = snapshot_init_name(&intent.logical_id);
-    scavenge_snapshot_temp::<S>(root, &name)?;
     AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || lock.verify(root))
 }
 
@@ -1037,7 +1048,6 @@ fn write_rollover_intent<S: SnapshotSpec>(
         bail!("authenticated snapshot rollover intent exceeds its byte bound");
     }
     let name = snapshot_rollover_name(&intent.logical_id);
-    scavenge_snapshot_temp::<S>(root, &name)?;
     AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || {
         store_lock.verify(root)?;
         root_lock.verify(root)
@@ -1441,30 +1451,96 @@ fn ensure_rollover_capacity<S: SnapshotSpec>(usage: SnapshotRootUsage) -> Result
 }
 
 fn snapshot_temp_scan_budget<S: SnapshotSpec>() -> Result<usize> {
+    let crash_entries = S::MAX_LOGICAL_STORES
+        .checked_mul(SNAPSHOT_METADATA_FILES_PER_LOGICAL)
+        .and_then(|entries| entries.checked_mul(SNAPSHOT_RESIDUE_FORMS_PER_FILE))
+        .context("authenticated snapshot crash-residue capacity overflowed")?;
     S::MAX_ROOT_ENTRIES
-        .checked_add(SNAPSHOT_TEMP_ENTRY_SLACK)
+        .checked_add(crash_entries)
         .context("authenticated snapshot temp scan capacity overflowed")
-}
-
-fn scavenge_snapshot_temp<S: SnapshotSpec>(root: &SafeRoot, name: &str) -> Result<()> {
-    AtomicStateWriter::scavenge_direct_temps_bounded(
-        root,
-        name,
-        snapshot_temp_scan_budget::<S>()?,
-    )?;
-    Ok(())
 }
 
 fn scavenge_snapshot_metadata_temps<S: SnapshotSpec>(
     root: &SafeRoot,
     logical_id: &str,
 ) -> Result<()> {
-    for name in [
-        snapshot_locator_name(logical_id),
-        snapshot_init_name(logical_id),
-        snapshot_rollover_name(logical_id),
+    let current_hash = sha256_hex(logical_id.as_bytes());
+    AtomicStateWriter::scavenge_direct_temp_namespaces_bounded(
+        root,
+        snapshot_temp_scan_budget::<S>()?,
+        move |entries| snapshot_metadata_temp_targets::<S>(entries, &current_hash),
+    )?;
+    Ok(())
+}
+
+fn snapshot_metadata_temp_targets<S: SnapshotSpec>(
+    entries: &[OsString],
+    current_hash: &str,
+) -> Result<BTreeSet<OsString>> {
+    let mut logical_hashes = BTreeSet::from([current_hash.to_string()]);
+    for entry in entries {
+        let name = entry
+            .to_str()
+            .context("authenticated snapshot root entry is not UTF-8")?;
+        if let Some(hash) = snapshot_logical_hash_from_root_entry(name)? {
+            logical_hashes.insert(hash.to_string());
+        }
+        if let Some(target) = AtomicStateWriter::canonical_direct_temp_target(entry) {
+            let target = target
+                .to_str()
+                .context("authenticated snapshot temp target is not UTF-8")?;
+            let hash = snapshot_metadata_target_hash(target)?
+                .context("authenticated snapshot root contains a foreign atomic temp")?;
+            logical_hashes.insert(hash.to_string());
+        }
+    }
+    if logical_hashes.len() > S::MAX_LOGICAL_STORES {
+        bail!("authenticated snapshot crash residue exceeds its logical-store capacity");
+    }
+    let mut targets = BTreeSet::new();
+    for hash in logical_hashes {
+        targets.insert(OsString::from(format!(".snapshot-locator-{hash}.json")));
+        targets.insert(OsString::from(format!(".snapshot-init-{hash}.json")));
+        targets.insert(OsString::from(format!(".snapshot-rollover-{hash}.json")));
+    }
+    Ok(targets)
+}
+
+fn snapshot_logical_hash_from_root_entry(name: &str) -> Result<Option<&str>> {
+    if let Some(hash) = name
+        .strip_prefix(".snapshot-store-")
+        .and_then(|value| value.strip_suffix(".lock"))
+    {
+        validate_snapshot_logical_hash(hash)?;
+        return Ok(Some(hash));
+    }
+    snapshot_metadata_target_hash(name)
+}
+
+fn snapshot_metadata_target_hash(name: &str) -> Result<Option<&str>> {
+    for prefix in [
+        ".snapshot-locator-",
+        ".snapshot-init-",
+        ".snapshot-rollover-",
     ] {
-        scavenge_snapshot_temp::<S>(root, &name)?;
+        if let Some(hash) = name
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(".json"))
+        {
+            validate_snapshot_logical_hash(hash)?;
+            return Ok(Some(hash));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_snapshot_logical_hash(hash: &str) -> Result<()> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("authenticated snapshot metadata filename hash is malformed");
     }
     Ok(())
 }
@@ -1737,7 +1813,6 @@ fn write_locator<S: SnapshotSpec>(
         bail!("authenticated snapshot locator exceeds its byte bound");
     }
     let name = snapshot_locator_name(&locator.logical_id);
-    scavenge_snapshot_temp::<S>(root, &name)?;
     AtomicStateWriter::write_direct_fenced(root, &name, &bytes, || {
         store_lock.verify(root)?;
         root_lock.verify(root)
@@ -1825,6 +1900,8 @@ mod tests {
 
     enum QuotaSnapshotSpec {}
 
+    enum ManyQuotaSnapshotSpec {}
+
     impl JournalSpec for QuotaSnapshotSpec {
         const FORMAT_VERSION: u32 = 1;
         const NAMESPACE: &'static str = "quota_snapshot";
@@ -1851,6 +1928,34 @@ mod tests {
         const MAX_LOGICAL_STORES: usize = 2;
         const MAX_ROOT_ENTRIES: usize = 7;
         const MAX_PHYSICAL_INSTANCES: usize = 2;
+    }
+
+    impl JournalSpec for ManyQuotaSnapshotSpec {
+        const FORMAT_VERSION: u32 = 1;
+        const NAMESPACE: &'static str = "many_quota_snapshot";
+        const ROOT_NAME: &'static str = "many-quota-snapshots-v1";
+        const ROOT_LOCK_NAME: &'static str = ".many-quota-snapshots.lock";
+        const INSTANCE_LOCK_NAME: &'static str = ".many-quota-snapshot.lock";
+        const HEAD_FILE_NAME: &'static str = ".head.json";
+        const RECORD_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0many-quota-snapshot-record\0v1\0");
+        const HEAD_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0many-quota-snapshot-head\0v1\0");
+        const MAX_RECORDS: usize = 8;
+        const MAX_RECORD_BYTES: u64 = 64 * 1024;
+        const MAX_TOTAL_BYTES: u64 = 256 * 1024;
+        const MAX_PHASE_BYTES: usize = 32;
+        const MAX_SUBJECT_BYTES: usize = 64;
+        const MAX_INSTANCE_ID_BYTES: usize = 64;
+    }
+
+    impl SnapshotSpec for ManyQuotaSnapshotSpec {
+        const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+        const LOCATOR_DOMAIN: AuthenticationDomain =
+            AuthenticationDomain::new(b"MACO\0many-quota-snapshot-locator\0v1\0");
+        const MAX_LOGICAL_STORES: usize = 9;
+        const MAX_ROOT_ENTRIES: usize = 28;
+        const MAX_PHYSICAL_INSTANCES: usize = 9;
     }
 
     fn repository() -> (TempDir, std::path::PathBuf) {
@@ -2086,6 +2191,52 @@ mod tests {
         .expect("responsible logical store scavenges before root inventory");
         assert_eq!(reopened.current().value, 1);
         assert_eq!(fs::read_dir(root_path).expect("quota root").count(), 7);
+    }
+
+    #[test]
+    fn full_namespace_open_scavenges_nine_logical_temp_namespaces_in_one_pass() {
+        let (_temp, path) = repository();
+        let logical_ids = (0..9)
+            .map(|index| format!("many-temp-{index}"))
+            .collect::<Vec<_>>();
+        for logical_id in &logical_ids {
+            let store = AuthenticatedSnapshotStore::<ManyQuotaSnapshotSpec, u64>::create(
+                authenticator(&path),
+                logical_id,
+                1,
+                1,
+            )
+            .expect("fill many-logical namespace");
+            drop(store);
+        }
+        let repo = Repository::open(&path).expect("repo");
+        let root_path = repo
+            .commondir()
+            .join("maco/state")
+            .join(ManyQuotaSnapshotSpec::ROOT_NAME);
+        let root = SafeRoot::open_existing(&root_path).expect("many-logical root");
+        assert_eq!(fs::read_dir(&root_path).expect("full root").count(), 28);
+        for logical_id in &logical_ids {
+            let locator_name = snapshot_locator_name(logical_id);
+            AtomicStateWriter::write_direct_fenced(&root, &locator_name, b"crash-temp", || {
+                bail!("injected locator fence failure")
+            })
+            .err()
+            .expect("leave logical locator temp");
+        }
+        assert_eq!(
+            fs::read_dir(&root_path).expect("root with temps").count(),
+            37
+        );
+
+        let reopened = AuthenticatedSnapshotStore::<ManyQuotaSnapshotSpec, u64>::open_instance(
+            authenticator(&path),
+            &logical_ids[0],
+        )
+        .expect("one open scavenges every logical temp namespace");
+
+        assert_eq!(reopened.current().value, 1);
+        assert_eq!(fs::read_dir(root_path).expect("recovered root").count(), 28);
     }
 
     #[test]
