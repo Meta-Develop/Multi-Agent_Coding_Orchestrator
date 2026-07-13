@@ -2,15 +2,15 @@ use crate::{
     repo_semantic,
     safe_state::{
         BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits, BoundedTreeWalker,
+        DirectoryBindingGuard,
     },
 };
-use anyhow::Result;
-use git2::Repository;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const REPOSITORY_INVENTORY_MAX_DEPTH: usize = 128;
@@ -293,7 +293,25 @@ fn normalize_text(text: &str) -> String {
 }
 
 fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
-    let git_repo = Repository::open(repo).ok();
+    let deadline = Instant::now()
+        .checked_add(REPOSITORY_INVENTORY_MAX_DURATION)
+        .context("repository inventory deadline overflowed")?;
+    let worktree_binding = DirectoryBindingGuard::bind(repo)?;
+    let git_bindings_and_visible = match git2::Repository::open(repo) {
+        Ok(git_repo) => Some((
+            DirectoryBindingGuard::bind(git_repo.path())?,
+            DirectoryBindingGuard::bind(git_repo.commondir())?,
+            crate::worktree::bounded_repository_visible_paths(
+                repo,
+                REPOSITORY_INVENTORY_MAX_ENTRIES,
+                REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
+                remaining_inventory_time(deadline, "before bounded Git inventory")?,
+            )?
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        )),
+        Err(_) => None,
+    };
     let inventory = BoundedTreeWalker::walk_with(
         repo,
         BoundedTreeWalkLimits {
@@ -301,12 +319,12 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
             max_entries: REPOSITORY_INVENTORY_MAX_ENTRIES,
             max_path_bytes: REPOSITORY_INVENTORY_MAX_PATH_BYTES,
             max_total_path_bytes: REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
-            max_duration: REPOSITORY_INVENTORY_MAX_DURATION,
+            max_duration: remaining_inventory_time(deadline, "before descriptor inventory")?,
             same_device: true,
         },
         |entry| {
             let path = &entry.relative_path;
-            if is_runtime_path(path) || is_ignored_path(git_repo.as_ref(), path) {
+            if is_runtime_path(path) {
                 return Ok(BoundedTreeWalkAction::Skip);
             }
             Ok(match entry.kind {
@@ -330,9 +348,20 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
             })
         },
     )?;
+    worktree_binding.verify()?;
+    if let Some((git_dir_binding, common_dir_binding, _)) = &git_bindings_and_visible {
+        git_dir_binding.verify()?;
+        common_dir_binding.verify()?;
+    }
+    remaining_inventory_time(deadline, "after repository inventory")?;
     let mut files = inventory
         .into_iter()
-        .filter(|entry| entry.kind == BoundedTreeEntryKind::RegularFile)
+        .filter(|entry| {
+            entry.kind == BoundedTreeEntryKind::RegularFile
+                && git_bindings_and_visible
+                    .as_ref()
+                    .is_none_or(|(_, _, visible)| visible.contains(&entry.relative_path))
+        })
         .map(|entry| entry.relative_path)
         .collect::<Vec<_>>();
     files.sort();
@@ -340,10 +369,11 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn is_ignored_path(git_repo: Option<&Repository>, relative: &Path) -> bool {
-    git_repo
-        .and_then(|repo| repo.status_should_ignore(relative).ok())
-        .unwrap_or(false)
+fn remaining_inventory_time(deadline: Instant, phase: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .with_context(|| format!("repository inventory exceeded its total time limit {phase}"))
 }
 
 fn should_skip_dir(name: &str) -> bool {

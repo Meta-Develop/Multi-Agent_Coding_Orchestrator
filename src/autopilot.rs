@@ -22,7 +22,7 @@ use crate::{
     },
     safe_state::{
         BoundedRegularReader, BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction,
-        BoundedTreeWalkLimits, BoundedTreeWalker,
+        BoundedTreeWalkLimits, BoundedTreeWalker, DirectoryBindingGuard,
     },
     semantic_coord::SemanticIntentStore,
     supervise::{
@@ -67,7 +67,6 @@ const AUTOPILOT_MAX_PATH_COMPONENTS: usize = 256;
 const AUTOPILOT_MAX_STRING_BYTES: usize = 256 * 1024;
 const AUTOPILOT_MAX_REVIEWER_ARGS: usize = 256;
 const AUTOPILOT_MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
-const AUTOPILOT_STATUS_MAX_DEPTH: usize = 128;
 const AUTOPILOT_STATUS_MAX_ENTRIES: usize = 100_000;
 const AUTOPILOT_STATUS_MAX_PATH_BYTES: usize = 4096;
 const AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
@@ -497,6 +496,8 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
     write_private_json(&mut artifact_writer, &artifacts.plan, &plan)?;
 
     let safety = safety_report(&repo, options.allow_dirty_primary, &plan.assigned_paths)?;
+    let repository_bindings = RepositoryPathBindings::bind(&repo)?;
+    verify_after_autopilot_safety(&repository_bindings)?;
     if safety.refused {
         write_skipped_stage_reports(&mut artifact_writer, "safety_refusal")?;
         let validation = AutopilotValidationSummary {
@@ -579,6 +580,12 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
                 SupervisorRuntime::Fake,
             ),
         };
+        if !options.allow_dirty_primary && !dirty_primary_paths(&repo)?.is_empty() {
+            bail!("primary worktree changed after safety preflight and before supervisor start");
+        }
+        repository_bindings
+            .verify()
+            .context("repository changed immediately before supervisor start")?;
         let supervisor = match supervise::run_supervisor_plan_file(SupervisorRunOptions {
             repo: repo.clone(),
             plan_file: supervisor_plan_path,
@@ -2473,126 +2480,87 @@ fn read_artifact_json(reader: &ArtifactRunReader, relative: impl AsRef<Path>) ->
         .with_context(|| format!("failed to parse finalized artifact {}", relative.display()))
 }
 
+struct RepositoryPathBindings {
+    worktree: DirectoryBindingGuard,
+    git_dir: DirectoryBindingGuard,
+    common_dir: DirectoryBindingGuard,
+}
+
+impl RepositoryPathBindings {
+    fn bind(repo_path: &Path) -> Result<Self> {
+        let repository = Repository::open(repo_path)
+            .with_context(|| format!("failed to bind repository {}", repo_path.display()))?;
+        let worktree = repository
+            .workdir()
+            .context("repository binding requires a non-bare worktree")?;
+        let bindings = Self {
+            worktree: DirectoryBindingGuard::bind(worktree)?,
+            git_dir: DirectoryBindingGuard::bind(repository.path())?,
+            common_dir: DirectoryBindingGuard::bind(repository.commondir())?,
+        };
+        bindings.verify()?;
+        Ok(bindings)
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.worktree
+            .verify()
+            .context("repository worktree changed")?;
+        self.git_dir
+            .verify()
+            .context("repository Git directory changed")?;
+        self.common_dir
+            .verify()
+            .context("repository common directory changed")
+    }
+}
+
+fn verify_after_autopilot_safety(bindings: &RepositoryPathBindings) -> Result<()> {
+    #[cfg(test)]
+    run_after_autopilot_safety_hook();
+    bindings
+        .verify()
+        .context("repository changed after autopilot safety preflight")
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_AUTOPILOT_SAFETY_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_after_autopilot_safety_hook(hook: impl FnMut() + 'static) {
+    AFTER_AUTOPILOT_SAFETY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_autopilot_safety_hook() {
+    AFTER_AUTOPILOT_SAFETY_HOOK.with(|slot| {
+        if let Some(mut hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
-    let repo = Repository::open(repo_path)
-        .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
-    let workdir = repo
-        .workdir()
-        .context("repository status requires a non-bare worktree")?;
-    bounded_repository_dirty_paths(workdir)
+    bounded_repository_dirty_paths(repo_path)
 }
 
 fn bounded_repository_dirty_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
-    let repo = Repository::open(repo_path)
-        .with_context(|| format!("failed to open repository {}", repo_path.display()))?;
-    let root = repo
-        .workdir()
-        .context("repository status requires a non-bare worktree")?;
-    let inventory = BoundedTreeWalker::walk_with(
-        root,
-        BoundedTreeWalkLimits {
-            max_depth: AUTOPILOT_STATUS_MAX_DEPTH,
-            max_entries: AUTOPILOT_STATUS_MAX_ENTRIES,
-            max_path_bytes: AUTOPILOT_STATUS_MAX_PATH_BYTES,
-            max_total_path_bytes: AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES,
-            max_duration: AUTOPILOT_STATUS_MAX_DURATION,
-            same_device: true,
-        },
-        |entry| {
-            let path = &entry.relative_path;
-            if path == Path::new(".git")
-                || path.starts_with(".git")
-                || is_local_runtime_path(path)
-                || repo.status_should_ignore(path).unwrap_or(false)
-            {
-                return Ok(BoundedTreeWalkAction::Skip);
-            }
-            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
-                BoundedTreeWalkAction::RecordAndDescend
-            } else {
-                BoundedTreeWalkAction::Record
-            })
-        },
-    )?;
-    let mut candidates = inventory
-        .into_iter()
-        .filter(|entry| entry.kind != BoundedTreeEntryKind::Directory)
-        .map(|entry| {
-            let kind = if entry.kind == BoundedTreeEntryKind::RegularFile
-                && !entry.is_safe_regular_file()
-            {
-                BoundedTreeEntryKind::Special
-            } else {
-                entry.kind
-            };
-            (entry.relative_path, kind)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let index = repo.index().context("failed to open repository index")?;
-    if index.len() > AUTOPILOT_STATUS_MAX_ENTRIES {
-        bail!("repository index exceeds the bounded status entry limit");
-    }
-    let index_deadline = std::time::Instant::now()
-        .checked_add(AUTOPILOT_STATUS_MAX_DURATION)
-        .context("repository index deadline overflowed")?;
-    let mut index_path_bytes = 0_usize;
-    for entry in index.iter() {
-        if std::time::Instant::now() >= index_deadline {
-            bail!("repository index inspection exceeded its time limit");
-        }
-        if entry.path.len() > AUTOPILOT_STATUS_MAX_PATH_BYTES {
-            bail!("repository index path exceeds the bounded status path limit");
-        }
-        index_path_bytes = index_path_bytes
-            .checked_add(entry.path.len())
-            .context("repository index path byte count overflowed")?;
-        if index_path_bytes > AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES {
-            bail!("repository index paths exceed the bounded status aggregate limit");
-        }
-        let path = git_index_path(&entry.path)?;
-        let path = normalize_repo_relative_path(&path)?;
-        if !is_local_runtime_path(&path) {
-            candidates
-                .entry(path)
-                .or_insert(BoundedTreeEntryKind::RegularFile);
-        }
-    }
-    if candidates.len() > AUTOPILOT_STATUS_MAX_ENTRIES {
-        bail!("repository status candidate set exceeds its entry limit");
-    }
-    let deadline = std::time::Instant::now()
-        .checked_add(AUTOPILOT_STATUS_MAX_DURATION)
-        .context("repository status deadline overflowed")?;
-    let mut dirty = Vec::new();
-    for (path, kind) in candidates {
-        if std::time::Instant::now() >= deadline {
-            bail!("repository status inspection exceeded its time limit");
-        }
-        if kind == BoundedTreeEntryKind::Special {
-            dirty.push(path);
-            continue;
-        }
-        let status = repo.status_file(&path).with_context(|| {
-            format!("failed to inspect repository status for {}", path.display())
-        })?;
-        if !status.is_empty() && !status.contains(git2::Status::IGNORED) {
-            dirty.push(path);
-        }
-    }
+    let mut dirty = crate::worktree::bounded_repository_status_paths(
+        repo_path,
+        AUTOPILOT_STATUS_MAX_ENTRIES,
+        AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES,
+        AUTOPILOT_STATUS_MAX_DURATION,
+    )?
+    .into_iter()
+    .map(|(path, _status)| normalize_repo_relative_path(path))
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+    dirty.retain(|path| !is_local_runtime_path(path));
+    dirty.sort();
+    dirty.dedup();
     Ok(dirty)
-}
-
-#[cfg(unix)]
-fn git_index_path(bytes: &[u8]) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
-}
-
-#[cfg(not(unix))]
-fn git_index_path(bytes: &[u8]) -> Result<PathBuf> {
-    String::from_utf8(bytes.to_vec())
-        .map(PathBuf::from)
-        .context("repository index path is not valid UTF-8")
 }
 
 fn is_local_runtime_path(path: &Path) -> bool {
@@ -2847,6 +2815,26 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_binding_rejects_root_swap_after_safety_preflight() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").expect("init repo");
+        let displaced = temp.path().join("repo-displaced");
+        let replacement = repo.clone();
+        let bindings = RepositoryPathBindings::bind(&repo).expect("bind repository");
+        set_after_autopilot_safety_hook(move || {
+            fs::rename(&replacement, &displaced).expect("displace repository root");
+            fs::create_dir(&replacement).expect("create replacement root");
+        });
+
+        let error = verify_after_autopilot_safety(&bindings)
+            .expect_err("repository root replacement must fail closed");
+
+        assert!(format!("{error:#}").contains("repository"));
+    }
 
     #[test]
     fn autopilot_plan_input_is_bounded_nofollow_and_json_fail_closed() {

@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
-use git2::{Repository, Status};
+use git2::Repository;
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use crate::safe_state::{
     BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
-    BoundedTreeWalker,
+    BoundedTreeWalker, DirectoryBindingGuard,
 };
 
 const REPOSITORY_MAP_MAX_DEPTH: usize = 128;
@@ -65,6 +66,20 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
         .workdir()
         .context("repository map requires a non-bare repository")?
         .to_path_buf();
+    let worktree_binding = DirectoryBindingGuard::bind(&root)?;
+    let git_dir_binding = DirectoryBindingGuard::bind(repo.path())?;
+    let common_dir_binding = DirectoryBindingGuard::bind(repo.commondir())?;
+    let deadline = Instant::now()
+        .checked_add(REPOSITORY_MAP_MAX_DURATION)
+        .context("repository map deadline overflowed")?;
+    let statuses = crate::worktree::bounded_repository_status_paths(
+        &root,
+        REPOSITORY_MAP_MAX_ENTRIES,
+        REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
+        remaining_map_time(deadline, "before bounded Git status")?,
+    )?
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
 
     let inventory = BoundedTreeWalker::walk_with(
         &root,
@@ -73,7 +88,7 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
             max_entries: REPOSITORY_MAP_MAX_ENTRIES,
             max_path_bytes: REPOSITORY_MAP_MAX_PATH_BYTES,
             max_total_path_bytes: REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
-            max_duration: REPOSITORY_MAP_MAX_DURATION,
+            max_duration: remaining_map_time(deadline, "before descriptor inventory")?,
             same_device: true,
         },
         |entry| {
@@ -86,19 +101,27 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
             })
         },
     )?;
-    let deadline = Instant::now()
-        .checked_add(REPOSITORY_MAP_MAX_DURATION)
-        .context("repository status deadline overflowed")?;
     let entries = inventory
         .into_iter()
-        .map(|entry| map_inventory_entry(&repo, entry, deadline))
+        .map(|entry| map_inventory_entry(&statuses, entry, deadline))
         .collect::<Result<Vec<_>>>()?;
+    worktree_binding.verify()?;
+    git_dir_binding.verify()?;
+    common_dir_binding.verify()?;
+    remaining_map_time(deadline, "after repository map")?;
 
     Ok(RepoMap { root, entries })
 }
 
+fn remaining_map_time(deadline: Instant, phase: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .with_context(|| format!("repository map exceeded its total time limit {phase}"))
+}
+
 fn map_inventory_entry(
-    repo: &Repository,
+    statuses: &BTreeMap<PathBuf, [u8; 2]>,
     entry: BoundedTreeEntry,
     deadline: Instant,
 ) -> Result<RepoMapEntry> {
@@ -109,14 +132,11 @@ fn map_inventory_entry(
     let git_status = match kind {
         RepoEntryKind::Directory => RepoGitStatus::Directory,
         RepoEntryKind::Other => RepoGitStatus::Untracked,
-        RepoEntryKind::File | RepoEntryKind::Symlink => {
-            classify_git_status(repo.status_file(&entry.relative_path).with_context(|| {
-                format!(
-                    "failed to inspect Git status for {}",
-                    entry.relative_path.display()
-                )
-            })?)
-        }
+        RepoEntryKind::File | RepoEntryKind::Symlink => statuses
+            .get(&entry.relative_path)
+            .copied()
+            .map(classify_porcelain_status)
+            .unwrap_or(RepoGitStatus::Clean),
     };
     Ok(RepoMapEntry {
         path: entry.relative_path.clone(),
@@ -127,23 +147,20 @@ fn map_inventory_entry(
     })
 }
 
-fn classify_git_status(status: Status) -> RepoGitStatus {
-    if status.is_conflicted() {
+fn classify_porcelain_status(status: [u8; 2]) -> RepoGitStatus {
+    let [index, worktree] = status;
+    if index == b'U' || worktree == b'U' || matches!((index, worktree), (b'A', b'A') | (b'D', b'D'))
+    {
         RepoGitStatus::Conflicted
-    } else if status.intersects(Status::WT_NEW) {
+    } else if index == b'?' && worktree == b'?' {
         RepoGitStatus::Untracked
-    } else if status.intersects(Status::INDEX_NEW) {
+    } else if index == b'A' {
         RepoGitStatus::Added
-    } else if status.intersects(Status::WT_DELETED | Status::INDEX_DELETED) {
+    } else if index == b'D' || worktree == b'D' {
         RepoGitStatus::Deleted
-    } else if status.intersects(Status::WT_RENAMED | Status::INDEX_RENAMED) {
+    } else if index == b'R' || worktree == b'R' {
         RepoGitStatus::Renamed
-    } else if status.intersects(
-        Status::WT_MODIFIED
-            | Status::INDEX_MODIFIED
-            | Status::WT_TYPECHANGE
-            | Status::INDEX_TYPECHANGE,
-    ) {
+    } else if matches!(index, b'M' | b'T' | b'C') || matches!(worktree, b'M' | b'T' | b'C') {
         RepoGitStatus::Modified
     } else {
         RepoGitStatus::Clean

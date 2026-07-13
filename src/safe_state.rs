@@ -520,6 +520,88 @@ pub enum BoundedTreeWalkAction {
 
 pub struct BoundedTreeWalker;
 
+/// Binds a directory pathname to the exact opened filesystem object.  The
+/// descriptor is retained so callers can fence multi-phase, path-based work
+/// against a concurrent rename/replacement of the directory.
+#[derive(Debug)]
+pub struct DirectoryBindingGuard {
+    path: PathBuf,
+    directory: File,
+    identity: FileIdentity,
+    #[cfg(unix)]
+    generation: fs::Metadata,
+}
+
+impl DirectoryBindingGuard {
+    pub fn bind(path: impl AsRef<Path>) -> Result<Self> {
+        let path = absolute_normalized(path.as_ref())?;
+        #[cfg(unix)]
+        {
+            let directory = open_unix_directory(&path)?;
+            let stat = fstat(directory.as_raw_fd())?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                bail!(
+                    "directory binding target is not a directory: {}",
+                    path.display()
+                );
+            }
+            Ok(Self {
+                path,
+                identity: identity_from_stat(&stat),
+                generation: directory.metadata()?,
+                directory,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            bail!("verified directory pathname bindings are unsupported on this platform")
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let held = fstat(self.directory.as_raw_fd())?;
+            let held_generation = self.directory.metadata()?;
+            if held.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || identity_from_stat(&held) != self.identity
+                || !same_file_generation(&self.generation, &held_generation)
+            {
+                bail!("held directory binding changed: {}", self.path.display());
+            }
+            let rebound_directory = open_unix_directory(&self.path).with_context(|| {
+                format!(
+                    "directory pathname binding disappeared: {}",
+                    self.path.display()
+                )
+            })?;
+            let rebound = fstat(rebound_directory.as_raw_fd())?;
+            let rebound_generation = rebound_directory.metadata()?;
+            if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || identity_from_stat(&rebound) != self.identity
+                || !same_file_generation(&self.generation, &rebound_generation)
+            {
+                bail!(
+                    "directory pathname binding changed: {}",
+                    self.path.display()
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        bail!("verified directory pathname bindings are unsupported on this platform")
+    }
+}
+
 impl BoundedTreeWalker {
     pub fn walk(
         root: impl AsRef<Path>,
@@ -547,8 +629,8 @@ impl BoundedTreeWalker {
 
         #[cfg(unix)]
         {
-            let directory = open_unix_directory(&root)?;
-            let root_stat = fstat(directory.as_raw_fd())?;
+            let root_binding = DirectoryBindingGuard::bind(&root)?;
+            let root_stat = fstat(root_binding.directory.as_raw_fd())?;
             let deadline = Instant::now()
                 .checked_add(limits.max_duration)
                 .context("bounded tree walk deadline overflowed")?;
@@ -565,7 +647,9 @@ impl BoundedTreeWalker {
                 action: &mut action,
                 entries: &mut entries,
             };
-            walker.walk(directory.as_raw_fd(), Path::new(""), 0)?;
+            walker.walk(root_binding.directory.as_raw_fd(), Path::new(""), 0)?;
+            budget.ensure_before_deadline("after repository traversal")?;
+            root_binding.verify()?;
             Ok(entries)
         }
 
@@ -604,7 +688,8 @@ impl BoundedRegularReader {
             let relative = absolute.strip_prefix(root).with_context(|| {
                 format!("failed to make path root-relative: {}", absolute.display())
             })?;
-            Self::read_relative(root, relative, max_bytes)
+            let mut file = open_relative_regular_unix_allow_mounts(root, relative)?;
+            read_bounded_file(&mut file, &absolute, max_bytes)
         }
         #[cfg(not(unix))]
         {
@@ -647,14 +732,14 @@ impl BoundedRegularReader {
         let root = absolute_normalized(root.as_ref())?;
         let relative = validated_relative_path(relative.as_ref())?;
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            let mut file = open_relative_regular_unix(&root, &relative)?;
+            let mut file = open_repository_relative_regular_linux(&root, &relative)?;
             read_bounded_file(&mut file, &root.join(&relative), max_bytes)
         }
 
-        #[cfg(not(unix))]
-        bail!("bounded no-follow reads are unsupported on this platform")
+        #[cfg(not(target_os = "linux"))]
+        bail!("mount-confined repository-relative reads require Linux openat2")
     }
 
     pub fn read_relative_utf8(
@@ -682,27 +767,39 @@ impl BoundedRegularReader {
         relative: impl AsRef<Path>,
         max_bytes: u64,
     ) -> Result<Option<String>> {
+        let relative = relative.as_ref();
+        let Some(bytes) = Self::read_relative_optional(root, relative, max_bytes)? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .with_context(|| {
+                format!(
+                    "repository-relative file is not valid UTF-8: {}",
+                    relative.display()
+                )
+            })
+            .map(Some)
+    }
+
+    pub fn read_relative_optional(
+        root: impl AsRef<Path>,
+        relative: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
         let root = absolute_normalized(root.as_ref())?;
         let relative = validated_relative_path(relative.as_ref())?;
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
-            let Some(mut file) = open_relative_optional_regular_unix(&root, &relative)? else {
+            let Some(mut file) = open_repository_relative_optional_regular_linux(&root, &relative)?
+            else {
                 return Ok(None);
             };
-            let bytes = read_bounded_file(&mut file, &root.join(&relative), max_bytes)?;
-            String::from_utf8(bytes)
-                .with_context(|| {
-                    format!(
-                        "repository-relative file is not valid UTF-8: {}",
-                        relative.display()
-                    )
-                })
-                .map(Some)
+            read_bounded_file(&mut file, &root.join(&relative), max_bytes).map(Some)
         }
 
-        #[cfg(not(unix))]
-        bail!("bounded no-follow reads are unsupported on this platform")
+        #[cfg(not(target_os = "linux"))]
+        bail!("mount-confined repository-relative reads require Linux openat2")
     }
 
     pub fn identity(path: impl AsRef<Path>) -> Result<FileIdentity> {
@@ -1961,7 +2058,7 @@ fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn open_relative_regular_unix(root: &Path, relative: &Path) -> Result<File> {
+fn open_relative_regular_unix_allow_mounts(root: &Path, relative: &Path) -> Result<File> {
     let mut directory = open_unix_directory(root)?;
     let components = relative.components().collect::<Vec<_>>();
     for (index, component) in components.iter().enumerate() {
@@ -2009,60 +2106,89 @@ fn open_relative_regular_unix(root: &Path, relative: &Path) -> Result<File> {
     )
 }
 
-#[cfg(unix)]
-fn open_relative_optional_regular_unix(root: &Path, relative: &Path) -> Result<Option<File>> {
-    let mut directory = open_unix_directory(root)?;
-    let components = relative.components().collect::<Vec<_>>();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(segment) = component else {
-            bail!("invalid relative component in {}", relative.display());
-        };
-        let name = c_string(segment)?;
-        let is_final = index + 1 == components.len();
-        let flags = if is_final {
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
-        } else {
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
-        };
-        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to inspect repository-relative component {} without following links",
-                    segment.to_string_lossy()
-                )
-            });
-        }
-        let opened = unsafe { File::from_raw_fd(fd) };
-        let metadata = opened.metadata().with_context(|| {
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LinuxOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+#[cfg(target_os = "linux")]
+const RESOLVE_NO_XDEV: u64 = 0x01;
+#[cfg(target_os = "linux")]
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+#[cfg(target_os = "linux")]
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+#[cfg(target_os = "linux")]
+const RESOLVE_BENEATH: u64 = 0x08;
+
+#[cfg(target_os = "linux")]
+fn open_repository_relative_linux(root: &Path, relative: &Path) -> Result<File> {
+    let root = open_unix_directory(root)?;
+    let relative = c_string(relative.as_os_str())?;
+    let how = LinuxOpenHow {
+        flags: u64::try_from(libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .context("openat2 flags did not fit u64")?,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            &how as *const LinuxOpenHow,
+            std::mem::size_of::<LinuxOpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
             format!(
-                "failed to inspect repository-relative component {}",
-                segment.to_string_lossy()
+                "failed to open mount-confined repository-relative path {}",
+                Path::new(relative.to_string_lossy().as_ref()).display()
             )
-        })?;
-        if is_final {
-            if metadata.file_type().is_dir() {
-                return Ok(None);
-            }
-            ensure_regular_single_link_metadata(&root.join(relative), &metadata)?;
-            return Ok(Some(opened));
-        }
-        if !metadata.file_type().is_dir() {
-            bail!(
-                "relative path component is not a directory: {}",
-                segment.to_string_lossy()
-            );
-        }
-        directory = opened;
+        });
     }
-    bail!(
-        "relative path has no final component: {}",
-        relative.display()
-    )
+    let fd = i32::try_from(fd).context("openat2 returned an invalid file descriptor")?;
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_repository_relative_regular_linux(root: &Path, relative: &Path) -> Result<File> {
+    let file = open_repository_relative_linux(root, relative)?;
+    identity_from_file(&file, &root.join(relative))?;
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn open_repository_relative_optional_regular_linux(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<File>> {
+    let file = match open_repository_relative_linux(root, relative) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect mount-confined repository-relative path {}",
+            relative.display()
+        )
+    })?;
+    if metadata.file_type().is_dir() {
+        return Ok(None);
+    }
+    ensure_regular_single_link_metadata(&root.join(relative), &metadata)?;
+    Ok(Some(file))
 }
 
 fn random_temp_name(file_name: &OsStr) -> OsString {
@@ -3404,6 +3530,8 @@ where
                 identity: identity_from_stat(&stat),
             };
             let decision = (self.action)(&entry)?;
+            self.budget
+                .ensure_before_deadline("after repository inventory callback")?;
             if matches!(
                 decision,
                 BoundedTreeWalkAction::Record | BoundedTreeWalkAction::RecordAndDescend
@@ -3509,6 +3637,7 @@ fn inventory_directory_entries(fd: RawFd, budget: &mut InventoryBudget) -> Resul
         entries.push(OsString::from_vec(name.to_bytes().to_vec()));
     }
     entries.sort();
+    budget.ensure_before_deadline("after directory entry sorting")?;
     Ok(entries)
 }
 
@@ -3936,6 +4065,33 @@ mod tests {
             fifo_started.elapsed() < Duration::from_secs(1),
             "no-writer FIFO open must fail without blocking"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_relative_reader_refuses_mount_boundary() {
+        let error = BoundedRegularReader::read_relative("/", "proc/self/status", 64 * 1024)
+            .expect_err("repository-relative reader must not cross into procfs");
+
+        assert!(format!("{error:#}").contains("mount-confined"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_binding_guard_rejects_pathname_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bound = temp.path().join("bound");
+        let displaced = temp.path().join("displaced");
+        fs::create_dir(&bound).expect("create bound directory");
+        let guard = DirectoryBindingGuard::bind(&bound).expect("bind directory");
+        fs::rename(&bound, &displaced).expect("displace bound directory");
+        fs::create_dir(&bound).expect("create replacement directory");
+
+        let error = guard
+            .verify()
+            .expect_err("replacement directory must fail binding verification");
+
+        assert!(error.to_string().contains("binding changed"));
     }
 
     #[cfg(unix)]
@@ -4439,6 +4595,29 @@ mod tests {
         let error =
             BoundedTreeWalker::walk(&root, limits).expect_err("path aggregate must fail closed");
         assert!(format!("{error:#}").contains("aggregate"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_tree_walk_checks_deadline_after_callback() {
+        let root = tempfile::tempdir().expect("tempdir");
+        fs::write(root.path().join("entry"), "data").expect("write entry");
+        let limits = BoundedTreeWalkLimits {
+            max_depth: 8,
+            max_entries: 8,
+            max_path_bytes: 128,
+            max_total_path_bytes: 1024,
+            max_duration: Duration::from_millis(1),
+            same_device: true,
+        };
+
+        let error = BoundedTreeWalker::walk_with(root.path(), limits, |_entry| {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(BoundedTreeWalkAction::Record)
+        })
+        .expect_err("callback overrun must fail the hard deadline check");
+
+        assert!(error.to_string().contains("time limit"));
     }
 
     #[cfg(unix)]
