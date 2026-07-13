@@ -361,7 +361,7 @@ cargo clippy --all-targets -- -D warnings
 If Rust is not available globally, use Nix:
 
 ```bash
-nix develop path:$PWD
+nix develop .
 ```
 
 Inside that shell, run the same Cargo commands.
@@ -369,9 +369,9 @@ Inside that shell, run the same Cargo commands.
 For one-shot checks:
 
 ```bash
-nix develop path:$PWD -c cargo fmt -- --check
-nix develop path:$PWD -c cargo test
-nix develop path:$PWD -c cargo clippy --all-targets -- -D warnings
+nix develop . -c cargo fmt -- --check
+nix develop . -c cargo test
+nix develop . -c cargo clippy --all-targets -- -D warnings
 ```
 
 The Nix development shell also pins the supply-chain tools through
@@ -379,9 +379,14 @@ The Nix development shell also pins the supply-chain tools through
 with:
 
 ```bash
-nix develop path:$PWD -c cargo audit --deny warnings
-nix develop path:$PWD -c cargo deny --locked check -D warnings advisories bans licenses sources
+nix develop . -c cargo audit --deny warnings
+nix develop . -c cargo deny --locked check -D warnings advisories bans licenses sources
 ```
+
+The `.` flake reference uses Nix's Git-filtered source for this repository, so
+ignored local coordination files are not copied into the Nix store. The flake
+exports development shells only; release contents are selected independently
+by Cargo, whose package manifest excludes `.agents`, `.maco`, and `AGENTS.md`.
 
 `cargo fetch --locked` is the explicit online boundary for Rust dependencies in
 a fresh checkout. Once that checksum-verified closure is present in the Cargo

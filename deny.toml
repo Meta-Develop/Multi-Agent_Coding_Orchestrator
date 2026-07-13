@@ -1,10 +1,20 @@
 # Keep this policy intentionally small: the lockfile is audited across every
 # target represented in Cargo metadata, including build and dev dependencies.
 
+[graph]
+# An empty target list means no platform filtering: inspect every target that
+# Cargo resolves into the lockfile. Keep dev dependencies in the graph too.
+targets = []
+exclude = []
+all-features = false
+no-default-features = false
+exclude-dev = false
+
 [advisories]
 ignore = []
 
 [licenses]
+include-dev = true
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -26,6 +36,7 @@ exceptions = [
 
 [bans]
 multiple-versions = "deny"
+multiple-versions-include-dev = true
 wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
@@ -35,6 +46,14 @@ allow-workspace = true
 deny = []
 skip = []
 skip-tree = []
+
+# Keep the duplicate allowlists empty. The dev path
+# `workspace -> tempfile -> getrandom` overlaps the native build path
+# `workspace -> git2 -> libgit2-sys -> cc -> jobserver -> getrandom`, so both
+# resolve to getrandom 0.3.4. That also removes the duplicate dev/target-only
+# hashbrown, r-efi, and wit-bindgen branches and eliminates foldhash 0.1.5
+# rather than granting its Zlib license a repository-wide allowance or a stale
+# per-crate exception.
 
 [sources]
 unknown-registry = "deny"
