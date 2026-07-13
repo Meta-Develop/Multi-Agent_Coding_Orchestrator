@@ -401,6 +401,10 @@ cargo check --locked --offline --all-targets
 The Nix shell pins the Rust/native toolchain, while `Cargo.lock` pins crates.io
 versions and checksums. The Cargo configuration forces the checksum-verified
 `libgit2` and zlib sources from that closure instead of ambient system copies.
+Dependency unification removes `foldhash` and therefore needs no Zlib license
+exception for that crate. Separately, the vendored `libz-sys@1.1.28` build
+embeds stock zlib: `deny.toml` records its combined crate/native license
+expression and accepts Zlib only for that exact crate version.
 The project does not keep a separate crate mirror or RustSec database snapshot,
 so a completely empty machine still needs the explicit fetch steps before
 offline verification.
