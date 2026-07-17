@@ -1663,17 +1663,6 @@ where
     let effect_observed = publication_effect_observed(&publication_report);
     let receipt_result =
         verify_publication_receipt(&publication_report, &prepared.binding, forge, agent_id);
-    let final_candidate_result = reverify_prepared_candidate(
-        publication_options(),
-        agent_id,
-        &prepared.binding,
-        lease,
-        &mut hooks.prepare,
-        "after publication",
-        validation.clone(),
-        Some(review_report.clone()),
-        Some(reviewed_candidate.clone()),
-    );
 
     if publication_report.status != PrPublicationStatus::Published {
         let has_durable_receipt = publication_report.publication_receipt.is_some();
@@ -1702,6 +1691,17 @@ where
         )
         .with_publication_audit(true, effect_observed);
     }
+    let final_candidate_result = reverify_prepared_candidate(
+        publication_options(),
+        agent_id,
+        &prepared.binding,
+        lease,
+        &mut hooks.prepare,
+        "after publication",
+        validation.clone(),
+        Some(review_report.clone()),
+        Some(reviewed_candidate.clone()),
+    );
     if let Err(mut outcome) = final_candidate_result {
         outcome.publication = Some(publication_report);
         outcome.retryable = false;

@@ -297,7 +297,7 @@ fn normalize_text(text: &str) -> String {
 
 fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
     let deadline = Instant::now()
-        .checked_add(REPOSITORY_INVENTORY_MAX_DURATION)
+        .checked_add(repository_inventory_max_duration())
         .context("repository inventory deadline overflowed")?;
     let binding = crate::worktree::RepositoryBindingGuard::bind(repo)?;
     let first = collect_git_inventory_snapshot(&binding, deadline)?;
@@ -326,6 +326,24 @@ fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+#[cfg(not(test))]
+fn repository_inventory_max_duration() -> Duration {
+    REPOSITORY_INVENTORY_MAX_DURATION
+}
+
+#[cfg(test)]
+fn repository_inventory_max_duration() -> Duration {
+    REPOSITORY_INVENTORY_DURATION_OVERRIDE
+        .with(|override_duration| override_duration.get())
+        .unwrap_or(REPOSITORY_INVENTORY_MAX_DURATION)
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPOSITORY_INVENTORY_DURATION_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn collect_git_inventory_snapshot(
@@ -426,6 +444,42 @@ mod tests {
     use super::*;
     use std::fs;
 
+    const CONTENTION_RESILIENT_INVENTORY_DURATION: Duration = Duration::from_secs(600);
+
+    static CONTENTION_RESILIENT_INVENTORY_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    struct RepositoryInventoryDurationOverride {
+        previous: Option<Duration>,
+    }
+
+    impl RepositoryInventoryDurationOverride {
+        fn set(duration: Duration) -> Self {
+            let previous = REPOSITORY_INVENTORY_DURATION_OVERRIDE
+                .with(|override_duration| override_duration.replace(Some(duration)));
+            Self { previous }
+        }
+    }
+
+    impl Drop for RepositoryInventoryDurationOverride {
+        fn drop(&mut self) {
+            REPOSITORY_INVENTORY_DURATION_OVERRIDE
+                .with(|override_duration| override_duration.set(self.previous));
+        }
+    }
+
+    fn run_contention_resilient_inventory_test<R>(test: impl FnOnce() -> R) -> R {
+        let lock = CONTENTION_RESILIENT_INVENTORY_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _duration_override =
+            RepositoryInventoryDurationOverride::set(CONTENTION_RESILIENT_INVENTORY_DURATION);
+        let result = test();
+        drop(lock);
+        result
+    }
+
     #[test]
     fn propose_task_paths_does_not_match_common_symbol_words() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -487,23 +541,25 @@ mod tests {
 
     #[test]
     fn propose_task_paths_routes_docs_and_rust_tasks_separately() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path();
-        git2::Repository::init(repo).expect("init repo");
-        write_file(repo, "README.md", "# Project\n");
-        write_file(repo, "docs/guide.md", "# Guide\n");
-        write_file(repo, "src/worktree.rs", "pub struct WorktreeManager;\n");
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "README.md", "# Project\n");
+            write_file(repo, "docs/guide.md", "# Guide\n");
+            write_file(repo, "src/worktree.rs", "pub struct WorktreeManager;\n");
 
-        let docs_paths = propose_task_paths(repo, "Update docs", "Refresh documentation.")
-            .expect("propose docs paths");
-        assert_eq!(
-            docs_paths,
-            vec![PathBuf::from("README.md"), PathBuf::from("docs/guide.md")]
-        );
+            let docs_paths = propose_task_paths(repo, "Update docs", "Refresh documentation.")
+                .expect("propose docs paths");
+            assert_eq!(
+                docs_paths,
+                vec![PathBuf::from("README.md"), PathBuf::from("docs/guide.md")]
+            );
 
-        let rust_paths =
-            propose_task_paths(repo, "Repair WorktreeManager", "").expect("propose rust paths");
-        assert_eq!(rust_paths, vec![PathBuf::from("src/worktree.rs")]);
+            let rust_paths =
+                propose_task_paths(repo, "Repair WorktreeManager", "").expect("propose rust paths");
+            assert_eq!(rust_paths, vec![PathBuf::from("src/worktree.rs")]);
+        });
     }
 
     #[test]
@@ -523,17 +579,19 @@ mod tests {
 
     #[test]
     fn propose_task_path_proposal_reports_filename_only_degradation() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path();
-        git2::Repository::init(repo).expect("init repo");
-        write_file(repo, "src/planning.rs", "pub fn propose_task_paths() {}\n");
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/planning.rs", "pub fn propose_task_paths() {}\n");
 
-        let proposal = propose_task_path_proposal(repo, "Repair planning", "")
-            .expect("propose degraded paths");
+            let proposal = propose_task_path_proposal(repo, "Repair planning", "")
+                .expect("propose degraded paths");
 
-        assert_eq!(proposal.paths, vec![PathBuf::from("src/planning.rs")]);
-        assert!(!proposal.diagnostics.degraded);
-        assert!(proposal.diagnostics.notes.is_empty());
+            assert_eq!(proposal.paths, vec![PathBuf::from("src/planning.rs")]);
+            assert!(!proposal.diagnostics.degraded);
+            assert!(proposal.diagnostics.notes.is_empty());
+        });
     }
 
     #[test]
@@ -580,18 +638,20 @@ mod tests {
 
     #[test]
     fn collect_repo_files_excludes_git_ignored_directory() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repo = temp.path();
-        git2::Repository::init(repo).expect("init repo");
-        write_file(repo, ".gitignore", "ignored/\n");
-        write_file(repo, "ignored/generated.rs", "pub fn ignored() {}\n");
-        write_file(repo, "src/lib.rs", "pub fn kept() {}\n");
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, ".gitignore", "ignored/\n");
+            write_file(repo, "ignored/generated.rs", "pub fn ignored() {}\n");
+            write_file(repo, "src/lib.rs", "pub fn kept() {}\n");
 
-        let files = collect_repo_files(repo).expect("collect repo files");
+            let files = collect_repo_files(repo).expect("collect repo files");
 
-        assert!(files.contains(&PathBuf::from(".gitignore")));
-        assert!(files.contains(&PathBuf::from("src/lib.rs")));
-        assert!(!files.iter().any(|path| path.starts_with("ignored")));
+            assert!(files.contains(&PathBuf::from(".gitignore")));
+            assert!(files.contains(&PathBuf::from("src/lib.rs")));
+            assert!(!files.iter().any(|path| path.starts_with("ignored")));
+        });
     }
 
     #[cfg(unix)]

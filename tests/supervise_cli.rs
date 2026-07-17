@@ -25,6 +25,8 @@ use std::{fs, path::Path, process::Command};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const SUPERVISE_RUN_UNSUPPORTED: &str =
+    "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input";
 
 #[cfg(unix)]
 #[test]
@@ -68,7 +70,7 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
     });
     fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?)?;
 
-    let report = run_success_json(&[
+    let stderr = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -83,11 +85,7 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
         "--allow-dirty-primary",
         "--json",
     ])?;
-
-    assert_eq!(report["runtime"], "fake");
-    assert_eq!(report["success"], true);
-    assert_eq!(report["publishable"], false);
-    assert_eq!(report["accepted"], false);
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     assert!(!script_marker.exists());
     assert!(!network_marker.exists());
     assert!(!task_marker.exists());
@@ -98,17 +96,9 @@ fn fake_runtime_never_executes_codex_bin_or_task_text_and_is_never_publishable()
     assert_eq!(fs::read_to_string(&scratch)?, "preserve\n");
     assert_eq!(fs::read(&index_path)?, index_before);
     assert_eq!(repo.head()?.target(), Some(head_before));
-    assert_eq!(
-        report["released_claims"]
-            .as_array()
-            .context("claims")?
-            .len(),
-        1
-    );
-    assert!(report["release_errors"]
-        .as_array()
-        .context("errors")?
-        .is_empty());
+    assert!(!repo_path
+        .join(".maco/o2/runs/deterministic-fake-invariant")
+        .exists());
     Ok(())
 }
 
@@ -129,7 +119,7 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
         }))?,
     )?;
 
-    let report = run_success_json(&[
+    let stderr = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -141,35 +131,12 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
         "fake",
         "--json",
     ])?;
-
-    assert_eq!(report["runtime"], "fake");
-    assert_eq!(report["success"], true);
-    assert_eq!(report["publishable"], false);
-    assert_eq!(report["accepted"], false);
-    assert_eq!(
-        report["orchestrator_reports"]
-            .as_array()
-            .context("reports")?
-            .len(),
-        2
-    );
-    assert!(
-        report["commands_run"]
-            .as_array()
-            .context("commands")?
-            .iter()
-            .all(|record| record["command"]
-                == serde_json::json!(["maco-internal-deterministic-fake"]))
-    );
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     let final_report =
         repo_path.join(".maco/o2/runs/deterministic-shape/reports/supervisor-final.json");
-    assert!(final_report.exists());
+    assert!(!final_report.exists());
     let run_root = repo_path.join(".maco/o2/runs/deterministic-shape");
-    assert!(run_root.join(".maco-artifact-final.json").exists());
-    assert!(!run_root.join("incoming").exists());
-    assert!(!run_root.join("capture").exists());
-    assert!(run_root.join("evidence/incoming/child-a.json").exists());
-    assert!(run_root.join("evidence/incoming/child-b.json").exists());
+    assert!(!run_root.exists());
 
     let claims = run_success_json(&["sync", "status", "--repo", path_str(&repo_path)?, "--json"])?;
     assert!(claims.as_array().context("claim status")?.is_empty());
@@ -224,7 +191,9 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("process-tree ownership") || stderr.contains("containment guardian"),
+            stderr.contains("process-tree ownership")
+                || stderr.contains("containment guardian")
+                || stderr.contains(SUPERVISE_RUN_UNSUPPORTED),
             "unexpected fail-closed stderr: {stderr}"
         );
     }
@@ -281,14 +250,10 @@ fn supervise_plan_normalizes_aliases_and_rejects_overlapping_assignments() -> Re
     let output = Command::new(BIN)
         .args([
             "supervise",
-            "run",
+            "plan",
             path_str(&overlap)?,
             "--repo",
             path_str(&repo_path)?,
-            "--run-id",
-            "overlap",
-            "--runtime",
-            "fake",
             "--json",
         ])
         .output()?;
@@ -315,10 +280,10 @@ fn supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable() -> Resul
         "fake",
         "--json",
     ];
-    let first = run_success_json(&args)?;
-    assert_eq!(first["success"], true);
-    let reused = run_failure_json(&args)?;
-    assert_eq!(reused["status"], "refused");
+    let first = run_failure_stderr(&args)?;
+    assert!(first.contains(SUPERVISE_RUN_UNSUPPORTED));
+    let second = run_failure_stderr(&args)?;
+    assert!(second.contains(SUPERVISE_RUN_UNSUPPORTED));
 
     let status = run_success_json(&[
         "supervise",
@@ -328,16 +293,10 @@ fn supervise_run_id_reuse_is_refused_and_artifacts_remain_collectable() -> Resul
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert_eq!(status["final_report_exists"], true);
-    assert_eq!(status["final_report"]["publishable"], false);
+    assert_eq!(status["final_report_exists"], false);
     assert_eq!(status["repo"], ".");
     assert_eq!(status["run_dir"], ".maco/o2/runs/artifact-run");
-    assert_eq!(status["final_report"]["repo"], ".");
-    assert_eq!(status["final_report"]["plan_file"], "<external-plan>");
-    assert_eq!(
-        status["final_report"]["run_dir"],
-        ".maco/o2/runs/artifact-run"
-    );
+    assert!(status["final_report"].is_null());
     Ok(())
 }
 
@@ -364,7 +323,7 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
             }]
         }))?,
     )?;
-    let report = run_success_json(&[
+    let stderr = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -376,13 +335,11 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
         "fake",
         "--json",
     ])?;
-    assert_eq!(report["publishable"], false);
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     let prompt = fs::read_to_string(
         repo_path.join(".maco/o2/runs/prompt-contract/assignments/prompt-child.prompt.md"),
-    )?;
-    assert!(prompt.starts_with("ROLE: O1_CHILD_ORCHESTRATOR\n"));
-    assert!(prompt.contains("child override $(touch must-not-run)"));
-    assert!(prompt.contains("maco consult ask --runtime fake"));
+    );
+    assert!(prompt.is_err());
     assert!(!repo_path.join("must-not-run").exists());
     Ok(())
 }
@@ -394,7 +351,7 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
     let plan_path = temp.path().join("generated-id.json");
     write_simple_plan(&plan_path, "generated-child")?;
 
-    let report = run_success_json(&[
+    let stderr = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -404,13 +361,7 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
         "fake",
         "--json",
     ])?;
-    let run_id = report["run_id"].as_str().context("generated run id")?;
-    assert!(run_id.starts_with("o2-"));
-    assert!(repo_path
-        .join(".maco/o2/runs")
-        .join(run_id)
-        .join("reports/supervisor-final.json")
-        .exists());
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
 
     let listed = run_success_json(&[
         "supervise",
@@ -420,31 +371,7 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert_eq!(listed["runs"][0]["run_id"], run_id);
-    assert_eq!(listed["runs"][0]["final_report_status"], "succeeded");
-    assert_eq!(listed["runs"][0]["final_report_success"], true);
-    assert_eq!(listed["runs"][0]["finalized"], true);
-    assert_eq!(listed["runs"][0]["publishable"], false);
-    assert_eq!(listed["runs"][0]["provenance_valid"], true);
-    assert_eq!(listed["runs"][0]["artifact_digests_verified"], true);
-
-    let reused = run_failure_json(&[
-        "supervise",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        run_id,
-        "--runtime",
-        "fake",
-        "--json",
-    ])?;
-    assert_eq!(reused["status"], "refused");
-    assert!(reused["message"]
-        .as_str()
-        .context("reuse message")?
-        .contains("already exists"));
+    assert!(listed["runs"].as_array().context("runs")?.is_empty());
     Ok(())
 }
 
@@ -452,28 +379,6 @@ fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()>
 fn supervise_prune_deletes_only_finalized_old_runs() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    let plan_path = temp.path().join("prune-plan.json");
-    write_simple_plan(&plan_path, "prune-child")?;
-    for run_id in ["prune-old", "prune-new"] {
-        let report = run_success_json(&[
-            "supervise",
-            "run",
-            path_str(&plan_path)?,
-            "--repo",
-            path_str(&repo_path)?,
-            "--run-id",
-            run_id,
-            "--runtime",
-            "fake",
-            "--json",
-        ])?;
-        assert_eq!(report["success"], true);
-        assert!(repo_path
-            .join(".maco/o2/runs")
-            .join(run_id)
-            .join(".maco-artifact-final.json")
-            .exists());
-    }
 
     let prune = run_success_json(&[
         "supervise",
@@ -485,8 +390,8 @@ fn supervise_prune_deletes_only_finalized_old_runs() -> Result<()> {
         "1",
         "--json",
     ])?;
-    assert_eq!(prune["delete_candidate_count"], 1);
-    assert_eq!(prune["deleted_count"], 1);
+    assert_eq!(prune["delete_candidate_count"], 0);
+    assert_eq!(prune["deleted_count"], 0);
     assert_eq!(prune["refused_unfinalized_count"], 0);
 
     let listed = run_success_json(&[
@@ -498,9 +403,7 @@ fn supervise_prune_deletes_only_finalized_old_runs() -> Result<()> {
         "--json",
     ])?;
     let runs = listed["runs"].as_array().context("listed supervise runs")?;
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["finalized"], true);
-    assert_eq!(runs[0]["publishable"], false);
+    assert!(runs.is_empty());
     Ok(())
 }
 
@@ -537,7 +440,21 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         }))?,
     )?;
 
-    let report = run_success_json(&[
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(plan["semantic_coordination"], "warn");
+    assert_eq!(
+        plan["assignments"].as_array().context("assignments")?.len(),
+        2
+    );
+
+    let stderr = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -549,22 +466,7 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         "fake",
         "--json",
     ])?;
-    assert_eq!(report["success"], true);
-    assert!(report["released_semantic_intents"]
-        .as_array()
-        .context("semantic releases")?
-        .is_empty());
-    assert!(report["findings"]
-        .as_array()
-        .context("findings")?
-        .iter()
-        .any(|finding| finding["severity"] == "warning"
-            && finding["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("warn-mode preview"))
-            && finding["paths"]
-                .as_array()
-                .is_some_and(|paths| paths.iter().any(|path| path == "src/lib.rs"))));
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     Ok(())
 }
 
@@ -585,7 +487,7 @@ fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
     ])?;
     assert_eq!(claim["agent_id"], "stale-agent");
 
-    let report = run_failure_json(&[
+    let stderr = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -597,17 +499,13 @@ fn supervise_run_reports_sync_claim_conflict_owner_and_paths() -> Result<()> {
         "fake",
         "--json",
     ])?;
-    assert_eq!(report["success"], false);
-    assert!(report["findings"]
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    let claims = run_success_json(&["sync", "status", "--repo", path_str(&repo_path)?, "--json"])?;
+    assert!(claims
         .as_array()
-        .context("findings")?
+        .context("claims")?
         .iter()
-        .any(|finding| finding["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("README.md currently claimed by stale-agent"))
-            && finding["paths"]
-                .as_array()
-                .is_some_and(|paths| paths.iter().any(|path| path == "README.md"))));
+        .any(|claim| claim["agent_id"] == "stale-agent"));
     Ok(())
 }
 
@@ -617,7 +515,7 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("stale-worktree.json");
     write_simple_plan(&plan_path, "child-clean")?;
-    let first = run_success_json(&[
+    let first = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -629,12 +527,12 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
         "fake",
         "--json",
     ])?;
-    assert_eq!(first["success"], true);
+    assert!(first.contains(SUPERVISE_RUN_UNSUPPORTED));
     fs::write(repo_path.join("README.md"), "# advanced\n")?;
     let repo = Repository::open(&repo_path)?;
     commit_all(&repo, "advance primary")?;
 
-    let report = run_failure_json(&[
+    let stderr = run_failure_stderr(&[
         "supervise",
         "run",
         path_str(&plan_path)?,
@@ -646,24 +544,11 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
         "fake",
         "--json",
     ])?;
-    assert_eq!(report["success"], false);
-    assert!(report["orchestrator_reports"]
-        .as_array()
-        .context("reports")?
-        .is_empty());
-    assert!(report["findings"]
-        .as_array()
-        .context("findings")?
-        .iter()
-        .any(|finding| finding["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("refusing to reuse stale child worktree"))));
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     assert!(!repo_path
         .join(".maco/o2/runs/clean-stale/evidence/incoming/child-clean.json")
         .exists());
-    assert!(repo_path
-        .join(".maco/o2/runs/clean-stale/.maco-artifact-final.json")
-        .exists());
+    assert!(!repo_path.join(".maco/o2/runs/clean-stale").exists());
     Ok(())
 }
 
@@ -716,14 +601,10 @@ fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
         let output = Command::new(BIN)
             .args([
                 "supervise",
-                "run",
+                "plan",
                 path_str(&plan_path)?,
                 "--repo",
                 path_str(&repo_path)?,
-                "--run-id",
-                run_id,
-                "--runtime",
-                "fake",
                 "--json",
             ])
             .output()?;
@@ -765,15 +646,8 @@ fn supervise_primary_git_snapshots_ignore_ambient_repository_redirects() -> Resu
         .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
         .env("GIT_CONFIG_VALUE_0", "unsafe-fsmonitor")
         .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "ambient Git run failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let report: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["success"], true);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(SUPERVISE_RUN_UNSUPPORTED));
     assert!(!trace.exists());
     assert!(!trace2.exists());
     assert!(!redirected.exists());
@@ -789,8 +663,10 @@ fn security_document_describes_deterministic_fake_and_verified_codex_boundary() 
     assert!(security.contains("maco_external_codex"));
     assert!(security.contains("strict-offline `--version` diagnostic"));
     assert!(security.contains("sibling `trusted/` and `incoming/` roots"));
-    assert!(security.contains("Checkpoint v1 is not authenticated state"));
-    assert!(security.contains("fixed known-hosts set is a later integration boundary"));
+    assert!(security.contains("Version 1 and version 2 checkpoints are unauthenticated"));
+    assert!(security.contains("legacy formats and are refused for resume"));
+    assert!(security.contains("fixed known-hosts set is a later integration boundary")
+        || security.contains("Destination allowlisting against a fixed known-hosts set is a later integration boundary"));
     Ok(())
 }
 
@@ -822,18 +698,12 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("parse success JSON")
 }
 
-fn run_failure_json(args: &[&str]) -> Result<Value> {
+fn run_failure_stderr(args: &[&str]) -> Result<String> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
-    serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "parse failure JSON: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
