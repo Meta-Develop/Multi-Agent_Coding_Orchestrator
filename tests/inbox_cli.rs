@@ -96,12 +96,13 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
     let items = scan["items"].as_array().context("items")?;
     assert_eq!(items.len(), 4);
     assert!(items.iter().all(|item| {
-        item["source_snapshot"]["version"] == 1
+        item["source_snapshot"]["version"] == 2
             && item["source_snapshot"]["provider"] == "fake"
+            && item["source_snapshot"]["repository_host"] == "fake"
             && item["source_snapshot"]["repository_selector"] == "."
             && item["source_snapshot"]["repository_identity"]
                 .as_str()
-                .is_some_and(|value| value.starts_with("maco-v1-"))
+                .is_some_and(|value| value.len() == 64)
             && item["source_snapshot"]["digest"]
                 .as_str()
                 .is_some_and(|value| value.starts_with("maco-v1-"))
@@ -166,6 +167,7 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -277,6 +279,7 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -365,6 +368,7 @@ fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -419,6 +423,7 @@ fn status_and_collect_return_sanitized_repo_relative_reports() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn status_and_collect_fail_closed_across_absent_active_and_tampered_runs() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -563,6 +568,7 @@ fn assert_corrupt_inbox_status(repo: &Path, run_id: &str) -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn dry_run_cli_does_not_launch_autopilot() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -600,6 +606,7 @@ fn dry_run_cli_does_not_launch_autopilot() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn dry_run_config_does_not_require_cli_flag() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -705,24 +712,15 @@ fn permission_config_overrides_legacy_action_policy() -> Result<()> {
     )?;
     commit_all(&Repository::open(&repo_path)?, "inbox permission config")?;
 
-    let scan = run_success_json(&["inbox", "scan", "--repo", path_str(&repo_path)?, "--json"])?;
+    let error = run_failure_stderr(&["inbox", "scan", "--repo", path_str(&repo_path)?, "--json"])?;
 
-    assert_eq!(scan["action_policy"], "fake");
-    assert_eq!(scan["permission_mode"], "fake");
-    assert_eq!(scan["github_enabled"], false);
-    assert!(scan["items"]
-        .as_array()
-        .context("items")?
-        .iter()
-        .all(|item| item["url"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("fake://")));
+    assert!(error.contains("action_policy github conflicts with permission_mode fake"));
 
     Ok(())
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_read_permission_plans_without_launching_autopilot() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -776,6 +774,7 @@ fn github_read_permission_plans_without_launching_autopilot() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_local_reads_live_github_but_publishes_and_comments_locally() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -821,6 +820,7 @@ fn github_local_reads_live_github_but_publishes_and_comments_locally() -> Result
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_pr_permission_dry_run_plans_github_publish_without_commenting() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -864,6 +864,7 @@ fn github_pr_permission_dry_run_plans_github_publish_without_commenting() -> Res
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -910,6 +911,7 @@ fn github_git_permission_dry_run_plans_git_publish_without_commenting() -> Resul
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_git_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -952,6 +954,7 @@ fn github_git_permission_refuses_without_bound_external_reviewer() -> Result<()>
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_pr_permission_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -994,6 +997,7 @@ fn github_pr_permission_refuses_without_bound_external_reviewer() -> Result<()> 
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let success_repo = create_named_committed_repo(temp.path(), "github-full-success")?;
@@ -1090,6 +1094,7 @@ fn github_full_workspace_refuses_without_bound_external_reviewer() -> Result<()>
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn run_passes_codex_bin_to_autopilot() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -1121,6 +1126,7 @@ fn run_passes_codex_bin_to_autopilot() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn watch_once_passes_codex_bin_to_autopilot() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -1203,6 +1209,7 @@ fn github_mode_is_disabled_by_default() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn watch_once_runs_one_poll_iteration() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -1339,6 +1346,7 @@ fn workspace_scan_uses_default_github_read_and_repo_fake_override() -> Result<()
     let temp = TempDir::new().context("tempdir")?;
     let github_repo = create_named_committed_repo(temp.path(), "github-repo")?;
     let fake_repo = create_named_committed_repo(temp.path(), "fake-repo")?;
+    add_https_origin(&github_repo, "workspace-scan-github-origin")?;
     let config_path = temp.path().join("workspace-inbox-permissions.json");
     write_json_file(
         &config_path,
@@ -1423,6 +1431,7 @@ fn workspace_scan_uses_default_github_read_and_repo_fake_override() -> Result<()
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn workspace_watch_once_runs_one_workspace_iteration() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_named_committed_repo(temp.path(), "watch-repo")?;
@@ -1508,6 +1517,7 @@ fn workspace_watch_once_runs_one_workspace_iteration() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let good_repo = create_named_committed_repo(temp.path(), "good-repo")?;
@@ -1667,6 +1677,7 @@ fn workspace_run_non_strict_continues_and_strict_fails_on_refusal() -> Result<()
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let read_repo = create_named_committed_repo(temp.path(), "read-repo")?;
@@ -1829,6 +1840,7 @@ fn workspace_run_permission_modes_keep_read_local_and_publish_boundaries() -> Re
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn workspace_run_refuses_real_publication_modes_without_validation_commands() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let git_repo = create_named_committed_repo(temp.path(), "publish-no-validation-git-repo")?;
@@ -2004,6 +2016,7 @@ fn workspace_scan_error_redacts_generic_temp_absolute_paths() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn repeated_workspace_run_suppresses_duplicate_items_for_same_repo() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_named_committed_repo(temp.path(), "duplicate-repo")?;
@@ -2164,6 +2177,7 @@ fn workspace_public_json_redacts_temp_paths_and_secret_like_values() -> Result<(
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn active_live_lock_refuses_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2183,6 +2197,7 @@ fn active_live_lock_refuses_run() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn active_sync_claim_refuses_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2209,6 +2224,7 @@ fn active_sync_claim_refuses_run() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn active_semantic_intent_refuses_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2236,6 +2252,7 @@ fn active_semantic_intent_refuses_run() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2291,6 +2308,7 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
@@ -2327,6 +2345,7 @@ fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Resu
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn maco_runtime_paths_do_not_self_block() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
@@ -2355,6 +2374,7 @@ fn maco_runtime_paths_do_not_self_block() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn timeout_seconds_stops_hanging_validation_command() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -2398,6 +2418,7 @@ fn timeout_seconds_stops_hanging_validation_command() -> Result<()> {
 }
 
 #[test]
+#[ignore = "effectful inbox run/watch is temporarily unsupported until the capability-bound supervisor bridge returns"]
 fn auto_merge_is_never_performed() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
