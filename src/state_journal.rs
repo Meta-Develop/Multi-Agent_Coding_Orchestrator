@@ -223,6 +223,48 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         Ok(journal)
     }
 
+    /// Opens an existing authenticated journal without creating locks,
+    /// scavenging crash residue, repairing its head, or publishing state.
+    /// Transitional journals are refused instead of recovered.
+    pub(crate) fn open_existing_read_only(
+        authenticator: RepositoryAuthenticator,
+        expected: &JournalIdentity,
+    ) -> Result<Self> {
+        validate_spec::<S>()?;
+        validate_identity::<S>(expected)?;
+        authenticator.verify_epoch()?;
+        authenticator.verify_repository_binding(&expected.repository)?;
+        let journal_root = open_existing_journal_root::<S>(&authenticator)?;
+        let reserved = journal_root
+            .bind_existing_direct_child_directory(&expected.run_id)
+            .context("authenticated checkpoint run directory is missing or unsafe")?;
+        let run_root = SafeRoot::open_existing(reserved.path())?;
+        if run_root.identity() != &expected.run_directory_identity {
+            bail!("authenticated checkpoint run directory identity changed");
+        }
+        let run_lock =
+            BoundStateLock::try_acquire_existing_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
+                .with_context(|| {
+                    format!(
+                        "{} instance is active, incomplete, or missing its stable lock",
+                        S::NAMESPACE
+                    )
+                })?;
+        let mut journal = Self {
+            authenticator,
+            journal_root,
+            run_root,
+            run_lock,
+            identity: expected.clone(),
+            records: Vec::new(),
+            record_bytes: 0,
+            spec: PhantomData,
+        };
+        journal.load_without_recovery()?;
+        journal.verify_boundaries()?;
+        Ok(journal)
+    }
+
     /// Opens a stable instance when its authenticated identity is not stored by
     /// the caller. The first record is locator material only: its identity is
     /// structurally bounded, then the normal `open` path authenticates the
@@ -380,6 +422,80 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         self.record_bytes = total;
         self.recover_temporary_files(&inventory)?;
         self.verify_or_recover_head(inventory.head_exists)?;
+        Ok(())
+    }
+
+    fn load_without_recovery(&mut self) -> Result<()> {
+        self.verify_boundaries()?;
+        let inventory = inventory_run_directory::<S>(&self.run_root)?;
+        if !inventory.record_temps.is_empty() || !inventory.head_temps.is_empty() {
+            bail!("authenticated journal has crash residue requiring recovery");
+        }
+        let mut records = Vec::with_capacity(inventory.records.len());
+        let mut total = 0_u64;
+        let mut previous = AuthenticationTag::zero();
+        for (expected_index, (sequence, name)) in inventory.records.iter().enumerate() {
+            let expected_sequence = u64::try_from(expected_index)
+                .context("checkpoint sequence overflowed")?
+                .checked_add(1)
+                .context("checkpoint sequence overflowed")?;
+            if *sequence != expected_sequence {
+                bail!("checkpoint journal has a missing, reordered, or duplicate sequence");
+            }
+            let bytes =
+                BoundedRegularReader::read_direct(&self.run_root, name, S::MAX_RECORD_BYTES)?;
+            total = total
+                .checked_add(u64::try_from(bytes.len()).context("record length overflowed")?)
+                .context("journal byte total overflowed")?;
+            if total > S::MAX_TOTAL_BYTES {
+                bail!("{} journal exceeds its aggregate byte bound", S::NAMESPACE);
+            }
+            let record: JournalRecord = serde_json::from_slice(&bytes)
+                .context("checkpoint journal contains a truncated or malformed record")?;
+            validate_record::<S>(&record, &self.identity, expected_sequence, &previous)?;
+            self.authenticator.verify_tag(
+                S::RECORD_DOMAIN,
+                &record_mac_payload(&record)?,
+                &record.mac,
+            )?;
+            previous = record.mac.clone();
+            records.push(record);
+        }
+        if records.len() > S::MAX_RECORDS {
+            bail!("{} journal exceeds its record-count bound", S::NAMESPACE);
+        }
+        self.records = records;
+        self.record_bytes = total;
+        self.verify_head_exact(inventory.head_exists)
+    }
+
+    fn verify_head_exact(&self, head_exists: bool) -> Result<()> {
+        if !head_exists {
+            bail!("authenticated journal head is missing; recovery is required");
+        }
+        let last_sequence =
+            u64::try_from(self.records.len()).context("checkpoint count overflowed")?;
+        let last_mac = self
+            .records
+            .last()
+            .map(|record| record.mac.clone())
+            .context("authenticated journal has a head but no durable record")?;
+        let bytes = BoundedRegularReader::read_direct(
+            &self.run_root,
+            S::HEAD_FILE_NAME,
+            S::MAX_RECORD_BYTES,
+        )?;
+        let head: JournalHead = serde_json::from_slice(&bytes)
+            .context("checkpoint journal head is truncated or malformed")?;
+        validate_head::<S>(&head, &self.identity)?;
+        self.authenticator
+            .verify_tag(S::HEAD_DOMAIN, &head_mac_payload(&head)?, &head.mac)?;
+        if head.sequence != last_sequence
+            || head.last_record_mac != last_mac
+            || head.record_bytes != self.record_bytes
+        {
+            bail!("authenticated journal head does not exactly match its published tail; recovery is required");
+        }
         Ok(())
     }
 

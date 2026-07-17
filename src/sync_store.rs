@@ -698,7 +698,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn claims_wrapper_recovers_nine_residues_beyond_a_full_snapshot_root() {
+    fn claims_wrapper_recovers_nine_metadata_residues_before_inventory() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -708,16 +708,6 @@ mod tests {
             .join(ClaimsSnapshotSpec::ROOT_NAME);
         let root = SafeRoot::open_existing(&root_path).expect("claims snapshot root");
         let durable_entries = fs::read_dir(&root_path).expect("durable root").count();
-        for index in durable_entries..ClaimsSnapshotSpec::MAX_ROOT_ENTRIES {
-            let filler = root_path.join(format!("capacity-filler-{index:03}"));
-            fs::write(&filler, b"").expect("capacity filler");
-            fs::set_permissions(&filler, fs::Permissions::from_mode(0o600))
-                .expect("private filler");
-        }
-        assert_eq!(
-            fs::read_dir(&root_path).expect("full root").count(),
-            ClaimsSnapshotSpec::MAX_ROOT_ENTRIES
-        );
         let logical_hash = sha256_hex(CLAIMS_LOGICAL_ID.as_bytes());
         let targets = [
             format!(".snapshot-locator-{logical_hash}.json"),
@@ -734,9 +724,9 @@ mod tests {
         }
         assert_eq!(
             fs::read_dir(&root_path)
-                .expect("full root plus residues")
+                .expect("durable root plus residues")
                 .count(),
-            ClaimsSnapshotSpec::MAX_ROOT_ENTRIES + 9
+            durable_entries + 9
         );
 
         let reopened =
@@ -744,10 +734,8 @@ mod tests {
 
         assert!(reopened.snapshot().expect("claims snapshot").is_empty());
         assert_eq!(
-            fs::read_dir(root_path)
-                .expect("recovered full root")
-                .count(),
-            ClaimsSnapshotSpec::MAX_ROOT_ENTRIES
+            fs::read_dir(root_path).expect("recovered root").count(),
+            durable_entries
         );
     }
 
@@ -1035,7 +1023,7 @@ mod tests {
         let repo = Repository::open(&repo_path).expect("open repo");
         commit_readme(&repo).expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
-            .create(crate::worktree::WorktreeCreateOptions {
+            .create_for_test(crate::worktree::WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,

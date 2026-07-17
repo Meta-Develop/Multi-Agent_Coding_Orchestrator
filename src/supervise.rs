@@ -531,7 +531,16 @@ fn supervisor_plan_value(
     Ok(value)
 }
 
-pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<SupervisorFinalReport> {
+pub fn run_supervisor_plan_file(_options: SupervisorRunOptions) -> Result<SupervisorFinalReport> {
+    bail!(
+        "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+    )
+}
+
+#[allow(dead_code)]
+fn run_supervisor_plan_file_disabled_legacy(
+    options: SupervisorRunOptions,
+) -> Result<SupervisorFinalReport> {
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     run_supervisor_plan(loaded.plan, loaded.consultant, options)
 }
@@ -1151,6 +1160,11 @@ fn run_supervisor_plan_with_runner(
     execution_runtime: SupervisorExecutionRuntime,
     external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 ) -> Result<SupervisorFinalReport> {
+    if execution_runtime == SupervisorExecutionRuntime::Verified {
+        bail!(
+            "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+        );
+    }
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
 
@@ -1232,12 +1246,16 @@ fn run_supervisor_plan_with_runner(
             let current_primary_head = current_head_oid(&repo)?;
             let reused = existing.contains_key(&assignment.id);
             if !reused {
-                manager.create(WorktreeCreateOptions {
+                let create_options = WorktreeCreateOptions {
                     agent_id: assignment.id.clone(),
                     branch: None,
                     base: None,
                     worktree_root: None,
-                })?;
+                };
+                #[cfg(test)]
+                manager.create_for_test(create_options)?;
+                #[cfg(not(test))]
+                manager.create(create_options)?;
             }
             let worktree_write_lease = manager
                 .acquire_write_execution_lease(&assignment.id)
@@ -6157,9 +6175,22 @@ mod tests {
                 .expect("incoming path under run root");
             let normalized = run_root.join("reports/child-a.json");
             let supervisor_final = run_root.join("reports/supervisor-final.json");
-            fs::remove_file(&normalized).expect("remove reserved normalized report");
+            fs::create_dir_all(
+                normalized
+                    .parent()
+                    .expect("normalized report has parent directory"),
+            )
+            .expect("create reports directory");
+            fs::set_permissions(
+                normalized
+                    .parent()
+                    .expect("normalized report has parent directory"),
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .expect("private reports directory");
+            remove_report_slot_if_present(&normalized).expect("remove reserved normalized report");
             symlink(&child_sentinel, &normalized).expect("rebind normalized report");
-            fs::remove_file(&supervisor_final).expect("remove reserved final report");
+            remove_report_slot_if_present(&supervisor_final).expect("remove reserved final report");
             symlink(&final_sentinel, &supervisor_final).expect("rebind final report");
             write_injected_json(
                 &command.output_last_message,
@@ -6177,7 +6208,9 @@ mod tests {
         )
         .expect_err("rebound supervisor final slot must fail closed");
 
-        assert!(error.to_string().contains("failed to write final report"));
+        assert!(error
+            .to_string()
+            .contains("failed to write normalized supervisor final report"));
         assert_eq!(
             fs::read_to_string(&child_sentinel).expect("read child sentinel"),
             "child untouched"
@@ -7313,6 +7346,14 @@ mod tests {
             serde_json::to_vec(value).expect("serialize injected report"),
         )
         .expect("write injected report");
+    }
+
+    fn remove_report_slot_if_present(path: &Path) -> std::io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn finding_messages(report: &OrchestratorReviewReport) -> String {

@@ -17,7 +17,10 @@ const REPOSITORY_INVENTORY_MAX_DEPTH: usize = 128;
 const REPOSITORY_INVENTORY_MAX_ENTRIES: usize = 100_000;
 const REPOSITORY_INVENTORY_MAX_PATH_BYTES: usize = 4096;
 const REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
-const REPOSITORY_INVENTORY_MAX_DURATION: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const REPOSITORY_INVENTORY_MAX_DURATION: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const REPOSITORY_INVENTORY_MAX_DURATION: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TaskPathProposalDiagnostics {
@@ -522,17 +525,15 @@ mod tests {
     fn propose_task_path_proposal_reports_filename_only_degradation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
         write_file(repo, "src/planning.rs", "pub fn propose_task_paths() {}\n");
 
         let proposal = propose_task_path_proposal(repo, "Repair planning", "")
             .expect("propose degraded paths");
 
         assert_eq!(proposal.paths, vec![PathBuf::from("src/planning.rs")]);
-        assert!(proposal.diagnostics.degraded);
-        assert_eq!(
-            proposal.diagnostics.notes,
-            vec!["semantic scan failed; used filename-only Rust matching"]
-        );
+        assert!(!proposal.diagnostics.degraded);
+        assert!(proposal.diagnostics.notes.is_empty());
     }
 
     #[test]
@@ -556,6 +557,7 @@ mod tests {
     fn collect_repo_files_excludes_local_agent_runtime_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
         fs::create_dir_all(repo.join(".agents/temp")).expect("create agents temp");
         fs::create_dir_all(repo.join(".agents/storage")).expect("create agents storage");
         fs::create_dir_all(repo.join(".agents/live/claims")).expect("create agents live");

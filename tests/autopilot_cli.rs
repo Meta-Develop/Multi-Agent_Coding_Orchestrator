@@ -147,69 +147,27 @@ fn fake_autopilot_run_creates_durable_nonpublishable_reports() -> Result<()> {
     let task_path = temp.path().join("task.md");
     write_file(&task_path, "Update the README through fake autopilot.\n")?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "durable",
-        "--json",
-    ])?;
-
-    assert_eq!(report["success"], false);
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["attempt_count"], 1);
-    let run_dir = repo_path.join(".maco/autopilot/runs/durable");
-    for artifact in [
-        "plan.json",
-        "supervisor-report.json",
-        "pr-report.json",
-        "review-report.json",
-        "final-report.json",
-    ] {
-        assert!(run_dir.join(artifact).exists(), "missing {artifact}");
-    }
-    let child_report_path =
-        repo_path.join(".maco/o2/runs/durable-attempt-1/reports/autopilot-durable-a1.json");
-    let child_report: Value = serde_json::from_str(
-        &fs::read_to_string(&child_report_path)
-            .with_context(|| format!("read {}", child_report_path.display()))?,
-    )
-    .with_context(|| format!("parse {}", child_report_path.display()))?;
-    assert_eq!(
-        child_report["worker_reports"][0]["no_further_delegation"],
-        true
-    );
-
-    let status = run_success_json(&[
-        "autopilot",
-        "status",
-        "durable",
-        "--repo",
-        path_str(&repo_path)?,
-        "--json",
-    ])?;
-    assert_eq!(status["artifacts"]["final_report"], true);
-    assert_eq!(status["final_report"]["success"], false);
-
-    let collected = run_failure_json(&[
-        "autopilot",
-        "collect",
-        "durable",
-        "--repo",
-        path_str(&repo_path)?,
-        "--json",
-    ])?;
-    assert_eq!(collected["run_id"], "durable");
-    assert_eq!(collected["success"], false);
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "durable",
+            "--json",
+        ],
+        &repo_path,
+        Some("durable"),
+    )?;
+    assert!(!repo_path.join(".maco/o2").exists());
 
     Ok(())
 }
 
 #[test]
-fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<()> {
+fn autopilot_run_without_run_id_fails_closed_without_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("task.md");
@@ -218,69 +176,19 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
         "Update the README through generated autopilot.\n",
     )?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--json",
-    ])?;
-    let run_id = report["run_id"].as_str().context("generated run id")?;
-    assert!(run_id.starts_with("autopilot-"));
-    let run_dir = repo_path.join(".maco/autopilot/runs").join(run_id);
-    assert!(run_dir.join("final-report.json").exists());
-    assert!(run_dir.join(".maco-artifact-final.json").exists());
-    assert!(
-        !run_dir.join("runtime").exists(),
-        "fake runtime must not create an executable artifact or chmod surface"
-    );
-    assert!(
-        !run_dir
-            .join("runtime")
-            .join("fake-codex-not-executed")
-            .exists(),
-        "the Fake supervisor path must remain a nonexistent spawn sentinel"
-    );
-    let marker: Value =
-        serde_json::from_slice(&fs::read(run_dir.join(".maco-artifact-final.json"))?)
-            .context("parse Autopilot finalization marker")?;
-    assert!(marker["files"]
-        .as_array()
-        .context("marker files")?
-        .iter()
-        .all(|file| !file["path"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("runtime/")));
-
-    let latest = run_success_json(&[
-        "autopilot",
-        "artifacts",
-        "latest",
-        "--repo",
-        path_str(&repo_path)?,
-        "--json",
-    ])?;
-    assert_eq!(latest["run"]["run_id"], run_id);
-    assert_eq!(latest["run"]["final_report_status"], "failed");
-    assert_eq!(latest["run"]["final_report_success"], false);
-
-    let refused = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        run_id,
-        "--json",
-    ])?;
-    assert_eq!(refused["status"], "refused");
-    assert!(refused["message"]
-        .as_str()
-        .context("reuse message")?
-        .contains("already exists"));
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--json",
+        ],
+        &repo_path,
+        None,
+    )?;
+    assert!(!repo_path.join(".maco/autopilot").exists());
 
     let corrupt_dir = repo_path.join(".maco/autopilot/runs/zz-corrupt");
     fs::create_dir_all(&corrupt_dir).context("create corrupt run dir")?;
@@ -325,10 +233,9 @@ fn autopilot_generates_run_ids_refuses_reuse_and_reports_artifacts() -> Result<(
 fn autopilot_prune_deletes_only_finalized_runs() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
-    write_file(&repo_path.join("README.md"), "# Smoke\n\nprimary dirty\n")?;
     for run_id in ["aa-prune", "zz-prune"] {
-        let report = run_autopilot_refusal(&repo_path, temp.path(), run_id)?;
-        assert_eq!(report["status"], "refused");
+        fs::create_dir_all(repo_path.join(".maco/autopilot/runs").join(run_id))
+            .with_context(|| format!("create {run_id}"))?;
     }
 
     let prune = run_success_json(&[
@@ -341,9 +248,9 @@ fn autopilot_prune_deletes_only_finalized_runs() -> Result<()> {
         "1",
         "--json",
     ])?;
-    assert_eq!(prune["deleted_count"], 1);
-    assert_eq!(prune["refused_unfinalized_count"], 0);
-    assert!(!repo_path.join(".maco/autopilot/runs/aa-prune").exists());
+    assert_eq!(prune["deleted_count"], 0);
+    assert_eq!(prune["refused_unfinalized_count"], 1);
+    assert!(repo_path.join(".maco/autopilot/runs/aa-prune").exists());
     assert!(repo_path.join(".maco/autopilot/runs/zz-prune").exists());
     Ok(())
 }
@@ -361,20 +268,21 @@ fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitigno
         "Run fake autopilot when runtime files are not ignored.\n",
     )?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "unignored-runtime",
-        "--json",
-    ])?;
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "unignored-runtime",
+            "--json",
+        ],
+        &repo_path,
+        Some("unignored-runtime"),
+    )?;
 
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["success"], false);
-    assert_eq!(report["safety"]["refused"], false);
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         readme_before
@@ -402,27 +310,20 @@ fn fake_supervise_flow_is_nonpublishable_and_stops_before_pr_review() -> Result<
         }"#,
     )?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "local-flow",
-        "--json",
-    ])?;
-
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["validation"]["status"], "skipped");
-    assert_eq!(report["pr"], Value::Null);
-    assert_eq!(report["review"], Value::Null);
-    let supervisor: Value = serde_json::from_str(&fs::read_to_string(
-        repo_path.join(".maco/autopilot/runs/local-flow/supervisor-report.json"),
-    )?)?;
-    assert_eq!(supervisor["runtime"], "fake");
-    assert_eq!(supervisor["success"], true);
-    assert_eq!(supervisor["publishable"], false);
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "local-flow",
+            "--json",
+        ],
+        &repo_path,
+        Some("local-flow"),
+    )?;
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         "# Smoke\n"
@@ -456,22 +357,20 @@ fn fake_supervisor_stops_before_blocking_review_or_repair() -> Result<()> {
         }"#,
     )?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "review-repair",
-        "--json",
-    ])?;
-
-    assert_eq!(report["success"], false);
-    assert_eq!(report["attempt_count"], 1);
-    assert_eq!(report["repair_attempts_used"], 0);
-    assert_eq!(report["attempts"][0]["blocking_findings"], 0);
-    assert_eq!(report["attempts"][0]["review_status"], Value::Null);
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "review-repair",
+            "--json",
+        ],
+        &repo_path,
+        Some("review-repair"),
+    )?;
 
     Ok(())
 }
@@ -494,24 +393,20 @@ fn fake_supervisor_stops_before_validation_repair_loop() -> Result<()> {
         }"#,
     )?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "validation-stop",
-        "--json",
-    ])?;
-
-    assert_eq!(report["success"], false);
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["attempt_count"], 1);
-    assert_eq!(report["repair_attempts_used"], 0);
-    assert_eq!(report["validation"]["status"], "skipped");
-    assert_eq!(report["pr"], Value::Null);
-    assert_eq!(report["auto_merge_performed"], false);
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "validation-stop",
+            "--json",
+        ],
+        &repo_path,
+        Some("validation-stop"),
+    )?;
 
     Ok(())
 }
@@ -538,25 +433,20 @@ fn dirty_primary_refusal_emits_public_json() -> Result<()> {
     }
     write_file(&repo_path.join(".maco-cache/preflight/state.json"), "{}\n")?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "dirty",
-        "--json",
-    ])?;
-
-    assert_eq!(report["status"], "refused");
-    assert_eq!(report["safety"]["refused"], true);
-    assert_eq!(report["safety"]["refusals"][0]["kind"], "dirty_primary");
-    assert_eq!(
-        report["safety"]["refusals"][0]["paths"],
-        serde_json::json!(["README.md"])
-    );
-    assert_eq!(report["auto_merge_performed"], false);
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "dirty",
+            "--json",
+        ],
+        &repo_path,
+        Some("dirty"),
+    )?;
 
     Ok(())
 }
@@ -589,41 +479,8 @@ fn status_and_collect_require_verified_finalization_and_distinguish_active_runs(
     ])?;
     assert_eq!(missing_collect["status"], "missing");
 
-    write_file(&repo_path.join("README.md"), "# Smoke\n\nprimary dirty\n")?;
-    for run_id in [
-        "verified",
-        "report-tamper",
-        "hmac-tamper",
-        "marker-malformed",
-    ] {
-        let report = run_autopilot_refusal(&repo_path, temp.path(), run_id)?;
-        assert_eq!(report["status"], "refused");
-    }
-
-    let verified_dir = repo_path.join(".maco/autopilot/runs/verified");
-    let marker: Value = serde_json::from_slice(
-        &fs::read(verified_dir.join(".maco-artifact-final.json")).context("read marker")?,
-    )
-    .context("parse marker")?;
-    assert_eq!(marker["publish_requested"], false);
-    assert_eq!(marker["publishable"], false);
-    assert!(marker["files"]
-        .as_array()
-        .context("marker files")?
-        .iter()
-        .all(|file| file["disposition"] == "private_evidence"));
-    let verified = run_success_json(&[
-        "autopilot",
-        "status",
-        "verified",
-        "--repo",
-        path_str(&repo_path)?,
-        "--json",
-    ])?;
-    assert_eq!(verified["final_report"]["status"], "refused");
-
     let active_dir = repo_path.join(".maco/autopilot/runs/active");
-    fs::create_dir(&active_dir).context("create active run")?;
+    fs::create_dir_all(&active_dir).context("create active run")?;
     fs::set_permissions(&active_dir, fs::Permissions::from_mode(0o700))
         .context("chmod active run")?;
     write_file(&active_dir.join("plan.json"), "{}\n")?;
@@ -656,41 +513,6 @@ fn status_and_collect_require_verified_finalization_and_distinguish_active_runs(
     ])?;
     assert!(active_collect.contains("active or unfinalized"));
 
-    write_file(
-        &repo_path.join(".maco/autopilot/runs/report-tamper/final-report.json"),
-        "{\"status\":\"succeeded\",\"success\":true}\n",
-    )?;
-    assert_corrupt_autopilot_status(&repo_path, "report-tamper")?;
-
-    let hmac_path = repo_path.join(".maco/autopilot/runs/hmac-tamper/.maco-artifact-final.json");
-    let mut hmac_marker: Value =
-        serde_json::from_slice(&fs::read(&hmac_path)?).context("parse hmac marker")?;
-    hmac_marker["hmac_sha256"] = Value::String("00".repeat(32));
-    write_file(
-        &hmac_path,
-        &format!("{}\n", serde_json::to_string_pretty(&hmac_marker)?),
-    )?;
-    assert_corrupt_autopilot_status(&repo_path, "hmac-tamper")?;
-
-    write_file(
-        &repo_path.join(".maco/autopilot/runs/marker-malformed/.maco-artifact-final.json"),
-        "{not json\n",
-    )?;
-    assert_corrupt_autopilot_status(&repo_path, "marker-malformed")?;
-
-    Ok(())
-}
-
-fn assert_corrupt_autopilot_status(repo: &Path, run_id: &str) -> Result<()> {
-    let failure = run_failure_stderr(&[
-        "autopilot",
-        "status",
-        run_id,
-        "--repo",
-        path_str(repo)?,
-        "--json",
-    ])?;
-    assert!(failure.contains("corrupt or unverifiable"));
     Ok(())
 }
 
@@ -708,12 +530,22 @@ fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
         path_str(&sync_repo)?,
         "--json",
     ])?;
-    let sync_report = run_autopilot_refusal(&sync_repo, temp.path(), "sync-refusal")?;
-    assert_refusal_kind(&sync_report, "active_sync_claims")?;
-    let sync_refusal = refusal_by_kind(&sync_report, "active_sync_claims")?;
-    assert_eq!(sync_refusal["paths"], serde_json::json!(["README.md"]));
-    assert_eq!(sync_refusal["lock_details"][0]["owner"], "other-agent");
-    assert_eq!(sync_refusal["lock_details"][0]["token"], 1);
+    let sync_task = temp.path().join("sync-refusal.md");
+    write_file(&sync_task, "Refuse autopilot on README.md.\n")?;
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&sync_task)?,
+            "--repo",
+            path_str(&sync_repo)?,
+            "--run-id",
+            "sync-refusal",
+            "--json",
+        ],
+        &sync_repo,
+        Some("sync-refusal"),
+    )?;
 
     let semantic_repo = create_committed_repo(&temp.path().join("semantic"))?;
     run_success_json(&[
@@ -726,24 +558,41 @@ fn sync_semantic_and_live_locks_are_preflight_refusals() -> Result<()> {
         path_str(&semantic_repo)?,
         "--json",
     ])?;
-    let semantic_report = run_autopilot_refusal(&semantic_repo, temp.path(), "semantic-refusal")?;
-    assert_refusal_kind(&semantic_report, "active_semantic_intents")?;
-    let semantic_refusal = refusal_by_kind(&semantic_report, "active_semantic_intents")?;
-    assert_eq!(semantic_refusal["paths"], serde_json::json!(["README.md"]));
-    assert_eq!(
-        semantic_refusal["lock_details"][0]["owner"],
-        "semantic-agent"
-    );
-    assert_eq!(semantic_refusal["lock_details"][0]["token"], 1);
+    let semantic_task = temp.path().join("semantic-refusal.md");
+    write_file(&semantic_task, "Refuse autopilot on README.md.\n")?;
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&semantic_task)?,
+            "--repo",
+            path_str(&semantic_repo)?,
+            "--run-id",
+            "semantic-refusal",
+            "--json",
+        ],
+        &semantic_repo,
+        Some("semantic-refusal"),
+    )?;
 
     let live_repo = create_committed_repo(&temp.path().join("live"))?;
     write_live_claim(&live_repo, "active-live", "active", "README.md")?;
-    let live_report = run_autopilot_refusal(&live_repo, temp.path(), "live-refusal")?;
-    assert_refusal_kind(&live_report, "active_live_locks")?;
-    let live_refusal = refusal_by_kind(&live_report, "active_live_locks")?;
-    assert_eq!(live_refusal["paths"], serde_json::json!(["README.md"]));
-    assert_eq!(live_refusal["lock_details"][0]["owner"], "worker-a");
-    assert_eq!(live_refusal["lock_details"][0]["claim_id"], "active-live");
+    let live_task = temp.path().join("live-refusal.md");
+    write_file(&live_task, "Refuse autopilot on README.md.\n")?;
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&live_task)?,
+            "--repo",
+            path_str(&live_repo)?,
+            "--run-id",
+            "live-refusal",
+            "--json",
+        ],
+        &live_repo,
+        Some("live-refusal"),
+    )?;
 
     Ok(())
 }
@@ -779,23 +628,20 @@ fn non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot() -> Result
 
     let task_path = temp.path().join("readme-task.md");
     write_file(&task_path, "Update README.md through fake autopilot.\n")?;
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "non-overlap",
-        "--json",
-    ])?;
-
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["safety"]["refused"], false);
-    assert_eq!(
-        report["plan"]["assigned_paths"],
-        serde_json::json!(["README.md"])
-    );
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "non-overlap",
+            "--json",
+        ],
+        &repo_path,
+        Some("non-overlap"),
+    )?;
 
     Ok(())
 }
@@ -815,23 +661,20 @@ fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
         }"#,
     )?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "no-auto-merge",
-        "--json",
-    ])?;
-
-    assert_eq!(report["auto_merge_requested"], true);
-    assert_eq!(report["auto_merge_performed"], false);
-    assert!(report["next_action"]
-        .as_str()
-        .context("next action")?
-        .contains("trusted Codex runtime"));
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "no-auto-merge",
+            "--json",
+        ],
+        &repo_path,
+        Some("no-auto-merge"),
+    )?;
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         "# Smoke\n"
@@ -847,31 +690,20 @@ fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
     let task_path = temp.path().join("task.md");
     write_file(&task_path, "Check public shape.\n")?;
 
-    let report = run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "shape",
-        "--json",
-    ])?;
-
-    assert_eq!(report["version"], 1);
-    assert_eq!(report["artifacts"]["plan"], "plan.json");
-    assert_eq!(
-        report["artifacts"]["supervisor_report"],
-        "supervisor-report.json"
-    );
-    assert_eq!(report["reports_created"]["final_report"], true);
-    assert_eq!(report["plan"]["forge_mode"], "fake");
-    assert_eq!(report["status"], "failed");
-    assert_eq!(report["pr"], Value::Null);
-    assert_eq!(report["ci_reaction_supported"], false);
-    assert_eq!(report["check_status"]["state"], "not_supported");
-    let serialized = serde_json::to_string(&report).context("serialize report")?;
-    assert!(!serialized.contains(&repo_path.display().to_string()));
+    assert_autopilot_run_unsupported(
+        &[
+            "autopilot",
+            "run",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "shape",
+            "--json",
+        ],
+        &repo_path,
+        Some("shape"),
+    )?;
 
     let review = run_success_json(&[
         "review",
@@ -888,39 +720,20 @@ fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
     Ok(())
 }
 
-fn run_autopilot_refusal(repo: &Path, temp: &Path, run_id: &str) -> Result<Value> {
-    let task_path = temp.join(format!("{run_id}.md"));
-    write_file(&task_path, "Refuse autopilot on README.md.\n")?;
-    run_failure_json(&[
-        "autopilot",
-        "run",
-        path_str(&task_path)?,
-        "--repo",
-        path_str(repo)?,
-        "--run-id",
-        run_id,
-        "--json",
-    ])
-}
-
-fn assert_refusal_kind(report: &Value, kind: &str) -> Result<()> {
-    assert_eq!(report["status"], "refused");
-    let refusals = report["safety"]["refusals"]
-        .as_array()
-        .context("refusals")?;
-    if !refusals.iter().any(|refusal| refusal["kind"] == kind) {
-        anyhow::bail!("expected refusal kind {kind}: {refusals:?}");
+fn assert_autopilot_run_unsupported(
+    args: &[&str],
+    repo: &Path,
+    run_id: Option<&str>,
+) -> Result<()> {
+    let stderr = run_failure_stderr(args)?;
+    assert!(stderr.contains("capability-bound supervisor input bridge"));
+    if let Some(run_id) = run_id {
+        assert!(
+            !repo.join(".maco/autopilot/runs").join(run_id).exists(),
+            "unsupported autopilot run created artifacts for {run_id}"
+        );
     }
     Ok(())
-}
-
-fn refusal_by_kind<'a>(report: &'a Value, kind: &str) -> Result<&'a Value> {
-    report["safety"]["refusals"]
-        .as_array()
-        .context("refusals")?
-        .iter()
-        .find(|refusal| refusal["kind"] == kind)
-        .with_context(|| format!("expected refusal kind {kind}"))
 }
 
 fn write_live_claim(repo: &Path, claim_id: &str, status: &str, path: &str) -> Result<()> {

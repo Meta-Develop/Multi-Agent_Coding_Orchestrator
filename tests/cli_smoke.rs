@@ -46,6 +46,10 @@ fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
     ])?;
     assert_eq!(validation["agent_count"], 1);
 
+    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
+        return Ok(());
+    }
+
     let (summary, verified_backend_available) = run_json_regardless([
         "orchestrate",
         "run",
@@ -97,6 +101,10 @@ fn cli_orchestrate_failure_still_emits_json_summary() -> Result<()> {
     )
     .context("write plan")?;
 
+    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
+        return Ok(());
+    }
+
     let output = Command::new(BIN)
         .args([
             "orchestrate",
@@ -143,6 +151,11 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
         }"#,
     )
     .context("write plan")?;
+
+    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
+        assert!(!patch_dir.exists());
+        return Ok(());
+    }
 
     let (summary, verified_backend_available) = run_json_regardless([
         "orchestrate",
@@ -201,6 +214,10 @@ fn cli_claim_conflict_still_emits_json_summary() -> Result<()> {
     )
     .context("write plan")?;
 
+    if assert_orchestrate_run_unsupported(&plan_path, &repo_path)? {
+        return Ok(());
+    }
+
     let output = Command::new(BIN)
         .args([
             "orchestrate",
@@ -230,6 +247,9 @@ fn cli_worktree_diff_uses_active_claims_for_json() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nchanged\n").context("edit worktree")?;
@@ -260,6 +280,37 @@ fn cli_worktree_diff_uses_active_claims_for_json() -> Result<()> {
         .context("diff summary")?
         .contains("changed"));
 
+    Ok(())
+}
+
+#[test]
+fn cli_worktree_pending_on_fresh_repo_creates_no_maco_state() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let maco_root = repo_path.join(".git").join("maco");
+    assert!(!maco_root.exists());
+
+    let pending = run_success_json(["worktree", "pending", "--repo", repo, "--json"])?;
+
+    assert_eq!(pending.as_array().context("pending array")?.len(), 0);
+    assert!(!maco_root.exists());
+    let remove = Command::new(BIN)
+        .args([
+            "worktree",
+            "remove",
+            "agent-a",
+            "--repo",
+            repo,
+            "--delete-branch",
+            "--json",
+        ])
+        .output()
+        .context("run unsupported non-force removal")?;
+    assert!(!remove.status.success());
+    assert!(String::from_utf8_lossy(&remove.stderr)
+        .contains("non-force managed worktree removal is unsupported"));
+    assert!(!maco_root.exists());
     Ok(())
 }
 
@@ -411,6 +462,9 @@ fn cli_merge_preview_blocks_unclaimed_edits_json() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nchanged\n").context("edit worktree")?;
@@ -773,6 +827,42 @@ fn cli_prompt_preview_refuses_symlinked_repository_excerpts() -> Result<()> {
 
 fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     run_success_json_args(&args)
+}
+
+fn assert_worktree_creation_unsupported(repo: &str) -> Result<bool> {
+    let output = Command::new(BIN)
+        .args(["worktree", "create", "agent-a", "--repo", repo, "--json"])
+        .output()
+        .context("run unsupported worktree create")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("managed worktree creation is unsupported")
+            && stderr.contains("capability-bound"),
+        "unexpected worktree-create refusal: {stderr}"
+    );
+    Ok(true)
+}
+
+fn assert_orchestrate_run_unsupported(plan: &Path, repo: &Path) -> Result<bool> {
+    let output = Command::new(BIN)
+        .args([
+            "orchestrate",
+            "run",
+            plan.to_str().context("plan path utf8")?,
+            "--repo",
+            repo.to_str().context("repo path utf8")?,
+            "--json",
+        ])
+        .output()
+        .context("run unsupported orchestration")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("orchestration assignment creation is temporarily unsupported"),
+        "unexpected orchestration refusal: {stderr}"
+    );
+    Ok(true)
 }
 
 fn run_success_json_args(args: &[&str]) -> Result<Value> {

@@ -2268,9 +2268,14 @@ fn publish_pr_with_verified_authority(
             "rerun pr preview and validation for the current committed candidate before publishing",
         ));
     }
-    after_local.commit_id = local_commit.clone();
-    after_local.head_id = after_local.preview.candidate.metadata.agent_head.clone();
     let reviewed_binding = after_local.preview.candidate.validation_binding.clone();
+    let published_commit = if require_validation {
+        reviewed_binding.agent_head.clone()
+    } else {
+        local_commit.clone()
+    };
+    after_local.commit_id = published_commit.clone();
+    after_local.head_id = after_local.preview.candidate.metadata.agent_head.clone();
 
     let primary_repo = Repository::open(&repo_root).context("failed to open primary repository")?;
     let raw_remote_url = match after_local.forge {
@@ -2291,7 +2296,7 @@ fn publish_pr_with_verified_authority(
         validation_evidence,
         write_lease,
     )?;
-    final_report.commit_id = local_commit;
+    final_report.commit_id = published_commit;
     final_report.head_id = final_report.preview.candidate.metadata.agent_head.clone();
     final_report.remote = raw_remote_url.as_deref().map(redact_remote_url);
     if final_report.readiness == ApplyReadinessStatus::Blocked {
@@ -8987,7 +8992,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let agent_a = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -8995,7 +9000,7 @@ mod tests {
             })
             .expect("create agent-a worktree");
         let agent_b = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-b".to_string(),
                 branch: None,
                 base: None,

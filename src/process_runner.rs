@@ -8532,6 +8532,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn required_containment_verifies_normal_nonzero_and_timeout_units_empty() {
         let temp = tempfile::tempdir().expect("tempdir");
         let normal = match run_process(
@@ -8619,6 +8620,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn inaccessible_placeholder_blocks_nix_daemon_socket_access() {
         use std::os::unix::net::UnixStream;
 
@@ -8691,6 +8693,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
         if !strict_backend_available_for_tests() {
             return;
@@ -8839,6 +8842,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn strict_target_cannot_create_network_or_sysv_ipc_endpoints() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("all-blocked");
@@ -9054,6 +9058,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn parent_death_around_launcher_spawn_leaves_no_runtime_or_secret() {
         const CHILD_ENV: &str = "MACO_TEST_LAUNCHER_DEATH_CHILD";
         if env::var_os(CHILD_ENV).is_some() {
@@ -9135,6 +9140,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn parent_sigkill_after_environment_publish_removes_secret_and_unit() {
         const CHILD_ENV: &str = "MACO_TEST_PUBLISHED_ENV_DEATH_CHILD";
         if env::var_os(CHILD_ENV).is_some() {
@@ -9295,6 +9301,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn guardian_reaps_unit_when_runner_aborts_before_start_release() {
         const CHILD_ENV: &str = "MACO_TEST_PRE_GATE_ABORT_CHILD";
         if env::var_os(CHILD_ENV).is_some() {
@@ -9378,6 +9385,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
     fn guardian_reaps_unit_and_blocks_mutation_after_runner_sigabrt() {
         const CHILD_ENV: &str = "MACO_TEST_ABORTED_GUARDIAN_CHILD";
         if env::var_os(CHILD_ENV).is_some() {

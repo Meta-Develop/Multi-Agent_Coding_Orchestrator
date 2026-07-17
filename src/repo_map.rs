@@ -16,7 +16,10 @@ const REPOSITORY_MAP_MAX_DEPTH: usize = 128;
 const REPOSITORY_MAP_MAX_ENTRIES: usize = 100_000;
 const REPOSITORY_MAP_MAX_PATH_BYTES: usize = 4096;
 const REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
-const REPOSITORY_MAP_MAX_DURATION: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const REPOSITORY_MAP_MAX_DURATION: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const REPOSITORY_MAP_MAX_DURATION: Duration = Duration::from_secs(120);
 type RepositoryMapSnapshot = (BTreeMap<PathBuf, [u8; 2]>, Vec<BoundedTreeEntry>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

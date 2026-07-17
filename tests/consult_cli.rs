@@ -353,6 +353,7 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
             .context("fail-closed external error")?;
         assert!(
             error.contains("version preflight")
+                || error.contains("strict-offline version diagnostic")
                 || error.contains("process-tree ownership")
                 || error.contains("containment"),
             "unexpected fail-closed error: {error}"

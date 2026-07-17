@@ -164,6 +164,10 @@ const RETIREMENT_SIDECAR_FILE: &str = ".legacy-retirement.sidecar";
 pub(crate) const LEGACY_RETIREMENT_DOMAIN: AuthenticationDomain =
     AuthenticationDomain::new(b"MACO\0legacy-state-retirement\0v1\0");
 
+pub(crate) fn is_legacy_retirement_metadata_name(name: &str) -> bool {
+    matches!(name, RETIREMENT_INTENT_FILE | RETIREMENT_SIDECAR_FILE)
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyRetirementFaultPoint {

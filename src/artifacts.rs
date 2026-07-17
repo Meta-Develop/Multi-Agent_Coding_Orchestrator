@@ -3065,7 +3065,7 @@ mod tests {
     fn missing_common_key_scans_main_and_every_registered_linked_worktree() {
         let (temp, repo) = committed_repo();
         let linked = WorktreeManager::new(&repo)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "artifact-linked".to_string(),
                 branch: None,
                 base: None,
@@ -3107,7 +3107,7 @@ mod tests {
     fn stale_registered_worktree_refuses_first_key_creation() {
         let (temp, repo) = committed_repo();
         let linked = WorktreeManager::new(&repo)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "artifact-stale".to_string(),
                 branch: None,
                 base: None,
@@ -3120,12 +3120,16 @@ mod tests {
             .common_dir
             .join("maco/state")
             .join(authentication_key_file_name());
+        let original_key = fs::read(&key_path).expect("managed worktree registry created auth key");
 
         let error = open_artifact_auth_writer(&repository)
             .err()
             .expect("stale worktree registration must fail closed");
         assert!(error.to_string().contains("stale or invalid"));
-        assert!(!key_path.exists());
+        assert_eq!(
+            fs::read(&key_path).expect("auth key remains present"),
+            original_key
+        );
     }
 
     #[test]

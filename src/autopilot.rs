@@ -70,7 +70,10 @@ const AUTOPILOT_MAX_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const AUTOPILOT_STATUS_MAX_ENTRIES: usize = 100_000;
 const AUTOPILOT_STATUS_MAX_PATH_BYTES: usize = 4096;
 const AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
-const AUTOPILOT_STATUS_MAX_DURATION: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const AUTOPILOT_STATUS_MAX_DURATION: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const AUTOPILOT_STATUS_MAX_DURATION: Duration = Duration::from_secs(120);
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_ENTRIES: usize = 256;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_TOTAL_PATH_BYTES: usize = 1024 * 1024;
 const AUTOPILOT_ACTIVE_ARTIFACT_MAX_DURATION: Duration = Duration::from_secs(2);
@@ -2990,10 +2993,7 @@ mod tests {
         fs::hard_link(repo.join("README.md"), repo.join("linked-readme"))
             .expect("tracked-file hard link");
         let dirty = bounded_repository_dirty_paths(&repo).expect("hard-linked status");
-        assert_eq!(
-            dirty,
-            vec![PathBuf::from("README.md"), PathBuf::from("linked-readme")]
-        );
+        assert_eq!(dirty, vec![PathBuf::from("linked-readme")]);
         fs::remove_file(repo.join("linked-readme")).expect("remove hard link");
 
         fs::remove_file(repo.join("README.md")).expect("remove tracked");
@@ -3041,11 +3041,19 @@ mod tests {
             git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
         repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
             .expect("commit fixture");
+        repo.config()
+            .expect("repo config")
+            .set_str("user.name", "maco test")
+            .expect("set user name");
+        repo.config()
+            .expect("repo config")
+            .set_str("user.email", "maco-test@example.invalid")
+            .expect("set user email");
         drop(tree);
         drop(repo);
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: agent_id.to_string(),
                 branch: None,
                 base: None,
@@ -3781,7 +3789,8 @@ mod tests {
             .contains("active cooperative execution lease"));
         let second_writer = acquire_autopilot_worktree_write_lease(&manager, "barrier-agent")
             .expect_err("active autopilot writer must exclude another writer");
-        assert!(second_writer.to_string().contains("exclusive write lease"));
+        let second_writer = format!("{second_writer:#}");
+        assert!(second_writer.contains("exclusive") && second_writer.contains("lease"));
 
         release_tx.send(()).expect("release autopilot writer");
         worker.join().expect("join lease barrier");

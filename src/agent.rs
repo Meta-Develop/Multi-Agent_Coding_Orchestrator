@@ -211,6 +211,11 @@ fn run_agent_with_provider_runtime<P>(
 where
     P: LlmProvider,
 {
+    if runtime == AgentExecutionRuntime::Verified {
+        bail!(
+            "agent assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+        );
+    }
     let repo = discover_repo_root(&options.repo)?;
     let agent_id = normalize_agent_id(&options.agent_id)?;
     let claimed_paths = normalize_claimed_paths(options.claimed_paths)?;
@@ -543,12 +548,16 @@ fn select_worktree(
         );
     }
 
-    let record = manager.create(WorktreeCreateOptions {
+    let create_options = WorktreeCreateOptions {
         agent_id: agent_id.to_string(),
         branch: None,
         base: None,
         worktree_root: None,
-    })?;
+    };
+    #[cfg(test)]
+    let record = manager.create_for_test(create_options)?;
+    #[cfg(not(test))]
+    let record = manager.create(create_options)?;
     Ok(SelectedWorktree {
         record,
         reused: false,

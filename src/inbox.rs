@@ -5549,7 +5549,7 @@ mod tests {
     }
 
     #[test]
-    fn real_publication_mode_refuses_fake_reviewer_authority_before_intake_or_artifacts() {
+    fn real_publication_mode_fails_closed_before_intake_or_artifacts() {
         let (_temp, repo) = temp_repo();
         let error = run_inbox(InboxRunOptions {
             repo: repo.clone(),
@@ -5560,8 +5560,9 @@ mod tests {
             max_items: Some(1),
             codex_bin: None,
         })
-        .expect_err("fake reviewer must not authorize real publication");
-        assert!(error.to_string().contains("external reviewer"));
+        .expect_err("real publication must fail closed before effectful intake");
+        let error = format!("{error:#}");
+        assert!(error.contains("capability-bound supervisor input bridge"));
         assert!(!repo.join(".maco/inbox/runs/reviewer-refusal").exists());
     }
 

@@ -20,13 +20,14 @@ use crate::{
         TreeLinkPolicy,
     },
     state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec},
+    state_migration::is_legacy_retirement_metadata_name,
 };
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     fs::File,
     marker::PhantomData,
@@ -192,7 +193,7 @@ where
             let _ = read_rollover_intent::<S>(authenticator, &root, logical_id)?;
             bail!("authenticated snapshot rollover must be recovered before offline inspection");
         }
-        verify_root_inventory::<S>(authenticator, &root, &root_lock)?;
+        verify_root_inventory_allowing_metadata_temps::<S>(authenticator, &root, &root_lock)?;
         root_lock.verify(&root)?;
         authenticator.verify_epoch()
     }
@@ -372,6 +373,53 @@ where
         scavenge_snapshot_metadata_temps::<S>(&store.store_root, logical_id)?;
         verify_root_inventory::<S>(store.journal.authenticator(), &store.store_root, &root_lock)?;
         Ok(store)
+    }
+
+    /// Reads an already-initialized logical snapshot using only existing
+    /// locks and exact durable state. No crash recovery, migration,
+    /// scavenging, lock creation, or publication is permitted.
+    pub(crate) fn read_existing_current(
+        authenticator: RepositoryAuthenticator,
+        logical_id: &str,
+    ) -> Result<AuthenticatedSnapshot<T>> {
+        validate_logical_id::<S>(logical_id)?;
+        let store_root = AuthenticatedStateJournal::<S>::existing_root(&authenticator)?;
+        let store_lock = BoundStateLock::try_acquire_existing_exclusive(
+            &store_root,
+            &snapshot_lock_name(logical_id),
+        )
+        .context(
+            "authenticated snapshot store is active, incomplete, or missing its stable lock",
+        )?;
+        let root_lock = BoundStateLock::try_acquire_existing_exclusive(
+            &store_root,
+            S::ROOT_LOCK_NAME,
+        )
+        .context(
+            "authenticated snapshot namespace is active, incomplete, or missing its stable lock",
+        )?;
+        if store_root.direct_child_exists(snapshot_init_name(logical_id))? {
+            let _ = read_init_intent::<S>(&authenticator, &store_root, logical_id)?;
+            bail!("authenticated snapshot initialization is transitional; recovery is required");
+        }
+        if store_root.direct_child_exists(snapshot_rollover_name(logical_id))? {
+            let _ = read_rollover_intent::<S>(&authenticator, &store_root, logical_id)?;
+            bail!("authenticated snapshot rollover is transitional; recovery is required");
+        }
+        let locator = read_locator::<S>(&authenticator, &store_root, logical_id)?;
+        verify_root_inventory::<S>(&authenticator, &store_root, &root_lock)?;
+        store_lock.verify(&store_root)?;
+        root_lock.verify(&store_root)?;
+        drop(root_lock);
+
+        let authenticator = verify_retained_instances_read_only::<S, T>(authenticator, &locator)?;
+        let journal = AuthenticatedStateJournal::<S>::open_existing_read_only(
+            authenticator,
+            &locator.active_identity,
+        )?;
+        let current = exact_current_from_journal::<S, T>(&journal, &locator)?;
+        store_lock.verify(&store_root)?;
+        Ok(current)
     }
 
     fn from_journal(
@@ -1271,6 +1319,23 @@ fn verify_root_inventory<S: SnapshotSpec>(
     root: &SafeRoot,
     root_lock: &BoundStateLock,
 ) -> Result<SnapshotRootUsage> {
+    verify_root_inventory_inner::<S>(authenticator, root, root_lock, false)
+}
+
+fn verify_root_inventory_allowing_metadata_temps<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    root: &SafeRoot,
+    root_lock: &BoundStateLock,
+) -> Result<SnapshotRootUsage> {
+    verify_root_inventory_inner::<S>(authenticator, root, root_lock, true)
+}
+
+fn verify_root_inventory_inner<S: SnapshotSpec>(
+    authenticator: &RepositoryAuthenticator,
+    root: &SafeRoot,
+    root_lock: &BoundStateLock,
+    allow_metadata_temps: bool,
+) -> Result<SnapshotRootUsage> {
     if S::MAX_LOGICAL_STORES == 0 || S::MAX_ROOT_ENTRIES == 0 || S::MAX_PHYSICAL_INSTANCES == 0 {
         bail!("authenticated snapshot namespace capacity must be non-zero");
     }
@@ -1394,7 +1459,29 @@ fn verify_root_inventory<S: SnapshotSpec>(
                 )?,
                 _ => bail!("authenticated snapshot rollover phase is inconsistent"),
             }
+            continue;
         }
+
+        if name == S::ROOT_LOCK_NAME {
+            continue;
+        }
+        if let Some(hash) = name
+            .strip_prefix(".snapshot-store-")
+            .and_then(|value| value.strip_suffix(".lock"))
+        {
+            validate_snapshot_logical_hash(hash)?;
+            continue;
+        }
+        if is_legacy_retirement_metadata_name(&name) {
+            let _ = BoundedRegularReader::read_direct(root, &name, S::MAX_RECORD_BYTES)?;
+            continue;
+        }
+        if allow_metadata_temps && is_snapshot_metadata_temp_name(&name)? {
+            let _ = BoundedRegularReader::read_direct(root, &name, S::MAX_RECORD_BYTES)?;
+            continue;
+        }
+
+        bail!("unexpected file in authenticated snapshot journal root: {name}");
     }
 
     for (logical_id, candidate) in &init_candidates {
@@ -1547,6 +1634,16 @@ fn snapshot_metadata_target_hash(name: &str) -> Result<Option<&str>> {
         }
     }
     Ok(None)
+}
+
+fn is_snapshot_metadata_temp_name(name: &str) -> Result<bool> {
+    let Some(target) = AtomicStateWriter::canonical_direct_temp_target(OsStr::new(name))? else {
+        return Ok(false);
+    };
+    let target = target
+        .to_str()
+        .context("authenticated snapshot temp target is not UTF-8")?;
+    Ok(snapshot_metadata_target_hash(target)?.is_some())
 }
 
 fn validate_snapshot_logical_hash(hash: &str) -> Result<()> {
@@ -1813,6 +1910,114 @@ where
     Ok(authenticator)
 }
 
+fn verify_retained_instances_read_only<S, T>(
+    mut authenticator: RepositoryAuthenticator,
+    locator: &SnapshotLocator,
+) -> Result<RepositoryAuthenticator>
+where
+    S: SnapshotSpec,
+    T: DeserializeOwned,
+{
+    let mut previous_token = 0_u64;
+    for anchor in &locator.retained_instances {
+        let journal = AuthenticatedStateJournal::<S>::open_existing_read_only(
+            authenticator,
+            &anchor.identity,
+        )
+        .context(
+            "authenticated snapshot retained journal is missing, transitional, or substituted",
+        )?;
+        let expected_len = anchor
+            .end_generation
+            .checked_sub(anchor.start_generation)
+            .and_then(|value| value.checked_add(1))
+            .context("authenticated snapshot retained generation range overflowed")?;
+        if u64::try_from(journal.records().len()).unwrap_or(u64::MAX) != expected_len {
+            bail!("authenticated snapshot retained journal length does not match its anchor");
+        }
+        let mut terminal_token = None;
+        for record in journal.records() {
+            if record.phase != S::SNAPSHOT_PHASE || record.subject.is_some() {
+                bail!("authenticated snapshot retained journal contains a non-snapshot record");
+            }
+            let snapshot: AuthenticatedSnapshot<T> = serde_json::from_value(record.payload.clone())
+                .context("authenticated snapshot retained payload is malformed")?;
+            let generation = anchor
+                .start_generation
+                .checked_add(record.sequence.saturating_sub(1))
+                .context("authenticated snapshot retained generation overflowed")?;
+            if snapshot.version != S::SNAPSHOT_FORMAT_VERSION
+                || snapshot.generation != generation
+                || snapshot.token <= previous_token
+            {
+                bail!("authenticated snapshot retained generation or token is non-monotonic");
+            }
+            previous_token = snapshot.token;
+            terminal_token = Some(snapshot.token);
+        }
+        let terminal = journal
+            .records()
+            .last()
+            .context("authenticated snapshot retained journal is empty")?;
+        if terminal.mac != anchor.terminal_mac
+            || terminal_token != Some(anchor.terminal_token)
+            || previous_token != anchor.terminal_token
+        {
+            bail!("authenticated snapshot retained terminal evidence does not match its anchor");
+        }
+        authenticator = journal.into_authenticator()?;
+    }
+    Ok(authenticator)
+}
+
+fn exact_current_from_journal<S, T>(
+    journal: &AuthenticatedStateJournal<S>,
+    locator: &SnapshotLocator,
+) -> Result<AuthenticatedSnapshot<T>>
+where
+    S: SnapshotSpec,
+    T: DeserializeOwned,
+{
+    if journal.identity() != &locator.active_identity {
+        bail!("authenticated snapshot locator selected the wrong journal identity");
+    }
+    let mut previous_token = locator.prior_token;
+    let mut current = None;
+    for record in journal.records() {
+        if record.phase != S::SNAPSHOT_PHASE || record.subject.is_some() {
+            bail!("authenticated snapshot journal contains a non-snapshot record");
+        }
+        let snapshot: AuthenticatedSnapshot<T> = serde_json::from_value(record.payload.clone())
+            .context("authenticated snapshot payload is malformed")?;
+        let expected_generation = locator
+            .active_start_generation
+            .checked_add(record.sequence.saturating_sub(1))
+            .context("authenticated snapshot absolute generation overflowed")?;
+        if snapshot.version != S::SNAPSHOT_FORMAT_VERSION
+            || snapshot.generation != expected_generation
+            || snapshot.token <= previous_token
+        {
+            bail!("authenticated snapshot generation or token is non-monotonic");
+        }
+        previous_token = snapshot.token;
+        current = Some(snapshot);
+    }
+    let current = current
+        .context("initialized authenticated snapshot namespace has no durable signed generation")?;
+    let terminal_mac = journal
+        .records()
+        .last()
+        .map(|record| record.mac.clone())
+        .context("authenticated snapshot journal has no terminal MAC")?;
+    if current.generation != locator.generation
+        || current.token != locator.token
+        || terminal_mac != locator.terminal_mac
+    {
+        bail!("authenticated snapshot locator does not exactly match its journal tail; recovery is required");
+    }
+    Ok(current)
+}
+
 fn write_locator<S: SnapshotSpec>(
     authenticator: &RepositoryAuthenticator,
     root: &SafeRoot,
@@ -2016,6 +2221,47 @@ mod tests {
     }
 
     #[test]
+    fn existing_only_snapshot_reader_refuses_metadata_residue_without_scavenging() {
+        let (_temp, path) = repository();
+        let store = AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::create(
+            authenticator(&path),
+            "claims",
+            1,
+            7,
+        )
+        .expect("create snapshot");
+        let root_path = store.store_root.path().to_path_buf();
+        drop(store);
+        let root = SafeRoot::open_existing(&root_path).expect("snapshot root");
+        let locator = snapshot_locator_name("claims");
+        AtomicStateWriter::write_direct_fenced(&root, &locator, b"crash-temp", || {
+            bail!("injected locator fence failure")
+        })
+        .err()
+        .expect("leave metadata residue");
+        let before = fs::read_dir(&root_path)
+            .expect("root before read")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<BTreeSet<_>>();
+
+        let error = AuthenticatedSnapshotStore::<TestSnapshotSpec, u64>::read_existing_current(
+            authenticator(&path),
+            "claims",
+        )
+        .expect_err("existing-only reader must refuse transitional residue");
+
+        assert!(error.to_string().contains("unexpected file"));
+        let after = fs::read_dir(&root_path)
+            .expect("root after read")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            after, before,
+            "read-only inspection scavenged metadata residue"
+        );
+    }
+
+    #[test]
     fn default_effect_namespace_supports_multiple_logical_snapshots() {
         let (_temp, path) = repository();
         let first = AuthenticatedSnapshotStore::<DefaultEffectWalSpec, String>::create(
@@ -2207,6 +2453,68 @@ mod tests {
         .expect("responsible logical store scavenges before root inventory");
         assert_eq!(reopened.current().value, 1);
         assert_eq!(fs::read_dir(root_path).expect("quota root").count(), 7);
+    }
+
+    #[test]
+    fn full_namespace_new_logical_refusal_scavenges_existing_logical_locator_temp() {
+        let (_temp, path) = repository();
+        for logical_id in ["quota-existing-a", "quota-existing-b"] {
+            let store = AuthenticatedSnapshotStore::<QuotaSnapshotSpec, u64>::create(
+                authenticator(&path),
+                logical_id,
+                1,
+                1,
+            )
+            .expect("fill logical quota");
+            drop(store);
+        }
+        let repo = Repository::open(&path).expect("repo");
+        let root_path = repo
+            .commondir()
+            .join("maco/state")
+            .join(QuotaSnapshotSpec::ROOT_NAME);
+        let root = SafeRoot::open_existing(&root_path).expect("quota root");
+        let existing_locator = snapshot_locator_name("quota-existing-a");
+        AtomicStateWriter::write_direct_fenced(&root, &existing_locator, b"crash-temp", || {
+            bail!("injected existing locator fence failure")
+        })
+        .err()
+        .expect("leave canonical existing-logical locator temp");
+        assert_eq!(fs::read_dir(&root_path).expect("root with temp").count(), 8);
+
+        let error = AuthenticatedSnapshotStore::<QuotaSnapshotSpec, u64>::create(
+            authenticator(&path),
+            "quota-new-c",
+            1,
+            1,
+        )
+        .err()
+        .expect("new logical store must be refused at quota");
+
+        assert!(error.to_string().contains("capacity"));
+        assert_eq!(
+            fs::read_dir(&root_path).expect("clean quota root").count(),
+            7
+        );
+        assert!(!root_path
+            .join(snapshot_locator_name("quota-new-c"))
+            .exists());
+        assert!(!root_path.join(snapshot_init_name("quota-new-c")).exists());
+        assert!(!root_path.join(snapshot_lock_name("quota-new-c")).exists());
+        let physical_count = fs::read_dir(&root_path)
+            .expect("quota root")
+            .map(|entry| entry.expect("root entry"))
+            .filter(|entry| entry.file_type().expect("entry type").is_dir())
+            .count();
+        assert_eq!(physical_count, 2, "new logical journal residue was created");
+        for logical_id in ["quota-existing-a", "quota-existing-b"] {
+            let reopened = AuthenticatedSnapshotStore::<QuotaSnapshotSpec, u64>::open_instance(
+                authenticator(&path),
+                logical_id,
+            )
+            .expect("existing logical store remains healthy");
+            assert_eq!(reopened.current().value, 1);
+        }
     }
 
     #[test]

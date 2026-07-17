@@ -17,6 +17,9 @@ fn merge_apply_accepts_external_validation_report_and_applies() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nagent change\n")
@@ -61,6 +64,9 @@ fn merge_apply_required_validation_accepts_exact_candidate_binding() -> Result<(
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nbound\n").context("edit worktree")?;
@@ -111,6 +117,9 @@ fn merge_preview_required_validation_rejects_legacy_unbound_pass() -> Result<()>
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nlegacy\n").context("edit worktree")?;
@@ -160,6 +169,9 @@ fn merge_apply_rejects_stale_binding_after_agent_candidate_changes() -> Result<(
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nfirst\n")
@@ -217,6 +229,9 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ncandidate\n")
@@ -273,6 +288,9 @@ fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nlocked\n").context("edit worktree")?;
@@ -348,6 +366,9 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -426,6 +447,9 @@ fn merge_apply_refuses_malformed_repo_common_lock() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nlocked\n").context("edit worktree")?;
@@ -471,6 +495,9 @@ fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nsymlink lock\n")
@@ -509,6 +536,9 @@ fn merge_apply_refuses_symlink_repository_state_directory() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -551,6 +581,9 @@ fn merge_apply_overwrites_unlocked_stale_owner_record() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nstale lock\n")
@@ -589,6 +622,9 @@ fn merge_apply_json_reports_dirty_primary_blocker() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nagent change\n")
@@ -630,6 +666,9 @@ fn merge_preview_reports_stale_base_and_apply_conflict_paths() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Agent\n").context("edit agent readme")?;
@@ -690,6 +729,9 @@ fn merge_preview_reports_unclaimed_edits_with_paths() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nagent change\n")
@@ -728,6 +770,9 @@ fn merge_preview_reports_committed_worktree_change() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ncommitted\n")
@@ -768,6 +813,9 @@ fn merge_validation_failure_blocks_and_force_only_forces_validation() -> Result<
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nagent change\n")
@@ -850,6 +898,9 @@ fn merge_preview_required_validation_blocks_missing_not_run_and_skipped_evidence
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nagent change\n")
@@ -934,6 +985,9 @@ fn merge_apply_candidate_validation_failure_blocks_before_primary_apply() -> Res
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ncandidate\n")
@@ -984,6 +1038,9 @@ fn merge_apply_rejects_successful_validation_that_mutates_candidate_sandbox() ->
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ncandidate\n")
@@ -1024,6 +1081,9 @@ fn merge_apply_kills_setsid_validation_descendant_before_accepting_success() -> 
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -1092,6 +1152,9 @@ fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule(
     commit_all(&primary, "add dependency submodule")?;
 
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -1149,6 +1212,9 @@ fn merge_preview_preserves_non_utf8_claimed_path_and_emits_ascii_json() -> Resul
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     let raw_name = std::ffi::OsString::from_vec(b"raw-\xff.txt".to_vec());
@@ -1213,6 +1279,9 @@ fn merge_preview_ignores_ambient_git_repository_and_index_overrides() -> Result<
     let repo_path = create_committed_repo(temp.path())?;
     let decoy_path = create_committed_repo(&temp.path().join("decoy-root"))?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nenv safe\n").context("edit worktree")?;
@@ -1273,6 +1342,9 @@ fn merge_preview_candidate_capture_does_not_write_unreachable_real_objects() -> 
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(
@@ -1312,6 +1384,21 @@ fn write_bound_validation(path: &Path, binding: &Value) -> Result<()> {
         serde_json::to_vec_pretty(&evidence).context("serialize evidence")?,
     )
     .context("write bound validation")
+}
+
+fn assert_worktree_creation_unsupported(repo: &str) -> Result<bool> {
+    let output = Command::new(BIN)
+        .args(["worktree", "create", "agent-a", "--repo", repo, "--json"])
+        .output()
+        .context("run unsupported worktree create")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("managed worktree creation is unsupported")
+            && stderr.contains("capability-bound"),
+        "unexpected worktree-create refusal: {stderr}"
+    );
+    Ok(true)
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {

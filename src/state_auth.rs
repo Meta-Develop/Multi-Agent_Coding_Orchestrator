@@ -447,13 +447,13 @@ impl RepositoryAuthWriter {
             // key. This preserves precise diagnostics for existing markers or
             // journals while the epoch sentinel remains the final fail-closed
             // backstop for otherwise unregistered authenticated state.
+            before_first_key(&state_root)?;
+            validate_registered_consumers_before_first_key(&state_root)?;
             if epoch_exists {
                 bail!(
                     "repository authentication key is missing for an existing authentication epoch; refusing to generate a replacement key"
                 );
             }
-            validate_registered_consumers_before_first_key(&state_root)?;
-            before_first_key(&state_root)?;
             let mut key = SecretKey([0_u8; AUTH_KEY_BYTES]);
             fill_os_random(&mut key.0)?;
             AtomicStateWriter::scavenge_direct_temps(&state_root, AUTH_KEY_FILE)?;

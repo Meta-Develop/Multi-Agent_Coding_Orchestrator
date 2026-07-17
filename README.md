@@ -26,7 +26,7 @@ The current implementation covers a local-first command-line slice:
 
 - `maco init` initializes a Git repository.
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
-- `maco worktree list` lists verified registered agent worktrees without recovering pending operations; `maco worktree pending` inspects those operations.
+- `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
@@ -44,7 +44,7 @@ The current implementation covers a local-first command-line slice:
   repo-local semantic intent coordination for paths, modules, and symbols
   without automatic task planning.
 - `maco orchestrate validate <plan-file>` validates a local JSON orchestration plan.
-- `maco orchestrate run <plan-file>` creates or reuses agent worktrees, claims paths, runs configured local shell commands, runs per-agent validation commands in agent worktrees, enforces path-claim boundaries, optionally writes patches and checkpoints, releases claims, and emits a run summary.
+- `maco orchestrate run <plan-file>` is temporarily unsupported because verified assignment creation depends on the disabled managed-worktree creation boundary. Validation and existing read-only/status/collection surfaces remain available.
 - `maco orchestrate resume <checkpoint-file>` authenticates the repository-bound v3 journal, validates repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims, then reruns validation/capture for completed commands without rerunning those commands.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
@@ -62,10 +62,13 @@ The current implementation covers a local-first command-line slice:
   expose and safely mutate repo-local Markdown claim liveness for active,
   blocked, ready-for-review, handoff, and done work.
 - `maco llm providers` and `maco llm prompt-preview` expose the provider-neutral prompt boundary without network calls.
-- `maco agent run` runs a local fake-provider-backed proposal in an isolated worktree with durable claims, boundary checks, validation, merge-preview reporting, and no real network providers by default.
+- `maco agent run` is temporarily unsupported because verified agent assignment creation depends on the disabled managed-worktree creation boundary.
 - `maco supervise plan` normalizes an opt-in supervisor task or JSON plan for
   Codex CLI subprocess orchestration.
-- `maco supervise run` serially launches opt-in O1 child orchestrators through
+- `maco supervise run` is temporarily unsupported because verified supervisor
+  assignment creation depends on the disabled managed-worktree creation
+  boundary. `maco supervise plan/status/collect` remain available. The retained
+  supervisor design serially launches opt-in O1 child orchestrators through
   the Codex CLI in isolated child worktrees under an O2 supervisor. Each child
   is instructed to read `AGENTS.md` and project-local `.agents` guidance before
   acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
@@ -119,11 +122,12 @@ Implemented local foundations:
 1. Result collection, merge preview, and guarded patch apply for agent worktrees.
 2. Parser-backed Rust repository maps for modules, symbols, impls, imports, and
    dependency edges, plus semantic risk reports for changed paths.
-3. Local orchestration with dependency scheduling, path claims, timeouts,
+3. Retained local orchestration internals with dependency scheduling, path claims, timeouts,
    per-agent validation, repo-level validation, run ids, checkpoint writes,
    safe checkpoint resume, and guarded `reuse=reset`.
 4. Provider-neutral LLM adapter boundaries with deterministic fake-provider
-   tests and local fake-provider-backed `maco agent run` execution.
+   tests; public fake-provider-backed `maco agent run` execution is temporarily
+   disabled at the assignment-creation boundary.
 
 Known limitations and roadmap for 0.3.0:
 
@@ -431,7 +435,7 @@ cargo run -- repo query path src/worktree.rs --repo . --json
 cargo run -- repo query risk --path src/worktree.rs --repo . --json
 ```
 
-Create a worktree from the current repository HEAD:
+Managed worktree creation currently returns `Unsupported` before repository access:
 
 ```bash
 cargo run -- worktree create agent-a --repo . --json
@@ -443,10 +447,10 @@ List worktrees:
 cargo run -- worktree list --repo .
 ```
 
-Remove a clean worktree and delete its default branch:
+Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 
 ```bash
-cargo run -- worktree remove agent-a --repo . --delete-branch
+cargo run -- worktree remove agent-a --repo . --force --delete-branch
 ```
 
 Claim paths for an agent:
@@ -521,13 +525,17 @@ Run a local orchestration plan:
 
 ```bash
 cargo run -- orchestrate validate plan.json --json
+# Temporarily returns Unsupported before assignment creation:
 cargo run -- orchestrate run plan.json --repo . --jobs 2 --patch-dir .maco/patches --reuse clean --run-id demo --checkpoint-dir .maco/checkpoints --json
 cargo run -- orchestrate resume .maco/checkpoints/demo.json --repo . --plan-file plan.json --jobs 2 --patch-dir .maco/patches --json
 ```
 
-The orchestrator validates that plan paths do not overlap, dependencies are
-known and acyclic, commands are non-empty, and timeouts are positive. It creates
-or reuses a linked worktree for each agent id according to
+The orchestrator validator checks that plan paths do not overlap, dependencies
+are known and acyclic, commands are non-empty, and timeouts are positive.
+Verified `orchestrate run` currently returns `Unsupported` before claims,
+artifacts, commands, or assignment worktrees are created. Once the
+capability-bound creation boundary is restored, the retained execution design
+creates or reuses a linked worktree for each agent id according to
 `worktree_reuse_policy` or CLI `--reuse`, claims all requested paths before
 running commands, runs dependency-ready agents up to `--jobs`, and releases
 claims at the end. A failed agent skips only its transitive dependents;
@@ -1017,13 +1025,15 @@ Run a deterministic local fake-provider proposal in an isolated worktree:
 cargo run -- agent run task.md --agent-id agent-a --path README.md --fake-proposal proposal.json --validation "cargo test" --repo . --json
 ```
 
-`maco agent run` currently accepts only the local `fake` provider. It renders
+The command above currently returns `Unsupported` before repository, claim, or
+worktree mutation. The retained agent runner accepts only the local `fake`
+provider. It renders
 the same provider-neutral prompt boundary used by `llm prompt-preview`.
 Provider-proposed shell commands are disabled by default: the command above
 reports a refusal for the proposed `printf` command and tells you to rerun with
 `--allow-provider-commands` if you trust the proposal. Patch-only fake proposals
 can run without that opt-in. When command execution is explicitly allowed,
-`maco agent run` applies fake-provider proposed patches and commands inside the
+the retained agent runner applies fake-provider proposed patches and commands inside the
 agent worktree, runs provider-proposed and CLI-supplied validation commands,
 collects a merge candidate and preview, reports path-boundary violations, and
 releases durable claims unless `--keep-claims` is supplied. Real network
@@ -1072,13 +1082,15 @@ Run an opt-in supervisor-of-orchestrators plan:
 
 ```bash
 cargo run -- supervise plan supervisor-plan.json --repo . --json
+# Temporarily returns Unsupported before reserving artifacts or assignments:
 cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --json
 cargo run -- supervise status supervise-demo --repo . --json
 cargo run -- supervise collect supervise-demo --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
 ```
 
-`maco supervise run` is opt-in process-level orchestration. It shells out to the
+`maco supervise run` currently returns `Unsupported` before reserving artifacts,
+claims, or child worktrees. The retained process-level design shells out to the
 configured Codex-compatible executable, creates isolated child worktrees, claims
 each assignment's paths, records semantic coordination metadata when the plan
 requests it, and writes structured logs and reports under the run directory.
@@ -1127,7 +1139,7 @@ SubAgent/delegated-worker mechanisms when available only for terminal worker or
 researcher execution so the project manager/worker boundary is preserved. If no
 delegated-worker mechanism is available, the child should stop before mutation
 and report the exact blocked worker task. For child assignments with workers,
-`maco supervise run` requires structured terminal audit evidence before
+the retained supervisor runner requires structured terminal audit evidence before
 accepting the child report: the parent launches a read-only `REVIEW_AUDITOR`
 subprocess and requires an accepted AuditorReport with `role=auditor`,
 `no_further_delegation=true`, `read_only=true`, and coverage for all assigned
@@ -1136,10 +1148,10 @@ acceptance gate collects and accepts it. The accepted parent-launched
 AuditorReport is appended to the child `audit_reports` field.
 If a child declares worker assignments but returns zero `worker_reports`, the
 child report is rejected as structurally incomplete. If a child has no worker
-assignments but leaves a non-empty child worktree diff, `maco supervise run`
+assignments but leaves a non-empty child worktree diff, the retained runner
 still launches the parent read-only `REVIEW_AUDITOR` and requires it to cover
 the child orchestrator id and changed paths.
-`maco supervise run` does not apply worker changes to the primary worktree
+The retained supervisor runner does not apply worker changes to the primary worktree
 automatically. Child orchestrator execution is currently serial: the supervisor
 starts and waits for one child process at a time.
 `max_child_assignments` bounds the number of child assignments in the plan, and
@@ -1172,13 +1184,15 @@ Run the fake-first autopilot workflow:
 > in-place writes or ABA changes. Inventory and map output is discarded when
 > the bounded before/after captures differ, but matching captures are not a
 > same-UID safety guarantee. Effectful Inbox run/watch entry points, managed
-> worktree creation, and non-force managed worktree removal are disabled at
-> their public entry points for the same reason; Inbox scan/status and forced
-> removal under the existing explicit operator override remain available.
-> Supervisor assignments that require creating a managed worktree are therefore
-> temporarily unsupported. `maco worktree pending` inspects durable pending
-> operations without recovering them; operators can use authenticated state and
-> `remove --force` for explicitly authorized pending or managed-state cleanup.
+> worktree creation, non-force managed worktree removal, `orchestrate run`,
+> `agent run`, `supervise run`, and Inbox run/watch/workspace run/watch are
+> disabled at their public entry points for the same reason. Inbox scan/status,
+> worktree list/pending, and force cleanup remain available. `maco worktree
+> pending` opens only an existing authenticated snapshot and existing locks;
+> absent state returns no operations, and crash residue or transitional state is
+> refused without recovery or mutation. Operators must inspect preserved manual
+> recovery evidence before using `remove --force` for explicitly authorized
+> cleanup; force cleanup only unlinks children whose exact identity was persisted.
 > The read-only Git
 > subprocess still lacks descriptor transfer, so matching captures do not raise
 > its pathname inputs above the documented same-UID trust boundary. A
@@ -1377,6 +1391,7 @@ Run the fake-first inbox reaction loop:
 
 ```bash
 cargo run -- inbox scan --repo . --json
+# The following run/watch commands currently return Unsupported:
 cargo run -- inbox run --repo . --run-id inbox-demo --json
 cargo run -- inbox run --repo . --run-id inbox-codex --permission github_local --codex-bin codex --json
 cargo run -- inbox status inbox-demo --repo . --json
@@ -1415,13 +1430,11 @@ item is used. Duplicate detection remains stable by repository, kind, and number
 while the snapshot digest separately identifies the observed source revision.
 Fake fixtures use fixed timestamps and canonical fake OIDs for reproducibility.
 
-`maco inbox run` processes selected candidates through the same fake-first
-autopilot flow unless config `action_policy` or CLI `--dry-run` selects dry-run
-mode. `--max-items` overrides config selection for a scan, run, or watch command.
-`--codex-bin` on `run` or `watch`, or `codex_bin` in `maco-inbox.json`, passes a
-Codex-compatible executable through to autopilot; omitted keeps deterministic
-fake child execution. `timeout_seconds` is honored for validation commands that
-do not return.
+`maco inbox run` and `maco inbox watch` currently return `Unsupported` before
+repository config, artifacts, claims, supervisors, or worktrees are opened or
+created. `scan`, `status`, `collect`, and read-only artifact inspection remain
+available. The fake-first reaction flow described below is retained design, not
+currently executable behavior.
 
 Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
 including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
@@ -1501,13 +1514,15 @@ Run the cross-repository inbox workspace supervisor:
 
 ```bash
 cargo run -- inbox workspace scan --config workspace-inbox.json --json
+# The following workspace run/watch commands currently return Unsupported:
 cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-demo --json
 cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-dry --dry-run --json
 cargo run -- inbox workspace watch --config workspace-inbox.json --poll-seconds 60 --once --json
 ```
 
-Workspace inbox supervises the same inbox flow across multiple configured local
-repositories. The aggregate JSON reports `version`, a public-safe `config_path`,
+Workspace inbox `run` and `watch` currently return `Unsupported` before reading
+the workspace config or creating artifacts. Workspace `scan` remains available.
+The retained aggregate design reports `version`, a public-safe `config_path`,
 `strict`, repo counts, and one entry per repository with `id`, `enabled`,
 `permission_mode`, `status`, `success`, `refused`, optional `message`, and an
 embedded `scan_report` or `run_report`. Workspace run artifacts are written
@@ -1535,5 +1550,6 @@ Cleanup examples:
 
 ```bash
 cargo run -- sync status --repo . --json
-cargo run -- worktree remove agent-a --repo . --delete-branch
+cargo run -- worktree pending --repo . --json
+cargo run -- worktree remove agent-a --repo . --force --delete-branch
 ```

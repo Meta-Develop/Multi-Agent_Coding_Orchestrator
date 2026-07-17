@@ -6486,7 +6486,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let agent_a = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -6494,7 +6494,7 @@ mod tests {
             })
             .expect("create agent-a worktree");
         let agent_b = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-b".to_string(),
                 branch: None,
                 base: None,

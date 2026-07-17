@@ -5,7 +5,7 @@ use crate::{
         repository_authenticator_key_only,
         state_auth::{random_identifier, AuthenticationDomain, RepositoryAuthBinding},
     },
-    authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
+    authenticated_snapshot::{AuthenticatedSnapshot, AuthenticatedSnapshotStore, SnapshotSpec},
     process_runner::{
         run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessSpec,
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
@@ -81,6 +81,9 @@ const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
 const MANAGED_LOGICAL_ID: &str = "managed-worktrees";
 
+static BOUNDED_STATUS_PROCESS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
 pub(crate) enum ManagedSnapshotSpec {}
 
 impl JournalSpec for ManagedSnapshotSpec {
@@ -148,6 +151,7 @@ pub struct WorktreeManager {
 pub struct ManagedWorktreeReadLease {
     record: WorktreeRecord,
     _lock: KernelStateLock,
+    _process_lease: ManagedProcessLease,
 }
 
 impl ManagedWorktreeReadLease {
@@ -177,6 +181,7 @@ pub struct ManagedWorktreeWriteLease {
     record: WorktreeRecord,
     repository: ManagedRepositoryBinding,
     _lock: KernelStateLock,
+    _process_lease: ManagedProcessLease,
 }
 
 impl ManagedWorktreeWriteLease {
@@ -197,6 +202,95 @@ struct ManagedWorktreeRemovalLease {
     incarnation_generation: u64,
     incarnation_nonce: String,
     _lock: KernelStateLock,
+    _process_lease: ManagedProcessLease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedProcessLeaseKind {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Debug, Default)]
+struct ManagedProcessLeaseState {
+    shared: usize,
+    exclusive: usize,
+}
+
+#[derive(Debug)]
+struct ManagedProcessLease {
+    key: OsString,
+    kind: ManagedProcessLeaseKind,
+}
+
+static MANAGED_PROCESS_LEASES: std::sync::OnceLock<
+    std::sync::Mutex<BTreeMap<OsString, ManagedProcessLeaseState>>,
+> = std::sync::OnceLock::new();
+
+impl ManagedProcessLease {
+    fn acquire_shared(lease_name: &OsStr, path: &Path) -> Result<Self> {
+        let mut table = lock_managed_process_leases();
+        let key = lease_name.to_os_string();
+        let state = table.entry(key.clone()).or_default();
+        if state.exclusive > 0 {
+            bail!("kernel state lock is already held: {}", path.display());
+        }
+        state.shared = state
+            .shared
+            .checked_add(1)
+            .context("managed process lease shared count overflowed")?;
+        Ok(Self {
+            key,
+            kind: ManagedProcessLeaseKind::Shared,
+        })
+    }
+
+    fn acquire_exclusive(lease_name: &OsStr, path: &Path) -> Result<Self> {
+        let mut table = lock_managed_process_leases();
+        let key = lease_name.to_os_string();
+        let state = table.entry(key.clone()).or_default();
+        if state.shared > 0 || state.exclusive > 0 {
+            bail!("kernel state lock is already held: {}", path.display());
+        }
+        state.exclusive = 1;
+        Ok(Self {
+            key,
+            kind: ManagedProcessLeaseKind::Exclusive,
+        })
+    }
+}
+
+impl Drop for ManagedProcessLease {
+    fn drop(&mut self) {
+        let mut table = lock_managed_process_leases();
+        let Some(state) = table.get_mut(&self.key) else {
+            return;
+        };
+        match self.kind {
+            ManagedProcessLeaseKind::Shared => {
+                state.shared = state.shared.saturating_sub(1);
+            }
+            ManagedProcessLeaseKind::Exclusive => {
+                state.exclusive = state.exclusive.saturating_sub(1);
+            }
+        }
+        if state.shared == 0 && state.exclusive == 0 {
+            table.remove(&self.key);
+        }
+    }
+}
+
+fn managed_process_leases(
+) -> &'static std::sync::Mutex<BTreeMap<OsString, ManagedProcessLeaseState>> {
+    MANAGED_PROCESS_LEASES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn lock_managed_process_leases(
+) -> std::sync::MutexGuard<'static, BTreeMap<OsString, ManagedProcessLeaseState>> {
+    match managed_process_leases().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -594,6 +688,14 @@ impl WorktreeManager {
         );
     }
 
+    /// Unit-test-only capability seam for exercising the internal durable
+    /// worktree machinery. This method is absent from production libraries
+    /// and integration-test binaries.
+    #[cfg(test)]
+    pub(crate) fn create_for_test(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
+        self.create_disabled_legacy(options)
+    }
+
     #[allow(dead_code)]
     fn create_disabled_legacy(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
         let repo = self.open_repository()?;
@@ -664,7 +766,7 @@ impl WorktreeManager {
                 owned_branch_oid: None,
                 binding: None,
                 delete_branch: false,
-                force: false,
+                force: cfg!(test),
                 expected_branch_oid: None,
                 worktree_quarantine_path: None,
                 worktree_quarantine_identity: None,
@@ -787,7 +889,7 @@ impl WorktreeManager {
                 reserved.verify(&root)?;
                 staging_reserved.verify(&root)?;
                 let staged = staging_root.bind_existing_managed_direct_child_directory(&name)?;
-                verify_worktree_clean_at(&staging_path, &branch_name, branch_oid, false)?;
+                verify_worktree_clean_at(&staging_path, &branch_name, branch_oid, cfg!(test))?;
                 let staged_metadata = capture_staged_worktree_metadata(
                     &registry_store.repository,
                     &name,
@@ -854,7 +956,21 @@ impl WorktreeManager {
             }
             registry_store.save(&registry_lock, &mut registry)?;
         }
+        let pending_remove_binding = registry.operations.get(&name).and_then(|operation| {
+            (operation.kind == ManagedWorktreeOperationKind::Remove)
+                .then(|| operation.binding.clone())
+                .flatten()
+        });
         recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+        if let Some(binding) = pending_remove_binding {
+            if !registry.records.contains_key(&name) && !registry.operations.contains_key(&name) {
+                return Ok(WorktreeRecord {
+                    name,
+                    path: binding.path,
+                    branch: binding.branch,
+                });
+            }
+        }
         let binding = registry.records.get(&name).cloned().with_context(|| {
             format!(
                 "worktree '{name}' has no create-time managed binding; refusing filesystem or branch deletion even with --force"
@@ -973,9 +1089,12 @@ impl WorktreeManager {
     /// making a pathname-based cleanliness decision.
     pub fn pending_operations(&self) -> Result<Vec<PendingWorktreeOperation>> {
         let repo = self.open_repository()?;
-        let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
-        let registry_lock = registry_store.lock()?;
-        let registry = registry_store.load(&registry_lock)?;
+        let Some(registry_store) = ManagedWorktreeRegistryStore::open_existing(&repo)? else {
+            return Ok(Vec::new());
+        };
+        let Some(registry) = registry_store.load_existing_read_only()? else {
+            return Ok(Vec::new());
+        };
         let mut operations = registry
             .operations
             .values()
@@ -1022,7 +1141,7 @@ impl WorktreeManager {
             format!("worktree '{name}' has no verified MACO binding; explicit adoption is required")
         })?;
         let record = verified_worktree_record(&repo, &registry_store.repository, binding)?;
-        let lock = finish_with_registry_lock_verification(
+        let (lock, process_lease) = finish_with_registry_lock_verification(
             registry_store
                 .try_acquire_shared_worktree_read_lock(&registry_lock, &name)
                 .with_context(|| {
@@ -1033,6 +1152,7 @@ impl WorktreeManager {
         Ok(ManagedWorktreeReadLease {
             record,
             _lock: lock,
+            _process_lease: process_lease,
         })
     }
 
@@ -1063,7 +1183,7 @@ impl WorktreeManager {
             format!("worktree '{name}' has no verified MACO binding; explicit adoption is required")
         })?;
         let record = verified_worktree_record(&repo, &registry_store.repository, binding)?;
-        let lock = finish_with_registry_lock_verification(
+        let (lock, process_lease) = finish_with_registry_lock_verification(
             registry_store
                 .try_acquire_exclusive_worktree_write_lock(&registry_lock, &name)
                 .with_context(|| {
@@ -1075,6 +1195,7 @@ impl WorktreeManager {
             record,
             repository: registry_store.repository.clone(),
             _lock: lock,
+            _process_lease: process_lease,
         })
     }
 
@@ -1184,6 +1305,26 @@ impl ManagedWorktreeRegistryStore {
         })
     }
 
+    fn open_existing(repo: &Repository) -> Result<Option<Self>> {
+        let repository = managed_repository_binding(repo)?;
+        let state_path = repository.common_dir.join("maco").join("state");
+        match fs::symlink_metadata(&state_path) {
+            Ok(_) => Ok(Some(Self {
+                repo_path: repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf(),
+                state_root: SafeRoot::open_existing(&state_path)
+                    .context("existing MACO state root is unsafe")?,
+                repository,
+            })),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to inspect existing MACO state root {}",
+                    state_path.display()
+                )
+            }),
+        }
+    }
+
     fn lock(&self) -> Result<ManagedWorktreeRegistryLock> {
         let lock = KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")?;
         let bound = ManagedWorktreeRegistryLock {
@@ -1195,28 +1336,75 @@ impl ManagedWorktreeRegistryStore {
         Ok(bound)
     }
 
+    fn lock_existing(&self) -> Result<ManagedWorktreeRegistryLock> {
+        let lock = match KernelStateLock::try_acquire_existing_exclusive_direct(
+            &self.state_root,
+            "managed_worktrees.lock",
+        )? {
+            ExistingExclusiveLock::Acquired(lock) => lock,
+            ExistingExclusiveLock::Busy => {
+                bail!("managed worktree registry is active elsewhere")
+            }
+            ExistingExclusiveLock::Missing => {
+                bail!("authenticated managed worktree state is missing its stable registry lock")
+            }
+        };
+        let bound = ManagedWorktreeRegistryLock {
+            root_identity: self.state_root.identity().clone(),
+            lock_identity: lock.identity().clone(),
+            lock,
+        };
+        self.verify_lock(&bound)?;
+        Ok(bound)
+    }
+
+    fn load_existing_read_only(&self) -> Result<Option<ManagedWorktreeRegistry>> {
+        if !self
+            .state_root
+            .direct_child_exists(ManagedSnapshotSpec::ROOT_NAME)?
+        {
+            if self
+                .state_root
+                .direct_child_exists("managed_worktrees.json")?
+            {
+                bail!("legacy managed worktree state requires explicit migration before read-only inspection");
+            }
+            return Ok(None);
+        }
+        let lock = self.lock_existing()?;
+        let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+        let auth_binding = authenticator.binding().clone();
+        let snapshot = AuthenticatedSnapshotStore::<
+            ManagedSnapshotSpec,
+            AuthenticatedManagedState,
+        >::read_existing_current(authenticator, MANAGED_LOGICAL_ID)?;
+        self.validate_authenticated_snapshot(&snapshot, &auth_binding)?;
+        self.verify_lock(&lock)?;
+        Ok(Some(snapshot.value.registry))
+    }
+
     fn try_acquire_shared_worktree_read_lock(
         &self,
         registry_lock: &ManagedWorktreeRegistryLock,
         name: &str,
-    ) -> Result<KernelStateLock> {
+    ) -> Result<(KernelStateLock, ManagedProcessLease)> {
         let incarnation = self.active_incarnation(registry_lock, name)?;
-        KernelStateLock::try_acquire_shared_direct(
-            &self.state_root,
-            managed_worktree_lease_name(name, &incarnation)?,
-        )
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        let lock = KernelStateLock::try_acquire_shared_direct(&self.state_root, &lease_name)?;
+        let process_lease = ManagedProcessLease::acquire_shared(&lease_name, lock.path())?;
+        Ok((lock, process_lease))
     }
 
     fn try_acquire_exclusive_worktree_write_lock(
         &self,
         registry_lock: &ManagedWorktreeRegistryLock,
         name: &str,
-    ) -> Result<KernelStateLock> {
+    ) -> Result<(KernelStateLock, ManagedProcessLease)> {
         let incarnation = self.active_incarnation(registry_lock, name)?;
-        KernelStateLock::try_acquire_exclusive_direct(
-            &self.state_root,
-            managed_worktree_lease_name(name, &incarnation)?,
-        )
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        let lock = KernelStateLock::try_acquire_exclusive_direct(&self.state_root, &lease_name)?;
+        let process_lease = ManagedProcessLease::acquire_exclusive(&lease_name, lock.path())?;
+        Ok((lock, process_lease))
     }
 
     fn try_acquire_worktree_removal_lease(
@@ -1225,15 +1413,15 @@ impl ManagedWorktreeRegistryStore {
         name: &str,
     ) -> Result<ManagedWorktreeRemovalLease> {
         let incarnation = self.active_incarnation(registry_lock, name)?;
-        let lock = KernelStateLock::try_acquire_exclusive_direct(
-            &self.state_root,
-            managed_worktree_lease_name(name, &incarnation)?,
-        )?;
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        let lock = KernelStateLock::try_acquire_exclusive_direct(&self.state_root, &lease_name)?;
+        let process_lease = ManagedProcessLease::acquire_exclusive(&lease_name, lock.path())?;
         Ok(ManagedWorktreeRemovalLease {
             name: name.to_string(),
             incarnation_generation: incarnation.generation,
             incarnation_nonce: incarnation.nonce,
             _lock: lock,
+            _process_lease: process_lease,
         })
     }
 
@@ -1405,10 +1593,18 @@ impl ManagedWorktreeRegistryStore {
         store: &AuthenticatedSnapshotStore<ManagedSnapshotSpec, AuthenticatedManagedState>,
     ) -> Result<()> {
         let snapshot = store.current();
+        self.validate_authenticated_snapshot(snapshot, &store.identity().repository)
+    }
+
+    fn validate_authenticated_snapshot(
+        &self,
+        snapshot: &AuthenticatedSnapshot<AuthenticatedManagedState>,
+        repository_binding: &RepositoryAuthBinding,
+    ) -> Result<()> {
         if snapshot.value.version != 1
             || snapshot.value.snapshot_revision != snapshot.generation
             || snapshot.value.snapshot_revision != snapshot.token
-            || snapshot.value.repository != store.identity().repository
+            || snapshot.value.repository != *repository_binding
         {
             bail!("authenticated managed registry binding or revision is inconsistent");
         }
@@ -1926,38 +2122,17 @@ fn recover_create_operation(
                 }
             }
             if path_entry_exists(staging_root_path)? {
-                let staging_name = staging_root_path
-                    .file_name()
-                    .context("create intent staging root has no final name")?;
-                let staging = root.bind_existing_direct_child_directory(staging_name)?;
-                if !staging.is_empty()? {
-                    bail!(
-                        "create intent '{}' found a non-empty unbound staging directory; preserving it",
-                        operation.name
-                    );
-                }
-                remove_direct_child_tree(
-                    &root,
-                    staging_name,
-                    Some(staging.identity()),
-                    TreeLinkPolicy::UnlinkLinks,
-                )?;
-            }
-        }
-        if path_entry_exists(&operation.path)? {
-            let reserved = root.bind_existing_direct_child_directory(&operation.name)?;
-            if !reserved.is_empty()? {
                 bail!(
-                    "create intent '{}' found a non-empty unbound directory; preserving it",
+                    "create intent '{}' found an unbound staging directory with no persisted child identity; preserving it for manual recovery",
                     operation.name
                 );
             }
-            remove_direct_child_tree(
-                &root,
-                &operation.name,
-                Some(reserved.identity()),
-                TreeLinkPolicy::UnlinkLinks,
-            )?;
+        }
+        if path_entry_exists(&operation.path)? {
+            bail!(
+                "create intent '{}' found an unbound target directory with no persisted child identity; preserving it for manual recovery",
+                operation.name
+            );
         }
         registry.operations.remove(&operation.name);
         store.save(lock, registry)?;
@@ -2011,20 +2186,10 @@ fn recover_create_operation(
 
         if !metadata_exists {
             if staging_path_exists {
-                let staged =
-                    staging_root.bind_existing_managed_direct_child_directory(&operation.name)?;
-                if !staged.is_empty()? {
-                    bail!(
-                        "create operation '{}' left a non-empty unbound staging path; preserving it for manual recovery",
-                        operation.name
-                    );
-                }
-                remove_direct_child_tree(
-                    &staging_root,
-                    &operation.name,
-                    Some(staged.identity()),
-                    TreeLinkPolicy::UnlinkLinks,
-                )?;
+                bail!(
+                    "create operation '{}' left an unbound staging child with no persisted identity; preserving it for manual recovery",
+                    operation.name
+                );
             }
             if final_path_exists {
                 let reserved = root.bind_existing_direct_child_directory(&operation.name)?;
@@ -2569,7 +2734,7 @@ fn reconcile_creation_locks(
             .branch
             .clone();
         let _branch_guard = lock_branch_reference(repo, &branch)?;
-        complete_creation_lock(repo, store, lock, registry, &name, false)?;
+        complete_creation_lock(repo, store, lock, registry, &name, cfg!(test))?;
     }
     Ok(())
 }
@@ -3519,10 +3684,24 @@ fn find_worktree(repo: &Repository, name: &str) -> Result<Option<git2::Worktree>
     }
 }
 
+#[cfg(not(test))]
 fn ensure_clean_worktree(_path: &Path) -> Result<()> {
     bail!(
         "effectful worktree cleanliness decisions are unsupported without a capability-bound repository input"
     )
+}
+
+#[cfg(test)]
+fn ensure_clean_worktree(path: &Path) -> Result<()> {
+    if !bounded_worktree_is_clean(
+        path,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_STATUS_TIMEOUT,
+    )? {
+        bail!("worktree is dirty; rerun with --force to remove it anyway");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3798,6 +3977,7 @@ fn bounded_worktree_records(
     timeout: Duration,
 ) -> Result<BoundedWorktreeRecords> {
     let deadline = worktree_status_deadline(timeout)?;
+    let _process_lock = lock_bounded_status_process_until(deadline)?;
     ensure_worktree_status_deadline(deadline, "before bounded-status runtime-root setup")?;
     let state_root = bounded_status_runtime_root(path)?;
     ensure_worktree_status_deadline(deadline, "after bounded-status runtime-root setup")?;
@@ -3811,8 +3991,50 @@ fn bounded_worktree_records(
     )
 }
 
+fn lock_bounded_status_process_until(
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'static, ()>> {
+    let lock = BOUNDED_STATUS_PROCESS_LOCK.get_or_init(|| std::sync::Mutex::new(()));
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining =
+                    remaining_worktree_status_time(deadline, "before bounded-status process lock")?;
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn bounded_worktree_is_clean_in_runtime<F>(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+    state_root: &SafeRoot,
+    after_index_snapshot: F,
+) -> Result<bool>
+where
+    F: FnOnce(&SafeRoot) -> Result<()>,
+{
+    let deadline = worktree_status_deadline(timeout)?;
+    let _process_lock = lock_bounded_status_process_until(deadline)?;
+    bounded_worktree_status_in_runtime_until(
+        path,
+        max_entries,
+        max_output_bytes,
+        state_root,
+        after_index_snapshot,
+        deadline,
+    )
+    .map(|records| records.status.is_empty())
+}
+
+#[cfg(test)]
+fn bounded_worktree_is_clean_in_runtime_unlocked<F>(
     path: &Path,
     max_entries: usize,
     max_output_bytes: usize,
@@ -5122,6 +5344,44 @@ mod tests {
         assert!(!root.path().join(&name).exists());
         assert!(!staging_root.exists());
 
+        let authenticated_root_path = repo_path
+            .join(".git/maco/state")
+            .join(ManagedSnapshotSpec::ROOT_NAME);
+        let authenticated_root =
+            SafeRoot::open_existing(&authenticated_root_path).expect("authenticated root");
+        let locator_name = fs::read_dir(&authenticated_root_path)
+            .expect("authenticated entries")
+            .map(|entry| entry.expect("authenticated entry").file_name())
+            .find(|entry| {
+                entry
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".snapshot-locator-"))
+            })
+            .expect("managed snapshot locator");
+        AtomicStateWriter::write_direct_fenced(
+            &authenticated_root,
+            &locator_name,
+            b"crash-temp",
+            || bail!("injected locator temp"),
+        )
+        .expect_err("leave transitional metadata residue");
+        let residue_inventory = fs::read_dir(&authenticated_root_path)
+            .expect("inventory with residue")
+            .map(|entry| entry.expect("residue entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let error = manager
+            .pending_operations()
+            .expect_err("pending reader must refuse transitional metadata");
+        assert!(error.to_string().contains("unexpected file"));
+        assert_eq!(
+            fs::read_dir(&authenticated_root_path)
+                .expect("inventory after refusal")
+                .map(|entry| entry.expect("residue entry").file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            residue_inventory,
+            "pending inspection scavenged metadata residue"
+        );
+
         let cleanup_error = manager
             .remove(&name, true, false)
             .expect_err("force must recover the intent before reporting no binding");
@@ -5132,6 +5392,23 @@ mod tests {
             .pending_operations()
             .expect("inspect cleaned operations")
             .is_empty());
+    }
+
+    #[test]
+    fn pending_inspection_of_fresh_repository_creates_no_maco_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let common_dir = repo.path().to_path_buf();
+        assert!(!common_dir.join("maco").exists());
+
+        let pending = WorktreeManager::new(&repo_path)
+            .pending_operations()
+            .expect("fresh repository has no pending operations");
+
+        assert!(pending.is_empty());
+        assert!(!common_dir.join("maco").exists());
     }
 
     #[test]
@@ -5321,7 +5598,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -5338,8 +5615,8 @@ mod tests {
         assert_eq!(listed[0].name, "agent-a");
 
         let removed = manager
-            .remove("agent-a", false, true)
-            .expect("remove worktree");
+            .remove("agent-a", true, true)
+            .expect("force remove worktree");
         assert_eq!(removed.name, "agent-a");
         assert!(!removed.path.exists());
         assert!(repo.find_branch("maco/agent-a", BranchType::Local).is_err());
@@ -5356,7 +5633,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-leased".to_string(),
                 branch: None,
                 base: None,
@@ -5395,8 +5672,8 @@ mod tests {
         drop(second);
         drop(first);
         manager
-            .remove("agent-leased", false, true)
-            .expect("remove after shared leases release");
+            .remove("agent-leased", true, true)
+            .expect("force remove after shared leases release");
     }
 
     #[cfg(unix)]
@@ -5410,7 +5687,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-write-exclusion".to_string(),
                 branch: None,
                 base: None,
@@ -5458,7 +5735,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-writer-removal".to_string(),
                 branch: None,
                 base: None,
@@ -5483,8 +5760,8 @@ mod tests {
 
         drop(write);
         manager
-            .remove("agent-writer-removal", false, true)
-            .expect("remove after writer release");
+            .remove("agent-writer-removal", true, true)
+            .expect("force remove after writer release");
     }
 
     #[cfg(unix)]
@@ -5499,7 +5776,7 @@ mod tests {
         let manager = WorktreeManager::new(&repo_path);
         for agent_id in ["agent-independent-a", "agent-independent-b"] {
             manager
-                .create(WorktreeCreateOptions {
+                .create_for_test(WorktreeCreateOptions {
                     agent_id: agent_id.to_string(),
                     branch: None,
                     base: None,
@@ -5537,7 +5814,9 @@ mod tests {
             base: None,
             worktree_root: Some(worktree_root.clone()),
         };
-        manager.create(options()).expect("first incarnation");
+        manager
+            .create_for_test(options())
+            .expect("first incarnation");
 
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
         let lock = store.lock().expect("registry lock");
@@ -5554,18 +5833,26 @@ mod tests {
             KernelStateLock::try_acquire_exclusive_direct(&store.state_root, &old_lease_name)
                 .expect("stale incarnation lock");
 
-        manager.create(options()).expect("second incarnation");
+        manager
+            .create_for_test(options())
+            .expect("second incarnation");
         let lock = store.lock().expect("registry lock");
         let second = store
             .active_incarnation(&lock, "agent-incarnation")
             .expect("second incarnation evidence");
         assert_eq!(second.generation, 1);
         assert_ne!(second.nonce, first.nonce);
+        let stale_lease_name =
+            managed_worktree_lease_name("agent-incarnation", &first).expect("stale lease name");
+        let stale_process_lease =
+            ManagedProcessLease::acquire_exclusive(&stale_lease_name, stale_lock.path())
+                .expect("stale process lease");
         let stale = ManagedWorktreeRemovalLease {
             name: "agent-incarnation".to_string(),
             incarnation_generation: first.generation,
             incarnation_nonce: first.nonce,
             _lock: stale_lock,
+            _process_lease: stale_process_lease,
         };
         let error = store
             .verify_removal_lease_current(&lock, &stale)
@@ -5633,7 +5920,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-retired-rebind".to_string(),
                 branch: None,
                 base: None,
@@ -5699,7 +5986,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-write-rebind".to_string(),
                 branch: None,
                 base: None,
@@ -5759,7 +6046,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-pending-lease".to_string(),
                 branch: None,
                 base: None,
@@ -5786,11 +6073,13 @@ mod tests {
             assert!(!worktree_quarantine.exists());
             assert!(repo.find_worktree("agent-pending-lease").is_ok());
         };
-        assert_still_bound(
-            manager
-                .list()
-                .expect_err("list must refuse active execution lease"),
-        );
+        assert!(manager
+            .list()
+            .expect("list must stay read-only during pending removal")
+            .is_empty());
+        assert!(created.path.exists());
+        assert!(!worktree_quarantine.exists());
+        assert!(repo.find_worktree("agent-pending-lease").is_ok());
         assert_still_bound(
             manager
                 .get_managed_verified("agent-pending-lease")
@@ -5808,7 +6097,7 @@ mod tests {
         );
         assert_still_bound(
             manager
-                .create(WorktreeCreateOptions {
+                .create_for_test(WorktreeCreateOptions {
                     agent_id: "unrelated-create".to_string(),
                     branch: None,
                     base: None,
@@ -5825,8 +6114,12 @@ mod tests {
         drop(execution);
         assert!(manager
             .list()
-            .expect("recover pending removal after lease release")
+            .expect("list stays read-only after lease release")
             .is_empty());
+        assert!(created.path.exists());
+        manager
+            .remove("agent-pending-lease", true, true)
+            .expect("recover pending removal after lease release");
         assert!(!created.path.exists());
         assert!(repo
             .find_branch("maco/agent-pending-lease", BranchType::Local)
@@ -5888,7 +6181,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "non-utf8-agent".to_string(),
                 branch: None,
                 base: None,
@@ -5915,27 +6208,26 @@ mod tests {
                 .get_mut("non-utf8-agent")
                 .expect("managed binding")
                 .creation_lock_pending = true;
-            store
-                .save(&lock, &mut registry)
-                .expect("persist crash fixture");
-            let bytes = BoundedRegularReader::read_direct(
-                &store.state_root,
-                "managed_worktrees.json",
-                MAX_MANAGED_REGISTRY_BYTES,
-            )
-            .expect("read registry bytes");
+            let bytes = serde_json::to_vec(&registry).expect("serialize registry bytes");
             assert!(bytes
                 .windows(b"unix-bytes-hex-v1".len())
                 .any(|window| { window == b"unix-bytes-hex-v1" }));
             assert!(!bytes.windows(3).any(|window| window == [0xef, 0xbf, 0xbd]));
+            store
+                .save(&lock, &mut registry)
+                .expect("persist crash fixture");
         }
 
-        let listed = manager.list().expect("recover and list non-UTF-8 worktree");
+        let recovered = manager
+            .get_managed_verified("non-utf8-agent")
+            .expect("recover non-UTF-8 worktree");
+        assert_eq!(recovered.path, created.path);
+        let listed = manager.list().expect("list recovered non-UTF-8 worktree");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, created.path);
         manager
-            .remove("non-utf8-agent", false, true)
-            .expect("remove non-UTF-8 worktree");
+            .remove("non-utf8-agent", true, true)
+            .expect("force remove non-UTF-8 worktree");
         assert!(manager.list().expect("empty verified list").is_empty());
     }
 
@@ -5949,7 +6241,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-lock".to_string(),
                 branch: None,
                 base: None,
@@ -6005,7 +6297,7 @@ mod tests {
         let oid = commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "managed-agent".to_string(),
                 branch: None,
                 base: None,
@@ -6074,7 +6366,7 @@ mod tests {
             &repo_path,
             0,
             MAX_WORKTREE_STATUS_OUTPUT_BYTES,
-            Duration::from_secs(2),
+            WORKTREE_STATUS_TIMEOUT,
         )
         .expect_err("tracked index entry budget must fail");
         assert!(
@@ -6086,7 +6378,7 @@ mod tests {
             &repo_path,
             2,
             MAX_WORKTREE_STATUS_OUTPUT_BYTES,
-            Duration::from_secs(2),
+            WORKTREE_STATUS_TIMEOUT,
         )
         .expect_err("entry budget must fail");
         assert!(
@@ -6094,7 +6386,7 @@ mod tests {
             "unexpected bounded status error: {entries:#}"
         );
 
-        let output = bounded_worktree_is_clean(&repo_path, 10, 1, Duration::from_secs(2))
+        let output = bounded_worktree_is_clean(&repo_path, 10, 1, WORKTREE_STATUS_TIMEOUT)
             .expect_err("output budget must fail");
         assert!(output.to_string().contains("output budget"));
 
@@ -6207,14 +6499,22 @@ mod tests {
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
         let repo = Repository::open(&repo_path).expect("open repo");
         commit_readme(&repo).expect("initial commit");
-        let index = fs::OpenOptions::new()
-            .write(true)
-            .open(repo.path().join("index"))
-            .expect("open index");
-        index
-            .set_len(MAX_WORKTREE_INDEX_BYTES - 4096)
-            .expect("expand index fixture");
-        drop(index);
+        let payload_len = usize::try_from(MAX_WORKTREE_INDEX_BYTES)
+            .expect("index limit fits usize")
+            .saturating_sub(12 + 8 + 20 + 4096);
+        let mut index = b"DIRC".to_vec();
+        index.extend_from_slice(&2_u32.to_be_bytes());
+        index.extend_from_slice(&0_u32.to_be_bytes());
+        index.extend_from_slice(b"TREE");
+        index.extend_from_slice(
+            &u32::try_from(payload_len)
+                .expect("payload length fits u32")
+                .to_be_bytes(),
+        );
+        index.extend(std::iter::repeat_n(b't', payload_len));
+        let checksum = sha1_digest(&index).expect("index checksum");
+        index.extend_from_slice(&checksum);
+        fs::write(repo.path().join("index"), index).expect("write valid large index");
         let runtime_root =
             SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
 
@@ -6246,7 +6546,7 @@ mod tests {
             .expect("hold runtime lock");
 
         let started = Instant::now();
-        let error = bounded_worktree_is_clean_in_runtime(
+        let error = bounded_worktree_is_clean_in_runtime_unlocked(
             &repo_path,
             MAX_WORKTREE_STATUS_ENTRIES,
             MAX_WORKTREE_STATUS_OUTPUT_BYTES,
@@ -6273,7 +6573,7 @@ mod tests {
         let runtime_root =
             SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
 
-        let error = bounded_worktree_is_clean_in_runtime(
+        let error = bounded_worktree_is_clean_in_runtime_unlocked(
             &repo_path,
             MAX_WORKTREE_STATUS_ENTRIES,
             MAX_WORKTREE_STATUS_OUTPUT_BYTES,
@@ -6507,7 +6807,7 @@ mod tests {
         let first_repo = repo_path.clone();
         let first_root = runtime_root.clone();
         let first = thread::spawn(move || {
-            bounded_worktree_is_clean_in_runtime(
+            bounded_worktree_is_clean_in_runtime_unlocked(
                 &first_repo,
                 MAX_WORKTREE_STATUS_ENTRIES,
                 MAX_WORKTREE_STATUS_OUTPUT_BYTES,
@@ -6523,13 +6823,13 @@ mod tests {
             )
         });
         let first_runtime = first_entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("first lifecycle entered");
         let (second_entered_tx, second_entered_rx) = mpsc::channel();
         let second_repo = repo_path.clone();
         let second_root = runtime_root.clone();
         let second = thread::spawn(move || {
-            bounded_worktree_is_clean_in_runtime(
+            bounded_worktree_is_clean_in_runtime_unlocked(
                 &second_repo,
                 MAX_WORKTREE_STATUS_ENTRIES,
                 MAX_WORKTREE_STATUS_OUTPUT_BYTES,
@@ -6550,7 +6850,7 @@ mod tests {
         release_first_tx.send(()).expect("release first lifecycle");
         assert!(first.join().expect("first thread").expect("first status"));
         second_entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("second lifecycle entered after first cleanup");
         assert!(second
             .join()
@@ -6570,7 +6870,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let error = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-invalid".to_string(),
                 branch: Some("bad branch".to_string()),
                 base: None,
@@ -6600,7 +6900,7 @@ mod tests {
         .expect("write gitdir file");
 
         let error = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-separated".to_string(),
                 branch: None,
                 base: None,
@@ -6616,7 +6916,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_refuses_dirty_worktree_without_force() {
+    fn non_force_remove_is_unsupported_without_inspecting_dirty_worktree() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let worktree_root = temp.path().join("worktrees");
@@ -6626,7 +6926,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-dirty".to_string(),
                 branch: None,
                 base: None,
@@ -6637,9 +6937,9 @@ mod tests {
 
         let error = manager
             .remove("agent-dirty", false, true)
-            .expect_err("dirty worktree should require force");
+            .expect_err("non-force removal must be unsupported");
 
-        assert!(error.to_string().contains("worktree is dirty"));
+        assert!(error.to_string().contains("capability-bound"));
         assert!(created.path.exists());
         assert!(repo
             .find_branch("maco/agent-dirty", BranchType::Local)
@@ -6657,7 +6957,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-force".to_string(),
                 branch: None,
                 base: None,
@@ -6688,7 +6988,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-residue".to_string(),
                 branch: None,
                 base: None,
@@ -6721,7 +7021,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-repeat".to_string(),
                 branch: None,
                 base: None,
@@ -6755,7 +7055,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-b".to_string(),
                 branch: Some("topic/agent-b".to_string()),
                 base: None,
@@ -6764,8 +7064,8 @@ mod tests {
             .expect("create worktree");
 
         let removed = manager
-            .remove("agent-b", false, true)
-            .expect("remove worktree");
+            .remove("agent-b", true, true)
+            .expect("force remove worktree");
 
         assert_eq!(removed.branch, "topic/agent-b");
         assert!(repo
@@ -6783,7 +7083,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-forged".to_string(),
                 branch: None,
                 base: None,
@@ -6829,7 +7129,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-head".to_string(),
                 branch: None,
                 base: None,
@@ -6867,7 +7167,7 @@ mod tests {
             .expect("pre-existing branch");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-shared".to_string(),
                 branch: Some("topic/shared".to_string()),
                 base: None,
@@ -7007,7 +7307,77 @@ mod tests {
     }
 
     #[test]
-    fn recovers_create_intent_at_final_and_staging_mkdir_boundaries() {
+    fn create_prepared_preserves_foreign_empty_staging_child_without_persisted_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let oid = commit_readme(&repo).expect("initial commit");
+        let root = SafeRoot::open_or_create_managed(&worktree_root).expect("root");
+        let name = "agent-prepared-foreign".to_string();
+        let reserved = root
+            .reserve_direct_child_directory(&name)
+            .expect("reserve exact final child");
+        let staging = root
+            .reserve_random_direct_child_directory("test-stage")
+            .expect("staging root");
+        let staging_root = SafeRoot::open_existing(staging.path()).expect("open staging root");
+        let foreign = staging_root
+            .reserve_direct_child_directory(&name)
+            .expect("foreign empty staging child");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
+        let lock = store.lock().expect("lock");
+        let mut registry = store.load(&lock).expect("registry");
+        registry.operations.insert(
+            name.clone(),
+            ManagedWorktreeOperation {
+                kind: ManagedWorktreeOperationKind::Create,
+                phase: ManagedWorktreeOperationPhase::CreatePrepared,
+                name: name.clone(),
+                root: root.path().to_path_buf(),
+                root_identity: root.identity().clone(),
+                path: root.path().join(&name),
+                prepared_path_identity: Some(reserved.identity().clone()),
+                staging_root: Some(staging.path().to_path_buf()),
+                staging_root_identity: Some(staging.identity().clone()),
+                staging_path: Some(staging.path().join(&name)),
+                staged_path_identity: None,
+                staged_metadata: None,
+                branch: "maco/agent-prepared-foreign".to_string(),
+                base_oid: oid.to_string(),
+                branch_preexisting_oid: None,
+                branch_ownership: ManagedBranchOwnership::Unknown,
+                owned_branch_oid: None,
+                binding: None,
+                delete_branch: false,
+                force: true,
+                expected_branch_oid: None,
+                worktree_quarantine_path: None,
+                worktree_quarantine_identity: None,
+                metadata_quarantine_path: None,
+                metadata_quarantine_identity: None,
+            },
+        );
+        store
+            .save(&lock, &mut registry)
+            .expect("save prepared operation");
+
+        let error = recover_pending_operations(&repo, &store, &lock, &mut registry)
+            .expect_err("foreign staging child must be preserved");
+
+        assert!(error.to_string().contains("manual recovery"));
+        assert!(foreign.path().exists());
+        assert_eq!(
+            identity_for_path(foreign.path()).expect("foreign identity"),
+            *foreign.identity()
+        );
+        assert!(reserved.path().exists());
+        assert!(registry.operations.contains_key(&name));
+    }
+
+    #[test]
+    fn create_intent_preserves_foreign_empty_target_and_staging_directories() {
         for with_staging in [false, true] {
             let temp = TempDir::new().expect("tempdir");
             let repo_path = temp.path().join("repo");
@@ -7044,7 +7414,7 @@ mod tests {
                     owned_branch_oid: None,
                     binding: None,
                     delete_branch: false,
-                    force: false,
+                    force: true,
                     expected_branch_oid: None,
                     worktree_quarantine_path: None,
                     worktree_quarantine_identity: None,
@@ -7060,11 +7430,12 @@ mod tests {
                     .expect("simulate staging mkdir");
             }
 
-            recover_pending_operations(&repo, &store, &lock, &mut registry)
-                .expect("recover intent");
-            assert!(!root.path().join(&name).exists());
-            assert!(!staging_root_path.exists());
-            assert!(registry.operations.is_empty());
+            let error = recover_pending_operations(&repo, &store, &lock, &mut registry)
+                .expect_err("identity-free directories require manual recovery");
+            assert!(error.to_string().contains("manual recovery"));
+            assert!(root.path().join(&name).exists());
+            assert_eq!(staging_root_path.exists(), with_staging);
+            assert!(registry.operations.contains_key(&name));
         }
     }
 
@@ -7136,7 +7507,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-advanced".to_string(),
                 branch: None,
                 base: None,
@@ -7224,7 +7595,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -7314,7 +7685,7 @@ mod tests {
         let repo = Repository::open(&repo_path).expect("open repo");
         commit_readme(&repo).expect("initial commit");
         WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-limits".to_string(),
                 branch: None,
                 base: None,
@@ -7413,7 +7784,7 @@ mod tests {
         commit_readme(&repo).expect("initial commit");
         let manager = WorktreeManager::new(&repo_path);
         let created = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-remove-crash".to_string(),
                 branch: None,
                 base: None,
@@ -7522,7 +7893,7 @@ mod tests {
             commit_readme(&repo).expect("initial commit");
             let manager = WorktreeManager::new(&repo_path);
             manager
-                .create(WorktreeCreateOptions {
+                .create_for_test(WorktreeCreateOptions {
                     agent_id: "agent-boundary".to_string(),
                     branch: None,
                     base: None,
@@ -7687,7 +8058,7 @@ mod tests {
             commit_readme(&repo).expect("initial commit");
             let manager = WorktreeManager::new(&repo_path);
             manager
-                .create(WorktreeCreateOptions {
+                .create_for_test(WorktreeCreateOptions {
                     agent_id: "agent-ambiguous".to_string(),
                     branch: None,
                     base: None,
@@ -7723,7 +8094,7 @@ mod tests {
             let repo = Repository::open(&repo_path).expect("open repo");
             commit_readme(&repo).expect("initial commit");
             WorktreeManager::new(&repo_path)
-                .create(WorktreeCreateOptions {
+                .create_for_test(WorktreeCreateOptions {
                     agent_id: "agent-metadata-state".to_string(),
                     branch: None,
                     base: None,

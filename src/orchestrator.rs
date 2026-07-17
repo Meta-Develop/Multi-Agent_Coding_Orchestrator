@@ -103,6 +103,7 @@ static CANDIDATE_BOUNDARY_FAILURE_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+#[derive(PartialEq, Eq)]
 struct CheckpointEventFailureHook {
     run_id: String,
     phase: String,
@@ -110,7 +111,7 @@ struct CheckpointEventFailureHook {
 
 #[cfg(test)]
 static CHECKPOINT_EVENT_FAILURE_HOOK: std::sync::OnceLock<
-    std::sync::Mutex<Option<CheckpointEventFailureHook>>,
+    std::sync::Mutex<Vec<CheckpointEventFailureHook>>,
 > = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -942,6 +943,11 @@ fn run_plan_with_controls_runtime(
     controls: OrchestrationRunControls,
     runtime: OrchestrationExecutionRuntime,
 ) -> Result<OrchestrationSummary> {
+    if runtime == OrchestrationExecutionRuntime::Verified {
+        bail!(
+            "orchestration assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+        );
+    }
     if options.jobs == 0 {
         bail!("orchestration jobs must be at least 1");
     }
@@ -2741,12 +2747,16 @@ fn select_worktrees(
             );
         }
 
-        manager.create(WorktreeCreateOptions {
+        let create_options = WorktreeCreateOptions {
             agent_id: agent.id.clone(),
             branch: None,
             base: None,
             worktree_root: None,
-        })?;
+        };
+        #[cfg(test)]
+        manager.create_for_test(create_options)?;
+        #[cfg(not(test))]
+        manager.create(create_options)?;
         let lease = manager
             .acquire_write_execution_lease(&agent.id)
             .with_context(|| {
@@ -4669,13 +4679,19 @@ impl<'a> DisposableValidationWorktree<'a> {
     fn create(manager: &'a WorktreeManager, base_oid: &Oid) -> Result<Self> {
         let sequence = REPO_VALIDATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let name = normalize_agent_id(&format!("repo-validation-{}-{sequence}", process::id()))?;
+        let create_options = WorktreeCreateOptions {
+            agent_id: name.clone(),
+            branch: None,
+            base: Some(base_oid.to_string()),
+            worktree_root: None,
+        };
+        #[cfg(test)]
         manager
-            .create(WorktreeCreateOptions {
-                agent_id: name.clone(),
-                branch: None,
-                base: Some(base_oid.to_string()),
-                worktree_root: None,
-            })
+            .create_for_test(create_options)
+            .context("combined candidate managed worktree creation failed")?;
+        #[cfg(not(test))]
+        manager
+            .create(create_options)
             .context("combined candidate managed worktree creation failed")?;
         let lease = match manager.acquire_write_execution_lease(&name) {
             Ok(lease) => lease,
@@ -5546,13 +5562,15 @@ impl RunCheckpointWriter {
 
 #[cfg(test)]
 fn install_checkpoint_event_failure(run_id: &str, phase: &str) {
-    let hook = CHECKPOINT_EVENT_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
-    let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let hook = CHECKPOINT_EVENT_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut hooks = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     assert!(
-        slot.is_none(),
+        !hooks
+            .iter()
+            .any(|hook| hook.run_id == run_id && hook.phase == phase),
         "checkpoint event failure hook already installed"
     );
-    *slot = Some(CheckpointEventFailureHook {
+    hooks.push(CheckpointEventFailureHook {
         run_id: run_id.to_string(),
         phase: phase.to_string(),
     });
@@ -5560,13 +5578,13 @@ fn install_checkpoint_event_failure(run_id: &str, phase: &str) {
 
 #[cfg(test)]
 fn take_checkpoint_event_failure(run_id: &str, phase: &str) -> bool {
-    let hook = CHECKPOINT_EVENT_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(None));
-    let mut slot = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if slot
-        .as_ref()
-        .is_some_and(|hook| hook.run_id == run_id && hook.phase == phase)
+    let hook = CHECKPOINT_EVENT_FAILURE_HOOK.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut hooks = hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(position) = hooks
+        .iter()
+        .position(|hook| hook.run_id == run_id && hook.phase == phase)
     {
-        slot.take();
+        hooks.remove(position);
         true
     } else {
         false
@@ -6786,6 +6804,7 @@ mod tests {
         let validation_repo =
             Repository::clone(primary.to_str().expect("primary utf8"), &validation_path)
                 .expect("clone validation target");
+        SyncStore::open(&validation_path).expect("create validation sensitive state root");
         let index_path = validation_repo.path().join("index");
         let index_before = fs::read(&index_path).expect("read validation index before apply");
 
@@ -7194,7 +7213,7 @@ mod tests {
         commit_all(&repo, "initial commit").expect("commit");
         let manager = WorktreeManager::new(&repo_path);
         manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -7202,7 +7221,7 @@ mod tests {
             })
             .expect("create agent-a worktree");
         let unrelated = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-b".to_string(),
                 branch: None,
                 base: None,
@@ -7356,7 +7375,7 @@ mod tests {
         commit_all(&repo, "initial commit").expect("commit");
         let manager = WorktreeManager::new(&repo_path);
         let record = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "git-marker-redirect".to_string(),
                 branch: None,
                 base: None,
@@ -8080,7 +8099,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let agent_a_worktree = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -8088,7 +8107,7 @@ mod tests {
             })
             .expect("create agent-a worktree");
         let agent_b_worktree = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-b".to_string(),
                 branch: None,
                 base: None,
@@ -8220,7 +8239,7 @@ mod tests {
         commit_all(&repo, "initial commit").expect("commit");
         let manager = WorktreeManager::new(&repo_path);
         let worktree = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-resume".to_string(),
                 branch: None,
                 base: None,
@@ -8364,7 +8383,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let agent_a_worktree = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -8372,7 +8391,7 @@ mod tests {
             })
             .expect("create agent-a worktree");
         let agent_b_worktree = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-b".to_string(),
                 branch: None,
                 base: None,
@@ -8537,7 +8556,7 @@ mod tests {
 
         let manager = WorktreeManager::new(&repo_path);
         let agent_a_worktree = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -8545,7 +8564,7 @@ mod tests {
             })
             .expect("create agent-a worktree");
         let agent_b_worktree = manager
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-b".to_string(),
                 branch: None,
                 base: None,
@@ -8650,7 +8669,7 @@ mod tests {
             SemanticCoordinationMode::Block
         );
         assert_eq!(summary.first_failed_agent(), Some("agent-b"));
-        assert_eq!(summary.agents[0].status, AgentRunStatus::Skipped);
+        assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
         assert_eq!(summary.agents[1].status, AgentRunStatus::Failed);
         assert_eq!(summary.released_semantic_intents.len(), 1);
         assert_eq!(
@@ -8680,7 +8699,7 @@ mod tests {
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -8758,7 +8777,7 @@ mod tests {
         fs::write(repo_path.join("README.md"), "# v1\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -8806,7 +8825,7 @@ mod tests {
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -8847,7 +8866,7 @@ mod tests {
         fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
                 branch: None,
                 base: None,
@@ -9200,7 +9219,7 @@ mod tests {
         commit_all(&repo, "initial commit").expect("commit");
         SyncStore::open(&repo_path).expect("create repository state root");
         let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "profile-binding".to_string(),
                 branch: None,
                 base: None,
@@ -9229,7 +9248,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn verified_child_cannot_read_repository_authentication_key() {
+    fn verified_run_fails_closed_before_child_can_read_repository_authentication_key() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         let checkpoint_dir = temp.path().join("checkpoints");
@@ -9253,7 +9272,7 @@ mod tests {
             .expect("encode plan"),
         )
         .expect("write plan");
-        let summary = super::run_plan_file_with_controls(
+        let error = super::run_plan_file_with_controls(
             OrchestrationRunOptions {
                 repo: repo_path,
                 plan_file,
@@ -9268,9 +9287,10 @@ mod tests {
                 semantic_coordination: SemanticCoordinationMode::Off,
             },
         )
-        .expect("run verified isolated child");
-        assert!(summary.success);
-        assert_eq!(summary.agents[0].stdout.text, "state-hidden\n");
+        .expect_err("verified assignment creation must fail closed");
+        assert!(error
+            .to_string()
+            .contains("orchestration assignment creation is temporarily unsupported"));
     }
 
     #[cfg(unix)]
@@ -9807,7 +9827,7 @@ mod tests {
         fs::write(repo_path.join("README.md"), "# paths\n").expect("write readme");
         commit_all(&repo, "initial commit").expect("commit");
         let worktree = WorktreeManager::new(&repo_path)
-            .create(WorktreeCreateOptions {
+            .create_for_test(WorktreeCreateOptions {
                 agent_id: "lossless-path-agent".to_string(),
                 branch: None,
                 base: None,
