@@ -6525,6 +6525,286 @@ mod tests {
         (repo_path, manager, agent_a, agent_b)
     }
 
+    fn create_semantic_merge_fixture(
+        root: &Path,
+        files: &[(&str, &str)],
+    ) -> (PathBuf, WorktreeRecord) {
+        let repo_path = root.join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        for (path, contents) in files {
+            let path = repo_path.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create semantic fixture parent");
+            }
+            fs::write(path, contents).expect("write semantic fixture file");
+        }
+        let repo = Repository::open(&repo_path).expect("open repository");
+        commit_all_for_semantic_test(&repo, "initial semantic fixture")
+            .expect("commit semantic fixture");
+        drop(repo);
+
+        let manager = WorktreeManager::new(&repo_path);
+        let agent = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create semantic agent worktree");
+        (repo_path, agent)
+    }
+
+    fn commit_all_for_semantic_test(repo: &Repository, message: &str) -> Result<Oid> {
+        let mut index = repo.index().context("open semantic fixture index")?;
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .context("stage semantic fixture")?;
+        index.write().context("write semantic fixture index")?;
+        let tree_id = index.write_tree().context("write semantic fixture tree")?;
+        let tree = repo
+            .find_tree(tree_id)
+            .context("find semantic fixture tree")?;
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").context("signature")?;
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .context("commit semantic fixture")
+    }
+
+    fn semantic_preview_options(repo_path: &Path, claim: &str) -> MergePreviewOptions {
+        MergePreviewOptions {
+            collect: MergeCollectOptions {
+                repo: repo_path.to_path_buf(),
+                agent_id: "agent-a".to_string(),
+                claimed_paths: vec![PathBuf::from(claim)],
+                include_full_diff: false,
+                diff_summary_char_limit: DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                validations: Vec::new(),
+            },
+            forces: MergeForceOptions::default(),
+            require_validation: false,
+        }
+    }
+
+    #[test]
+    fn semantic_conflicts_report_same_function_and_dependent_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, agent) = create_semantic_merge_fixture(
+            temp.path(),
+            &[
+                ("src/lib.rs", "pub mod consumer;\npub mod shared;\n"),
+                ("src/shared.rs", "pub fn compute() -> i32 {\n    1\n}\n"),
+                (
+                    "src/consumer.rs",
+                    "use crate::shared::compute;\n\npub fn consume() -> i32 { compute() }\n",
+                ),
+            ],
+        );
+        fs::write(
+            agent.path.join("src/shared.rs"),
+            "pub fn compute() -> i32 {\n    2\n}\n",
+        )
+        .expect("edit candidate function");
+        fs::write(
+            repo_path.join("src/shared.rs"),
+            "pub fn compute() -> i32 {\n    3\n}\n",
+        )
+        .expect("edit primary function");
+        let primary = Repository::open(&repo_path).expect("open primary");
+        commit_all_for_semantic_test(&primary, "change primary function")
+            .expect("commit primary function");
+
+        let preview = preview_merge_apply(semantic_preview_options(&repo_path, "src/shared.rs"))
+            .expect("preview semantic conflict");
+        let semantic = &preview.safety.semantic_conflicts;
+        assert!(semantic.advisory);
+        assert_eq!(
+            semantic.status,
+            SemanticConflictClassificationStatus::Classified
+        );
+        assert!(!semantic.degraded);
+        assert_eq!(semantic.risk, SemanticConflictRisk::Medium);
+        assert_eq!(
+            semantic.conflict_paths,
+            vec![PathBuf::from("src/shared.rs")]
+        );
+        let overlap = semantic.overlaps.first().expect("semantic overlap");
+        assert_eq!(overlap.kind, SemanticConflictOverlapKind::SymbolLevel);
+        assert!(overlap
+            .common_symbols
+            .iter()
+            .any(|symbol| symbol.name == "compute"));
+        assert!(overlap
+            .impacted_files
+            .contains(&PathBuf::from("src/consumer.rs")));
+        assert_eq!(
+            preview.safety.readiness.status,
+            ApplyReadinessStatus::Blocked
+        );
+        assert!(preview
+            .safety
+            .readiness
+            .blockers
+            .contains(&ApplyBlocker::ApplyCheckFailed));
+        let preview_json = serde_json::to_value(&preview).expect("serialize semantic preview");
+        assert_eq!(
+            preview_json["safety"]["semantic_conflicts"]["overlaps"][0]["kind"],
+            "symbol_level"
+        );
+
+        let report = merge_apply_report(MergeApplyOptions {
+            preview: semantic_preview_options(&repo_path, "src/shared.rs"),
+            candidate_validation_commands: Vec::new(),
+        })
+        .expect("build blocked apply report");
+        assert_eq!(report.status, MergeApplyReportStatus::Blocked);
+        assert_eq!(
+            report.preview.safety.semantic_conflicts.overlaps[0].kind,
+            SemanticConflictOverlapKind::SymbolLevel
+        );
+        let report_json = serde_json::to_value(&report).expect("serialize semantic apply report");
+        assert_eq!(
+            report_json["preview"]["safety"]["semantic_conflicts"]["advisory"],
+            true
+        );
+    }
+
+    #[test]
+    fn semantic_conflicts_classify_import_only_as_low_risk() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, agent) = create_semantic_merge_fixture(
+            temp.path(),
+            &[
+                (
+                    "src/lib.rs",
+                    "use crate::alpha::item;\n\npub mod alpha;\npub mod beta;\n\npub fn call() {}\n",
+                ),
+                ("src/alpha.rs", "pub fn item() {}\npub fn renamed() {}\n"),
+                ("src/beta.rs", "pub fn item() {}\n"),
+            ],
+        );
+        fs::write(
+            agent.path.join("src/lib.rs"),
+            "use crate::beta::item;\n\npub mod alpha;\npub mod beta;\n\npub fn call() {}\n",
+        )
+        .expect("edit candidate import");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "use crate::alpha::renamed;\n\npub mod alpha;\npub mod beta;\n\npub fn call() {}\n",
+        )
+        .expect("edit primary import");
+        let primary = Repository::open(&repo_path).expect("open primary");
+        commit_all_for_semantic_test(&primary, "change primary import")
+            .expect("commit primary import");
+
+        let preview = preview_merge_apply(semantic_preview_options(&repo_path, "src/lib.rs"))
+            .expect("preview import conflict");
+        let semantic = &preview.safety.semantic_conflicts;
+        assert_eq!(
+            semantic.status,
+            SemanticConflictClassificationStatus::Classified
+        );
+        assert!(!semantic.degraded);
+        assert_eq!(semantic.risk, SemanticConflictRisk::Low);
+        let overlap = semantic.overlaps.first().expect("import overlap");
+        assert_eq!(overlap.kind, SemanticConflictOverlapKind::ImportOnly);
+        assert_eq!(overlap.risk, SemanticConflictRisk::Low);
+        assert!(overlap.primary.import_only);
+        assert!(overlap.candidate.import_only);
+        assert!(!overlap.primary.touched_imports.is_empty());
+        assert!(!overlap.candidate.touched_imports.is_empty());
+    }
+
+    #[test]
+    fn semantic_conflicts_report_signature_and_impl_overlap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, agent) = create_semantic_merge_fixture(
+            temp.path(),
+            &[(
+                "src/lib.rs",
+                "pub struct Worker;\n\nimpl Worker {\n    pub fn run(&self, value: i32) -> i32 { value }\n}\n",
+            )],
+        );
+        fs::write(
+            agent.path.join("src/lib.rs"),
+            "pub struct Worker;\n\nimpl Worker {\n    pub fn run(&self, value: i64) -> i32 { value as i32 }\n}\n",
+        )
+        .expect("edit candidate signature");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub struct Worker;\n\nimpl Worker {\n    pub fn run(&self, value: i32) -> i64 { value as i64 }\n}\n",
+        )
+        .expect("edit primary signature");
+        let primary = Repository::open(&repo_path).expect("open primary");
+        commit_all_for_semantic_test(&primary, "change primary signature")
+            .expect("commit primary signature");
+
+        let preview = preview_merge_apply(semantic_preview_options(&repo_path, "src/lib.rs"))
+            .expect("preview signature conflict");
+        let overlap = preview
+            .safety
+            .semantic_conflicts
+            .overlaps
+            .first()
+            .expect("signature overlap");
+        assert_eq!(overlap.kind, SemanticConflictOverlapKind::SignatureLevel);
+        assert_eq!(overlap.risk, SemanticConflictRisk::High);
+        assert!(overlap
+            .common_symbols
+            .iter()
+            .any(|symbol| symbol.name == "run"));
+        assert!(overlap
+            .common_impls
+            .iter()
+            .any(|symbol| symbol.impl_target.as_deref() == Some("Worker")));
+        assert!(overlap
+            .common_modules
+            .iter()
+            .any(|module| module == "crate"));
+    }
+
+    #[test]
+    fn semantic_conflicts_mark_unresolved_paths_as_degraded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo_path, agent) = create_semantic_merge_fixture(
+            temp.path(),
+            &[
+                ("README.md", "# Base\n"),
+                ("src/lib.rs", "pub fn ok() {}\n"),
+            ],
+        );
+        fs::write(agent.path.join("README.md"), "# Candidate\n").expect("edit candidate readme");
+        fs::write(repo_path.join("README.md"), "# Primary\n").expect("edit primary readme");
+        let primary = Repository::open(&repo_path).expect("open primary");
+        commit_all_for_semantic_test(&primary, "change primary readme")
+            .expect("commit primary readme");
+
+        let preview = preview_merge_apply(semantic_preview_options(&repo_path, "README.md"))
+            .expect("preview unresolved conflict");
+        let semantic = &preview.safety.semantic_conflicts;
+        assert_eq!(
+            semantic.status,
+            SemanticConflictClassificationStatus::Degraded
+        );
+        assert!(semantic.degraded);
+        assert_eq!(semantic.risk, SemanticConflictRisk::Unknown);
+        assert_eq!(semantic.confidence, SemanticConflictConfidence::None);
+        assert_eq!(
+            semantic.overlaps[0].kind,
+            SemanticConflictOverlapKind::Unresolved
+        );
+        assert!(!semantic.overlaps[0].notes.is_empty());
+    }
+
     #[test]
     fn candidate_collection_holds_read_lease_until_snapshot_finishes() {
         let temp = tempfile::tempdir().expect("tempdir");
