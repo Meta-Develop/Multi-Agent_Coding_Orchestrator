@@ -390,7 +390,8 @@ nix develop . -c cargo deny --locked check -D warnings advisories bans licenses 
 The `.` flake reference uses Nix's Git-filtered source for this repository, so
 ignored local coordination files are not copied into the Nix store. The flake
 exports development shells only; release contents are selected independently
-by Cargo, whose package manifest excludes `.agents`, `.maco`, and `AGENTS.md`.
+by Cargo, whose package manifest excludes `.agents`, `.github`, `.maco`, and
+`AGENTS.md`.
 
 `cargo fetch --locked` is the explicit online boundary for Rust dependencies in
 a fresh checkout. Once that checksum-verified closure is present in the Cargo

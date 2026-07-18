@@ -2,6 +2,7 @@
 name = "multi-agent-coding-orchestrator"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Local-first multi-agent coding orchestrator"
 license = "AGPL-3.0-or-later"
 readme = "README.md"
@@ -12,6 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = [
     ".agent/**",
     ".agents/**",
+    ".github/**",
     ".maco/**",
     ".maco-cache/**",
     "AGENTS.md",
