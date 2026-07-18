@@ -296,16 +296,16 @@ fn normalize_text(text: &str) -> String {
 }
 
 fn collect_repo_files(repo: &Path) -> Result<Vec<PathBuf>> {
-    let deadline = Instant::now()
+    let mut deadline = Instant::now()
         .checked_add(repository_inventory_max_duration())
         .context("repository inventory deadline overflowed")?;
     let binding = crate::worktree::RepositoryBindingGuard::bind(repo)?;
-    let first = collect_git_inventory_snapshot(&binding, deadline)?;
-    let second = collect_git_inventory_snapshot(&binding, deadline)?;
+    let first = collect_git_inventory_snapshot(&binding, &mut deadline)?;
+    let second = collect_git_inventory_snapshot(&binding, &mut deadline)?;
     let stable = if first == second {
         second
     } else {
-        let retry = collect_git_inventory_snapshot(&binding, deadline)?;
+        let retry = collect_git_inventory_snapshot(&binding, &mut deadline)?;
         if second != retry {
             anyhow::bail!("repository inventory changed across its bounded retry");
         }
@@ -348,19 +348,42 @@ thread_local! {
 
 fn collect_git_inventory_snapshot(
     binding: &crate::worktree::RepositoryBindingGuard,
-    deadline: Instant,
+    deadline: &mut Instant,
 ) -> Result<(BTreeSet<PathBuf>, Vec<BoundedTreeEntry>)> {
-    let visible = crate::worktree::bounded_repository_visible_paths_bound(
-        binding,
-        REPOSITORY_INVENTORY_MAX_ENTRIES,
-        REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
-        remaining_inventory_time(deadline, "before bounded Git inventory")?,
-    )?
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let inventory = collect_descriptor_inventory(binding.worktree_binding(), deadline)?;
+    let (visible, process_queue_wait) =
+        crate::worktree::bounded_repository_visible_paths_bound_with_process_wait(
+            binding,
+            REPOSITORY_INVENTORY_MAX_ENTRIES,
+            REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
+            remaining_inventory_time(*deadline, "before bounded Git inventory")?,
+        )?;
+    // The bounded-status layer serializes callers in-process before it starts
+    // its own execution deadline. Exclude only that queue wait from the
+    // repository inventory deadline so concurrent tests or callers do not
+    // consume one another's real inventory budget.
+    extend_inventory_deadline(
+        deadline,
+        process_queue_wait,
+        "bounded Git inventory queue wait",
+    )?;
+    let visible = visible.into_iter().collect::<BTreeSet<_>>();
+    let inventory = collect_descriptor_inventory(binding.worktree_binding(), *deadline)?;
     binding.verify()?;
     Ok((visible, inventory))
+}
+
+fn extend_inventory_deadline(
+    deadline: &mut Instant,
+    duration: Duration,
+    phase: &str,
+) -> Result<()> {
+    if duration.is_zero() {
+        return Ok(());
+    }
+    *deadline = deadline.checked_add(duration).with_context(|| {
+        format!("repository inventory deadline overflowed while excluding {phase}")
+    })?;
+    Ok(())
 }
 
 fn collect_descriptor_inventory(

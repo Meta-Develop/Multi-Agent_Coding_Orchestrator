@@ -71,15 +71,15 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
         .context("repository map requires a non-bare repository")?
         .to_path_buf();
     let repository_binding = crate::worktree::RepositoryBindingGuard::bind(&root)?;
-    let deadline = Instant::now()
+    let mut deadline = Instant::now()
         .checked_add(REPOSITORY_MAP_MAX_DURATION)
         .context("repository map deadline overflowed")?;
-    let first = capture_repository_map_snapshot(&repository_binding, deadline)?;
-    let second = capture_repository_map_snapshot(&repository_binding, deadline)?;
+    let first = capture_repository_map_snapshot(&repository_binding, &mut deadline)?;
+    let second = capture_repository_map_snapshot(&repository_binding, &mut deadline)?;
     let (statuses, inventory) = if first == second {
         second
     } else {
-        let retry = capture_repository_map_snapshot(&repository_binding, deadline)?;
+        let retry = capture_repository_map_snapshot(&repository_binding, &mut deadline)?;
         if second != retry {
             anyhow::bail!("repository map changed across its bounded retry");
         }
@@ -97,16 +97,25 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
 
 fn capture_repository_map_snapshot(
     binding: &crate::worktree::RepositoryBindingGuard,
-    deadline: Instant,
+    deadline: &mut Instant,
 ) -> Result<RepositoryMapSnapshot> {
-    let statuses = crate::worktree::bounded_repository_status_paths_bound(
-        binding,
-        REPOSITORY_MAP_MAX_ENTRIES,
-        REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
-        remaining_map_time(deadline, "before bounded Git status")?,
-    )?
-    .into_iter()
-    .collect::<BTreeMap<_, _>>();
+    let (statuses, process_queue_wait) =
+        crate::worktree::bounded_repository_status_paths_bound_with_process_wait(
+            binding,
+            REPOSITORY_MAP_MAX_ENTRIES,
+            REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
+            remaining_map_time(*deadline, "before bounded Git status")?,
+        )?;
+    // The worktree status path excludes only process-local serializer queue
+    // wait from its own budget. Keep repository-map's outer deadline aligned
+    // so unrelated in-process status callers do not spend this map's real
+    // status, descriptor-walk, and classification budget.
+    extend_map_deadline(
+        deadline,
+        process_queue_wait,
+        "bounded Git status queue wait",
+    )?;
+    let statuses = statuses.into_iter().collect::<BTreeMap<_, _>>();
     let inventory = BoundedTreeWalker::walk_bound_with(
         binding.worktree_binding(),
         BoundedTreeWalkLimits {
@@ -114,7 +123,7 @@ fn capture_repository_map_snapshot(
             max_entries: REPOSITORY_MAP_MAX_ENTRIES,
             max_path_bytes: REPOSITORY_MAP_MAX_PATH_BYTES,
             max_total_path_bytes: REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
-            max_duration: remaining_map_time(deadline, "before descriptor inventory")?,
+            max_duration: remaining_map_time(*deadline, "before descriptor inventory")?,
             same_device: true,
         },
         |entry| {
@@ -129,6 +138,16 @@ fn capture_repository_map_snapshot(
     )?;
     binding.verify()?;
     Ok((statuses, inventory))
+}
+
+fn extend_map_deadline(deadline: &mut Instant, duration: Duration, phase: &str) -> Result<()> {
+    if duration.is_zero() {
+        return Ok(());
+    }
+    *deadline = deadline
+        .checked_add(duration)
+        .with_context(|| format!("repository map deadline overflowed while excluding {phase}"))?;
+    Ok(())
 }
 
 fn remaining_map_time(deadline: Instant, phase: &str) -> Result<Duration> {

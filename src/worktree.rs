@@ -71,11 +71,13 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-// The total budget includes contention on the process-wide runtime lock,
-// startup scavenging, repository/index capture, private Git setup, both Git
-// commands, and resumable cleanup. Individual Git commands remain bounded by
-// the same absolute deadline; this larger envelope prevents unrelated local
-// repositories from spuriously exhausting the shared runtime-lock budget.
+// The total budget starts after the in-process status serializer is acquired.
+// Queueing behind another caller in this process is not subprocess or private
+// runtime work, so it must not spend the bounded Git execution budget. Once a
+// caller is admitted, the deadline covers the global runtime lock, startup
+// scavenging, repository/index capture, private Git setup, Git commands, and
+// resumable cleanup. Individual Git commands remain bounded by this same
+// absolute deadline and the per-command cap.
 #[cfg(test)]
 const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";
@@ -3934,40 +3936,64 @@ pub(crate) fn bounded_repository_status_paths(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<Vec<(PathBuf, [u8; 2])>> {
+) -> Result<BoundedStatusPathRecords> {
     let binding = RepositoryBindingGuard::bind(path)?;
     bounded_repository_status_paths_bound(&binding, max_entries, max_output_bytes, timeout)
 }
+
+type BoundedStatusPathRecords = Vec<(PathBuf, [u8; 2])>;
 
 pub(crate) fn bounded_repository_status_paths_bound(
     binding: &RepositoryBindingGuard,
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<Vec<(PathBuf, [u8; 2])>> {
-    binding.verify()?;
-    let records =
-        bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
-    binding.verify()?;
-    parse_porcelain_v1_z(&records.status, max_entries)
+) -> Result<BoundedStatusPathRecords> {
+    let (paths, _) = bounded_repository_status_paths_bound_with_process_wait(
+        binding,
+        max_entries,
+        max_output_bytes,
+        timeout,
+    )?;
+    Ok(paths)
 }
 
-pub(crate) fn bounded_repository_visible_paths_bound(
+pub(crate) fn bounded_repository_status_paths_bound_with_process_wait(
     binding: &RepositoryBindingGuard,
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(BoundedStatusPathRecords, Duration)> {
     binding.verify()?;
     let records =
         bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
     binding.verify()?;
-    parse_nul_paths(&records.visible, max_entries)
+    Ok((
+        parse_porcelain_v1_z(&records.status, max_entries)?,
+        records.process_queue_wait,
+    ))
+}
+
+pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
+    binding: &RepositoryBindingGuard,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<(Vec<PathBuf>, Duration)> {
+    binding.verify()?;
+    let records =
+        bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
+    binding.verify()?;
+    Ok((
+        parse_nul_paths(&records.visible, max_entries)?,
+        records.process_queue_wait,
+    ))
 }
 
 struct BoundedWorktreeRecords {
     visible: Vec<u8>,
     status: Vec<u8>,
+    process_queue_wait: Duration,
 }
 
 fn bounded_worktree_records(
@@ -3976,35 +4002,39 @@ fn bounded_worktree_records(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedWorktreeRecords> {
-    let deadline = worktree_status_deadline(timeout)?;
-    let _process_lock = lock_bounded_status_process_until(deadline)?;
+    let (_process_lock, deadline, process_queue_wait) =
+        enter_bounded_status_process_scope(timeout)?;
     ensure_worktree_status_deadline(deadline, "before bounded-status runtime-root setup")?;
     let state_root = bounded_status_runtime_root(path)?;
     ensure_worktree_status_deadline(deadline, "after bounded-status runtime-root setup")?;
-    bounded_worktree_status_in_runtime_until(
+    let mut records = bounded_worktree_status_in_runtime_until(
         path,
         max_entries,
         max_output_bytes,
         &state_root,
         |_| Ok(()),
         deadline,
-    )
+    )?;
+    records.process_queue_wait = process_queue_wait;
+    Ok(records)
 }
 
-fn lock_bounded_status_process_until(
-    deadline: Instant,
-) -> Result<std::sync::MutexGuard<'static, ()>> {
+fn enter_bounded_status_process_scope(
+    timeout: Duration,
+) -> Result<(std::sync::MutexGuard<'static, ()>, Instant, Duration)> {
+    validate_worktree_status_timeout(timeout)?;
+    let queued_at = Instant::now();
+    let process_lock = lock_bounded_status_process();
+    let process_queue_wait = queued_at.elapsed();
+    let deadline = worktree_status_deadline(timeout)?;
+    Ok((process_lock, deadline, process_queue_wait))
+}
+
+fn lock_bounded_status_process() -> std::sync::MutexGuard<'static, ()> {
     let lock = BOUNDED_STATUS_PROCESS_LOCK.get_or_init(|| std::sync::Mutex::new(()));
-    loop {
-        match lock.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let remaining =
-                    remaining_worktree_status_time(deadline, "before bounded-status process lock")?;
-                std::thread::sleep(remaining.min(Duration::from_millis(5)));
-            }
-        }
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -4020,8 +4050,7 @@ fn bounded_worktree_is_clean_in_runtime<F>(
 where
     F: FnOnce(&SafeRoot) -> Result<()>,
 {
-    let deadline = worktree_status_deadline(timeout)?;
-    let _process_lock = lock_bounded_status_process_until(deadline)?;
+    let (_process_lock, deadline, _) = enter_bounded_status_process_scope(timeout)?;
     bounded_worktree_status_in_runtime_until(
         path,
         max_entries,
@@ -4216,6 +4245,7 @@ where
         Ok(BoundedWorktreeRecords {
             visible,
             status: bytes,
+            process_queue_wait: Duration::ZERO,
         })
     })();
     let cleanup = (|| -> Result<usize> {
@@ -4889,10 +4919,15 @@ fn scavenge_bounded_status_runtimes_until(
     )
 }
 
-fn worktree_status_deadline(timeout: Duration) -> Result<Instant> {
+fn validate_worktree_status_timeout(timeout: Duration) -> Result<()> {
     if timeout.is_zero() {
         bail!("worktree status total time budget must be non-zero");
     }
+    Ok(())
+}
+
+fn worktree_status_deadline(timeout: Duration) -> Result<Instant> {
+    validate_worktree_status_timeout(timeout)?;
     Instant::now()
         .checked_add(timeout)
         .context("worktree status total time budget overflowed")
@@ -6560,6 +6595,33 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "lock wait ignored the total operation deadline"
         );
+    }
+
+    #[test]
+    fn bounded_status_process_lock_wait_does_not_consume_execution_budget() {
+        let held = lock_bounded_status_process();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || -> Result<()> {
+            ready_tx
+                .send(())
+                .context("failed to signal bounded-status process-lock wait")?;
+            let (_guard, deadline, _process_queue_wait) =
+                enter_bounded_status_process_scope(Duration::from_millis(100))?;
+            ensure_worktree_status_deadline(
+                deadline,
+                "immediately after bounded-status process lock acquisition",
+            )
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker started waiting for process lock");
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+        worker
+            .join()
+            .expect("bounded-status process-lock worker panicked")
+            .expect("process-lock queue wait must be excluded from execution budget");
     }
 
     #[cfg(target_os = "linux")]
