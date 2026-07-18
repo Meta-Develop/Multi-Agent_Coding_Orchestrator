@@ -2307,13 +2307,23 @@ enum PrSubcommand {
 #[derive(Debug, Args)]
 struct PrPreviewArgs {
     /// Stable agent id used when the worktree was created.
-    agent_id: String,
+    #[arg(required_unless_present = "from_branch")]
+    agent_id: Option<String>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// Explicit claimed path. Repeat to provide multiple claims.
-    #[arg(long, required = true)]
+    #[arg(long, required_unless_present = "from_branch")]
     claim: Vec<PathBuf>,
+    /// Publish committed work from this local branch instead of a managed agent worktree.
+    #[arg(long)]
+    from_branch: Option<String>,
+    /// Build a deterministic squash import commit on this local base branch before publishing.
+    #[arg(long, requires = "from_branch")]
+    squash_onto: Option<String>,
+    /// Exclude a repository-local path from the published branch snapshot. Repeat for multiple paths.
+    #[arg(long = "exclude", requires = "from_branch")]
+    exclude: Vec<PathBuf>,
     /// Validation JSON. With --require-validation, copy the exact current preview.candidate.validation_binding into an envelope with passed reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
@@ -2334,13 +2344,23 @@ struct PrPreviewArgs {
 #[derive(Debug, Args)]
 struct PrPublishArgs {
     /// Stable agent id used when the worktree was created.
-    agent_id: String,
+    #[arg(required_unless_present = "from_branch")]
+    agent_id: Option<String>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// Explicit claimed path. Repeat to provide multiple claims.
-    #[arg(long, required = true)]
+    #[arg(long, required_unless_present = "from_branch")]
     claim: Vec<PathBuf>,
+    /// Publish committed work from this local branch instead of a managed agent worktree.
+    #[arg(long)]
+    from_branch: Option<String>,
+    /// Build a deterministic squash import commit on this local base branch before publishing.
+    #[arg(long, requires = "from_branch")]
+    squash_onto: Option<String>,
+    /// Exclude a repository-local path from the published branch snapshot. Repeat for multiple paths.
+    #[arg(long = "exclude", requires = "from_branch")]
+    exclude: Vec<PathBuf>,
     /// Candidate-bound validation envelope produced after previewing the clean, committed candidate; legacy report arrays are unbound.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
@@ -2456,15 +2476,19 @@ struct IssueCreateArgs {
 fn pr_options_from_preview_args(
     args: PrPreviewArgs,
 ) -> Result<(PrPublicationOptions, ValidationEvidenceBundle)> {
-    let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
+    let agent_id = pr_publication_agent_id(args.agent_id, args.from_branch.as_deref())?;
+    let validation_evidence = load_validation_evidence(&args.validation_report, &agent_id)?;
     Ok((
         PrPublicationOptions {
             repo: args.repo,
-            agent_id: args.agent_id,
+            agent_id,
             claimed_paths: args.claim,
             validations: Vec::new(),
             forge: args.forge,
             draft: !args.ready,
+            from_branch: args.from_branch,
+            squash_onto: args.squash_onto,
+            exclude_paths: args.exclude,
         },
         validation_evidence,
     ))
@@ -2473,18 +2497,33 @@ fn pr_options_from_preview_args(
 fn pr_options_from_publish_args(
     args: PrPublishArgs,
 ) -> Result<(PrPublicationOptions, ValidationEvidenceBundle)> {
-    let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
+    let agent_id = pr_publication_agent_id(args.agent_id, args.from_branch.as_deref())?;
+    let validation_evidence = load_validation_evidence(&args.validation_report, &agent_id)?;
     Ok((
         PrPublicationOptions {
             repo: args.repo,
-            agent_id: args.agent_id,
+            agent_id,
             claimed_paths: args.claim,
             validations: Vec::new(),
             forge: args.forge,
             draft: !args.ready,
+            from_branch: args.from_branch,
+            squash_onto: args.squash_onto,
+            exclude_paths: args.exclude,
         },
         validation_evidence,
     ))
+}
+
+fn pr_publication_agent_id(agent_id: Option<String>, from_branch: Option<&str>) -> Result<String> {
+    match (agent_id, from_branch) {
+        (Some(agent_id), None) => Ok(agent_id),
+        (None, Some(branch)) => publication::branch_publication_agent_id(branch),
+        (Some(_), Some(_)) => {
+            bail!("agent id positional argument cannot be combined with --from-branch")
+        }
+        (None, None) => bail!("provide an agent id or --from-branch"),
+    }
 }
 
 fn issue_options_from_args(

@@ -1396,6 +1396,9 @@ where
         validations: Vec::new(),
         forge,
         draft: plan.publish_mode == AutopilotPublishMode::DraftOnly,
+        from_branch: None,
+        squash_onto: None,
+        exclude_paths: Vec::new(),
     };
 
     let prepared_report = match (hooks.prepare)(publication_options()) {
@@ -2794,6 +2797,7 @@ fn blocker_label(blocker: ApplyBlocker) -> &'static str {
         ApplyBlocker::DirtyPrimary => "dirty_primary",
         ApplyBlocker::StaleBase => "stale_base",
         ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
+        ApplyBlocker::ExcludedReference => "excluded_reference",
         ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
         ApplyBlocker::ValidationMissing => "validation_missing",
         ApplyBlocker::ValidationNotRun => "validation_not_run",

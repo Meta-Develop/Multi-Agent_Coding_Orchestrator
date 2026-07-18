@@ -29,6 +29,9 @@ fn pr_publish_help_describes_bound_two_stage_validation() -> Result<()> {
     assert!(help.contains("origin host/owner/repo"));
     assert!(help.contains("OID receipt"));
     assert!(help.contains("journals retry state"));
+    assert!(help.contains("--from-branch"));
+    assert!(help.contains("--squash-onto"));
+    assert!(help.contains("--exclude"));
     Ok(())
 }
 
@@ -1377,6 +1380,300 @@ fn pr_publish_bound_evidence_rejects_later_same_path_commit_without_push() -> Re
 }
 
 #[test]
+fn pr_publish_from_branch_requires_and_accepts_bound_validation() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let base_branch = git_current_branch(&repo_path)?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", "-b", "task/docs"])?;
+    fs::write(repo_path.join("README.md"), "# Smoke\n\nbranch publish\n")
+        .context("edit task branch")?;
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    let task_head = commit_all(&repo, "task branch candidate").context("commit task branch")?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", &base_branch])?;
+
+    let missing = run_failure_json(&[
+        "pr",
+        "publish",
+        "--from-branch",
+        "task/docs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--forge",
+        "fake",
+        "--require-validation",
+        "--json",
+    ])?;
+    assert_eq!(missing["status"], "blocked");
+    assert_contains(&missing["blockers"], "validation_missing")?;
+    assert_eq!(missing["created"], false);
+
+    let preview = run_success_json(&[
+        "pr",
+        "preview",
+        "--from-branch",
+        "task/docs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(preview["status"], "preview");
+    assert_eq!(preview["branch"], "task/docs");
+    assert_eq!(
+        preview["preview"]["candidate"]["validation_binding"]["agent_head"],
+        task_head.to_string()
+    );
+    let validation_path = temp.path().join("branch-validation.json");
+    write_bound_validation(
+        &validation_path,
+        &preview["preview"]["candidate"]["validation_binding"],
+    )?;
+
+    let report = run_success_json(&[
+        "pr",
+        "publish",
+        "--from-branch",
+        "task/docs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--validation-report",
+        path_str(&validation_path)?,
+        "--require-validation",
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "published");
+    assert_eq!(report["validation_required"], true);
+    assert_eq!(report["head_id"], task_head.to_string());
+    assert_eq!(report["commit_id"], task_head.to_string());
+    assert_eq!(report["changed_paths"][0], "README.md");
+    assert_eq!(
+        report["preview"]["safety"]["validation_evidence"]["binding_status"],
+        "bound"
+    );
+    Ok(())
+}
+
+#[test]
+fn pr_publish_squash_onto_builds_import_commit_on_disjoint_base() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let base_branch = git_current_branch(&repo_path)?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", "-b", "task/squash"])?;
+    fs::write(repo_path.join("README.md"), "# Smoke\n\nsquashed branch\n")
+        .context("edit task branch")?;
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    let task_head = commit_all(&repo, "squashed task").context("commit task branch")?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", &base_branch])?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "checkout",
+        "--orphan",
+        "public-base",
+    ])?;
+    fs::write(repo_path.join("README.md"), "# Public snapshot\n").context("write public readme")?;
+    let repo = Repository::open(&repo_path).context("reopen repo")?;
+    let public_base = commit_all(&repo, "public base snapshot").context("commit public base")?;
+
+    let preview = run_success_json(&[
+        "pr",
+        "preview",
+        "--from-branch",
+        "task/squash",
+        "--squash-onto",
+        "public-base",
+        "--repo",
+        path_str(&repo_path)?,
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(preview["status"], "preview");
+    let planned_import = Oid::from_str(preview["head_id"].as_str().context("preview head id")?)
+        .context("parse planned import")?;
+    assert!(repo.find_commit(planned_import).is_err());
+
+    let report = run_success_json(&[
+        "pr",
+        "publish",
+        "--from-branch",
+        "task/squash",
+        "--squash-onto",
+        "public-base",
+        "--repo",
+        path_str(&repo_path)?,
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "published");
+    assert_eq!(report["base"], "public-base");
+    assert_ne!(report["head_id"], task_head.to_string());
+    let import_head = Oid::from_str(report["head_id"].as_str().context("head id")?)
+        .context("parse import head")?;
+    assert_eq!(commit_parent(&repo_path, import_head)?, Some(public_base));
+    assert_eq!(
+        git_show_file(&repo_path, &format!("{import_head}:README.md"))?,
+        "# Smoke\n\nsquashed branch\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn pr_publish_exclude_refuses_referenced_missing_path() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let base_branch = git_current_branch(&repo_path)?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "checkout",
+        "-b",
+        "task/context",
+    ])?;
+    fs::create_dir_all(repo_path.join("agent-context")).context("create agent context")?;
+    fs::write(
+        repo_path.join("agent-context/context.json"),
+        "{\"note\":true}\n",
+    )
+    .context("write context")?;
+    fs::write(
+        repo_path.join("Cargo.toml"),
+        "[package]\nname = \"smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[package.metadata]\nagent_context = \"agent-context/context.json\"\n",
+    )
+    .context("write cargo manifest reference")?;
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    commit_all(&repo, "task context").context("commit task context")?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", &base_branch])?;
+
+    let report = run_failure_json(&[
+        "pr",
+        "publish",
+        "--from-branch",
+        "task/context",
+        "--exclude",
+        "agent-context",
+        "--repo",
+        path_str(&repo_path)?,
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(report["created"], false);
+    assert_contains(&report["blockers"], "excluded_reference")?;
+    assert!(report["next_action"]
+        .as_str()
+        .context("next action")?
+        .contains("excluded path"));
+    assert!(serde_json::to_string(&report)
+        .context("serialize report")?
+        .contains("agent-context"));
+    Ok(())
+}
+
+#[test]
+fn pr_publish_exclude_refuses_rust_path_attribute_reference() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let base_branch = git_current_branch(&repo_path)?;
+    run_git(&[
+        "-C",
+        path_str(&repo_path)?,
+        "checkout",
+        "-b",
+        "task/rust-exclude",
+    ])?;
+    fs::write(
+        repo_path.join("src/secret.rs"),
+        "pub fn hidden() -> bool { true }\n",
+    )
+    .context("write excluded rust module")?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "#[path = \"secret.rs\"]\nmod generated;\n\npub fn ok() -> bool { generated::hidden() }\n",
+    )
+    .context("write rust path attribute reference")?;
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    commit_all(&repo, "task rust excluded reference").context("commit rust excluded reference")?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", &base_branch])?;
+
+    let report = run_failure_json(&[
+        "pr",
+        "publish",
+        "--from-branch",
+        "task/rust-exclude",
+        "--exclude",
+        "src/secret.rs",
+        "--repo",
+        path_str(&repo_path)?,
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "blocked");
+    assert_contains(&report["blockers"], "excluded_reference")?;
+    assert!(serde_json::to_string(&report)
+        .context("serialize report")?
+        .contains("secret.rs"));
+    Ok(())
+}
+
+#[test]
+fn pr_publish_from_branch_blocks_dirty_primary_and_stale_base() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let base_branch = git_current_branch(&repo_path)?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", "-b", "task/gates"])?;
+    fs::write(repo_path.join("README.md"), "# Smoke\n\nbranch gate\n")
+        .context("edit task branch")?;
+    let repo = Repository::open(&repo_path).context("open repo")?;
+    commit_all(&repo, "task gate branch").context("commit task gate branch")?;
+    run_git(&["-C", path_str(&repo_path)?, "checkout", &base_branch])?;
+
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub fn ok() -> bool { false }\n",
+    )
+    .context("dirty primary lib")?;
+    let dirty = run_failure_json(&[
+        "pr",
+        "publish",
+        "--from-branch",
+        "task/gates",
+        "--repo",
+        path_str(&repo_path)?,
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(dirty["status"], "blocked");
+    assert_contains(&dirty["blockers"], "dirty_primary")?;
+
+    let repo = Repository::open(&repo_path).context("reopen repo")?;
+    commit_all(&repo, "advance base after task branch").context("advance base")?;
+    let stale = run_failure_json(&[
+        "pr",
+        "publish",
+        "--from-branch",
+        "task/gates",
+        "--repo",
+        path_str(&repo_path)?,
+        "--forge",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(stale["status"], "blocked");
+    assert_contains(&stale["blockers"], "stale_base")?;
+    Ok(())
+}
+
+#[test]
 fn issue_preview_redacts_body_and_does_not_create_issue() -> Result<()> {
     let report = run_success_json(&[
         "issue",
@@ -1829,6 +2126,30 @@ fn git_ref_exists(bare_repo: &Path, ref_name: &str) -> Result<bool> {
         .output()
         .context("git show-ref")?;
     Ok(output.status.success())
+}
+
+fn git_current_branch(repo_path: &Path) -> Result<String> {
+    let repo = Repository::open(repo_path).context("open repo for branch name")?;
+    let branch = repo
+        .head()
+        .context("read repo head")?
+        .shorthand()
+        .map(ToString::to_string)
+        .context("current branch name was not UTF-8")?;
+    Ok(branch)
+}
+
+fn commit_parent(repo_path: &Path, commit: Oid) -> Result<Option<Oid>> {
+    let repo = Repository::open(repo_path).context("open repo for commit parent")?;
+    let commit = repo.find_commit(commit).context("find commit")?;
+    match commit.parent_count() {
+        0 => Ok(None),
+        1 => commit
+            .parent_id(0)
+            .map(Some)
+            .context("read first commit parent"),
+        count => anyhow::bail!("expected at most one parent, found {count}"),
+    }
 }
 
 fn path_str(path: &Path) -> Result<&str> {

@@ -4,16 +4,20 @@ use crate::{
     llm::{RedactionSummary, Redactor},
     merge::{
         self, ApplyBlocker, ApplyBlockerDetail, ApplyBlockerDisposition, ApplyReadinessStatus,
-        BoundValidationEvidenceBundle, MergeApplyPreview, MergeCandidate, MergeCollectOptions,
-        MergeForceOptions, MergePreviewOptions, OutputSummary, RepoCommonLock, SafetyCheckStatus,
-        ValidationEvidenceBundle, ValidationReport,
+        BoundValidationEvidenceBundle, ChangeKind, ChangedPath, DiffOutput, MergeApplyPreview,
+        MergeCandidate, MergeCollectOptions, MergeForceOptions, MergePreviewOptions, OutputSummary,
+        RepoCommonLock, SafetyCheckStatus, ValidationEvidenceBundle, ValidationReport,
+        WorktreeMergeMetadata,
     },
     process_runner::{StdinMode, TrustedFixedNetworkProfile},
     safe_state::SafeRoot,
+    sync::normalize_repo_relative_path,
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
-use git2::{ObjectType, Oid, Repository};
+use git2::{
+    BranchType, Delta, DiffFormat, DiffOptions, ObjectType, Oid, Repository, Signature, Time, Tree,
+};
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,6 +62,7 @@ const MAX_PUBLICATION_CLOSURE_OBJECTS: usize = 262_144;
 const MAX_PUBLICATION_CLOSURE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_PUBLICATION_TREE_DEPTH: usize = 256;
 const MAX_PUBLICATION_COMMIT_DEPTH: usize = 262_144;
+const MAX_EXCLUSION_REFERENCE_FILE_BYTES: usize = 1024 * 1024;
 const GITHUB_PR_RECEIPT_FIELDS: &str = "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft,title,body,headRefName,headRepository,headRepositoryOwner,isCrossRepository,author";
 const GITHUB_ISSUE_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state";
 const GITHUB_PR_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup";
@@ -1139,6 +1144,9 @@ pub struct PrPublicationOptions {
     pub validations: Vec<ValidationReport>,
     pub forge: ForgeKind,
     pub draft: bool,
+    pub from_branch: Option<String>,
+    pub squash_onto: Option<String>,
+    pub exclude_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1148,6 +1156,28 @@ pub struct IssuePublicationOptions {
     pub body: String,
     pub labels: Vec<String>,
     pub forge: ForgeKind,
+}
+
+fn validate_publication_branch_name(branch: &str, label: &str) -> Result<()> {
+    if branch.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    validate_publication_ref(&format!("refs/heads/{branch}"))
+        .with_context(|| format!("{label} is not a safe local branch name"))
+}
+
+pub fn branch_publication_agent_id(branch: &str) -> Result<String> {
+    validate_publication_branch_name(branch, "from-branch")?;
+    let mut segment = sanitize_url_segment(branch);
+    if segment.len() > 38 {
+        segment.truncate(38);
+        segment = segment.trim_matches('-').to_string();
+    }
+    if segment.is_empty() {
+        segment = "branch".to_string();
+    }
+    let id = format!("branch-{segment}-{:016x}", stable_hash(branch.as_bytes()));
+    crate::worktree::normalize_agent_id(&id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1679,6 +1709,14 @@ pub fn preview_pr_with_validation_evidence(
     require_validation: bool,
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<PrPublicationReport> {
+    if options.from_branch.is_some() {
+        return preview_branch_pr_with_validation_evidence(
+            options,
+            require_validation,
+            validation_evidence,
+        );
+    }
+    ensure_worktree_publication_options(&options)?;
     let preview = build_merge_preview(&options, require_validation, validation_evidence)?;
     publication_report_from_preview(options, preview)
 }
@@ -1694,6 +1732,7 @@ pub(crate) fn preview_pr_with_validation_evidence_and_write_lease(
     validation_evidence: ValidationEvidenceBundle,
     write_lease: &ManagedWorktreeWriteLease,
 ) -> Result<PrPublicationReport> {
+    ensure_worktree_publication_options(&options)?;
     let preview = build_merge_preview_with_write_lease(
         &options,
         require_validation,
@@ -1961,7 +2000,9 @@ fn publication_report_from_preview(
 ) -> Result<PrPublicationReport> {
     let primary_repo = Repository::open(&preview.candidate.metadata.primary_repo_root)
         .context("failed to open primary repository")?;
-    let base = current_branch_name(&primary_repo)?.unwrap_or_else(|| "HEAD".to_string());
+    let base = options.squash_onto.clone().map(Ok).unwrap_or_else(|| {
+        current_branch_name(&primary_repo).map(|name| name.unwrap_or_else(|| "HEAD".to_string()))
+    })?;
     let body = pr_body(&preview);
     let status = if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         PrPublicationStatus::Blocked
@@ -2005,6 +2046,7 @@ fn publication_report_from_preview(
 }
 
 pub fn publish_pr(options: PrPublicationOptions) -> Result<PrPublicationReport> {
+    ensure_worktree_publication_options(&options)?;
     let repo_root = discover_primary_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo_root);
     let write_lease = manager
@@ -2016,6 +2058,19 @@ pub fn publish_pr(options: PrPublicationOptions) -> Result<PrPublicationReport> 
             )
         })?;
     publish_pr_with_write_lease(options, &write_lease)
+}
+
+fn ensure_worktree_publication_options(options: &PrPublicationOptions) -> Result<()> {
+    if options.from_branch.is_some() {
+        bail!("worktree publication entrypoint cannot be used with --from-branch");
+    }
+    if options.squash_onto.is_some() {
+        bail!("--squash-onto requires --from-branch");
+    }
+    if !options.exclude_paths.is_empty() {
+        bail!("--exclude requires --from-branch");
+    }
+    Ok(())
 }
 
 pub fn publish_pr_with_validation_requirement(
@@ -2031,6 +2086,14 @@ pub fn publish_pr_with_validation_evidence(
     require_validation: bool,
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<PrPublicationReport> {
+    if options.from_branch.is_some() {
+        return publish_branch_pr_with_validation_evidence(
+            options,
+            require_validation,
+            validation_evidence,
+        );
+    }
+    ensure_worktree_publication_options(&options)?;
     let repo_root = discover_primary_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo_root);
     let write_lease = manager
@@ -2059,6 +2122,7 @@ fn publish_pr_with_validation_evidence_after_lock<F>(
 where
     F: FnOnce(),
 {
+    ensure_worktree_publication_options(&options)?;
     let repo_root = discover_primary_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo_root);
     let write_lease = manager
@@ -2310,8 +2374,641 @@ fn publish_pr_with_verified_authority(
             "rerun pr preview and validation for the current committed candidate before publishing",
         ));
     }
-    report = final_report;
+    complete_pr_publication_effects(
+        final_report,
+        &repo_root,
+        &worktree_path,
+        raw_remote_url,
+        source_guard,
+    )
+}
 
+fn preview_branch_pr_with_validation_evidence(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<PrPublicationReport> {
+    ensure_branch_publication_options(&options)?;
+    let (preview, excluded_reference) =
+        build_branch_publication_preview(&options, require_validation, validation_evidence)?;
+    let report = publication_report_from_preview(options, preview)?;
+    Ok(block_excluded_reference_if_needed(
+        report,
+        excluded_reference,
+    ))
+}
+
+fn publish_branch_pr_with_validation_evidence(
+    options: PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<PrPublicationReport> {
+    ensure_branch_publication_options(&options)?;
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let _lock = RepoCommonLock::acquire(&repo_root, "pr-publish")?;
+    let mut report = preview_branch_pr_with_validation_evidence(
+        options.clone(),
+        require_validation,
+        validation_evidence.clone(),
+    )?;
+    if report.readiness == ApplyReadinessStatus::Blocked {
+        return Ok(report);
+    }
+    let reviewed_binding = report.preview.candidate.validation_binding.clone();
+    let published_commit = reviewed_binding.agent_head.clone();
+    report.commit_id = published_commit.clone();
+    report.head_id = report.preview.candidate.metadata.agent_head.clone();
+
+    let primary_repo = Repository::open(&repo_root).context("failed to open primary repository")?;
+    let raw_remote_url = publication_remote_url_for_forge(report.forge, &primary_repo)?;
+    if options.squash_onto.is_some() || !options.exclude_paths.is_empty() {
+        let materialized = materialize_branch_publication_import_commit(&options)?;
+        if Some(materialized.to_string()) != reviewed_binding.agent_head {
+            return Ok(block_publication(
+                report,
+                ApplyBlocker::StaleBase,
+                "branch publication import commit changed before external publication",
+                "rerun pr preview and validation for the current branch candidate before publishing",
+            ));
+        }
+    }
+
+    let mut final_report = preview_branch_pr_with_validation_evidence(
+        options,
+        require_validation,
+        validation_evidence,
+    )?;
+    final_report.commit_id = published_commit;
+    final_report.head_id = final_report.preview.candidate.metadata.agent_head.clone();
+    final_report.remote = raw_remote_url.as_deref().map(redact_remote_url);
+    if final_report.readiness == ApplyReadinessStatus::Blocked {
+        return Ok(final_report);
+    }
+    if final_report.preview.candidate.validation_binding != reviewed_binding {
+        return Ok(block_publication(
+            final_report,
+            ApplyBlocker::StaleBase,
+            "branch publication candidate changed before external publication",
+            "rerun pr preview and validation for the current branch candidate before publishing",
+        ));
+    }
+    complete_pr_publication_effects(final_report, &repo_root, &repo_root, raw_remote_url, None)
+}
+
+fn ensure_branch_publication_options(options: &PrPublicationOptions) -> Result<()> {
+    let branch = options
+        .from_branch
+        .as_deref()
+        .context("--from-branch is required for branch publication")?;
+    validate_publication_branch_name(branch, "from-branch")?;
+    if let Some(base) = options.squash_onto.as_deref() {
+        validate_publication_branch_name(base, "squash-onto")?;
+    }
+    Ok(())
+}
+
+fn publication_remote_url_for_forge(forge: ForgeKind, repo: &Repository) -> Result<Option<String>> {
+    match forge {
+        ForgeKind::Fake => Ok(None),
+        ForgeKind::Git => Ok(Some(
+            remote_url(repo, "origin").context("Git publication requires an 'origin' remote")?,
+        )),
+        ForgeKind::Github => Ok(Some(
+            remote_url(repo, "origin")
+                .context("GitHub PR publication requires an 'origin' remote")?,
+        )),
+    }
+}
+
+fn build_branch_publication_preview(
+    options: &PrPublicationOptions,
+    require_validation: bool,
+    validation_evidence: ValidationEvidenceBundle,
+) -> Result<(MergeApplyPreview, Option<ExcludedReference>)> {
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let repo = Repository::open(&repo_root)
+        .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
+    let source_branch = options
+        .from_branch
+        .as_deref()
+        .context("--from-branch is required for branch publication")?;
+    let base_branch = branch_publication_base(&repo, options.squash_onto.as_deref())?;
+    if source_branch == base_branch {
+        bail!("--from-branch must differ from the publication base branch");
+    }
+
+    let excluded_paths = normalize_exclude_paths(&options.exclude_paths)?;
+    let source_oid = branch_head_oid(&repo, source_branch, "from-branch")?;
+    let base_oid = branch_head_oid(&repo, &base_branch, "publication base")?;
+    let current_head = repo.head().ok().and_then(|head| head.target());
+    let source_commit = repo
+        .find_commit(source_oid)
+        .with_context(|| format!("failed to read from-branch commit {source_oid}"))?;
+    let base_commit = repo
+        .find_commit(base_oid)
+        .with_context(|| format!("failed to read publication base commit {base_oid}"))?;
+    let source_tree = source_commit
+        .tree()
+        .context("failed to read from-branch tree")?;
+    let publish_tree_id = filtered_tree_id(&repo, &source_tree, &excluded_paths)?;
+    let needs_import = options.squash_onto.is_some() || !excluded_paths.is_empty();
+    let (publish_head, merge_base) = if needs_import {
+        (
+            planned_squashed_import_commit_oid(
+                &repo,
+                &base_commit,
+                publish_tree_id,
+                source_branch,
+                source_oid,
+                &base_branch,
+                &excluded_paths,
+            )?,
+            Some(base_oid),
+        )
+    } else {
+        (source_oid, merge_base_or_none(&repo, base_oid, source_oid)?)
+    };
+
+    let base_tree = base_commit
+        .tree()
+        .context("failed to read publication base tree")?;
+    let publish_tree = repo
+        .find_tree(publish_tree_id)
+        .context("failed to read branch publication tree")?;
+    let (changes, raw_diff) = diff_trees(&repo, &base_tree, &publish_tree)?;
+    let changed_paths = changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+    let claimed_paths = if options.claimed_paths.is_empty() {
+        changed_paths.clone()
+    } else {
+        merge::normalize_claim_paths(options.claimed_paths.clone())?
+    };
+    let unclaimed_changed_paths = merge::unclaimed_paths(&changed_paths, &claimed_paths);
+    let presented_diff = merge::patch_text_for_json(&raw_diff);
+    let metadata = WorktreeMergeMetadata {
+        agent_id: options.agent_id.clone(),
+        worktree_path: repo_root.clone(),
+        branch: branch_publication_report_branch(source_branch, needs_import),
+        primary_repo_root: repo_root,
+        primary_head: Some(base_oid.to_string()),
+        agent_head: Some(publish_head.to_string()),
+        merge_base: merge_base.map(|oid| oid.to_string()),
+        base_matches_primary: Some(current_head == Some(base_oid) && merge_base == Some(base_oid)),
+    };
+    let validation_binding = merge::candidate_validation_binding(&metadata, &raw_diff)?;
+    let validations = validation_evidence.reports();
+    let diff = DiffOutput {
+        summary: summarize_text(&presented_diff, options_diff_summary_limit()),
+        full: Some(presented_diff),
+    };
+    let candidate = MergeCandidate {
+        metadata,
+        claimed_paths,
+        changed_paths: changed_paths.clone(),
+        changes,
+        unclaimed_changed_paths,
+        diff,
+        validations,
+        validation_binding,
+        validation_evidence,
+        raw_diff,
+        snapshot_tree: publish_tree_id,
+    };
+    let excluded_reference = find_excluded_reference(&repo, &publish_tree, &excluded_paths)?;
+    let preview = merge::build_merge_apply_preview(
+        candidate,
+        MergeForceOptions::default(),
+        require_validation,
+    )?;
+    Ok((preview, excluded_reference))
+}
+
+fn options_diff_summary_limit() -> usize {
+    merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT
+}
+
+fn branch_publication_base(repo: &Repository, squash_onto: Option<&str>) -> Result<String> {
+    if let Some(base) = squash_onto {
+        validate_publication_branch_name(base, "squash-onto")?;
+        return Ok(base.to_string());
+    }
+    current_branch_name(repo)?
+        .filter(|branch| branch != "HEAD")
+        .context("branch publication requires a checked-out base branch or --squash-onto")
+}
+
+fn branch_head_oid(repo: &Repository, branch: &str, label: &str) -> Result<Oid> {
+    validate_publication_branch_name(branch, label)?;
+    let branch = repo
+        .find_branch(branch, BranchType::Local)
+        .with_context(|| format!("{label} branch '{branch}' was not found locally"))?;
+    branch
+        .get()
+        .target()
+        .with_context(|| format!("{label} branch did not point at a commit"))
+}
+
+fn normalize_exclude_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| normalize_repo_relative_path(path).map_err(anyhow::Error::from))
+        .collect::<Result<BTreeSet<_>>>()
+        .map(|paths| paths.into_iter().collect())
+}
+
+fn merge_base_or_none(repo: &Repository, base: Oid, head: Oid) -> Result<Option<Oid>> {
+    match repo.merge_base(base, head) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error).context("failed to compute branch publication merge base"),
+    }
+}
+
+fn branch_publication_report_branch(source_branch: &str, import_commit: bool) -> String {
+    if import_commit {
+        format!(
+            "maco/branch-publish/{}-{:016x}",
+            sanitize_url_segment(source_branch),
+            stable_hash(source_branch.as_bytes())
+        )
+    } else {
+        source_branch.to_string()
+    }
+}
+
+fn planned_squashed_import_commit_oid(
+    repo: &Repository,
+    base_commit: &git2::Commit<'_>,
+    tree_id: Oid,
+    source_branch: &str,
+    source_oid: Oid,
+    base_branch: &str,
+    excluded_paths: &[PathBuf],
+) -> Result<Oid> {
+    let bytes = squashed_import_commit_bytes(
+        repo,
+        base_commit,
+        tree_id,
+        source_branch,
+        source_oid,
+        base_branch,
+        excluded_paths,
+    )?;
+    Oid::hash_object(ObjectType::Commit, &bytes)
+        .context("failed to hash deterministic branch publication import commit")
+}
+
+fn materialize_branch_publication_import_commit(options: &PrPublicationOptions) -> Result<Oid> {
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let repo = Repository::open(&repo_root)
+        .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
+    let source_branch = options
+        .from_branch
+        .as_deref()
+        .context("--from-branch is required for branch publication")?;
+    let base_branch = branch_publication_base(&repo, options.squash_onto.as_deref())?;
+    let excluded_paths = normalize_exclude_paths(&options.exclude_paths)?;
+    let source_oid = branch_head_oid(&repo, source_branch, "from-branch")?;
+    let base_oid = branch_head_oid(&repo, &base_branch, "publication base")?;
+    let source_commit = repo
+        .find_commit(source_oid)
+        .with_context(|| format!("failed to read from-branch commit {source_oid}"))?;
+    let base_commit = repo
+        .find_commit(base_oid)
+        .with_context(|| format!("failed to read publication base commit {base_oid}"))?;
+    let source_tree = source_commit
+        .tree()
+        .context("failed to read from-branch tree")?;
+    let publish_tree_id = filtered_tree_id(&repo, &source_tree, &excluded_paths)?;
+    let bytes = squashed_import_commit_bytes(
+        &repo,
+        &base_commit,
+        publish_tree_id,
+        source_branch,
+        source_oid,
+        &base_branch,
+        &excluded_paths,
+    )?;
+    let oid = Oid::hash_object(ObjectType::Commit, &bytes)
+        .context("failed to hash deterministic branch publication import commit")?;
+    let written = repo
+        .odb()
+        .context("failed to open publication object database")?
+        .write(ObjectType::Commit, &bytes)
+        .context("failed to write deterministic branch publication import commit")?;
+    if written != oid {
+        bail!("written branch publication import commit did not match its planned OID");
+    }
+    Ok(written)
+}
+
+fn squashed_import_commit_bytes(
+    repo: &Repository,
+    base_commit: &git2::Commit<'_>,
+    tree_id: Oid,
+    source_branch: &str,
+    source_oid: Oid,
+    base_branch: &str,
+    excluded_paths: &[PathBuf],
+) -> Result<Vec<u8>> {
+    let tree = repo
+        .find_tree(tree_id)
+        .context("failed to read filtered branch tree for squash import")?;
+    let signature = deterministic_publication_signature()?;
+    let message =
+        squashed_import_commit_message(source_branch, source_oid, base_branch, excluded_paths);
+    let buffer = repo
+        .commit_create_buffer(&signature, &signature, &message, &tree, &[base_commit])
+        .context("failed to build deterministic branch publication import commit")?;
+    Ok(buffer.as_ref().to_vec())
+}
+
+fn deterministic_publication_signature() -> Result<Signature<'static>> {
+    Signature::new(
+        "maco publication",
+        "maco-publication@example.invalid",
+        &Time::new(0, 0),
+    )
+    .context("failed to build deterministic publication signature")
+}
+
+fn squashed_import_commit_message(
+    source_branch: &str,
+    source_oid: Oid,
+    base_branch: &str,
+    excluded_paths: &[PathBuf],
+) -> String {
+    let mut message = format!(
+        "maco: import {source_branch} snapshot\n\nSource branch: {source_branch}\nSource commit: {source_oid}\nBase branch: {base_branch}\n"
+    );
+    if !excluded_paths.is_empty() {
+        message.push_str("\nExcluded paths:\n");
+        for path in excluded_paths {
+            message.push_str("- ");
+            message.push_str(&merge::path_json_text(path));
+            message.push('\n');
+        }
+    }
+    message
+}
+
+fn filtered_tree_id(
+    repo: &Repository,
+    source_tree: &Tree<'_>,
+    excluded_paths: &[PathBuf],
+) -> Result<Oid> {
+    if excluded_paths.is_empty() {
+        return Ok(source_tree.id());
+    }
+    let mut tree_id = source_tree.id();
+    for path in excluded_paths {
+        let tree = repo
+            .find_tree(tree_id)
+            .context("failed to read tree while applying publication exclusions")?;
+        tree_id = remove_path_from_tree(repo, &tree, path)?;
+    }
+    Ok(tree_id)
+}
+
+fn remove_path_from_tree(repo: &Repository, tree: &Tree<'_>, path: &Path) -> Result<Oid> {
+    let components = repo_path_components(path)?;
+    remove_components_from_tree(repo, tree, &components)
+}
+
+fn remove_components_from_tree(
+    repo: &Repository,
+    tree: &Tree<'_>,
+    components: &[String],
+) -> Result<Oid> {
+    let name = components
+        .first()
+        .context("publication exclusion path was empty")?;
+    let mut builder = repo
+        .treebuilder(Some(tree))
+        .context("failed to create tree filter builder")?;
+    if components.len() == 1 {
+        match builder.remove(name.as_str()) {
+            Ok(()) => {}
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(error).context("failed to remove excluded path from tree"),
+        }
+        return builder.write().context("failed to write filtered tree");
+    }
+    if let Some(entry) = tree.get_name(name) {
+        if entry.kind() == Some(ObjectType::Tree) {
+            let child = entry
+                .to_object(repo)
+                .context("failed to read tree entry for exclusion")?
+                .peel_to_tree()
+                .context("failed to peel exclusion entry to tree")?;
+            let child_id = remove_components_from_tree(repo, &child, &components[1..])?;
+            builder
+                .insert(name.as_str(), child_id, 0o040000)
+                .context("failed to insert filtered subtree")?;
+        }
+    }
+    builder.write().context("failed to write filtered tree")
+}
+
+fn repo_path_components(path: &Path) -> Result<Vec<String>> {
+    path.components()
+        .map(|component| match component {
+            std::path::Component::Normal(segment) => segment
+                .to_str()
+                .map(|segment| segment.to_string())
+                .context("publication path component was not UTF-8"),
+            _ => bail!("publication path was not normalized"),
+        })
+        .collect()
+}
+
+fn diff_trees(
+    repo: &Repository,
+    base_tree: &Tree<'_>,
+    publish_tree: &Tree<'_>,
+) -> Result<(Vec<ChangedPath>, Vec<u8>)> {
+    let mut options = DiffOptions::new();
+    let diff = repo
+        .diff_tree_to_tree(Some(base_tree), Some(publish_tree), Some(&mut options))
+        .context("failed to diff branch publication trees")?;
+    let changes = diff
+        .deltas()
+        .map(|delta| {
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .context("branch publication diff omitted path")?
+                .to_path_buf();
+            Ok(ChangedPath {
+                path,
+                kind: change_kind_from_delta(delta.status()),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut raw_diff = Vec::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        if matches!(line.origin(), ' ' | '+' | '-') {
+            raw_diff.push(line.origin() as u8);
+        }
+        raw_diff.extend_from_slice(line.content());
+        true
+    })
+    .context("failed to render branch publication diff")?;
+    Ok((changes, raw_diff))
+}
+
+fn change_kind_from_delta(delta: Delta) -> ChangeKind {
+    match delta {
+        Delta::Added => ChangeKind::Added,
+        Delta::Deleted => ChangeKind::Deleted,
+        Delta::Modified => ChangeKind::Modified,
+        Delta::Renamed => ChangeKind::Renamed,
+        Delta::Typechange => ChangeKind::Typechange,
+        Delta::Untracked => ChangeKind::Untracked,
+        Delta::Conflicted => ChangeKind::Conflicted,
+        _ => ChangeKind::Unknown,
+    }
+}
+
+#[derive(Debug)]
+struct ExcludedReference {
+    excluded_path: PathBuf,
+    referencing_path: PathBuf,
+    pattern: String,
+}
+
+fn find_excluded_reference(
+    repo: &Repository,
+    tree: &Tree<'_>,
+    excluded_paths: &[PathBuf],
+) -> Result<Option<ExcludedReference>> {
+    if excluded_paths.is_empty() {
+        return Ok(None);
+    }
+    let patterns = excluded_paths
+        .iter()
+        .map(|path| (path.clone(), excluded_reference_patterns(path)))
+        .collect::<Vec<_>>();
+    find_excluded_reference_in_tree(repo, tree, PathBuf::new(), &patterns)
+}
+
+fn find_excluded_reference_in_tree(
+    repo: &Repository,
+    tree: &Tree<'_>,
+    prefix: PathBuf,
+    patterns: &[(PathBuf, Vec<String>)],
+) -> Result<Option<ExcludedReference>> {
+    for entry in tree {
+        let name = entry
+            .name()
+            .context("publication tree entry name was not UTF-8")?;
+        let path = prefix.join(name);
+        match entry.kind() {
+            Some(ObjectType::Tree) => {
+                let child = entry
+                    .to_object(repo)
+                    .context("failed to read publication subtree")?
+                    .peel_to_tree()
+                    .context("failed to peel publication subtree")?;
+                if let Some(reference) =
+                    find_excluded_reference_in_tree(repo, &child, path, patterns)?
+                {
+                    return Ok(Some(reference));
+                }
+            }
+            Some(ObjectType::Blob) => {
+                let blob = entry
+                    .to_object(repo)
+                    .context("failed to read publication blob")?
+                    .peel_to_blob()
+                    .context("failed to peel publication blob")?;
+                if blob.size() > MAX_EXCLUSION_REFERENCE_FILE_BYTES {
+                    continue;
+                }
+                let Ok(text) = std::str::from_utf8(blob.content()) else {
+                    continue;
+                };
+                for (excluded_path, excluded_patterns) in patterns {
+                    if let Some(pattern) = excluded_patterns
+                        .iter()
+                        .find(|pattern| text.contains(pattern.as_str()))
+                    {
+                        return Ok(Some(ExcludedReference {
+                            excluded_path: excluded_path.clone(),
+                            referencing_path: path,
+                            pattern: pattern.clone(),
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn excluded_reference_patterns(path: &Path) -> Vec<String> {
+    let mut patterns = vec![merge::path_json_text(path)];
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        patterns.push(format!("\"{file_name}\""));
+        patterns.push(format!("r#\"{file_name}\"#"));
+    }
+    if let Some(module) = rust_module_name(path) {
+        patterns.push(format!("mod {module};"));
+        patterns.push(format!("pub mod {module};"));
+        patterns.push(format!("mod {module} {{"));
+    }
+    patterns.sort();
+    patterns.dedup();
+    patterns
+}
+
+fn rust_module_name(path: &Path) -> Option<String> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    if stem == "mod" {
+        path.parent()?
+            .file_name()?
+            .to_str()
+            .map(ToString::to_string)
+    } else {
+        Some(stem.to_string())
+    }
+}
+
+fn block_excluded_reference_if_needed(
+    report: PrPublicationReport,
+    reference: Option<ExcludedReference>,
+) -> PrPublicationReport {
+    let Some(reference) = reference else {
+        return report;
+    };
+    let message = format!(
+        "published tree still references excluded path {} from {} using '{}'",
+        merge::path_json_text(&reference.excluded_path),
+        merge::path_json_text(&reference.referencing_path),
+        reference.pattern
+    );
+    block_publication(
+        report,
+        ApplyBlocker::ExcludedReference,
+        &message,
+        "remove the reference to the excluded path or publish without that exclusion",
+    )
+}
+
+fn complete_pr_publication_effects(
+    mut report: PrPublicationReport,
+    repo_root: &Path,
+    worktree_path: &Path,
+    raw_remote_url: Option<String>,
+    source_guard: Option<ExternalSourceGuard>,
+) -> Result<PrPublicationReport> {
     match report.forge {
         ForgeKind::Fake => {
             report.pr_url = Some(fake_pr_url(
@@ -2332,7 +3029,7 @@ fn publish_pr_with_verified_authority(
                 .as_deref()
                 .context("Git publication report has no origin URL")?;
             let mut transaction = PublicationTransaction::open(
-                &repo_root,
+                repo_root,
                 &report,
                 "origin",
                 remote_url,
@@ -2340,7 +3037,7 @@ fn publish_pr_with_verified_authority(
                 source_guard.clone(),
             )?;
             report.publication_receipt = Some(transaction.receipt());
-            if let Err(error) = ensure_remote_expected_commit(&worktree_path, &mut transaction) {
+            if let Err(error) = ensure_remote_expected_commit(worktree_path, &mut transaction) {
                 return Ok(publication_transaction_failure(
                     report,
                     &mut transaction,
@@ -2375,7 +3072,7 @@ fn publish_pr_with_verified_authority(
                 .as_deref()
                 .context("GitHub publication report has no origin URL")?;
             let mut transaction = PublicationTransaction::open(
-                &repo_root,
+                repo_root,
                 &report,
                 "origin",
                 remote_url,
@@ -2384,7 +3081,7 @@ fn publish_pr_with_verified_authority(
             )?;
             report.publication_receipt = Some(transaction.receipt());
             if let Err(error) =
-                ensure_github_remote_expected_commit(&worktree_path, &mut transaction)
+                ensure_github_remote_expected_commit(worktree_path, &mut transaction)
             {
                 return Ok(publication_transaction_failure(
                     report,
@@ -2394,7 +3091,7 @@ fn publish_pr_with_verified_authority(
             }
             report.pushed = true;
             report.publication_receipt = Some(transaction.receipt());
-            let github = match reconcile_github_pr(&worktree_path, &mut transaction) {
+            let github = match reconcile_github_pr(worktree_path, &mut transaction) {
                 Ok(github) => github,
                 Err(error) => {
                     return Ok(publication_transaction_failure(
@@ -9019,6 +9716,9 @@ mod tests {
             validations: Vec::new(),
             forge: ForgeKind::Fake,
             draft: true,
+            from_branch: None,
+            squash_onto: None,
+            exclude_paths: Vec::new(),
         }
     }
 

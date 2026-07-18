@@ -54,8 +54,8 @@ The current implementation covers a local-first command-line slice:
   candidate before mutating the primary worktree. A command failure or a
   recursive candidate-state change, including an initialized or uninitialized
   submodule change, blocks the apply and leaves the primary worktree unchanged.
-- `maco pr preview` checks whether an agent worktree is ready to publish without mutating the primary worktree or contacting a forge.
-- `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when validation is not required, re-previews the resulting clean commit, then either emits a deterministic fake PR URL or, with explicit `--forge github`, publishes an OID-bound remote ref and verifies the resulting GitHub receipt. A durable transaction journal reconciles a lost push or `gh` response when the same command is rerun. With `--require-validation`, publication is a two-stage workflow: commit first, preview and validate that exact binding, then publish with the bound envelope.
+- `maco pr preview` checks whether an agent worktree or `--from-branch` task branch is ready to publish without contacting a forge.
+- `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when validation is not required, or publishes a committed `--from-branch` task branch through the same gates. `--squash-onto <base>` builds a deterministic import commit on a disjoint base lineage, and `--exclude <path>` refuses referenced-but-missing exclusions. Publication re-previews the exact candidate before either emitting a deterministic fake PR URL or, with explicit `--forge github`, publishing an OID-bound remote ref and verifying the resulting GitHub receipt. A durable transaction journal reconciles a lost push or `gh` response when the same command is rerun. With `--require-validation`, publication is a two-stage workflow: commit or preview first, validate that exact binding, then publish with the bound envelope.
 - `maco issue preview` redacts issue bodies without creating anything.
 - `maco issue create --forge fake|github` creates a deterministic fake issue URL locally or, with explicit `--forge github`, shells out to `gh issue create`.
 - `maco live status`, `maco live validate`, `maco live apply`,
@@ -913,11 +913,27 @@ cargo run -- pr preview agent-a --repo . --claim README.md --require-validation 
 cargo run -- pr publish agent-a --repo . --claim README.md --forge fake --json
 cargo run -- pr publish agent-a --repo . --claim README.md --forge fake --require-validation --validation-report validation.json --json
 cargo run -- pr publish agent-a --repo . --claim README.md --forge github --ready --json
+cargo run -- pr preview --from-branch task/docs --repo . --json
+cargo run -- pr publish --from-branch task/docs --repo . --forge fake --require-validation --validation-report validation.json --json
+cargo run -- pr publish --from-branch task/docs --squash-onto main --exclude .agents --repo . --forge fake --json
 ```
 
 `maco pr preview` uses the same merge-preview gates as `merge apply` and never
 pushes or creates a pull request. `maco pr publish --forge fake|github` refuses
 dirty-primary, stale-base, unclaimed-edit, validation, and apply-check blockers.
+`maco pr preview|publish --from-branch <task-branch>` uses the same gates for a
+committed primary task branch instead of a managed agent worktree. When
+`--claim` is omitted in branch mode, all changed paths in the branch candidate
+are treated as the reviewed publication scope; pass `--claim` to keep the
+unclaimed-edit gate narrow.
+
+`--squash-onto <base>` builds a deterministic import commit whose parent is the
+named local base branch and whose tree is the task branch snapshot, so PR
+publication works even when the task branch and base branch have disjoint
+history. `--exclude <path>` removes repository-local agent context from that
+published snapshot. Publication refuses with an `excluded_reference` blocker if
+the remaining tree still refers to an excluded path, for example from
+`Cargo.toml` or a Rust `mod` declaration.
 
 With `--require-validation`, use this exact two-stage workflow:
 
@@ -927,12 +943,15 @@ With `--require-validation`, use this exact two-stage workflow:
    above and add the passed validation report.
 4. Run `maco pr publish ... --require-validation --validation-report <envelope>`.
 
-Required publication never creates an internal commit, because doing so would
-change the binding after review. A dirty required candidate is blocked with the
-commit -> preview -> validate -> publish recovery sequence. Without
-`--require-validation`, publish may commit safe uncommitted changes in the agent
-worktree only, but it re-previews the clean commit and checks it again immediately
-before external publication. The fake forge returns deterministic
+Required worktree publication never creates an internal commit, because doing so
+would change the binding after review. A dirty required worktree candidate is
+blocked with the commit -> preview -> validate -> publish recovery sequence.
+Branch `--squash-onto` and `--exclude` previews build the same deterministic
+import commit that publish will recheck, so the validation binding remains
+stable across the two-stage flow. Without `--require-validation`, publish may
+commit safe uncommitted changes in the agent worktree only, but it re-previews
+the clean commit and checks it again immediately before external publication.
+The fake forge returns deterministic
 `fake://pr/...` URLs and never uses the network. GitHub publication runs only
 when `--forge github` is passed and shells out to local `git` and `gh` using the
 transaction and verification sequence above.

@@ -444,6 +444,7 @@ pub enum ApplyBlocker {
     DirtyPrimary,
     StaleBase,
     ApplyCheckFailed,
+    ExcludedReference,
     UnclaimedEdits,
     ValidationMissing,
     ValidationNotRun,
@@ -821,7 +822,7 @@ pub(crate) fn preview_merge_apply_with_evidence_and_write_lease(
     build_merge_apply_preview(candidate, options.forces, options.require_validation)
 }
 
-fn build_merge_apply_preview(
+pub(crate) fn build_merge_apply_preview(
     candidate: MergeCandidate,
     forces: MergeForceOptions,
     require_validation: bool,
@@ -1365,7 +1366,7 @@ fn metadata_from_heads(
     })
 }
 
-fn candidate_validation_binding(
+pub(crate) fn candidate_validation_binding(
     metadata: &WorktreeMergeMetadata,
     full_diff: &[u8],
 ) -> Result<CandidateValidationBinding> {
@@ -4533,7 +4534,10 @@ fn reports_with_status(
         .collect()
 }
 
-fn unclaimed_paths(changed_paths: &[PathBuf], claimed_paths: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn unclaimed_paths(
+    changed_paths: &[PathBuf],
+    claimed_paths: &[PathBuf],
+) -> Vec<PathBuf> {
     changed_paths
         .iter()
         .filter(|path| {
@@ -4545,7 +4549,7 @@ fn unclaimed_paths(changed_paths: &[PathBuf], claimed_paths: &[PathBuf]) -> Vec<
         .collect()
 }
 
-fn normalize_claim_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+pub(crate) fn normalize_claim_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     let paths = paths
         .into_iter()
         .map(normalize_repo_relative_path)
@@ -4677,7 +4681,7 @@ fn path_buf_from_git_bytes(bytes: &[u8]) -> Result<PathBuf> {
     }
 }
 
-fn patch_text_for_json(bytes: &[u8]) -> String {
+pub(crate) fn patch_text_for_json(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).unwrap_or_else(|error| escape_bytes_ascii(error.as_bytes()))
 }
 
@@ -6171,6 +6175,7 @@ fn blocker_label(blocker: ApplyBlocker) -> &'static str {
         ApplyBlocker::DirtyPrimary => "dirty_primary",
         ApplyBlocker::StaleBase => "stale_base",
         ApplyBlocker::ApplyCheckFailed => "apply_check_failed",
+        ApplyBlocker::ExcludedReference => "excluded_reference",
         ApplyBlocker::UnclaimedEdits => "unclaimed_edits",
         ApplyBlocker::ValidationMissing => "validation_missing",
         ApplyBlocker::ValidationNotRun => "validation_not_run",
