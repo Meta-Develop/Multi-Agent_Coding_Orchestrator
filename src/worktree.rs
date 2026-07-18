@@ -71,7 +71,13 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
         max_duration: Duration::from_secs(10),
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+// Full library suites share the finite systemd containment slots with other
+// process-runner tests. Preserve the production cap while allowing that
+// bounded slot wait to complete inside the larger test-only status budget.
+#[cfg(test)]
+const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKTREE_GC_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 // The total budget starts after the in-process status serializer is acquired.
 // Queueing behind another caller in this process is not subprocess or private
