@@ -49,7 +49,7 @@ The current implementation covers a local-first command-line slice:
 - `maco orchestrate resume <checkpoint-file>` authenticates the repository-bound v3 journal, validates repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims, then reruns validation/capture for completed commands without rerunning those commands.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
-- `maco merge preview` and `maco merge apply` collect one stable agent snapshot and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, candidate-bound validation, and apply-check safety reports. Both commands accept external validation JSON with `--validation-report`; `--require-validation` accepts passed reports only when their envelope contains the exact current `candidate.validation_binding` (or a passed `merge apply --validation-command`).
+- `maco merge preview` and `maco merge apply` collect one stable agent snapshot and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, candidate-bound validation, and apply-check safety reports. Their JSON reports also include advisory semantic classification for overlapping symbols, impls, modules, imports, signatures, and dependent files. Both commands accept external validation JSON with `--validation-report`; `--require-validation` accepts passed reports only when their envelope contains the exact current `candidate.validation_binding` (or a passed `merge apply --validation-command`).
 - `maco merge apply --validation-command <command>` validates a temporary merged
   candidate before mutating the primary worktree. A command failure or a
   recursive candidate-state change, including an initialized or uninitialized
@@ -132,9 +132,9 @@ Implemented local foundations:
 
 Known limitations and roadmap for 0.3.0:
 
-1. Richer merge conflict classification is a known limitation. Current apply
-   uses Git apply safety checks and reports structured blockers, but does not
-   classify conflicts by symbol or dependency impact.
+1. Semantic merge conflict classification is advisory and Rust-only. It is
+   bounded by parser-map coverage and reports degraded confidence when a
+   conflict path cannot be resolved; Git safety checks remain authoritative.
 2. Semantic task planning, including automatic path-claim and orchestration-plan
    proposal, is post-0.3.0 roadmap work. Current task-to-path proposals are
    conservative helpers for autopilot and inbox defaults; claim gates remain
@@ -633,10 +633,22 @@ cargo run -- merge apply agent-a --repo . --claim src --force-dirty-primary --fo
 Merge apply refuses dirty primary worktrees, stale agent bases, unclaimed edits,
 validation failures, and apply conflicts unless the matching explicit force flag
 is passed. Apply-check failures themselves are still blocking unless
-`--force-apply-conflicts` allows a successful three-way apply check. Validation
-failures are considered when validation reports are supplied from collected run
-summaries or from direct `--validation-report` JSON files. External validation
-JSON may be a single report, an array, an object with `validation`,
+`--force-apply-conflicts` allows a successful three-way apply check.
+
+When an apply check reports overlapping paths, both commands add
+`safety.semantic_conflicts` to the existing JSON report. The parser-backed Rust
+map identifies touched symbols, impls, modules, imports, and signature changes;
+the existing semantic risk query supplies dependency impacts and impacted
+files. Import-only and conservative formatting-only overlaps are low risk.
+`advisory=true` means this classification never changes readiness or force
+behavior. `degraded`, `confidence`, and `notes` expose unsupported paths, parse
+errors, or bounded truncation instead of presenting an unresolved overlap as a
+confident classification.
+
+Validation failures are considered when validation reports are supplied from
+collected run summaries or from direct `--validation-report` JSON files.
+External validation JSON may be a single report, an array, an object with
+`validation`,
 `validations`, or `reports`, or an orchestration summary with per-agent
 validation. Those legacy forms remain useful as advisory evidence, but they are
 unbound and do **not** satisfy `--require-validation`. Required external
