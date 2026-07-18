@@ -728,18 +728,22 @@ fn touched_semantic_imports(
                 glob: import.glob,
                 visibility: import.visibility.clone(),
             })
-            .chain(map.re_exports.iter().filter_map(|import| {
-                (normalize_map_path(&map.root, &import.file) == normalized_path
-                    && changes.current_lines.iter().any(|line| {
-                        import.span.start_line <= *line && *line <= import.span.end_line
-                    }))
-                .then(|| SemanticConflictImport {
-                    path: import.path.clone(),
-                    alias: import.alias.clone(),
-                    glob: import.glob,
-                    visibility: import.visibility.clone(),
-                })
-            }))
+            .chain(
+                map.re_exports
+                    .iter()
+                    .filter(|import| {
+                        normalize_map_path(&map.root, &import.file) == normalized_path
+                            && changes.current_lines.iter().any(|line| {
+                                import.span.start_line <= *line && *line <= import.span.end_line
+                            })
+                    })
+                    .map(|import| SemanticConflictImport {
+                        path: import.path.clone(),
+                        alias: import.alias.clone(),
+                        glob: import.glob,
+                        visibility: import.visibility.clone(),
+                    }),
+            )
             .collect::<Vec<_>>();
     imports.sort();
     imports.dedup();
