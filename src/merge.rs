@@ -7,6 +7,7 @@ pub use crate::merge_semantic::{
 };
 use crate::{
     llm::Redactor,
+    merge_semantic::classify_semantic_conflicts,
     process_runner::{
         run_process, ContainmentEvidence, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
         SideEffectConfinementEvidence, SideEffectConfinementProfile,
@@ -854,6 +855,7 @@ pub(crate) fn build_merge_apply_preview(
         patch,
         forces.allow_apply_conflicts,
     )?;
+    let semantic_conflicts = classify_semantic_conflicts(&candidate, &apply_check);
     let checks = SafetyChecks {
         primary_state_unchanged: &primary_state_unchanged,
         dirty_primary: &dirty_primary,
@@ -883,7 +885,7 @@ pub(crate) fn build_merge_apply_preview(
             candidate_validation_commands,
             force_options: forces,
             apply_mode,
-            semantic_conflicts: SemanticConflictClassification::no_conflict(),
+            semantic_conflicts,
             readiness,
         },
     })
@@ -3368,6 +3370,7 @@ fn refresh_apply_safety(
         &patch,
         preview.safety.force_options.allow_apply_conflicts,
     )?;
+    let semantic_conflicts = classify_semantic_conflicts(&preview.candidate, &apply_check);
     let verified_primary_state = PrimaryRepositoryState::capture(repo_root)?;
     let primary_state_unchanged = if current_primary_state == verified_primary_state {
         primary_state_check(expected_primary_state, &verified_primary_state)
@@ -3404,6 +3407,7 @@ fn refresh_apply_safety(
     preview.safety.validation = validation;
     preview.safety.validation_evidence = validation_evidence;
     preview.safety.apply_mode = apply_mode;
+    preview.safety.semantic_conflicts = semantic_conflicts;
     preview.safety.readiness = readiness;
     Ok(())
 }
