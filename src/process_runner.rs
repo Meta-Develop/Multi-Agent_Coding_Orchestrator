@@ -56,8 +56,12 @@ const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const SYSTEMD_OPERATION_GRACE: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
 const SYSTEMD_SLOT_WAIT: Duration = Duration::from_secs(30);
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(test)))]
 const MAX_CONCURRENT_SYSTEMD_UNITS: usize = 8;
+// The unit-test binary can issue many strict-containment commands concurrently. Keep enough
+// capacity for parallel coverage without overwhelming the shared user systemd manager.
+#[cfg(all(target_os = "linux", test))]
+const MAX_CONCURRENT_SYSTEMD_UNITS: usize = 4;
 #[cfg(target_os = "linux")]
 const EXPEDITED_SYSTEMD_SLOT_THRESHOLD: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
@@ -5259,7 +5263,7 @@ impl SystemdUnitPermit {
                 RESERVED_EXPEDITED_SYSTEMD_SLOTS
             };
             // Slot zero stays available for operations whose total deadline is at most one second;
-            // longer and unbounded runs share the other seven slots.
+            // longer and unbounded runs share the remaining slots.
             for slot in first_slot..MAX_CONCURRENT_SYSTEMD_UNITS {
                 let path = runtime_root.join(format!("maco-process-runner-slot-{slot}.lock"));
                 let file = OpenOptions::new()
