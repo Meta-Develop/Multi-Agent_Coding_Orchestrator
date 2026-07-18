@@ -34,7 +34,11 @@ use crate::{
     supervise::{self, SupervisorRunOptions},
     sync::{normalize_repo_relative_path, ClaimToken},
     sync_store::{OwnerReport, SyncStore},
-    worktree::{RepositoryInfo, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
+    worktree::{
+        RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason,
+        WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
+        WorktreeRetentionPolicy,
+    },
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -1354,13 +1358,34 @@ impl WorktreeCommand {
         match self.command {
             WorktreeSubcommand::Create(args) => {
                 let manager = WorktreeManager::new(args.repo);
-                let record = manager.create(WorktreeCreateOptions {
-                    agent_id: args.agent_id,
-                    branch: args.branch,
-                    base: args.base,
-                    worktree_root: args.worktree_root,
-                })?;
+                let retention = WorktreeRetentionPolicy {
+                    max_age: args.gc_max_age_seconds.map(Duration::from_secs),
+                    max_count: args.gc_max_count,
+                };
+                let record = manager.create_with_retention(
+                    WorktreeCreateOptions {
+                        agent_id: args.agent_id.clone(),
+                        branch: args.branch,
+                        base: args.base,
+                        worktree_root: args.worktree_root.clone(),
+                    },
+                    retention,
+                )?;
                 print_worktree_record(&record, args.json)
+            }
+            WorktreeSubcommand::Gc(args) => {
+                let manager = WorktreeManager::new(args.repo);
+                let report = manager.gc(WorktreeGcOptions {
+                    worktree_root: args.worktree_root,
+                    dry_run: args.dry_run,
+                    remove_targets: !args.keep_targets,
+                    retention: WorktreeRetentionPolicy {
+                        max_age: args.max_age_seconds.map(Duration::from_secs),
+                        max_count: args.max_count,
+                    },
+                    exclude_agent_id: None,
+                })?;
+                print_worktree_gc_report(&report, args.json)
             }
             WorktreeSubcommand::Remove(args) => {
                 let manager = WorktreeManager::new(args.repo);
@@ -1907,6 +1932,8 @@ enum WorktreeSubcommand {
     Create(CreateWorktreeArgs),
     /// Collect an agent worktree diff and claim-boundary report.
     Diff(DiffWorktreeArgs),
+    /// Remove clean, inactive managed worktrees and unregistered leftover directories.
+    Gc(GcWorktreeArgs),
     /// Remove a linked worktree for an agent.
     Remove(RemoveWorktreeArgs),
     /// List registered worktrees.
@@ -1931,6 +1958,37 @@ struct CreateWorktreeArgs {
     /// Parent directory for agent worktrees.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
+    /// After creation, remove eligible older clean worktrees older than this many seconds.
+    #[arg(long)]
+    gc_max_age_seconds: Option<u64>,
+    /// After creation, keep at most this many newest eligible clean worktrees.
+    #[arg(long)]
+    gc_max_count: Option<usize>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GcWorktreeArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Parent directory for agent worktrees.
+    #[arg(long)]
+    worktree_root: Option<PathBuf>,
+    /// List cleanup actions without removing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Keep per-worktree target/ directories for retained worktrees.
+    #[arg(long)]
+    keep_targets: bool,
+    /// Remove only eligible clean worktrees older than this many seconds.
+    #[arg(long)]
+    max_age_seconds: Option<u64>,
+    /// Keep at most this many newest eligible clean worktrees.
+    #[arg(long)]
+    max_count: Option<usize>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -3311,6 +3369,67 @@ fn print_worktree_record(record: &WorktreeRecord, json: bool) -> Result<()> {
         println!("Path: {}", record.path.display());
     }
     Ok(())
+}
+
+fn print_worktree_gc_report(report: &WorktreeGcReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Worktree GC: {}",
+        if report.dry_run { "dry-run" } else { "applied" }
+    );
+    println!("Considered: {}", report.considered_count);
+    println!("Removed: {}", report.removed_count);
+    println!("Protected: {}", report.protected_count);
+    println!("Retained: {}", report.retained_count);
+    println!("Targets cleaned: {}", report.target_removed_count);
+    println!("Orphans pruned: {}", report.orphan_removed_count);
+    for entry in &report.entries {
+        let branch = entry.branch.as_deref().unwrap_or("-");
+        let target = entry
+            .target_path
+            .as_ref()
+            .map(|path| format!(" target={}", path.display()))
+            .unwrap_or_default();
+        println!(
+            "{}\t{}\t{}\t{}\t{}{}",
+            worktree_gc_status_label(entry.status),
+            worktree_gc_reason_label(entry.reason),
+            entry.name,
+            branch,
+            entry.path.display(),
+            target
+        );
+    }
+    Ok(())
+}
+
+fn worktree_gc_status_label(status: WorktreeGcStatus) -> &'static str {
+    match status {
+        WorktreeGcStatus::Removed => "removed",
+        WorktreeGcStatus::WouldRemove => "would-remove",
+        WorktreeGcStatus::Retained => "retained",
+        WorktreeGcStatus::Protected => "protected",
+        WorktreeGcStatus::OrphanPruned => "orphan-pruned",
+        WorktreeGcStatus::OrphanWouldPrune => "orphan-would-prune",
+    }
+}
+
+fn worktree_gc_reason_label(reason: WorktreeGcReason) -> &'static str {
+    match reason {
+        WorktreeGcReason::FinishedBranch => "finished-branch",
+        WorktreeGcReason::RetentionKeep => "retention-keep",
+        WorktreeGcReason::ExcludedCurrentWorktree => "excluded-current-worktree",
+        WorktreeGcReason::Dirty => "dirty",
+        WorktreeGcReason::ActiveLease => "active-lease",
+        WorktreeGcReason::ActiveClaim => "active-claim",
+        WorktreeGcReason::TargetRemoved => "target-removed",
+        WorktreeGcReason::TargetWouldRemove => "target-would-remove",
+        WorktreeGcReason::NoTarget => "no-target",
+        WorktreeGcReason::UnregisteredOrphan => "unregistered-orphan",
+    }
 }
 
 fn print_path_claim(label: &str, claim: &crate::sync::PathClaim, json: bool) -> Result<()> {

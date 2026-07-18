@@ -24,6 +24,7 @@ use crate::{
         finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
         LEGACY_RETIREMENT_DOMAIN,
     },
+    sync_store::SyncStore,
 };
 use anyhow::{bail, Context, Result};
 use git2::{
@@ -32,12 +33,12 @@ use git2::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -71,6 +72,7 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKTREE_GC_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 // The total budget starts after the in-process status serializer is acquired.
 // Queueing behind another caller in this process is not subprocess or private
 // runtime work, so it must not spend the bounded Git execution budget. Once a
@@ -134,6 +136,72 @@ pub struct PendingWorktreeOperation {
     pub phase: String,
     pub path: PathBuf,
     pub force: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorktreeRetentionPolicy {
+    pub max_age: Option<Duration>,
+    pub max_count: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeGcOptions {
+    pub worktree_root: Option<PathBuf>,
+    pub dry_run: bool,
+    pub remove_targets: bool,
+    pub retention: WorktreeRetentionPolicy,
+    pub exclude_agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeGcReport {
+    pub dry_run: bool,
+    pub remove_targets: bool,
+    pub max_age_seconds: Option<u64>,
+    pub max_count: Option<usize>,
+    pub considered_count: usize,
+    pub removed_count: usize,
+    pub protected_count: usize,
+    pub retained_count: usize,
+    pub target_removed_count: usize,
+    pub orphan_removed_count: usize,
+    pub entries: Vec<WorktreeGcEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorktreeGcEntry {
+    pub name: String,
+    pub branch: Option<String>,
+    pub path: PathBuf,
+    pub status: WorktreeGcStatus,
+    pub reason: WorktreeGcReason,
+    pub target_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeGcStatus {
+    Removed,
+    WouldRemove,
+    Retained,
+    Protected,
+    OrphanPruned,
+    OrphanWouldPrune,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeGcReason {
+    FinishedBranch,
+    RetentionKeep,
+    ExcludedCurrentWorktree,
+    Dirty,
+    ActiveLease,
+    ActiveClaim,
+    TargetRemoved,
+    TargetWouldRemove,
+    NoTarget,
+    UnregisteredOrphan,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +328,13 @@ impl ManagedProcessLease {
             kind: ManagedProcessLeaseKind::Exclusive,
         })
     }
+
+    fn is_active(lease_name: &OsStr) -> bool {
+        let table = lock_managed_process_leases();
+        table
+            .get(lease_name)
+            .is_some_and(|state| state.shared > 0 || state.exclusive > 0)
+    }
 }
 
 impl Drop for ManagedProcessLease {
@@ -334,6 +409,8 @@ struct ManagedWorktreeBinding {
     branch_created_by_maco: bool,
     base_oid: String,
     created_branch_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at_unix_nanos: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     creation_lock_pending: bool,
 }
@@ -684,7 +761,15 @@ impl WorktreeManager {
         repository_info(&repo)
     }
 
-    pub fn create(&self, _options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
+    pub fn create(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
+        self.create_with_retention(options, WorktreeRetentionPolicy::default())
+    }
+
+    pub fn create_with_retention(
+        &self,
+        _options: WorktreeCreateOptions,
+        _retention: WorktreeRetentionPolicy,
+    ) -> Result<WorktreeRecord> {
         bail!(
             "managed worktree creation is unsupported without a capability-bound repository cleanliness input"
         );
@@ -695,7 +780,34 @@ impl WorktreeManager {
     /// and integration-test binaries.
     #[cfg(test)]
     pub(crate) fn create_for_test(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
-        self.create_disabled_legacy(options)
+        self.create_for_test_with_retention(options, WorktreeRetentionPolicy::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_for_test_with_retention(
+        &self,
+        options: WorktreeCreateOptions,
+        retention: WorktreeRetentionPolicy,
+    ) -> Result<WorktreeRecord> {
+        let exclude_agent_id = Some(normalize_agent_id(&options.agent_id)?);
+        let worktree_root = options.worktree_root.clone();
+        let record = self.create_disabled_legacy(options)?;
+        if retention.max_age.is_some() || retention.max_count.is_some() {
+            let retention = WorktreeRetentionPolicy {
+                max_age: retention.max_age,
+                max_count: retention
+                    .max_count
+                    .map(|max_count| max_count.saturating_sub(1)),
+            };
+            self.gc(WorktreeGcOptions {
+                worktree_root,
+                dry_run: false,
+                remove_targets: true,
+                retention,
+                exclude_agent_id,
+            })?;
+        }
+        Ok(record)
     }
 
     #[allow(dead_code)]
@@ -1112,6 +1224,255 @@ impl WorktreeManager {
         Ok(operations)
     }
 
+    pub fn gc(&self, options: WorktreeGcOptions) -> Result<WorktreeGcReport> {
+        let repo = self.open_repository()?;
+        let worktree_root = resolve_worktree_root(&repo, options.worktree_root.clone())?;
+        let active_claims = active_claim_agent_ids(&repo)?;
+        let exclude_agent_id = options
+            .exclude_agent_id
+            .as_deref()
+            .map(normalize_agent_id)
+            .transpose()?;
+        let mut report = WorktreeGcReport {
+            dry_run: options.dry_run,
+            remove_targets: options.remove_targets,
+            max_age_seconds: options.retention.max_age.map(|age| age.as_secs()),
+            max_count: options.retention.max_count,
+            considered_count: 0,
+            removed_count: 0,
+            protected_count: 0,
+            retained_count: 0,
+            target_removed_count: 0,
+            orphan_removed_count: 0,
+            entries: Vec::new(),
+        };
+
+        let mut registered_names = BTreeSet::new();
+        let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
+        let registry_lock = registry_store.lock()?;
+        let mut registry = registry_store.load(&registry_lock)?;
+        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+        for name in registry.records.keys() {
+            registered_names.insert(name.clone());
+        }
+
+        let mut candidates = Vec::new();
+        let bindings = registry.records.values().cloned().collect::<Vec<_>>();
+        for binding in bindings {
+            if registry.operations.contains_key(&binding.name) {
+                continue;
+            }
+            report.considered_count = report
+                .considered_count
+                .checked_add(1)
+                .context("worktree GC considered count overflowed")?;
+            if exclude_agent_id.as_deref() == Some(binding.name.as_str()) {
+                report.retained_count = report
+                    .retained_count
+                    .checked_add(1)
+                    .context("worktree GC retained count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: binding.name,
+                    branch: Some(binding.branch),
+                    path: binding.path,
+                    status: WorktreeGcStatus::Retained,
+                    reason: WorktreeGcReason::ExcludedCurrentWorktree,
+                    target_path: None,
+                });
+                continue;
+            }
+            if active_claims.contains(&binding.name) {
+                report.protected_count = report
+                    .protected_count
+                    .checked_add(1)
+                    .context("worktree GC protected count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: binding.name,
+                    branch: Some(binding.branch),
+                    path: binding.path,
+                    status: WorktreeGcStatus::Protected,
+                    reason: WorktreeGcReason::ActiveClaim,
+                    target_path: None,
+                });
+                continue;
+            }
+            let verified = verify_managed_worktree_binding(
+                &repo,
+                &registry_store.repository,
+                &binding,
+                false,
+            )?;
+            let removal_lease = if options.dry_run {
+                if registry_store
+                    .worktree_has_active_execution_lease(&registry_lock, &binding.name)?
+                {
+                    report.protected_count = report
+                        .protected_count
+                        .checked_add(1)
+                        .context("worktree GC protected count overflowed")?;
+                    report.entries.push(WorktreeGcEntry {
+                        name: binding.name,
+                        branch: Some(binding.branch),
+                        path: verified.path,
+                        status: WorktreeGcStatus::Protected,
+                        reason: WorktreeGcReason::ActiveLease,
+                        target_path: None,
+                    });
+                    continue;
+                }
+                None
+            } else {
+                match registry_store
+                    .try_acquire_worktree_removal_lease(&registry_lock, &binding.name)
+                {
+                    Ok(lease) => Some(lease),
+                    Err(error) if is_active_lease_error(&error) => {
+                        report.protected_count = report
+                            .protected_count
+                            .checked_add(1)
+                            .context("worktree GC protected count overflowed")?;
+                        report.entries.push(WorktreeGcEntry {
+                            name: binding.name,
+                            branch: Some(binding.branch),
+                            path: verified.path,
+                            status: WorktreeGcStatus::Protected,
+                            reason: WorktreeGcReason::ActiveLease,
+                            target_path: None,
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error).context("failed to inspect managed worktree lease")
+                    }
+                }
+            };
+            if !gc_worktree_is_clean(&verified.path)? {
+                report.protected_count = report
+                    .protected_count
+                    .checked_add(1)
+                    .context("worktree GC protected count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: binding.name,
+                    branch: Some(binding.branch),
+                    path: verified.path,
+                    status: WorktreeGcStatus::Protected,
+                    reason: WorktreeGcReason::Dirty,
+                    target_path: None,
+                });
+                continue;
+            }
+            candidates.push(WorktreeGcCandidate {
+                binding,
+                branch_oid: verified.branch_oid,
+                removal_lease,
+            });
+        }
+
+        let now = unix_now_nanos()?;
+        candidates.sort_by(|left, right| {
+            gc_created_at(&right.binding)
+                .cmp(&gc_created_at(&left.binding))
+                .then_with(|| left.binding.name.cmp(&right.binding.name))
+        });
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            let should_remove =
+                retention_selects_gc_candidate(&candidate.binding, index, now, options.retention);
+            if should_remove {
+                let target_path = gc_target_path_if_present(&candidate.binding.path)?;
+                if options.dry_run {
+                    report.removed_count = report
+                        .removed_count
+                        .checked_add(1)
+                        .context("worktree GC removed count overflowed")?;
+                    report.entries.push(WorktreeGcEntry {
+                        name: candidate.binding.name,
+                        branch: Some(candidate.binding.branch),
+                        path: candidate.binding.path,
+                        status: WorktreeGcStatus::WouldRemove,
+                        reason: WorktreeGcReason::FinishedBranch,
+                        target_path,
+                    });
+                    continue;
+                }
+                remove_gc_candidate(
+                    &repo,
+                    &registry_store,
+                    &registry_lock,
+                    &mut registry,
+                    &candidate,
+                )?;
+                registered_names.remove(&candidate.binding.name);
+                report.removed_count = report
+                    .removed_count
+                    .checked_add(1)
+                    .context("worktree GC removed count overflowed")?;
+                report.entries.push(WorktreeGcEntry {
+                    name: candidate.binding.name,
+                    branch: Some(candidate.binding.branch),
+                    path: candidate.binding.path,
+                    status: WorktreeGcStatus::Removed,
+                    reason: WorktreeGcReason::FinishedBranch,
+                    target_path,
+                });
+                continue;
+            }
+
+            let target_path = gc_target_path_if_present(&candidate.binding.path)?;
+            if options.remove_targets {
+                if let Some(target_path) = target_path {
+                    let reason = if options.dry_run {
+                        WorktreeGcReason::TargetWouldRemove
+                    } else {
+                        remove_worktree_target_dir(&candidate.binding.path)?;
+                        report.target_removed_count = report
+                            .target_removed_count
+                            .checked_add(1)
+                            .context("worktree GC target count overflowed")?;
+                        WorktreeGcReason::TargetRemoved
+                    };
+                    report.retained_count = report
+                        .retained_count
+                        .checked_add(1)
+                        .context("worktree GC retained count overflowed")?;
+                    report.entries.push(WorktreeGcEntry {
+                        name: candidate.binding.name,
+                        branch: Some(candidate.binding.branch),
+                        path: candidate.binding.path,
+                        status: WorktreeGcStatus::Retained,
+                        reason,
+                        target_path: Some(target_path),
+                    });
+                    continue;
+                }
+            }
+            report.retained_count = report
+                .retained_count
+                .checked_add(1)
+                .context("worktree GC retained count overflowed")?;
+            report.entries.push(WorktreeGcEntry {
+                name: candidate.binding.name,
+                branch: Some(candidate.binding.branch),
+                path: candidate.binding.path,
+                status: WorktreeGcStatus::Retained,
+                reason: if options.remove_targets {
+                    WorktreeGcReason::NoTarget
+                } else {
+                    WorktreeGcReason::RetentionKeep
+                },
+                target_path: None,
+            });
+        }
+
+        prune_unregistered_worktree_directories(
+            &repo,
+            &worktree_root,
+            &registered_names,
+            options.dry_run,
+            &mut report,
+        )?;
+        Ok(report)
+    }
+
     /// Resolves one execution-facing worktree through the durable MACO
     /// registry. An unbound Git worktree is rejected instead of being adopted
     /// implicitly.
@@ -1246,6 +1607,290 @@ impl WorktreeManager {
         Repository::open(&self.repo_path)
             .with_context(|| format!("failed to open repository {}", self.repo_path.display()))
     }
+}
+
+struct WorktreeGcCandidate {
+    binding: ManagedWorktreeBinding,
+    branch_oid: Oid,
+    removal_lease: Option<ManagedWorktreeRemovalLease>,
+}
+
+fn remove_gc_candidate(
+    repo: &Repository,
+    registry_store: &ManagedWorktreeRegistryStore,
+    registry_lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    candidate: &WorktreeGcCandidate,
+) -> Result<()> {
+    if registry.operations.len() >= MAX_MANAGED_OPERATIONS {
+        bail!("managed worktree registry has no remaining operation capacity");
+    }
+    let removal_lease = candidate
+        .removal_lease
+        .as_ref()
+        .context("worktree GC removal candidate lacks removal authority")?;
+    let binding = &candidate.binding;
+    let worktree_quarantine_path = deterministic_remove_quarantine_path(
+        &binding.root,
+        "worktree",
+        &binding.name,
+        &binding.path_identity,
+    );
+    let metadata_root = registry_store.repository.common_dir.join("worktrees");
+    let metadata_quarantine_path = deterministic_remove_quarantine_path(
+        &metadata_root,
+        "metadata",
+        &binding.name,
+        &binding.metadata_dir_identity,
+    );
+    registry.operations.insert(
+        binding.name.clone(),
+        ManagedWorktreeOperation {
+            kind: ManagedWorktreeOperationKind::Remove,
+            phase: ManagedWorktreeOperationPhase::RemovePrepared,
+            name: binding.name.clone(),
+            root: binding.root.clone(),
+            root_identity: binding.root_identity.clone(),
+            path: binding.path.clone(),
+            prepared_path_identity: Some(binding.path_identity.clone()),
+            staging_root: None,
+            staging_root_identity: None,
+            staging_path: None,
+            staged_path_identity: None,
+            staged_metadata: None,
+            branch: binding.branch.clone(),
+            base_oid: binding.base_oid.clone(),
+            branch_preexisting_oid: None,
+            branch_ownership: if binding.branch_created_by_maco {
+                ManagedBranchOwnership::CreatedByMaco
+            } else {
+                ManagedBranchOwnership::Preexisting
+            },
+            owned_branch_oid: binding
+                .branch_created_by_maco
+                .then(|| binding.created_branch_oid.clone()),
+            binding: Some(binding.clone()),
+            delete_branch: false,
+            force: true,
+            expected_branch_oid: Some(candidate.branch_oid.to_string()),
+            worktree_quarantine_path: Some(worktree_quarantine_path),
+            worktree_quarantine_identity: None,
+            metadata_quarantine_path: Some(metadata_quarantine_path),
+            metadata_quarantine_identity: None,
+        },
+    );
+    registry_store.save(registry_lock, registry)?;
+    recover_pending_operations_with_held_removal_lease(
+        repo,
+        registry_store,
+        registry_lock,
+        registry,
+        Some(removal_lease),
+    )
+}
+
+fn resolve_worktree_root(repo: &Repository, requested_root: Option<PathBuf>) -> Result<PathBuf> {
+    let root = requested_root.unwrap_or_else(|| default_worktree_root(repo));
+    if root.is_absolute() {
+        Ok(root)
+    } else {
+        Ok(repo
+            .workdir()
+            .context("worktree GC requires a non-bare repository")?
+            .join(root))
+    }
+}
+
+fn active_claim_agent_ids(repo: &Repository) -> Result<BTreeSet<String>> {
+    let state_root = repo.commondir().join("maco").join("state");
+    if !path_entry_exists(&state_root.join(ClaimsStatePresence::Authenticated.root_name()))?
+        && !path_entry_exists(&state_root.join(ClaimsStatePresence::Legacy.file_name()))?
+    {
+        return Ok(BTreeSet::new());
+    }
+    let repo_path = repo.workdir().unwrap_or_else(|| repo.path());
+    let claims = SyncStore::open(repo_path)?.snapshot()?;
+    Ok(claims
+        .into_iter()
+        .map(|claim| claim.agent_id)
+        .collect::<BTreeSet<_>>())
+}
+
+enum ClaimsStatePresence {
+    Authenticated,
+    Legacy,
+}
+
+impl ClaimsStatePresence {
+    fn root_name(&self) -> &'static str {
+        match self {
+            Self::Authenticated => "authenticated-claims-state-v1",
+            Self::Legacy => "claims.json",
+        }
+    }
+
+    fn file_name(&self) -> &'static str {
+        self.root_name()
+    }
+}
+
+fn is_active_lease_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("already held")
+        || message.contains("active cooperative execution lease")
+        || message.contains("state lock")
+}
+
+fn gc_worktree_is_clean(path: &Path) -> Result<bool> {
+    Ok(bounded_repository_status_paths(
+        path,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_GC_STATUS_TIMEOUT,
+    )?
+    .is_empty())
+}
+
+fn gc_created_at(binding: &ManagedWorktreeBinding) -> i64 {
+    binding.created_at_unix_nanos.unwrap_or(0)
+}
+
+fn retention_selects_gc_candidate(
+    binding: &ManagedWorktreeBinding,
+    index: usize,
+    now: i64,
+    retention: WorktreeRetentionPolicy,
+) -> bool {
+    if retention.max_age.is_none() && retention.max_count.is_none() {
+        return true;
+    }
+    let count_expired = retention
+        .max_count
+        .is_some_and(|max_count| index >= max_count);
+    let age_expired = retention.max_age.is_some_and(|max_age| {
+        binding
+            .created_at_unix_nanos
+            .and_then(|created| now.checked_sub(created))
+            .and_then(|age_nanos| u128::try_from(age_nanos.max(0)).ok())
+            .is_some_and(|age_nanos| age_nanos >= max_age.as_nanos())
+    });
+    count_expired || age_expired
+}
+
+fn gc_target_path_if_present(worktree_path: &Path) -> Result<Option<PathBuf>> {
+    let target_path = worktree_path.join("target");
+    match fs::symlink_metadata(&target_path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(Some(target_path))
+        }
+        Ok(_) => bail!(
+            "worktree target path is not a plain directory: {}",
+            target_path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {}", target_path.display()))
+        }
+    }
+}
+
+fn remove_worktree_target_dir(worktree_path: &Path) -> Result<()> {
+    let root = SafeRoot::open_existing(worktree_path)?;
+    remove_direct_child_tree(&root, "target", None, TreeLinkPolicy::UnlinkLinks)
+}
+
+fn prune_unregistered_worktree_directories(
+    repo: &Repository,
+    worktree_root: &Path,
+    registered_names: &BTreeSet<String>,
+    dry_run: bool,
+    report: &mut WorktreeGcReport,
+) -> Result<()> {
+    if !path_entry_exists(worktree_root)? {
+        return Ok(());
+    }
+    let root = SafeRoot::open_existing(worktree_root)?;
+    let git_registered = git_registered_worktree_names(repo, root.path())?;
+    for child_name in root.direct_child_names_bounded(MAX_MANAGED_RECORDS)? {
+        if child_name.to_string_lossy().starts_with(".maco-") {
+            continue;
+        }
+        let Some(name) = child_name.to_str() else {
+            bail!("managed worktree root contains a non-UTF-8 child name");
+        };
+        if normalize_agent_id(name)? != name {
+            bail!("managed worktree root contains a noncanonical child name: {name}");
+        }
+        if registered_names.contains(name) || git_registered.contains(name) {
+            continue;
+        }
+        let path = root.direct_child(&child_name)?;
+        if dry_run {
+            report.orphan_removed_count = report
+                .orphan_removed_count
+                .checked_add(1)
+                .context("worktree GC orphan count overflowed")?;
+            report.entries.push(WorktreeGcEntry {
+                name: name.to_string(),
+                branch: None,
+                path,
+                status: WorktreeGcStatus::OrphanWouldPrune,
+                reason: WorktreeGcReason::UnregisteredOrphan,
+                target_path: None,
+            });
+            continue;
+        }
+        remove_direct_child_tree(&root, &child_name, None, TreeLinkPolicy::UnlinkLinks)?;
+        report.orphan_removed_count = report
+            .orphan_removed_count
+            .checked_add(1)
+            .context("worktree GC orphan count overflowed")?;
+        report.entries.push(WorktreeGcEntry {
+            name: name.to_string(),
+            branch: None,
+            path,
+            status: WorktreeGcStatus::OrphanPruned,
+            reason: WorktreeGcReason::UnregisteredOrphan,
+            target_path: None,
+        });
+    }
+    Ok(())
+}
+
+fn git_registered_worktree_names(
+    repo: &Repository,
+    worktree_root: &Path,
+) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let list = repo.worktrees().context("failed to list Git worktrees")?;
+    for index in 0..list.len() {
+        let Some(name) = list
+            .get(index)
+            .context("failed to read Git worktree name")?
+        else {
+            continue;
+        };
+        let worktree = repo
+            .find_worktree(name)
+            .with_context(|| format!("failed to inspect Git worktree '{name}'"))?;
+        let path = fs::canonicalize(worktree.path()).with_context(|| {
+            format!(
+                "failed to resolve Git worktree path {}",
+                worktree.path().display()
+            )
+        })?;
+        if path.parent() == Some(worktree_root) {
+            names.insert(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+fn unix_now_nanos() -> Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    i64::try_from(duration.as_nanos()).context("current Unix time exceeds supported range")
 }
 
 struct VerifiedManagedWorktree {
@@ -1425,6 +2070,24 @@ impl ManagedWorktreeRegistryStore {
             _lock: lock,
             _process_lease: process_lease,
         })
+    }
+
+    fn worktree_has_active_execution_lease(
+        &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<bool> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        if ManagedProcessLease::is_active(&lease_name) {
+            return Ok(true);
+        }
+        match KernelStateLock::try_acquire_existing_exclusive_direct(&self.state_root, &lease_name)?
+        {
+            ExistingExclusiveLock::Missing => Ok(false),
+            ExistingExclusiveLock::Busy => Ok(true),
+            ExistingExclusiveLock::Acquired(_lock) => Ok(false),
+        }
     }
 
     fn load(&self, lock: &ManagedWorktreeRegistryLock) -> Result<ManagedWorktreeRegistry> {
@@ -2365,7 +3028,7 @@ fn recover_create_operation(
         verify_local_branch_oid(repo, &operation.branch, expected_branch_oid)?;
         let base_oid =
             Oid::from_str(&operation.base_oid).context("create operation base OID is malformed")?;
-        let binding = capture_managed_worktree_binding(
+        let mut binding = capture_managed_worktree_binding(
             repo,
             &store.repository,
             &root,
@@ -2375,6 +3038,7 @@ fn recover_create_operation(
             base_oid,
             expected_branch_oid,
         )?;
+        binding.created_at_unix_nanos = Some(unix_now_nanos()?);
         operation.phase = ManagedWorktreeOperationPhase::CreateObserved;
         operation.binding = Some(binding);
         registry
@@ -2400,7 +3064,13 @@ fn recover_create_operation(
         }
         let base_oid =
             Oid::from_str(&operation.base_oid).context("create operation base OID is malformed")?;
-        let observed_binding = capture_managed_worktree_binding(
+        let binding = operation.binding.clone().with_context(|| {
+            format!(
+                "create operation '{}' reached observed phase without a binding",
+                operation.name
+            )
+        })?;
+        let mut observed_binding = capture_managed_worktree_binding(
             repo,
             &store.repository,
             &root,
@@ -2410,12 +3080,7 @@ fn recover_create_operation(
             base_oid,
             expected_branch_oid,
         )?;
-        let binding = operation.binding.clone().with_context(|| {
-            format!(
-                "create operation '{}' reached observed phase without a binding",
-                operation.name
-            )
-        })?;
+        observed_binding.created_at_unix_nanos = binding.created_at_unix_nanos;
         if binding != observed_binding {
             bail!(
                 "create operation '{}' binding changed before finalization",
@@ -3357,6 +4022,7 @@ fn capture_managed_worktree_binding(
         branch_created_by_maco,
         base_oid: base_oid.to_string(),
         created_branch_oid: created_branch_oid.to_string(),
+        created_at_unix_nanos: None,
         creation_lock_pending: true,
     })
 }
@@ -5655,6 +6321,233 @@ mod tests {
         assert_eq!(removed.name, "agent-a");
         assert!(!removed.path.exists());
         assert!(repo.find_branch("maco/agent-a", BranchType::Local).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_removes_finished_clean_worktree_and_keeps_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "agent-finished", &worktree_root);
+        fs::create_dir_all(created.path.join("target/debug")).expect("create target");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root.clone()), false))
+            .expect("gc finished worktree");
+
+        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.entries[0].status, WorktreeGcStatus::Removed);
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::FinishedBranch);
+        assert!(!created.path.exists());
+        assert!(repo
+            .find_branch("maco/agent-finished", BranchType::Local)
+            .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_protects_dirty_worktree() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "agent-dirty-gc", &worktree_root);
+        fs::write(created.path.join("scratch.txt"), "local work\n").expect("dirty worktree");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), false))
+            .expect("gc dirty worktree");
+
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.protected_count, 1);
+        assert_eq!(report.entries[0].status, WorktreeGcStatus::Protected);
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::Dirty);
+        assert!(created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_protects_active_execution_lease() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "agent-leased-gc", &worktree_root);
+        let _lease = manager
+            .acquire_read_execution_lease("agent-leased-gc")
+            .expect("active read lease");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), false))
+            .expect("gc leased worktree");
+
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.protected_count, 1);
+        assert_eq!(report.entries[0].status, WorktreeGcStatus::Protected);
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::ActiveLease);
+        assert!(created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_protects_active_path_claim_for_agent() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "agent-claimed-gc", &worktree_root);
+        SyncStore::open(&repo_path)
+            .expect("open claims")
+            .claim_paths("agent-claimed-gc", [PathBuf::from("src")])
+            .expect("claim path");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), false))
+            .expect("gc claimed worktree");
+
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.protected_count, 1);
+        assert_eq!(report.entries[0].status, WorktreeGcStatus::Protected);
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::ActiveClaim);
+        assert!(created.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_retention_keeps_newest_and_removes_retained_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let old = create_gc_worktree(&manager, "agent-old-gc", &worktree_root);
+        let new = create_gc_worktree(&manager, "agent-new-gc", &worktree_root);
+        fs::create_dir_all(old.path.join("target/debug")).expect("old target");
+        fs::create_dir_all(new.path.join("target/debug")).expect("new target");
+
+        let report = manager
+            .gc(WorktreeGcOptions {
+                worktree_root: Some(worktree_root),
+                dry_run: false,
+                remove_targets: true,
+                retention: WorktreeRetentionPolicy {
+                    max_age: None,
+                    max_count: Some(1),
+                },
+                exclude_agent_id: None,
+            })
+            .expect("gc with retention");
+
+        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.retained_count, 1);
+        assert_eq!(report.target_removed_count, 1);
+        assert!(!old.path.exists());
+        assert!(new.path.exists());
+        assert!(!new.path.join("target").exists());
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.name == "agent-new-gc"
+                && entry.reason == WorktreeGcReason::TargetRemoved));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_retention_applies_after_new_worktree_creation() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let old = create_gc_worktree(&manager, "agent-create-old", &worktree_root);
+
+        let new = manager
+            .create_for_test_with_retention(
+                WorktreeCreateOptions {
+                    agent_id: "agent-create-new".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                },
+                WorktreeRetentionPolicy {
+                    max_age: None,
+                    max_count: Some(1),
+                },
+            )
+            .expect("create with retention");
+
+        assert!(!old.path.exists());
+        assert!(new.path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_prunes_unregistered_leftover_directory_second_pass() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let orphan = worktree_root.join("agent-orphan-gc");
+        fs::create_dir_all(orphan.join("target/debug")).expect("orphan directory");
+        fs::write(orphan.join("leftover.txt"), "partial delete residue\n").expect("orphan file");
+        let manager = WorktreeManager::new(&repo_path);
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), false))
+            .expect("gc orphan");
+
+        assert_eq!(report.orphan_removed_count, 1);
+        assert!(report.entries.iter().any(|entry| {
+            entry.name == "agent-orphan-gc"
+                && entry.status == WorktreeGcStatus::OrphanPruned
+                && entry.reason == WorktreeGcReason::UnregisteredOrphan
+        }));
+        assert!(!orphan.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gc_dry_run_reports_without_removing_worktree_or_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let created = create_gc_worktree(&manager, "agent-dry-run-gc", &worktree_root);
+        fs::create_dir_all(created.path.join("target/debug")).expect("target");
+
+        let report = manager
+            .gc(gc_options(Some(worktree_root), true))
+            .expect("dry-run gc");
+
+        assert!(report.dry_run);
+        assert_eq!(report.removed_count, 1);
+        assert_eq!(report.entries[0].status, WorktreeGcStatus::WouldRemove);
+        assert_eq!(report.entries[0].reason, WorktreeGcReason::FinishedBranch);
+        assert!(created.path.exists());
+        assert!(created.path.join("target").exists());
     }
 
     #[cfg(unix)]
@@ -8293,6 +9186,31 @@ mod tests {
             .is_err());
         assert!(!registry.records.contains_key(&binding.name));
         assert!(!registry.operations.contains_key(&binding.name));
+    }
+
+    fn create_gc_worktree(
+        manager: &WorktreeManager,
+        agent_id: &str,
+        worktree_root: &Path,
+    ) -> WorktreeRecord {
+        manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: agent_id.to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root.to_path_buf()),
+            })
+            .expect("create GC worktree")
+    }
+
+    fn gc_options(worktree_root: Option<PathBuf>, dry_run: bool) -> WorktreeGcOptions {
+        WorktreeGcOptions {
+            worktree_root,
+            dry_run,
+            remove_targets: true,
+            retention: WorktreeRetentionPolicy::default(),
+            exclude_agent_id: None,
+        }
     }
 
     fn commit_readme(repo: &Repository) -> Result<Oid> {

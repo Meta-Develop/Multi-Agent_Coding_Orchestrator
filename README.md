@@ -28,6 +28,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
+- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and prunes unregistered leftover directories under the managed worktree root.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
 - `maco sync release <token>` releases one durable claim.
@@ -274,7 +275,9 @@ be repository-relative; a missing path or directory may still be named as a
 claim scope, but neither is read as prompt content.
 
 Default linked worktrees are created outside the repository at
-`../.maco/worktrees/<repo-name>/<agent-id>`.
+`../.maco/worktrees/<repo-name>/<agent-id>`. Completed task branches can be
+cleaned with `maco worktree gc`; branch refs remain available for later
+recreation, while dirty, claimed, or leased worktrees are left in place.
 
 ## Local Artifact Boundaries
 
@@ -439,6 +442,7 @@ Managed worktree creation currently returns `Unsupported` before repository acce
 
 ```bash
 cargo run -- worktree create agent-a --repo . --json
+cargo run -- worktree create agent-b --repo . --gc-max-count 10 --gc-max-age-seconds 604800 --json
 ```
 
 List worktrees:
@@ -446,6 +450,24 @@ List worktrees:
 ```bash
 cargo run -- worktree list --repo .
 ```
+
+Dry-run lifecycle cleanup for completed managed worktrees and retained Rust build
+artifacts:
+
+```bash
+cargo run -- worktree gc --repo . --dry-run --json
+cargo run -- worktree gc --repo . --max-count 10 --max-age-seconds 604800 --json
+cargo run -- worktree gc --repo . --keep-targets
+```
+
+GC keeps worktrees with uncommitted changes, active MACO execution leases, or
+active path claims for the same agent id. Without retention filters, every clean
+inactive managed worktree is eligible for removal; with `--max-count` and/or
+`--max-age-seconds`, retained clean worktrees keep the checkout but lose their
+`target/` directory unless `--keep-targets` is set. A second pass prunes
+unregistered direct-child directories left under the managed worktree root, which
+covers the NTFS/DrvFS case where Git deregisters a worktree but leaves a partial
+directory behind.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 
@@ -1187,7 +1209,7 @@ Run the fake-first autopilot workflow:
 > worktree creation, non-force managed worktree removal, `orchestrate run`,
 > `agent run`, `supervise run`, and Inbox run/watch/workspace run/watch are
 > disabled at their public entry points for the same reason. Inbox scan/status,
-> worktree list/pending, and force cleanup remain available. `maco worktree
+> worktree list/pending, worktree gc, and force cleanup remain available. `maco worktree
 > pending` opens only an existing authenticated snapshot and existing locks;
 > absent state returns no operations, and crash residue or transitional state is
 > refused without recovery or mutation. Operators must inspect preserved manual
