@@ -1,3 +1,10 @@
+pub use crate::merge_semantic::{
+    SemanticConflictClassification, SemanticConflictClassificationStatus,
+    SemanticConflictConfidence, SemanticConflictDependencyImpact, SemanticConflictDependencySide,
+    SemanticConflictImport, SemanticConflictLineRange, SemanticConflictOverlap,
+    SemanticConflictOverlapKind, SemanticConflictRisk, SemanticConflictSide,
+    SemanticConflictSymbol,
+};
 use crate::{
     llm::Redactor,
     process_runner::{
@@ -393,6 +400,7 @@ pub struct MergeApplySafety {
     pub candidate_validation_commands: Vec<String>,
     pub force_options: MergeForceOptions,
     pub apply_mode: ApplyMode,
+    pub semantic_conflicts: SemanticConflictClassification,
     pub readiness: ApplyReadiness,
 }
 
@@ -875,6 +883,7 @@ pub(crate) fn build_merge_apply_preview(
             candidate_validation_commands,
             force_options: forces,
             apply_mode,
+            semantic_conflicts: SemanticConflictClassification::no_conflict(),
             readiness,
         },
     })
@@ -4594,14 +4603,17 @@ fn classify_status(status: Status) -> ChangeKind {
     }
 }
 
-fn serialize_path<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
+pub(crate) fn serialize_path<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     serializer.serialize_str(&path_json_text(path))
 }
 
-fn serialize_paths<S>(paths: &[PathBuf], serializer: S) -> std::result::Result<S::Ok, S::Error>
+pub(crate) fn serialize_paths<S>(
+    paths: &[PathBuf],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -7297,6 +7309,7 @@ mod tests {
                 candidate_validation_commands: Vec::new(),
                 force_options: MergeForceOptions::default(),
                 apply_mode: ApplyMode::Direct,
+                semantic_conflicts: SemanticConflictClassification::no_conflict(),
                 readiness: ApplyReadiness {
                     status: ApplyReadinessStatus::Safe,
                     blockers: Vec::new(),

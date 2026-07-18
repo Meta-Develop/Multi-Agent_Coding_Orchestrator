@@ -13,6 +13,7 @@ pub mod inbox;
 pub mod live_claim;
 pub mod llm;
 pub mod merge;
+pub(crate) mod merge_semantic;
 pub mod orchestrator;
 pub(crate) mod pinned_exec;
 pub mod planning;
