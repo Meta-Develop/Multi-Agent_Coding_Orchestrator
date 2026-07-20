@@ -1,15 +1,16 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
-    path::{Path, PathBuf},
-    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
-};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
+use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 pub const ORCHESTRATION_EVENT_PATH: &str = "events/orchestration.jsonl";
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,42 +51,31 @@ pub enum OrchestrationEventError {
     Clock(#[from] SystemTimeError),
     #[error("event timestamp is outside the supported RFC3339 range")]
     TimestampOutOfRange,
-    #[error("failed to create orchestration event directory {path}: {source}")]
-    CreateDirectory { path: PathBuf, source: io::Error },
-    #[error("failed to serialize orchestration event: {0}")]
-    Serialize(#[from] serde_json::Error),
-    #[error("failed to open orchestration event journal {path}: {source}")]
-    Open { path: PathBuf, source: io::Error },
-    #[error("failed to append orchestration event journal {path}: {source}")]
-    Append { path: PathBuf, source: io::Error },
+    #[error("failed to append orchestration event journal: {0}")]
+    ArtifactAppend(String),
+    #[cfg(test)]
+    #[error("injected orchestration event append failure")]
+    InjectedAppend,
 }
 
 #[derive(Clone, Debug)]
 pub struct OrchestrationEventJournal {
-    directory: PathBuf,
-    path: PathBuf,
     repository_id: String,
     run_id: String,
+    enabled: bool,
 }
 
 impl OrchestrationEventJournal {
-    pub fn new(
-        run_dir: impl AsRef<Path>,
-        repository_id: impl Into<String>,
-        run_id: impl Into<String>,
-    ) -> Self {
-        let run_dir = run_dir.as_ref();
-        let directory = run_dir.join("events");
+    pub fn new(repository_id: impl Into<String>, run_id: impl Into<String>) -> Self {
         Self {
-            path: run_dir.join(ORCHESTRATION_EVENT_PATH),
-            directory,
             repository_id: repository_id.into(),
             run_id: run_id.into(),
+            enabled: true,
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub fn create_event(
@@ -100,16 +90,34 @@ impl OrchestrationEventJournal {
     }
 
     pub fn append(
-        &self,
+        &mut self,
+        writer: &mut ArtifactRunWriter,
         node: impl Into<String>,
         parent: Option<&str>,
         role: OrchestrationRole,
         kind: OrchestrationEventKind,
         payload: Value,
     ) -> Result<(), OrchestrationEventError> {
-        let event = self.create_event(node, parent, role, kind, payload)?;
-        let line = encode_event_line(&event)?;
-        self.append_line(&line)
+        if !self.enabled {
+            return Ok(());
+        }
+        let result = self
+            .create_event(node, parent, role, kind, payload)
+            .and_then(|event| {
+                run_append_fault()?;
+                writer
+                    .append_json_line(
+                        ORCHESTRATION_EVENT_PATH,
+                        &event,
+                        ArtifactFileDisposition::PrivateEvidence,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| OrchestrationEventError::ArtifactAppend(format!("{error:#}")))
+            });
+        if result.is_err() {
+            self.enabled = false;
+        }
+        result
     }
 
     fn create_event_at(
@@ -131,29 +139,6 @@ impl OrchestrationEventJournal {
             kind,
             payload,
         })
-    }
-
-    fn append_line(&self, line: &[u8]) -> Result<(), OrchestrationEventError> {
-        fs::create_dir_all(&self.directory).map_err(|source| {
-            OrchestrationEventError::CreateDirectory {
-                path: self.directory.clone(),
-                source,
-            }
-        })?;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|source| OrchestrationEventError::Open {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.write_all(line)
-            .map_err(|source| OrchestrationEventError::Append {
-                path: self.path.clone(),
-                source,
-            })
     }
 }
 
@@ -202,11 +187,28 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
 }
 
 #[cfg(test)]
+pub(crate) fn set_orchestration_event_append_fault() {
+    APPEND_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn run_append_fault() -> Result<(), OrchestrationEventError> {
+    if APPEND_FAULT.with(|fault| fault.replace(false)) {
+        return Err(OrchestrationEventError::InjectedAppend);
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn run_append_fault() -> Result<(), OrchestrationEventError> {
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::time::Duration;
 
     use serde_json::{json, Value};
-    use tempfile::tempdir;
 
     use super::*;
 
@@ -224,63 +226,55 @@ mod tests {
     }
 
     #[test]
-    fn writer_appends_schema_conforming_json_lines() {
-        let temp = tempdir().expect("temporary directory");
-        let run_dir = temp.path().join("run-1");
-        let journal = OrchestrationEventJournal::new(&run_dir, "repo-id", "run-1");
-
-        journal
-            .append(
+    fn encodes_schema_conforming_json_line() {
+        let journal = OrchestrationEventJournal::new("repo-id", "run-1");
+        let event = journal
+            .create_event_at(
+                UNIX_EPOCH,
                 "worker-1",
                 Some("orchestrator-1"),
                 OrchestrationRole::Worker,
                 OrchestrationEventKind::Spawn,
                 json!({"attempt": 1, "thread_id": "thread-1"}),
             )
-            .expect("append spawn event");
-        journal
-            .append(
-                "worker-1",
-                None,
-                OrchestrationRole::Auditor,
-                OrchestrationEventKind::Accept,
-                json!({"accepted": true}),
-            )
-            .expect("append accept event");
-
-        assert_eq!(
-            journal.path(),
-            run_dir.join(ORCHESTRATION_EVENT_PATH).as_path()
-        );
-        let contents = fs::read_to_string(journal.path()).expect("read event journal");
-        let records = contents
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("valid JSON record"))
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0]["repo"], "repo-id");
-        assert_eq!(records[0]["run"], "run-1");
-        assert_eq!(records[0]["node"], "worker-1");
-        assert_eq!(records[0]["parent"], "orchestrator-1");
-        assert_eq!(records[0]["role"], "worker");
-        assert_eq!(records[0]["kind"], "spawn");
-        assert_eq!(records[0]["payload"]["attempt"], 1);
-        assert_eq!(records[0]["payload"]["thread_id"], "thread-1");
-        assert_eq!(records[1]["parent"], Value::Null);
-        assert_eq!(records[1]["role"], "auditor");
-        assert_eq!(records[1]["kind"], "accept");
-        for record in records {
-            let object = record.as_object().expect("event object");
-            assert_eq!(object.len(), 8);
-            for field in [
-                "ts", "repo", "run", "node", "parent", "role", "kind", "payload",
-            ] {
-                assert!(object.contains_key(field), "missing {field}");
-            }
-            let timestamp = object["ts"].as_str().expect("timestamp string");
-            assert_eq!(timestamp.len(), 20);
-            assert!(timestamp.ends_with('Z'));
+            .expect("create event");
+        let line = encode_event_line(&event).expect("encode event line");
+        assert_eq!(line.last(), Some(&b'\n'));
+        let record: Value = serde_json::from_slice(&line).expect("valid JSON record");
+        let object = record.as_object().expect("event object");
+        assert_eq!(object.len(), 8);
+        for field in [
+            "ts", "repo", "run", "node", "parent", "role", "kind", "payload",
+        ] {
+            assert!(object.contains_key(field), "missing {field}");
         }
+        assert_eq!(record["ts"], "1970-01-01T00:00:00Z");
+        assert_eq!(record["repo"], "repo-id");
+        assert_eq!(record["run"], "run-1");
+        assert_eq!(record["node"], "worker-1");
+        assert_eq!(record["parent"], "orchestrator-1");
+        assert_eq!(record["role"], "worker");
+        assert_eq!(record["kind"], "spawn");
+        assert_eq!(record["payload"]["attempt"], 1);
+        assert_eq!(record["payload"]["thread_id"], "thread-1");
+    }
+
+    #[test]
+    fn escalation_payload_keeps_origin_distinct_from_tree_parent() {
+        let journal = OrchestrationEventJournal::new("repo-id", "run-1");
+        let event = journal
+            .create_event_at(
+                UNIX_EPOCH,
+                "peer-task",
+                Some("run-1"),
+                OrchestrationRole::Supervisor,
+                OrchestrationEventKind::Escalate,
+                json!({"origin": "worker-7", "reason": "cross-cutting follow-up"}),
+            )
+            .expect("create escalation event");
+        assert_eq!(event.parent.as_deref(), Some("run-1"));
+        assert_eq!(event.payload["origin"], "worker-7");
+        assert_ne!(event.payload["origin"], event.parent.unwrap());
     }
 
     #[test]

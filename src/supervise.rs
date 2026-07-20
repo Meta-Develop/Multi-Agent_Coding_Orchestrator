@@ -1,11 +1,12 @@
 use crate::{
     artifacts::{
-        ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory,
-        RunArtifactFamily,
+        repository_authenticator_key_only, ArtifactFileDisposition, ArtifactRunReader,
+        ArtifactRunWriter, ArtifactScratchDirectory, RunArtifactFamily,
     },
     external_agent::{
         run_external_agent, ExternalAgentCommand, ExternalAgentRun, ExternalProgramTrust,
     },
+    orchestration_event::{OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole},
     orchestrator::{RunId, SemanticCoordinationMode},
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
@@ -1204,6 +1205,177 @@ fn append_child_attempt_history(
     }
 }
 
+fn initialize_orchestration_event_journal(
+    repo: &Path,
+    run_id: &RunId,
+) -> Option<OrchestrationEventJournal> {
+    match repository_authenticator_key_only(repo) {
+        Ok(authenticator) => Some(OrchestrationEventJournal::new(
+            authenticator.binding().repository_id.clone(),
+            run_id.as_str(),
+        )),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "supervise orchestration event journal is unavailable"
+            );
+            None
+        }
+    }
+}
+
+fn record_orchestration_event(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    node: &str,
+    parent: Option<&str>,
+    role: OrchestrationRole,
+    kind: OrchestrationEventKind,
+    payload: Value,
+) {
+    let Some(active_journal) = journal.as_mut() else {
+        return;
+    };
+    let append_error = active_journal
+        .append(writer, node, parent, role, kind, payload)
+        .err();
+    if let Some(error) = append_error {
+        tracing::warn!(
+            error = %error,
+            node,
+            ?kind,
+            "disabled supervise orchestration event journal after append failure"
+        );
+        *journal = None;
+    }
+}
+
+fn lifecycle_event_payload(status: &str, attempt: Option<usize>, thread_id: Option<&str>) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("status".to_string(), Value::String(status.to_string()));
+    if let Some(attempt) = attempt {
+        payload.insert("attempt".to_string(), json!(attempt));
+    }
+    if let Some(thread_id) = thread_id {
+        payload.insert(
+            "thread_id".to_string(),
+            Value::String(thread_id.to_string()),
+        );
+    }
+    Value::Object(payload)
+}
+
+fn codex_thread_id_from_stdout(stdout: &[u8]) -> Option<String> {
+    stdout
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .filter_map(|value| {
+            value
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .find(|thread_id| {
+            !thread_id.is_empty()
+                && thread_id.len() <= 256
+                && !thread_id.chars().any(char::is_control)
+        })
+}
+
+fn record_worker_journal_events(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    assignment: &OrchestratorAssignment,
+    journals: &WorkerExecutionJournalEvidenceSet,
+) {
+    for (worker_id, evidence) in journals {
+        let (status, entries, error) = match &evidence.status {
+            WorkerExecutionJournalStatus::Loaded(entries) => ("loaded", Some(entries.len()), None),
+            WorkerExecutionJournalStatus::Missing => ("missing", None, None),
+            WorkerExecutionJournalStatus::Invalid(error) => ("invalid", None, Some(error.as_str())),
+        };
+        record_orchestration_event(
+            journal,
+            writer,
+            worker_id,
+            Some(&assignment.id),
+            OrchestrationRole::Worker,
+            OrchestrationEventKind::Journal,
+            json!({
+                "status": status,
+                "entries": entries,
+                "error": error,
+                "evidence_path": serializable_path(&evidence.evidence_relative_path),
+            }),
+        );
+    }
+}
+
+fn record_final_report_decisions(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    run_id: &RunId,
+    report: &OrchestratorReviewReport,
+) {
+    for worker in &report.worker_reports {
+        record_orchestration_event(
+            journal,
+            writer,
+            &worker.id,
+            Some(&report.id),
+            OrchestrationRole::Worker,
+            if report_failed(worker) {
+                OrchestrationEventKind::Reject
+            } else {
+                OrchestrationEventKind::Accept
+            },
+            json!({
+                "status": worker.status,
+                "accepted": worker.accepted,
+                "rejected": worker.rejected,
+            }),
+        );
+    }
+    for auditor in &report.audit_reports {
+        record_orchestration_event(
+            journal,
+            writer,
+            &auditor.id,
+            Some(&report.id),
+            OrchestrationRole::Auditor,
+            if report_failed(auditor) {
+                OrchestrationEventKind::Reject
+            } else {
+                OrchestrationEventKind::Accept
+            },
+            json!({
+                "status": auditor.status,
+                "accepted": auditor.accepted,
+                "rejected": auditor.rejected,
+            }),
+        );
+    }
+    record_orchestration_event(
+        journal,
+        writer,
+        &report.id,
+        Some(run_id.as_str()),
+        OrchestrationRole::Orchestrator,
+        if report_failed(report) {
+            OrchestrationEventKind::Reject
+        } else {
+            OrchestrationEventKind::Accept
+        },
+        json!({
+            "status": report.status,
+            "accepted": report.accepted,
+            "rejected": report.rejected,
+        }),
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
@@ -1265,6 +1437,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let manager = WorktreeManager::new(&repo);
     let mut sync_store_slot = None;
     let mut semantic_store_slot = None;
+    let mut orchestration_journal = None;
     let mut acquired_claim_tokens = Vec::new();
     let mut acquired_semantic_tokens = Vec::new();
     let mut planned_semantic_intents = Vec::new();
@@ -1307,6 +1480,16 @@ fn run_supervisor_plan_with_runner_and_creation(
         )?;
         sync_store_slot = Some(SyncStore::open(&repo)?);
         semantic_store_slot = Some(SemanticIntentStore::open(&repo)?);
+        orchestration_journal = initialize_orchestration_event_journal(&repo, &options.run_id);
+        record_orchestration_event(
+            &mut orchestration_journal,
+            &mut artifact_writer,
+            options.run_id.as_str(),
+            None,
+            OrchestrationRole::Supervisor,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload("running", None, None),
+        );
         let sync_store = sync_store_slot
             .as_ref()
             .context("supervisor sync store was not initialized")?;
@@ -1514,6 +1697,28 @@ fn run_supervisor_plan_with_runner_and_creation(
                 command.output_schema = Some(schema_path.clone());
                 command = command.with_hidden_root(&repo);
 
+                record_orchestration_event(
+                    &mut orchestration_journal,
+                    &mut artifact_writer,
+                    &assignment.id,
+                    Some(options.run_id.as_str()),
+                    OrchestrationRole::Orchestrator,
+                    OrchestrationEventKind::Spawn,
+                    json!({
+                        "attempt": attempt,
+                        "corrective_retry": corrective_retry_used,
+                    }),
+                );
+                record_orchestration_event(
+                    &mut orchestration_journal,
+                    &mut artifact_writer,
+                    &assignment.id,
+                    Some(options.run_id.as_str()),
+                    OrchestrationRole::Orchestrator,
+                    OrchestrationEventKind::Status,
+                    lifecycle_event_payload("running", Some(attempt), None),
+                );
+
                 let external_run_result = match runtime {
                     SupervisorRuntime::Codex => Ok(external_runner(&command)),
                     SupervisorRuntime::Fake => deterministic_fake_child_run(
@@ -1538,6 +1743,24 @@ fn run_supervisor_plan_with_runner_and_creation(
                 };
                 drop(incoming_output_root);
                 drop(capture_output_root);
+                let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
+                record_orchestration_event(
+                    &mut orchestration_journal,
+                    &mut artifact_writer,
+                    &assignment.id,
+                    Some(options.run_id.as_str()),
+                    OrchestrationRole::Orchestrator,
+                    OrchestrationEventKind::Status,
+                    lifecycle_event_payload(
+                        if external_process_completed(&external_run) {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
+                        Some(attempt),
+                        child_thread_id.as_deref(),
+                    ),
+                );
                 let attempt_containment_verified = external_safety_verified(&external_run, runtime);
                 if !attempt_containment_verified {
                     external_containment_failed = true;
@@ -1563,6 +1786,12 @@ fn run_supervisor_plan_with_runner_and_creation(
                     assignment,
                     &incoming_scratch,
                 )?;
+                record_worker_journal_events(
+                    &mut orchestration_journal,
+                    &mut artifact_writer,
+                    assignment,
+                    &worker_journal_evidence,
+                );
                 import_external_attempt_evidence(
                     &mut artifact_writer,
                     ExternalAttemptEvidenceContext {
@@ -1623,6 +1852,29 @@ fn run_supervisor_plan_with_runner_and_creation(
                     corrective_retry_used,
                 });
                 if retry_used {
+                    record_orchestration_event(
+                        &mut orchestration_journal,
+                        &mut artifact_writer,
+                        &assignment.id,
+                        Some(options.run_id.as_str()),
+                        OrchestrationRole::Orchestrator,
+                        OrchestrationEventKind::Reject,
+                        json!({
+                            "scope": "attempt",
+                            "attempt": attempt,
+                            "reason": "structural report requires corrective retry",
+                            "structural_problems": report_shape_problems,
+                        }),
+                    );
+                    record_orchestration_event(
+                        &mut orchestration_journal,
+                        &mut artifact_writer,
+                        &assignment.id,
+                        Some(options.run_id.as_str()),
+                        OrchestrationRole::Orchestrator,
+                        OrchestrationEventKind::Status,
+                        lifecycle_event_payload("retrying", Some(attempt), None),
+                    );
                     retry_feedback = Some(report_shape_problems);
                     continue;
                 }
@@ -1765,6 +2017,24 @@ fn run_supervisor_plan_with_runner_and_creation(
                 auditor_command = auditor_command
                     .with_workspace_access(WorkspaceAccess::ReadOnly)
                     .with_hidden_root(&repo);
+                record_orchestration_event(
+                    &mut orchestration_journal,
+                    &mut artifact_writer,
+                    &auditor_id,
+                    Some(&assignment.id),
+                    OrchestrationRole::Auditor,
+                    OrchestrationEventKind::Spawn,
+                    json!({"attempt": 1}),
+                );
+                record_orchestration_event(
+                    &mut orchestration_journal,
+                    &mut artifact_writer,
+                    &auditor_id,
+                    Some(&assignment.id),
+                    OrchestrationRole::Auditor,
+                    OrchestrationEventKind::Status,
+                    lifecycle_event_payload("running", Some(1), None),
+                );
                 let auditor_run_result = match runtime {
                     SupervisorRuntime::Codex => Ok(external_runner(&auditor_command)),
                     SupervisorRuntime::Fake => {
@@ -1787,6 +2057,24 @@ fn run_supervisor_plan_with_runner_and_creation(
                 };
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
+                let auditor_thread_id = codex_thread_id_from_stdout(auditor_run.stdout_bytes());
+                record_orchestration_event(
+                    &mut orchestration_journal,
+                    &mut artifact_writer,
+                    &auditor_id,
+                    Some(&assignment.id),
+                    OrchestrationRole::Auditor,
+                    OrchestrationEventKind::Status,
+                    lifecycle_event_payload(
+                        if external_process_completed(&auditor_run) {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
+                        Some(1),
+                        auditor_thread_id.as_deref(),
+                    ),
+                );
                 let auditor_containment_verified = external_safety_verified(&auditor_run, runtime);
                 if !auditor_containment_verified {
                     assignment_containment_verified = false;
@@ -1845,6 +2133,12 @@ fn run_supervisor_plan_with_runner_and_creation(
                 validate_auditor_reports(assignment, &final_report_path, &mut child_report);
             }
             write_child_report(&mut artifact_writer, &final_report_relative, &child_report)?;
+            record_final_report_decisions(
+                &mut orchestration_journal,
+                &mut artifact_writer,
+                &options.run_id,
+                &child_report,
+            );
             if child_report.status != ReviewStatus::Succeeded {
                 findings.push(Finding {
                     severity: FindingSeverity::Error,
@@ -2049,6 +2343,33 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .to_string()
         },
     };
+    record_orchestration_event(
+        &mut orchestration_journal,
+        &mut artifact_writer,
+        final_report.run_id.as_str(),
+        None,
+        OrchestrationRole::Supervisor,
+        OrchestrationEventKind::Gate,
+        json!({
+            "success": final_report.success,
+            "publishable": final_report.publishable,
+            "accepted": final_report.accepted,
+            "rejected": final_report.rejected,
+        }),
+    );
+    record_orchestration_event(
+        &mut orchestration_journal,
+        &mut artifact_writer,
+        final_report.run_id.as_str(),
+        None,
+        OrchestrationRole::Supervisor,
+        OrchestrationEventKind::Status,
+        json!({
+            "status": "final",
+            "result": final_report.status,
+            "success": final_report.success,
+        }),
+    );
     write_final_report(&mut artifact_writer, &final_report)?;
     artifact_writer.finalize(
         RunArtifactFamily::Supervise.final_report_relative_path(),
@@ -5802,6 +6123,9 @@ mod tests {
     use super::*;
     use crate::{
         external_agent::{CapturedOutput, CodexPermissionEvidence},
+        orchestration_event::{
+            set_orchestration_event_append_fault, OrchestrationEvent, ORCHESTRATION_EVENT_PATH,
+        },
         process_runner::{ContainmentBackend, SideEffectConfinementProfileKind},
     };
     use git2::Signature;
@@ -6232,6 +6556,155 @@ mod tests {
     }
 
     #[test]
+    fn fake_supervise_run_finalizes_manifested_report_tree_events() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let run_id = RunId::new("fake-orchestration-events").expect("valid run id");
+        let mut options = injected_options(&repo_path, temp.path(), run_id.as_str());
+        options.runtime = SupervisorRuntime::Fake;
+        let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+            panic!("fake runtime must not invoke the external runner")
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run fake supervise journal fixture");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized fake supervise run");
+        let journal_record = reader
+            .finalization()
+            .files
+            .iter()
+            .find(|record| record.path == Path::new(ORCHESTRATION_EVENT_PATH))
+            .expect("manifested orchestration journal");
+        assert_eq!(
+            journal_record.disposition,
+            ArtifactFileDisposition::PrivateEvidence
+        );
+        let events = read_finalized_orchestration_events(&reader);
+        assert!(!events.is_empty());
+        let repository_id = repository_authenticator_key_only(&repo_path)
+            .expect("open repository authenticator")
+            .binding()
+            .repository_id
+            .clone();
+        for event in &events {
+            assert_eq!(event.repo, repository_id);
+            assert_eq!(event.run, run_id.as_str());
+            assert_eq!(event.ts.len(), 20);
+            assert!(event.ts.ends_with('Z'));
+        }
+
+        assert!(events.iter().any(|event| {
+            event.node == assignment.id
+                && event.parent.as_deref() == Some(run_id.as_str())
+                && event.role == OrchestrationRole::Orchestrator
+                && event.kind == OrchestrationEventKind::Spawn
+                && event.payload["attempt"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == "worker-a"
+                && event.parent.as_deref() == Some(assignment.id.as_str())
+                && event.role == OrchestrationRole::Worker
+                && event.kind == OrchestrationEventKind::Journal
+                && event.payload["status"] == "loaded"
+        }));
+        let expected_auditor_id = parent_auditor_id(&assignment);
+        assert!(events.iter().any(|event| {
+            event.node == expected_auditor_id
+                && event.parent.as_deref() == Some(assignment.id.as_str())
+                && event.role == OrchestrationRole::Auditor
+                && event.kind == OrchestrationEventKind::Spawn
+        }));
+
+        for orchestrator in &report.orchestrator_reports {
+            for worker in &orchestrator.worker_reports {
+                assert_final_decision_event(
+                    &events,
+                    &worker.id,
+                    &orchestrator.id,
+                    OrchestrationRole::Worker,
+                    worker,
+                );
+            }
+            for auditor in &orchestrator.audit_reports {
+                assert_final_decision_event(
+                    &events,
+                    &auditor.id,
+                    &orchestrator.id,
+                    OrchestrationRole::Auditor,
+                    auditor,
+                );
+            }
+            assert_final_decision_event(
+                &events,
+                &orchestrator.id,
+                run_id.as_str(),
+                OrchestrationRole::Orchestrator,
+                orchestrator,
+            );
+        }
+        assert!(events.iter().any(|event| {
+            event.node == run_id.as_str()
+                && event.parent.is_none()
+                && event.role == OrchestrationRole::Supervisor
+                && event.kind == OrchestrationEventKind::Gate
+                && event.payload["success"] == report.success
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == run_id.as_str()
+                && event.parent.is_none()
+                && event.role == OrchestrationRole::Supervisor
+                && event.kind == OrchestrationEventKind::Status
+                && event.payload["status"] == "final"
+        }));
+    }
+
+    #[test]
+    fn journal_append_failure_does_not_block_fake_run_finalization() {
+        let (temp, repo_path) = injected_repository();
+        let mut plan = injected_plan(injected_assignment(false), 0);
+        plan.assignments.clear();
+        let run_id = RunId::new("journal-failure-isolated").expect("valid run id");
+        let mut options = injected_options(&repo_path, temp.path(), run_id.as_str());
+        options.runtime = SupervisorRuntime::Fake;
+        let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+            panic!("empty fake plan must not invoke the external runner")
+        };
+        set_orchestration_event_append_fault();
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("journal failure must not abort supervise finalization");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized run after journal failure");
+        assert!(reader
+            .read(ORCHESTRATION_EVENT_PATH)
+            .expect_err("disabled journal must not create an unmanifested artifact")
+            .to_string()
+            .contains("not present in the finalized manifest"));
+        assert!(
+            read_supervisor_final_report(&reader)
+                .expect("read finalized report after journal failure")
+                .success
+        );
+    }
+
+    #[test]
     fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let repo = Repository::init(temp.path()).expect("initialize repository");
@@ -6589,6 +7062,27 @@ mod tests {
         assert!(history.contains("child attempt 1 history"));
         assert!(history.contains("child attempt 2 history"));
         assert!(history.contains("corrective_retry_used=true"));
+
+        let run_id = RunId::new("injected-retry").expect("valid retry run id");
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized retry run");
+        let events = read_finalized_orchestration_events(&reader);
+        let attempts = events
+            .iter()
+            .filter(|event| {
+                event.node == assignment.id
+                    && event.role == OrchestrationRole::Orchestrator
+                    && event.kind == OrchestrationEventKind::Spawn
+            })
+            .filter_map(|event| event.payload["attempt"].as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(attempts, vec![1, 2]);
+        assert!(events.iter().any(|event| {
+            event.node == assignment.id
+                && event.kind == OrchestrationEventKind::Reject
+                && event.payload["scope"] == "attempt"
+                && event.payload["attempt"] == 1
+        }));
     }
 
     #[test]
@@ -7645,6 +8139,29 @@ mod tests {
         assert!(error.to_string().contains("lenient JSON extraction failed"));
     }
 
+    #[test]
+    fn thread_id_parser_uses_first_valid_id_in_bounded_stdout_jsonl() {
+        let stdout = b"diagnostic prelude\n{\"type\":\"thread.started\",\"thread_id\":\"thread-first\"}\n{\"thread_id\":\"thread-later\"}\n";
+        assert_eq!(
+            codex_thread_id_from_stdout(stdout).as_deref(),
+            Some("thread-first")
+        );
+        assert_eq!(
+            codex_thread_id_from_stdout(
+                b"{\"type\":\"turn.started\"}\n{\"thread_id\":\"thread-later\"}\n"
+            )
+            .as_deref(),
+            Some("thread-later")
+        );
+        assert_eq!(
+            codex_thread_id_from_stdout(
+                b"{\"thread_id\":\"\"}\n{\"thread_id\":\"bad\\nthread\"}\n{\"thread_id\":\"thread-valid\"}\n"
+            )
+            .as_deref(),
+            Some("thread-valid")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn finding_serialization_escapes_non_utf8_paths_reversibly() {
@@ -7771,6 +8288,49 @@ mod tests {
         assert!(prompt.contains("write a structured execution journal"));
         assert!(prompt.contains("\"start_timestamp\""));
         assert!(prompt.contains("\"changed_paths\""));
+    }
+
+    fn read_finalized_orchestration_events(reader: &ArtifactRunReader) -> Vec<OrchestrationEvent> {
+        let contents = reader
+            .read(ORCHESTRATION_EVENT_PATH)
+            .expect("read finalized orchestration journal");
+        std::str::from_utf8(&contents)
+            .expect("UTF-8 orchestration journal")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("schema-conforming event record"))
+            .collect()
+    }
+
+    fn assert_final_decision_event<T: ReportStatus>(
+        events: &[OrchestrationEvent],
+        node: &str,
+        parent: &str,
+        role: OrchestrationRole,
+        report: &T,
+    ) {
+        let expected_kind = if report_failed(report) {
+            OrchestrationEventKind::Reject
+        } else {
+            OrchestrationEventKind::Accept
+        };
+        let event = events
+            .iter()
+            .find(|event| {
+                event.node == node
+                    && event.parent.as_deref() == Some(parent)
+                    && event.role == role
+                    && event.kind == expected_kind
+                    && event.payload.get("scope").is_none()
+            })
+            .unwrap_or_else(|| {
+                panic!("missing final {expected_kind:?} event for {role:?} {node} under {parent}")
+            });
+        assert_eq!(event.payload["accepted"], report.accepted());
+        assert_eq!(event.payload["rejected"], report.rejected());
+        assert_eq!(
+            event.payload["status"],
+            serde_json::to_value(report.status()).expect("serialize report status")
+        );
     }
 
     fn injected_repository() -> (tempfile::TempDir, PathBuf) {
