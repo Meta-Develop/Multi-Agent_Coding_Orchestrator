@@ -1152,6 +1152,13 @@ Child/model final-message bytes are confined to `incoming/`; normalized child
 reports and `supervisor-final.json` are parent-owned under `reports/`. Only the
 incoming root is granted writable to an external child. The parent retains file
 descriptors for bounded reads and atomic final writes.
+Worker prompts also include a structured execution journal path under
+`incoming/worker-journals/<worker-id>.jsonl`. Terminal workers append JSONL
+records with `command`, `cwd`, `start_timestamp`, `end_timestamp`, and
+`changed_paths`; the supervisor imports them into
+`logs/workers/<child-id>/<worker-id>.jsonl` and rejects material mismatches
+against WorkerReport evidence, assigned paths, or the supervisor-inspected Git
+diff.
 Each Codex CLI child orchestrator is instructed to read `AGENTS.md` and
 project-local `.agents` guidance before acting. The generated prompt contract is
 user-directed root O2 -> autonomous O2 supervisor -> O1 child orchestrator ->

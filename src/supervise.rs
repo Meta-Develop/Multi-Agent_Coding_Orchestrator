@@ -748,7 +748,7 @@ Required behavior:
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
 - If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
-- Each worker must also write its structured execution journal to the exact path in its worker prompt. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects worker evidence that the journal or Git diff does not support.
+- Each worker must also write its structured execution journal to the exact path in its worker prompt; that path is the only allowed non-source artifact write for a terminal worker. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects worker evidence that the journal or Git diff does not support.
 - Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
 - Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
 - Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
@@ -854,7 +854,7 @@ Ownership:
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
 - Do not mutate the primary worktree.
-- Before returning your WorkerReport, write a structured execution journal to the exact execution journal path above. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
+- Before returning your WorkerReport, write a structured execution journal to the exact execution journal path above; this is the only allowed non-source artifact write for this worker. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
 - Run validation or record why validation was not run.
 - Return WorkerReport JSON in your final response with changed files, commands run, validation results, findings, remaining risk, and next safe action.
 - Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
@@ -1063,6 +1063,32 @@ struct ExternalAttemptEvidenceContext<'a> {
     external_command: &'a ExternalAgentCommand,
     raw_report_validated: bool,
     runtime: SupervisorRuntime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerExecutionJournalEvidence {
+    incoming_relative_path: PathBuf,
+    evidence_relative_path: PathBuf,
+    status: WorkerExecutionJournalStatus,
+}
+
+type WorkerExecutionJournalEvidenceSet = BTreeMap<String, WorkerExecutionJournalEvidence>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerExecutionJournalStatus {
+    Loaded(Vec<WorkerExecutionJournalEntry>),
+    Missing,
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerExecutionJournalEntry {
+    command: Vec<String>,
+    cwd: PathBuf,
+    start_timestamp: String,
+    end_timestamp: String,
+    changed_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1489,6 +1515,11 @@ fn run_supervisor_plan_with_runner(
                     &attempt_artifacts.raw_report_relative,
                 )
                 .is_ok();
+                let worker_journal_evidence = import_worker_execution_journals(
+                    &mut artifact_writer,
+                    assignment,
+                    &incoming_scratch,
+                )?;
                 import_external_attempt_evidence(
                     &mut artifact_writer,
                     ExternalAttemptEvidenceContext {
@@ -1510,6 +1541,7 @@ fn run_supervisor_plan_with_runner(
                     &command,
                     &worktree.path,
                     &child_base_head,
+                    &worker_journal_evidence,
                 );
                 if !primary_changes.is_empty() {
                     mark_primary_integrity_violation(
@@ -2194,6 +2226,7 @@ fn collect_child_report(
     external_command: &ExternalAgentCommand,
     worktree_path: &Path,
     child_base_head: &Oid,
+    worker_journals: &WorkerExecutionJournalEvidenceSet,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     let mut report_shape_problems = Vec::new();
     let mut report = match read_child_report(external_run.output_last_message(), report_path) {
@@ -2261,6 +2294,12 @@ fn collect_child_report(
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
     validate_worker_report_evidence(assignment, report_path, &mut report);
+    validate_worker_execution_journal_evidence(
+        assignment,
+        report_path,
+        worker_journals,
+        &mut report,
+    );
     (report, report_shape_problems)
 }
 
@@ -2855,15 +2894,12 @@ fn validate_worker_report_evidence(
         .collect::<Vec<_>>();
     if !reported_but_not_observed.is_empty() || !observed_but_not_reported.is_empty() {
         let paths = union_paths(&reported_but_not_observed, &observed_but_not_reported);
-        report.findings.push(Finding {
-            severity: FindingSeverity::Warning,
-            message: format!(
-                "worker files_changed union differs from actual child worktree Git changes; reported-but-not-observed: {}; observed-but-not-reported: {}",
-                display_paths(&reported_but_not_observed),
-                display_paths(&observed_but_not_reported)
-            ),
-            paths,
-        });
+        let message = format!(
+            "worker files_changed union differs from actual child worktree Git changes; reported-but-not-observed: {}; observed-but-not-reported: {}",
+            display_paths(&reported_but_not_observed),
+            display_paths(&observed_but_not_reported)
+        );
+        blocking_messages.push((message, paths));
     }
 
     if blocking_messages.is_empty() {
@@ -2884,6 +2920,237 @@ fn validate_worker_report_evidence(
         "one or more worker reports have structural evidence inconsistencies".to_string();
     report.next_safe_action =
         "inspect worker reports and rerun the child scope with corrected evidence".to_string();
+}
+
+fn validate_worker_execution_journal_evidence(
+    assignment: &OrchestratorAssignment,
+    report_path: &Path,
+    journals: &WorkerExecutionJournalEvidenceSet,
+    report: &mut OrchestratorReviewReport,
+) {
+    if assignment.worker_assignments.is_empty() || report.worker_reports.is_empty() {
+        return;
+    }
+
+    let workers_by_id = assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| (worker.id.as_str(), worker))
+        .collect::<BTreeMap<_, _>>();
+    let actual_set = report
+        .files_changed
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut blocking_messages = Vec::new();
+
+    for worker_report in &mut report.worker_reports {
+        let Some(worker_assignment) = workers_by_id.get(worker_report.id.as_str()) else {
+            continue;
+        };
+        let Some(journal) = journals.get(&worker_report.id) else {
+            let message = format!(
+                "worker '{}' execution journal evidence was not imported by the supervisor gate",
+                worker_report.id
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                vec![report_path.to_path_buf()],
+            );
+            blocking_messages.push((message, vec![report_path.to_path_buf()]));
+            continue;
+        };
+
+        let entries = match &journal.status {
+            WorkerExecutionJournalStatus::Loaded(entries) => entries,
+            WorkerExecutionJournalStatus::Missing => {
+                let message = format!(
+                    "worker '{}' execution journal is missing; expected {} imported as {}",
+                    worker_report.id,
+                    journal.incoming_relative_path.display(),
+                    journal.evidence_relative_path.display()
+                );
+                mark_worker_report_structural_inconsistency(
+                    worker_report,
+                    message.clone(),
+                    vec![journal.evidence_relative_path.clone()],
+                );
+                blocking_messages.push((message, vec![journal.evidence_relative_path.clone()]));
+                continue;
+            }
+            WorkerExecutionJournalStatus::Invalid(error) => {
+                let message = format!(
+                    "worker '{}' execution journal {} is invalid: {}",
+                    worker_report.id,
+                    journal.evidence_relative_path.display(),
+                    error
+                );
+                mark_worker_report_structural_inconsistency(
+                    worker_report,
+                    message.clone(),
+                    vec![journal.evidence_relative_path.clone()],
+                );
+                blocking_messages.push((message, vec![journal.evidence_relative_path.clone()]));
+                continue;
+            }
+        };
+
+        let mut journal_paths = BTreeSet::<PathBuf>::new();
+        let mut journal_unauthorized_paths = BTreeSet::<PathBuf>::new();
+        for entry in entries {
+            for path in &entry.changed_paths {
+                journal_paths.insert(path.clone());
+                if !worker_assignment
+                    .assigned_paths
+                    .iter()
+                    .any(|assigned| path_is_covered_by_claim(path, assigned))
+                {
+                    journal_unauthorized_paths.insert(path.clone());
+                }
+            }
+        }
+
+        if !journal_unauthorized_paths.is_empty() {
+            let paths = journal_unauthorized_paths.into_iter().collect::<Vec<_>>();
+            let message = format!(
+                "worker '{}' execution journal {} changed paths outside assigned_paths: {}",
+                worker_report.id,
+                journal.evidence_relative_path.display(),
+                display_paths(&paths)
+            );
+            let finding_paths = union_paths(
+                &paths,
+                std::slice::from_ref(&journal.evidence_relative_path),
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                finding_paths.clone(),
+            );
+            blocking_messages.push((message, finding_paths));
+        }
+
+        let journal_without_git = journal_paths
+            .difference(&actual_set)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !journal_without_git.is_empty() {
+            let message = format!(
+                "worker '{}' execution journal {} changed paths are not supported by supervisor-inspected Git diff: {}",
+                worker_report.id,
+                journal.evidence_relative_path.display(),
+                display_paths(&journal_without_git)
+            );
+            let finding_paths = union_paths(
+                &journal_without_git,
+                std::slice::from_ref(&journal.evidence_relative_path),
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                finding_paths.clone(),
+            );
+            blocking_messages.push((message, finding_paths));
+        }
+
+        let journal_commands = entries
+            .iter()
+            .map(|entry| (entry.command.clone(), entry.cwd.clone()))
+            .collect::<BTreeSet<_>>();
+        let reported_commands_without_journal = worker_report
+            .commands_run
+            .iter()
+            .filter(|record| {
+                !journal_commands.contains(&(record.command.clone(), record.cwd.clone()))
+            })
+            .map(|record| (record.command.clone(), record.cwd.clone()))
+            .collect::<Vec<_>>();
+        if !reported_commands_without_journal.is_empty() {
+            let message = format!(
+                "worker '{}' commands_run entries are not supported by execution journal {}: {}",
+                worker_report.id,
+                journal.evidence_relative_path.display(),
+                display_command_identities(&reported_commands_without_journal)
+            );
+            let paths = vec![
+                report_path.to_path_buf(),
+                journal.evidence_relative_path.clone(),
+            ];
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                paths.clone(),
+            );
+            blocking_messages.push((message, paths));
+        }
+
+        let reported_paths = worker_report
+            .files_changed
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let report_without_journal = reported_paths
+            .difference(&journal_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !report_without_journal.is_empty() {
+            let message = format!(
+                "worker '{}' files_changed paths are not supported by execution journal {}: {}",
+                worker_report.id,
+                journal.evidence_relative_path.display(),
+                display_paths(&report_without_journal)
+            );
+            let finding_paths = union_paths(
+                &report_without_journal,
+                std::slice::from_ref(&journal.evidence_relative_path),
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                finding_paths.clone(),
+            );
+            blocking_messages.push((message, finding_paths));
+        }
+
+        let report_without_git = reported_paths
+            .difference(&actual_set)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !report_without_git.is_empty() {
+            let message = format!(
+                "worker '{}' files_changed paths are not supported by supervisor-inspected Git diff: {}",
+                worker_report.id,
+                display_paths(&report_without_git)
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                report_without_git.clone(),
+            );
+            blocking_messages.push((message, report_without_git));
+        }
+    }
+
+    if blocking_messages.is_empty() {
+        return;
+    }
+
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    for (message, paths) in blocking_messages {
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message,
+            paths,
+        });
+    }
+    report.remaining_risk =
+        "one or more worker execution journals are missing, invalid, or inconsistent with reported evidence".to_string();
+    report.next_safe_action =
+        "inspect worker execution journals and rerun the child scope with corrected process evidence"
+            .to_string();
 }
 
 fn mark_worker_report_structural_inconsistency(
@@ -4010,6 +4277,125 @@ fn read_auditor_report(
     })?;
     parse_report_json(contents)
         .with_context(|| format!("failed to parse auditor report {}", display_path.display()))
+}
+
+fn import_worker_execution_journals(
+    writer: &mut ArtifactRunWriter,
+    assignment: &OrchestratorAssignment,
+    incoming_scratch: &ArtifactScratchDirectory,
+) -> Result<WorkerExecutionJournalEvidenceSet> {
+    let mut journals = WorkerExecutionJournalEvidenceSet::new();
+    for worker in &assignment.worker_assignments {
+        let incoming_relative_path = worker_execution_journal_incoming_relative(worker);
+        let scratch_path = incoming_scratch.path().join(&incoming_relative_path);
+        let evidence_relative_path =
+            worker_execution_journal_evidence_relative(&assignment.id, &worker.id);
+        let status = match read_bounded_regular_file_nofollow(
+            &scratch_path,
+            MAX_WORKER_EXECUTION_JOURNAL_BYTES,
+        ) {
+            Ok(bytes) => {
+                writer.write_bytes(
+                    &evidence_relative_path,
+                    &bytes,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )?;
+                match parse_worker_execution_journal(&bytes, &evidence_relative_path) {
+                    Ok(entries) => WorkerExecutionJournalStatus::Loaded(entries),
+                    Err(error) => WorkerExecutionJournalStatus::Invalid(error.to_string()),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                WorkerExecutionJournalStatus::Missing
+            }
+            Err(error) => WorkerExecutionJournalStatus::Invalid(format!(
+                "failed to read incoming worker execution journal {}: {error}",
+                incoming_relative_path.display()
+            )),
+        };
+        journals.insert(
+            worker.id.clone(),
+            WorkerExecutionJournalEvidence {
+                incoming_relative_path,
+                evidence_relative_path,
+                status,
+            },
+        );
+    }
+    Ok(journals)
+}
+
+fn parse_worker_execution_journal(
+    bytes: &[u8],
+    display_path: &Path,
+) -> Result<Vec<WorkerExecutionJournalEntry>> {
+    if bytes.len() > MAX_WORKER_EXECUTION_JOURNAL_BYTES {
+        bail!(
+            "worker execution journal {} exceeds its configured {} byte limit",
+            display_path.display(),
+            MAX_WORKER_EXECUTION_JOURNAL_BYTES
+        );
+    }
+    let contents = std::str::from_utf8(bytes).with_context(|| {
+        format!(
+            "worker execution journal {} is not UTF-8",
+            display_path.display()
+        )
+    })?;
+    let mut entries = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index.saturating_add(1);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut entry: WorkerExecutionJournalEntry =
+            serde_json::from_str(trimmed).with_context(|| {
+                format!(
+                    "failed to parse worker execution journal {} line {}",
+                    display_path.display(),
+                    line_number
+                )
+            })?;
+        if entry.command.is_empty() {
+            bail!(
+                "worker execution journal {} line {} omitted command",
+                display_path.display(),
+                line_number
+            );
+        }
+        if entry.cwd.as_os_str().is_empty() {
+            bail!(
+                "worker execution journal {} line {} omitted cwd",
+                display_path.display(),
+                line_number
+            );
+        }
+        if entry.start_timestamp.trim().is_empty() {
+            bail!(
+                "worker execution journal {} line {} omitted start_timestamp",
+                display_path.display(),
+                line_number
+            );
+        }
+        if entry.end_timestamp.trim().is_empty() {
+            bail!(
+                "worker execution journal {} line {} omitted end_timestamp",
+                display_path.display(),
+                line_number
+            );
+        }
+        entry.changed_paths = normalize_paths(std::mem::take(&mut entry.changed_paths))
+            .with_context(|| {
+                format!(
+                    "worker execution journal {} line {} has invalid changed_paths",
+                    display_path.display(),
+                    line_number
+                )
+            })?;
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn import_external_attempt_evidence(
@@ -5300,6 +5686,17 @@ fn display_strings(values: &[String]) -> String {
     values.join(", ")
 }
 
+fn display_command_identities(commands: &[(Vec<String>, PathBuf)]) -> String {
+    if commands.is_empty() {
+        return "<none>".to_string();
+    }
+    commands
+        .iter()
+        .map(|(command, cwd)| format!("{} @ {}", display_strings(command), cwd.display()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn path_relative_to(repo: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(repo)
         .map(Path::to_path_buf)
@@ -6038,6 +6435,7 @@ mod tests {
             "assignments/child-a.attempt-2.prompt.md",
             "evidence/incoming/child-a.attempt-1.json",
             "evidence/incoming/child-a.attempt-2.json",
+            "logs/workers/child-a/worker-a.jsonl",
             "reports/child-a.json",
             "reports/supervisor-final.json",
             ARTIFACT_FINALIZATION_MARKER,
@@ -6421,7 +6819,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_diff_reconciliation_uses_git_observed_paths_and_warns_on_worker_union() {
+    fn injected_diff_reconciliation_rejects_unattributed_worker_diff() {
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(true);
         let plan = injected_plan(assignment.clone(), 0);
@@ -6455,14 +6853,57 @@ mod tests {
         )
         .expect("run injected diff reconciliation");
 
-        assert!(report.success);
+        assert!(!report.success);
         assert_eq!(report.files_changed, vec![PathBuf::from("README.md")]);
         let child = &report.orchestrator_reports[0];
         assert_eq!(child.files_changed, vec![PathBuf::from("README.md")]);
+        assert_eq!(child.status, ReviewStatus::Failed);
         let messages = finding_messages(child);
         assert!(messages.contains("child-reported files_changed does not match actual"));
         assert!(messages.contains("worker files_changed union differs from actual"));
         assert!(messages.contains("observed-but-not-reported: README.md"));
+    }
+
+    #[test]
+    fn injected_runner_rejects_missing_worker_execution_journal() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "injected-missing-journal");
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if name.contains("review-auditor") {
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+                return injected_verified_run(command);
+            }
+            write_injected_json(
+                &command.output_last_message,
+                &injected_child_report(&assignment),
+            );
+            injected_verified_run_without_journals(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run injected missing journal");
+
+        assert!(!report.success);
+        let child = &report.orchestrator_reports[0];
+        assert_eq!(child.status, ReviewStatus::Failed);
+        assert!(finding_messages(child).contains("execution journal is missing"));
     }
 
     #[test]
@@ -6563,6 +7004,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn injected_worker_execution_journals_reject_material_mismatches() {
+        let assignment = injected_assignment(true);
+        let report_path = Path::new("worker-journal-evidence.json");
+
+        let mut missing = injected_child_report(&assignment);
+        missing.files_changed = vec![PathBuf::from("README.md")];
+        missing.worker_reports[0].files_changed = vec![PathBuf::from("README.md")];
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &injected_worker_journal_evidence(WorkerExecutionJournalStatus::Missing),
+            &mut missing,
+        );
+        assert_eq!(missing.status, ReviewStatus::Failed);
+        assert!(finding_messages(&missing).contains("execution journal is missing"));
+
+        let mut invalid = injected_child_report(&assignment);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &injected_worker_journal_evidence(WorkerExecutionJournalStatus::Invalid(
+                "not JSONL".to_string(),
+            )),
+            &mut invalid,
+        );
+        assert_eq!(invalid.status, ReviewStatus::Failed);
+        assert!(finding_messages(&invalid).contains("execution journal"));
+        assert!(finding_messages(&invalid).contains("invalid"));
+
+        let mut unsupported_by_journal = injected_child_report(&assignment);
+        unsupported_by_journal.files_changed = vec![PathBuf::from("README.md")];
+        unsupported_by_journal.worker_reports[0].files_changed = vec![PathBuf::from("README.md")];
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(Vec::new())),
+            &mut unsupported_by_journal,
+        );
+        assert_eq!(unsupported_by_journal.status, ReviewStatus::Failed);
+        assert!(finding_messages(&unsupported_by_journal)
+            .contains("not supported by execution journal"));
+
+        let mut unsupported_by_git = injected_child_report(&assignment);
+        unsupported_by_git.worker_reports[0].files_changed = vec![PathBuf::from("README.md")];
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(vec![
+                injected_journal_entry(vec![PathBuf::from("README.md")]),
+            ])),
+            &mut unsupported_by_git,
+        );
+        assert_eq!(unsupported_by_git.status, ReviewStatus::Failed);
+        assert!(finding_messages(&unsupported_by_git)
+            .contains("not supported by supervisor-inspected Git diff"));
+
+        let mut outside_assigned = injected_child_report(&assignment);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(vec![
+                injected_journal_entry(vec![PathBuf::from("Cargo.toml")]),
+            ])),
+            &mut outside_assigned,
+        );
+        assert_eq!(outside_assigned.status, ReviewStatus::Failed);
+        assert!(finding_messages(&outside_assigned).contains("outside assigned_paths"));
+
+        let mut journal_claim_without_git = injected_child_report(&assignment);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(vec![
+                injected_journal_entry(vec![PathBuf::from("README.md")]),
+            ])),
+            &mut journal_claim_without_git,
+        );
+        assert_eq!(journal_claim_without_git.status, ReviewStatus::Failed);
+        assert!(finding_messages(&journal_claim_without_git)
+            .contains("changed paths are not supported by supervisor-inspected Git diff"));
+
+        let mut command_claim_without_journal = injected_child_report(&assignment);
+        command_claim_without_journal.worker_reports[0]
+            .commands_run
+            .push(injected_command_record());
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(Vec::new())),
+            &mut command_claim_without_journal,
+        );
+        assert_eq!(command_claim_without_journal.status, ReviewStatus::Failed);
+        assert!(finding_messages(&command_claim_without_journal)
+            .contains("commands_run entries are not supported by execution journal"));
     }
 
     #[test]
@@ -7077,6 +7615,28 @@ mod tests {
         assert!(!runtime_labeled_worker.contains("ROLE: expert-coder"));
     }
 
+    #[test]
+    fn worker_prompt_includes_execution_journal_contract() {
+        let assignment = injected_assignment(true);
+        let worker = &assignment.worker_assignments[0];
+        let plan = injected_plan(assignment.clone(), 0);
+        let prompt = worker_prompt(
+            &plan,
+            &assignment,
+            worker,
+            Path::new("/tmp/maco-run"),
+            Path::new("/tmp/maco-run/schemas/worker-report.schema.json"),
+        )
+        .expect("render worker prompt");
+
+        assert!(prompt.contains(
+            "Execution journal path: /tmp/maco-run/incoming/worker-journals/worker-a.jsonl"
+        ));
+        assert!(prompt.contains("write a structured execution journal"));
+        assert!(prompt.contains("\"start_timestamp\""));
+        assert!(prompt.contains("\"changed_paths\""));
+    }
+
     fn injected_repository() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().expect("temporary repository root");
         let path = temp.path().join("repo");
@@ -7291,6 +7851,31 @@ mod tests {
         }
     }
 
+    fn injected_worker_journal_evidence(
+        status: WorkerExecutionJournalStatus,
+    ) -> WorkerExecutionJournalEvidenceSet {
+        WorkerExecutionJournalEvidenceSet::from([(
+            "worker-a".to_string(),
+            WorkerExecutionJournalEvidence {
+                incoming_relative_path: PathBuf::from("worker-journals/worker-a.jsonl"),
+                evidence_relative_path: worker_execution_journal_evidence_relative(
+                    "child-a", "worker-a",
+                ),
+                status,
+            },
+        )])
+    }
+
+    fn injected_journal_entry(changed_paths: Vec<PathBuf>) -> WorkerExecutionJournalEntry {
+        WorkerExecutionJournalEntry {
+            command: vec!["injected-worker".to_string()],
+            cwd: PathBuf::from("."),
+            start_timestamp: "2026-01-01T00:00:00Z".to_string(),
+            end_timestamp: "2026-01-01T00:00:01Z".to_string(),
+            changed_paths,
+        }
+    }
+
     fn injected_oid(value: &str) -> Oid {
         Oid::hash_object(ObjectType::Blob, value.as_bytes()).expect("hash injected object")
     }
@@ -7349,6 +7934,11 @@ mod tests {
     }
 
     fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
+        write_injected_worker_journals_from_report(command);
+        injected_verified_run_without_journals(command)
+    }
+
+    fn injected_verified_run_without_journals(command: &ExternalAgentCommand) -> ExternalAgentRun {
         ExternalAgentRun {
             command: vec!["injected-runner".to_string()],
             cwd: command.cwd.clone(),
@@ -7378,6 +7968,57 @@ mod tests {
             error: None,
             output_last_message: fs::read(&command.output_last_message).ok(),
         }
+    }
+
+    fn write_injected_worker_journals_from_report(command: &ExternalAgentCommand) {
+        let contents = match fs::read(&command.output_last_message) {
+            Ok(contents) => contents,
+            Err(_) => return,
+        };
+        let report = match serde_json::from_slice::<OrchestratorReviewReport>(&contents) {
+            Ok(report) => report,
+            Err(_) => return,
+        };
+        let Some(incoming_root) = command.output_last_message.parent() else {
+            return;
+        };
+        let journal_root = incoming_root.join("worker-journals");
+        fs::create_dir_all(&journal_root).expect("create injected worker journal directory");
+        for worker in &report.worker_reports {
+            let journal_path = journal_root.join(worker_execution_journal_file_name(&worker.id));
+            let journal = if worker.files_changed.is_empty() && worker.commands_run.is_empty() {
+                String::new()
+            } else {
+                let entries = injected_worker_journal_entries(worker);
+                entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::to_string(entry)
+                            .expect("serialize injected worker journal entry")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n"
+            };
+            fs::write(&journal_path, journal).expect("write injected worker journal");
+        }
+    }
+
+    fn injected_worker_journal_entries(worker: &WorkerReport) -> Vec<WorkerExecutionJournalEntry> {
+        if worker.commands_run.is_empty() {
+            return vec![injected_journal_entry(worker.files_changed.clone())];
+        }
+        worker
+            .commands_run
+            .iter()
+            .map(|record| WorkerExecutionJournalEntry {
+                command: record.command.clone(),
+                cwd: record.cwd.clone(),
+                start_timestamp: "2026-01-01T00:00:00Z".to_string(),
+                end_timestamp: "2026-01-01T00:00:01Z".to_string(),
+                changed_paths: worker.files_changed.clone(),
+            })
+            .collect()
     }
 
     fn injected_command_record() -> CommandRunRecord {
