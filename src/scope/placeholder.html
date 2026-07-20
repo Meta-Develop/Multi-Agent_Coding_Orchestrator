@@ -408,20 +408,13 @@
           return stableStringify(event);
         }
 
-        function eventTime(event) {
-          var parsed = Date.parse(event.ts || "");
-          return Number.isFinite(parsed) ? parsed : 0;
-        }
-
         function normalizeEvents(records) {
           var unique = new Map();
           (Array.isArray(records) ? records : []).forEach(function (event) {
             if (!event || typeof event !== "object" || !event.node || !event.kind) return;
             unique.set(eventKey(event), event);
           });
-          return Array.from(unique.entries()).sort(function (left, right) {
-            return eventTime(left[1]) - eventTime(right[1]) || left[0].localeCompare(right[0]);
-          });
+          return Array.from(unique.entries());
         }
 
         function replaceEvents(records) {
@@ -442,9 +435,6 @@
           var wasAtLiveEdge = state.live || state.cursor === state.events.length;
           state.eventKeys.add(key);
           state.events.push(event);
-          state.events.sort(function (left, right) {
-            return eventTime(left) - eventTime(right) || eventKey(left).localeCompare(eventKey(right));
-          });
           if (wasAtLiveEdge) {
             state.cursor = state.events.length;
             state.live = true;
@@ -463,7 +453,7 @@
           if (["accepted", "accept", "safe", "approved", "passed", "pass"].includes(raw)) return "accepted";
           if (["rejected", "reject", "failed", "fail"].includes(raw)) return "rejected";
           if (["blocked", "unsafe", "error"].includes(raw)) return "blocked";
-          if (["done", "complete", "completed", "finished", "closed", "released"].includes(raw)) return "done";
+          if (["done", "complete", "completed", "finished", "closed", "released", "skipped"].includes(raw)) return "done";
           return fallback || "pending";
         }
 
