@@ -453,33 +453,62 @@
           return true;
         }
 
-        function statusName(value, fallback) {
+        function normalizedStatus(value) {
           var raw = String(value || "").toLowerCase().replace(/[- ]/g, "_");
-          if (["running", "active", "in_progress", "started"].includes(raw)) return "running";
+          if (["running", "active", "in_progress", "started", "retrying"].includes(raw)) return "running";
           if (["pending", "ready", "waiting", "idle"].includes(raw)) return "pending";
           if (["queued", "escalation_pending", "requested"].includes(raw)) return "queued";
           if (["accepted", "accept", "safe", "approved", "passed", "pass", "succeeded", "success"].includes(raw)) return "accepted";
           if (["rejected", "reject", "failed", "fail", "failure"].includes(raw)) return "rejected";
           if (["blocked", "unsafe", "error"].includes(raw)) return "blocked";
           if (["done", "complete", "completed", "finished", "closed", "released", "skipped"].includes(raw)) return "done";
-          return fallback || "pending";
+          return null;
+        }
+
+        function explicitLifecycleStatus(payload, fields) {
+          if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+          var containers = [payload];
+          ["report", "validation", "state", "heartbeat"].forEach(function (key) {
+            if (payload[key] && typeof payload[key] === "object" && !Array.isArray(payload[key])) {
+              containers.push(payload[key]);
+            }
+          });
+          var fieldOrder = fields || ["to", "status", "result", "readiness", "state"];
+          for (var containerIndex = 0; containerIndex < containers.length; containerIndex += 1) {
+            for (var fieldIndex = 0; fieldIndex < fieldOrder.length; fieldIndex += 1) {
+              var status = normalizedStatus(containers[containerIndex][fieldOrder[fieldIndex]]);
+              if (status) return status;
+            }
+          }
+          return null;
+        }
+
+        function lifecycleStatus(payload, previous, fields) {
+          return explicitLifecycleStatus(payload, fields) || previous || "pending";
+        }
+
+        function failedGate(detail) {
+          return detail.blocked === true || detail.success === false || detail.accepted === false ||
+            detail.rejected === true || (Array.isArray(detail.blockers) && detail.blockers.length > 0);
+        }
+
+        function passedGate(detail) {
+          return detail.success === true || detail.accepted === true;
         }
 
         function statusFromEvent(event, previous) {
           var payload = event.payload && typeof event.payload === "object" ? event.payload : {};
           if (event.kind === "accept") return "accepted";
-          if (event.kind === "reject") return "rejected";
-          if (event.kind === "escalate") return "queued";
-          if (event.kind === "gate") {
-            return statusName(payload.status || payload.readiness || payload.result || payload.to,
-              payload.blocked || (Array.isArray(payload.blockers) && payload.blockers.length) ? "blocked" : previous);
+          if (event.kind === "reject") {
+            return explicitLifecycleStatus(payload) === "blocked" ? "blocked" : "rejected";
           }
+          if (event.kind === "escalate") return "queued";
+          if (event.kind === "gate") return gateStatus(gateDetail(payload), previous);
           if (event.kind === "spawn") {
-            return statusName(payload.status || payload.to || payload.state,
-              event.role === "supervisor" ? "running" : "pending");
+            return lifecycleStatus(payload, event.role === "supervisor" ? "running" : "pending");
           }
           if (event.kind === "status" || event.kind === "claim") {
-            return statusName(payload.to || payload.status || payload.state || payload.result, previous);
+            return lifecycleStatus(payload, previous);
           }
           return previous || "pending";
         }
@@ -517,9 +546,12 @@
         }
 
         function gateStatus(detail, previous) {
-          return statusName(detail.status || detail.readiness || detail.result || detail.to,
-            detail.blocked || (Array.isArray(detail.blockers) && detail.blockers.length) ?
-              "blocked" : previous || "pending");
+          if (failedGate(detail)) return "blocked";
+          var explicit = explicitLifecycleStatus(detail, ["status", "readiness", "result", "to", "state"]);
+          if (explicit === "rejected") return "blocked";
+          if (explicit) return explicit;
+          if (passedGate(detail)) return "accepted";
+          return previous || "pending";
         }
 
         function gateIdentity(detail, event, index) {
