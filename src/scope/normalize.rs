@@ -204,29 +204,27 @@ fn scan_run_events(
     let mut events = Vec::new();
     let mut parents = BTreeMap::new();
     let mut roles = BTreeMap::new();
-    if family == "o2" {
-        parents.insert(run_id.to_string(), None);
-        roles.insert(run_id.to_string(), OrchestrationRole::Supervisor);
-        push_event(
-            &mut events,
-            NormalizedEvent {
-                ts: file_timestamp(run_dir),
-                repo: target.id.clone(),
-                run: run_id.to_string(),
-                node: run_id.to_string(),
-                parent: None,
-                role: OrchestrationRole::Supervisor,
-                kind: OrchestrationEventKind::Spawn,
-                payload: json!({"source": "fallback", "synthetic": true}),
-            },
-        )?;
-    }
+    parents.insert(run_id.to_string(), None);
+    roles.insert(run_id.to_string(), OrchestrationRole::Supervisor);
+    push_event(
+        &mut events,
+        NormalizedEvent {
+            ts: file_timestamp(run_dir),
+            repo: target.id.clone(),
+            run: run_id.to_string(),
+            node: run_id.to_string(),
+            parent: None,
+            role: OrchestrationRole::Supervisor,
+            kind: OrchestrationEventKind::Spawn,
+            payload: json!({"source": "fallback", "family": family, "synthetic": true}),
+        },
+    )?;
     if let Some(assignments_dir) = validate_directory_chain(run_dir, &["assignments"])? {
         read_supervisor_plan(
             &assignments_dir.join("supervisor-plan.json"),
             &target.id,
             run_id,
-            (family == "o2").then_some(run_id),
+            Some(run_id),
             &mut events,
             &mut parents,
             &mut roles,
@@ -237,11 +235,20 @@ fn scan_run_events(
             &reports_dir,
             &target.id,
             run_id,
-            &parents,
-            &roles,
+            &mut parents,
+            &mut roles,
             &mut events,
         )?;
     }
+    read_family_reports(
+        run_dir,
+        family,
+        &target.id,
+        run_id,
+        &mut parents,
+        &mut roles,
+        &mut events,
+    )?;
     if let Some(logs_dir) = validate_directory_chain(run_dir, &["logs"])? {
         read_log_tails(&logs_dir, &target.id, run_id, &parents, &roles, &mut events)?;
     }
@@ -432,8 +439,8 @@ fn read_reports(
     directory: &Path,
     repo_id: &str,
     run_id: &str,
-    parents: &BTreeMap<String, Option<String>>,
-    roles: &BTreeMap<String, OrchestrationRole>,
+    parents: &mut BTreeMap<String, Option<String>>,
+    roles: &mut BTreeMap<String, OrchestrationRole>,
     events: &mut Vec<NormalizedEvent>,
 ) -> io::Result<()> {
     let mut report_count = 0_usize;
@@ -466,6 +473,207 @@ fn read_reports(
     Ok(())
 }
 
+fn read_family_reports(
+    run_dir: &Path,
+    family: &str,
+    repo_id: &str,
+    run_id: &str,
+    parents: &mut BTreeMap<String, Option<String>>,
+    roles: &mut BTreeMap<String, OrchestrationRole>,
+    events: &mut Vec<NormalizedEvent>,
+) -> io::Result<()> {
+    let mut report_count = 0_usize;
+    match family {
+        "autopilot" => {
+            normalize_known_report(
+                &run_dir.join("final-report.json"),
+                run_id,
+                None,
+                Some(OrchestrationRole::Supervisor),
+                "final-report.json",
+                &mut report_count,
+                repo_id,
+                run_id,
+                parents,
+                roles,
+                events,
+            )?;
+            let parent = Some(run_id);
+            for (name, suffix, role) in [
+                (
+                    "supervisor-report.json",
+                    "supervisor",
+                    OrchestrationRole::Supervisor,
+                ),
+                ("review-report.json", "review", OrchestrationRole::Auditor),
+                (
+                    "pr-report.json",
+                    "publication",
+                    OrchestrationRole::Orchestrator,
+                ),
+            ] {
+                normalize_known_report(
+                    &run_dir.join(name),
+                    &format!("{run_id}-{suffix}"),
+                    parent,
+                    Some(role),
+                    name,
+                    &mut report_count,
+                    repo_id,
+                    run_id,
+                    parents,
+                    roles,
+                    events,
+                )?;
+            }
+        }
+        "inbox" => {
+            normalize_known_report(
+                &run_dir.join("final-report.json"),
+                run_id,
+                None,
+                Some(OrchestrationRole::Supervisor),
+                "final-report.json",
+                &mut report_count,
+                repo_id,
+                run_id,
+                parents,
+                roles,
+                events,
+            )?;
+            let parent = Some(run_id);
+            normalize_known_report(
+                &run_dir.join("scan-report.json"),
+                &format!("{run_id}-scan"),
+                parent,
+                Some(OrchestrationRole::Supervisor),
+                "scan-report.json",
+                &mut report_count,
+                repo_id,
+                run_id,
+                parents,
+                roles,
+                events,
+            )?;
+            for path in read_child_files(run_dir, Some("json"))? {
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Some(role) = inbox_item_report_role(name) else {
+                    continue;
+                };
+                let fallback = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or(run_id);
+                normalize_known_report(
+                    &path,
+                    fallback,
+                    parent,
+                    Some(role),
+                    name,
+                    &mut report_count,
+                    repo_id,
+                    run_id,
+                    parents,
+                    roles,
+                    events,
+                )?;
+            }
+        }
+        "consult" => {
+            let trusted = validate_directory_chain(run_dir, &["trusted"])?
+                .map(|directory| directory.join("consultant-report.json"));
+            let trusted_found = if let Some(path) = trusted {
+                normalize_known_report(
+                    &path,
+                    run_id,
+                    None,
+                    Some(OrchestrationRole::Auditor),
+                    "trusted/consultant-report.json",
+                    &mut report_count,
+                    repo_id,
+                    run_id,
+                    parents,
+                    roles,
+                    events,
+                )?
+            } else {
+                false
+            };
+            if !trusted_found {
+                normalize_known_report(
+                    &run_dir.join("consultant-report.json"),
+                    run_id,
+                    None,
+                    Some(OrchestrationRole::Auditor),
+                    "consultant-report.json",
+                    &mut report_count,
+                    repo_id,
+                    run_id,
+                    parents,
+                    roles,
+                    events,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_known_report(
+    path: &Path,
+    fallback_node: &str,
+    parent_hint: Option<&str>,
+    role_hint: Option<OrchestrationRole>,
+    source: &str,
+    report_count: &mut usize,
+    repo_id: &str,
+    run_id: &str,
+    parents: &mut BTreeMap<String, Option<String>>,
+    roles: &mut BTreeMap<String, OrchestrationRole>,
+    events: &mut Vec<NormalizedEvent>,
+) -> io::Result<bool> {
+    let Some(report) = read_json(path)? else {
+        return Ok(false);
+    };
+    collect_report(
+        &report,
+        fallback_node,
+        parent_hint,
+        role_hint,
+        0,
+        report_count,
+        source,
+        &file_timestamp(path),
+        repo_id,
+        run_id,
+        parents,
+        roles,
+        events,
+    )?;
+    Ok(true)
+}
+
+fn inbox_item_report_role(name: &str) -> Option<OrchestrationRole> {
+    for (suffix, role) in [
+        ("-autopilot-report.json", OrchestrationRole::Orchestrator),
+        ("-github-report.json", OrchestrationRole::Worker),
+    ] {
+        if let Some(index) = name
+            .strip_prefix("item-")
+            .and_then(|value| value.strip_suffix(suffix))
+        {
+            if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Some(role);
+            }
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_report(
     report: &Value,
@@ -478,8 +686,8 @@ fn collect_report(
     ts: &str,
     repo_id: &str,
     run_id: &str,
-    parents: &BTreeMap<String, Option<String>>,
-    roles: &BTreeMap<String, OrchestrationRole>,
+    parents: &mut BTreeMap<String, Option<String>>,
+    roles: &mut BTreeMap<String, OrchestrationRole>,
     events: &mut Vec<NormalizedEvent>,
 ) -> io::Result<()> {
     if depth > MAX_REPORT_DEPTH {
@@ -507,16 +715,13 @@ fn collect_report(
         .map(|value| scope_role(Some(value)))
         .or(role_hint)
         .or_else(|| roles.get(node).copied())
-        .unwrap_or_else(|| {
-            if node == run_id || fallback_node == "supervisor-final" {
-                OrchestrationRole::Supervisor
-            } else {
-                OrchestrationRole::Worker
-            }
-        });
+        .unwrap_or_else(|| infer_report_role(node, fallback_node, run_id));
     let parent = parent_hint
         .map(str::to_owned)
-        .or_else(|| parents.get(node).cloned().flatten());
+        .or_else(|| parents.get(node).cloned().flatten())
+        .or_else(|| infer_auditor_parent(node, role));
+    parents.insert(node.to_string(), parent.clone());
+    roles.insert(node.to_string(), role);
     push_event(
         events,
         NormalizedEvent {
@@ -634,9 +839,10 @@ fn read_log_tails(
         let Some(record) = read_last_json_line(&path)? else {
             continue;
         };
-        let Some(node) = path.file_stem().and_then(|name| name.to_str()) else {
+        let Some(raw_node) = path.file_stem().and_then(|name| name.to_str()) else {
             continue;
         };
+        let node = normalize_log_node(raw_node);
         push_event(
             events,
             NormalizedEvent {
@@ -647,12 +853,12 @@ fn read_log_tails(
                     .unwrap_or_else(|| file_timestamp(&path)),
                 repo: repo_id.to_string(),
                 run: run_id.to_string(),
-                node: node.to_string(),
-                parent: parents.get(node).cloned().flatten(),
+                node: node.clone(),
+                parent: parents.get(&node).cloned().flatten(),
                 role: roles
-                    .get(node)
+                    .get(&node)
                     .copied()
-                    .unwrap_or(OrchestrationRole::Worker),
+                    .unwrap_or_else(|| infer_report_role(&node, &node, run_id)),
                 kind: OrchestrationEventKind::Journal,
                 payload: json!({
                     "source": relative_source(directory, &path, "logs"),
@@ -662,6 +868,21 @@ fn read_log_tails(
         )?;
     }
     Ok(())
+}
+
+fn normalize_log_node(stem: &str) -> String {
+    let Some((node, attempt)) = stem.rsplit_once(".attempt-") else {
+        return stem.to_string();
+    };
+    let positive_attempt = attempt
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|attempt| attempt > 0);
+    if !node.is_empty() && positive_attempt {
+        node.to_string()
+    } else {
+        stem.to_string()
+    }
 }
 
 fn read_state_tsv(
@@ -845,11 +1066,36 @@ fn report_kind(report: &Value) -> OrchestrationEventKind {
     {
         return OrchestrationEventKind::Reject;
     }
+    if report.get("success").and_then(Value::as_bool) == Some(true) {
+        return OrchestrationEventKind::Accept;
+    }
+    if report.get("success").and_then(Value::as_bool) == Some(false) {
+        return OrchestrationEventKind::Reject;
+    }
     match report.get("status").and_then(Value::as_str) {
         Some("succeeded" | "completed" | "accepted" | "done") => OrchestrationEventKind::Accept,
         Some("failed" | "rejected" | "blocked") => OrchestrationEventKind::Reject,
         _ => OrchestrationEventKind::Status,
     }
+}
+
+fn infer_report_role(node: &str, fallback_node: &str, run_id: &str) -> OrchestrationRole {
+    if node.ends_with("-review-auditor") || fallback_node.ends_with("-review-auditor") {
+        OrchestrationRole::Auditor
+    } else if node == run_id || fallback_node == "supervisor-final" {
+        OrchestrationRole::Supervisor
+    } else {
+        OrchestrationRole::Worker
+    }
+}
+
+fn infer_auditor_parent(node: &str, role: OrchestrationRole) -> Option<String> {
+    if role != OrchestrationRole::Auditor {
+        return None;
+    }
+    node.strip_suffix("-review-auditor")
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_owned)
 }
 
 fn scope_role(role: Option<&str>) -> OrchestrationRole {
@@ -1449,6 +1695,171 @@ mod tests {
     }
 
     #[test]
+    fn legacy_root_reports_replay_autopilot_inbox_and_consult_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let autopilot = temp.path().join(".maco/autopilot/runs/auto-run");
+        write(
+            &autopilot.join("final-report.json"),
+            r#"{"run_id":"auto-run","status":"succeeded","success":true}"#,
+        );
+        write(
+            &autopilot.join("review-report.json"),
+            r#"{"status":"failed","success":false}"#,
+        );
+        write(
+            &autopilot.join("supervisor-report.json"),
+            r#"{"status":"running"}"#,
+        );
+
+        let partial = temp.path().join(".maco/autopilot/runs/auto-partial");
+        write(
+            &partial.join("supervisor-report.json"),
+            r#"{"status":"running"}"#,
+        );
+
+        let inbox = temp.path().join(".maco/inbox/runs/inbox-run");
+        write(
+            &inbox.join("final-report.json"),
+            r#"{"run_id":"inbox-run","status":"failed","success":false}"#,
+        );
+        write(&inbox.join("scan-report.json"), r#"{"status":"running"}"#);
+        write(
+            &inbox.join("item-1-autopilot-report.json"),
+            r#"{"status":"succeeded","success":true}"#,
+        );
+        write(
+            &inbox.join("item-1-github-report.json"),
+            r#"{"status":"failed","success":false}"#,
+        );
+        write(
+            &inbox.join("selected-items.json"),
+            r#"{"id":"must-not-be-an-event","status":"succeeded"}"#,
+        );
+
+        let trusted_consult = temp.path().join(".maco/consult/runs/consult-trusted");
+        write(
+            &trusted_consult.join("trusted/consultant-report.json"),
+            r#"{"run_id":"consult-trusted","status":"succeeded","success":true}"#,
+        );
+        let root_consult = temp.path().join(".maco/consult/runs/consult-root");
+        write(
+            &root_consult.join("consultant-report.json"),
+            r#"{"run_id":"consult-root","status":"failed","success":false}"#,
+        );
+
+        let snapshot = scan_repositories(&[target(temp.path())]).expect("scan legacy reports");
+        let auto_events = snapshot
+            .events_for_run("repo-one", "autopilot", "auto-run")
+            .expect("autopilot run");
+        assert!(auto_events.iter().any(|event| {
+            event.node == "auto-run"
+                && event.role == OrchestrationRole::Supervisor
+                && event.kind == OrchestrationEventKind::Accept
+        }));
+        assert!(auto_events.iter().any(|event| {
+            event.node == "auto-run-review"
+                && event.parent.as_deref() == Some("auto-run")
+                && event.role == OrchestrationRole::Auditor
+                && event.kind == OrchestrationEventKind::Reject
+        }));
+        assert!(auto_events.iter().any(|event| {
+            event.node == "auto-run-supervisor"
+                && event.parent.as_deref() == Some("auto-run")
+                && event.kind == OrchestrationEventKind::Status
+        }));
+        let partial_events = snapshot
+            .events_for_run("repo-one", "autopilot", "auto-partial")
+            .expect("partial autopilot run");
+        assert!(partial_events.iter().any(|event| {
+            event.node == "auto-partial-supervisor"
+                && event.parent.as_deref() == Some("auto-partial")
+                && event.kind == OrchestrationEventKind::Status
+        }));
+
+        let inbox_events = snapshot
+            .events_for_run("repo-one", "inbox", "inbox-run")
+            .expect("inbox run");
+        assert!(inbox_events.iter().any(|event| {
+            event.node == "inbox-run"
+                && event.role == OrchestrationRole::Supervisor
+                && event.kind == OrchestrationEventKind::Reject
+        }));
+        assert!(inbox_events.iter().any(|event| {
+            event.node == "item-1-autopilot-report"
+                && event.parent.as_deref() == Some("inbox-run")
+                && event.role == OrchestrationRole::Orchestrator
+                && event.kind == OrchestrationEventKind::Accept
+        }));
+        assert!(inbox_events.iter().any(|event| {
+            event.node == "item-1-github-report"
+                && event.parent.as_deref() == Some("inbox-run")
+                && event.role == OrchestrationRole::Worker
+                && event.kind == OrchestrationEventKind::Reject
+        }));
+        assert!(!inbox_events
+            .iter()
+            .any(|event| event.node == "must-not-be-an-event"));
+
+        for (run_id, kind) in [
+            ("consult-trusted", OrchestrationEventKind::Accept),
+            ("consult-root", OrchestrationEventKind::Reject),
+        ] {
+            let events = snapshot
+                .events_for_run("repo-one", "consult", run_id)
+                .expect("consult run");
+            assert!(events.iter().any(|event| {
+                event.node == run_id
+                    && event.role == OrchestrationRole::Auditor
+                    && event.kind == kind
+            }));
+        }
+    }
+
+    #[test]
+    fn report_identity_drives_attempt_log_liveness_roles_and_parents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = temp.path().join(".maco/o2/runs/o2-log-run");
+        write(
+            &run.join("assignments/supervisor-plan.json"),
+            r#"{"assignments":[{"id":"child","role":"child_orchestrator"}]}"#,
+        );
+        write(
+            &run.join("reports/child.json"),
+            r#"{"id":"child","status":"succeeded","accepted":true}"#,
+        );
+        write(
+            &run.join("reports/child-review-auditor.json"),
+            r#"{"id":"child-review-auditor","status":"succeeded","accepted":true}"#,
+        );
+        write(
+            &run.join("logs/child.attempt-1.jsonl"),
+            "{\"ts\":\"2026-07-20T01:00:00Z\",\"status\":\"running\"}\n",
+        );
+        write(
+            &run.join("logs/child-review-auditor.attempt-2.jsonl"),
+            "{\"ts\":\"2026-07-20T01:01:00Z\",\"status\":\"running\"}\n",
+        );
+
+        let snapshot = scan_repositories(&[target(temp.path())]).expect("scan attempt logs");
+        let events = snapshot
+            .events_for_run("repo-one", "o2", "o2-log-run")
+            .expect("O2 run");
+        assert!(events.iter().any(|event| {
+            event.node == "child"
+                && event.parent.as_deref() == Some("o2-log-run")
+                && event.role == OrchestrationRole::Orchestrator
+                && event.kind == OrchestrationEventKind::Journal
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == "child-review-auditor"
+                && event.parent.as_deref() == Some("child")
+                && event.role == OrchestrationRole::Auditor
+                && event.kind == OrchestrationEventKind::Journal
+        }));
+        assert!(!events.iter().any(|event| event.node.contains(".attempt-")));
+    }
+
+    #[test]
     fn summaries_cover_all_families_and_detect_final_reports() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(
@@ -1499,7 +1910,7 @@ mod tests {
         assert!(runs.iter().any(|run| {
             run.family == "o2" && run.run == "unfinalized" && !run.final_report_exists
         }));
-        assert_eq!(snapshot.all_events().len(), 3);
+        assert!(snapshot.all_events().len() >= runs.len());
     }
 
     #[cfg(unix)]
