@@ -279,6 +279,7 @@
               <span>Choose a project and run to load its normalized events.</span>
             </div>
             <ol id="treeSummary" class="sr-only" aria-live="polite"></ol>
+            <ol id="edgeSummary" class="sr-only" aria-live="polite" aria-label="Graph relationships"></ol>
           </div>
           <div class="timeline" aria-label="Replay controls">
             <button id="playButton" type="button" disabled aria-label="Play replay">▶ Play</button>
@@ -363,6 +364,7 @@
           empty: document.getElementById("emptyState"),
           estimate: document.getElementById("estimateNote"),
           treeSummary: document.getElementById("treeSummary"),
+          edgeSummary: document.getElementById("edgeSummary"),
           log: document.getElementById("eventLog"),
           play: document.getElementById("playButton"),
           replay: document.getElementById("replayButton"),
@@ -450,8 +452,8 @@
           if (["running", "active", "in_progress", "started"].includes(raw)) return "running";
           if (["pending", "ready", "waiting", "idle"].includes(raw)) return "pending";
           if (["queued", "escalation_pending", "requested"].includes(raw)) return "queued";
-          if (["accepted", "accept", "safe", "approved", "passed", "pass"].includes(raw)) return "accepted";
-          if (["rejected", "reject", "failed", "fail"].includes(raw)) return "rejected";
+          if (["accepted", "accept", "safe", "approved", "passed", "pass", "succeeded", "success"].includes(raw)) return "accepted";
+          if (["rejected", "reject", "failed", "fail", "failure"].includes(raw)) return "rejected";
           if (["blocked", "unsafe", "error"].includes(raw)) return "blocked";
           if (["done", "complete", "completed", "finished", "closed", "released", "skipped"].includes(raw)) return "done";
           return fallback || "pending";
@@ -477,7 +479,6 @@
         }
 
         function displayRole(event) {
-          if (event.kind === "gate") return "gate";
           if (event.role === "supervisor") return "o2";
           if (event.role === "orchestrator") return "o1";
           if (event.role === "auditor") return "auditor";
@@ -489,35 +490,125 @@
           return value.filter(function (item) { return typeof item === "string" && item; });
         }
 
+        function hashString(value) {
+          var hash = 2166136261;
+          for (var index = 0; index < value.length; index += 1) {
+            hash ^= value.charCodeAt(index);
+            hash = Math.imul(hash, 16777619);
+          }
+          return (hash >>> 0).toString(36);
+        }
+
+        function syntheticId(kind, identity) {
+          var readable = String(identity || kind).toLowerCase().replace(/[^a-z0-9_-]+/g, "-")
+            .replace(/^-+|-+$/g, "").slice(0, 32) || kind;
+          return "scope-" + kind + "-" + readable + "-" + hashString(String(identity));
+        }
+
+        function gateDetail(payload) {
+          return payload.validation && typeof payload.validation === "object" && !Array.isArray(payload.validation) ?
+            payload.validation : payload;
+        }
+
+        function gateStatus(detail, previous) {
+          return statusName(detail.status || detail.readiness || detail.result || detail.to,
+            detail.blocked || (Array.isArray(detail.blockers) && detail.blockers.length) ?
+              "blocked" : previous || "pending");
+        }
+
+        function gateIdentity(detail, event, index) {
+          var identity = detail.id || detail.name || detail.check || detail.command || detail.label || detail.target;
+          return event.node + ":" + (identity ? String(identity) : "validation-" + index);
+        }
+
+        function gateLabel(detail) {
+          var label = detail.name || detail.check || detail.label || detail.command || detail.id || "validation";
+          return "gate · " + String(label);
+        }
+
+        function coverageEvidence(event, payload) {
+          var targets = [];
+          var containers = [event, payload];
+          ["report", "audit", "review", "evidence"].forEach(function (key) {
+            if (payload[key] && typeof payload[key] === "object" && !Array.isArray(payload[key])) {
+              containers.push(payload[key]);
+            }
+          });
+          containers.forEach(function (container) {
+            ["covers", "coverage", "covered_nodes", "worker_ids", "reviewed_worker_ids"].forEach(function (key) {
+              targets = targets.concat(arrayStrings(container[key]));
+            });
+          });
+          return Array.from(new Set(targets));
+        }
+
         function buildGraph(events) {
           var nodes = new Map();
           var escalationIds = [];
           var explicitCoverage = [];
 
-          events.forEach(function (event, index) {
-            var payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+          function newNode(id, label, role, parent, status, index) {
+            return {
+              id: id,
+              label: label,
+              role: role,
+              parent: parent || null,
+              status: status || "pending",
+              born: index,
+              last: index,
+              escalation: false,
+              origin: null,
+              originNode: null,
+              inferred: false,
+              estimated: false,
+              column: 0,
+              depth: 0
+            };
+          }
+
+          function ensureSubject(event, index) {
             var node = nodes.get(event.node);
             if (!node) {
-              node = {
-                id: event.node,
-                label: event.node,
-                role: displayRole(event),
-                parent: event.parent || null,
-                status: "pending",
-                born: index,
-                last: index,
-                escalation: false,
-                origin: null,
-                inferred: false,
-                column: 0,
-                depth: 0
-              };
+              node = newNode(event.node, event.node, displayRole(event), event.parent, "pending", index);
               nodes.set(event.node, node);
             }
-            node.role = displayRole(event) === "gate" ? "gate" : node.role;
             if (event.parent) node.parent = event.parent;
-            node.status = statusFromEvent(event, node.status);
             node.last = index;
+            return node;
+          }
+
+          function addGate(event, payload, index) {
+            var nested = payload.validation && typeof payload.validation === "object" &&
+              !Array.isArray(payload.validation);
+            var subject = nodes.get(event.node);
+            if (nested || subject && subject.role !== "gate") {
+              subject = ensureSubject(event, index);
+              var detail = gateDetail(payload);
+              var identity = gateIdentity(detail, event, index);
+              var id = syntheticId("gate", identity);
+              var gate = nodes.get(id);
+              if (!gate) {
+                gate = newNode(id, gateLabel(detail), "gate", subject.id, gateStatus(detail), index);
+                nodes.set(id, gate);
+              } else {
+                gate.label = gateLabel(detail);
+                gate.status = gateStatus(detail, gate.status);
+                gate.last = index;
+              }
+              return gate;
+            }
+
+            var detail = gateDetail(payload);
+            var gate = newNode(event.node, gateLabel(detail), "gate", event.parent,
+              gateStatus(detail), index);
+            nodes.set(event.node, gate);
+            return gate;
+          }
+
+          events.forEach(function (event, index) {
+            var payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+            var node = event.kind === "gate" ? addGate(event, payload, index) : ensureSubject(event, index);
+            if (event.kind !== "gate") node.status = statusFromEvent(event, node.status);
             if (event.kind === "escalate") {
               node.escalation = true;
               node.role = "o2";
@@ -526,12 +617,10 @@
               node.label = (node.inferred ? "≈ " : "") + "peer-o2 ← " + node.origin;
               if (!escalationIds.includes(node.id)) escalationIds.push(node.id);
             }
-            var coverage = []
-              .concat(arrayStrings(payload.covers))
-              .concat(arrayStrings(payload.coverage))
-              .concat(arrayStrings(payload.covered_nodes))
-              .concat(arrayStrings(payload.worker_ids));
-            coverage.forEach(function (target) { explicitCoverage.push([node.id, target]); });
+            var coverage = coverageEvidence(event, payload);
+            if (node.role === "auditor") {
+              coverage.forEach(function (target) { explicitCoverage.push([node.id, target]); });
+            }
           });
 
           nodes.forEach(function (node) {
@@ -546,11 +635,31 @@
                 last: node.born,
                 escalation: false,
                 origin: null,
+                originNode: null,
                 inferred: false,
+                estimated: false,
                 column: 0,
                 depth: 0
               });
             }
+          });
+
+          escalationIds.forEach(function (id) {
+            var escalation = nodes.get(id);
+            if (!escalation) return;
+            if (nodes.has(escalation.origin)) {
+              escalation.originNode = escalation.origin;
+              return;
+            }
+            var anchorId = syntheticId("origin", escalation.origin);
+            var anchor = nodes.get(anchorId);
+            if (!anchor) {
+              anchor = newNode(anchorId, "≈ " + escalation.origin + " origin", "worker",
+                escalation.parent, "pending", escalation.born);
+              anchor.estimated = true;
+              nodes.set(anchorId, anchor);
+            }
+            escalation.originNode = anchorId;
           });
 
           escalationIds.forEach(function (id, index) {
@@ -598,22 +707,9 @@
           }
           nodes.forEach(function (node) {
             if (node.parent) addEdge(node.parent, node.id, node.escalation ? "escalation" : "solid");
-            if (node.escalation && node.origin) addEdge(node.origin, node.id, "origin");
+            if (node.escalation && node.originNode) addEdge(node.originNode, node.id, "origin");
           });
           explicitCoverage.forEach(function (pair) { addEdge(pair[0], pair[1], "coverage"); });
-          nodes.forEach(function (auditor) {
-            if (auditor.role !== "auditor") return;
-            var hasExplicit = edges.some(function (edge) {
-              return edge.from === auditor.id && edge.style === "coverage";
-            });
-            if (!hasExplicit) {
-              nodes.forEach(function (candidate) {
-                if (candidate.role === "worker" && candidate.parent && candidate.parent === auditor.parent) {
-                  addEdge(auditor.id, candidate.id, "coverage");
-                }
-              });
-            }
-          });
 
           return { nodes: nodes, edges: edges };
         }
@@ -826,9 +922,39 @@
           }).forEach(function (node) {
             var item = document.createElement("li");
             item.textContent = node.label + ", " + node.role + ", " + node.status +
-              (node.parent ? ", parent " + node.parent : "");
+              (node.parent ? ", parent " + node.parent : "") +
+              ", depth " + node.depth + ", column " + node.column +
+              (node.estimated ? ", estimated origin anchor" : "");
             if (node.inferred) item.title = "Escalation origin is an estimate inferred by the backend.";
+            if (node.estimated) item.title = "Estimated anchor synthesized because the named escalation origin is absent from the event stream.";
             elements.treeSummary.appendChild(item);
+          });
+        }
+
+        function renderEdgeSummary(layout) {
+          elements.edgeSummary.replaceChildren();
+          layout.edges.forEach(function (edge) {
+            if (!["origin", "coverage"].includes(edge.style)) {
+              var target = layout.nodes.get(edge.to);
+              if (!target || target.role !== "gate") return;
+            }
+            var from = layout.nodes.get(edge.from);
+            var to = layout.nodes.get(edge.to);
+            if (!from || !to) return;
+            var item = document.createElement("li");
+            item.dataset.edgeKind = to.role === "gate" ? "gate" : edge.style;
+            if (edge.style === "origin") {
+              item.textContent = "origin edge: " + from.label + " to " + to.label +
+                (from.estimated ? ", estimated source" : "");
+              if (from.estimated) {
+                item.title = "Amber escalation-origin edge from a synthesized estimated anchor.";
+              }
+            } else if (edge.style === "coverage") {
+              item.textContent = "coverage edge: " + from.label + " reviewed " + to.label + ", explicit evidence";
+            } else {
+              item.textContent = "gate edge: " + from.label + " to " + to.label + ", " + to.status;
+            }
+            elements.edgeSummary.appendChild(item);
           });
         }
 
@@ -900,10 +1026,14 @@
               "The live stream will add nodes when normalized events arrive." :
               "Choose a project and run to load its normalized events.";
           }
-          var inferred = Array.from(graph.nodes.values()).filter(function (node) { return node.inferred; });
-          elements.estimate.dataset.visible = String(inferred.length > 0);
-          elements.estimate.textContent = inferred.length ? "≈ inferred origin" + (inferred.length > 1 ? "s" : "") : "";
+          var estimated = Array.from(graph.nodes.values()).filter(function (node) {
+            return node.inferred || node.estimated;
+          });
+          elements.estimate.dataset.visible = String(estimated.length > 0);
+          elements.estimate.textContent = estimated.length ? "≈ inferred / estimated origin" +
+            (estimated.length > 1 ? "s" : "") : "";
           renderTreeSummary(state.layout);
+          renderEdgeSummary(state.layout);
           renderLog();
           window.requestAnimationFrame(renderFrame);
         }

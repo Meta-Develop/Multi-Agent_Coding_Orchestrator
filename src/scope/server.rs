@@ -761,6 +761,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("text/html; charset=utf-8"));
         assert!(response.contains("MACO_SCOPE_SPAWN_TREE_UI"));
+        assert!(response.contains("id=\"edgeSummary\""));
+        assert!(response.contains("reviewed_worker_ids"));
         server.stop();
     }
 
