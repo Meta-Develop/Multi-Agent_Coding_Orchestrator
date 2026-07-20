@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -20,6 +23,18 @@ const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_LOG_TAIL_BYTES: u64 = 128 * 1024;
 const MAX_DISCOVERY_DEPTH: usize = 5;
+const MAX_REPOSITORIES: usize = 64;
+const MAX_RUNS_PER_REPOSITORY: usize = 4_096;
+const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+const MAX_DISCOVERY_ENTRIES: usize = 16_384;
+const MAX_NAMED_FILES: usize = 4_096;
+const MAX_EVENTS_PER_RUN: usize = 16_384;
+const MAX_ASSIGNMENTS_PER_RUN: usize = 4_096;
+const MAX_ASSIGNMENT_DEPTH: usize = 16;
+const MAX_EMBEDDED_REPORTS: usize = 4_096;
+const MAX_REPORT_DEPTH: usize = 16;
+const MAX_JOURNAL_RECORDS: usize = 32_768;
+const MAX_JOURNAL_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryTarget {
@@ -85,6 +100,11 @@ pub struct RunSummary {
 pub type NormalizedEvent = OrchestrationEvent;
 
 pub fn scan_repositories(repositories: &[RepositoryTarget]) -> io::Result<ScopeSnapshot> {
+    if repositories.len() > MAX_REPOSITORIES {
+        return Err(invalid_data(format!(
+            "Scope repository scan exceeds the {MAX_REPOSITORIES} repository limit"
+        )));
+    }
     let mut targets = repositories.to_vec();
     targets.sort_by(|left, right| {
         left.id
@@ -100,10 +120,34 @@ pub fn scan_repositories(repositories: &[RepositoryTarget]) -> io::Result<ScopeS
 }
 
 fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
+    let repository_root = fs::canonicalize(&target.path)?;
+    if repository_root != target.path {
+        return Err(invalid_data(format!(
+            "Scope repository path must be canonical: {}",
+            target.path.display()
+        )));
+    }
     let mut discovered = Vec::new();
     for (family, directory) in RUN_FAMILIES {
-        let run_root = target.path.join(".maco").join(directory).join("runs");
+        let Some(run_root) =
+            validate_directory_chain(&repository_root, &[".maco", directory, "runs"])?
+        else {
+            continue;
+        };
         for run_dir in read_child_directories(&run_root)? {
+            if discovered.len() >= MAX_RUNS_PER_REPOSITORY {
+                return Err(invalid_data(format!(
+                    "Scope run discovery exceeds the {MAX_RUNS_PER_REPOSITORY} run limit in {}",
+                    repository_root.display()
+                )));
+            }
+            let canonical_run = fs::canonicalize(&run_dir)?;
+            if canonical_run != run_dir || !canonical_run.starts_with(&repository_root) {
+                return Err(invalid_data(format!(
+                    "Scope run directory escapes its canonical repository root: {}",
+                    run_dir.display()
+                )));
+            }
             let Some(run_name) = run_dir.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -113,7 +157,7 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
             let modified = no_follow_metadata(&run_dir)
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(UNIX_EPOCH);
-            let mut events = scan_run_events(target, run_name, &run_dir)?;
+            let mut events = scan_run_events(target, family, run_name, &run_dir)?;
             sort_and_deduplicate(&mut events);
             discovered.push((
                 RunSummary {
@@ -146,41 +190,61 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
 
 fn scan_run_events(
     target: &RepositoryTarget,
+    family: &str,
     run_id: &str,
     run_dir: &Path,
 ) -> io::Result<Vec<NormalizedEvent>> {
-    let journal = run_dir.join("events").join("orchestration.jsonl");
-    if is_regular_file(&journal)? {
-        return read_journal(&journal, &target.id, run_id);
+    if let Some(events_dir) = validate_directory_chain(run_dir, &["events"])? {
+        let journal = events_dir.join("orchestration.jsonl");
+        if is_regular_file(&journal)? {
+            return read_journal(&journal, &target.id, run_id);
+        }
     }
 
     let mut events = Vec::new();
     let mut parents = BTreeMap::new();
     let mut roles = BTreeMap::new();
-    read_supervisor_plan(
-        &run_dir.join("assignments").join("supervisor-plan.json"),
-        &target.id,
-        run_id,
-        &mut events,
-        &mut parents,
-        &mut roles,
-    )?;
-    read_reports(
-        &run_dir.join("reports"),
-        &target.id,
-        run_id,
-        &parents,
-        &roles,
-        &mut events,
-    )?;
-    read_log_tails(
-        &run_dir.join("logs"),
-        &target.id,
-        run_id,
-        &parents,
-        &roles,
-        &mut events,
-    )?;
+    if family == "o2" {
+        parents.insert(run_id.to_string(), None);
+        roles.insert(run_id.to_string(), OrchestrationRole::Supervisor);
+        push_event(
+            &mut events,
+            NormalizedEvent {
+                ts: file_timestamp(run_dir),
+                repo: target.id.clone(),
+                run: run_id.to_string(),
+                node: run_id.to_string(),
+                parent: None,
+                role: OrchestrationRole::Supervisor,
+                kind: OrchestrationEventKind::Spawn,
+                payload: json!({"source": "fallback", "synthetic": true}),
+            },
+        )?;
+    }
+    if let Some(assignments_dir) = validate_directory_chain(run_dir, &["assignments"])? {
+        read_supervisor_plan(
+            &assignments_dir.join("supervisor-plan.json"),
+            &target.id,
+            run_id,
+            (family == "o2").then_some(run_id),
+            &mut events,
+            &mut parents,
+            &mut roles,
+        )?;
+    }
+    if let Some(reports_dir) = validate_directory_chain(run_dir, &["reports"])? {
+        read_reports(
+            &reports_dir,
+            &target.id,
+            run_id,
+            &parents,
+            &roles,
+            &mut events,
+        )?;
+    }
+    if let Some(logs_dir) = validate_directory_chain(run_dir, &["logs"])? {
+        read_log_tails(&logs_dir, &target.id, run_id, &parents, &roles, &mut events)?;
+    }
     read_state_tsv(&run_dir.join("STATE.tsv"), &target.id, run_id, &mut events)?;
     read_heartbeat_tsv(
         &run_dir.join("HEARTBEAT.tsv"),
@@ -190,19 +254,55 @@ fn scan_run_events(
     )?;
     read_queue_tsv(&run_dir.join("queue.tsv"), &target.id, run_id, &mut events)?;
     read_escalations(run_dir, &target.id, run_id, &mut events)?;
+    ensure_event_limit(&events)?;
     Ok(events)
 }
 
 fn read_journal(path: &Path, repo_id: &str, run_id: &str) -> io::Result<Vec<NormalizedEvent>> {
-    let Some(bytes) = read_bounded(path, MAX_JOURNAL_BYTES)? else {
+    let Some(file) = open_regular_file(path)? else {
         return Ok(Vec::new());
     };
+    if file.metadata()?.len() > MAX_JOURNAL_BYTES {
+        return Err(invalid_data(format!(
+            "Scope orchestration journal exceeds the {MAX_JOURNAL_BYTES} byte limit: {}",
+            path.display()
+        )));
+    }
+    let mut reader = BufReader::new(file);
     let mut events = Vec::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
+    let mut line = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut record_count = 0_usize;
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
+        if total_bytes > MAX_JOURNAL_BYTES {
+            return Err(invalid_data(format!(
+                "Scope orchestration journal grew beyond the {MAX_JOURNAL_BYTES} byte limit: {}",
+                path.display()
+            )));
+        }
+        if line.len() > MAX_JOURNAL_LINE_BYTES {
+            return Err(invalid_data(format!(
+                "Scope orchestration journal line exceeds the {MAX_JOURNAL_LINE_BYTES} byte limit: {}",
+                path.display()
+            )));
+        }
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let Ok(mut event) = serde_json::from_slice::<NormalizedEvent>(line) else {
+        record_count += 1;
+        if record_count > MAX_JOURNAL_RECORDS {
+            return Err(invalid_data(format!(
+                "Scope orchestration journal exceeds the {MAX_JOURNAL_RECORDS} record limit: {}",
+                path.display()
+            )));
+        }
+        let Ok(mut event) = serde_json::from_slice::<NormalizedEvent>(&line) else {
             continue;
         };
         if event.ts.is_empty() || event.node.is_empty() {
@@ -210,7 +310,7 @@ fn read_journal(path: &Path, repo_id: &str, run_id: &str) -> io::Result<Vec<Norm
         }
         event.repo = repo_id.to_string();
         event.run = run_id.to_string();
-        events.push(event);
+        push_event(&mut events, event)?;
     }
     sort_and_deduplicate(&mut events);
     Ok(events)
@@ -220,6 +320,7 @@ fn read_supervisor_plan(
     path: &Path,
     repo_id: &str,
     run_id: &str,
+    root_parent: Option<&str>,
     events: &mut Vec<NormalizedEvent>,
     parents: &mut BTreeMap<String, Option<String>>,
     roles: &mut BTreeMap<String, OrchestrationRole>,
@@ -228,11 +329,22 @@ fn read_supervisor_plan(
         return Ok(());
     };
     let ts = file_timestamp(path);
+    let mut assignment_count = 0_usize;
     if let Some(assignments) = value.get("assignments").and_then(Value::as_array) {
         for assignment in assignments {
             collect_assignment(
-                assignment, None, repo_id, run_id, &ts, events, parents, roles,
-            );
+                assignment,
+                root_parent,
+                OrchestrationRole::Orchestrator,
+                0,
+                &mut assignment_count,
+                repo_id,
+                run_id,
+                &ts,
+                events,
+                parents,
+                roles,
+            )?;
         }
     }
     Ok(())
@@ -242,50 +354,78 @@ fn read_supervisor_plan(
 fn collect_assignment(
     assignment: &Value,
     parent: Option<&str>,
+    default_role: OrchestrationRole,
+    depth: usize,
+    assignment_count: &mut usize,
     repo_id: &str,
     run_id: &str,
     ts: &str,
     events: &mut Vec<NormalizedEvent>,
     parents: &mut BTreeMap<String, Option<String>>,
     roles: &mut BTreeMap<String, OrchestrationRole>,
-) {
+) -> io::Result<()> {
+    if depth > MAX_ASSIGNMENT_DEPTH {
+        return Err(invalid_data(format!(
+            "Scope supervisor plan exceeds the {MAX_ASSIGNMENT_DEPTH} assignment depth limit"
+        )));
+    }
+    *assignment_count += 1;
+    if *assignment_count > MAX_ASSIGNMENTS_PER_RUN {
+        return Err(invalid_data(format!(
+            "Scope supervisor plan exceeds the {MAX_ASSIGNMENTS_PER_RUN} assignment limit"
+        )));
+    }
     let Some(node) = assignment.get("id").and_then(Value::as_str) else {
-        return;
+        return Ok(());
     };
     if node.is_empty() {
-        return;
+        return Ok(());
     }
-    let role = scope_role(assignment.get("role").and_then(Value::as_str));
+    let role = assignment
+        .get("role")
+        .and_then(Value::as_str)
+        .map(|value| scope_role(Some(value)))
+        .unwrap_or(default_role);
     let parent = parent.map(str::to_owned);
     parents.insert(node.to_string(), parent.clone());
     roles.insert(node.to_string(), role);
-    events.push(NormalizedEvent {
-        ts: ts.to_string(),
-        repo: repo_id.to_string(),
-        run: run_id.to_string(),
-        node: node.to_string(),
-        parent: parent.clone(),
-        role,
-        kind: OrchestrationEventKind::Spawn,
-        payload: json!({"source": "assignments/supervisor-plan.json", "assignment": assignment}),
-    });
+    push_event(
+        events,
+        NormalizedEvent {
+            ts: ts.to_string(),
+            repo: repo_id.to_string(),
+            run: run_id.to_string(),
+            node: node.to_string(),
+            parent: parent.clone(),
+            role,
+            kind: OrchestrationEventKind::Spawn,
+            payload: json!({"source": "assignments/supervisor-plan.json", "assignment": assignment}),
+        },
+    )?;
 
-    for child_key in ["assignments", "worker_assignments"] {
+    for (child_key, child_role) in [
+        ("assignments", OrchestrationRole::Orchestrator),
+        ("worker_assignments", OrchestrationRole::Worker),
+    ] {
         if let Some(children) = assignment.get(child_key).and_then(Value::as_array) {
             for child in children {
                 collect_assignment(
                     child,
                     Some(node),
+                    child_role,
+                    depth + 1,
+                    assignment_count,
                     repo_id,
                     run_id,
                     ts,
                     events,
                     parents,
                     roles,
-                );
+                )?;
             }
         }
     }
+    Ok(())
 }
 
 fn read_reports(
@@ -296,6 +436,7 @@ fn read_reports(
     roles: &BTreeMap<String, OrchestrationRole>,
     events: &mut Vec<NormalizedEvent>,
 ) -> io::Result<()> {
+    let mut report_count = 0_usize;
     for path in read_child_files(directory, Some("json"))? {
         let Some(report) = read_json(&path)? else {
             continue;
@@ -304,61 +445,110 @@ fn read_reports(
             .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or(run_id);
-        let node = report
-            .get("id")
-            .and_then(Value::as_str)
-            .or_else(|| report.get("run_id").and_then(Value::as_str))
-            .unwrap_or(fallback_node);
-        if node.is_empty() {
-            continue;
-        }
-        let role = report
-            .get("role")
-            .and_then(Value::as_str)
-            .map(|value| scope_role(Some(value)))
-            .or_else(|| roles.get(node).copied())
-            .unwrap_or_else(|| {
-                if node == run_id || fallback_node == "supervisor-final" {
-                    OrchestrationRole::Supervisor
-                } else {
-                    OrchestrationRole::Worker
-                }
-            });
-        let parent = parents.get(node).cloned().flatten();
-        let kind = report_kind(&report);
         let source = relative_source(directory, &path, "reports");
         let ts = file_timestamp(&path);
-        events.push(NormalizedEvent {
-            ts: ts.clone(),
+        collect_report(
+            &report,
+            fallback_node,
+            None,
+            None,
+            0,
+            &mut report_count,
+            &source,
+            &ts,
+            repo_id,
+            run_id,
+            parents,
+            roles,
+            events,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_report(
+    report: &Value,
+    fallback_node: &str,
+    parent_hint: Option<&str>,
+    role_hint: Option<OrchestrationRole>,
+    depth: usize,
+    report_count: &mut usize,
+    source: &str,
+    ts: &str,
+    repo_id: &str,
+    run_id: &str,
+    parents: &BTreeMap<String, Option<String>>,
+    roles: &BTreeMap<String, OrchestrationRole>,
+    events: &mut Vec<NormalizedEvent>,
+) -> io::Result<()> {
+    if depth > MAX_REPORT_DEPTH {
+        return Err(invalid_data(format!(
+            "Scope embedded reports exceed the {MAX_REPORT_DEPTH} depth limit"
+        )));
+    }
+    *report_count += 1;
+    if *report_count > MAX_EMBEDDED_REPORTS {
+        return Err(invalid_data(format!(
+            "Scope reports exceed the {MAX_EMBEDDED_REPORTS} report limit"
+        )));
+    }
+    let node = report
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| report.get("run_id").and_then(Value::as_str))
+        .unwrap_or(fallback_node);
+    if node.is_empty() {
+        return Ok(());
+    }
+    let role = report
+        .get("role")
+        .and_then(Value::as_str)
+        .map(|value| scope_role(Some(value)))
+        .or(role_hint)
+        .or_else(|| roles.get(node).copied())
+        .unwrap_or_else(|| {
+            if node == run_id || fallback_node == "supervisor-final" {
+                OrchestrationRole::Supervisor
+            } else {
+                OrchestrationRole::Worker
+            }
+        });
+    let parent = parent_hint
+        .map(str::to_owned)
+        .or_else(|| parents.get(node).cloned().flatten());
+    push_event(
+        events,
+        NormalizedEvent {
+            ts: ts.to_string(),
             repo: repo_id.to_string(),
             run: run_id.to_string(),
             node: node.to_string(),
             parent: parent.clone(),
             role,
-            kind,
+            kind: report_kind(report),
             payload: json!({"source": source, "report": report}),
-        });
+        },
+    )?;
 
-        if let Some(token) = report.get("claim_token").filter(|token| !token.is_null()) {
-            events.push(NormalizedEvent {
-                ts: ts.clone(),
-                repo: repo_id.to_string(),
-                run: run_id.to_string(),
-                node: node.to_string(),
-                parent: parent.clone(),
-                role,
-                kind: OrchestrationEventKind::Claim,
-                payload: json!({
-                    "source": source,
-                    "claim_token": token,
-                    "assigned_paths": report.get("assigned_paths").cloned().unwrap_or(Value::Null),
-                }),
-            });
+    if let Some(token) = report.get("claim_token").filter(|token| !token.is_null()) {
+        push_claim_event(
+            events, report, token, source, ts, repo_id, run_id, node, &parent, role,
+        )?;
+    }
+    if let Some(tokens) = report.get("claim_tokens").and_then(Value::as_array) {
+        for token in tokens.iter().filter(|token| !token.is_null()) {
+            push_claim_event(
+                events, report, token, source, ts, repo_id, run_id, node, &parent, role,
+            )?;
         }
-        if let Some(validations) = report.get("validation_results").and_then(Value::as_array) {
-            for validation in validations {
-                events.push(NormalizedEvent {
-                    ts: ts.clone(),
+    }
+    if let Some(validations) = report.get("validation_results").and_then(Value::as_array) {
+        for validation in validations {
+            push_event(
+                events,
+                NormalizedEvent {
+                    ts: ts.to_string(),
                     repo: repo_id.to_string(),
                     run: run_id.to_string(),
                     node: node.to_string(),
@@ -366,11 +556,70 @@ fn read_reports(
                     role,
                     kind: OrchestrationEventKind::Gate,
                     payload: json!({"source": source, "validation": validation}),
-                });
+                },
+            )?;
+        }
+    }
+
+    for (key, child_role) in [
+        ("orchestrator_reports", OrchestrationRole::Orchestrator),
+        ("worker_reports", OrchestrationRole::Worker),
+        ("audit_reports", OrchestrationRole::Auditor),
+    ] {
+        if let Some(children) = report.get(key).and_then(Value::as_array) {
+            for (index, child) in children.iter().enumerate() {
+                let child_fallback = format!("{node}-{key}-{}", index + 1);
+                collect_report(
+                    child,
+                    &child_fallback,
+                    Some(node),
+                    Some(child_role),
+                    depth + 1,
+                    report_count,
+                    source,
+                    ts,
+                    repo_id,
+                    run_id,
+                    parents,
+                    roles,
+                    events,
+                )?;
             }
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_claim_event(
+    events: &mut Vec<NormalizedEvent>,
+    report: &Value,
+    token: &Value,
+    source: &str,
+    ts: &str,
+    repo_id: &str,
+    run_id: &str,
+    node: &str,
+    parent: &Option<String>,
+    role: OrchestrationRole,
+) -> io::Result<()> {
+    push_event(
+        events,
+        NormalizedEvent {
+            ts: ts.to_string(),
+            repo: repo_id.to_string(),
+            run: run_id.to_string(),
+            node: node.to_string(),
+            parent: parent.clone(),
+            role,
+            kind: OrchestrationEventKind::Claim,
+            payload: json!({
+                "source": source,
+                "claim_token": token,
+                "assigned_paths": report.get("assigned_paths").cloned().unwrap_or(Value::Null),
+            }),
+        },
+    )
 }
 
 fn read_log_tails(
@@ -388,26 +637,29 @@ fn read_log_tails(
         let Some(node) = path.file_stem().and_then(|name| name.to_str()) else {
             continue;
         };
-        events.push(NormalizedEvent {
-            ts: record
-                .get("ts")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| file_timestamp(&path)),
-            repo: repo_id.to_string(),
-            run: run_id.to_string(),
-            node: node.to_string(),
-            parent: parents.get(node).cloned().flatten(),
-            role: roles
-                .get(node)
-                .copied()
-                .unwrap_or(OrchestrationRole::Worker),
-            kind: OrchestrationEventKind::Journal,
-            payload: json!({
-                "source": relative_source(directory, &path, "logs"),
-                "tail": record,
-            }),
-        });
+        push_event(
+            events,
+            NormalizedEvent {
+                ts: record
+                    .get("ts")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| file_timestamp(&path)),
+                repo: repo_id.to_string(),
+                run: run_id.to_string(),
+                node: node.to_string(),
+                parent: parents.get(node).cloned().flatten(),
+                role: roles
+                    .get(node)
+                    .copied()
+                    .unwrap_or(OrchestrationRole::Worker),
+                kind: OrchestrationEventKind::Journal,
+                payload: json!({
+                    "source": relative_source(directory, &path, "logs"),
+                    "tail": record,
+                }),
+            },
+        )?;
     }
     Ok(())
 }
@@ -438,16 +690,19 @@ fn read_state_tsv(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| file_timestamp(path));
-    events.push(NormalizedEvent {
-        ts,
-        repo: repo_id.to_string(),
-        run: run_id.to_string(),
-        node: run_id.to_string(),
-        parent: None,
-        role: OrchestrationRole::Supervisor,
-        kind: OrchestrationEventKind::Status,
-        payload: json!({"source": "STATE.tsv", "state": state}),
-    });
+    push_event(
+        events,
+        NormalizedEvent {
+            ts,
+            repo: repo_id.to_string(),
+            run: run_id.to_string(),
+            node: run_id.to_string(),
+            parent: None,
+            role: OrchestrationRole::Supervisor,
+            kind: OrchestrationEventKind::Status,
+            payload: json!({"source": "STATE.tsv", "state": state}),
+        },
+    )?;
     Ok(())
 }
 
@@ -468,16 +723,19 @@ fn read_heartbeat_tsv(
             .filter(|value| !value.is_empty())
             .cloned()
             .unwrap_or_else(|| file_timestamp(path));
-        events.push(NormalizedEvent {
-            ts,
-            repo: repo_id.to_string(),
-            run: run_id.to_string(),
-            node: node.to_string(),
-            parent: None,
-            role: OrchestrationRole::Supervisor,
-            kind: OrchestrationEventKind::Status,
-            payload: json!({"source": "HEARTBEAT.tsv", "heartbeat": row}),
-        });
+        push_event(
+            events,
+            NormalizedEvent {
+                ts,
+                repo: repo_id.to_string(),
+                run: run_id.to_string(),
+                node: node.to_string(),
+                parent: None,
+                role: OrchestrationRole::Supervisor,
+                kind: OrchestrationEventKind::Status,
+                payload: json!({"source": "HEARTBEAT.tsv", "heartbeat": row}),
+            },
+        )?;
     }
     Ok(())
 }
@@ -497,16 +755,19 @@ fn read_queue_tsv(
             .get("parent_task_id")
             .filter(|value| !value.is_empty())
             .cloned();
-        events.push(NormalizedEvent {
-            ts: ts.clone(),
-            repo: repo_id.to_string(),
-            run: run_id.to_string(),
-            node: node.clone(),
-            parent,
-            role: OrchestrationRole::Supervisor,
-            kind: OrchestrationEventKind::Spawn,
-            payload: json!({"source": "queue.tsv", "task": row}),
-        });
+        push_event(
+            events,
+            NormalizedEvent {
+                ts: ts.clone(),
+                repo: repo_id.to_string(),
+                run: run_id.to_string(),
+                node: node.clone(),
+                parent,
+                role: OrchestrationRole::Supervisor,
+                kind: OrchestrationEventKind::Spawn,
+                payload: json!({"source": "queue.tsv", "task": row}),
+            },
+        )?;
     }
     Ok(())
 }
@@ -550,23 +811,26 @@ fn read_escalations(
             } else {
                 format!("escalation-{}", index + 1)
             };
-            events.push(NormalizedEvent {
-                ts: ts.clone(),
-                repo: repo_id.to_string(),
-                run: run_id.to_string(),
-                node,
-                parent: parent.clone(),
-                role: OrchestrationRole::Supervisor,
-                kind: OrchestrationEventKind::Escalate,
-                payload: json!({
-                    "source": "NEXT_O2_TASKS.tsv",
-                    "scope_key": scope_key,
-                    "task_file": task_file,
-                    "reason": reason,
-                    "origin": origin,
-                    "inferred": true,
-                }),
-            });
+            push_event(
+                events,
+                NormalizedEvent {
+                    ts: ts.clone(),
+                    repo: repo_id.to_string(),
+                    run: run_id.to_string(),
+                    node,
+                    parent: parent.clone(),
+                    role: OrchestrationRole::Supervisor,
+                    kind: OrchestrationEventKind::Escalate,
+                    payload: json!({
+                        "source": "NEXT_O2_TASKS.tsv",
+                        "scope_key": scope_key,
+                        "task_file": task_file,
+                        "reason": reason,
+                        "origin": origin,
+                        "inferred": true,
+                    }),
+                },
+            )?;
         }
     }
     Ok(())
@@ -599,12 +863,17 @@ fn scope_role(role: Option<&str>) -> OrchestrationRole {
 
 fn final_report_exists(family: &str, run_dir: &Path) -> io::Result<bool> {
     let candidates = match family {
-        "o2" => vec![run_dir.join("reports").join("supervisor-final.json")],
+        "o2" => validate_directory_chain(run_dir, &["reports"])?
+            .map(|directory| vec![directory.join("supervisor-final.json")])
+            .unwrap_or_default(),
         "autopilot" | "inbox" => vec![run_dir.join("final-report.json")],
-        "consult" => vec![
-            run_dir.join("trusted").join("consultant-report.json"),
-            run_dir.join("consultant-report.json"),
-        ],
+        "consult" => {
+            let mut candidates = vec![run_dir.join("consultant-report.json")];
+            if let Some(directory) = validate_directory_chain(run_dir, &["trusted"])? {
+                candidates.push(directory.join("consultant-report.json"));
+            }
+            candidates
+        }
         "o2-autopilot" => vec![run_dir.join("SUMMARY.md")],
         _ => Vec::new(),
     };
@@ -634,24 +903,31 @@ fn read_text(path: &Path) -> io::Result<Option<String>> {
 }
 
 fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
-    if !is_regular_file(path)? {
+    let Some(file) = open_regular_file(path)? else {
         return Ok(None);
+    };
+    if file.metadata()?.len() > max_bytes {
+        return Err(invalid_data(format!(
+            "Scope artifact exceeds the {max_bytes} byte limit: {}",
+            path.display()
+        )));
     }
-    let file = File::open(path)?;
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
-        return Ok(None);
+        return Err(invalid_data(format!(
+            "Scope artifact grew beyond the {max_bytes} byte limit: {}",
+            path.display()
+        )));
     }
     Ok(Some(bytes))
 }
 
 fn read_last_json_line(path: &Path) -> io::Result<Option<Value>> {
-    if !is_regular_file(path)? {
+    let Some(mut file) = open_regular_file(path)? else {
         return Ok(None);
-    }
-    let mut file = File::open(path)?;
+    };
     let length = file.metadata()?.len();
     let start = length.saturating_sub(MAX_LOG_TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
@@ -719,18 +995,35 @@ fn read_children(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    if metadata.file_type().is_symlink() {
+        return Err(invalid_data(format!(
+            "Scope refuses symlinked directory {}",
+            directory.display()
+        )));
+    }
     if !metadata.file_type().is_dir() {
-        return Ok(Vec::new());
+        return Err(invalid_data(format!(
+            "Scope expected a directory at {}",
+            directory.display()
+        )));
     }
     let mut paths = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let Ok(entry) = entry else {
-            continue;
-        };
+    for (index, entry) in fs::read_dir(directory)?.enumerate() {
+        if index >= MAX_DIRECTORY_ENTRIES {
+            return Err(invalid_data(format!(
+                "Scope directory exceeds the {MAX_DIRECTORY_ENTRIES} entry limit: {}",
+                directory.display()
+            )));
+        }
+        let entry = entry?;
         let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_data(format!(
+                "Scope refuses symlinked artifact {}",
+                path.display()
+            )));
+        }
         if include(&metadata, &path) {
             paths.push(path);
         }
@@ -742,14 +1035,26 @@ fn read_children(
 fn find_named_files(root: &Path, name: &str, max_depth: usize) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    let mut visited = 0_usize;
     while let Some((directory, depth)) = pending.pop() {
         for path in read_children(&directory, |_, _| true)? {
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                continue;
-            };
+            visited += 1;
+            if visited > MAX_DISCOVERY_ENTRIES {
+                return Err(invalid_data(format!(
+                    "Scope recursive discovery exceeds the {MAX_DISCOVERY_ENTRIES} entry limit under {}",
+                    root.display()
+                )));
+            }
+            let metadata = fs::symlink_metadata(&path)?;
             if metadata.file_type().is_file()
                 && path.file_name().and_then(|value| value.to_str()) == Some(name)
             {
+                if found.len() >= MAX_NAMED_FILES {
+                    return Err(invalid_data(format!(
+                        "Scope recursive discovery exceeds the {MAX_NAMED_FILES} named-file limit under {}",
+                        root.display()
+                    )));
+                }
                 found.push(path);
             } else if metadata.file_type().is_dir() && depth < max_depth {
                 pending.push((path, depth + 1));
@@ -762,6 +1067,10 @@ fn find_named_files(root: &Path, name: &str, max_depth: usize) -> io::Result<Vec
 
 fn is_regular_file(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid_data(format!(
+            "Scope refuses symlinked artifact {}",
+            path.display()
+        ))),
         Ok(metadata) => Ok(metadata.file_type().is_file()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -770,6 +1079,108 @@ fn is_regular_file(path: &Path) -> io::Result<bool> {
 
 fn no_follow_metadata(path: &Path) -> io::Result<fs::Metadata> {
     fs::symlink_metadata(path)
+}
+
+fn open_regular_file(path: &Path) -> io::Result<Option<File>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(invalid_data(format!(
+            "Scope refuses symlinked artifact {}",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(invalid_data(format!(
+            "Scope expected a regular file at {}",
+            path.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(invalid_data(format!(
+            "Scope artifact changed type while opening {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+        return Err(invalid_data(format!(
+            "Scope artifact changed identity while opening {}",
+            path.display()
+        )));
+    }
+    Ok(Some(file))
+}
+
+fn validate_directory_chain(root: &Path, components: &[&str]) -> io::Result<Option<PathBuf>> {
+    let canonical_root = fs::canonicalize(root)?;
+    if canonical_root != root {
+        return Err(invalid_data(format!(
+            "Scope directory root must be canonical: {}",
+            root.display()
+        )));
+    }
+    let mut current = root.to_path_buf();
+    for component in components {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_data(format!(
+                "Scope refuses symlinked intermediate directory {}",
+                current.display()
+            )));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(invalid_data(format!(
+                "Scope expected a directory at {}",
+                current.display()
+            )));
+        }
+        let canonical = fs::canonicalize(&current)?;
+        if canonical != current || !canonical.starts_with(&canonical_root) {
+            return Err(invalid_data(format!(
+                "Scope directory escapes its canonical root: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(Some(current))
+}
+
+fn push_event(events: &mut Vec<NormalizedEvent>, event: NormalizedEvent) -> io::Result<()> {
+    if events.len() >= MAX_EVENTS_PER_RUN {
+        return Err(invalid_data(format!(
+            "Scope run exceeds the {MAX_EVENTS_PER_RUN} normalized event limit"
+        )));
+    }
+    events.push(event);
+    Ok(())
+}
+
+fn ensure_event_limit(events: &[NormalizedEvent]) -> io::Result<()> {
+    if events.len() > MAX_EVENTS_PER_RUN {
+        return Err(invalid_data(format!(
+            "Scope run exceeds the {MAX_EVENTS_PER_RUN} normalized event limit"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn relative_source(directory: &Path, path: &Path, prefix: &str) -> String {
@@ -916,9 +1327,22 @@ mod tests {
     }
 
     #[test]
+    fn repository_scan_breadth_overflow_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repositories = (0..=MAX_REPOSITORIES)
+            .map(|index| RepositoryTarget {
+                id: format!("repo-{index}"),
+                path: temp.path().to_path_buf(),
+            })
+            .collect::<Vec<_>>();
+        let error = scan_repositories(&repositories).expect_err("reject repository overflow");
+        assert!(error.to_string().contains("repository limit"));
+    }
+
+    #[test]
     fn fallback_reconstructs_tree_acceptance_liveness_and_inferred_escalation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let run = temp.path().join(".maco/o2-autopilot/runs/run-fallback");
+        let run = temp.path().join(".maco/o2/runs/run-fallback");
         write(
             &run.join("assignments/supervisor-plan.json"),
             r#"{
@@ -929,12 +1353,21 @@ mod tests {
             }"#,
         );
         write(
-            &run.join("reports/worker-a.json"),
+            &run.join("reports/o1-a.json"),
             r#"{
-                "id":"worker-a","role":"worker","status":"succeeded",
-                "accepted":true,"claim_token":42,
-                "assigned_paths":["src/a.rs"],
-                "validation_results":[{"name":"unit","passed":true}]
+                "id":"o1-a","role":"child_orchestrator","status":"succeeded",
+                "accepted":true,
+                "worker_reports":[{
+                    "id":"worker-a","role":"worker","status":"succeeded",
+                    "accepted":true,"claim_token":42,
+                    "assigned_paths":["src/a.rs"],
+                    "validation_results":[{"name":"unit","status":"succeeded"}]
+                }],
+                "audit_reports":[{
+                    "id":"auditor-a","role":"auditor","status":"failed",
+                    "accepted":false,"rejected":true,
+                    "validation_results":[{"name":"coverage","status":"failed"}]
+                }]
             }"#,
         );
         write(
@@ -960,22 +1393,48 @@ mod tests {
 
         let snapshot = scan_repositories(&[target(temp.path())]).expect("scan fallbacks");
         let events = snapshot
-            .events_for_run("repo-one", "o2-autopilot", "run-fallback")
+            .events_for_run("repo-one", "o2", "run-fallback")
             .expect("fallback run");
         assert!(events.iter().any(|event| {
-            event.node == "worker-a"
-                && event.parent.as_deref() == Some("o1-a")
+            event.node == "run-fallback"
+                && event.parent.is_none()
+                && event.role == OrchestrationRole::Supervisor
+                && event.kind == OrchestrationEventKind::Spawn
+                && event.payload["synthetic"] == true
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == "o1-a"
+                && event.parent.as_deref() == Some("run-fallback")
+                && event.role == OrchestrationRole::Orchestrator
                 && event.kind == OrchestrationEventKind::Spawn
         }));
         assert!(events.iter().any(|event| {
-            event.node == "worker-a" && event.kind == OrchestrationEventKind::Accept
+            event.node == "worker-a"
+                && event.parent.as_deref() == Some("o1-a")
+                && event.role == OrchestrationRole::Worker
+                && event.kind == OrchestrationEventKind::Spawn
         }));
-        assert!(events
-            .iter()
-            .any(|event| event.kind == OrchestrationEventKind::Claim));
-        assert!(events
-            .iter()
-            .any(|event| event.kind == OrchestrationEventKind::Gate));
+        assert!(events.iter().any(|event| {
+            event.node == "worker-a"
+                && event.parent.as_deref() == Some("o1-a")
+                && event.role == OrchestrationRole::Worker
+                && event.kind == OrchestrationEventKind::Accept
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == "auditor-a"
+                && event.parent.as_deref() == Some("o1-a")
+                && event.role == OrchestrationRole::Auditor
+                && event.kind == OrchestrationEventKind::Reject
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == "worker-a" && event.kind == OrchestrationEventKind::Claim
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == "worker-a" && event.kind == OrchestrationEventKind::Gate
+        }));
+        assert!(events.iter().any(|event| {
+            event.node == "auditor-a" && event.kind == OrchestrationEventKind::Gate
+        }));
         assert!(events
             .iter()
             .any(|event| event.kind == OrchestrationEventKind::Journal));
@@ -1040,12 +1499,12 @@ mod tests {
         assert!(runs.iter().any(|run| {
             run.family == "o2" && run.run == "unfinalized" && !run.final_report_exists
         }));
-        assert_eq!(snapshot.all_events().len(), 1);
+        assert_eq!(snapshot.all_events().len(), 3);
     }
 
     #[cfg(unix)]
     #[test]
-    fn scanning_skips_symlinked_artifacts() {
+    fn scanning_rejects_symlinked_artifacts() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1058,10 +1517,57 @@ mod tests {
         fs::create_dir_all(&events_dir).expect("events dir");
         symlink(&outside, events_dir.join("orchestration.jsonl")).expect("journal symlink");
 
-        let snapshot = scan_repositories(&[target(temp.path())]).expect("scan symlink");
-        assert!(snapshot
-            .events_for_run("repo-one", "o2", "symlinked")
-            .expect("symlinked run")
-            .is_empty());
+        let error = scan_repositories(&[target(temp.path())]).expect_err("reject journal symlink");
+        assert!(error.to_string().contains("symlinked artifact"));
+    }
+
+    #[test]
+    fn primary_journal_bound_overflows_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let oversized = temp.path().join("oversized.jsonl");
+        write(&oversized, "{}");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&oversized)
+            .expect("open oversized journal")
+            .set_len(MAX_JOURNAL_BYTES + 1)
+            .expect("extend oversized journal");
+        let error = read_journal(&oversized, "repo", "run").expect_err("reject byte overflow");
+        assert!(error.to_string().contains("byte limit"));
+
+        let long_line = temp.path().join("long-line.jsonl");
+        write(&long_line, &"x".repeat(MAX_JOURNAL_LINE_BYTES + 1));
+        let error = read_journal(&long_line, "repo", "run").expect_err("reject long line");
+        assert!(error.to_string().contains("line exceeds"));
+
+        let excessive_records = temp.path().join("too-many-records.jsonl");
+        write(&excessive_records, &"{}\n".repeat(MAX_JOURNAL_RECORDS + 1));
+        let error =
+            read_journal(&excessive_records, "repo", "run").expect_err("reject record overflow");
+        assert!(error.to_string().contains("record limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanning_rejects_symlinked_fixed_intermediate_directories() {
+        use std::os::unix::fs::symlink;
+
+        let maco_temp = tempfile::tempdir().expect("maco tempdir");
+        let outside_maco = maco_temp.path().join("outside-maco");
+        fs::create_dir(&outside_maco).expect("outside maco");
+        let watched = maco_temp.path().join("watched");
+        fs::create_dir(&watched).expect("watched repo");
+        symlink(&outside_maco, watched.join(".maco")).expect("maco symlink");
+        let error = scan_repositories(&[target(&watched)]).expect_err("reject maco symlink");
+        assert!(error.to_string().contains("intermediate directory"));
+
+        let events_temp = tempfile::tempdir().expect("events tempdir");
+        let run = events_temp.path().join(".maco/o2/runs/run/events-parent");
+        fs::create_dir_all(&run).expect("run directory");
+        let run_root = events_temp.path().join(".maco/o2/runs/run");
+        symlink(&run, run_root.join("events")).expect("events symlink");
+        let error =
+            scan_repositories(&[target(events_temp.path())]).expect_err("reject events symlink");
+        assert!(error.to_string().contains("intermediate directory"));
     }
 }
