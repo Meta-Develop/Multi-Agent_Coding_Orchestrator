@@ -27,6 +27,7 @@ const MAX_CONNECTIONS: usize = 64;
 const MAX_JSON_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_EVENTS_PER_SCAN: usize = 65_536;
+const MAX_DECODED_ROUTE_SEGMENT_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
 struct ServerConfig {
@@ -230,7 +231,7 @@ fn write_run_events_response(
         );
     };
 
-    match source.events(repo_id, family, run_id) {
+    match source.events(&repo_id, &family, &run_id) {
         Ok(Some(events)) => write_json_response(
             stream,
             "200 OK",
@@ -249,7 +250,7 @@ fn write_run_events_response(
     }
 }
 
-fn parse_run_events_path(path: &str) -> Option<(&str, &str, &str)> {
+fn parse_run_events_path(path: &str) -> Option<(String, String, String)> {
     let parts = path.split('/').collect::<Vec<_>>();
     if parts.len() != 7
         || !parts[0].is_empty()
@@ -259,13 +260,48 @@ fn parse_run_events_path(path: &str) -> Option<(&str, &str, &str)> {
     {
         return None;
     }
-    let repo_id = parts[3];
-    let family = parts[4];
-    let run_id = parts[5];
-    if repo_id.is_empty() || family.is_empty() || run_id.is_empty() {
+    Some((
+        decode_route_segment(parts[3])?,
+        decode_route_segment(parts[4])?,
+        decode_route_segment(parts[5])?,
+    ))
+}
+
+fn decode_route_segment(encoded: &str) -> Option<String> {
+    let encoded = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len().min(MAX_DECODED_ROUTE_SEGMENT_BYTES));
+    let mut index = 0;
+    while index < encoded.len() {
+        let byte = if encoded[index] == b'%' {
+            let high = decode_hex(*encoded.get(index + 1)?)?;
+            let low = decode_hex(*encoded.get(index + 2)?)?;
+            index += 3;
+            (high << 4) | low
+        } else {
+            let byte = encoded[index];
+            index += 1;
+            byte
+        };
+        if decoded.len() >= MAX_DECODED_ROUTE_SEGMENT_BYTES {
+            return None;
+        }
+        decoded.push(byte);
+    }
+
+    let decoded = String::from_utf8(decoded).ok()?;
+    if decoded.is_empty() || decoded.chars().any(char::is_control) {
         None
     } else {
-        Some((repo_id, family, run_id))
+        Some(decoded)
+    }
+}
+
+fn decode_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -574,6 +610,7 @@ mod tests {
     struct TestDataSource {
         projects: Value,
         events: Mutex<Vec<OrchestrationEvent>>,
+        expected_route: Option<(String, String, String)>,
     }
 
     impl TestDataSource {
@@ -581,7 +618,14 @@ mod tests {
             Self {
                 projects,
                 events: Mutex::new(events),
+                expected_route: None,
             }
+        }
+
+        fn with_route(mut self, repo_id: &str, family: &str, run_id: &str) -> Self {
+            self.expected_route =
+                Some((repo_id.to_string(), family.to_string(), run_id.to_string()));
+            self
         }
 
         fn set_events(&self, events: Vec<OrchestrationEvent>) {
@@ -596,10 +640,15 @@ mod tests {
 
         fn events(
             &self,
-            _repo_id: &str,
-            _family: &str,
-            _run_id: &str,
+            repo_id: &str,
+            family: &str,
+            run_id: &str,
         ) -> Result<Option<Vec<OrchestrationEvent>>> {
+            if self.expected_route.as_ref().is_some_and(|expected| {
+                expected.0 != repo_id || expected.1 != family || expected.2 != run_id
+            }) {
+                return Ok(None);
+            }
             Ok(Some(self.events.lock().expect("lock test events").clone()))
         }
 
@@ -739,15 +788,67 @@ mod tests {
     fn parses_only_exact_run_event_paths() {
         assert_eq!(
             parse_run_events_path("/api/runs/repo/o2/run-1/events"),
-            Some(("repo", "o2", "run-1"))
+            Some(("repo".to_string(), "o2".to_string(), "run-1".to_string()))
+        );
+        assert_eq!(
+            parse_run_events_path(
+                "/api/runs/repo%20space/family%25+name/run-%E6%97%A5%E6%9C%AC%2Fpart/events"
+            ),
+            Some((
+                "repo space".to_string(),
+                "family%+name".to_string(),
+                "run-日本/part".to_string()
+            ))
         );
         for path in [
             "/api/runs/repo/o2/run-1/events/",
             "/api/runs//o2/run-1/events",
             "/api/runs/repo/o2/run-1/events/extra",
+            "/api/runs/repo%/o2/run-1/events",
+            "/api/runs/repo%2/o2/run-1/events",
+            "/api/runs/repo%GG/o2/run-1/events",
+            "/api/runs/repo%FF/o2/run-1/events",
+            "/api/runs/repo%00/o2/run-1/events",
         ] {
             assert!(parse_run_events_path(path).is_none(), "accepted {path}");
         }
+        let oversized = format!(
+            "/api/runs/{}/o2/run-1/events",
+            "a".repeat(MAX_DECODED_ROUTE_SEGMENT_BYTES + 1)
+        );
+        assert!(parse_run_events_path(&oversized).is_none());
+    }
+
+    #[test]
+    fn encoded_run_route_round_trips_exact_identifiers_and_rejects_malformed_encoding() {
+        let source: Arc<dyn ScopeDataSource> = Arc::new(
+            TestDataSource::new(
+                json!({"projects": []}),
+                vec![event("encoded-route", json!({"status": "ready"}))],
+            )
+            .with_route("repo space", "family%+name", "run-日本/part"),
+        );
+        let mut server = TestServer::start(source, test_config());
+
+        let response = http_get(
+            server.address,
+            "/api/runs/repo%20space/family%25+name/run-%E6%97%A5%E6%9C%AC%2Fpart/events",
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"node\":\"encoded-route\""));
+
+        for path in [
+            "/api/runs/repo%/family%25+name/run-%E6%97%A5%E6%9C%AC%2Fpart/events",
+            "/api/runs/repo%20space/family%FF/run-%E6%97%A5%E6%9C%AC%2Fpart/events",
+            "/api/runs/repo%20space/family%25+name/run-%00/events",
+        ] {
+            let response = http_get(server.address, path);
+            assert!(
+                response.starts_with("HTTP/1.1 404 Not Found"),
+                "unexpected response for {path}: {response}"
+            );
+        }
+        server.stop();
     }
 
     #[test]

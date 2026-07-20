@@ -385,6 +385,9 @@
           source: null,
           replayTimer: null,
           loadToken: 0,
+          pendingLoad: null,
+          animationFrame: null,
+          unloading: false,
           lastLogCursor: -1,
           layout: { nodes: new Map(), edges: [], width: 900, height: 496 }
         };
@@ -419,8 +422,11 @@
           return Array.from(unique.entries());
         }
 
-        function replaceEvents(records) {
-          var normalized = normalizeEvents(records);
+        function replaceEvents(records, trailingRecords) {
+          var combined = (Array.isArray(records) ? records : []).concat(
+            Array.isArray(trailingRecords) ? trailingRecords : []
+          );
+          var normalized = normalizeEvents(combined);
           state.events = normalized.map(function (entry) { return entry[1]; });
           state.eventKeys = new Set(normalized.map(function (entry) { return entry[0]; }));
           state.cursor = state.events.length;
@@ -1002,17 +1008,26 @@
           state.lastLogCursor = state.cursor;
         }
 
+        function animationIsActive() {
+          return !reducedMotion && Array.from(state.layout.nodes.values()).some(function (node) {
+            return node.status === "running" || node.status === "queued";
+          });
+        }
+
+        function scheduleAnimationFrame() {
+          if (state.unloading || state.animationFrame !== null) return;
+          state.animationFrame = window.requestAnimationFrame(renderFrame);
+        }
+
         function renderFrame(timestamp) {
+          state.animationFrame = null;
+          if (state.unloading) return;
           resizeCanvas(state.layout);
           context.clearRect(0, 0, state.layout.width, state.layout.height);
           drawGuides(state.layout);
           state.layout.edges.forEach(function (edge) { drawEdge(edge, timestamp / 1000); });
           state.layout.nodes.forEach(function (node) { drawNode(node, timestamp / 1000); });
-          if (!reducedMotion && Array.from(state.layout.nodes.values()).some(function (node) {
-            return node.status === "running" || node.status === "queued";
-          })) {
-            window.requestAnimationFrame(renderFrame);
-          }
+          if (animationIsActive()) scheduleAnimationFrame();
         }
 
         function render() {
@@ -1035,7 +1050,7 @@
           renderTreeSummary(state.layout);
           renderEdgeSummary(state.layout);
           renderLog();
-          window.requestAnimationFrame(renderFrame);
+          scheduleAnimationFrame();
         }
 
         function updateControls() {
@@ -1108,7 +1123,7 @@
             elements.run.appendChild(none);
             elements.run.disabled = true;
             state.selectedRun = null;
-            replaceEvents([]);
+            loadSelectedRun();
             return;
           }
           runs.forEach(function (run, index) {
@@ -1127,10 +1142,18 @@
           var project = state.selectedProject;
           var run = state.selectedRun;
           var token = ++state.loadToken;
+          state.pendingLoad = null;
+          replaceEvents([]);
           if (!project || !run) {
-            replaceEvents([]);
             return;
           }
+          state.pendingLoad = {
+            token: token,
+            repo: String(project.id),
+            run: String(run.run),
+            liveEvents: [],
+            liveKeys: new Set()
+          };
           showError("");
           elements.status.textContent = "Loading " + run.family + " / " + run.run;
           var segments = [project.id, run.family, run.run].map(function (segment) {
@@ -1140,12 +1163,16 @@
             var response = await fetch("/api/runs/" + segments.join("/") + "/events", { cache: "no-store" });
             if (!response.ok) throw new Error("events request returned HTTP " + response.status);
             var records = await response.json();
-            if (token !== state.loadToken) return;
-            replaceEvents(records);
+            var pending = state.pendingLoad;
+            if (token !== state.loadToken || !pending || pending.token !== token) return;
+            state.pendingLoad = null;
+            replaceEvents(records, pending.liveEvents);
             elements.status.textContent = "Loaded " + run.family + " / " + run.run;
           } catch (error) {
-            if (token !== state.loadToken) return;
-            replaceEvents([]);
+            var pending = state.pendingLoad;
+            if (token !== state.loadToken || !pending || pending.token !== token) return;
+            state.pendingLoad = null;
+            replaceEvents([], pending.liveEvents);
             showError("Could not load run: " + error.message);
             elements.status.textContent = "Run load failed";
           }
@@ -1162,6 +1189,14 @@
               var event = JSON.parse(message.data);
               if (!state.selectedProject || !state.selectedRun) return;
               if (event.repo !== state.selectedProject.id || event.run !== state.selectedRun.run) return;
+              var pending = state.pendingLoad;
+              if (pending && pending.token === state.loadToken && event.repo === pending.repo && event.run === pending.run) {
+                var key = eventKey(event);
+                if (!pending.liveKeys.has(key)) {
+                  pending.liveKeys.add(key);
+                  pending.liveEvents.push(event);
+                }
+              }
               if (appendEvent(event)) elements.status.textContent = "Live event received: " + event.kind + " · " + event.node;
             } catch (error) {
               showError("Ignored malformed stream event: " + error.message);
@@ -1236,8 +1271,11 @@
           }
         });
         window.addEventListener("beforeunload", function () {
+          state.unloading = true;
           if (state.source) state.source.close();
           if (state.replayTimer !== null) window.clearTimeout(state.replayTimer);
+          if (state.animationFrame !== null) window.cancelAnimationFrame(state.animationFrame);
+          state.animationFrame = null;
         });
 
         updateControls();
