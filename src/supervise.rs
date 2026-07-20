@@ -47,6 +47,7 @@ const SNAPSHOT_GIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUPERVISOR_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_SUPERVISOR_INPUT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_WORKER_EXECUTION_JOURNAL_BYTES: usize = 1024 * 1024;
 const ARTIFACT_FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
@@ -747,6 +748,7 @@ Required behavior:
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
 - If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
+- Each worker must also write its structured execution journal to the exact path in its worker prompt. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects worker evidence that the journal or Git diff does not support.
 - Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
 - Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
 - Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
@@ -833,6 +835,7 @@ pub fn worker_prompt(
         serde_json::to_string_pretty(worker).context("failed to serialize worker assignment")?;
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     let task = worker_task(plan, orchestrator, worker);
+    let journal_path = worker_execution_journal_incoming_path(run_dir, worker);
     Ok(format!(
         r#"{role_prefix}You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
@@ -845,11 +848,13 @@ Ownership:
 - Semantic symbols: {semantic_symbols}
 - Semantic modules: {semantic_modules}
 - Run artifact root: {run_dir}
+- Execution journal path: {journal_path}
 - Explicit report path: {report_path}
 
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
 - Do not mutate the primary worktree.
+- Before returning your WorkerReport, write a structured execution journal to the exact execution journal path above. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
 - Run validation or record why validation was not run.
 - Return WorkerReport JSON in your final response with changed files, commands run, validation results, findings, remaining risk, and next safe action.
 - Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
@@ -871,6 +876,7 @@ Worker assignment JSON:
         semantic_symbols = worker.semantic_symbols.join(", "),
         semantic_modules = worker.semantic_modules.join(", "),
         run_dir = run_dir.display(),
+        journal_path = journal_path.display(),
         report_path = worker
             .report_path
             .as_ref()
@@ -1090,6 +1096,27 @@ fn child_attempt_artifacts(
         raw_stdout_relative: PathBuf::from("logs").join(format!("{stem}.jsonl")),
         command_record_relative: PathBuf::from("logs").join(format!("{stem}.summary.json")),
     }
+}
+
+fn worker_execution_journal_file_name(worker_id: &str) -> String {
+    format!("{worker_id}.jsonl")
+}
+
+fn worker_execution_journal_incoming_relative(worker: &WorkerAssignment) -> PathBuf {
+    PathBuf::from("worker-journals").join(worker_execution_journal_file_name(&worker.id))
+}
+
+fn worker_execution_journal_incoming_path(run_dir: &Path, worker: &WorkerAssignment) -> PathBuf {
+    run_dir
+        .join("incoming")
+        .join(worker_execution_journal_incoming_relative(worker))
+}
+
+fn worker_execution_journal_evidence_relative(assignment_id: &str, worker_id: &str) -> PathBuf {
+    PathBuf::from("logs")
+        .join("workers")
+        .join(assignment_id)
+        .join(worker_execution_journal_file_name(worker_id))
 }
 
 fn prompt_with_corrective_feedback(prompt: &str, problems: &[String]) -> String {
@@ -4326,6 +4353,7 @@ fn deterministic_fake_child_run(
     claim_token: u64,
     semantic_intent_token: Option<u64>,
 ) -> Result<ExternalAgentRun> {
+    write_deterministic_fake_worker_journals(command, assignment)?;
     let worker_reports = assignment
         .worker_assignments
         .iter()
@@ -4382,6 +4410,33 @@ fn deterministic_fake_child_run(
     let mut output = serde_json::to_vec_pretty(&report)?;
     output.push(b'\n');
     Ok(deterministic_fake_run(command, output))
+}
+
+fn write_deterministic_fake_worker_journals(
+    command: &ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+) -> Result<()> {
+    let incoming_path = command
+        .output_last_message
+        .parent()
+        .context("deterministic fake child report path has no parent directory")?;
+    let journal_root = incoming_path.join("worker-journals");
+    fs::create_dir_all(&journal_root).with_context(|| {
+        format!(
+            "failed to create deterministic fake worker journal directory {}",
+            journal_root.display()
+        )
+    })?;
+    for worker in &assignment.worker_assignments {
+        let journal_path = journal_root.join(worker_execution_journal_file_name(&worker.id));
+        fs::write(&journal_path, b"").with_context(|| {
+            format!(
+                "failed to write deterministic fake worker execution journal {}",
+                journal_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn deterministic_fake_auditor_run(
