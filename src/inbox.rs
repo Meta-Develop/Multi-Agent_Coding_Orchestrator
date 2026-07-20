@@ -1179,6 +1179,13 @@ struct LoadedWorkspaceConfig {
     public_config_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceRepository {
+    pub id: String,
+    pub path: PathBuf,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 struct WorkspaceRepoSpec {
     id: String,
@@ -1990,6 +1997,18 @@ fn load_workspace_config(path: &Path) -> Result<LoadedWorkspaceConfig> {
         config_dir: root.path().to_path_buf(),
         public_config_path: public_config_path(path),
     })
+}
+
+pub(crate) fn load_workspace_repositories(path: &Path) -> Result<Vec<WorkspaceRepository>> {
+    let loaded = load_workspace_config(path)?;
+    Ok(workspace_repo_specs(&loaded)?
+        .into_iter()
+        .map(|repository| WorkspaceRepository {
+            id: repository.id,
+            path: repository.repo_path,
+            enabled: repository.enabled,
+        })
+        .collect())
 }
 
 fn validate_workspace_config(mut config: InboxWorkspaceConfig) -> Result<InboxWorkspaceConfig> {
@@ -5311,6 +5330,64 @@ mod tests {
             loaded.config_dir,
             fs::canonicalize(&real).expect("canonical real")
         );
+    }
+
+    #[test]
+    fn workspace_repository_projection_uses_config_relative_paths_and_enabled_flags() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_dir = temp.path().join("config");
+        let first = config_dir.join("first");
+        let second = config_dir.join("second");
+        fs::create_dir_all(&first).expect("first repository");
+        fs::create_dir(&second).expect("second repository");
+        let config = config_dir.join("workspace.json");
+        fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "repositories": [
+                    {"id": "first", "path": "first"},
+                    {"id": "second", "path": "second", "enabled": false}
+                ]
+            }))
+            .expect("workspace JSON"),
+        )
+        .expect("workspace config");
+
+        let repositories =
+            load_workspace_repositories(&config).expect("project workspace repositories");
+
+        assert_eq!(
+            repositories,
+            vec![
+                WorkspaceRepository {
+                    id: "first".to_string(),
+                    path: fs::canonicalize(first).expect("canonical first repository"),
+                    enabled: true,
+                },
+                WorkspaceRepository {
+                    id: "second".to_string(),
+                    path: fs::canonicalize(second).expect("canonical second repository"),
+                    enabled: false,
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_repository_projection_preserves_strict_no_follow_loading() {
+        let temp = TempDir::new().expect("tempdir");
+        let external = temp.path().join("external.json");
+        fs::write(
+            &external,
+            br#"{"repositories":[{"id":"repo","path":".","unknown":true}]}"#,
+        )
+        .expect("strict schema fixture");
+        assert!(load_workspace_repositories(&external).is_err());
+
+        let linked = temp.path().join("workspace.json");
+        symlink(&external, &linked).expect("workspace symlink");
+        assert!(load_workspace_repositories(&linked).is_err());
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub enum OrchestrationEventKind {
     Reject,
     Escalate,
     Gate,
+    Claim,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -300,6 +301,7 @@ mod tests {
             (OrchestrationEventKind::Reject, "reject"),
             (OrchestrationEventKind::Escalate, "escalate"),
             (OrchestrationEventKind::Gate, "gate"),
+            (OrchestrationEventKind::Claim, "claim"),
         ];
         for (kind, expected) in kinds {
             assert_eq!(
