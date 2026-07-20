@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{hash_map::RandomState, BTreeMap, BTreeSet},
-    fs,
+    ffi::OsStr,
+    fs::{self, File},
     hash::{BuildHasher, Hash, Hasher},
     io::Write,
     path::{Component, Path, PathBuf},
@@ -35,8 +36,8 @@ use std::{
 
 #[cfg(unix)]
 use std::{
-    ffi::{CStr, CString, OsStr},
-    fs::{File, OpenOptions},
+    ffi::{CStr, CString},
+    fs::OpenOptions,
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -60,9 +61,30 @@ const MAX_ARTIFACT_SCRATCH_DIRECTORIES: usize = 64;
 const MAX_ARTIFACT_SCRATCH_NAME_BYTES: usize = 128;
 static RESERVATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactAppendFaultPoint {
+    #[cfg(test)]
+    PartialWrite,
+    AfterWriteBeforeFileSync,
+    AfterFileSyncBeforeParentSync,
+}
+
+struct ArtifactAppendRecovery<'a> {
+    relative: &'a Path,
+    previous_contents: &'a [u8],
+    attempted_append: &'a [u8],
+    disposition: ArtifactFileDisposition,
+    opened_identity: &'a FileIdentity,
+    file: &'a mut File,
+    parent: &'a SafeRoot,
+    create: bool,
+    new_file_bytes: u64,
+    proposed_total: u64,
+}
+
 #[cfg(test)]
 thread_local! {
-    static APPEND_FAULT_AFTER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ARTIFACT_APPEND_FAULT: std::cell::Cell<Option<ArtifactAppendFaultPoint>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -292,6 +314,7 @@ pub struct ArtifactRunWriter {
     writer_evidence: ArtifactWriterEvidence,
     files: BTreeMap<PathBuf, ArtifactFileRecord>,
     outstanding_scratches: BTreeMap<PathBuf, FileIdentity>,
+    poisoned_appends: BTreeSet<PathBuf>,
     total_bytes: u64,
     run_lock: BoundArtifactLock,
 }
@@ -502,6 +525,7 @@ impl ArtifactRunWriter {
                 writer_evidence,
                 files: BTreeMap::new(),
                 outstanding_scratches: BTreeMap::new(),
+                poisoned_appends: BTreeSet::new(),
                 total_bytes: 0,
                 run_lock,
             })
@@ -738,6 +762,12 @@ impl ArtifactRunWriter {
         self.run_lock.verify(&self.run)?;
         let result = (|| -> Result<ArtifactFileRecord> {
             let relative = validate_artifact_relative_path(relative)?;
+            if self.poisoned_appends.contains(&relative) {
+                bail!(
+                    "artifact append path is poisoned by an unrecovered prior write: {}",
+                    relative.display()
+                );
+            }
             if let Some(scratch) = self
                 .outstanding_scratches
                 .keys()
@@ -823,16 +853,15 @@ impl ArtifactRunWriter {
                 );
             }
             let append_result = (|| -> Result<ArtifactFileRecord> {
-                file.write_all(contents).with_context(|| {
-                    format!("failed to append artifact file {}", relative.display())
-                })?;
+                write_artifact_append(&mut file, contents, &relative)?;
+                run_artifact_append_fault(ArtifactAppendFaultPoint::AfterWriteBeforeFileSync)?;
                 file.sync_data().with_context(|| {
                     format!(
                         "failed to persist appended artifact file {}",
                         relative.display()
                     )
                 })?;
-                run_artifact_append_fault_after_sync()?;
+                run_artifact_append_fault(ArtifactAppendFaultPoint::AfterFileSyncBeforeParentSync)?;
                 if create {
                     parent.sync_directory_fenced()?;
                 }
@@ -878,19 +907,26 @@ impl ArtifactRunWriter {
                     Ok(record)
                 }
                 Err(error) => {
-                    let recovery = self.reconcile_failed_artifact_append(
-                        &relative,
-                        &expected,
-                        contents,
+                    let recovery = self.reconcile_failed_artifact_append(ArtifactAppendRecovery {
+                        relative: &relative,
+                        previous_contents: &expected,
+                        attempted_append: contents,
                         disposition,
-                        previous_bytes,
-                        &opened_identity,
-                    );
+                        opened_identity: &opened_identity,
+                        file: &mut file,
+                        parent: &parent,
+                        create,
+                        new_file_bytes,
+                        proposed_total,
+                    });
                     match recovery {
                         Ok(()) => Err(error),
-                        Err(recovery_error) => Err(error.context(format!(
-                            "artifact append recovery also failed: {recovery_error:#}"
-                        ))),
+                        Err(recovery_error) => {
+                            self.poisoned_appends.insert(relative);
+                            Err(error.context(format!(
+                                "artifact append recovery also failed and poisoned this path: {recovery_error:#}"
+                            )))
+                        }
                     }
                 }
             }
@@ -898,16 +934,36 @@ impl ArtifactRunWriter {
         finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
     }
 
+    /// Completes and durably verifies the exact attempted line after any
+    /// post-open append error. A short write is never manifested as valid
+    /// JSONL: recovery appends the known remaining suffix. The caller poisons
+    /// the path only when the filesystem no longer permits proving that exact
+    /// durable result, which is an artifact-integrity failure rather than a
+    /// routine journal error.
     fn reconcile_failed_artifact_append(
         &mut self,
-        relative: &Path,
-        previous_contents: &[u8],
-        attempted_append: &[u8],
-        disposition: ArtifactFileDisposition,
-        previous_bytes: u64,
-        opened_identity: &FileIdentity,
+        recovery: ArtifactAppendRecovery<'_>,
     ) -> Result<()> {
+        let ArtifactAppendRecovery {
+            relative,
+            previous_contents,
+            attempted_append,
+            disposition,
+            opened_identity,
+            file,
+            parent,
+            create,
+            new_file_bytes,
+            proposed_total,
+        } = recovery;
         let path = self.run.path().join(relative);
+        let held = ensure_private_regular_file_handle(file, &path)?;
+        if &held != opened_identity {
+            bail!(
+                "opened artifact file identity changed before append recovery: {}",
+                relative.display()
+            );
+        }
         let before = ensure_private_regular_file(&path)?;
         if &before != opened_identity {
             bail!(
@@ -933,24 +989,66 @@ impl ArtifactRunWriter {
         if !attempted_append.starts_with(appended) {
             bail!("artifact append recovery found bytes outside the attempted append");
         }
-        let observed_bytes =
-            u64::try_from(observed.len()).context("recovered artifact length overflow")?;
-        let recovered_total = self
-            .total_bytes
-            .checked_sub(previous_bytes)
-            .and_then(|total| total.checked_add(observed_bytes))
-            .context("recovered artifact byte accounting overflow")?;
-        if recovered_total > MAX_ARTIFACT_TOTAL_BYTES {
-            bail!("recovered artifact exceeds the aggregate byte limit");
+        if appended.len() < attempted_append.len() {
+            file.write_all(&attempted_append[appended.len()..])
+                .with_context(|| {
+                    format!(
+                        "failed to complete partial artifact append {}",
+                        relative.display()
+                    )
+                })?;
+        }
+        file.sync_data().with_context(|| {
+            format!(
+                "failed to persist recovered artifact append {}",
+                relative.display()
+            )
+        })?;
+        if create {
+            parent.sync_directory_fenced().with_context(|| {
+                format!(
+                    "failed to persist recovered artifact parent {}",
+                    parent.path().display()
+                )
+            })?;
+        }
+        let held_after_sync = ensure_private_regular_file_handle(file, &path)?;
+        if &held_after_sync != opened_identity {
+            bail!(
+                "opened artifact file identity changed while syncing append recovery: {}",
+                relative.display()
+            );
+        }
+        let rebound = ensure_private_regular_file(&path)?;
+        if &rebound != opened_identity {
+            bail!(
+                "artifact file identity changed after append recovery: {}",
+                relative.display()
+            );
+        }
+        let mut expected = previous_contents.to_vec();
+        expected.extend_from_slice(attempted_append);
+        let verified = BoundedRegularReader::read_relative(
+            self.run.path(),
+            relative,
+            MAX_ARTIFACT_FILE_BYTES,
+        )?;
+        let after_read = ensure_private_regular_file(&path)?;
+        if &after_read != opened_identity || verified != expected {
+            bail!(
+                "artifact append recovery could not verify the completed durable line: {}",
+                relative.display()
+            );
         }
         let record = ArtifactFileRecord {
             path: relative.to_path_buf(),
-            bytes: observed_bytes,
-            sha256: sha256_hex(&observed),
+            bytes: new_file_bytes,
+            sha256: sha256_hex(&verified),
             disposition,
         };
         self.files.insert(relative.to_path_buf(), record);
-        self.total_bytes = recovered_total;
+        self.total_bytes = proposed_total;
+        self.poisoned_appends.remove(relative);
         Ok(())
     }
 
@@ -969,6 +1067,12 @@ impl ArtifactRunWriter {
         final_report: &Path,
         publish_requested: bool,
     ) -> Result<ArtifactFinalization> {
+        if !self.poisoned_appends.is_empty() {
+            bail!(
+                "artifact run has {} poisoned append path(s); refusing to finalize an incomplete append",
+                self.poisoned_appends.len()
+            );
+        }
         if !self.outstanding_scratches.is_empty() {
             let noun = if self.outstanding_scratches.len() == 1 {
                 "directory"
@@ -1135,21 +1239,46 @@ impl ArtifactRunReader {
 }
 
 #[cfg(test)]
-fn set_artifact_append_fault_after_sync() {
-    APPEND_FAULT_AFTER_SYNC.with(|fault| fault.set(true));
+fn set_artifact_append_fault(point: ArtifactAppendFaultPoint) {
+    ARTIFACT_APPEND_FAULT.with(|fault| fault.set(Some(point)));
 }
 
 #[cfg(test)]
-fn run_artifact_append_fault_after_sync() -> Result<()> {
-    let should_fail = APPEND_FAULT_AFTER_SYNC.with(|fault| fault.replace(false));
-    if should_fail {
-        bail!("injected artifact append failure after sync");
-    }
-    Ok(())
+fn take_artifact_append_fault(point: ArtifactAppendFaultPoint) -> bool {
+    ARTIFACT_APPEND_FAULT.with(|fault| {
+        if fault.get() == Some(point) {
+            fault.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
-#[cfg(not(test))]
-fn run_artifact_append_fault_after_sync() -> Result<()> {
+fn write_artifact_append(file: &mut File, contents: &[u8], relative: &Path) -> Result<()> {
+    #[cfg(test)]
+    if take_artifact_append_fault(ArtifactAppendFaultPoint::PartialWrite) {
+        let partial = contents.len().saturating_sub(1).max(1).min(contents.len());
+        file.write_all(&contents[..partial]).with_context(|| {
+            format!(
+                "failed to inject partial artifact append {}",
+                relative.display()
+            )
+        })?;
+        bail!("injected partial artifact append before completion");
+    }
+    file.write_all(contents)
+        .with_context(|| format!("failed to append artifact file {}", relative.display()))
+}
+
+fn run_artifact_append_fault(point: ArtifactAppendFaultPoint) -> Result<()> {
+    #[cfg(test)]
+    let should_fail = take_artifact_append_fault(point);
+    #[cfg(not(test))]
+    let should_fail = false;
+    if should_fail {
+        bail!("injected artifact append failure at {point:?}");
+    }
     Ok(())
 }
 
@@ -3312,7 +3441,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_json_line_append_reconciles_manifest_and_still_finalizes() {
+    fn partial_json_line_append_is_completed_before_later_append_and_finalize() {
         let (_temp, repo) = committed_repo();
         let run_id = RunId::new("append-recovery").expect("run id");
         let mut writer = ArtifactRunWriter::reserve(
@@ -3323,19 +3452,39 @@ mod tests {
         )
         .expect("reserve writer");
         let path = Path::new("events/orchestration.jsonl");
-        set_artifact_append_fault_after_sync();
+        set_artifact_append_fault(ArtifactAppendFaultPoint::PartialWrite);
         let error = writer
             .append_json_line(
                 path,
                 &serde_json::json!({"kind":"spawn","node":"worker-1"}),
                 ArtifactFileDisposition::PrivateEvidence,
             )
-            .expect_err("injected post-write failure");
+            .expect_err("injected partial write failure");
         assert!(error
             .to_string()
-            .contains("injected artifact append failure"));
+            .contains("injected partial artifact append"));
+        writer
+            .append_json_line(
+                path,
+                &serde_json::json!({"kind":"accept","node":"worker-1"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("append after recovered partial write");
         let journal = fs::read(writer.run_dir().join(path)).expect("read recovered journal");
-        assert_eq!(journal, b"{\"kind\":\"spawn\",\"node\":\"worker-1\"}\n");
+        assert_eq!(
+            journal,
+            concat!(
+                "{\"kind\":\"spawn\",\"node\":\"worker-1\"}\n",
+                "{\"kind\":\"accept\",\"node\":\"worker-1\"}\n"
+            )
+            .as_bytes()
+        );
+        for line in journal
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            serde_json::from_slice::<Value>(line).expect("recovered JSONL line is complete");
+        }
         let record = writer.files.get(path).expect("reconciled record");
         assert_eq!(record.bytes, u64::try_from(journal.len()).expect("length"));
         assert_eq!(record.sha256, sha256_hex(&journal));
@@ -3356,6 +3505,60 @@ mod tests {
             .expect("finalize after recovered append failure");
         ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
             .expect("open finalized recovered run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_append_recovery_syncs_file_and_new_parent_before_finalization() {
+        for (index, fault) in [
+            ArtifactAppendFaultPoint::AfterWriteBeforeFileSync,
+            ArtifactAppendFaultPoint::AfterFileSyncBeforeParentSync,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_temp, repo) = committed_repo();
+            let run_id = RunId::new(format!("append-sync-recovery-{index}")).expect("run id");
+            let mut writer = ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                run_id.clone(),
+                "supervise",
+            )
+            .expect("reserve writer");
+            let path = Path::new("events/orchestration.jsonl");
+            set_artifact_append_fault(fault);
+            let error = writer
+                .append_json_line(
+                    path,
+                    &serde_json::json!({"kind":"spawn","node":"worker-1"}),
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .expect_err("injected durability-boundary failure");
+            assert!(error
+                .to_string()
+                .contains("injected artifact append failure"));
+            assert!(writer.poisoned_appends.is_empty());
+            let journal = fs::read(writer.run_dir().join(path)).expect("read recovered journal");
+            serde_json::from_slice::<Value>(journal.strip_suffix(b"\n").expect("newline"))
+                .expect("recovered journal line");
+
+            writer
+                .write_json(
+                    RunArtifactFamily::Supervise.final_report_relative_path(),
+                    &serde_json::json!({"status":"succeeded"}),
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .expect("write final report");
+            writer
+                .finalize(
+                    RunArtifactFamily::Supervise.final_report_relative_path(),
+                    false,
+                )
+                .expect("finalize after durability recovery");
+            ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+                .expect("open finalized recovered run");
+        }
     }
 
     #[cfg(unix)]
