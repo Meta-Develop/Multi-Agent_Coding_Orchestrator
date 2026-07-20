@@ -24,6 +24,7 @@ pub mod repo_map;
 pub mod repo_semantic;
 pub mod review;
 pub mod safe_state;
+pub mod scope;
 pub(crate) mod secure_output;
 pub mod semantic_coord;
 pub(crate) mod state_journal;

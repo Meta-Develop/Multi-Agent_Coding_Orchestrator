@@ -27,6 +27,7 @@ use crate::{
     repo_semantic::{self, SemanticRepoMap},
     review::{self, ReviewPrOptions, ReviewerConfig, ReviewerMode},
     safe_state::BoundedRegularReader,
+    scope::{self, ScopeServeOptions},
     semantic_coord::{
         SemanticCoordinationReport, SemanticIntentRequest, SemanticIntentStore, SemanticIntentToken,
     },
@@ -100,6 +101,7 @@ impl Cli {
             Command::Supervise(command) => command.run(),
             Command::Consult(command) => command.run(),
             Command::Inbox(command) => command.run(),
+            Command::Scope(command) => command.run(),
             Command::Autopilot(command) => command.run(),
             Command::Review(command) => command.run(),
             Command::Agent(command) => command.run(),
@@ -138,6 +140,8 @@ enum Command {
     Consult(ConsultCommand),
     /// Scan and react to safe GitHub issue and pull request inbox items.
     Inbox(InboxCommand),
+    /// Serve read-only real-time orchestration observability APIs.
+    Scope(ScopeCommand),
     /// Run local-first autopilot workflow phases.
     Autopilot(AutopilotCommand),
     /// Run independent review adapters.
@@ -806,6 +810,43 @@ enum WorkspaceInboxSubcommand {
     Run(RunWorkspaceInboxArgs),
     /// Poll configured repositories and run workspace inbox supervision.
     Watch(WatchWorkspaceInboxArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScopeCommand {
+    #[command(subcommand)]
+    command: ScopeSubcommand,
+}
+
+impl ScopeCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            ScopeSubcommand::Serve(args) => scope::serve(ScopeServeOptions {
+                repositories: args.repositories,
+                workspace: args.workspace,
+                bind: args.bind,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ScopeSubcommand {
+    /// Serve the localhost-only Scope observability backend.
+    Serve(ScopeServeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScopeServeArgs {
+    /// Repository path to watch. Repeat to watch multiple repositories.
+    #[arg(long = "repo")]
+    repositories: Vec<PathBuf>,
+    /// Inbox-shaped workspace JSON listing repositories to watch.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Loopback address and port for the HTTP server.
+    #[arg(long, default_value = "127.0.0.1:7878")]
+    bind: String,
 }
 
 #[derive(Debug, Args)]
