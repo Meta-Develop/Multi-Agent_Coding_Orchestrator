@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::{artifacts::state_auth::sha256_hex, orchestration_event::OrchestrationEvent};
 
-const PLACEHOLDER_HTML: &str = include_str!("placeholder.html");
+const SCOPE_HTML: &str = include_str!("placeholder.html");
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const OVER_CAPACITY_IO_TIMEOUT: Duration = Duration::from_millis(100);
@@ -196,7 +196,7 @@ fn handle_connection(
             &mut stream,
             "200 OK",
             "text/html; charset=utf-8",
-            PLACEHOLDER_HTML.as_bytes(),
+            SCOPE_HTML.as_bytes(),
             &[],
         ),
         "/api/projects" => match source.projects() {
@@ -748,6 +748,20 @@ mod tests {
         ] {
             assert!(parse_run_events_path(path).is_none(), "accepted {path}");
         }
+    }
+
+    #[test]
+    fn root_serves_embedded_spawn_tree_frontend() {
+        let source: Arc<dyn ScopeDataSource> =
+            Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
+        let mut server = TestServer::start(source, test_config());
+
+        let response = http_get(server.address, "/");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("text/html; charset=utf-8"));
+        assert!(response.contains("MACO_SCOPE_SPAWN_TREE_UI"));
+        server.stop();
     }
 
     #[test]

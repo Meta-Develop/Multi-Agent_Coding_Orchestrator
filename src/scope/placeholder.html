@@ -5,19 +5,1125 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>MACO Scope</title>
     <style>
-      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-      body { max-width: 48rem; margin: 12vh auto; padding: 0 1.5rem; line-height: 1.6; }
-      a { color: #7dd3fc; }
-      code { background: #1f2937; padding: 0.15rem 0.35rem; border-radius: 0.25rem; }
+      :root {
+        color-scheme: dark;
+        --page: #0b1014;
+        --panel: #11181d;
+        --panel-2: #151e24;
+        --line: #26343c;
+        --ink: #d6dde0;
+        --muted: #93a0a6;
+        --cyan: #4fd8c4;
+        --amber: #fab219;
+        --green: #28b94d;
+        --red: #e45252;
+        --orange: #ec835a;
+        --dim: #568263;
+        --mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, Menlo, monospace;
+        --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        min-width: 320px;
+        margin: 0;
+        background:
+          radial-gradient(circle at 25% 0%, rgba(79, 216, 196, 0.07), transparent 34rem),
+          var(--page);
+        color: var(--ink);
+        font-family: var(--sans);
+      }
+      button, select, input { font: inherit; }
+      button, select {
+        min-height: 2.25rem;
+        border: 1px solid var(--line);
+        border-radius: 0.45rem;
+        background: #10171c;
+        color: var(--ink);
+      }
+      button { cursor: pointer; padding: 0.4rem 0.75rem; }
+      button:hover:not(:disabled), select:hover:not(:disabled) { border-color: #3a5c67; }
+      button:disabled, select:disabled { cursor: not-allowed; opacity: 0.5; }
+      button:focus-visible, select:focus-visible, input:focus-visible {
+        outline: 2px solid var(--cyan);
+        outline-offset: 2px;
+      }
+      .shell { width: min(100%, 112rem); margin: 0 auto; padding: 1rem; }
+      .masthead {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        padding: 0.65rem 0 1rem;
+      }
+      .brand {
+        margin: 0;
+        font: 650 clamp(1.05rem, 2vw, 1.35rem)/1 var(--mono);
+        letter-spacing: -0.02em;
+      }
+      .brand span { color: var(--cyan); }
+      .connection {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        color: var(--muted);
+        font: 0.72rem var(--mono);
+        margin-left: auto;
+      }
+      .connection::before {
+        width: 0.55rem;
+        height: 0.55rem;
+        border-radius: 50%;
+        background: currentColor;
+        content: "";
+      }
+      .connection[data-state="live"] { color: var(--cyan); }
+      .connection[data-state="error"] { color: var(--red); }
+      .toolbar {
+        display: grid;
+        grid-template-columns: minmax(12rem, 1fr) minmax(14rem, 2fr) auto;
+        gap: 0.75rem;
+        align-items: end;
+        padding: 0.85rem;
+        border: 1px solid var(--line);
+        border-radius: 0.7rem 0.7rem 0 0;
+        background: var(--panel);
+      }
+      .field { display: grid; gap: 0.3rem; min-width: 0; }
+      .field label, .section-label {
+        color: var(--muted);
+        font: 0.64rem var(--mono);
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+      .field select { width: 100%; padding: 0.35rem 0.55rem; }
+      .summary { color: var(--muted); font: 0.72rem/1.4 var(--mono); white-space: nowrap; }
+      .workspace {
+        display: grid;
+        grid-template-columns: minmax(0, 3fr) minmax(18rem, 1fr);
+        min-height: 40rem;
+        border-right: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        border-left: 1px solid var(--line);
+        background: var(--panel);
+      }
+      .tree-panel { min-width: 0; border-right: 1px solid var(--line); }
+      .panel-heading {
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+        min-height: 2.75rem;
+        padding: 0.7rem 0.9rem;
+        border-bottom: 1px solid var(--line);
+        font: 0.7rem var(--mono);
+      }
+      .panel-heading .hint { margin-left: auto; color: var(--muted); }
+      .canvas-wrap {
+        position: relative;
+        min-height: 31rem;
+        overflow: auto;
+        background:
+          linear-gradient(rgba(38, 52, 60, 0.16) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(38, 52, 60, 0.12) 1px, transparent 1px),
+          #0d1418;
+        background-size: 2.5rem 2.5rem;
+      }
+      canvas { display: block; }
+      .empty {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-content: center;
+        gap: 0.45rem;
+        padding: 2rem;
+        color: var(--muted);
+        text-align: center;
+        font: 0.76rem/1.6 var(--mono);
+      }
+      .empty strong { color: var(--ink); font-size: 0.9rem; }
+      .empty[hidden] { display: none; }
+      .estimate-note {
+        display: none;
+        max-width: 24rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--amber);
+      }
+      .estimate-note[data-visible="true"] { display: inline; }
+      .timeline {
+        display: grid;
+        grid-template-columns: auto auto minmax(8rem, 1fr) auto auto;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.75rem 0.9rem;
+        border-top: 1px solid var(--line);
+        background: #0f161b;
+        font: 0.7rem var(--mono);
+      }
+      .timeline button { color: var(--cyan); border-color: #2d6b61; }
+      .timeline button.secondary { color: var(--muted); border-color: var(--line); }
+      .timeline input { width: 100%; accent-color: var(--cyan); }
+      .timeline select { padding: 0.3rem 0.45rem; }
+      .clock { min-width: 8.8rem; color: var(--muted); text-align: right; white-space: nowrap; }
+      .log-panel { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; }
+      .event-log {
+        height: 34rem;
+        margin: 0;
+        padding: 0.75rem 0.85rem;
+        overflow: auto;
+        color: var(--ink);
+        font: 0.68rem/1.65 var(--mono);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .log-line { display: grid; grid-template-columns: 5.7rem 4.8rem minmax(0, 1fr); gap: 0.45rem; }
+      .log-line .time { color: #64747c; }
+      .log-line .kind { color: var(--cyan); }
+      .log-line[data-kind="escalate"] .kind,
+      .log-line[data-kind="gate"] .kind { color: var(--amber); }
+      .log-line[data-kind="accept"] .kind { color: var(--green); }
+      .log-line[data-kind="reject"] .kind { color: var(--red); }
+      .log-empty { color: var(--muted); }
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem 1rem;
+        padding: 0.75rem 0.85rem;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font: 0.64rem var(--mono);
+      }
+      .legend-item { display: inline-flex; align-items: center; gap: 0.35rem; }
+      .swatch { width: 0.65rem; height: 0.65rem; border: 1px solid currentColor; border-radius: 50%; }
+      .swatch.o2 { box-shadow: 0 0 0 2px #0f161b, 0 0 0 3px currentColor; }
+      .swatch.worker { transform: scale(0.72); }
+      .swatch.auditor { border-radius: 0; transform: rotate(45deg) scale(0.75); }
+      .swatch.gate { border-radius: 0.18rem; }
+      .edge-swatch { width: 1.25rem; border-top: 2px solid currentColor; }
+      .edge-swatch.dashed { border-top-style: dashed; color: var(--amber); }
+      .edge-swatch.dotted { border-top-style: dotted; }
+      .statusbar {
+        display: flex;
+        gap: 1rem;
+        padding: 0.55rem 0.85rem;
+        border: 1px solid var(--line);
+        border-top: 0;
+        border-radius: 0 0 0.7rem 0.7rem;
+        color: var(--muted);
+        background: #0d1418;
+        font: 0.67rem/1.4 var(--mono);
+      }
+      .statusbar .error { color: var(--red); }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      @media (max-width: 840px) {
+        .toolbar { grid-template-columns: 1fr; }
+        .summary { white-space: normal; }
+        .workspace { grid-template-columns: 1fr; }
+        .tree-panel { border-right: 0; border-bottom: 1px solid var(--line); }
+        .event-log { height: 18rem; }
+      }
+      @media (max-width: 560px) {
+        .shell { padding: 0.45rem; }
+        .timeline { grid-template-columns: auto auto 1fr; }
+        .timeline .clock { grid-column: 1 / -1; text-align: left; }
+        .timeline .speed-field { justify-self: end; }
+        .panel-heading .hint { display: none; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; }
+      }
     </style>
   </head>
-  <body>
-    <h1>MACO Scope backend is running</h1>
-    <p>The full orchestration visualization UI ships in the next stage.</p>
-    <p>
-      Explore <a href="/api/projects">the project API</a>, replay a run at
-      <code>/api/runs/{repo_id}/{family}/{run_id}/events</code>, or connect to
-      <a href="/api/stream">the live SSE stream</a>.
-    </p>
+  <body data-maco-scope-ui="spawn-tree-v1">
+    <!-- Stable marker: MACO_SCOPE_SPAWN_TREE_UI -->
+    <main class="shell">
+      <header class="masthead">
+        <h1 class="brand"><span>MACO</span> Scope</h1>
+        <div id="connection" class="connection" data-state="loading" role="status" aria-live="polite">DISCOVERING</div>
+      </header>
+
+      <section class="toolbar" aria-label="Scope run navigation">
+        <div class="field">
+          <label for="projectSelect">Project</label>
+          <select id="projectSelect" disabled><option>Loading projects…</option></select>
+        </div>
+        <div class="field">
+          <label for="runSelect">Run</label>
+          <select id="runSelect" disabled><option>Select a project</option></select>
+        </div>
+        <div id="runSummary" class="summary">0 events</div>
+      </section>
+
+      <section class="workspace" aria-label="Run visualization">
+        <div class="tree-panel">
+          <div class="panel-heading">
+            <span class="section-label">Spawn tree</span>
+            <span id="estimateNote" class="estimate-note" title="The ≈ symbol marks an escalation origin inferred by the backend."></span>
+            <span class="hint">depth ↓ · escalation →</span>
+          </div>
+          <div id="canvasWrap" class="canvas-wrap">
+            <canvas id="treeCanvas" width="900" height="496" aria-label="Agent spawn tree for the selected run"></canvas>
+            <div id="emptyState" class="empty">
+              <strong>No run selected</strong>
+              <span>Choose a project and run to load its normalized events.</span>
+            </div>
+            <ol id="treeSummary" class="sr-only" aria-live="polite"></ol>
+          </div>
+          <div class="timeline" aria-label="Replay controls">
+            <button id="playButton" type="button" disabled aria-label="Play replay">▶ Play</button>
+            <button id="replayButton" class="secondary" type="button" disabled>↺ Replay</button>
+            <label class="sr-only" for="scrubber">Replay position</label>
+            <input id="scrubber" type="range" min="0" max="0" value="0" step="1" disabled>
+            <span id="clock" class="clock">event 0 / 0</span>
+            <label class="speed-field">speed
+              <select id="speedSelect" aria-label="Replay speed">
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <aside class="log-panel" aria-label="Normalized event log">
+          <div class="panel-heading"><span class="section-label">Event stream</span></div>
+          <div id="eventLog" class="event-log" role="log" aria-live="polite">
+            <div class="log-empty">Waiting for a run…</div>
+          </div>
+          <div class="legend" aria-label="Visual legend">
+            <span class="legend-item"><i class="swatch o2"></i>O2</span>
+            <span class="legend-item"><i class="swatch"></i>O1</span>
+            <span class="legend-item"><i class="swatch worker"></i>worker</span>
+            <span class="legend-item"><i class="swatch auditor"></i>auditor</span>
+            <span class="legend-item"><i class="swatch gate"></i>gate</span>
+            <span class="legend-item"><i class="edge-swatch"></i>spawn</span>
+            <span class="legend-item"><i class="edge-swatch dashed"></i>escalation</span>
+            <span class="legend-item"><i class="edge-swatch dotted"></i>coverage</span>
+          </div>
+        </aside>
+      </section>
+
+      <footer class="statusbar">
+        <span id="statusMessage">Read-only local observer</span>
+        <span id="errorMessage" class="error" role="alert"></span>
+      </footer>
+    </main>
+
+    <script>
+      (function () {
+        "use strict";
+
+        var reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        var palette = {
+          running: "#4fd8c4",
+          pending: "#64747c",
+          queued: "#fab219",
+          accepted: "#28b94d",
+          rejected: "#e45252",
+          blocked: "#ec835a",
+          done: "#568263",
+          ink: "#d6dde0",
+          muted: "#93a0a6",
+          edge: "#40515a",
+          auditor: "#71838c",
+          background: "#0d1418"
+        };
+        var glyphs = {
+          running: "▶",
+          pending: "…",
+          queued: "◇",
+          accepted: "✓",
+          rejected: "✕",
+          blocked: "!",
+          done: "✓"
+        };
+        var roleOrder = { o2: 0, o1: 1, worker: 2, auditor: 3, gate: 4 };
+
+        var elements = {
+          project: document.getElementById("projectSelect"),
+          run: document.getElementById("runSelect"),
+          summary: document.getElementById("runSummary"),
+          connection: document.getElementById("connection"),
+          status: document.getElementById("statusMessage"),
+          error: document.getElementById("errorMessage"),
+          canvasWrap: document.getElementById("canvasWrap"),
+          canvas: document.getElementById("treeCanvas"),
+          empty: document.getElementById("emptyState"),
+          estimate: document.getElementById("estimateNote"),
+          treeSummary: document.getElementById("treeSummary"),
+          log: document.getElementById("eventLog"),
+          play: document.getElementById("playButton"),
+          replay: document.getElementById("replayButton"),
+          scrubber: document.getElementById("scrubber"),
+          clock: document.getElementById("clock"),
+          speed: document.getElementById("speedSelect")
+        };
+        var context = elements.canvas.getContext("2d");
+        var state = {
+          projects: [],
+          selectedProject: null,
+          selectedRun: null,
+          events: [],
+          eventKeys: new Set(),
+          cursor: 0,
+          playing: false,
+          live: true,
+          source: null,
+          replayTimer: null,
+          loadToken: 0,
+          lastLogCursor: -1,
+          layout: { nodes: new Map(), edges: [], width: 900, height: 496 }
+        };
+
+        function setConnection(label, mode) {
+          elements.connection.textContent = label;
+          elements.connection.dataset.state = mode;
+        }
+
+        function showError(message) {
+          elements.error.textContent = message || "";
+        }
+
+        function stableStringify(value) {
+          if (value === null || typeof value !== "object") return JSON.stringify(value);
+          if (Array.isArray(value)) return "[" + value.map(stableStringify).join(",") + "]";
+          return "{" + Object.keys(value).sort().map(function (key) {
+            return JSON.stringify(key) + ":" + stableStringify(value[key]);
+          }).join(",") + "}";
+        }
+
+        function eventKey(event) {
+          return stableStringify(event);
+        }
+
+        function eventTime(event) {
+          var parsed = Date.parse(event.ts || "");
+          return Number.isFinite(parsed) ? parsed : 0;
+        }
+
+        function normalizeEvents(records) {
+          var unique = new Map();
+          (Array.isArray(records) ? records : []).forEach(function (event) {
+            if (!event || typeof event !== "object" || !event.node || !event.kind) return;
+            unique.set(eventKey(event), event);
+          });
+          return Array.from(unique.entries()).sort(function (left, right) {
+            return eventTime(left[1]) - eventTime(right[1]) || left[0].localeCompare(right[0]);
+          });
+        }
+
+        function replaceEvents(records) {
+          var normalized = normalizeEvents(records);
+          state.events = normalized.map(function (entry) { return entry[1]; });
+          state.eventKeys = new Set(normalized.map(function (entry) { return entry[0]; }));
+          state.cursor = state.events.length;
+          state.live = true;
+          state.playing = false;
+          state.lastLogCursor = -1;
+          updateControls();
+          render();
+        }
+
+        function appendEvent(event) {
+          var key = eventKey(event);
+          if (state.eventKeys.has(key)) return false;
+          var wasAtLiveEdge = state.live || state.cursor === state.events.length;
+          state.eventKeys.add(key);
+          state.events.push(event);
+          state.events.sort(function (left, right) {
+            return eventTime(left) - eventTime(right) || eventKey(left).localeCompare(eventKey(right));
+          });
+          if (wasAtLiveEdge) {
+            state.cursor = state.events.length;
+            state.live = true;
+          }
+          state.lastLogCursor = -1;
+          updateControls();
+          render();
+          return true;
+        }
+
+        function statusName(value, fallback) {
+          var raw = String(value || "").toLowerCase().replace(/[- ]/g, "_");
+          if (["running", "active", "in_progress", "started"].includes(raw)) return "running";
+          if (["pending", "ready", "waiting", "idle"].includes(raw)) return "pending";
+          if (["queued", "escalation_pending", "requested"].includes(raw)) return "queued";
+          if (["accepted", "accept", "safe", "approved", "passed", "pass"].includes(raw)) return "accepted";
+          if (["rejected", "reject", "failed", "fail"].includes(raw)) return "rejected";
+          if (["blocked", "unsafe", "error"].includes(raw)) return "blocked";
+          if (["done", "complete", "completed", "finished", "closed", "released"].includes(raw)) return "done";
+          return fallback || "pending";
+        }
+
+        function statusFromEvent(event, previous) {
+          var payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+          if (event.kind === "accept") return "accepted";
+          if (event.kind === "reject") return "rejected";
+          if (event.kind === "escalate") return "queued";
+          if (event.kind === "gate") {
+            return statusName(payload.status || payload.readiness || payload.result || payload.to,
+              payload.blocked || (Array.isArray(payload.blockers) && payload.blockers.length) ? "blocked" : previous);
+          }
+          if (event.kind === "spawn") {
+            return statusName(payload.status || payload.to || payload.state,
+              event.role === "supervisor" ? "running" : "pending");
+          }
+          if (event.kind === "status" || event.kind === "claim") {
+            return statusName(payload.to || payload.status || payload.state || payload.result, previous);
+          }
+          return previous || "pending";
+        }
+
+        function displayRole(event) {
+          if (event.kind === "gate") return "gate";
+          if (event.role === "supervisor") return "o2";
+          if (event.role === "orchestrator") return "o1";
+          if (event.role === "auditor") return "auditor";
+          return "worker";
+        }
+
+        function arrayStrings(value) {
+          if (!Array.isArray(value)) return [];
+          return value.filter(function (item) { return typeof item === "string" && item; });
+        }
+
+        function buildGraph(events) {
+          var nodes = new Map();
+          var escalationIds = [];
+          var explicitCoverage = [];
+
+          events.forEach(function (event, index) {
+            var payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+            var node = nodes.get(event.node);
+            if (!node) {
+              node = {
+                id: event.node,
+                label: event.node,
+                role: displayRole(event),
+                parent: event.parent || null,
+                status: "pending",
+                born: index,
+                last: index,
+                escalation: false,
+                origin: null,
+                inferred: false,
+                column: 0,
+                depth: 0
+              };
+              nodes.set(event.node, node);
+            }
+            node.role = displayRole(event) === "gate" ? "gate" : node.role;
+            if (event.parent) node.parent = event.parent;
+            node.status = statusFromEvent(event, node.status);
+            node.last = index;
+            if (event.kind === "escalate") {
+              node.escalation = true;
+              node.role = "o2";
+              node.origin = typeof payload.origin === "string" && payload.origin ? payload.origin : (event.parent || "unknown");
+              node.inferred = payload.inferred === true;
+              node.label = (node.inferred ? "≈ " : "") + "peer-o2 ← " + node.origin;
+              if (!escalationIds.includes(node.id)) escalationIds.push(node.id);
+            }
+            var coverage = []
+              .concat(arrayStrings(payload.covers))
+              .concat(arrayStrings(payload.coverage))
+              .concat(arrayStrings(payload.covered_nodes))
+              .concat(arrayStrings(payload.worker_ids));
+            coverage.forEach(function (target) { explicitCoverage.push([node.id, target]); });
+          });
+
+          nodes.forEach(function (node) {
+            if (node.parent && !nodes.has(node.parent)) {
+              nodes.set(node.parent, {
+                id: node.parent,
+                label: node.parent,
+                role: "o1",
+                parent: null,
+                status: "pending",
+                born: node.born,
+                last: node.born,
+                escalation: false,
+                origin: null,
+                inferred: false,
+                column: 0,
+                depth: 0
+              });
+            }
+          });
+
+          escalationIds.forEach(function (id, index) {
+            var root = nodes.get(id);
+            if (root) root.column = index + 1;
+          });
+
+          function inheritedColumn(node, trail) {
+            if (node.column > 0 || !node.parent || trail.has(node.id)) return node.column;
+            var parent = nodes.get(node.parent);
+            if (!parent) return 0;
+            trail.add(node.id);
+            node.column = inheritedColumn(parent, trail);
+            return node.column;
+          }
+
+          function delegationDepth(node, trail) {
+            if (!node.parent || trail.has(node.id)) return roleOrder[node.role] || 0;
+            var parent = nodes.get(node.parent);
+            if (!parent) return roleOrder[node.role] || 0;
+            trail.add(node.id);
+            return Math.max(delegationDepth(parent, trail) + 1, roleOrder[node.role] || 0);
+          }
+
+          nodes.forEach(function (node) {
+            inheritedColumn(node, new Set());
+            node.depth = node.escalation ? 0 : delegationDepth(node, new Set());
+          });
+          var deepestNonGate = 0;
+          nodes.forEach(function (node) {
+            if (node.role !== "gate") deepestNonGate = Math.max(deepestNonGate, node.depth);
+          });
+          nodes.forEach(function (node) {
+            if (node.role === "gate") node.depth = deepestNonGate + 1;
+          });
+
+          var edges = [];
+          var edgeKeys = new Set();
+          function addEdge(from, to, style) {
+            if (!nodes.has(from) || !nodes.has(to) || from === to) return;
+            var key = from + "\u0000" + to + "\u0000" + style;
+            if (edgeKeys.has(key)) return;
+            edgeKeys.add(key);
+            edges.push({ from: from, to: to, style: style });
+          }
+          nodes.forEach(function (node) {
+            if (node.parent) addEdge(node.parent, node.id, node.escalation ? "escalation" : "solid");
+            if (node.escalation && node.origin) addEdge(node.origin, node.id, "origin");
+          });
+          explicitCoverage.forEach(function (pair) { addEdge(pair[0], pair[1], "coverage"); });
+          nodes.forEach(function (auditor) {
+            if (auditor.role !== "auditor") return;
+            var hasExplicit = edges.some(function (edge) {
+              return edge.from === auditor.id && edge.style === "coverage";
+            });
+            if (!hasExplicit) {
+              nodes.forEach(function (candidate) {
+                if (candidate.role === "worker" && candidate.parent && candidate.parent === auditor.parent) {
+                  addEdge(auditor.id, candidate.id, "coverage");
+                }
+              });
+            }
+          });
+
+          return { nodes: nodes, edges: edges };
+        }
+
+        function computeLayout(graph) {
+          var groups = new Map();
+          var maxColumn = 0;
+          var maxDepth = 0;
+          graph.nodes.forEach(function (node) {
+            maxColumn = Math.max(maxColumn, node.column);
+            maxDepth = Math.max(maxDepth, node.depth);
+            var key = node.column + ":" + node.depth;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(node);
+          });
+          groups.forEach(function (group) {
+            group.sort(function (left, right) {
+              return left.born - right.born || left.id.localeCompare(right.id);
+            });
+          });
+
+          var mainMax = 1;
+          var peerMax = new Map();
+          groups.forEach(function (group, key) {
+            var column = Number(key.split(":")[0]);
+            if (column === 0) mainMax = Math.max(mainMax, group.length);
+            else peerMax.set(column, Math.max(peerMax.get(column) || 1, group.length));
+          });
+          var paddingX = 70;
+          var mainWidth = Math.max(650, mainMax * 155);
+          var peerWidths = [];
+          for (var column = 1; column <= maxColumn; column += 1) {
+            peerWidths[column] = Math.max(260, (peerMax.get(column) || 1) * 145);
+          }
+          var columnStarts = [paddingX];
+          var cursorX = paddingX + mainWidth;
+          for (var peerColumn = 1; peerColumn <= maxColumn; peerColumn += 1) {
+            cursorX += 45;
+            columnStarts[peerColumn] = cursorX;
+            cursorX += peerWidths[peerColumn];
+          }
+          var width = Math.max(900, cursorX + paddingX);
+          var rowHeight = 112;
+          var top = 70;
+          var height = Math.max(496, top + maxDepth * rowHeight + 105);
+
+          groups.forEach(function (group, key) {
+            var parts = key.split(":");
+            var groupColumn = Number(parts[0]);
+            var groupDepth = Number(parts[1]);
+            var start = columnStarts[groupColumn];
+            var available = groupColumn === 0 ? mainWidth : peerWidths[groupColumn];
+            group.forEach(function (node, index) {
+              node.x = start + available * ((index + 1) / (group.length + 1));
+              node.y = top + groupDepth * rowHeight;
+            });
+          });
+          return { nodes: graph.nodes, edges: graph.edges, width: width, height: height, maxDepth: maxDepth };
+        }
+
+        function resizeCanvas(layout) {
+          var ratio = Math.min(window.devicePixelRatio || 1, 2);
+          if (elements.canvas.width !== Math.round(layout.width * ratio) ||
+              elements.canvas.height !== Math.round(layout.height * ratio)) {
+            elements.canvas.width = Math.round(layout.width * ratio);
+            elements.canvas.height = Math.round(layout.height * ratio);
+            elements.canvas.style.width = layout.width + "px";
+            elements.canvas.style.height = layout.height + "px";
+          }
+          context.setTransform(ratio, 0, 0, ratio, 0, 0);
+        }
+
+        function edgePoint(edge, amount) {
+          var from = state.layout.nodes.get(edge.from);
+          var to = state.layout.nodes.get(edge.to);
+          var midY = (from.y + to.y) / 2;
+          var inverse = 1 - amount;
+          if (Math.abs(from.y - to.y) < 1) {
+            return { x: from.x + (to.x - from.x) * amount, y: from.y };
+          }
+          return {
+            x: inverse * inverse * inverse * from.x + 3 * inverse * inverse * amount * from.x +
+              3 * inverse * amount * amount * to.x + amount * amount * amount * to.x,
+            y: inverse * inverse * inverse * from.y + 3 * inverse * inverse * amount * midY +
+              3 * inverse * amount * amount * midY + amount * amount * amount * to.y
+          };
+        }
+
+        function traceEdge(edge) {
+          var from = state.layout.nodes.get(edge.from);
+          var to = state.layout.nodes.get(edge.to);
+          context.beginPath();
+          context.moveTo(from.x, from.y);
+          if (Math.abs(from.y - to.y) < 1) {
+            context.lineTo(to.x, to.y);
+          } else {
+            var midY = (from.y + to.y) / 2;
+            context.bezierCurveTo(from.x, midY, to.x, midY, to.x, to.y);
+          }
+        }
+
+        function drawEdge(edge, now) {
+          var child = state.layout.nodes.get(edge.to);
+          var active = child && (child.status === "running" || child.status === "queued");
+          traceEdge(edge);
+          context.lineWidth = active ? 1.8 : 1.1;
+          context.globalAlpha = edge.style === "coverage" ? 0.72 : 1;
+          context.strokeStyle = edge.style === "origin" ? palette.queued :
+            edge.style === "escalation" ? "#9c833a" :
+            edge.style === "coverage" ? palette.auditor :
+            active ? palette.running : palette.edge;
+          context.setLineDash(edge.style === "coverage" ? [2, 5] :
+            edge.style === "escalation" || edge.style === "origin" ? [8, 6] : []);
+          context.stroke();
+          context.setLineDash([]);
+          context.globalAlpha = 1;
+          if (active && !reducedMotion) {
+            var point = edgePoint(edge, (now * 0.35 + child.born * 0.09) % 1);
+            context.beginPath();
+            context.arc(point.x, point.y, 2.4, 0, Math.PI * 2);
+            context.fillStyle = edge.style === "origin" ? palette.queued : palette.running;
+            context.fill();
+          }
+        }
+
+        function roundRect(x, y, width, height, radius) {
+          context.beginPath();
+          context.moveTo(x + radius, y);
+          context.arcTo(x + width, y, x + width, y + height, radius);
+          context.arcTo(x + width, y + height, x, y + height, radius);
+          context.arcTo(x, y + height, x, y, radius);
+          context.arcTo(x, y, x + width, y, radius);
+          context.closePath();
+        }
+
+        function drawNode(node, now) {
+          var color = palette[node.status] || palette.pending;
+          var radius = node.role === "o2" ? 14 : node.role === "o1" ? 12 : 8;
+          if (node.status === "running" && !reducedMotion) {
+            var pulse = 5 + Math.sin(now * 4 + node.x * 0.02) * 2.5;
+            context.beginPath();
+            context.arc(node.x, node.y, radius + pulse, 0, Math.PI * 2);
+            context.strokeStyle = color;
+            context.globalAlpha = 0.25;
+            context.lineWidth = 2;
+            context.stroke();
+            context.globalAlpha = 1;
+          }
+          context.fillStyle = palette.background;
+          context.strokeStyle = color;
+          context.lineWidth = 1.7;
+          if (node.role === "auditor") {
+            context.save();
+            context.translate(node.x, node.y);
+            context.rotate(Math.PI / 4);
+            context.beginPath();
+            context.rect(-9, -9, 18, 18);
+            context.fill();
+            context.stroke();
+            context.restore();
+          } else if (node.role === "gate") {
+            roundRect(node.x - 16, node.y - 13, 32, 26, 5);
+            context.fill();
+            context.stroke();
+          } else {
+            context.beginPath();
+            context.arc(node.x, node.y, radius, 0, Math.PI * 2);
+            context.fill();
+            context.stroke();
+            if (node.role === "o2") {
+              context.beginPath();
+              context.arc(node.x, node.y, radius + 5, 0, Math.PI * 2);
+              context.globalAlpha = 0.6;
+              context.stroke();
+              context.globalAlpha = 1;
+            }
+          }
+          context.fillStyle = color;
+          context.font = "600 10px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+          context.textAlign = "left";
+          context.fillText(glyphs[node.status] || "…", node.x + radius + 7, node.y - radius + 3);
+          context.textAlign = "center";
+          context.fillStyle = node.status === "pending" || node.status === "done" ? palette.muted : palette.ink;
+          context.font = "11px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+          context.fillText(node.label, node.x, node.y + Math.max(radius, 10) + 20);
+        }
+
+        function drawGuides(layout) {
+          context.save();
+          context.fillStyle = "#46555d";
+          context.font = "10px " + getComputedStyle(document.documentElement).getPropertyValue("--mono");
+          context.textAlign = "left";
+          for (var depth = 0; depth <= layout.maxDepth; depth += 1) {
+            var y = 70 + depth * 112;
+            context.fillText(depth === 0 ? "depth 0 · O2 / escalation →" : "depth " + depth, 12, y - 34);
+            context.beginPath();
+            context.moveTo(10, y + 48);
+            context.lineTo(layout.width - 10, y + 48);
+            context.strokeStyle = "rgba(64, 81, 90, 0.22)";
+            context.lineWidth = 1;
+            context.stroke();
+          }
+          context.restore();
+        }
+
+        function renderTreeSummary(layout) {
+          elements.treeSummary.replaceChildren();
+          Array.from(layout.nodes.values()).sort(function (left, right) {
+            return left.depth - right.depth || left.column - right.column || left.x - right.x;
+          }).forEach(function (node) {
+            var item = document.createElement("li");
+            item.textContent = node.label + ", " + node.role + ", " + node.status +
+              (node.parent ? ", parent " + node.parent : "");
+            if (node.inferred) item.title = "Escalation origin is an estimate inferred by the backend.";
+            elements.treeSummary.appendChild(item);
+          });
+        }
+
+        function describeEvent(event) {
+          var payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+          var details = [];
+          if (event.parent) details.push("parent=" + event.parent);
+          if (event.kind === "escalate") {
+            details.push("origin=" + (payload.inferred ? "≈" : "") + (payload.origin || event.parent || "unknown"));
+          }
+          ["from", "to", "status", "reason", "scope_key", "command", "result"].forEach(function (key) {
+            if (payload[key] !== undefined && typeof payload[key] !== "object") details.push(key + "=" + String(payload[key]));
+          });
+          return event.node + "  " + details.join("  ");
+        }
+
+        function renderLog() {
+          if (state.lastLogCursor === state.cursor) return;
+          var pinned = Math.abs(elements.log.scrollHeight - elements.log.scrollTop - elements.log.clientHeight) < 20;
+          elements.log.replaceChildren();
+          var visible = state.events.slice(0, state.cursor);
+          if (!visible.length) {
+            var empty = document.createElement("div");
+            empty.className = "log-empty";
+            empty.textContent = state.events.length ? "Scrub forward to reveal events…" : "No normalized events in this run.";
+            elements.log.appendChild(empty);
+          } else {
+            visible.forEach(function (event) {
+              var line = document.createElement("div");
+              line.className = "log-line";
+              line.dataset.kind = event.kind;
+              var time = document.createElement("span");
+              time.className = "time";
+              time.textContent = String(event.ts || "").replace(/^.*T/, "").replace(/Z$/, "") || "—";
+              var kind = document.createElement("span");
+              kind.className = "kind";
+              kind.textContent = event.kind;
+              var message = document.createElement("span");
+              message.textContent = describeEvent(event);
+              line.append(time, kind, message);
+              elements.log.appendChild(line);
+            });
+          }
+          if (pinned || state.live || state.playing) elements.log.scrollTop = elements.log.scrollHeight;
+          state.lastLogCursor = state.cursor;
+        }
+
+        function renderFrame(timestamp) {
+          resizeCanvas(state.layout);
+          context.clearRect(0, 0, state.layout.width, state.layout.height);
+          drawGuides(state.layout);
+          state.layout.edges.forEach(function (edge) { drawEdge(edge, timestamp / 1000); });
+          state.layout.nodes.forEach(function (node) { drawNode(node, timestamp / 1000); });
+          if (!reducedMotion && Array.from(state.layout.nodes.values()).some(function (node) {
+            return node.status === "running" || node.status === "queued";
+          })) {
+            window.requestAnimationFrame(renderFrame);
+          }
+        }
+
+        function render() {
+          var visibleEvents = state.events.slice(0, state.cursor);
+          var graph = buildGraph(visibleEvents);
+          state.layout = computeLayout(graph);
+          elements.empty.hidden = graph.nodes.size > 0;
+          if (!graph.nodes.size) {
+            elements.empty.querySelector("strong").textContent = state.selectedRun ? "No events yet" : "No run selected";
+            elements.empty.querySelector("span").textContent = state.selectedRun ?
+              "The live stream will add nodes when normalized events arrive." :
+              "Choose a project and run to load its normalized events.";
+          }
+          var inferred = Array.from(graph.nodes.values()).filter(function (node) { return node.inferred; });
+          elements.estimate.dataset.visible = String(inferred.length > 0);
+          elements.estimate.textContent = inferred.length ? "≈ inferred origin" + (inferred.length > 1 ? "s" : "") : "";
+          renderTreeSummary(state.layout);
+          renderLog();
+          window.requestAnimationFrame(renderFrame);
+        }
+
+        function updateControls() {
+          var count = state.events.length;
+          elements.scrubber.max = String(count);
+          elements.scrubber.value = String(state.cursor);
+          elements.scrubber.disabled = count === 0;
+          elements.play.disabled = count === 0;
+          elements.replay.disabled = count === 0;
+          elements.play.textContent = state.playing ? "⏸ Pause" : "▶ Play";
+          var timestamp = state.cursor > 0 && state.events[state.cursor - 1] ? state.events[state.cursor - 1].ts : "start";
+          elements.clock.textContent = "event " + state.cursor + " / " + count + " · " + timestamp;
+          elements.summary.textContent = count + " event" + (count === 1 ? "" : "s") +
+            (state.live ? " · live edge" : " · replay");
+        }
+
+        function stopPlayback() {
+          state.playing = false;
+          if (state.replayTimer !== null) window.clearTimeout(state.replayTimer);
+          state.replayTimer = null;
+          updateControls();
+        }
+
+        function schedulePlayback() {
+          if (!state.playing) return;
+          if (state.cursor >= state.events.length) {
+            stopPlayback();
+            state.live = true;
+            updateControls();
+            return;
+          }
+          var speed = Number(elements.speed.value) || 1;
+          state.replayTimer = window.setTimeout(function () {
+            state.cursor += 1;
+            state.live = state.cursor === state.events.length;
+            state.lastLogCursor = -1;
+            updateControls();
+            render();
+            schedulePlayback();
+          }, 700 / speed);
+        }
+
+        function populateProjects() {
+          elements.project.replaceChildren();
+          if (!state.projects.length) {
+            var none = document.createElement("option");
+            none.textContent = "No watched repositories";
+            elements.project.appendChild(none);
+            elements.project.disabled = true;
+            populateRuns();
+            return;
+          }
+          state.projects.forEach(function (project, index) {
+            var option = document.createElement("option");
+            option.value = String(index);
+            option.textContent = project.id + " (" + (Array.isArray(project.runs) ? project.runs.length : 0) + " runs)";
+            elements.project.appendChild(option);
+          });
+          elements.project.disabled = false;
+          state.selectedProject = state.projects[0];
+          populateRuns();
+        }
+
+        function populateRuns() {
+          elements.run.replaceChildren();
+          var runs = state.selectedProject && Array.isArray(state.selectedProject.runs) ? state.selectedProject.runs : [];
+          if (!runs.length) {
+            var none = document.createElement("option");
+            none.textContent = state.selectedProject ? "No runs discovered" : "Select a project";
+            elements.run.appendChild(none);
+            elements.run.disabled = true;
+            state.selectedRun = null;
+            replaceEvents([]);
+            return;
+          }
+          runs.forEach(function (run, index) {
+            var option = document.createElement("option");
+            option.value = String(index);
+            option.textContent = run.family + " / " + run.run + " · " + run.event_count + " events";
+            elements.run.appendChild(option);
+          });
+          elements.run.disabled = false;
+          state.selectedRun = runs[0];
+          loadSelectedRun();
+        }
+
+        async function loadSelectedRun() {
+          stopPlayback();
+          var project = state.selectedProject;
+          var run = state.selectedRun;
+          var token = ++state.loadToken;
+          if (!project || !run) {
+            replaceEvents([]);
+            return;
+          }
+          showError("");
+          elements.status.textContent = "Loading " + run.family + " / " + run.run;
+          var segments = [project.id, run.family, run.run].map(function (segment) {
+            return encodeURIComponent(String(segment));
+          });
+          try {
+            var response = await fetch("/api/runs/" + segments.join("/") + "/events", { cache: "no-store" });
+            if (!response.ok) throw new Error("events request returned HTTP " + response.status);
+            var records = await response.json();
+            if (token !== state.loadToken) return;
+            replaceEvents(records);
+            elements.status.textContent = "Loaded " + run.family + " / " + run.run;
+          } catch (error) {
+            if (token !== state.loadToken) return;
+            replaceEvents([]);
+            showError("Could not load run: " + error.message);
+            elements.status.textContent = "Run load failed";
+          }
+        }
+
+        function connectStream() {
+          if (state.source) state.source.close();
+          var source = new EventSource("/api/stream");
+          state.source = source;
+          source.onopen = function () { setConnection("LIVE STREAM", "live"); };
+          source.onerror = function () { setConnection("RECONNECTING", "error"); };
+          source.onmessage = function (message) {
+            try {
+              var event = JSON.parse(message.data);
+              if (!state.selectedProject || !state.selectedRun) return;
+              if (event.repo !== state.selectedProject.id || event.run !== state.selectedRun.run) return;
+              if (appendEvent(event)) elements.status.textContent = "Live event received: " + event.kind + " · " + event.node;
+            } catch (error) {
+              showError("Ignored malformed stream event: " + error.message);
+            }
+          };
+        }
+
+        async function discover() {
+          showError("");
+          try {
+            var response = await fetch("/api/projects", { cache: "no-store" });
+            if (!response.ok) throw new Error("projects request returned HTTP " + response.status);
+            var snapshot = await response.json();
+            state.projects = Array.isArray(snapshot.projects) ? snapshot.projects : [];
+            populateProjects();
+            connectStream();
+            if (!state.projects.length) {
+              setConnection("NO PROJECTS", "loading");
+              elements.status.textContent = "No watched repositories were discovered";
+            }
+          } catch (error) {
+            state.projects = [];
+            populateProjects();
+            setConnection("API ERROR", "error");
+            showError("Could not discover projects: " + error.message);
+            elements.status.textContent = "Project discovery failed";
+          }
+        }
+
+        elements.project.addEventListener("change", function () {
+          state.selectedProject = state.projects[Number(elements.project.value)] || null;
+          populateRuns();
+        });
+        elements.run.addEventListener("change", function () {
+          var runs = state.selectedProject && Array.isArray(state.selectedProject.runs) ? state.selectedProject.runs : [];
+          state.selectedRun = runs[Number(elements.run.value)] || null;
+          loadSelectedRun();
+        });
+        elements.play.addEventListener("click", function () {
+          if (state.playing) {
+            stopPlayback();
+            return;
+          }
+          if (state.cursor >= state.events.length) state.cursor = 0;
+          state.live = false;
+          state.playing = true;
+          state.lastLogCursor = -1;
+          updateControls();
+          render();
+          schedulePlayback();
+        });
+        elements.replay.addEventListener("click", function () {
+          stopPlayback();
+          state.cursor = 0;
+          state.live = false;
+          state.lastLogCursor = -1;
+          updateControls();
+          render();
+        });
+        elements.scrubber.addEventListener("input", function () {
+          stopPlayback();
+          state.cursor = Math.max(0, Math.min(state.events.length, Number(elements.scrubber.value)));
+          state.live = state.cursor === state.events.length;
+          state.lastLogCursor = -1;
+          updateControls();
+          render();
+        });
+        elements.speed.addEventListener("change", function () {
+          if (state.playing) {
+            if (state.replayTimer !== null) window.clearTimeout(state.replayTimer);
+            schedulePlayback();
+          }
+        });
+        window.addEventListener("beforeunload", function () {
+          if (state.source) state.source.close();
+          if (state.replayTimer !== null) window.clearTimeout(state.replayTimer);
+        });
+
+        updateControls();
+        render();
+        discover();
+      })();
+    </script>
   </body>
 </html>
