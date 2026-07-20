@@ -215,6 +215,25 @@ pub struct WorktreeManager {
     repo_path: PathBuf,
 }
 
+/// Opaque evidence that a specific primary repository was bound and observed
+/// clean through the bounded status boundary.
+///
+/// The capability is intentionally constructed only by [`WorktreeManager`].
+/// Each effectful create revalidates both the manager/repository association
+/// and current cleanliness; holding this value is not a permanent assertion
+/// that the worktree remained clean.
+#[derive(Debug)]
+pub(crate) struct RepositoryCleanlinessCapability {
+    repository: ManagedRepositoryBinding,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CreationCleanliness<'a> {
+    Bound(&'a RepositoryCleanlinessCapability),
+    #[cfg(test)]
+    TestOnly,
+}
+
 /// A cooperative shared read lease for one verified managed worktree.
 ///
 /// Immutable readers and collectors may hold this value concurrently. A
@@ -781,6 +800,59 @@ impl WorktreeManager {
         );
     }
 
+    /// Captures repository-bound cleanliness evidence for effectful managed
+    /// worktree creation. Callers must keep the opaque value and supply it to
+    /// the explicit capability-bearing create entrypoint.
+    #[allow(dead_code)]
+    pub(crate) fn acquire_repository_cleanliness(&self) -> Result<RepositoryCleanlinessCapability> {
+        RepositoryCleanlinessCapability::capture(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_with_repository_cleanliness(
+        &self,
+        options: WorktreeCreateOptions,
+        cleanliness: &RepositoryCleanlinessCapability,
+    ) -> Result<WorktreeRecord> {
+        self.create_with_repository_cleanliness_and_retention(
+            options,
+            WorktreeRetentionPolicy::default(),
+            cleanliness,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_with_repository_cleanliness_and_retention(
+        &self,
+        options: WorktreeCreateOptions,
+        retention: WorktreeRetentionPolicy,
+        cleanliness: &RepositoryCleanlinessCapability,
+    ) -> Result<WorktreeRecord> {
+        cleanliness.require_clean_for_manager(self)?;
+        let exclude_agent_id = Some(normalize_agent_id(&options.agent_id)?);
+        let worktree_root = options.worktree_root.clone();
+        let record =
+            self.create_disabled_legacy(options, CreationCleanliness::Bound(cleanliness))?;
+        cleanliness.require_clean_for_manager(self)?;
+        if retention.max_age.is_some() || retention.max_count.is_some() {
+            let retention = WorktreeRetentionPolicy {
+                max_age: retention.max_age,
+                max_count: retention
+                    .max_count
+                    .map(|max_count| max_count.saturating_sub(1)),
+            };
+            self.gc(WorktreeGcOptions {
+                worktree_root,
+                dry_run: false,
+                remove_targets: true,
+                retention,
+                exclude_agent_id,
+            })?;
+            cleanliness.require_clean_for_manager(self)?;
+        }
+        Ok(record)
+    }
+
     /// Unit-test-only capability seam for exercising the internal durable
     /// worktree machinery. This method is absent from production libraries
     /// and integration-test binaries.
@@ -797,7 +869,7 @@ impl WorktreeManager {
     ) -> Result<WorktreeRecord> {
         let exclude_agent_id = Some(normalize_agent_id(&options.agent_id)?);
         let worktree_root = options.worktree_root.clone();
-        let record = self.create_disabled_legacy(options)?;
+        let record = self.create_disabled_legacy(options, CreationCleanliness::TestOnly)?;
         if retention.max_age.is_some() || retention.max_count.is_some() {
             let retention = WorktreeRetentionPolicy {
                 max_age: retention.max_age,
@@ -817,12 +889,23 @@ impl WorktreeManager {
     }
 
     #[allow(dead_code)]
-    fn create_disabled_legacy(&self, options: WorktreeCreateOptions) -> Result<WorktreeRecord> {
+    fn create_disabled_legacy(
+        &self,
+        options: WorktreeCreateOptions,
+        cleanliness: CreationCleanliness<'_>,
+    ) -> Result<WorktreeRecord> {
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
+        cleanliness.require_clean_for_repository(&registry_store.repository)?;
         let registry_lock = registry_store.lock()?;
         let mut registry = registry_store.load(&registry_lock)?;
-        recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+        recover_pending_operations_with_creation_cleanliness(
+            &repo,
+            &registry_store,
+            &registry_lock,
+            &mut registry,
+            cleanliness,
+        )?;
         let name = normalize_agent_id(&options.agent_id)?;
         let branch_name = options.branch.unwrap_or_else(|| default_branch_name(&name));
         validate_branch_name(&branch_name)?;
@@ -899,7 +982,13 @@ impl WorktreeManager {
         let reserved = match root.reserve_direct_child_directory(&name) {
             Ok(reserved) => reserved,
             Err(error) => {
-                recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+                recover_pending_operations_with_creation_cleanliness(
+                    &repo,
+                    &registry_store,
+                    &registry_lock,
+                    &mut registry,
+                    cleanliness,
+                )?;
                 return Err(error);
             }
         };
@@ -912,7 +1001,13 @@ impl WorktreeManager {
                     Some(reserved.identity()),
                     TreeLinkPolicy::UnlinkLinks,
                 )?;
-                recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
+                recover_pending_operations_with_creation_cleanliness(
+                    &repo,
+                    &registry_store,
+                    &registry_lock,
+                    &mut registry,
+                    cleanliness,
+                )?;
                 return Err(error);
             }
         };
@@ -1009,7 +1104,7 @@ impl WorktreeManager {
                 reserved.verify(&root)?;
                 staging_reserved.verify(&root)?;
                 let staged = staging_root.bind_existing_managed_direct_child_directory(&name)?;
-                verify_worktree_clean_at(&staging_path, &branch_name, branch_oid, cfg!(test))?;
+                verify_worktree_clean_at(&staging_path, &branch_name, branch_oid, cleanliness)?;
                 let staged_metadata = capture_staged_worktree_metadata(
                     &registry_store.repository,
                     &name,
@@ -1026,8 +1121,13 @@ impl WorktreeManager {
                 registry_store.save(&registry_lock, &mut registry)?;
                 Ok(())
             })();
-        let recovery_result =
-            recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry);
+        let recovery_result = recover_pending_operations_with_creation_cleanliness(
+            &repo,
+            &registry_store,
+            &registry_lock,
+            &mut registry,
+            cleanliness,
+        );
         if let Err(create_error) = create_result {
             recovery_result.with_context(|| {
                 format!(
@@ -1041,11 +1141,13 @@ impl WorktreeManager {
             format!("managed worktree '{name}' was not finalized after create recovery")
         })?;
 
-        Ok(WorktreeRecord {
+        let record = WorktreeRecord {
             name,
             path: binding.path.clone(),
             branch: branch_name,
-        })
+        };
+        cleanliness.require_clean_for_repository(&registry_store.repository)?;
+        Ok(record)
     }
 
     /// Removes a managed worktree after taking its cooperative exclusive
@@ -2678,21 +2780,133 @@ fn validate_registry_bounds(registry: &ManagedWorktreeRegistry) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn recover_pending_operations(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
     lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
 ) -> Result<()> {
-    recover_pending_operations_with_held_removal_lease(repo, store, lock, registry, None)
+    recover_pending_operations_with_authority(
+        repo,
+        store,
+        lock,
+        registry,
+        None,
+        CreationCleanliness::TestOnly,
+    )
 }
 
+#[cfg(not(test))]
+fn recover_pending_operations(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+) -> Result<()> {
+    recover_pending_operations_without_creation_cleanliness(repo, store, lock, registry, None)
+}
+
+fn recover_pending_operations_with_creation_cleanliness(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    cleanliness: CreationCleanliness<'_>,
+) -> Result<()> {
+    recover_pending_operations_with_authority(repo, store, lock, registry, None, cleanliness)
+}
+
+#[cfg(test)]
 fn recover_pending_operations_with_held_removal_lease(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
     lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
+) -> Result<()> {
+    recover_pending_operations_with_authority(
+        repo,
+        store,
+        lock,
+        registry,
+        held_removal_lease,
+        CreationCleanliness::TestOnly,
+    )
+}
+
+#[cfg(not(test))]
+fn recover_pending_operations_with_held_removal_lease(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
+) -> Result<()> {
+    recover_pending_operations_without_creation_cleanliness(
+        repo,
+        store,
+        lock,
+        registry,
+        held_removal_lease,
+    )
+}
+
+#[cfg(not(test))]
+fn recover_pending_operations_without_creation_cleanliness(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
+) -> Result<()> {
+    if registry
+        .operations
+        .values()
+        .any(|operation| operation.kind == ManagedWorktreeOperationKind::Create)
+        || registry
+            .records
+            .values()
+            .any(|binding| binding.creation_lock_pending)
+    {
+        bail!(
+            "managed worktree create recovery requires a capability-bound repository cleanliness input"
+        );
+    }
+
+    let names = registry.operations.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        store.verify_authenticated_registry(lock, registry)?;
+        let operation = registry
+            .operations
+            .get(&name)
+            .cloned()
+            .context("managed worktree operation disappeared during recovery")?;
+        if operation.name != name {
+            bail!("managed worktree operation key/name mismatch for '{name}'");
+        }
+        if operation.kind != ManagedWorktreeOperationKind::Remove {
+            bail!("managed worktree create recovery reached an unbound recovery path");
+        }
+        recover_remove_operation_with_lease(
+            repo,
+            store,
+            lock,
+            registry,
+            operation,
+            held_removal_lease,
+        )?;
+    }
+    store.verify_authenticated_registry(lock, registry)
+}
+
+fn recover_pending_operations_with_authority(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
+    cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
     let names = registry.operations.keys().cloned().collect::<Vec<_>>();
     for name in names {
@@ -2707,30 +2921,47 @@ fn recover_pending_operations_with_held_removal_lease(
         }
         match operation.kind {
             ManagedWorktreeOperationKind::Create => {
-                recover_create_operation(repo, store, lock, registry, operation)?
+                recover_create_operation(repo, store, lock, registry, operation, cleanliness)?
             }
-            ManagedWorktreeOperationKind::Remove => {
-                let _lease = if let Some(lease) =
-                    held_removal_lease.filter(|lease| lease.name.as_str() == name.as_str())
-                {
-                    store.verify_removal_lease_current(lock, lease)?;
-                    None
-                } else {
-                    Some(
-                        store
-                            .try_acquire_worktree_removal_lease(lock, &name)
-                            .with_context(|| {
-                                format!(
-                                    "managed worktree '{name}' has an active cooperative execution lease; pending removal remains durable"
-                                )
-                            })?,
-                    )
-                };
-                recover_remove_operation(repo, store, lock, registry, operation)?
-            }
+            ManagedWorktreeOperationKind::Remove => recover_remove_operation_with_lease(
+                repo,
+                store,
+                lock,
+                registry,
+                operation,
+                held_removal_lease,
+            )?,
         }
     }
-    reconcile_creation_locks(repo, store, lock, registry)
+    reconcile_creation_locks(repo, store, lock, registry, cleanliness)
+}
+
+fn recover_remove_operation_with_lease(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    operation: ManagedWorktreeOperation,
+    held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
+) -> Result<()> {
+    let name = operation.name.clone();
+    let _lease = if let Some(lease) =
+        held_removal_lease.filter(|lease| lease.name.as_str() == name.as_str())
+    {
+        store.verify_removal_lease_current(lock, lease)?;
+        None
+    } else {
+        Some(
+            store
+                .try_acquire_worktree_removal_lease(lock, &name)
+                .with_context(|| {
+                    format!(
+                        "managed worktree '{name}' has an active cooperative execution lease; pending removal remains durable"
+                    )
+                })?,
+        )
+    };
+    recover_remove_operation(repo, store, lock, registry, operation)
 }
 
 fn recover_create_operation(
@@ -2739,6 +2970,7 @@ fn recover_create_operation(
     lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     mut operation: ManagedWorktreeOperation,
+    cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
     if operation.phase == ManagedWorktreeOperationPhase::CreateIntent {
         store.verify_authenticated_registry(lock, registry)?;
@@ -2907,7 +3139,7 @@ fn recover_create_operation(
             &staging_path,
             &operation.branch,
             expected_branch_oid,
-            operation.force,
+            cleanliness,
         )?;
         let staged = staging_root.bind_existing_managed_direct_child_directory(&operation.name)?;
         let staged_metadata = capture_staged_worktree_metadata(
@@ -3029,7 +3261,7 @@ fn recover_create_operation(
             &operation.path,
             &operation.branch,
             expected_branch_oid,
-            operation.force,
+            cleanliness,
         )?;
         verify_local_branch_oid(repo, &operation.branch, expected_branch_oid)?;
         let base_oid =
@@ -3062,7 +3294,7 @@ fn recover_create_operation(
             &operation.path,
             &operation.branch,
             expected_branch_oid,
-            operation.force,
+            cleanliness,
         )?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity {
@@ -3117,14 +3349,7 @@ fn recover_create_operation(
         }
         registry.operations.remove(&operation.name);
         store.save(lock, registry)?;
-        complete_creation_lock(
-            repo,
-            store,
-            lock,
-            registry,
-            &operation.name,
-            operation.force,
-        )?;
+        complete_creation_lock(repo, store, lock, registry, &operation.name, cleanliness)?;
         return Ok(());
     }
 
@@ -3287,7 +3512,7 @@ fn verify_worktree_clean_at(
     path: &Path,
     branch: &str,
     expected: Oid,
-    allow_unbound_cleanliness: bool,
+    cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
     let worktree_repo = Repository::open(path)
         .with_context(|| format!("failed to open created worktree {}", path.display()))?;
@@ -3313,10 +3538,9 @@ fn verify_worktree_clean_at(
         Ok(())
     };
     verify_head()?;
-    if !allow_unbound_cleanliness {
-        ensure_clean_worktree(path)
-            .context("created worktree is not clean at its persisted branch OID")?;
-    }
+    cleanliness
+        .require_clean_related_worktree(path)
+        .context("created worktree is not clean at its persisted branch OID")?;
 
     let mut index = worktree_repo
         .index()
@@ -3347,7 +3571,7 @@ fn complete_creation_lock(
     lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
     name: &str,
-    allow_unbound_cleanliness: bool,
+    cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
     let binding = registry
         .records
@@ -3361,12 +3585,7 @@ fn complete_creation_lock(
     let expected = Oid::from_str(&binding.created_branch_oid)
         .context("managed creation-lock branch OID is malformed")?;
     verify_local_branch_oid(repo, &binding.branch, expected)?;
-    verify_worktree_clean_at(
-        &verified.path,
-        &binding.branch,
-        expected,
-        allow_unbound_cleanliness,
-    )?;
+    verify_worktree_clean_at(&verified.path, &binding.branch, expected, cleanliness)?;
     let worktree = repo
         .find_worktree(name)
         .with_context(|| format!("failed to find finalized worktree '{name}'"))?;
@@ -3392,6 +3611,7 @@ fn reconcile_creation_locks(
     store: &ManagedWorktreeRegistryStore,
     lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
+    cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
     let names = registry
         .records
@@ -3407,7 +3627,7 @@ fn reconcile_creation_locks(
             .branch
             .clone();
         let _branch_guard = lock_branch_reference(repo, &branch)?;
-        complete_creation_lock(repo, store, lock, registry, &name, cfg!(test))?;
+        complete_creation_lock(repo, store, lock, registry, &name, cleanliness)?;
     }
     Ok(())
 }
@@ -4584,6 +4804,101 @@ impl RepositoryBindingGuard {
         }
         Ok(())
     }
+}
+
+#[allow(dead_code)]
+impl RepositoryCleanlinessCapability {
+    fn capture(manager: &WorktreeManager) -> Result<Self> {
+        let repository_handle = manager.open_repository()?;
+        let repository = managed_repository_binding(&repository_handle)?;
+        let capability = Self { repository };
+        capability.require_clean_for_manager(manager)?;
+        Ok(capability)
+    }
+
+    fn require_clean_for_manager(&self, manager: &WorktreeManager) -> Result<()> {
+        let repository_handle = manager.open_repository()?;
+        let repository = managed_repository_binding(&repository_handle)?;
+        self.require_clean_for_repository(&repository)
+    }
+
+    fn require_clean_for_repository(&self, repository: &ManagedRepositoryBinding) -> Result<()> {
+        if repository != &self.repository {
+            bail!("repository cleanliness capability belongs to a different managed repository");
+        }
+        let binding = RepositoryBindingGuard::bind(&repository.repository_workdir)
+            .context("failed to rebind managed repository cleanliness capability")?;
+        self.verify_primary_association(repository, &binding)?;
+        require_bound_repository_clean(&binding, "primary repository")?;
+        self.verify_primary_association(repository, &binding)
+    }
+
+    fn require_clean_related_worktree(&self, path: &Path) -> Result<()> {
+        let primary = RepositoryBindingGuard::bind(&self.repository.repository_workdir)
+            .context("failed to rebind managed repository cleanliness capability")?;
+        self.verify_primary_association(&self.repository, &primary)?;
+        let worktree = RepositoryBindingGuard::bind(path)
+            .context("failed to bind created managed worktree cleanliness")?;
+        if worktree.common_dir.path() != self.repository.common_dir
+            || worktree.common_dir.identity() != &self.repository.common_dir_identity
+        {
+            bail!(
+                "created managed worktree does not belong to the repository cleanliness capability"
+            );
+        }
+        require_bound_repository_clean(&worktree, "created managed worktree")?;
+        primary.verify()?;
+        self.verify_primary_association(&self.repository, &primary)
+    }
+
+    fn verify_primary_association(
+        &self,
+        repository: &ManagedRepositoryBinding,
+        binding: &RepositoryBindingGuard,
+    ) -> Result<()> {
+        binding.verify()?;
+        if binding.worktree.path() != repository.repository_workdir
+            || binding.worktree.identity() != &repository.repository_workdir_identity
+            || binding.git_dir.path() != repository.common_dir
+            || binding.git_dir.identity() != &repository.common_dir_identity
+            || binding.common_dir.path() != repository.common_dir
+            || binding.common_dir.identity() != &repository.common_dir_identity
+        {
+            bail!("repository cleanliness capability binding no longer matches its repository");
+        }
+        Ok(())
+    }
+}
+
+impl CreationCleanliness<'_> {
+    fn require_clean_for_repository(&self, repository: &ManagedRepositoryBinding) -> Result<()> {
+        match self {
+            Self::Bound(cleanliness) => cleanliness.require_clean_for_repository(repository),
+            #[cfg(test)]
+            Self::TestOnly => Ok(()),
+        }
+    }
+
+    fn require_clean_related_worktree(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Bound(cleanliness) => cleanliness.require_clean_related_worktree(path),
+            #[cfg(test)]
+            Self::TestOnly => Ok(()),
+        }
+    }
+}
+
+fn require_bound_repository_clean(binding: &RepositoryBindingGuard, label: &str) -> Result<()> {
+    let dirty = bounded_repository_status_paths_bound(
+        binding,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_GC_STATUS_TIMEOUT,
+    )?;
+    if !dirty.is_empty() {
+        bail!("{label} is dirty; managed worktree creation requires clean repository state");
+    }
+    binding.verify()
 }
 
 #[cfg(test)]
@@ -5978,6 +6293,155 @@ mod tests {
         assert!(create_error.to_string().contains("capability-bound"));
         assert!(remove_error.to_string().contains("capability-bound"));
         assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_cleanliness_capability_creates_clean_managed_worktree() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("capture clean repository capability");
+
+        let record = manager
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "capability-worker".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                },
+                &cleanliness,
+            )
+            .expect("create capability-bound worktree");
+
+        assert_eq!(record.name, "capability-worker");
+        assert_eq!(record.branch, "maco/capability-worker");
+        assert!(record.path.join("README.md").is_file());
+        assert!(bounded_repository_status_paths(
+            &record.path,
+            MAX_WORKTREE_STATUS_ENTRIES,
+            MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            WORKTREE_GC_STATUS_TIMEOUT,
+        )
+        .expect("inspect created worktree")
+        .is_empty());
+        assert_eq!(
+            manager.list_managed_verified().expect("list worktrees"),
+            vec![record]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_cleanliness_capability_refuses_dirty_primary_before_create() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("capture clean repository capability");
+        fs::write(repo_path.join("README.md"), "dirty\n").expect("dirty primary");
+
+        let error = manager
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "must-not-exist".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root.clone()),
+                },
+                &cleanliness,
+            )
+            .expect_err("dirty primary must be refused");
+
+        assert!(error.to_string().contains("primary repository is dirty"));
+        assert!(!worktree_root.exists());
+        assert!(repo
+            .find_branch("maco/must-not-exist", BranchType::Local)
+            .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_cleanliness_capability_rejects_cross_repository_use() {
+        let temp = TempDir::new().expect("tempdir");
+        let first_path = temp.path().join("first");
+        let second_path = temp.path().join("second");
+        WorktreeManager::init_repository(&first_path, "main").expect("init first repo");
+        WorktreeManager::init_repository(&second_path, "main").expect("init second repo");
+        commit_readme(&Repository::open(&first_path).expect("open first")).expect("commit first");
+        commit_readme(&Repository::open(&second_path).expect("open second"))
+            .expect("commit second");
+        let first = WorktreeManager::new(&first_path);
+        let second = WorktreeManager::new(&second_path);
+        let cleanliness = first
+            .acquire_repository_cleanliness()
+            .expect("capture first capability");
+        let second_worktrees = temp.path().join("second-worktrees");
+
+        let error = second
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "cross-repository".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(second_worktrees.clone()),
+                },
+                &cleanliness,
+            )
+            .expect_err("cross-repository capability must be refused");
+
+        assert!(error.to_string().contains("different managed repository"));
+        assert!(!second_worktrees.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repository_cleanliness_capability_rejects_binding_drift() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("capture repository capability");
+        fs::rename(repo_path.join(".git"), repo_path.join(".git-displaced"))
+            .expect("displace git directory");
+        fs::create_dir(repo_path.join(".git")).expect("replace git directory");
+
+        let error = manager
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "binding-drift".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root.clone()),
+                },
+                &cleanliness,
+            )
+            .expect_err("binding drift must be refused");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("association changed")
+                || message.contains("failed to open repository"),
+            "unexpected binding-drift error: {message}"
+        );
+        assert!(!worktree_root.exists());
     }
 
     #[test]
