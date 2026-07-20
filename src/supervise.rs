@@ -17,7 +17,9 @@ use crate::{
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
     sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
     sync_store::SyncStore,
-    worktree::{WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
+    worktree::{
+        RepositoryCleanlinessCapability, WorktreeCreateOptions, WorktreeManager, WorktreeRecord,
+    },
 };
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{
@@ -81,6 +83,7 @@ pub enum SupervisorRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupervisorExecutionRuntime {
     Verified,
+    #[cfg(test)]
     NonpublishableSimulation,
 }
 
@@ -532,18 +535,32 @@ fn supervisor_plan_value(
     Ok(value)
 }
 
-pub fn run_supervisor_plan_file(_options: SupervisorRunOptions) -> Result<SupervisorFinalReport> {
-    bail!(
-        "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-    )
+pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<SupervisorFinalReport> {
+    let mut external_runner = run_external_agent;
+    run_supervisor_plan_file_with_runner(options, &mut external_runner)
 }
 
-#[allow(dead_code)]
-fn run_supervisor_plan_file_disabled_legacy(
+fn run_supervisor_plan_file_with_runner(
     options: SupervisorRunOptions,
+    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 ) -> Result<SupervisorFinalReport> {
+    if options.runtime == SupervisorRuntime::Fake {
+        bail!(
+            "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+        );
+    }
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
-    run_supervisor_plan(loaded.plan, loaded.consultant, options)
+    run_supervisor_plan_with_runner_and_creation(
+        loaded.plan,
+        loaded.consultant,
+        options,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        external_runner,
+    )
 }
 
 pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<SupervisorStatusReport> {
@@ -1187,25 +1204,14 @@ fn append_child_attempt_history(
     }
 }
 
-fn run_supervisor_plan(
-    plan: SupervisorPlan,
-    consultant: SupervisorConsultantPlan,
-    options: SupervisorRunOptions,
-) -> Result<SupervisorFinalReport> {
-    let execution_runtime = match options.runtime {
-        SupervisorRuntime::Codex => SupervisorExecutionRuntime::Verified,
-        SupervisorRuntime::Fake => SupervisorExecutionRuntime::NonpublishableSimulation,
-    };
-    let mut external_runner = run_external_agent;
-    run_supervisor_plan_with_runner(
-        plan,
-        consultant,
-        options,
-        execution_runtime,
-        &mut external_runner,
-    )
+#[derive(Debug, Clone, Copy)]
+enum SupervisorWorktreeCreation<'a> {
+    Bound(&'a RepositoryCleanlinessCapability),
+    #[cfg(test)]
+    TestOnly,
 }
 
+#[cfg(test)]
 fn run_supervisor_plan_with_runner(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
@@ -1213,10 +1219,37 @@ fn run_supervisor_plan_with_runner(
     execution_runtime: SupervisorExecutionRuntime,
     external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 ) -> Result<SupervisorFinalReport> {
-    if execution_runtime == SupervisorExecutionRuntime::Verified {
-        bail!(
-            "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
-        );
+    run_supervisor_plan_with_runner_and_creation(
+        plan,
+        consultant,
+        options,
+        execution_runtime,
+        SupervisorWorktreeCreation::TestOnly,
+        external_runner,
+    )
+}
+
+fn run_supervisor_plan_with_runner_and_creation(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+) -> Result<SupervisorFinalReport> {
+    match worktree_creation {
+        SupervisorWorktreeCreation::Bound(_)
+            if execution_runtime != SupervisorExecutionRuntime::Verified =>
+        {
+            bail!("verified worktree creation capability requires the verified supervisor runtime")
+        }
+        #[cfg(test)]
+        SupervisorWorktreeCreation::TestOnly
+            if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation =>
+        {
+            bail!("test-only worktree creation requires the simulation supervisor runtime")
+        }
+        _ => {}
     }
     let runtime = options.runtime;
     let repo = discover_repo_root(&options.repo)?;
@@ -1305,10 +1338,20 @@ fn run_supervisor_plan_with_runner(
                     base: None,
                     worktree_root: None,
                 };
-                #[cfg(test)]
-                manager.create_for_test(create_options)?;
-                #[cfg(not(test))]
-                manager.create(create_options)?;
+                match worktree_creation {
+                    SupervisorWorktreeCreation::Bound(cleanliness) => manager
+                        .create_with_repository_cleanliness(create_options, cleanliness)
+                        .with_context(|| {
+                            format!(
+                                "failed to create capability-bound child worktree '{}'",
+                                assignment.id
+                            )
+                        })?,
+                    #[cfg(test)]
+                    SupervisorWorktreeCreation::TestOnly => {
+                        manager.create_for_test(create_options)?
+                    }
+                };
             }
             let worktree_write_lease = manager
                 .acquire_write_execution_lease(&assignment.id)
@@ -3772,6 +3815,7 @@ fn sanitized_git_output(
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
                 StrictOfflineWorkspaceProfile::read_only(workdir),
             )),
+        #[cfg(test)]
         SupervisorExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })?;
@@ -6058,6 +6102,98 @@ mod tests {
             error.to_string().contains("verified finalized artifact")
                 || error.to_string().contains("missing")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_run_entry_creates_and_materializes_assignment_worktree() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(false);
+        let plan = injected_plan(assignment.clone(), 0);
+        let mut options = injected_options(
+            &repo_path,
+            temp.path(),
+            "verified-capability-assignment-create",
+        );
+        options.allow_dirty_primary = false;
+        fs::write(
+            &options.plan_file,
+            serde_json::to_vec(&plan).expect("serialize verified supervisor plan"),
+        )
+        .expect("write verified supervisor plan");
+
+        let mut launched = false;
+        let mut runner = |command: &ExternalAgentCommand| {
+            launched = true;
+            assert_ne!(command.cwd, repo_path);
+            assert_eq!(
+                fs::read_to_string(command.cwd.join("README.md"))
+                    .expect("read materialized assignment worktree"),
+                "baseline\n"
+            );
+            write_injected_json(
+                &command.output_last_message,
+                &injected_child_report(&assignment),
+            );
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_file_with_runner(options, &mut runner)
+            .expect("run verified supervisor entry with injected external boundary");
+
+        assert!(launched, "runner was not launched; report: {report:#?}");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(report.orchestrator_reports.len(), 1);
+        let records = WorktreeManager::new(&repo_path)
+            .list_managed_verified()
+            .expect("list verified assignment worktree");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "child-a");
+        assert_eq!(records[0].branch, "maco/child-a");
+        let primary_head = current_head_oid(&repo_path).expect("read primary HEAD");
+        let child_head = current_head_oid(&records[0].path).expect("read assignment HEAD");
+        assert_eq!(child_head, primary_head);
+        let child_repo = Repository::open(&records[0].path).expect("open assignment worktree");
+        assert!(
+            !repository_is_dirty(&child_repo, "inspect materialized assignment cleanliness")
+                .expect("inspect materialized assignment cleanliness")
+        );
+        let lease = WorktreeManager::new(&repo_path)
+            .acquire_write_execution_lease("child-a")
+            .expect("assignment write lease must be available after run");
+        assert_eq!(lease.record().path, records[0].path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
+        let (temp, repo_path) = injected_repository();
+        let plan = injected_plan(injected_assignment(false), 0);
+        let mut options =
+            injected_options(&repo_path, temp.path(), "verified-capability-dirty-primary");
+        options.allow_dirty_primary = true;
+        fs::write(
+            &options.plan_file,
+            serde_json::to_vec(&plan).expect("serialize dirty-primary supervisor plan"),
+        )
+        .expect("write dirty-primary supervisor plan");
+        fs::write(repo_path.join("README.md"), "dirty\n").expect("dirty primary repository");
+
+        let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+            panic!("dirty primary must be refused before an external child launch")
+        };
+        let error = run_supervisor_plan_file_with_runner(options, &mut runner)
+            .expect_err("dirty primary must be refused at verified run entry");
+
+        assert!(format!("{error:#}").contains("primary repository is dirty"));
+        assert!(!repo_path
+            .join(".maco/o2/runs/verified-capability-dirty-primary")
+            .exists());
+        assert!(!temp.path().join(".maco/worktrees/repo/child-a").exists());
+        assert!(Repository::open(&repo_path)
+            .expect("reopen dirty primary")
+            .find_branch("maco/child-a", git2::BranchType::Local)
+            .is_err());
     }
 
     #[test]
