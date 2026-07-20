@@ -26,6 +26,7 @@ use std::{
     collections::{hash_map::RandomState, BTreeMap, BTreeSet},
     fs,
     hash::{BuildHasher, Hash, Hasher},
+    io::Write,
     path::{Component, Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -39,7 +40,7 @@ use std::{
     os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
+        io::{AsRawFd, FromRawFd},
     },
 };
 
@@ -58,6 +59,11 @@ const MAX_PRODUCER_BYTES: usize = 128;
 const MAX_ARTIFACT_SCRATCH_DIRECTORIES: usize = 64;
 const MAX_ARTIFACT_SCRATCH_NAME_BYTES: usize = 128;
 static RESERVATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_FAULT_AFTER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 const MAX_RUN_ROOT_ENTRIES: usize = 64;
@@ -709,6 +715,245 @@ impl ArtifactRunWriter {
         self.write_bytes(relative, &contents, disposition)
     }
 
+    /// Appends one compact JSON value and one trailing newline to an artifact.
+    /// Existing bytes are never rewritten or truncated, and every append must
+    /// retain the disposition established by the first record.
+    pub fn append_json_line<T: Serialize>(
+        &mut self,
+        relative: impl AsRef<Path>,
+        value: &T,
+        disposition: ArtifactFileDisposition,
+    ) -> Result<ArtifactFileRecord> {
+        let mut line = serde_json::to_vec(value).context("failed to serialize artifact JSONL")?;
+        line.push(b'\n');
+        self.append_bytes(relative.as_ref(), &line, disposition)
+    }
+
+    fn append_bytes(
+        &mut self,
+        relative: &Path,
+        contents: &[u8],
+        disposition: ArtifactFileDisposition,
+    ) -> Result<ArtifactFileRecord> {
+        self.run_lock.verify(&self.run)?;
+        let result = (|| -> Result<ArtifactFileRecord> {
+            let relative = validate_artifact_relative_path(relative)?;
+            if let Some(scratch) = self
+                .outstanding_scratches
+                .keys()
+                .find(|scratch| artifact_path_starts_with(&relative, scratch))
+            {
+                bail!(
+                    "artifact path overlaps outstanding scratch directory {}: {}",
+                    scratch.display(),
+                    relative.display()
+                );
+            }
+            let appended_bytes =
+                u64::try_from(contents.len()).context("artifact append length overflow")?;
+            let previous = self.files.get(&relative).cloned();
+            if let Some(record) = &previous {
+                if record.disposition != disposition {
+                    bail!(
+                        "artifact append cannot change file disposition: {}",
+                        relative.display()
+                    );
+                }
+            } else if self.files.len() >= MAX_ARTIFACT_FILES {
+                bail!(
+                    "artifact run exceeds its {} file manifest limit",
+                    MAX_ARTIFACT_FILES
+                );
+            }
+            let previous_bytes = previous.as_ref().map_or(0, |record| record.bytes);
+            let new_file_bytes = previous_bytes
+                .checked_add(appended_bytes)
+                .context("artifact file byte accounting overflow")?;
+            if new_file_bytes > MAX_ARTIFACT_FILE_BYTES {
+                bail!(
+                    "artifact file exceeds its {} byte limit: {}",
+                    MAX_ARTIFACT_FILE_BYTES,
+                    relative.display()
+                );
+            }
+            let proposed_total = self
+                .total_bytes
+                .checked_add(appended_bytes)
+                .context("artifact byte accounting overflow")?;
+            if proposed_total > MAX_ARTIFACT_TOTAL_BYTES {
+                bail!(
+                    "artifact run exceeds its {} byte aggregate limit",
+                    MAX_ARTIFACT_TOTAL_BYTES
+                );
+            }
+
+            let (expected, expected_identity) = if let Some(record) = &previous {
+                let path = self.run.path().join(&relative);
+                let before = ensure_private_regular_file(&path)?;
+                let contents = read_and_verify_record(&self.run, record)?;
+                let after = ensure_private_regular_file(&path)?;
+                if before != after {
+                    bail!(
+                        "artifact file identity changed while preparing append: {}",
+                        relative.display()
+                    );
+                }
+                (contents, Some(before))
+            } else {
+                (Vec::new(), None)
+            };
+            let (parent, file_name) = artifact_parent_and_name(&self.run, &relative, true)?;
+            let path = self.run.path().join(&relative);
+            let create = previous.is_none();
+            if create && parent.direct_child_exists(file_name)? {
+                bail!(
+                    "refusing to adopt an existing unmanifested artifact for append: {}",
+                    relative.display()
+                );
+            }
+            let mut file = open_private_artifact_append_file(&parent, file_name, create)?;
+            let opened_identity = ensure_private_regular_file_handle(&file, &path)?;
+            if expected_identity
+                .as_ref()
+                .is_some_and(|identity| identity != &opened_identity)
+            {
+                bail!(
+                    "artifact file identity changed before append: {}",
+                    relative.display()
+                );
+            }
+            let append_result = (|| -> Result<ArtifactFileRecord> {
+                file.write_all(contents).with_context(|| {
+                    format!("failed to append artifact file {}", relative.display())
+                })?;
+                file.sync_data().with_context(|| {
+                    format!(
+                        "failed to persist appended artifact file {}",
+                        relative.display()
+                    )
+                })?;
+                run_artifact_append_fault_after_sync()?;
+                if create {
+                    parent.sync_directory_fenced()?;
+                }
+                let rebound_identity = ensure_private_regular_file(&path)?;
+                if rebound_identity != opened_identity {
+                    bail!(
+                        "artifact file identity changed after append: {}",
+                        relative.display()
+                    );
+                }
+                let mut expected_after = expected.clone();
+                expected_after.extend_from_slice(contents);
+                let observed = BoundedRegularReader::read_relative(
+                    self.run.path(),
+                    &relative,
+                    MAX_ARTIFACT_FILE_BYTES,
+                )?;
+                let post_read_identity = ensure_private_regular_file(&path)?;
+                if post_read_identity != opened_identity {
+                    bail!(
+                        "artifact file identity changed while verifying append: {}",
+                        relative.display()
+                    );
+                }
+                if observed != expected_after {
+                    bail!(
+                        "artifact contents changed immediately after append: {}",
+                        relative.display()
+                    );
+                }
+
+                Ok(ArtifactFileRecord {
+                    path: relative.clone(),
+                    bytes: new_file_bytes,
+                    sha256: sha256_hex(&observed),
+                    disposition,
+                })
+            })();
+            match append_result {
+                Ok(record) => {
+                    self.files.insert(relative, record.clone());
+                    self.total_bytes = proposed_total;
+                    Ok(record)
+                }
+                Err(error) => {
+                    let recovery = self.reconcile_failed_artifact_append(
+                        &relative,
+                        &expected,
+                        contents,
+                        disposition,
+                        previous_bytes,
+                        &opened_identity,
+                    );
+                    match recovery {
+                        Ok(()) => Err(error),
+                        Err(recovery_error) => Err(error.context(format!(
+                            "artifact append recovery also failed: {recovery_error:#}"
+                        ))),
+                    }
+                }
+            }
+        })();
+        finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
+    }
+
+    fn reconcile_failed_artifact_append(
+        &mut self,
+        relative: &Path,
+        previous_contents: &[u8],
+        attempted_append: &[u8],
+        disposition: ArtifactFileDisposition,
+        previous_bytes: u64,
+        opened_identity: &FileIdentity,
+    ) -> Result<()> {
+        let path = self.run.path().join(relative);
+        let before = ensure_private_regular_file(&path)?;
+        if &before != opened_identity {
+            bail!(
+                "artifact file identity changed before append recovery: {}",
+                relative.display()
+            );
+        }
+        let observed = BoundedRegularReader::read_relative(
+            self.run.path(),
+            relative,
+            MAX_ARTIFACT_FILE_BYTES,
+        )?;
+        let after = ensure_private_regular_file(&path)?;
+        if after != before {
+            bail!(
+                "artifact file identity changed during append recovery: {}",
+                relative.display()
+            );
+        }
+        let appended = observed
+            .strip_prefix(previous_contents)
+            .context("artifact append recovery found prior bytes changed")?;
+        if !attempted_append.starts_with(appended) {
+            bail!("artifact append recovery found bytes outside the attempted append");
+        }
+        let observed_bytes =
+            u64::try_from(observed.len()).context("recovered artifact length overflow")?;
+        let recovered_total = self
+            .total_bytes
+            .checked_sub(previous_bytes)
+            .and_then(|total| total.checked_add(observed_bytes))
+            .context("recovered artifact byte accounting overflow")?;
+        if recovered_total > MAX_ARTIFACT_TOTAL_BYTES {
+            bail!("recovered artifact exceeds the aggregate byte limit");
+        }
+        let record = ArtifactFileRecord {
+            path: relative.to_path_buf(),
+            bytes: observed_bytes,
+            sha256: sha256_hex(&observed),
+            disposition,
+        };
+        self.files.insert(relative.to_path_buf(), record);
+        self.total_bytes = recovered_total;
+        Ok(())
+    }
+
     pub fn finalize(
         self,
         final_report: impl AsRef<Path>,
@@ -887,6 +1132,25 @@ impl ArtifactRunReader {
         self.run.verify()?;
         Ok(contents)
     }
+}
+
+#[cfg(test)]
+fn set_artifact_append_fault_after_sync() {
+    APPEND_FAULT_AFTER_SYNC.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn run_artifact_append_fault_after_sync() -> Result<()> {
+    let should_fail = APPEND_FAULT_AFTER_SYNC.with(|fault| fault.replace(false));
+    if should_fail {
+        bail!("injected artifact append failure after sync");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn run_artifact_append_fault_after_sync() -> Result<()> {
+    Ok(())
 }
 
 pub fn discover_repo_root(repo_path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -2346,6 +2610,76 @@ fn ensure_private_regular_file(path: &Path) -> Result<FileIdentity> {
 }
 
 #[cfg(unix)]
+fn ensure_private_regular_file_handle(file: &File, path: &Path) -> Result<FileIdentity> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened artifact file {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        bail!(
+            "opened artifact file is not an owner-private single-link regular file: {}",
+            path.display()
+        );
+    }
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn ensure_private_regular_file_handle(_file: &File, path: &Path) -> Result<FileIdentity> {
+    bail!(
+        "opened artifact file ACL validation is unsupported on this platform: {}",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+fn open_private_artifact_append_file(
+    parent: &SafeRoot,
+    file_name: &OsStr,
+    create: bool,
+) -> Result<File> {
+    parent.verify()?;
+    let directory = open_safe_root_handle(parent)?;
+    let name = CString::new(file_name.as_bytes()).context("artifact file name contains NUL")?;
+    let mut flags =
+        libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if create {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    }
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to open private artifact for append: {}",
+                parent.path().join(file_name).display()
+            )
+        });
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    ensure_private_regular_file_handle(&file, &parent.path().join(file_name))?;
+    parent.verify()?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_artifact_append_file(
+    _parent: &SafeRoot,
+    file_name: &OsStr,
+    _create: bool,
+) -> Result<File> {
+    bail!(
+        "no-follow artifact append is unsupported on this platform: {}",
+        Path::new(file_name).display()
+    )
+}
+
+#[cfg(unix)]
 fn filesystem_path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
 }
@@ -2851,6 +3185,177 @@ mod tests {
             .expect_err("unsupported platforms must never use recursive path deletion");
         assert!(error.to_string().contains("unsupported on this platform"));
         assert!(error.to_string().contains("refusing recursive deletion"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_line_appends_remain_manifested_and_finalize() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("append-json-lines").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "supervise",
+        )
+        .expect("reserve writer");
+        let path = Path::new("events/orchestration.jsonl");
+
+        let first = writer
+            .append_json_line(
+                path,
+                &serde_json::json!({"kind":"spawn","node":"worker-1"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("append first event");
+        let second = writer
+            .append_json_line(
+                path,
+                &serde_json::json!({"kind":"accept","node":"worker-1"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("append second event");
+        let expected = concat!(
+            "{\"kind\":\"spawn\",\"node\":\"worker-1\"}\n",
+            "{\"kind\":\"accept\",\"node\":\"worker-1\"}\n"
+        )
+        .as_bytes();
+        assert_eq!(
+            fs::read(writer.run_dir().join(path)).expect("read journal"),
+            expected
+        );
+        assert_eq!(
+            first.bytes,
+            u64::try_from(
+                expected
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .expect("first line")
+                    + 1
+            )
+            .expect("first line length")
+        );
+        assert_eq!(
+            second.bytes,
+            u64::try_from(expected.len()).expect("journal length")
+        );
+        assert_eq!(second.sha256, sha256_hex(expected));
+        assert_eq!(writer.total_bytes, second.bytes);
+        assert_eq!(writer.files.get(path), Some(&second));
+
+        writer
+            .write_json(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &serde_json::json!({"status":"succeeded"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write final report");
+        let finalization = writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize appended journal");
+        let finalized_record = finalization
+            .files
+            .iter()
+            .find(|record| record.path == path)
+            .expect("journal record");
+        assert_eq!(finalized_record, &second);
+
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized run");
+        let journal = reader.read(path).expect("read finalized journal");
+        let records = journal
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).expect("valid JSONL record"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["kind"], "spawn");
+        assert_eq!(records[1]["kind"], "accept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_line_append_rejects_disposition_change_without_mutation() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("append-disposition").expect("run id");
+        let mut writer =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Supervise, run_id, "supervise")
+                .expect("reserve writer");
+        let path = Path::new("events/orchestration.jsonl");
+        let first = writer
+            .append_json_line(
+                path,
+                &serde_json::json!({"kind":"spawn"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("append first event");
+        let before = fs::read(writer.run_dir().join(path)).expect("read before mismatch");
+
+        let error = writer
+            .append_json_line(
+                path,
+                &serde_json::json!({"kind":"accept"}),
+                ArtifactFileDisposition::Publishable,
+            )
+            .expect_err("disposition change must fail");
+        assert!(error.to_string().contains("cannot change file disposition"));
+        assert_eq!(
+            fs::read(writer.run_dir().join(path)).expect("read after mismatch"),
+            before
+        );
+        assert_eq!(writer.files.get(path), Some(&first));
+        assert_eq!(writer.total_bytes, first.bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_json_line_append_reconciles_manifest_and_still_finalizes() {
+        let (_temp, repo) = committed_repo();
+        let run_id = RunId::new("append-recovery").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "supervise",
+        )
+        .expect("reserve writer");
+        let path = Path::new("events/orchestration.jsonl");
+        set_artifact_append_fault_after_sync();
+        let error = writer
+            .append_json_line(
+                path,
+                &serde_json::json!({"kind":"spawn","node":"worker-1"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect_err("injected post-write failure");
+        assert!(error
+            .to_string()
+            .contains("injected artifact append failure"));
+        let journal = fs::read(writer.run_dir().join(path)).expect("read recovered journal");
+        assert_eq!(journal, b"{\"kind\":\"spawn\",\"node\":\"worker-1\"}\n");
+        let record = writer.files.get(path).expect("reconciled record");
+        assert_eq!(record.bytes, u64::try_from(journal.len()).expect("length"));
+        assert_eq!(record.sha256, sha256_hex(&journal));
+        assert_eq!(writer.total_bytes, record.bytes);
+
+        writer
+            .write_json(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &serde_json::json!({"status":"succeeded"}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write final report");
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize after recovered append failure");
+        ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized recovered run");
     }
 
     #[cfg(unix)]
