@@ -20,6 +20,16 @@ the Multi-Agent Coding Orchestrator.
 - Supervise evidence handling now includes worker-evidence cross-checks,
   canonical child-report artifacts, per-assignment task override, and stable
   child-diff baselines for auditable child results.
+- `maco supervise run --max-concurrent-children N` adds bounded child
+  scheduling while retaining legacy behavior at the default `N = 1`. Disjoint
+  path sets can run concurrently; overlapping assignments serialize with
+  scan-ahead scheduling under the sync claim overlap rules. Retries and parent
+  audits retain their assignment slot, ordinary failures remain isolated,
+  fatal aborts stop new starts and join active calls, plan-indexed outcomes
+  preserve deterministic report order, journal appends are synchronized, and
+  concurrent invocations use unique scratch roots. Zero is rejected before
+  artifacts are reserved. `max_child_assignments` remains the plan fan-out
+  budget rather than the concurrency bound.
 - New terminal cross-runtime CONSULTANT role with `maco consult ask` and
   `maco consult artifacts list/latest/prune`. Consultation is fake-first by
   default, supports explicit read-only Codex and Claude CLI adapters, and can
@@ -57,6 +67,11 @@ Nix shell.
 - Consultant results are advisory evidence only. Real Codex and Claude
   consultant adapters are explicit local-process opt-ins, remain read-only, and
   do not override assigned ownership, validation, review, or merge gates.
+- Effectful `maco supervise run` remains temporarily refused before artifact,
+  claim, or worktree reservation because managed-worktree creation still needs
+  its capability-bound repository input. The bounded scheduler is implemented
+  behind that separate gate; plan, status, collect, and artifact inspection
+  remain available.
 - PR and issue publication remain intentionally narrow and opt-in for live
   GitHub paths. Fake forge and fake inbox data stay the no-network defaults.
 - Real network LLM providers remain absent from `maco agent run` and must be

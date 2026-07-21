@@ -69,8 +69,9 @@ The current implementation covers a local-first command-line slice:
 - `maco supervise run` is temporarily unsupported because verified supervisor
   assignment creation depends on the disabled managed-worktree creation
   boundary. `maco supervise plan/status/collect` remain available. The retained
-  supervisor design serially launches opt-in O1 child orchestrators through
-  the Codex CLI in isolated child worktrees under an O2 supervisor. Each child
+  supervisor scheduler launches opt-in O1 child orchestrators through the
+  Codex CLI in isolated child worktrees under an O2 supervisor, with
+  `--max-concurrent-children` defaulting to the legacy serial behavior. Each child
   is instructed to read `AGENTS.md` and project-local `.agents` guidance before
   acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
   worker/researcher assignments when available, preserve the O1/O2 subprocess
@@ -1137,7 +1138,7 @@ Run an opt-in supervisor-of-orchestrators plan:
 ```bash
 cargo run -- supervise plan supervisor-plan.json --repo . --json
 # Temporarily returns Unsupported before reserving artifacts or assignments:
-cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --json
+cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --max-concurrent-children 2 --json
 cargo run -- supervise status supervise-demo --repo . --json
 cargo run -- supervise collect supervise-demo --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
@@ -1213,10 +1214,26 @@ assignments but leaves a non-empty child worktree diff, the retained runner
 still launches the parent read-only `REVIEW_AUDITOR` and requires it to cover
 the child orchestrator id and changed paths.
 The retained supervisor runner does not apply worker changes to the primary worktree
-automatically. Child orchestrator execution is currently serial: the supervisor
-starts and waits for one child process at a time.
-`max_child_assignments` bounds the number of child assignments in the plan, and
-therefore the allowed fan-out, but it is not a parallel execution limit yet.
+automatically. `--max-concurrent-children N` bounds child execution and defaults
+to `1`. The default preserves legacy plan order, reports, artifact paths, and
+the literal `incoming` and `capture` scratch roots. Zero is rejected before run
+artifacts are reserved. `max_child_assignments` separately bounds plan fan-out;
+it is not the concurrency limit.
+
+With `N > 1`, only assignments whose normalized path sets are disjoint can run
+at the same time. Equality, ancestor, and descendant relationships use the
+same overlap semantics as path claims. An overlapping assignment waits while
+the scheduler scans ahead for later disjoint work, so overlap does not impose
+unnecessary head-of-line blocking. Retries and the parent review auditor remain
+inside the assignment's slot. An ordinary assignment failure does not stop
+unrelated work; a fatal scheduler abort stops new starts and joins every active
+call before returning.
+
+Concurrent outcomes are stored by plan index, keeping final reports, command
+records, findings, releases, and deterministic artifacts in plan order. Event
+journal appends are synchronized and well formed, although completion events
+may interleave. Concurrent invocations use unique bounded scratch roots to
+avoid collisions; `N = 1` retains the legacy literal scratch names.
 `max_child_retries` defaults to `0` and may be set up to `2`; retries are only
 used for child report-shape failures such as missing or invalid report JSON or
 the wrong report id/role, and the retry prompt includes corrective feedback.
