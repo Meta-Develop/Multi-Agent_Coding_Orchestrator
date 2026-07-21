@@ -1527,6 +1527,23 @@ impl AssignmentExecutionOutcome {
     }
 }
 
+fn record_assignment_spawn_failure(
+    indexed_outcomes: &mut [Option<AssignmentExecutionOutcome>],
+    stop_scheduling: &mut bool,
+    index: usize,
+    assignment_id: &str,
+    error: &std::io::Error,
+) -> Result<()> {
+    *stop_scheduling = true;
+    let slot = indexed_outcomes
+        .get_mut(index)
+        .context("spawn failure referenced an assignment outside the scheduler plan")?;
+    *slot = Some(AssignmentExecutionOutcome::fatal(format!(
+        "failed to spawn supervisor assignment '{assignment_id}' thread: {error}"
+    )));
+    Ok(())
+}
+
 struct AssignmentExecutionContext<'a, 'writer> {
     index: usize,
     concurrent_mode: bool,
@@ -1545,6 +1562,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     semantic_store: &'a SemanticIntentStore,
     prepared_semantic_token: Option<u64>,
     prepared_semantic_findings: &'a [Finding],
+    prepared_semantic_failed: bool,
     serial_semantic_warn_intents: Option<&'a Mutex<Vec<SemanticIntent>>>,
     semantic_block_order: Option<usize>,
     semantic_block_gate: Option<&'a SemanticBlockGate>,
@@ -1612,6 +1630,31 @@ fn record_isolated_assignment_failure(
     });
 }
 
+fn semantic_resolution_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with("unresolved semantic symbol:")
+            || message.starts_with("ambiguous semantic symbol ")
+            || message.starts_with("unresolved semantic module:")
+            || message == "symbol query cannot be empty"
+            || message == "module query cannot be empty"
+    })
+}
+
+fn semantic_resolution_finding(
+    assignment: &OrchestratorAssignment,
+    error: &anyhow::Error,
+) -> Finding {
+    Finding {
+        severity: FindingSeverity::Error,
+        message: format!(
+            "supervisor assignment '{}' failed during semantic resolution: {error:#}",
+            assignment.id
+        ),
+        paths: assignment.assigned_paths.clone(),
+    }
+}
+
 struct CompletionSignal {
     index: usize,
     sender: mpsc::Sender<usize>,
@@ -1670,6 +1713,7 @@ fn execute_supervisor_assignment_inner(
         semantic_store,
         prepared_semantic_token,
         prepared_semantic_findings,
+        prepared_semantic_failed,
         serial_semantic_warn_intents,
         semantic_block_order,
         semantic_block_gate,
@@ -1679,6 +1723,10 @@ fn execute_supervisor_assignment_inner(
     outcome
         .findings
         .extend(prepared_semantic_findings.iter().cloned());
+    if *prepared_semantic_failed {
+        outcome.assignment_failed = true;
+        return Ok(());
+    }
     let semantic_block_turn = match (semantic_block_gate, semantic_block_order) {
         (Some(gate), Some(order)) => Some(gate.wait_for_turn(*order)?),
         _ => None,
@@ -1771,7 +1819,7 @@ fn execute_supervisor_assignment_inner(
 
     let semantic_token = if plan.semantic_coordination == SemanticCoordinationMode::Warn {
         if let Some(planned_intents) = serial_semantic_warn_intents {
-            let coordination = {
+            let coordination_result = {
                 let mut planned_intents = match planned_intents.lock() {
                     Ok(planned_intents) => planned_intents,
                     Err(poisoned) => poisoned.into_inner(),
@@ -1783,7 +1831,18 @@ fn execute_supervisor_assignment_inner(
                     &mut outcome.semantic_tokens,
                     &mut planned_intents,
                     &mut outcome.findings,
-                )?
+                )
+            };
+            let coordination = match coordination_result {
+                Ok(coordination) => coordination,
+                Err(error) if semantic_resolution_error(&error) => {
+                    outcome.assignment_failed = true;
+                    outcome
+                        .findings
+                        .push(semantic_resolution_finding(assignment, &error));
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             };
             match coordination {
                 SemanticAssignmentCoordination::Ready(token) => token,
@@ -1796,15 +1855,26 @@ fn execute_supervisor_assignment_inner(
         }
     } else {
         let mut planned_semantic_intents = Vec::new();
-        let coordination = coordinate_semantic_assignment(
+        let coordination_result = coordinate_semantic_assignment(
             semantic_store,
             assignment,
             plan.semantic_coordination,
             &mut outcome.semantic_tokens,
             &mut planned_semantic_intents,
             &mut outcome.findings,
-        )?;
+        );
         drop(semantic_block_turn);
+        let coordination = match coordination_result {
+            Ok(coordination) => coordination,
+            Err(error) if semantic_resolution_error(&error) => {
+                outcome.assignment_failed = true;
+                outcome
+                    .findings
+                    .push(semantic_resolution_finding(assignment, &error));
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         match coordination {
             SemanticAssignmentCoordination::Ready(token) => token,
             SemanticAssignmentCoordination::Blocked(conflict_count) => {
@@ -2478,6 +2548,7 @@ fn plan_has_overlapping_assignments(plan: &SupervisorPlan) -> bool {
 struct PreparedSemanticAssignment {
     token: Option<u64>,
     findings: Vec<Finding>,
+    assignment_failed: bool,
 }
 
 fn prepare_semantic_warn_assignments(
@@ -2495,10 +2566,20 @@ fn prepare_semantic_warn_assignments(
 
     let mut planned_preview_intents = Vec::new();
     for (index, assignment) in plan.assignments.iter().enumerate() {
-        let report = store.preview_with_additional_active(
+        let report = match store.preview_with_additional_active(
             semantic_assignment_request(assignment),
             &planned_preview_intents,
-        )?;
+        ) {
+            Ok(report) => report,
+            Err(error) if semantic_resolution_error(&error) => {
+                prepared[index]
+                    .findings
+                    .push(semantic_resolution_finding(assignment, &error));
+                prepared[index].assignment_failed = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if report.has_blocking_conflicts || report.has_advisory_conflicts {
             prepared[index].findings.push(Finding {
                 severity: FindingSeverity::Warning,
@@ -2716,6 +2797,8 @@ fn run_supervisor_plan_with_runner_and_creation(
                         semantic_store,
                         prepared_semantic_token: prepared_semantic_assignments[index].token,
                         prepared_semantic_findings: &prepared_semantic_assignments[index].findings,
+                        prepared_semantic_failed: prepared_semantic_assignments[index]
+                            .assignment_failed,
                         serial_semantic_warn_intents: Some(&serial_semantic_warn_intents),
                         semantic_block_order: None,
                         semantic_block_gate: None,
@@ -2777,41 +2860,58 @@ fn run_supervisor_plan_with_runner_and_creation(
                                         order
                                     });
                                 let completion_sender = completion_sender.clone();
-                                let handle = scope.spawn(move || {
-                                    let _completion = CompletionSignal {
-                                        index,
-                                        sender: completion_sender,
-                                    };
-                                    execute_supervisor_assignment(AssignmentExecutionContext {
-                                        index,
-                                        concurrent_mode: true,
-                                        plan: plan_ref,
-                                        consultant: consultant_ref,
-                                        assignment,
-                                        options: options_ref,
-                                        repo: repo_ref,
-                                        run_dir: run_dir_ref,
-                                        dirs: dirs_ref,
-                                        execution_runtime,
-                                        worktree_creation,
-                                        manager: manager_ref,
-                                        reused: existing_ids_ref.contains(&assignment.id),
-                                        sync_store,
-                                        semantic_store,
-                                        prepared_semantic_token: prepared_semantic_assignments_ref
-                                            [index]
-                                            .token,
-                                        prepared_semantic_findings:
-                                            &prepared_semantic_assignments_ref[index].findings,
-                                        serial_semantic_warn_intents: None,
-                                        semantic_block_order,
-                                        semantic_block_gate: semantic_block_order
-                                            .map(|_| semantic_block_gate_ref),
-                                        artifacts: artifacts_ref,
-                                        external_runner,
-                                    })
-                                });
-                                active.insert(index, handle);
+                                let spawn_result =
+                                    thread::Builder::new().spawn_scoped(scope, move || {
+                                        let _completion = CompletionSignal {
+                                            index,
+                                            sender: completion_sender,
+                                        };
+                                        execute_supervisor_assignment(AssignmentExecutionContext {
+                                            index,
+                                            concurrent_mode: true,
+                                            plan: plan_ref,
+                                            consultant: consultant_ref,
+                                            assignment,
+                                            options: options_ref,
+                                            repo: repo_ref,
+                                            run_dir: run_dir_ref,
+                                            dirs: dirs_ref,
+                                            execution_runtime,
+                                            worktree_creation,
+                                            manager: manager_ref,
+                                            reused: existing_ids_ref.contains(&assignment.id),
+                                            sync_store,
+                                            semantic_store,
+                                            prepared_semantic_token:
+                                                prepared_semantic_assignments_ref[index].token,
+                                            prepared_semantic_findings:
+                                                &prepared_semantic_assignments_ref[index].findings,
+                                            prepared_semantic_failed:
+                                                prepared_semantic_assignments_ref[index]
+                                                    .assignment_failed,
+                                            serial_semantic_warn_intents: None,
+                                            semantic_block_order,
+                                            semantic_block_gate: semantic_block_order
+                                                .map(|_| semantic_block_gate_ref),
+                                            artifacts: artifacts_ref,
+                                            external_runner,
+                                        })
+                                    });
+                                match spawn_result {
+                                    Ok(handle) => {
+                                        active.insert(index, handle);
+                                    }
+                                    Err(error) => {
+                                        record_assignment_spawn_failure(
+                                            &mut indexed_outcomes,
+                                            &mut stop_scheduling,
+                                            index,
+                                            &assignment.id,
+                                            &error,
+                                        )?;
+                                        break;
+                                    }
+                                }
                             }
                         }
 
@@ -8089,6 +8189,35 @@ mod tests {
     }
 
     #[test]
+    fn scoped_spawn_failure_records_fatal_index_and_stops_new_scheduling() {
+        let mut indexed_outcomes = (0..3)
+            .map(|_| None)
+            .collect::<Vec<Option<AssignmentExecutionOutcome>>>();
+        let mut stop_scheduling = false;
+        record_assignment_spawn_failure(
+            &mut indexed_outcomes,
+            &mut stop_scheduling,
+            1,
+            "child-b",
+            &std::io::Error::other("injected scoped spawn failure"),
+        )
+        .expect("record injected spawn failure");
+
+        assert!(stop_scheduling);
+        assert!(indexed_outcomes[0].is_none());
+        assert!(indexed_outcomes[2].is_none());
+        let outcome = indexed_outcomes[1]
+            .as_ref()
+            .expect("spawn failure outcome at plan index");
+        assert!(outcome.requires_scheduler_abort());
+        assert!(outcome
+            .fatal_error
+            .as_deref()
+            .is_some_and(|message| message.contains("child-b")
+                && message.contains("injected scoped spawn failure")));
+    }
+
+    #[test]
     fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_names() {
         let (temp, repo_path) = injected_repository();
         let assignments = vec![
@@ -8270,6 +8399,82 @@ mod tests {
         assert!(report.findings.iter().all(|finding| !finding
             .message
             .contains("semantic coordination warn-mode preview")));
+    }
+
+    #[test]
+    fn semantic_resolution_failure_does_not_stop_healthy_assignment_at_any_bound() {
+        for (case, semantic_coordination, max_concurrent_children) in [
+            ("warn-serial", SemanticCoordinationMode::Warn, 1usize),
+            ("warn-concurrent", SemanticCoordinationMode::Warn, 2usize),
+            ("block-concurrent", SemanticCoordinationMode::Block, 2usize),
+        ] {
+            let (temp, repo_path) = injected_repository();
+            fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
+            fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n")
+                .expect("write injected Rust source");
+            commit_injected_repository(&repo_path, "add semantic resolution fixture");
+            let mut assignments = vec![
+                injected_named_assignment("bad-semantic", "README.md"),
+                injected_named_assignment("healthy-semantic", "src/lib.rs"),
+            ];
+            assignments[0].semantic_symbols = vec!["MissingSymbol".to_string()];
+            assignments[1].semantic_symbols = vec!["Shared".to_string()];
+            let mut plan = injected_multi_plan(assignments.clone(), 0);
+            plan.semantic_coordination = semantic_coordination;
+            let options = injected_options(
+                &repo_path,
+                temp.path(),
+                &format!("semantic-resolution-isolation-{case}"),
+            );
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let runner = {
+                let assignments = assignments.clone();
+                let started = Arc::clone(&started);
+                move |command: &ExternalAgentCommand| {
+                    let id = injected_command_assignment_id(command);
+                    started
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(id.clone());
+                    let assignment = assignments
+                        .iter()
+                        .find(|assignment| assignment.id == id)
+                        .unwrap_or_else(|| panic!("missing assignment {id}"));
+                    write_injected_assignment_report(command, assignment);
+                    injected_verified_run(command)
+                }
+            };
+
+            let report = run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                max_concurrent_children,
+                &runner,
+            )
+            .expect("semantic resolution failure remains assignment-local");
+            assert!(!report.success);
+            assert_eq!(
+                *started
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                vec!["healthy-semantic".to_string()],
+                "case {case}"
+            );
+            assert_eq!(
+                report
+                    .orchestrator_reports
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["healthy-semantic"],
+                "case {case}"
+            );
+            assert!(report.findings.iter().any(|finding| finding
+                .message
+                .contains("bad-semantic' failed during semantic resolution: unresolved semantic symbol: MissingSymbol")),
+                "case {case}: {:?}", report.findings);
+        }
     }
 
     #[test]
