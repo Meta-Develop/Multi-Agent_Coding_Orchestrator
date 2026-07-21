@@ -8937,12 +8937,16 @@ mod tests {
                     .find(|assignment| assignment.id == id)
                     .unwrap_or_else(|| panic!("missing assignment {id}"));
                 write_injected_assignment_report(command, assignment);
-                let mut run = injected_verified_run(command);
                 if id == "child-a" {
-                    run.exit_code = Some(7);
-                    run.error = Some("exit status 7".to_string());
+                    let run = injected_verified_nonzero_run(command, 7);
+                    assert!(external_safety_verified(&run, SupervisorRuntime::Codex));
+                    assert!(run.codex_permissions.is_some());
+                    assert!(!run.publishable);
+                    assert!(!run.succeeded());
+                    run
+                } else {
+                    injected_verified_run(command)
                 }
-                run
             }
         };
 
@@ -11011,6 +11015,17 @@ mod tests {
     fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalAgentRun {
         write_injected_worker_journals_from_report(command);
         injected_verified_run_without_journals(command)
+    }
+
+    fn injected_verified_nonzero_run(
+        command: &ExternalAgentCommand,
+        exit_code: i32,
+    ) -> ExternalAgentRun {
+        let mut run = injected_verified_run(command);
+        run.exit_code = Some(exit_code);
+        run.publishable = false;
+        run.error = Some(format!("external agent exited with status {exit_code}"));
+        run
     }
 
     fn injected_verified_run_without_journals(command: &ExternalAgentCommand) -> ExternalAgentRun {

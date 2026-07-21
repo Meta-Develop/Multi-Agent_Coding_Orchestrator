@@ -1,8 +1,8 @@
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, CapturedBytes, EnvironmentMode,
-    ExternalCodexProfile, ProcessCancellation, ProcessRunError, ProcessSpec, ProcessTreeEvidence,
-    SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode, StreamCapture,
-    StrictOfflineWorkspaceProfile, WorkspaceAccess,
+    ExternalCodexProfile, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
+    ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode,
+    StreamCapture, StrictOfflineWorkspaceProfile, WorkspaceAccess,
 };
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
@@ -580,57 +580,18 @@ fn run_external_agent_runtime(
 
     report.stdout.target_launch_attempted = true;
     match run_process_cancellable(process_spec, cancellation) {
-        Ok(output) => {
-            let safety_verified = output.safety_evidence_verified();
-            report.exit_code = output.status.and_then(|status| status.code());
-            report.timed_out = output.timed_out;
-            report.process_tree = Some(output.process_tree);
-            report.side_effects = Some(output.side_effects);
-            if runtime == ExternalExecutionRuntime::Verified
-                && program_trust == ExternalProgramTrust::TrustedSystemCodex
-                && safety_verified
-                && output.status.is_some_and(|status| status.success())
-            {
-                report.codex_permissions = codex_version.map(|version| {
-                    codex_permission_evidence(version, spec, &argv_digest, &program_identity)
-                });
-            }
-            report.stdout = summarize_output(&output.stdout);
-            report.stdout.target_launch_attempted = true;
-            report.stderr = summarize_output(&output.stderr);
-            report.error = append_external_error(output.stdin_error, output.process_error);
-            if output.timed_out {
-                report.error = append_external_error(
-                    report.error.take(),
-                    Some(format!(
-                        "external agent timed out after {} seconds",
-                        spec.timeout.as_secs()
-                    )),
-                );
-            } else if !output.timed_out && !output.status.is_some_and(|status| status.success()) {
-                let status_error = match output.status.and_then(|status| status.code()) {
-                    Some(code) => format!("external agent exited with status {code}"),
-                    None => "external agent terminated without an exit code".to_string(),
-                };
-                report.error = append_external_error(report.error.take(), Some(status_error));
-            }
-            match output_reservation.read_bounded(OUTPUT_TEE_LIMIT_BYTES) {
-                Ok(bytes) => report.output_last_message = Some(bytes),
-                Err(error) => {
-                    report.error = append_external_error(
-                        report.error.take(),
-                        Some(format!(
-                            "external-agent output reservation changed: {error}"
-                        )),
-                    );
-                }
-            }
-            report.publishable = runtime == ExternalExecutionRuntime::Verified
-                && safety_verified
-                && report.program_trust == ExternalProgramTrust::TrustedSystemCodex
-                && report.codex_permissions.is_some()
-                && report.error.is_none();
-        }
+        Ok(output) => record_completed_target(
+            &mut report,
+            output,
+            &output_reservation,
+            CompletedTargetContext {
+                runtime,
+                codex_version,
+                spec,
+                argv_digest: &argv_digest,
+                program_identity: &program_identity,
+            },
+        ),
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
             if let Some(evidence) = error.cancellation_evidence() {
@@ -645,6 +606,79 @@ fn run_external_agent_runtime(
     }
     report.duration_ms = duration_millis(started.elapsed());
     report
+}
+
+struct CompletedTargetContext<'a> {
+    runtime: ExternalExecutionRuntime,
+    codex_version: Option<(u64, u64, u64)>,
+    spec: &'a ExternalAgentCommand,
+    argv_digest: &'a str,
+    program_identity: &'a ExternalProgramIdentity,
+}
+
+fn record_completed_target(
+    report: &mut ExternalAgentRun,
+    output: ProcessOutput,
+    output_reservation: &ReservedOutputFile,
+    context: CompletedTargetContext<'_>,
+) {
+    let safety_verified = output.safety_evidence_verified();
+    report.exit_code = output.status.and_then(|status| status.code());
+    report.timed_out = output.timed_out;
+    report.process_tree = Some(output.process_tree);
+    report.side_effects = Some(output.side_effects);
+    // Permission evidence describes the verified launch boundary, not the target's exit status.
+    // Supervisors consume it as containment evidence even when the assignment itself fails.
+    if context.runtime == ExternalExecutionRuntime::Verified
+        && report.program_trust == ExternalProgramTrust::TrustedSystemCodex
+        && safety_verified
+    {
+        report.codex_permissions = context.codex_version.map(|version| {
+            codex_permission_evidence(
+                version,
+                context.spec,
+                context.argv_digest,
+                context.program_identity,
+            )
+        });
+    }
+    report.stdout = summarize_output(&output.stdout);
+    report.stdout.target_launch_attempted = true;
+    report.stderr = summarize_output(&output.stderr);
+    report.error = append_external_error(output.stdin_error, output.process_error);
+    if output.timed_out {
+        report.error = append_external_error(
+            report.error.take(),
+            Some(format!(
+                "external agent timed out after {} seconds",
+                context.spec.timeout.as_secs()
+            )),
+        );
+    } else if !output.status.is_some_and(|status| status.success()) {
+        let status_error = match output.status.and_then(|status| status.code()) {
+            Some(code) => format!("external agent exited with status {code}"),
+            None => "external agent terminated without an exit code".to_string(),
+        };
+        report.error = append_external_error(report.error.take(), Some(status_error));
+    }
+    match output_reservation.read_bounded(OUTPUT_TEE_LIMIT_BYTES) {
+        Ok(bytes) => report.output_last_message = Some(bytes),
+        Err(error) => {
+            report.error = append_external_error(
+                report.error.take(),
+                Some(format!(
+                    "external-agent output reservation changed: {error}"
+                )),
+            );
+        }
+    }
+    report.publishable = context.runtime == ExternalExecutionRuntime::Verified
+        && safety_verified
+        && report.program_trust == ExternalProgramTrust::TrustedSystemCodex
+        && report.codex_permissions.is_some()
+        && report.exit_code == Some(0)
+        && !report.timed_out
+        && report.error.is_none();
 }
 
 fn failed_external_run(
@@ -1469,6 +1503,101 @@ mod tests {
             executable_identity: "identity".to_string(),
         });
         assert!(report.succeeded());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Result<()> {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+        use std::process::ExitStatus;
+
+        let temp = tempfile::tempdir()?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let prompt = temp.path().join("prompt.md");
+        fs::write(&prompt, "run a failing child\n")?;
+        let output_path = incoming.join("report.json");
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            &output_path,
+            Duration::from_secs(5),
+        );
+        let output_reservation = reserve_external_output(&output_path)?;
+        let identity_path = temp.path().join("trusted-codex-identity");
+        fs::write(&identity_path, b"identity")?;
+        let program_identity = external_program_identity(&identity_path)?;
+        let mut report = ExternalAgentRun {
+            command: vec!["codex".to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: command.timeout.as_secs(),
+            exit_code: None,
+            duration_ms: 0,
+            timed_out: false,
+            process_tree: None,
+            side_effects: None,
+            publishable: false,
+            program_trust: ExternalProgramTrust::TrustedSystemCodex,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: None,
+        };
+        let output = ProcessOutput {
+            status: Some(ExitStatus::from_raw(7 << 8)),
+            duration: Duration::from_millis(2),
+            timed_out: false,
+            process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ),
+            side_effects: SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            stdout: CapturedBytes::default(),
+            stderr: CapturedBytes::default(),
+            process_error: None,
+            stdin_error: None,
+        };
+
+        record_completed_target(
+            &mut report,
+            output,
+            &output_reservation,
+            CompletedTargetContext {
+                runtime: ExternalExecutionRuntime::Verified,
+                codex_version: Some((0, 142, 3)),
+                spec: &command,
+                argv_digest: "verified-argv-digest",
+                program_identity: &program_identity,
+            },
+        );
+
+        assert_eq!(report.exit_code, Some(7));
+        assert_eq!(
+            report.process_tree,
+            Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService
+            ))
+        );
+        assert_eq!(
+            report.side_effects,
+            Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex
+            ))
+        );
+        assert!(report.codex_permissions.is_some());
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("exited with status 7")));
+        assert!(!report.publishable);
+        assert!(!report.safely_executed());
+        assert!(!report.succeeded());
+        Ok(())
     }
 
     #[test]
