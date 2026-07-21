@@ -66,14 +66,19 @@ impl ScopeSnapshot {
             .map(|run| run.events.as_slice())
     }
 
-    pub fn all_events(&self) -> Vec<NormalizedEvent> {
+    pub fn all_events(&self) -> Vec<FamilyEvent> {
         let mut events = self
             .projects
             .iter()
             .flat_map(|project| project.runs.iter())
-            .flat_map(|run| run.events.iter().cloned())
+            .flat_map(|run| {
+                run.events.iter().cloned().map(|event| FamilyEvent {
+                    family: run.family.clone(),
+                    event,
+                })
+            })
             .collect::<Vec<_>>();
-        sort_and_deduplicate(&mut events);
+        sort_and_deduplicate_family_events(&mut events);
         events
     }
 }
@@ -98,6 +103,12 @@ pub struct RunSummary {
 }
 
 pub type NormalizedEvent = OrchestrationEvent;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FamilyEvent {
+    pub family: String,
+    pub event: NormalizedEvent,
+}
 
 pub fn scan_repositories(repositories: &[RepositoryTarget]) -> io::Result<ScopeSnapshot> {
     if repositories.len() > MAX_REPOSITORIES {
@@ -1435,17 +1446,7 @@ fn relative_source(directory: &Path, path: &Path, prefix: &str) -> String {
 }
 
 fn sort_and_deduplicate(events: &mut Vec<NormalizedEvent>) {
-    events.sort_by(|left, right| {
-        left.ts
-            .cmp(&right.ts)
-            .then_with(|| left.repo.cmp(&right.repo))
-            .then_with(|| left.run.cmp(&right.run))
-            .then_with(|| left.node.cmp(&right.node))
-            .then_with(|| left.parent.cmp(&right.parent))
-            .then_with(|| role_rank(left.role).cmp(&role_rank(right.role)))
-            .then_with(|| event_kind_rank(left.kind).cmp(&event_kind_rank(right.kind)))
-            .then_with(|| left.payload.to_string().cmp(&right.payload.to_string()))
-    });
+    events.sort_by(compare_events);
     let mut seen = BTreeSet::new();
     events.retain(|event| {
         let Ok(encoded) = serde_json::to_string(event) else {
@@ -1453,6 +1454,31 @@ fn sort_and_deduplicate(events: &mut Vec<NormalizedEvent>) {
         };
         seen.insert(encoded)
     });
+}
+
+fn sort_and_deduplicate_family_events(events: &mut Vec<FamilyEvent>) {
+    events.sort_by(|left, right| {
+        compare_events(&left.event, &right.event).then_with(|| left.family.cmp(&right.family))
+    });
+    let mut seen = BTreeSet::new();
+    events.retain(|event| {
+        let Ok(encoded) = serde_json::to_string(&event.event) else {
+            return false;
+        };
+        seen.insert((event.family.clone(), encoded))
+    });
+}
+
+fn compare_events(left: &NormalizedEvent, right: &NormalizedEvent) -> std::cmp::Ordering {
+    left.ts
+        .cmp(&right.ts)
+        .then_with(|| left.repo.cmp(&right.repo))
+        .then_with(|| left.run.cmp(&right.run))
+        .then_with(|| left.node.cmp(&right.node))
+        .then_with(|| left.parent.cmp(&right.parent))
+        .then_with(|| role_rank(left.role).cmp(&role_rank(right.role)))
+        .then_with(|| event_kind_rank(left.kind).cmp(&event_kind_rank(right.kind)))
+        .then_with(|| left.payload.to_string().cmp(&right.payload.to_string()))
 }
 
 fn role_rank(role: OrchestrationRole) -> u8 {
@@ -1535,6 +1561,35 @@ mod tests {
     fn write(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
         fs::write(path, contents).expect("write fixture");
+    }
+
+    #[test]
+    fn all_events_keeps_identical_records_from_distinct_families() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let event = concat!(
+            r#"{"ts":"2026-07-20T00:00:00Z","repo":"journal-repo","run":"shared-run","node":"worker-a","parent":null,"role":"worker","kind":"status","payload":{"status":"running"}}"#,
+            "\n"
+        );
+        write(
+            &temp
+                .path()
+                .join(".maco/autopilot/runs/shared-run/events/orchestration.jsonl"),
+            event,
+        );
+        write(
+            &temp
+                .path()
+                .join(".maco/o2/runs/shared-run/events/orchestration.jsonl"),
+            event,
+        );
+
+        let snapshot = scan_repositories(&[target(temp.path())]).expect("scan duplicate families");
+        let events = snapshot.all_events();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].family, "autopilot");
+        assert_eq!(events[1].family, "o2");
+        assert_eq!(events[0].event, events[1].event);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::inbox::load_workspace_repositories;
-use normalize::{scan_repositories, NormalizedEvent, RepositoryTarget};
+use normalize::{scan_repositories, FamilyEvent, NormalizedEvent, RepositoryTarget};
 use server::ScopeDataSource;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,7 +54,7 @@ impl ScopeDataSource for ScanningDataSource {
             .map(<[NormalizedEvent]>::to_vec))
     }
 
-    fn stream_events(&self) -> Result<Vec<NormalizedEvent>> {
+    fn stream_events(&self) -> Result<Vec<FamilyEvent>> {
         Ok(self.snapshot()?.all_events())
     }
 }
@@ -358,6 +358,7 @@ mod tests {
             serde_json::from_str(http_body(&events_response)).expect("events response JSON");
         let events = events.as_array().expect("events array");
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["family"], "o2");
         assert_eq!(events[0]["repo"], "fixture-repo");
         assert_eq!(events[0]["run"], "run-1");
         assert_eq!(events[0]["node"], "worker-1");
@@ -388,6 +389,7 @@ mod tests {
             .find_map(|line| line.strip_prefix("data: "))
             .expect("SSE data line");
         let event: Value = serde_json::from_str(data).expect("SSE event JSON");
+        assert_eq!(event["family"], "o2");
         assert_eq!(event["repo"], "fixture-repo");
         assert_eq!(event["node"], "worker-1");
 

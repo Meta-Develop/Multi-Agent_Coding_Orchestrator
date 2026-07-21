@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 
 use crate::{artifacts::state_auth::sha256_hex, orchestration_event::OrchestrationEvent};
 
+use super::normalize::FamilyEvent;
+
 const SCOPE_HTML: &str = include_str!("placeholder.html");
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,7 +68,14 @@ pub(crate) trait ScopeDataSource: Send + Sync {
         run_id: &str,
     ) -> Result<Option<Vec<OrchestrationEvent>>>;
 
-    fn stream_events(&self) -> Result<Vec<OrchestrationEvent>>;
+    fn stream_events(&self) -> Result<Vec<FamilyEvent>>;
+}
+
+#[derive(Serialize)]
+struct ScopeEventPayload<'a> {
+    family: &'a str,
+    #[serde(flatten)]
+    event: &'a OrchestrationEvent,
 }
 
 pub(crate) fn validate_loopback_bind(bind: &str) -> Result<SocketAddr> {
@@ -232,13 +241,22 @@ fn write_run_events_response(
     };
 
     match source.events(&repo_id, &family, &run_id) {
-        Ok(Some(events)) => write_json_response(
-            stream,
-            "200 OK",
-            &events,
-            &[],
-            config.max_json_response_bytes,
-        ),
+        Ok(Some(events)) => {
+            let payloads = events
+                .iter()
+                .map(|event| ScopeEventPayload {
+                    family: &family,
+                    event,
+                })
+                .collect::<Vec<_>>();
+            write_json_response(
+                stream,
+                "200 OK",
+                &payloads,
+                &[],
+                config.max_json_response_bytes,
+            )
+        }
         Ok(None) => write_json_response(
             stream,
             "404 Not Found",
@@ -334,8 +352,12 @@ fn write_event_stream(
                 } else {
                     let mut current_scan = BTreeSet::new();
                     for event in events {
+                        let payload = ScopeEventPayload {
+                            family: &event.family,
+                            event: &event.event,
+                        };
                         let serialized =
-                            match serialize_json_bounded(&event, config.max_sse_event_bytes) {
+                            match serialize_json_bounded(&payload, config.max_sse_event_bytes) {
                                 Ok(serialized) => serialized,
                                 Err(_) => {
                                     stream.write_all(b": event exceeds serialization limit\n\n")?;
@@ -609,7 +631,7 @@ mod tests {
 
     struct TestDataSource {
         projects: Value,
-        events: Mutex<Vec<OrchestrationEvent>>,
+        events: Mutex<Vec<FamilyEvent>>,
         expected_route: Option<(String, String, String)>,
     }
 
@@ -617,7 +639,12 @@ mod tests {
         fn new(projects: Value, events: Vec<OrchestrationEvent>) -> Self {
             Self {
                 projects,
-                events: Mutex::new(events),
+                events: Mutex::new(
+                    events
+                        .into_iter()
+                        .map(|event| family_event("o2", event))
+                        .collect(),
+                ),
                 expected_route: None,
             }
         }
@@ -629,6 +656,13 @@ mod tests {
         }
 
         fn set_events(&self, events: Vec<OrchestrationEvent>) {
+            *self.events.lock().expect("lock test events") = events
+                .into_iter()
+                .map(|event| family_event("o2", event))
+                .collect();
+        }
+
+        fn set_stream_events(&self, events: Vec<FamilyEvent>) {
             *self.events.lock().expect("lock test events") = events;
         }
     }
@@ -649,10 +683,17 @@ mod tests {
             }) {
                 return Ok(None);
             }
-            Ok(Some(self.events.lock().expect("lock test events").clone()))
+            Ok(Some(
+                self.events
+                    .lock()
+                    .expect("lock test events")
+                    .iter()
+                    .map(|event| event.event.clone())
+                    .collect(),
+            ))
         }
 
-        fn stream_events(&self) -> Result<Vec<OrchestrationEvent>> {
+        fn stream_events(&self) -> Result<Vec<FamilyEvent>> {
             Ok(self.events.lock().expect("lock test events").clone())
         }
     }
@@ -720,6 +761,13 @@ mod tests {
             role: OrchestrationRole::Worker,
             kind: OrchestrationEventKind::Status,
             payload,
+        }
+    }
+
+    fn family_event(family: &str, event: OrchestrationEvent) -> FamilyEvent {
+        FamilyEvent {
+            family: family.to_string(),
+            event,
         }
     }
 
@@ -835,6 +883,7 @@ mod tests {
             "/api/runs/repo%20space/family%25+name/run-%E6%97%A5%E6%9C%AC%2Fpart/events",
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"family\":\"family%+name\""));
         assert!(response.contains("\"node\":\"encoded-route\""));
 
         for path in [
@@ -864,6 +913,8 @@ mod tests {
         assert!(response.contains("MACO_SCOPE_SPAWN_TREE_UI"));
         assert!(response.contains("id=\"edgeSummary\""));
         assert!(response.contains("reviewed_worker_ids"));
+        assert!(response.contains("event.family !== state.selectedRun.family"));
+        assert!(response.contains("event.family === pending.family"));
         server.stop();
     }
 
@@ -958,6 +1009,7 @@ mod tests {
         let mut response = Vec::new();
 
         read_until(&mut stream, &mut response, "\"node\":\"worker-1\"");
+        read_until(&mut stream, &mut response, "\"family\":\"o2\"");
         read_until(&mut stream, &mut response, ": heartbeat");
         source.set_events(vec![first, second]);
         read_until(&mut stream, &mut response, "\"node\":\"worker-2\"");
@@ -967,5 +1019,45 @@ mod tests {
         assert_eq!(response.matches("\"node\":\"worker-2\"").count(), 1);
         assert!(response.contains(": heartbeat\n\n"));
         server.stop();
+    }
+
+    #[test]
+    fn stream_keeps_identical_events_from_distinct_families() {
+        let duplicate = event("shared-worker", json!({"status": "running"}));
+        let source = Arc::new(TestDataSource::new(json!({"projects": []}), Vec::new()));
+        source.set_stream_events(vec![
+            family_event("autopilot", duplicate.clone()),
+            family_event("o2", duplicate),
+        ]);
+        let stream_source: Arc<dyn ScopeDataSource> = source;
+        let mut server = TestServer::start(stream_source, test_config());
+        let mut stream = open_stream(server.address, "/api/stream");
+        let mut response = Vec::new();
+
+        read_until(&mut stream, &mut response, "\"family\":\"autopilot\"");
+        read_until(&mut stream, &mut response, "\"family\":\"o2\"");
+
+        let response = String::from_utf8(response).expect("SSE response UTF-8");
+        assert_eq!(response.matches("\"node\":\"shared-worker\"").count(), 2);
+        assert_eq!(response.matches("\"family\":\"autopilot\"").count(), 1);
+        assert_eq!(response.matches("\"family\":\"o2\"").count(), 1);
+        server.stop();
+    }
+
+    #[test]
+    fn transport_payload_adds_family_without_changing_normalized_event_serialization() {
+        let event = event("worker-1", json!({"status": "running"}));
+        let normalized = serde_json::to_value(&event).expect("normalized event JSON");
+        assert!(normalized.get("family").is_none());
+
+        let payload = serde_json::to_value(ScopeEventPayload {
+            family: "o2-autopilot",
+            event: &event,
+        })
+        .expect("Scope transport event JSON");
+        assert_eq!(payload["family"], "o2-autopilot");
+        assert_eq!(payload["repo"], normalized["repo"]);
+        assert_eq!(payload["run"], normalized["run"]);
+        assert_eq!(payload["payload"], normalized["payload"]);
     }
 }

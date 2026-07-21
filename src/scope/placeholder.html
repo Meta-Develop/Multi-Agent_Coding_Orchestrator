@@ -1182,6 +1182,7 @@
           state.pendingLoad = {
             token: token,
             repo: String(project.id),
+            family: String(run.family),
             run: String(run.run),
             liveEvents: [],
             liveKeys: new Set()
@@ -1220,9 +1221,12 @@
             try {
               var event = JSON.parse(message.data);
               if (!state.selectedProject || !state.selectedRun) return;
-              if (event.repo !== state.selectedProject.id || event.run !== state.selectedRun.run) return;
+              if (event.repo !== state.selectedProject.id ||
+                  event.family !== state.selectedRun.family ||
+                  event.run !== state.selectedRun.run) return;
               var pending = state.pendingLoad;
-              if (pending && pending.token === state.loadToken && event.repo === pending.repo && event.run === pending.run) {
+              if (pending && pending.token === state.loadToken &&
+                  event.repo === pending.repo && event.family === pending.family && event.run === pending.run) {
                 var key = eventKey(event);
                 if (!pending.liveKeys.has(key)) {
                   pending.liveKeys.add(key);
