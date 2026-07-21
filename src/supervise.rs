@@ -1483,6 +1483,7 @@ struct AssignmentExecutionOutcome {
     release_errors: Vec<String>,
     released_semantic_intents: Vec<SemanticIntent>,
     semantic_release_errors: Vec<String>,
+    assignment_failed: bool,
     external_containment_failed: bool,
     fatal_error: Option<String>,
 }
@@ -1500,6 +1501,14 @@ fn release_concurrent_assignment(
     outcome.release_errors = release_errors;
     outcome.released_semantic_intents = released_semantic_intents;
     outcome.semantic_release_errors = semantic_release_errors;
+    if outcome.fatal_error.is_none()
+        && (!outcome.release_errors.is_empty() || !outcome.semantic_release_errors.is_empty())
+    {
+        outcome.fatal_error = Some(
+            "supervisor assignment cleanup failed; scheduling stopped after joining active assignments"
+                .to_string(),
+        );
+    }
 }
 
 impl AssignmentExecutionOutcome {
@@ -1511,7 +1520,10 @@ impl AssignmentExecutionOutcome {
     }
 
     fn requires_scheduler_abort(&self) -> bool {
-        self.fatal_error.is_some() || self.external_containment_failed
+        self.fatal_error.is_some()
+            || self.external_containment_failed
+            || !self.release_errors.is_empty()
+            || !self.semantic_release_errors.is_empty()
     }
 }
 
@@ -1531,8 +1543,73 @@ struct AssignmentExecutionContext<'a, 'writer> {
     reused: bool,
     sync_store: &'a SyncStore,
     semantic_store: &'a SemanticIntentStore,
+    prepared_semantic_token: Option<u64>,
+    prepared_semantic_findings: &'a [Finding],
+    serial_semantic_warn_intents: Option<&'a Mutex<Vec<SemanticIntent>>>,
+    semantic_block_order: Option<usize>,
+    semantic_block_gate: Option<&'a SemanticBlockGate>,
     artifacts: &'a Mutex<SharedSupervisorArtifacts<'writer>>,
     external_runner: &'a (dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
+}
+
+#[derive(Default)]
+struct SemanticBlockGate {
+    next_order: Mutex<usize>,
+    changed: std::sync::Condvar,
+}
+
+struct SemanticBlockTurn<'a> {
+    next_order: std::sync::MutexGuard<'a, usize>,
+    gate: &'a SemanticBlockGate,
+}
+
+impl Drop for SemanticBlockTurn<'_> {
+    fn drop(&mut self) {
+        *self.next_order = self.next_order.saturating_add(1);
+        self.gate.changed.notify_all();
+    }
+}
+
+impl SemanticBlockGate {
+    fn wait_for_turn(&self, order: usize) -> Result<SemanticBlockTurn<'_>> {
+        let mut next_order = match self.next_order.lock() {
+            Ok(next_order) => next_order,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while *next_order < order {
+            next_order = match self.changed.wait(next_order) {
+                Ok(next_order) => next_order,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if *next_order != order {
+            bail!(
+                "semantic Block dispatch order {order} was already passed at {}",
+                *next_order
+            );
+        }
+        Ok(SemanticBlockTurn {
+            next_order,
+            gate: self,
+        })
+    }
+}
+
+fn record_isolated_assignment_failure(
+    outcome: &mut AssignmentExecutionOutcome,
+    assignment: &OrchestratorAssignment,
+    stage: &str,
+    error: &anyhow::Error,
+) {
+    outcome.assignment_failed = true;
+    outcome.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: format!(
+            "supervisor assignment '{}' failed during {stage}: {error:#}",
+            assignment.id
+        ),
+        paths: assignment.assigned_paths.clone(),
+    });
 }
 
 struct CompletionSignal {
@@ -1550,12 +1627,23 @@ fn execute_supervisor_assignment(
     context: AssignmentExecutionContext<'_, '_>,
 ) -> AssignmentExecutionOutcome {
     let mut outcome = AssignmentExecutionOutcome::default();
-    let result = execute_supervisor_assignment_inner(&context, &mut outcome);
-    if let Err(error) = result {
-        outcome.fatal_error = Some(format!(
-            "supervisor assignment '{}' aborted: {error:#}",
-            context.assignment.id
-        ));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_supervisor_assignment_inner(&context, &mut outcome)
+    }));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            outcome.fatal_error = Some(format!(
+                "supervisor assignment '{}' aborted: {error:#}",
+                context.assignment.id
+            ));
+        }
+        Err(_) => {
+            outcome.fatal_error = Some(format!(
+                "supervisor assignment '{}' panicked",
+                context.assignment.id
+            ));
+        }
     }
     outcome
 }
@@ -1580,9 +1668,21 @@ fn execute_supervisor_assignment_inner(
         reused,
         sync_store,
         semantic_store,
+        prepared_semantic_token,
+        prepared_semantic_findings,
+        serial_semantic_warn_intents,
+        semantic_block_order,
+        semantic_block_gate,
         artifacts,
         external_runner,
     } = context;
+    outcome
+        .findings
+        .extend(prepared_semantic_findings.iter().cloned());
+    let semantic_block_turn = match (semantic_block_gate, semantic_block_order) {
+        (Some(gate), Some(order)) => Some(gate.wait_for_turn(*order)?),
+        _ => None,
+    };
     let current_primary_head = current_head_oid(repo)?;
     if !reused {
         let create_options = WorktreeCreateOptions {
@@ -1591,7 +1691,7 @@ fn execute_supervisor_assignment_inner(
             base: None,
             worktree_root: None,
         };
-        match worktree_creation {
+        let create_result = match worktree_creation {
             SupervisorWorktreeCreation::Bound(cleanliness) => manager
                 .create_with_repository_cleanliness(create_options, cleanliness)
                 .with_context(|| {
@@ -1599,51 +1699,128 @@ fn execute_supervisor_assignment_inner(
                         "failed to create capability-bound child worktree '{}'",
                         assignment.id
                     )
-                })?,
+                }),
             #[cfg(test)]
-            SupervisorWorktreeCreation::TestOnly => manager.create_for_test(create_options)?,
+            SupervisorWorktreeCreation::TestOnly => manager.create_for_test(create_options),
         };
+        if let Err(error) = create_result {
+            record_isolated_assignment_failure(outcome, assignment, "worktree creation", &error);
+            return Ok(());
+        }
     }
-    let worktree_write_lease = manager
+    let worktree_write_lease = match manager
         .acquire_write_execution_lease(&assignment.id)
         .with_context(|| {
             format!(
                 "failed to acquire exclusive execution lease for child worktree '{}'",
                 assignment.id
             )
-        })?;
+        }) {
+        Ok(lease) => lease,
+        Err(error) => {
+            record_isolated_assignment_failure(
+                outcome,
+                assignment,
+                "worktree execution lease acquisition",
+                &error,
+            );
+            return Ok(());
+        }
+    };
     let worktree = worktree_write_lease.record().clone();
     if *reused {
-        ensure_reusable_child_worktree(&worktree, &current_primary_head)?;
+        if let Err(error) = ensure_reusable_child_worktree(&worktree, &current_primary_head) {
+            record_isolated_assignment_failure(
+                outcome,
+                assignment,
+                "reusable worktree validation",
+                &error,
+            );
+            return Ok(());
+        }
     }
-    let child_base_head = current_head_oid(&worktree.path).with_context(|| {
+    let child_base_head = match current_head_oid(&worktree.path).with_context(|| {
         format!(
             "failed to capture base HEAD for child worktree '{}' at {}",
             assignment.id,
             worktree.path.display()
         )
-    })?;
+    }) {
+        Ok(head) => head,
+        Err(error) => {
+            record_isolated_assignment_failure(
+                outcome,
+                assignment,
+                "worktree HEAD capture",
+                &error,
+            );
+            return Ok(());
+        }
+    };
     let claim = match sync_store.claim_paths(&assignment.id, assignment.assigned_paths.iter()) {
         Ok(claim) => claim,
         Err(error) => {
             outcome
                 .findings
                 .push(claim_failure_finding(sync_store, assignment, &error));
-            return Err(error)
-                .with_context(|| format!("failed to claim paths for '{}'", assignment.id));
+            outcome.assignment_failed = true;
+            return Ok(());
         }
     };
     outcome.claim_tokens.push(claim.token);
 
-    let mut planned_semantic_intents = Vec::new();
-    let semantic_token = coordinate_semantic_assignment(
-        semantic_store,
-        assignment,
-        plan.semantic_coordination,
-        &mut outcome.semantic_tokens,
-        &mut planned_semantic_intents,
-        &mut outcome.findings,
-    )?;
+    let semantic_token = if plan.semantic_coordination == SemanticCoordinationMode::Warn {
+        if let Some(planned_intents) = serial_semantic_warn_intents {
+            let coordination = {
+                let mut planned_intents = match planned_intents.lock() {
+                    Ok(planned_intents) => planned_intents,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                coordinate_semantic_assignment(
+                    semantic_store,
+                    assignment,
+                    plan.semantic_coordination,
+                    &mut outcome.semantic_tokens,
+                    &mut planned_intents,
+                    &mut outcome.findings,
+                )?
+            };
+            match coordination {
+                SemanticAssignmentCoordination::Ready(token) => token,
+                SemanticAssignmentCoordination::Blocked(_) => {
+                    bail!("warn-mode semantic preview unexpectedly blocked an assignment")
+                }
+            }
+        } else {
+            *prepared_semantic_token
+        }
+    } else {
+        let mut planned_semantic_intents = Vec::new();
+        let coordination = coordinate_semantic_assignment(
+            semantic_store,
+            assignment,
+            plan.semantic_coordination,
+            &mut outcome.semantic_tokens,
+            &mut planned_semantic_intents,
+            &mut outcome.findings,
+        )?;
+        drop(semantic_block_turn);
+        match coordination {
+            SemanticAssignmentCoordination::Ready(token) => token,
+            SemanticAssignmentCoordination::Blocked(conflict_count) => {
+                outcome.assignment_failed = true;
+                outcome.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: format!(
+                        "semantic coordination blocked assignment '{}' with {conflict_count} blocking conflict(s)",
+                        assignment.id
+                    ),
+                    paths: assignment.assigned_paths.clone(),
+                });
+                return Ok(());
+            }
+        }
+    };
 
     let final_report_name = format!("{}.json", assignment.id);
     let final_report_relative = PathBuf::from("reports").join(&final_report_name);
@@ -1783,7 +1960,25 @@ fn execute_supervisor_assignment_inner(
         // No scheduler, artifact-writer, or journal lock is held while the
         // independently contained external process runs.
         let external_run_result = match options.runtime {
-            SupervisorRuntime::Codex => Ok(external_runner(&command)),
+            SupervisorRuntime::Codex => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    external_runner(&command)
+                })) {
+                    Ok(run) => Ok(run),
+                    Err(payload) => {
+                        drop(incoming_output_root);
+                        drop(capture_output_root);
+                        with_supervisor_artifacts(artifacts, |writer, _| {
+                            discard_invocation_scratches(
+                                writer,
+                                &incoming_scratch,
+                                &capture_scratch,
+                            )
+                        })?;
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
             SupervisorRuntime::Fake => deterministic_fake_child_run(
                 &command,
                 assignment,
@@ -1942,12 +2137,14 @@ fn execute_supervisor_assignment_inner(
         break;
     }
 
-    let mut child_report = child_report.with_context(|| {
-        format!(
+    let Some(mut child_report) = child_report else {
+        let error = anyhow!(
             "child orchestrator '{}' did not produce a collected report after retries",
             assignment.id
-        )
-    })?;
+        );
+        record_isolated_assignment_failure(outcome, assignment, "child report collection", &error);
+        return Ok(());
+    };
     if plan.max_child_retries > 0 {
         append_child_attempt_history(&mut child_report, &attempt_history);
     }
@@ -2102,7 +2299,25 @@ fn execute_supervisor_assignment_inner(
         // The artifact and journal mutex is intentionally released before
         // entering the potentially long-running auditor process.
         let auditor_run_result = match options.runtime {
-            SupervisorRuntime::Codex => Ok(external_runner(&auditor_command)),
+            SupervisorRuntime::Codex => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    external_runner(&auditor_command)
+                })) {
+                    Ok(run) => Ok(run),
+                    Err(payload) => {
+                        drop(auditor_incoming_root);
+                        drop(auditor_capture_root);
+                        with_supervisor_artifacts(artifacts, |writer, _| {
+                            discard_invocation_scratches(
+                                writer,
+                                &auditor_incoming_scratch,
+                                &auditor_capture_scratch,
+                            )
+                        })?;
+                        std::panic::resume_unwind(payload);
+                    }
+                }
+            }
             SupervisorRuntime::Fake => {
                 deterministic_fake_auditor_run(&auditor_command, assignment, &child_report)
             }
@@ -2247,6 +2462,62 @@ fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssign
     })
 }
 
+fn plan_has_overlapping_assignments(plan: &SupervisorPlan) -> bool {
+    plan.assignments
+        .iter()
+        .enumerate()
+        .any(|(left_index, left)| {
+            plan.assignments
+                .iter()
+                .skip(left_index.saturating_add(1))
+                .any(|right| assignments_overlap(left, right))
+        })
+}
+
+#[derive(Default)]
+struct PreparedSemanticAssignment {
+    token: Option<u64>,
+    findings: Vec<Finding>,
+}
+
+fn prepare_semantic_warn_assignments(
+    store: &SemanticIntentStore,
+    plan: &SupervisorPlan,
+) -> Result<Vec<PreparedSemanticAssignment>> {
+    let mut prepared = plan
+        .assignments
+        .iter()
+        .map(|_| PreparedSemanticAssignment::default())
+        .collect::<Vec<_>>();
+    if plan.semantic_coordination != SemanticCoordinationMode::Warn {
+        return Ok(prepared);
+    }
+
+    let mut planned_preview_intents = Vec::new();
+    for (index, assignment) in plan.assignments.iter().enumerate() {
+        let report = store.preview_with_additional_active(
+            semantic_assignment_request(assignment),
+            &planned_preview_intents,
+        )?;
+        if report.has_blocking_conflicts || report.has_advisory_conflicts {
+            prepared[index].findings.push(Finding {
+                severity: FindingSeverity::Warning,
+                message: format!(
+                    "semantic coordination warn-mode preview for assignment '{}' found {} conflict(s)",
+                    assignment.id,
+                    report
+                        .blocking_conflict_count
+                        .saturating_add(report.advisory_conflict_count)
+                ),
+                paths: assignment.assigned_paths.clone(),
+            });
+        }
+        prepared[index].token = Some(report.intent.token.get());
+        planned_preview_intents.push(report.intent);
+    }
+    Ok(prepared)
+}
+
 #[cfg(test)]
 fn run_supervisor_plan_with_runner(
     plan: SupervisorPlan,
@@ -2347,6 +2618,7 @@ fn run_supervisor_plan_with_runner_and_creation(
         });
     }
     let mut primary_run_baseline = None;
+    let mut assignment_execution_failed = false;
     let mut external_containment_failed = false;
 
     let run_result = (|| -> Result<()> {
@@ -2403,6 +2675,16 @@ fn run_supervisor_plan_with_runner_and_creation(
             .into_iter()
             .map(|record| record.name)
             .collect::<BTreeSet<_>>();
+        let release_per_assignment =
+            max_concurrent_children > 1 || plan_has_overlapping_assignments(&plan);
+        let prepared_semantic_assignments = if max_concurrent_children > 1 {
+            prepare_semantic_warn_assignments(semantic_store, &plan)?
+        } else {
+            plan.assignments
+                .iter()
+                .map(|_| PreparedSemanticAssignment::default())
+                .collect()
+        };
         let (scheduler_result, indexed_outcomes) = {
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
@@ -2411,6 +2693,8 @@ fn run_supervisor_plan_with_runner_and_creation(
             let mut indexed_outcomes = (0..plan.assignments.len())
                 .map(|_| None)
                 .collect::<Vec<Option<AssignmentExecutionOutcome>>>();
+            let semantic_block_gate = SemanticBlockGate::default();
+            let serial_semantic_warn_intents = Mutex::new(Vec::new());
 
             let scheduler_result = if max_concurrent_children == 1 {
                 for (index, assignment) in plan.assignments.iter().enumerate() {
@@ -2430,9 +2714,18 @@ fn run_supervisor_plan_with_runner_and_creation(
                         reused: existing_ids.contains(&assignment.id),
                         sync_store,
                         semantic_store,
+                        prepared_semantic_token: prepared_semantic_assignments[index].token,
+                        prepared_semantic_findings: &prepared_semantic_assignments[index].findings,
+                        serial_semantic_warn_intents: Some(&serial_semantic_warn_intents),
+                        semantic_block_order: None,
+                        semantic_block_gate: None,
                         artifacts: &shared_artifacts,
                         external_runner,
                     });
+                    let mut outcome = outcome;
+                    if release_per_assignment {
+                        release_concurrent_assignment(&mut outcome, sync_store, semantic_store);
+                    }
                     let abort = outcome.requires_scheduler_abort();
                     indexed_outcomes[index] = Some(outcome);
                     if abort {
@@ -2450,11 +2743,14 @@ fn run_supervisor_plan_with_runner_and_creation(
                     let dirs_ref = &dirs;
                     let manager_ref = &manager;
                     let existing_ids_ref = &existing_ids;
+                    let prepared_semantic_assignments_ref = &prepared_semantic_assignments;
+                    let semantic_block_gate_ref = &semantic_block_gate;
                     let artifacts_ref = &shared_artifacts;
                     let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
                     let mut pending = (0..plan.assignments.len()).collect::<BTreeSet<_>>();
                     let mut active = BTreeMap::new();
                     let mut stop_scheduling = false;
+                    let mut next_semantic_block_order = 0usize;
 
                     while !pending.is_empty() || !active.is_empty() {
                         if !stop_scheduling {
@@ -2472,6 +2768,14 @@ fn run_supervisor_plan_with_runner_and_creation(
                                 };
                                 pending.remove(&index);
                                 let assignment = &plan_ref.assignments[index];
+                                let semantic_block_order = (plan_ref.semantic_coordination
+                                    == SemanticCoordinationMode::Block)
+                                    .then(|| {
+                                        let order = next_semantic_block_order;
+                                        next_semantic_block_order =
+                                            next_semantic_block_order.saturating_add(1);
+                                        order
+                                    });
                                 let completion_sender = completion_sender.clone();
                                 let handle = scope.spawn(move || {
                                     let _completion = CompletionSignal {
@@ -2494,6 +2798,15 @@ fn run_supervisor_plan_with_runner_and_creation(
                                         reused: existing_ids_ref.contains(&assignment.id),
                                         sync_store,
                                         semantic_store,
+                                        prepared_semantic_token: prepared_semantic_assignments_ref
+                                            [index]
+                                            .token,
+                                        prepared_semantic_findings:
+                                            &prepared_semantic_assignments_ref[index].findings,
+                                        serial_semantic_warn_intents: None,
+                                        semantic_block_order,
+                                        semantic_block_gate: semantic_block_order
+                                            .map(|_| semantic_block_gate_ref),
                                         artifacts: artifacts_ref,
                                         external_runner,
                                     })
@@ -2550,8 +2863,9 @@ fn run_supervisor_plan_with_runner_and_creation(
         for outcome in indexed_outcomes.into_iter().flatten() {
             command_records.extend(outcome.command_records);
             findings.extend(outcome.findings);
+            assignment_execution_failed |= outcome.assignment_failed;
             external_containment_failed |= outcome.external_containment_failed;
-            if max_concurrent_children == 1 {
+            if !release_per_assignment {
                 acquired_claim_tokens.extend(outcome.claim_tokens);
                 acquired_semantic_tokens.extend(outcome.semantic_tokens);
             } else {
@@ -2637,6 +2951,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let failed = run_result.is_err()
         || !release_errors.is_empty()
         || !semantic_release_errors.is_empty()
+        || assignment_execution_failed
         || external_containment_failed
         || final_primary_integrity_failed
         || orchestrator_reports.iter().any(report_failed);
@@ -2908,6 +3223,11 @@ fn validate_worker_assignments(assignment: &mut OrchestratorAssignment) -> Resul
     Ok(())
 }
 
+enum SemanticAssignmentCoordination {
+    Ready(Option<u64>),
+    Blocked(usize),
+}
+
 fn coordinate_semantic_assignment(
     store: &SemanticIntentStore,
     assignment: &OrchestratorAssignment,
@@ -2915,20 +3235,15 @@ fn coordinate_semantic_assignment(
     acquired_tokens: &mut Vec<crate::semantic_coord::SemanticIntentToken>,
     planned_preview_intents: &mut Vec<SemanticIntent>,
     findings: &mut Vec<Finding>,
-) -> Result<Option<u64>> {
+) -> Result<SemanticAssignmentCoordination> {
     if mode == SemanticCoordinationMode::Off {
-        return Ok(None);
+        return Ok(SemanticAssignmentCoordination::Ready(None));
     }
-    let request = SemanticIntentRequest {
-        agent_id: assignment.id.clone(),
-        paths: assignment.assigned_paths.clone(),
-        symbols: assignment.semantic_symbols.clone(),
-        modules: assignment.semantic_modules.clone(),
-        task_file: None,
-        notes: vec!["supervise child orchestrator assignment".to_string()],
-    };
+    let request = semantic_assignment_request(assignment);
     let report = match mode {
-        SemanticCoordinationMode::Off => return Ok(None),
+        SemanticCoordinationMode::Off => {
+            return Ok(SemanticAssignmentCoordination::Ready(None));
+        }
         SemanticCoordinationMode::Warn => {
             store.preview_with_additional_active(request, planned_preview_intents)?
         }
@@ -2951,16 +3266,27 @@ fn coordinate_semantic_assignment(
         planned_preview_intents.push(report.intent.clone());
     }
     if mode == SemanticCoordinationMode::Block && report.has_blocking_conflicts {
-        bail!(
-            "semantic coordination blocked assignment '{}' with {} blocking conflict(s)",
-            assignment.id,
-            report.blocking_conflict_count
-        );
+        return Ok(SemanticAssignmentCoordination::Blocked(
+            report.blocking_conflict_count,
+        ));
     }
     if mode == SemanticCoordinationMode::Block && report.persisted {
         acquired_tokens.push(report.intent.token);
     }
-    Ok(Some(report.intent.token.get()))
+    Ok(SemanticAssignmentCoordination::Ready(Some(
+        report.intent.token.get(),
+    )))
+}
+
+fn semantic_assignment_request(assignment: &OrchestratorAssignment) -> SemanticIntentRequest {
+    SemanticIntentRequest {
+        agent_id: assignment.id.clone(),
+        paths: assignment.assigned_paths.clone(),
+        symbols: assignment.semantic_symbols.clone(),
+        modules: assignment.semantic_modules.clone(),
+        task_file: None,
+        notes: vec!["supervise child orchestrator assignment".to_string()],
+    }
 }
 
 fn collect_child_report(
@@ -5652,7 +5978,15 @@ fn deterministic_fake_run(command: &ExternalAgentCommand, output: Vec<u8>) -> Ex
 
 fn external_safety_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) -> bool {
     match runtime {
-        SupervisorRuntime::Codex => run.succeeded(),
+        SupervisorRuntime::Codex => {
+            run.process_tree
+                .is_some_and(ProcessTreeEvidence::is_verified_empty)
+                && run
+                    .side_effects
+                    .is_some_and(SideEffectConfinementEvidence::is_verified)
+                && run.program_trust == ExternalProgramTrust::TrustedSystemCodex
+                && run.codex_permissions.is_some()
+        }
         SupervisorRuntime::Fake => {
             run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom
         }
@@ -7735,11 +8069,6 @@ mod tests {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let a_start = schedule
-            .events
-            .iter()
-            .position(|event| event == "child-a-start")
-            .expect("child A start");
         let c_start = schedule
             .events
             .iter()
@@ -7755,12 +8084,402 @@ mod tests {
             .iter()
             .position(|event| event == "child-b-start")
             .expect("child B start");
-        assert!(
-            c_start > a_start && c_start < a_finish,
-            "{:?}",
-            schedule.events
-        );
+        assert!(c_start < a_finish, "{:?}", schedule.events);
         assert!(b_start > a_finish, "{:?}", schedule.events);
+    }
+
+    #[test]
+    fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_names() {
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "serial-overlap-release");
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let runner = {
+            let assignments = assignments.clone();
+            let invocations = Arc::clone(&invocations);
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                invocations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((
+                        id.clone(),
+                        command
+                            .output_last_message
+                            .parent()
+                            .and_then(Path::file_name)
+                            .and_then(OsStr::to_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        command
+                            .json_log
+                            .parent()
+                            .and_then(Path::file_name)
+                            .and_then(OsStr::to_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ));
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                injected_verified_run(command)
+            }
+        };
+
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+        .expect("run serial overlapping assignments");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(
+            report
+                .orchestrator_reports
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-a", "child-b"]
+        );
+        assert_eq!(
+            report
+                .released_claims
+                .iter()
+                .map(|claim| claim.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-a", "child-b"]
+        );
+        assert_eq!(
+            *invocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![
+                (
+                    "child-a".to_string(),
+                    "incoming".to_string(),
+                    "capture".to_string()
+                ),
+                (
+                    "child-b".to_string(),
+                    "incoming".to_string(),
+                    "capture".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds() {
+        for max_concurrent_children in [1usize, 2] {
+            let (temp, repo_path) = injected_repository();
+            fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
+            fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n")
+                .expect("write injected Rust source");
+            commit_injected_repository(&repo_path, "add semantic fixture");
+            let mut assignments = vec![
+                injected_named_assignment("child-a", "README.md"),
+                injected_named_assignment("child-b", "src/lib.rs"),
+            ];
+            for assignment in &mut assignments {
+                assignment.semantic_symbols = vec!["Shared".to_string()];
+            }
+            let mut plan = injected_multi_plan(assignments.clone(), 0);
+            plan.semantic_coordination = SemanticCoordinationMode::Warn;
+            let run_id = format!("semantic-warn-plan-order-{max_concurrent_children}");
+            let options = injected_options(&repo_path, temp.path(), &run_id);
+            let runner = move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                injected_verified_run(command)
+            };
+
+            let report = run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                max_concurrent_children,
+                &runner,
+            )
+            .expect("run deterministic semantic warn preview");
+            assert!(report.success, "unexpected failed report: {report:#?}");
+            let warnings = report
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding
+                        .message
+                        .contains("semantic coordination warn-mode preview")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:#?}");
+            assert!(warnings[0].message.contains("assignment 'child-b'"));
+        }
+
+        let (temp, repo_path) = injected_repository();
+        fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
+        fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n")
+            .expect("write injected Rust source");
+        commit_injected_repository(&repo_path, "add serial warn failure fixture");
+        let sync_store = SyncStore::open(&repo_path).expect("open injected sync store");
+        let external_claim = sync_store
+            .claim_paths("external-owner", [PathBuf::from("README.md")])
+            .expect("reserve first serial assignment path");
+        let mut assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+        ];
+        for assignment in &mut assignments {
+            assignment.semantic_symbols = vec!["Shared".to_string()];
+        }
+        let mut plan = injected_multi_plan(assignments.clone(), 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Warn;
+        let options = injected_options(&repo_path, temp.path(), "serial-warn-early-failure");
+        let runner = move |command: &ExternalAgentCommand| {
+            let id = injected_command_assignment_id(command);
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .unwrap_or_else(|| panic!("missing assignment {id}"));
+            write_injected_assignment_report(command, assignment);
+            injected_verified_run(command)
+        };
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+        .expect("serial warn early failure remains reportable");
+        sync_store
+            .release(external_claim.token)
+            .expect("release serial warn external claim");
+        assert!(!report.success);
+        assert!(report.findings.iter().all(|finding| !finding
+            .message
+            .contains("semantic coordination warn-mode preview")));
+    }
+
+    #[test]
+    fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() {
+        #[derive(Default)]
+        struct BlockState {
+            child_c_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub struct Alpha;\npub struct Beta;\npub struct Gamma;\n",
+        )
+        .expect("write injected Rust source");
+        commit_injected_repository(&repo_path, "add Block semantic fixture");
+        let mut assignments = vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "README.md"),
+        ];
+        assignments[0].semantic_symbols = vec!["Alpha".to_string()];
+        assignments[1].semantic_symbols = vec!["Beta".to_string()];
+        assignments[2].semantic_symbols = vec!["Gamma".to_string()];
+        let mut plan = injected_multi_plan(assignments.clone(), 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
+        let options = injected_options(&repo_path, temp.path(), "semantic-block-dispatch-order");
+        let state = Arc::new((Mutex::new(BlockState::default()), Condvar::new()));
+        let runner = {
+            let assignments = assignments.clone();
+            let state = Arc::clone(&state);
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut block = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if id == "child-c" {
+                    block.child_c_started = true;
+                    condvar.notify_all();
+                } else if id == "child-a" {
+                    while !block.child_c_started {
+                        block = condvar
+                            .wait(block)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                drop(block);
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                injected_verified_run(command)
+            }
+        };
+
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("run deterministic semantic Block scheduling");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(
+            report
+                .released_semantic_intents
+                .iter()
+                .map(|intent| (intent.agent_id.as_str(), intent.token.get()))
+                .collect::<Vec<_>>(),
+            vec![("child-a", 1), ("child-b", 3), ("child-c", 2)]
+        );
+    }
+
+    #[test]
+    fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
+        let (temp, repo_path) = injected_repository();
+        let sync_store = SyncStore::open(&repo_path).expect("open injected sync store");
+        let external_claim = sync_store
+            .claim_paths("external-owner", [PathBuf::from("README.md")])
+            .expect("reserve injected conflicting claim");
+        let assignments = vec![
+            injected_named_assignment("claim-blocked", "README.md"),
+            injected_named_assignment("claim-healthy", "src/lib.rs"),
+        ];
+        let mut plan = injected_multi_plan(assignments.clone(), 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
+        let options = injected_options(&repo_path, temp.path(), "claim-conflict-isolation");
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let runner = {
+            let assignments = assignments.clone();
+            let started = Arc::clone(&started);
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                started
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(id.clone());
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                injected_verified_run(command)
+            }
+        };
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("claim conflict remains assignment-local");
+        sync_store
+            .release(external_claim.token)
+            .expect("release injected external claim");
+        assert!(!report.success);
+        assert_eq!(
+            *started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["claim-healthy".to_string()]
+        );
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("claim")));
+
+        #[derive(Default)]
+        struct SemanticConflictState {
+            child_c_started: bool,
+            blocked_runner_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub struct Shared;\npub struct Gamma;\n",
+        )
+        .expect("write injected Rust source");
+        commit_injected_repository(&repo_path, "add semantic conflict fixture");
+        let mut assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "Cargo.toml"),
+        ];
+        assignments[0].semantic_symbols = vec!["Shared".to_string()];
+        assignments[1].semantic_symbols = vec!["Shared".to_string()];
+        assignments[2].semantic_symbols = vec!["Gamma".to_string()];
+        let mut plan = injected_multi_plan(assignments.clone(), 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
+        let options = injected_options(&repo_path, temp.path(), "semantic-block-isolation");
+        let state = Arc::new((Mutex::new(SemanticConflictState::default()), Condvar::new()));
+        let runner = {
+            let assignments = assignments.clone();
+            let state = Arc::clone(&state);
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut conflict = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if id == "child-b" {
+                    conflict.blocked_runner_started = true;
+                } else if id == "child-c" {
+                    conflict.child_c_started = true;
+                    condvar.notify_all();
+                } else if id == "child-a" {
+                    while !conflict.child_c_started {
+                        conflict = condvar
+                            .wait(conflict)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                drop(conflict);
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                injected_verified_run(command)
+            }
+        };
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("semantic Block conflict remains assignment-local");
+        assert!(!report.success);
+        assert_eq!(
+            report
+                .orchestrator_reports
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-a", "child-c"]
+        );
+        let conflict = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(conflict.child_c_started);
+        assert!(!conflict.blocked_runner_started);
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("semantic coordination blocked assignment 'child-b'")));
     }
 
     #[test]
@@ -7921,6 +8640,94 @@ mod tests {
     }
 
     #[test]
+    fn contained_nonzero_child_failure_does_not_stop_pending_unrelated_assignment() {
+        #[derive(Default)]
+        struct FailureState {
+            child_b_started: bool,
+            child_c_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "Cargo.toml"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "contained-nonzero-isolation");
+        let state = Arc::new((Mutex::new(FailureState::default()), Condvar::new()));
+        let runner = {
+            let assignments = assignments.clone();
+            let state = Arc::clone(&state);
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut failure = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if id == "child-b" {
+                    failure.child_b_started = true;
+                    condvar.notify_all();
+                    while !failure.child_c_started {
+                        failure = condvar
+                            .wait(failure)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-a" {
+                    while !failure.child_b_started {
+                        failure = condvar
+                            .wait(failure)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-c" {
+                    failure.child_c_started = true;
+                    condvar.notify_all();
+                }
+                drop(failure);
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                let mut run = injected_verified_run(command);
+                if id == "child-a" {
+                    run.exit_code = Some(7);
+                    run.error = Some("exit status 7".to_string());
+                }
+                run
+            }
+        };
+
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("contained child failure remains reportable");
+        assert!(!report.success);
+        assert_eq!(
+            report
+                .orchestrator_reports
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-a", "child-b", "child-c"]
+        );
+        assert!(
+            state
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .child_c_started
+        );
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| !finding.message.contains("containment was not verified")));
+    }
+
+    #[test]
     fn fatal_scheduler_abort_stops_new_starts_and_joins_active_assignment() {
         #[derive(Default)]
         struct AbortState {
@@ -7972,7 +8779,9 @@ mod tests {
                 write_injected_assignment_report(command, assignment);
                 let mut run = injected_verified_run(command);
                 if id == "child-a" {
-                    run.publishable = false;
+                    run.process_tree = Some(ProcessTreeEvidence::Unverified(
+                        ContainmentBackend::SystemdUserService,
+                    ));
                     let mut abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     abort.child_a_returned = true;
                     condvar.notify_all();
@@ -8023,6 +8832,247 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.message.contains("containment")));
+    }
+
+    #[test]
+    fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
+        #[derive(Default)]
+        struct ReleaseState {
+            child_a_returned: bool,
+            child_b_started: bool,
+            release_child_b: bool,
+            child_c_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "README.md/blocked-after-release-error"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "concurrent-release-error-abort");
+        let state = Arc::new((Mutex::new(ReleaseState::default()), Condvar::new()));
+        let runner_repo = repo_path.clone();
+        let runner = {
+            let assignments = assignments.clone();
+            let state = Arc::clone(&state);
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if id == "child-b" {
+                    release.child_b_started = true;
+                    condvar.notify_all();
+                    while !release.release_child_b {
+                        release = condvar
+                            .wait(release)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-a" {
+                    while !release.child_b_started {
+                        release = condvar
+                            .wait(release)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-c" {
+                    release.child_c_started = true;
+                }
+                drop(release);
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                let run = injected_verified_run(command);
+                if id == "child-a" {
+                    let store = SyncStore::open(&runner_repo).expect("open injected sync store");
+                    let claim = store
+                        .snapshot()
+                        .expect("snapshot injected claims")
+                        .into_iter()
+                        .find(|claim| claim.agent_id == id)
+                        .expect("find child A claim");
+                    store
+                        .release(claim.token)
+                        .expect("inject scheduler release failure");
+                    let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    release.child_a_returned = true;
+                    condvar.notify_all();
+                }
+                run
+            }
+        };
+        let (done_sender, done_receiver) = mpsc::channel();
+        let supervisor_thread = thread::spawn(move || {
+            let result = run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            );
+            let _ = done_sender.send(result);
+        });
+
+        let (lock, condvar) = &*state;
+        let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !release.child_a_returned {
+            release = condvar
+                .wait(release)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        assert!(!release.child_c_started);
+        assert!(matches!(
+            done_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.release_child_b = true;
+        condvar.notify_all();
+        drop(release);
+
+        let report = done_receiver
+            .recv()
+            .expect("supervisor result after release-error join")
+            .expect("release error remains reportable");
+        supervisor_thread
+            .join()
+            .unwrap_or_else(|_| panic!("supervisor test thread panicked"));
+        assert!(!report.success);
+        assert!(
+            !lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .child_c_started
+        );
+        assert_eq!(report.orchestrator_reports.len(), 2);
+        assert_eq!(report.release_errors.len(), 1);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("cleanup failed")));
+        assert!(SyncStore::open(&repo_path)
+            .expect("reopen sync store")
+            .snapshot()
+            .expect("snapshot released claims")
+            .is_empty());
+    }
+
+    #[test]
+    fn panic_after_claim_releases_tokens_stops_pending_and_joins_active_assignment() {
+        #[derive(Default)]
+        struct PanicState {
+            child_a_panicking: bool,
+            child_b_started: bool,
+            release_child_b: bool,
+            child_c_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "README.md/blocked-after-panic"),
+        ];
+        let mut plan = injected_multi_plan(assignments.clone(), 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
+        let options = injected_options(&repo_path, temp.path(), "concurrent-panic-token-release");
+        let state = Arc::new((Mutex::new(PanicState::default()), Condvar::new()));
+        let runner = {
+            let assignments = assignments.clone();
+            let state = Arc::clone(&state);
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut panic_state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if id == "child-b" {
+                    panic_state.child_b_started = true;
+                    condvar.notify_all();
+                    while !panic_state.release_child_b {
+                        panic_state = condvar
+                            .wait(panic_state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-a" {
+                    while !panic_state.child_b_started {
+                        panic_state = condvar
+                            .wait(panic_state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    panic_state.child_a_panicking = true;
+                    condvar.notify_all();
+                    drop(panic_state);
+                    panic!("injected panic after assignment claim");
+                } else if id == "child-c" {
+                    panic_state.child_c_started = true;
+                }
+                drop(panic_state);
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                injected_verified_run(command)
+            }
+        };
+        let (done_sender, done_receiver) = mpsc::channel();
+        let supervisor_thread = thread::spawn(move || {
+            let result = run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            );
+            let _ = done_sender.send(result);
+        });
+
+        let (lock, condvar) = &*state;
+        let mut panic_state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !panic_state.child_a_panicking {
+            panic_state = condvar
+                .wait(panic_state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        assert!(!panic_state.child_c_started);
+        assert!(matches!(
+            done_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        panic_state.release_child_b = true;
+        condvar.notify_all();
+        drop(panic_state);
+
+        let report = done_receiver
+            .recv()
+            .expect("supervisor result after panic join")
+            .expect("panic remains reportable");
+        supervisor_thread
+            .join()
+            .unwrap_or_else(|_| panic!("supervisor test thread panicked"));
+        assert!(!report.success);
+        assert!(
+            !lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .child_c_started
+        );
+        assert_eq!(report.orchestrator_reports.len(), 1);
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("supervisor assignment 'child-a' panicked")));
+        assert!(SyncStore::open(&repo_path)
+            .expect("reopen sync store")
+            .snapshot()
+            .expect("snapshot released panic claims")
+            .is_empty());
+        assert!(SemanticIntentStore::open(&repo_path)
+            .expect("reopen semantic store")
+            .snapshot()
+            .expect("snapshot released panic semantic intents")
+            .is_empty());
     }
 
     #[test]
