@@ -206,7 +206,7 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
 }
 
 #[test]
-fn supervise_plan_normalizes_aliases_and_rejects_overlapping_assignments() -> Result<()> {
+fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignments() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("aliases.json");
@@ -247,6 +247,45 @@ fn supervise_plan_normalizes_aliases_and_rejects_overlapping_assignments() -> Re
           ]
         }"#,
     )?;
+    let overlap_plan = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&overlap)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(
+        overlap_plan["assignments"][0]["assigned_paths"],
+        serde_json::json!(["src"])
+    );
+    assert_eq!(
+        overlap_plan["assignments"][1]["assigned_paths"],
+        serde_json::json!(["src/lib.rs"])
+    );
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_still_rejects_overlapping_worker_siblings() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let overlap = temp.path().join("worker-overlap.json");
+    fs::write(
+        &overlap,
+        br#"{
+          "version": 1,
+          "task": "worker overlap",
+          "assignments": [{
+            "id": "child-a",
+            "assigned_paths": ["src"],
+            "worker_assignments": [
+              {"id": "worker-a", "assigned_paths": ["src/lib.rs"]},
+              {"id": "worker-b", "assigned_paths": ["src"]}
+            ]
+          }]
+        }"#,
+    )?;
     let output = Command::new(BIN)
         .args([
             "supervise",
@@ -258,7 +297,86 @@ fn supervise_plan_normalizes_aliases_and_rejects_overlapping_assignments() -> Re
         ])
         .output()?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("overlap"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("worker 'worker-b'") && stderr.contains("overlaps worker 'worker-a'"));
+    Ok(())
+}
+
+#[test]
+fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("bounded-run.json");
+    write_simple_plan(&plan_path, "bounded-child")?;
+
+    let zero_stderr = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "bounded-zero",
+        "--runtime",
+        "fake",
+        "--max-concurrent-children",
+        "0",
+        "--json",
+    ])?;
+    assert!(zero_stderr.contains("--max-concurrent-children must be at least 1"));
+    assert!(!repo_path.join(".maco/o2/runs/bounded-zero").exists());
+    assert!(!temp
+        .path()
+        .join(".maco/worktrees/repo/bounded-child")
+        .exists());
+    let repo = Repository::open(&repo_path)?;
+    assert!(repo
+        .find_branch("maco/bounded-child", git2::BranchType::Local)
+        .is_err());
+    let claims = run_success_json(&["sync", "status", "--repo", path_str(&repo_path)?, "--json"])?;
+    assert!(claims.as_array().context("claim status")?.is_empty());
+
+    let one_stderr = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "bounded-one",
+        "--runtime",
+        "fake",
+        "--max-concurrent-children",
+        "1",
+        "--json",
+    ])?;
+    assert!(one_stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert!(!repo_path.join(".maco/o2/runs/bounded-one").exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_run_does_not_silently_ignore_unimplemented_concurrent_bound() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("concurrent-run.json");
+    write_simple_plan(&plan_path, "concurrent-child")?;
+    let stderr = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "bounded-two",
+        "--runtime",
+        "fake",
+        "--max-concurrent-children",
+        "2",
+        "--json",
+    ])?;
+    assert!(stderr.contains("greater than 1 is not yet supported"));
+    assert!(!repo_path.join(".maco/o2/runs/bounded-two").exists());
     Ok(())
 }
 

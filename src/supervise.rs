@@ -16,7 +16,7 @@ use crate::{
     safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
-    sync::{normalize_repo_relative_path, ClaimToken, PathClaim},
+    sync::{normalize_repo_relative_path, paths_overlap, ClaimToken, PathClaim},
     sync_store::SyncStore,
     worktree::{
         RepositoryCleanlinessCapability, WorktreeCreateOptions, WorktreeManager, WorktreeRecord,
@@ -537,14 +537,36 @@ fn supervisor_plan_value(
 }
 
 pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<SupervisorFinalReport> {
-    let mut external_runner = run_external_agent;
-    run_supervisor_plan_file_with_runner(options, &mut external_runner)
+    run_supervisor_plan_file_with_max_concurrent_children(options, 1)
 }
 
+pub fn run_supervisor_plan_file_with_max_concurrent_children(
+    options: SupervisorRunOptions,
+    max_concurrent_children: usize,
+) -> Result<SupervisorFinalReport> {
+    let mut external_runner = run_external_agent;
+    run_supervisor_plan_file_with_runner_and_max_concurrent_children(
+        options,
+        max_concurrent_children,
+        &mut external_runner,
+    )
+}
+
+#[cfg(test)]
 fn run_supervisor_plan_file_with_runner(
     options: SupervisorRunOptions,
     external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 ) -> Result<SupervisorFinalReport> {
+    run_supervisor_plan_file_with_runner_and_max_concurrent_children(options, 1, external_runner)
+}
+
+fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
+    options: SupervisorRunOptions,
+    max_concurrent_children: usize,
+    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+) -> Result<SupervisorFinalReport> {
+    validate_max_concurrent_children(max_concurrent_children)?;
+    ensure_supported_max_concurrent_children(max_concurrent_children)?;
     if options.runtime == SupervisorRuntime::Fake {
         bail!(
             "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
@@ -558,6 +580,7 @@ fn run_supervisor_plan_file_with_runner(
         loaded.plan,
         loaded.consultant,
         options,
+        max_concurrent_children,
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
         external_runner,
@@ -1395,6 +1418,7 @@ fn run_supervisor_plan_with_runner(
         plan,
         consultant,
         options,
+        1,
         execution_runtime,
         SupervisorWorktreeCreation::TestOnly,
         external_runner,
@@ -1405,10 +1429,13 @@ fn run_supervisor_plan_with_runner_and_creation(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
     options: SupervisorRunOptions,
+    max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
     external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 ) -> Result<SupervisorFinalReport> {
+    validate_max_concurrent_children(max_concurrent_children)?;
+    ensure_supported_max_concurrent_children(max_concurrent_children)?;
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
@@ -2409,7 +2436,6 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
     }
 
     let mut seen = BTreeSet::new();
-    let mut path_owners = Vec::<PathOwner>::new();
     for assignment in &mut plan.assignments {
         assignment.id = normalize_agent_id(&assignment.id)?;
         if !seen.insert(assignment.id.clone()) {
@@ -2429,30 +2455,6 @@ fn validate_supervisor_plan(mut plan: SupervisorPlan) -> Result<SupervisorPlan> 
                 assignment.id
             );
         }
-        for path in &assignment.assigned_paths {
-            if let Some(owner) = path_owners
-                .iter()
-                .find(|owner| paths_overlap(path, &owner.path))
-            {
-                bail!(
-                    "path '{}' for assignment '{}' overlaps path '{}' for assignment '{}'",
-                    path.display(),
-                    assignment.id,
-                    owner.path.display(),
-                    owner.id
-                );
-            }
-        }
-        path_owners.extend(
-            assignment
-                .assigned_paths
-                .iter()
-                .cloned()
-                .map(|path| PathOwner {
-                    id: assignment.id.clone(),
-                    path,
-                }),
-        );
         assignment.semantic_symbols = sorted_unique_strings(&assignment.semantic_symbols);
         assignment.semantic_modules = sorted_unique_strings(&assignment.semantic_modules);
         validate_worker_assignments(assignment)?;
@@ -6025,12 +6027,24 @@ fn parent_auditor_id(assignment: &OrchestratorAssignment) -> String {
     format!("{}-review-auditor", assignment.id)
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left == right || left.starts_with(right) || right.starts_with(left)
-}
-
 fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
     path == claim || path.starts_with(claim)
+}
+
+pub(crate) fn validate_max_concurrent_children(max_concurrent_children: usize) -> Result<()> {
+    if max_concurrent_children == 0 {
+        bail!("--max-concurrent-children must be at least 1");
+    }
+    Ok(())
+}
+
+fn ensure_supported_max_concurrent_children(max_concurrent_children: usize) -> Result<()> {
+    if max_concurrent_children > 1 {
+        bail!(
+            "--max-concurrent-children greater than 1 is not yet supported by the supervisor executor"
+        );
+    }
+    Ok(())
 }
 
 fn display_paths(paths: &[PathBuf]) -> String {

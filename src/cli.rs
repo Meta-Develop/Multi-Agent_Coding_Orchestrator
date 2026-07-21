@@ -508,20 +508,24 @@ impl SuperviseCommand {
                 print_query_report(&plan, args.json)
             }
             SuperviseSubcommand::Run(args) => {
+                supervise::validate_max_concurrent_children(args.max_concurrent_children)?;
                 let resolved = resolve_run_id_for_run(
                     &args.repo,
                     RunArtifactFamily::Supervise,
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let report = supervise::run_supervisor_plan_file(SupervisorRunOptions {
-                    repo: resolved.repo,
-                    plan_file: args.supervisor_plan,
-                    run_id: resolved.run_id,
-                    codex_bin: args.codex_bin,
-                    runtime: args.runtime,
-                    allow_dirty_primary: args.allow_dirty_primary,
-                })?;
+                let report = supervise::run_supervisor_plan_file_with_max_concurrent_children(
+                    SupervisorRunOptions {
+                        repo: resolved.repo,
+                        plan_file: args.supervisor_plan,
+                        run_id: resolved.run_id,
+                        codex_bin: args.codex_bin,
+                        runtime: args.runtime,
+                        allow_dirty_primary: args.allow_dirty_primary,
+                    },
+                    args.max_concurrent_children,
+                )?;
                 print_query_report(&report, args.json)?;
                 if !report.success {
                     bail!("supervise run failed");
@@ -591,6 +595,9 @@ struct RunSuperviseArgs {
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
+    /// Maximum number of child assignments to run concurrently.
+    #[arg(long, default_value_t = 1)]
+    max_concurrent_children: usize,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
