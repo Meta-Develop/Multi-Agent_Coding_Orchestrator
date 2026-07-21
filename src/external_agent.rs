@@ -1,6 +1,6 @@
 use crate::process_runner::{
-    read_bounded_regular_file_nofollow, run_process, CapturedBytes, EnvironmentMode,
-    ExternalCodexProfile, ProcessRunError, ProcessSpec, ProcessTreeEvidence,
+    read_bounded_regular_file_nofollow, run_process_cancellable, CapturedBytes, EnvironmentMode,
+    ExternalCodexProfile, ProcessCancellation, ProcessRunError, ProcessSpec, ProcessTreeEvidence,
     SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode, StreamCapture,
     StrictOfflineWorkspaceProfile, WorkspaceAccess,
 };
@@ -284,21 +284,50 @@ fn default_target_launch_attempted() -> bool {
 }
 
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
-    run_external_agent_runtime(spec, ExternalExecutionRuntime::Verified)
+    run_external_agent_cancellable(spec, &ProcessCancellation::new())
+}
+
+pub fn run_external_agent_cancellable(
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+) -> ExternalAgentRun {
+    run_external_agent_runtime(spec, ExternalExecutionRuntime::Verified, cancellation)
 }
 
 #[cfg(test)]
 pub(crate) fn run_external_agent_nonpublishable_simulation(
     spec: &ExternalAgentCommand,
 ) -> ExternalAgentRun {
-    run_external_agent_runtime(spec, ExternalExecutionRuntime::NonpublishableSimulation)
+    run_external_agent_nonpublishable_simulation_cancellable(spec, &ProcessCancellation::new())
+}
+
+#[cfg(test)]
+fn run_external_agent_nonpublishable_simulation_cancellable(
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+) -> ExternalAgentRun {
+    run_external_agent_runtime(
+        spec,
+        ExternalExecutionRuntime::NonpublishableSimulation,
+        cancellation,
+    )
 }
 
 fn run_external_agent_runtime(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
+    cancellation: &ProcessCancellation,
 ) -> ExternalAgentRun {
     let started = Instant::now();
+    if cancellation.is_cancelled() {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            "external agent was cancelled before executable preflight".to_string(),
+        );
+    }
     let program_trust = external_program_trust(spec);
     let resolved_program = match resolve_external_program(&spec.program, &spec.cwd) {
         Ok(program) => program,
@@ -365,7 +394,7 @@ fn run_external_agent_runtime(
             ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
         ) {
         let remaining = spec.timeout.saturating_sub(started.elapsed());
-        match preflight_codex_version(&resolved_program, &spec.cwd, remaining) {
+        match preflight_codex_version(&resolved_program, &spec.cwd, remaining, cancellation) {
             Ok(version) => Some(version),
             Err(failure) => {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -377,6 +406,12 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+
+    if cancellation.is_cancelled() {
+        report.duration_ms = duration_millis(started.elapsed());
+        report.error = Some("external agent was cancelled before target setup".to_string());
+        return report;
+    }
 
     if spec.invocation == ExternalAgentInvocation::ClaudeConsultant {
         report.duration_ms = duration_millis(started.elapsed());
@@ -537,8 +572,14 @@ fn run_external_agent_runtime(
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     };
 
+    if cancellation.is_cancelled() {
+        report.duration_ms = duration_millis(started.elapsed());
+        report.error = Some("external agent was cancelled before target start".to_string());
+        return report;
+    }
+
     report.stdout.target_launch_attempted = true;
-    match run_process(process_spec) {
+    match run_process_cancellable(process_spec, cancellation) {
         Ok(output) => {
             let safety_verified = output.safety_evidence_verified();
             report.exit_code = output.status.and_then(|status| status.code());
@@ -592,6 +633,13 @@ fn run_external_agent_runtime(
         }
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
+            if let Some(evidence) = error.cancellation_evidence() {
+                report.process_tree = Some(evidence.process_tree);
+                report.side_effects = Some(evidence.side_effects);
+                report.stdout = summarize_output(&evidence.stdout);
+                report.stdout.target_launch_attempted = true;
+                report.stderr = summarize_output(&evidence.stderr);
+            }
             report.error = Some(error.to_string());
         }
     }
@@ -644,6 +692,7 @@ fn preflight_codex_version(
     program: &Path,
     cwd: &Path,
     timeout: Duration,
+    cancellation: &ProcessCancellation,
 ) -> std::result::Result<(u64, u64, u64), CodexPreflightFailure> {
     let program_parent = program.parent().ok_or_else(|| CodexPreflightFailure {
         message: format!(
@@ -654,7 +703,7 @@ fn preflight_codex_version(
     })?;
     let mut environment = BTreeMap::new();
     environment.insert("PATH".to_string(), TRUSTED_PATH.to_string());
-    let output = run_process(
+    let output = run_process_cancellable(
         ProcessSpec::direct("Codex version preflight", program, ["--version"], cwd, 4096)
             .with_environment(EnvironmentMode::ClearAndSet(environment))
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
@@ -663,6 +712,7 @@ fn preflight_codex_version(
             ))
             .with_stdin(StdinMode::Null)
             .with_timeout(Some(timeout)),
+        cancellation,
     )
     .map_err(|error| CodexPreflightFailure {
         timed_out: matches!(error, ProcessRunError::SetupTimeout { .. }),
@@ -1900,6 +1950,68 @@ exit 0
         assert!(report.stdout.text.contains("descendant started"));
         assert!(report.stderr.text.contains("descendant stderr started"));
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_agent_cancellation_reaches_target_and_prevents_delayed_mutation() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::thread;
+
+        let temp = tempfile::tempdir()?;
+        let started = temp.path().join("started");
+        let delayed = temp.path().join("delayed");
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\ntouch '{}'\n(sleep 0.3; touch '{}') &\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+                started.display(),
+                delayed.display()
+            ),
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "run until cancelled\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            temp.path().join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        );
+        let cancellation = ProcessCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            run_external_agent_nonpublishable_simulation_cancellable(&spec, &worker_cancellation)
+        });
+
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !started.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "external target did not reach ready gate"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancellation.cancel();
+        let report = worker
+            .join()
+            .unwrap_or_else(|_| panic!("external cancellation worker panicked"));
+
+        assert!(!report.timed_out);
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled")));
+        assert!(report.process_tree.is_some());
+        thread::sleep(Duration::from_millis(400));
+        assert!(!delayed.exists());
         Ok(())
     }
 

@@ -4,14 +4,16 @@ use crate::{
         ArtifactRunWriter, ArtifactScratchDirectory, RunArtifactFamily,
     },
     external_agent::{
-        run_external_agent, ExternalAgentCommand, ExternalAgentRun, ExternalProgramTrust,
+        run_external_agent_cancellable, ExternalAgentCommand, ExternalAgentRun,
+        ExternalProgramTrust,
     },
     orchestration_event::{OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole},
     orchestrator::{RunId, SemanticCoordinationMode},
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
-        EnvironmentMode, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
-        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
+        EnvironmentMode, ProcessCancellation, ProcessSpec, ProcessTreeEvidence,
+        SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode,
+        StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
     safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
@@ -64,6 +66,9 @@ const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".agents/storage",
     b".agents/live",
 ];
+
+type CancellableExternalRunner<'a> =
+    dyn Fn(&ExternalAgentCommand, &ProcessCancellation) -> ExternalAgentRun + Send + Sync + 'a;
 
 #[derive(Debug, Clone)]
 pub struct SupervisorRunOptions {
@@ -546,7 +551,7 @@ pub fn run_supervisor_plan_file_with_max_concurrent_children(
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
 ) -> Result<SupervisorFinalReport> {
-    let external_runner = run_external_agent;
+    let external_runner = run_external_agent_cancellable;
     run_supervisor_plan_file_with_runner_and_max_concurrent_children(
         options,
         max_concurrent_children,
@@ -560,18 +565,20 @@ fn run_supervisor_plan_file_with_runner(
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
     let serialized_runner = Mutex::new(external_runner);
-    run_supervisor_plan_file_with_runner_and_max_concurrent_children(options, 1, &|command| {
-        match serialized_runner.lock() {
+    run_supervisor_plan_file_with_runner_and_max_concurrent_children(
+        options,
+        1,
+        &|command, _cancellation| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
-        }
-    })
+        },
+    )
 }
 
 fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
-    external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
+    external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(max_concurrent_children)?;
     if options.runtime == SupervisorRuntime::Fake {
@@ -1567,7 +1574,8 @@ struct AssignmentExecutionContext<'a, 'writer> {
     semantic_block_order: Option<usize>,
     semantic_block_gate: Option<&'a SemanticBlockGate>,
     artifacts: &'a Mutex<SharedSupervisorArtifacts<'writer>>,
-    external_runner: &'a (dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
+    cancellation: ProcessCancellation,
+    external_runner: &'a CancellableExternalRunner<'a>,
 }
 
 #[derive(Default)]
@@ -1718,6 +1726,7 @@ fn execute_supervisor_assignment_inner(
         semantic_block_order,
         semantic_block_gate,
         artifacts,
+        cancellation,
         external_runner,
     } = context;
     outcome
@@ -2032,7 +2041,7 @@ fn execute_supervisor_assignment_inner(
         let external_run_result = match options.runtime {
             SupervisorRuntime::Codex => {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    external_runner(&command)
+                    external_runner(&command, cancellation)
                 })) {
                     Ok(run) => Ok(run),
                     Err(payload) => {
@@ -2371,7 +2380,7 @@ fn execute_supervisor_assignment_inner(
         let auditor_run_result = match options.runtime {
             SupervisorRuntime::Codex => {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    external_runner(&auditor_command)
+                    external_runner(&auditor_command, cancellation)
                 })) {
                     Ok(run) => Ok(run),
                     Err(payload) => {
@@ -2615,7 +2624,7 @@ fn run_supervisor_plan_with_runner(
         1,
         execution_runtime,
         SupervisorWorktreeCreation::TestOnly,
-        &|command| match serialized_runner.lock() {
+        &|command, _cancellation| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -2637,6 +2646,25 @@ fn run_supervisor_plan_with_concurrent_runner(
         max_concurrent_children,
         SupervisorExecutionRuntime::NonpublishableSimulation,
         SupervisorWorktreeCreation::TestOnly,
+        &|command, _cancellation| external_runner(command),
+    )
+}
+
+#[cfg(test)]
+fn run_supervisor_plan_with_concurrent_cancellable_runner(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    max_concurrent_children: usize,
+    external_runner: &CancellableExternalRunner<'_>,
+) -> Result<SupervisorFinalReport> {
+    run_supervisor_plan_with_runner_and_creation(
+        plan,
+        consultant,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        SupervisorWorktreeCreation::TestOnly,
         external_runner,
     )
 }
@@ -2648,7 +2676,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
-    external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
+    external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(max_concurrent_children)?;
     match worktree_creation {
@@ -2767,6 +2795,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .collect()
         };
         let (scheduler_result, indexed_outcomes) = {
+            let cancellation = ProcessCancellation::new();
             let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
                 journal: &mut orchestration_journal,
@@ -2803,6 +2832,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                         semantic_block_order: None,
                         semantic_block_gate: None,
                         artifacts: &shared_artifacts,
+                        cancellation: cancellation.clone(),
                         external_runner,
                     });
                     let mut outcome = outcome;
@@ -2860,6 +2890,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                                         order
                                     });
                                 let completion_sender = completion_sender.clone();
+                                let assignment_cancellation = cancellation.clone();
                                 let spawn_result =
                                     thread::Builder::new().spawn_scoped(scope, move || {
                                         let _completion = CompletionSignal {
@@ -2894,6 +2925,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                                             semantic_block_gate: semantic_block_order
                                                 .map(|_| semantic_block_gate_ref),
                                             artifacts: artifacts_ref,
+                                            cancellation: assignment_cancellation,
                                             external_runner,
                                         })
                                     });
@@ -2902,6 +2934,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                                         active.insert(index, handle);
                                     }
                                     Err(error) => {
+                                        cancellation.cancel();
                                         record_assignment_spawn_failure(
                                             &mut indexed_outcomes,
                                             &mut stop_scheduling,
@@ -2919,15 +2952,25 @@ fn run_supervisor_plan_with_runner_and_creation(
                             if pending.is_empty() || stop_scheduling {
                                 break;
                             }
+                            cancellation.cancel();
                             bail!("supervisor scheduler could not select a pending assignment");
                         }
 
-                        let completed_index = completion_receiver
-                            .recv()
-                            .context("supervisor assignment completion channel closed")?;
-                        let handle = active
-                            .remove(&completed_index)
-                            .context("supervisor completion referenced an inactive assignment")?;
+                        let completed_index = match completion_receiver.recv() {
+                            Ok(index) => index,
+                            Err(error) => {
+                                cancellation.cancel();
+                                return Err(error)
+                                    .context("supervisor assignment completion channel closed");
+                            }
+                        };
+                        let handle = match active.remove(&completed_index) {
+                            Some(handle) => handle,
+                            None => {
+                                cancellation.cancel();
+                                bail!("supervisor completion referenced an inactive assignment");
+                            }
+                        };
                         let mut outcome = match handle.join() {
                             Ok(outcome) => outcome,
                             Err(_) => AssignmentExecutionOutcome::fatal(format!(
@@ -2937,6 +2980,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                         };
                         release_concurrent_assignment(&mut outcome, sync_store, semantic_store);
                         if outcome.requires_scheduler_abort() {
+                            cancellation.cancel();
                             stop_scheduling = true;
                         }
                         indexed_outcomes[completed_index] = Some(outcome);
@@ -9037,6 +9081,93 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.message.contains("containment")));
+    }
+
+    #[test]
+    fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
+        #[derive(Default)]
+        struct AbortState {
+            child_b_started: bool,
+            child_b_observed_cancellation: bool,
+            child_c_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "README.md/blocked-after-fatal"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "concurrent-fatal-cancels-active");
+        let state = Arc::new((Mutex::new(AbortState::default()), Condvar::new()));
+        let runner = {
+            let state = Arc::clone(&state);
+            let assignments = assignments.clone();
+            move |command: &ExternalAgentCommand, cancellation: &ProcessCancellation| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                if id == "child-b" {
+                    {
+                        let mut abort =
+                            lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        abort.child_b_started = true;
+                        condvar.notify_all();
+                    }
+                    while !cancellation.is_cancelled() {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    lock.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .child_b_observed_cancellation = true;
+                } else if id == "child-a" {
+                    let mut abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !abort.child_b_started {
+                        abort = condvar
+                            .wait(abort)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-c" {
+                    lock.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .child_c_started = true;
+                }
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                let mut run = injected_verified_run(command);
+                if id == "child-a" {
+                    run.process_tree = Some(ProcessTreeEvidence::Unverified(
+                        ContainmentBackend::SystemdUserService,
+                    ));
+                } else if id == "child-b" {
+                    run.exit_code = None;
+                    run.error = Some("cancelled by scheduler".to_string());
+                }
+                run
+            }
+        };
+
+        let report = run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("fatal containment result remains reportable");
+
+        assert!(!report.success);
+        let abort = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(abort.child_b_observed_cancellation);
+        assert!(!abort.child_c_started);
+        assert_eq!(report.orchestrator_reports.len(), 2);
     }
 
     #[test]

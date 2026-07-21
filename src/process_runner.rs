@@ -70,6 +70,30 @@ const RESERVED_EXPEDITED_SYSTEMD_SLOTS: usize = 1;
 const SYSTEMD_RUNTIME_OVERHEAD: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const SYSTEMD_ORPHAN_SAFETY_FUSE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A run-scoped cancellation signal for independently contained child processes.
+///
+/// Clones observe the same state. Cancellation is cooperative at setup boundaries and in the
+/// process poll loop; once a child has started, its own containment backend remains responsible
+/// for terminating and proving its process tree empty.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessCancellation {
+    requested: Arc<AtomicBool>,
+}
+
+impl ProcessCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
 #[cfg(target_os = "linux")]
 const SYSTEMD_SANDBOX_SHOW_PROPERTIES: &[&str] = &[
     "ProtectSystem",
@@ -1155,6 +1179,13 @@ impl ProcessOutput {
 
 #[derive(Debug, Error)]
 pub enum ProcessRunError {
+    #[error("{label} ({command}) was cancelled during {phase}")]
+    Cancelled {
+        label: String,
+        command: String,
+        phase: &'static str,
+        evidence: Option<Box<ProcessFailureEvidence>>,
+    },
     #[error("failed to open {stream} tee for {label} at {path}: {source}")]
     OpenTee {
         label: String,
@@ -1227,6 +1258,13 @@ pub enum ProcessRunError {
 }
 
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
+    run_process_cancellable(spec, &ProcessCancellation::new())
+}
+
+pub fn run_process_cancellable(
+    spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
     let command_display = spec.command_display();
     validate_process_spec_bounds(&spec).map_err(|source| ProcessRunError::Spawn {
@@ -1244,6 +1282,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
             });
         }
     }
+    ensure_not_cancelled(cancellation, &spec.label, &command_display, "initial setup")?;
     let operation_deadline = spec
         .timeout
         .map(|timeout| {
@@ -1263,6 +1302,12 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         current_dir: spec.current_dir.clone(),
         source,
     })?;
+    ensure_not_cancelled(
+        cancellation,
+        &spec.label,
+        &command_display,
+        "executable preflight",
+    )?;
     ensure_setup_budget(
         operation_deadline,
         &spec.label,
@@ -1283,6 +1328,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         &spec.label,
         &command_display,
         operation_deadline,
+        cancellation,
     )?;
     let mut command = prepared_process_tree
         .build_command(&spec)
@@ -1299,6 +1345,12 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
     )?;
     configure_stdin(&mut command, &spec.stdin);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    ensure_not_cancelled(
+        cancellation,
+        &spec.label,
+        &command_display,
+        "child spawn gate",
+    )?;
 
     #[cfg(test)]
     if env::var_os("MACO_TEST_ABORT_BEFORE_CHILD_SPAWN").is_some() {
@@ -1340,6 +1392,7 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         &spec.label,
         &command_display,
         operation_deadline,
+        cancellation,
     ) {
         Ok(process_tree) => process_tree,
         Err(error) => {
@@ -1347,6 +1400,15 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
             return Err(append_process_run_error_cleanup(error, cleanup));
         }
     };
+    if cancellation.is_cancelled() {
+        return Err(cancel_attached_process(
+            &mut attached_process_tree,
+            &mut child,
+            &spec.label,
+            &command_display,
+            "containment attachment gate",
+        ));
+    }
     let prepared_io_result = {
         #[cfg(test)]
         if env::var_os("MACO_TEST_FAIL_PRE_RELEASE_IO_SETUP").is_some() {
@@ -1397,11 +1459,21 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         );
         return Err(append_process_run_error_cleanup(error, cleanup_error));
     }
+    if cancellation.is_cancelled() {
+        return Err(cancel_attached_process(
+            &mut attached_process_tree,
+            &mut child,
+            &spec.label,
+            &command_display,
+            "containment start gate",
+        ));
+    }
     let mut process_tree = match attached_process_tree.release(
         &mut child,
         &spec.label,
         &command_display,
         operation_deadline,
+        cancellation,
     ) {
         Ok(process_tree) => process_tree,
         Err(error) => {
@@ -1447,6 +1519,64 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
                     });
                 }
             };
+        }
+
+        if status.is_none() && cancellation.is_cancelled() {
+            let cleanup =
+                process_tree.cleanup(&mut child, false, &spec.label, "cancellation termination");
+            process_tree_evidence = cleanup.process_tree;
+            side_effect_evidence = cleanup.side_effects;
+            process_error = append_error(
+                process_error,
+                Some(format!(
+                    "{} was cancelled by its run supervisor",
+                    spec.label
+                )),
+            );
+            process_error = append_error(process_error, cleanup.error);
+
+            let exit_deadline = Instant::now() + EXIT_AND_DRAIN_GRACE;
+            status = match wait_for_exit_until(&mut child, exit_deadline) {
+                Ok(status) => status,
+                Err(source) => {
+                    let evidence = cleanup_after_wait_error(
+                        &mut child,
+                        &mut process_tree,
+                        &spec.label,
+                        output_drainers,
+                        input_writer,
+                    );
+                    return Err(ProcessRunError::Wait {
+                        label: spec.label.clone(),
+                        command: command_display.clone(),
+                        evidence: Box::new(evidence),
+                        source,
+                    });
+                }
+            };
+            if status.is_none() {
+                process_error = append_error(
+                    process_error,
+                    Some(format!(
+                        "{} was cancelled and did not exit within {} ms after termination",
+                        spec.label,
+                        EXIT_AND_DRAIN_GRACE.as_millis()
+                    )),
+                );
+                let (reaped_status, reap_error) =
+                    kill_and_reap_child(&mut child, &spec.label, "cancellation fallback");
+                status = Some(reaped_status);
+                process_error = append_error(process_error, reap_error);
+            }
+
+            finish_child_io(
+                &spec.label,
+                "after cancellation termination",
+                &mut output_drainers,
+                &mut input_writer,
+                &mut process_error,
+            );
+            break;
         }
 
         if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1550,6 +1680,69 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
         process_error,
         stdin_error,
     })
+}
+
+impl ProcessRunError {
+    pub fn cancellation_evidence(&self) -> Option<&ProcessFailureEvidence> {
+        match self {
+            Self::Cancelled {
+                evidence: Some(evidence),
+                ..
+            } => Some(evidence),
+            _ => None,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
+}
+
+fn ensure_not_cancelled(
+    cancellation: &ProcessCancellation,
+    label: &str,
+    command: &str,
+    phase: &'static str,
+) -> Result<(), ProcessRunError> {
+    if cancellation.is_cancelled() {
+        return Err(ProcessRunError::Cancelled {
+            label: label.to_string(),
+            command: command.to_string(),
+            phase,
+            evidence: None,
+        });
+    }
+    Ok(())
+}
+
+fn cancel_attached_process(
+    process_tree: &mut AttachedProcessTree,
+    child: &mut Child,
+    label: &str,
+    command: &str,
+    phase: &'static str,
+) -> ProcessRunError {
+    let cleanup = process_tree.cleanup(child, label, "pre-release cancellation rollback");
+    let process_error = append_error(
+        Some(format!("{label} was cancelled by its run supervisor")),
+        append_error(
+            cleanup.error,
+            wait_for_child_cleanup(child, label, "pre-release cancellation rollback"),
+        ),
+    );
+    ProcessRunError::Cancelled {
+        label: label.to_string(),
+        command: command.to_string(),
+        phase,
+        evidence: Some(Box::new(ProcessFailureEvidence {
+            stdout: CapturedBytes::default(),
+            stderr: CapturedBytes::default(),
+            process_tree: cleanup.process_tree,
+            side_effects: cleanup.side_effects,
+            process_error,
+            stdin_error: None,
+        })),
+    }
 }
 
 fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
@@ -3202,6 +3395,7 @@ impl PreparedProcessTree {
         label: &str,
         command: &str,
         operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
     ) -> Result<Self, ProcessRunError> {
         let unavailable = |source| ProcessRunError::ContainmentUnavailable {
             label: label.to_string(),
@@ -3229,15 +3423,24 @@ impl PreparedProcessTree {
         } else {
             SideEffectConfinementEvidence::Unverified(side_effect_profile.kind())
         };
+        ensure_not_cancelled(cancellation, label, command, "containment slot acquisition")?;
         match policy {
             ContainmentPolicy::Required => {
                 #[cfg(target_os = "linux")]
                 {
-                    match SystemdUnit::prepare(operation_deadline) {
+                    match SystemdUnit::prepare(operation_deadline, cancellation) {
                         Ok(unit) => Ok(Self {
                             backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
                             side_effects,
                         }),
+                        Err(_source) if cancellation.is_cancelled() => {
+                            Err(ProcessRunError::Cancelled {
+                                label: label.to_string(),
+                                command: command.to_string(),
+                                phase: "containment slot acquisition",
+                                evidence: None,
+                            })
+                        }
                         Err(source)
                             if operation_deadline
                                 .is_some_and(|deadline| Instant::now() >= deadline) =>
@@ -3365,18 +3568,38 @@ impl PreparedProcessTree {
         label: &str,
         command: &str,
         operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
     ) -> Result<AttachedProcessTree, ProcessRunError> {
         match self.backend {
             #[cfg(target_os = "linux")]
             PreparedContainmentBackend::Systemd(mut unit) => {
                 unit.launcher_spawned = true;
-                if let Err(source) = unit.confirm_attached(child, operation_deadline) {
+                if let Err(source) = unit.confirm_attached(child, operation_deadline, cancellation)
+                {
                     if let Err(error) = unit.rollback_startup(label) {
                         fail_closed_stuck_owner(&format!(
                             "{label} systemd containment startup rollback: {error}"
                         ));
                     }
-                    return if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    return if cancellation.is_cancelled() {
+                        Err(ProcessRunError::Cancelled {
+                            label: label.to_string(),
+                            command: command.to_string(),
+                            phase: "strict containment attachment gate",
+                            evidence: Some(Box::new(ProcessFailureEvidence {
+                                stdout: CapturedBytes::default(),
+                                stderr: CapturedBytes::default(),
+                                process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                                    ContainmentBackend::SystemdUserService,
+                                ),
+                                side_effects: self.side_effects,
+                                process_error: Some(format!(
+                                    "{label} was cancelled by its run supervisor"
+                                )),
+                                stdin_error: None,
+                            })),
+                        })
+                    } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                     {
                         Err(setup_timeout_error(
                             label,
@@ -3449,17 +3672,57 @@ impl AttachedProcessTree {
         label: &str,
         command: &str,
         operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
     ) -> Result<ProcessTree, ProcessRunError> {
+        if cancellation.is_cancelled() {
+            let cleanup = self.cleanup(child, label, "containment start-gate cancellation");
+            return Err(ProcessRunError::Cancelled {
+                label: label.to_string(),
+                command: command.to_string(),
+                phase: "containment start gate",
+                evidence: Some(Box::new(ProcessFailureEvidence {
+                    stdout: CapturedBytes::default(),
+                    stderr: CapturedBytes::default(),
+                    process_tree: cleanup.process_tree,
+                    side_effects: cleanup.side_effects,
+                    process_error: append_error(
+                        Some(format!("{label} was cancelled by its run supervisor")),
+                        cleanup.error,
+                    ),
+                    stdin_error: None,
+                })),
+            });
+        }
         match &mut self.backend {
             #[cfg(target_os = "linux")]
             ProcessTreeBackend::Systemd(unit) => {
-                if let Err(source) = unit.release_start_gate(child, operation_deadline) {
+                if let Err(source) =
+                    unit.release_start_gate(child, operation_deadline, cancellation)
+                {
                     if let Err(error) = unit.rollback_startup(label) {
                         fail_closed_stuck_owner(&format!(
                             "{label} systemd containment start-gate rollback: {error}"
                         ));
                     }
-                    return if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    return if cancellation.is_cancelled() {
+                        Err(ProcessRunError::Cancelled {
+                            label: label.to_string(),
+                            command: command.to_string(),
+                            phase: "strict containment start gate",
+                            evidence: Some(Box::new(ProcessFailureEvidence {
+                                stdout: CapturedBytes::default(),
+                                stderr: CapturedBytes::default(),
+                                process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                                    ContainmentBackend::SystemdUserService,
+                                ),
+                                side_effects: self.side_effects,
+                                process_error: Some(format!(
+                                    "{label} was cancelled by its run supervisor"
+                                )),
+                                stdin_error: None,
+                            })),
+                        })
+                    } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                     {
                         Err(setup_timeout_error(
                             label,
@@ -5238,7 +5501,11 @@ struct SystemdUnitPermit {
 
 #[cfg(target_os = "linux")]
 impl SystemdUnitPermit {
-    fn acquire(runtime_root: &Path, operation_deadline: Option<Instant>) -> std::io::Result<Self> {
+    fn acquire(
+        runtime_root: &Path,
+        operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
+    ) -> std::io::Result<Self> {
         use std::os::unix::{
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             io::AsRawFd,
@@ -5248,6 +5515,12 @@ impl SystemdUnitPermit {
         let effective_uid = unsafe { libc::geteuid() };
         let deadline = bounded_operation_deadline(SYSTEMD_SLOT_WAIT, operation_deadline)?;
         loop {
+            if cancellation.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "systemd containment slot acquisition was cancelled",
+                ));
+            }
             if Instant::now() >= deadline {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -5285,6 +5558,13 @@ impl SystemdUnitPermit {
                 }
                 // SAFETY: flock operates on this live owned descriptor and does not access memory.
                 if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    if cancellation.is_cancelled() {
+                        drop(file);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "systemd containment slot acquisition was cancelled",
+                        ));
+                    }
                     if Instant::now() >= deadline {
                         drop(file);
                         return Err(std::io::Error::new(
@@ -5326,7 +5606,10 @@ impl Drop for SystemdUnitPermit {
 
 #[cfg(target_os = "linux")]
 impl SystemdUnit {
-    fn prepare(operation_deadline: Option<Instant>) -> std::io::Result<Self> {
+    fn prepare(
+        operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
+    ) -> std::io::Result<Self> {
         #[cfg(test)]
         if env::var_os("MACO_TEST_DISABLE_STRICT_CONTAINMENT").is_some() {
             return Err(std::io::Error::new(
@@ -5335,7 +5618,7 @@ impl SystemdUnit {
             ));
         }
         let client_runtime = trusted_linux_runtime_root()?;
-        let permit = SystemdUnitPermit::acquire(&client_runtime, operation_deadline)?;
+        let permit = SystemdUnitPermit::acquire(&client_runtime, operation_deadline, cancellation)?;
         let systemd_run = find_trusted_unix_executable(
             "systemd-run",
             &[
@@ -5695,9 +5978,16 @@ impl SystemdUnit {
         &mut self,
         child: &mut Child,
         operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
         let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
         loop {
+            if cancellation.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "systemd containment attachment was cancelled",
+                ));
+            }
             if Instant::now() >= deadline {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -5812,6 +6102,7 @@ impl SystemdUnit {
         &mut self,
         child: &mut Child,
         operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
         let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
         remove_file_if_present(&self.environment_file).map_err(|error| {
@@ -5829,6 +6120,12 @@ impl SystemdUnit {
             )
         })?;
         loop {
+            if cancellation.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "systemd containment start-gate release was cancelled",
+                ));
+            }
             match signal_systemd_fifo(&self.start_fifo_path, b"start\n") {
                 Ok(()) => return Ok(()),
                 Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
@@ -8435,6 +8732,58 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancellation_terminates_owned_process_group_and_delayed_descendant() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ready = temp.path().join("ready");
+        let delayed = temp.path().join("delayed");
+        let command = format!(
+            "touch '{}'; (sleep 0.3; touch '{}') & trap '' TERM; while :; do sleep 1; done",
+            ready.display(),
+            delayed.display()
+        );
+        let cancellation = ProcessCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let workdir = temp.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            run_process_cancellable(
+                ProcessSpec::shell(
+                    "cancellable process group",
+                    Shell::UnixSh,
+                    command,
+                    workdir,
+                    1024,
+                )
+                .with_containment(ContainmentPolicy::TrustedBestEffort)
+                .with_timeout(Some(Duration::from_secs(5))),
+                &worker_cancellation,
+            )
+        });
+
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "child did not reach ready gate"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
+        cancellation.cancel();
+        let output = worker
+            .join()
+            .unwrap_or_else(|_| panic!("cancellable runner thread panicked"))
+            .expect("cancel contained process group");
+
+        assert!(!output.timed_out);
+        assert!(output
+            .process_error
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled")));
+        thread::sleep(Duration::from_millis(400));
+        assert!(!delayed.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn completion_first_observed_after_deadline_is_a_timeout() {
         let temp = tempfile::tempdir().expect("tempdir");
         let spec = ProcessSpec::shell(
@@ -8692,6 +9041,71 @@ mod tests {
         let evidence = fs::read_to_string(&marker).expect("socket denial evidence");
         assert!(evidence.contains("open=Some("));
         assert!(evidence.contains("connect=Some("));
+        assert_current_runner_has_no_systemd_residue();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
+    fn one_cancellation_cleans_two_simultaneous_strict_process_trees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cancellation = ProcessCancellation::new();
+        let mut workers = Vec::new();
+        let mut ready_paths = Vec::new();
+        for index in 0..2usize {
+            let ready = temp.path().join(format!("ready-{index}"));
+            ready_paths.push(ready.clone());
+            let workdir = temp.path().to_path_buf();
+            let worker_cancellation = cancellation.clone();
+            workers.push(thread::spawn(move || {
+                run_process_cancellable(
+                    ProcessSpec::shell(
+                        format!("simultaneous cancellable process {index}"),
+                        Shell::UnixSh,
+                        format!(
+                            "touch '{}'; trap '' TERM; while :; do sleep 1; done",
+                            ready.display()
+                        ),
+                        workdir,
+                        1024,
+                    )
+                    .with_timeout(Some(Duration::from_secs(10))),
+                    &worker_cancellation,
+                )
+            }));
+        }
+
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_paths.iter().all(|path| path.exists()) && Instant::now() < ready_deadline {
+            thread::sleep(POLL_INTERVAL);
+        }
+        cancellation.cancel();
+        let results = workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| panic!("strict cancellation worker panicked"))
+            })
+            .collect::<Vec<_>>();
+
+        if results
+            .iter()
+            .any(|result| result.as_ref().is_err_and(is_verified_backend_unavailable))
+        {
+            assert_current_runner_has_no_systemd_residue();
+            return;
+        }
+        assert!(ready_paths.iter().all(|path| path.exists()));
+        for output in results {
+            let output = output.expect("cancel strict contained process");
+            assert!(output.process_tree.is_verified_empty());
+            assert!(output.side_effects.is_verified());
+            assert!(output
+                .process_error
+                .as_deref()
+                .is_some_and(|error| error.contains("cancelled")));
+        }
         assert_current_runner_has_no_systemd_residue();
     }
 
@@ -10333,12 +10747,14 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         )
         .with_stdin(StdinMode::Null)
         .with_containment(ContainmentPolicy::TrustedBestEffort);
+        let cancellation = ProcessCancellation::new();
         let mut prepared_tree = PreparedProcessTree::prepare(
             spec.containment,
             &spec.side_effects,
             "evidence child",
             "sh",
             None,
+            &cancellation,
         )
         .expect("prepare evidence containment");
         let mut command = prepared_tree
@@ -10350,12 +10766,12 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn evidence child");
         let attached_tree = prepared_tree
-            .attach(&mut child, "evidence child", "sh", None)
+            .attach(&mut child, "evidence child", "sh", None, &cancellation)
             .expect("attach evidence child");
         let prepared = PreparedChildIo::take(&mut child, &StdinMode::Null)
             .expect("prepare evidence child I/O");
         let mut process_tree = attached_tree
-            .release(&mut child, "evidence child", "sh", None)
+            .release(&mut child, "evidence child", "sh", None, &cancellation)
             .expect("release evidence child");
         let (input_writer, mut output_drainers) =
             prepared.start("evidence child", StdinMode::Null, 1024, 1024, None, None);
