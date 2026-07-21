@@ -356,7 +356,7 @@ fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> 
 }
 
 #[test]
-fn supervise_run_does_not_silently_ignore_unimplemented_concurrent_bound() -> Result<()> {
+fn supervise_run_accepts_concurrent_bound_before_fake_runtime_safety_refusal() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("concurrent-run.json");
@@ -375,7 +375,7 @@ fn supervise_run_does_not_silently_ignore_unimplemented_concurrent_bound() -> Re
         "2",
         "--json",
     ])?;
-    assert!(stderr.contains("greater than 1 is not yet supported"));
+    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     assert!(!repo_path.join(".maco/o2/runs/bounded-two").exists());
     Ok(())
 }

@@ -34,6 +34,8 @@ use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    sync::{mpsc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -544,29 +546,34 @@ pub fn run_supervisor_plan_file_with_max_concurrent_children(
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
 ) -> Result<SupervisorFinalReport> {
-    let mut external_runner = run_external_agent;
+    let external_runner = run_external_agent;
     run_supervisor_plan_file_with_runner_and_max_concurrent_children(
         options,
         max_concurrent_children,
-        &mut external_runner,
+        &external_runner,
     )
 }
 
 #[cfg(test)]
 fn run_supervisor_plan_file_with_runner(
     options: SupervisorRunOptions,
-    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
-    run_supervisor_plan_file_with_runner_and_max_concurrent_children(options, 1, external_runner)
+    let serialized_runner = Mutex::new(external_runner);
+    run_supervisor_plan_file_with_runner_and_max_concurrent_children(options, 1, &|command| {
+        match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        }
+    })
 }
 
 fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
-    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+    external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(max_concurrent_children)?;
-    ensure_supported_max_concurrent_children(max_concurrent_children)?;
     if options.runtime == SupervisorRuntime::Fake {
         bail!(
             "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
@@ -721,6 +728,14 @@ pub fn supervise_role_prefix(
 }
 
 pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) -> Result<String> {
+    let incoming_root = context.run_dir.join("incoming");
+    child_orchestrator_prompt_with_incoming_root(context, &incoming_root)
+}
+
+fn child_orchestrator_prompt_with_incoming_root(
+    context: ChildOrchestratorPromptContext<'_>,
+    incoming_root: &Path,
+) -> Result<String> {
     let ChildOrchestratorPromptContext {
         plan,
         assignment,
@@ -738,7 +753,16 @@ pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) ->
     let worker_prompts = assignment
         .worker_assignments
         .iter()
-        .map(|worker| worker_prompt(plan, assignment, worker, run_dir, worker_schema_path))
+        .map(|worker| {
+            worker_prompt_with_incoming_root(
+                plan,
+                assignment,
+                worker,
+                run_dir,
+                incoming_root,
+                worker_schema_path,
+            )
+        })
         .collect::<Result<Vec<_>>>()?
         .join("\n\n--- worker prompt contract ---\n\n");
     let auditor_prompt = review_auditor_prompt(plan, assignment, run_dir, auditor_schema_path)?;
@@ -872,11 +896,29 @@ pub fn worker_prompt(
     run_dir: &Path,
     schema_path: &Path,
 ) -> Result<String> {
+    worker_prompt_with_incoming_root(
+        plan,
+        orchestrator,
+        worker,
+        run_dir,
+        &run_dir.join("incoming"),
+        schema_path,
+    )
+}
+
+fn worker_prompt_with_incoming_root(
+    plan: &SupervisorPlan,
+    orchestrator: &OrchestratorAssignment,
+    worker: &WorkerAssignment,
+    run_dir: &Path,
+    incoming_root: &Path,
+    schema_path: &Path,
+) -> Result<String> {
     let worker_json =
         serde_json::to_string_pretty(worker).context("failed to serialize worker assignment")?;
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     let task = worker_task(plan, orchestrator, worker);
-    let journal_path = worker_execution_journal_incoming_path(run_dir, worker);
+    let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
     Ok(format!(
         r#"{role_prefix}You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
@@ -1173,12 +1215,6 @@ fn worker_execution_journal_incoming_relative(worker: &WorkerAssignment) -> Path
     PathBuf::from("worker-journals").join(worker_execution_journal_file_name(&worker.id))
 }
 
-fn worker_execution_journal_incoming_path(run_dir: &Path, worker: &WorkerAssignment) -> PathBuf {
-    run_dir
-        .join("incoming")
-        .join(worker_execution_journal_incoming_relative(worker))
-}
-
 fn worker_execution_journal_evidence_relative(assignment_id: &str, worker_id: &str) -> PathBuf {
     PathBuf::from("logs")
         .join("workers")
@@ -1406,20 +1442,848 @@ enum SupervisorWorktreeCreation<'a> {
     TestOnly,
 }
 
+struct SharedSupervisorArtifacts<'a> {
+    writer: &'a mut ArtifactRunWriter,
+    journal: &'a mut Option<OrchestrationEventJournal>,
+}
+
+fn with_supervisor_artifacts<T>(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    operation: impl FnOnce(&mut ArtifactRunWriter, &mut Option<OrchestrationEventJournal>) -> Result<T>,
+) -> Result<T> {
+    let mut guard = artifacts
+        .lock()
+        .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    let SharedSupervisorArtifacts { writer, journal } = &mut *guard;
+    operation(writer, journal)
+}
+
+fn record_shared_orchestration_event(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    node: &str,
+    parent: Option<&str>,
+    role: OrchestrationRole,
+    kind: OrchestrationEventKind,
+    payload: Value,
+) -> Result<()> {
+    with_supervisor_artifacts(artifacts, |writer, journal| {
+        record_orchestration_event(journal, writer, node, parent, role, kind, payload);
+        Ok(())
+    })
+}
+
+#[derive(Default)]
+struct AssignmentExecutionOutcome {
+    command_records: Vec<CommandRunRecord>,
+    report: Option<OrchestratorReviewReport>,
+    findings: Vec<Finding>,
+    claim_tokens: Vec<ClaimToken>,
+    semantic_tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
+    released_claims: Vec<PathClaim>,
+    release_errors: Vec<String>,
+    released_semantic_intents: Vec<SemanticIntent>,
+    semantic_release_errors: Vec<String>,
+    external_containment_failed: bool,
+    fatal_error: Option<String>,
+}
+
+fn release_concurrent_assignment(
+    outcome: &mut AssignmentExecutionOutcome,
+    sync_store: &SyncStore,
+    semantic_store: &SemanticIntentStore,
+) {
+    let (released_claims, release_errors) =
+        release_claims(sync_store, std::mem::take(&mut outcome.claim_tokens));
+    let (released_semantic_intents, semantic_release_errors) =
+        release_semantic_intents(semantic_store, std::mem::take(&mut outcome.semantic_tokens));
+    outcome.released_claims = released_claims;
+    outcome.release_errors = release_errors;
+    outcome.released_semantic_intents = released_semantic_intents;
+    outcome.semantic_release_errors = semantic_release_errors;
+}
+
+impl AssignmentExecutionOutcome {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            fatal_error: Some(message.into()),
+            ..Self::default()
+        }
+    }
+
+    fn requires_scheduler_abort(&self) -> bool {
+        self.fatal_error.is_some() || self.external_containment_failed
+    }
+}
+
+struct AssignmentExecutionContext<'a, 'writer> {
+    index: usize,
+    concurrent_mode: bool,
+    plan: &'a SupervisorPlan,
+    consultant: &'a SupervisorConsultantPlan,
+    assignment: &'a OrchestratorAssignment,
+    options: &'a SupervisorRunOptions,
+    repo: &'a Path,
+    run_dir: &'a Path,
+    dirs: &'a RunDirs,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'a>,
+    manager: &'a WorktreeManager,
+    reused: bool,
+    sync_store: &'a SyncStore,
+    semantic_store: &'a SemanticIntentStore,
+    artifacts: &'a Mutex<SharedSupervisorArtifacts<'writer>>,
+    external_runner: &'a (dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
+}
+
+struct CompletionSignal {
+    index: usize,
+    sender: mpsc::Sender<usize>,
+}
+
+impl Drop for CompletionSignal {
+    fn drop(&mut self) {
+        let _ = self.sender.send(self.index);
+    }
+}
+
+fn execute_supervisor_assignment(
+    context: AssignmentExecutionContext<'_, '_>,
+) -> AssignmentExecutionOutcome {
+    let mut outcome = AssignmentExecutionOutcome::default();
+    let result = execute_supervisor_assignment_inner(&context, &mut outcome);
+    if let Err(error) = result {
+        outcome.fatal_error = Some(format!(
+            "supervisor assignment '{}' aborted: {error:#}",
+            context.assignment.id
+        ));
+    }
+    outcome
+}
+
+fn execute_supervisor_assignment_inner(
+    context: &AssignmentExecutionContext<'_, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+) -> Result<()> {
+    let AssignmentExecutionContext {
+        index,
+        concurrent_mode,
+        plan,
+        consultant,
+        assignment,
+        options,
+        repo,
+        run_dir,
+        dirs,
+        execution_runtime,
+        worktree_creation,
+        manager,
+        reused,
+        sync_store,
+        semantic_store,
+        artifacts,
+        external_runner,
+    } = context;
+    let current_primary_head = current_head_oid(repo)?;
+    if !reused {
+        let create_options = WorktreeCreateOptions {
+            agent_id: assignment.id.clone(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        };
+        match worktree_creation {
+            SupervisorWorktreeCreation::Bound(cleanliness) => manager
+                .create_with_repository_cleanliness(create_options, cleanliness)
+                .with_context(|| {
+                    format!(
+                        "failed to create capability-bound child worktree '{}'",
+                        assignment.id
+                    )
+                })?,
+            #[cfg(test)]
+            SupervisorWorktreeCreation::TestOnly => manager.create_for_test(create_options)?,
+        };
+    }
+    let worktree_write_lease = manager
+        .acquire_write_execution_lease(&assignment.id)
+        .with_context(|| {
+            format!(
+                "failed to acquire exclusive execution lease for child worktree '{}'",
+                assignment.id
+            )
+        })?;
+    let worktree = worktree_write_lease.record().clone();
+    if *reused {
+        ensure_reusable_child_worktree(&worktree, &current_primary_head)?;
+    }
+    let child_base_head = current_head_oid(&worktree.path).with_context(|| {
+        format!(
+            "failed to capture base HEAD for child worktree '{}' at {}",
+            assignment.id,
+            worktree.path.display()
+        )
+    })?;
+    let claim = match sync_store.claim_paths(&assignment.id, assignment.assigned_paths.iter()) {
+        Ok(claim) => claim,
+        Err(error) => {
+            outcome
+                .findings
+                .push(claim_failure_finding(sync_store, assignment, &error));
+            return Err(error)
+                .with_context(|| format!("failed to claim paths for '{}'", assignment.id));
+        }
+    };
+    outcome.claim_tokens.push(claim.token);
+
+    let mut planned_semantic_intents = Vec::new();
+    let semantic_token = coordinate_semantic_assignment(
+        semantic_store,
+        assignment,
+        plan.semantic_coordination,
+        &mut outcome.semantic_tokens,
+        &mut planned_semantic_intents,
+        &mut outcome.findings,
+    )?;
+
+    let final_report_name = format!("{}.json", assignment.id);
+    let final_report_relative = PathBuf::from("reports").join(&final_report_name);
+    let final_report_path = dirs.reports.join(&final_report_name);
+    let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+    let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+    let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+
+    let mut child_report = None;
+    let mut child_containment_verified = false;
+    let mut retry_feedback: Option<Vec<String>> = None;
+    let mut attempt_history = Vec::new();
+    let max_attempts = usize::from(plan.max_child_retries).saturating_add(1);
+    for attempt in 1..=max_attempts {
+        let (incoming_name, capture_name) =
+            invocation_scratch_names(*index, attempt, false, *concurrent_mode);
+        let incoming_path = run_dir.join(&incoming_name);
+        let capture_path = run_dir.join(&capture_name);
+        let attempt_artifacts = child_attempt_artifacts(
+            dirs,
+            &incoming_path,
+            &capture_path,
+            &assignment.id,
+            attempt,
+            max_attempts > 1,
+        );
+        let corrective_retry_used = retry_feedback.is_some();
+        let prompt = child_orchestrator_prompt_with_incoming_root(
+            ChildOrchestratorPromptContext {
+                plan,
+                assignment,
+                run_dir,
+                worktree: &worktree,
+                report_path: &attempt_artifacts.report_path,
+                schema_path: &schema_path,
+                worker_schema_path: &worker_schema_path,
+                auditor_schema_path: &auditor_schema_path,
+                consultant,
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: semantic_token,
+                },
+            },
+            &incoming_path,
+        )?;
+        let attempt_prompt = match &retry_feedback {
+            Some(problems) => prompt_with_corrective_feedback(&prompt, problems),
+            None => prompt,
+        };
+        let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            write_private_prompt(writer, &prompt_relative, &attempt_prompt)
+        })
+        .with_context(|| {
+            format!(
+                "failed to write prompt {}",
+                attempt_artifacts.prompt_path.display()
+            )
+        })?;
+
+        let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
+        if let Some(error) = primary_before.inspection_problem() {
+            bail!(
+                "refusing to launch child without a complete primary integrity snapshot: {error}"
+            );
+        }
+        let (incoming_scratch, capture_scratch) =
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                create_named_invocation_scratches(writer, &incoming_name, &capture_name)
+            })?;
+        if incoming_scratch.path() != incoming_path || capture_scratch.path() != capture_path {
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+            })?;
+            bail!("artifact scratch paths changed during child setup");
+        }
+        let incoming_output_root = match SecureOutputRoot::open_private(incoming_scratch.path()) {
+            Ok(root) => root,
+            Err(error) => {
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error).context("failed to bind child incoming scratch root");
+            }
+        };
+        let capture_output_root = match SecureOutputRoot::open_private(capture_scratch.path()) {
+            Ok(root) => root,
+            Err(error) => {
+                drop(incoming_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error).context("failed to bind parent capture scratch root");
+            }
+        };
+        if incoming_output_root.path() != incoming_scratch.path()
+            || capture_output_root.path() != capture_scratch.path()
+        {
+            drop(incoming_output_root);
+            drop(capture_output_root);
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+            })?;
+            bail!("descriptor-held invocation scratch roots changed during setup");
+        }
+        let mut command = ExternalAgentCommand::codex(
+            &options.codex_bin,
+            &worktree.path,
+            &attempt_artifacts.prompt_path,
+            &attempt_artifacts.log_path,
+            &attempt_artifacts.report_path,
+            Duration::from_secs(plan.child_timeout_seconds),
+        );
+        command.output_schema = Some(schema_path.clone());
+        command = command.with_hidden_root(repo);
+
+        record_shared_orchestration_event(
+            artifacts,
+            &assignment.id,
+            Some(options.run_id.as_str()),
+            OrchestrationRole::Orchestrator,
+            OrchestrationEventKind::Spawn,
+            json!({
+                "attempt": attempt,
+                "corrective_retry": corrective_retry_used,
+            }),
+        )?;
+        record_shared_orchestration_event(
+            artifacts,
+            &assignment.id,
+            Some(options.run_id.as_str()),
+            OrchestrationRole::Orchestrator,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload("running", Some(attempt), None),
+        )?;
+
+        // No scheduler, artifact-writer, or journal lock is held while the
+        // independently contained external process runs.
+        let external_run_result = match options.runtime {
+            SupervisorRuntime::Codex => Ok(external_runner(&command)),
+            SupervisorRuntime::Fake => deterministic_fake_child_run(
+                &command,
+                assignment,
+                claim.token.get(),
+                semantic_token,
+            ),
+        };
+        let external_run = match external_run_result {
+            Ok(run) => run,
+            Err(error) => {
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error).context("failed to produce deterministic child output");
+            }
+        };
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
+        record_shared_orchestration_event(
+            artifacts,
+            &assignment.id,
+            Some(options.run_id.as_str()),
+            OrchestrationRole::Orchestrator,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload(
+                if external_process_completed(&external_run) {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                Some(attempt),
+                child_thread_id.as_deref(),
+            ),
+        )?;
+        let attempt_containment_verified = external_safety_verified(&external_run, options.runtime);
+        if !attempt_containment_verified {
+            outcome.external_containment_failed = true;
+            outcome.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
+                    assignment.id,
+                    (external_run.process_tree, external_run.side_effects),
+                    attempt_artifacts.raw_report_relative.display()
+                ),
+                paths: vec![attempt_artifacts.raw_report_relative.clone()],
+            });
+        }
+        outcome
+            .command_records
+            .push(command_record_from_external(&external_run, &command));
+        let raw_report_validated = read_child_report(
+            external_run.output_last_message(),
+            &attempt_artifacts.raw_report_relative,
+        )
+        .is_ok();
+        let worker_journal_evidence = with_supervisor_artifacts(artifacts, |writer, journal| {
+            let evidence = import_worker_execution_journals(writer, assignment, &incoming_scratch)?;
+            record_worker_journal_events(journal, writer, assignment, &evidence);
+            Ok(evidence)
+        })?;
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            import_external_attempt_evidence(
+                writer,
+                ExternalAttemptEvidenceContext {
+                    incoming_scratch: &incoming_scratch,
+                    capture_scratch: &capture_scratch,
+                    artifacts: &attempt_artifacts,
+                    external_run: &external_run,
+                    external_command: &command,
+                    raw_report_validated,
+                    runtime: options.runtime,
+                },
+            )
+        })?;
+        let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
+        let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
+        let (mut attempt_report, report_shape_problems) = collect_child_report(
+            assignment,
+            &attempt_artifacts.raw_report_relative,
+            &external_run,
+            &command,
+            &worktree.path,
+            &child_base_head,
+            &worker_journal_evidence,
+        );
+        if !primary_changes.is_empty() {
+            mark_primary_integrity_violation(assignment, &primary_changes, &mut attempt_report);
+        }
+        if !attempt_containment_verified {
+            mark_child_containment_violation(
+                assignment,
+                &attempt_artifacts.raw_report_relative,
+                external_run.process_tree,
+                external_run.side_effects,
+                &mut attempt_report,
+            );
+            attempt_history.push(ChildAttemptHistory {
+                attempt,
+                report_path: attempt_artifacts.raw_report_relative.clone(),
+                structural_problems: report_shape_problems,
+                corrective_retry_used,
+            });
+            child_report = Some(attempt_report);
+            break;
+        }
+        let retry_used = should_retry_child_report(
+            &attempt_report,
+            &report_shape_problems,
+            attempt,
+            plan.max_child_retries,
+        );
+        attempt_history.push(ChildAttemptHistory {
+            attempt,
+            report_path: attempt_artifacts.raw_report_relative.clone(),
+            structural_problems: report_shape_problems.clone(),
+            corrective_retry_used,
+        });
+        if retry_used {
+            record_shared_orchestration_event(
+                artifacts,
+                &assignment.id,
+                Some(options.run_id.as_str()),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Reject,
+                json!({
+                    "scope": "attempt",
+                    "attempt": attempt,
+                    "reason": "structural report requires corrective retry",
+                    "structural_problems": report_shape_problems,
+                }),
+            )?;
+            record_shared_orchestration_event(
+                artifacts,
+                &assignment.id,
+                Some(options.run_id.as_str()),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Status,
+                lifecycle_event_payload("retrying", Some(attempt), None),
+            )?;
+            retry_feedback = Some(report_shape_problems);
+            continue;
+        }
+        if attempt > 1 {
+            attempt_report.findings.push(Finding {
+                severity: FindingSeverity::Warning,
+                message: format!("child report accepted after corrective retry attempt {attempt}"),
+                paths: vec![attempt_artifacts.raw_report_relative.clone()],
+            });
+        }
+        child_containment_verified = true;
+        child_report = Some(attempt_report);
+        break;
+    }
+
+    let mut child_report = child_report.with_context(|| {
+        format!(
+            "child orchestrator '{}' did not produce a collected report after retries",
+            assignment.id
+        )
+    })?;
+    if plan.max_child_retries > 0 {
+        append_child_attempt_history(&mut child_report, &attempt_history);
+    }
+    with_supervisor_artifacts(artifacts, |writer, _| {
+        write_child_report(writer, &final_report_relative, &child_report)
+    })?;
+
+    let mut assignment_containment_verified = child_containment_verified;
+    if child_containment_verified && parent_auditor_required(assignment, &child_report) {
+        let auditor_id = parent_auditor_id(assignment);
+        let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
+        let (auditor_incoming_name, auditor_capture_name) =
+            invocation_scratch_names(*index, 1, true, *concurrent_mode);
+        let auditor_incoming_path = run_dir.join(&auditor_incoming_name);
+        let auditor_capture_path = run_dir.join(&auditor_capture_name);
+        let auditor_report_path = auditor_incoming_path.join(format!("{auditor_id}.json"));
+        let auditor_log_path = auditor_capture_path.join(format!("{auditor_id}.jsonl"));
+        let auditor_artifacts = ChildAttemptArtifacts {
+            prompt_path: auditor_prompt_path.clone(),
+            report_path: auditor_report_path.clone(),
+            log_path: auditor_log_path.clone(),
+            raw_report_relative: PathBuf::from("evidence")
+                .join("incoming")
+                .join(format!("{auditor_id}.json")),
+            raw_stdout_relative: PathBuf::from("logs").join(format!("{auditor_id}.jsonl")),
+            command_record_relative: PathBuf::from("logs")
+                .join(format!("{auditor_id}.summary.json")),
+        };
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        let auditor_prompt = parent_review_auditor_prompt(ParentReviewAuditorPromptContext {
+            plan,
+            assignment,
+            run_dir,
+            worktree_path: &worktree.path,
+            child_report_path: &final_report_path,
+            auditor_report_path: &auditor_report_path,
+            schema_path: &auditor_schema_path,
+            child_report: &child_report,
+        })?;
+        let auditor_prompt_relative = dirs.relative(&auditor_prompt_path)?;
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            write_private_prompt(writer, &auditor_prompt_relative, &auditor_prompt)
+        })
+        .with_context(|| {
+            format!(
+                "failed to write auditor prompt {}",
+                auditor_prompt_path.display()
+            )
+        })?;
+
+        let primary_before_auditor = primary_worktree_snapshot(repo, *execution_runtime)?;
+        if let Some(error) = primary_before_auditor.inspection_problem() {
+            bail!(
+                "refusing to launch parent review auditor without a complete primary integrity snapshot: {error}"
+            );
+        }
+        let (auditor_incoming_scratch, auditor_capture_scratch) =
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                create_named_invocation_scratches(
+                    writer,
+                    &auditor_incoming_name,
+                    &auditor_capture_name,
+                )
+            })?;
+        if auditor_incoming_scratch.path() != auditor_incoming_path
+            || auditor_capture_scratch.path() != auditor_capture_path
+        {
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(
+                    writer,
+                    &auditor_incoming_scratch,
+                    &auditor_capture_scratch,
+                )
+            })?;
+            bail!("artifact scratch paths changed during parent auditor setup");
+        }
+        let auditor_incoming_root =
+            match SecureOutputRoot::open_private(auditor_incoming_scratch.path()) {
+                Ok(root) => root,
+                Err(error) => {
+                    with_supervisor_artifacts(artifacts, |writer, _| {
+                        discard_invocation_scratches(
+                            writer,
+                            &auditor_incoming_scratch,
+                            &auditor_capture_scratch,
+                        )
+                    })?;
+                    return Err(error)
+                        .context("failed to bind parent auditor incoming scratch root");
+                }
+            };
+        let auditor_capture_root =
+            match SecureOutputRoot::open_private(auditor_capture_scratch.path()) {
+                Ok(root) => root,
+                Err(error) => {
+                    drop(auditor_incoming_root);
+                    with_supervisor_artifacts(artifacts, |writer, _| {
+                        discard_invocation_scratches(
+                            writer,
+                            &auditor_incoming_scratch,
+                            &auditor_capture_scratch,
+                        )
+                    })?;
+                    return Err(error)
+                        .context("failed to bind parent auditor capture scratch root");
+                }
+            };
+        if auditor_incoming_root.path() != auditor_incoming_scratch.path()
+            || auditor_capture_root.path() != auditor_capture_scratch.path()
+        {
+            drop(auditor_incoming_root);
+            drop(auditor_capture_root);
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(
+                    writer,
+                    &auditor_incoming_scratch,
+                    &auditor_capture_scratch,
+                )
+            })?;
+            bail!("descriptor-held auditor scratch roots changed during setup");
+        }
+
+        let mut auditor_command = ExternalAgentCommand::codex(
+            &options.codex_bin,
+            &worktree.path,
+            &auditor_prompt_path,
+            &auditor_log_path,
+            &auditor_report_path,
+            Duration::from_secs(plan.child_timeout_seconds),
+        );
+        auditor_command.output_schema = Some(auditor_schema_path);
+        auditor_command = auditor_command
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_hidden_root(repo);
+        record_shared_orchestration_event(
+            artifacts,
+            &auditor_id,
+            Some(&assignment.id),
+            OrchestrationRole::Auditor,
+            OrchestrationEventKind::Spawn,
+            json!({"attempt": 1}),
+        )?;
+        record_shared_orchestration_event(
+            artifacts,
+            &auditor_id,
+            Some(&assignment.id),
+            OrchestrationRole::Auditor,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload("running", Some(1), None),
+        )?;
+
+        // The artifact and journal mutex is intentionally released before
+        // entering the potentially long-running auditor process.
+        let auditor_run_result = match options.runtime {
+            SupervisorRuntime::Codex => Ok(external_runner(&auditor_command)),
+            SupervisorRuntime::Fake => {
+                deterministic_fake_auditor_run(&auditor_command, assignment, &child_report)
+            }
+        };
+        let auditor_run = match auditor_run_result {
+            Ok(run) => run,
+            Err(error) => {
+                drop(auditor_incoming_root);
+                drop(auditor_capture_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(
+                        writer,
+                        &auditor_incoming_scratch,
+                        &auditor_capture_scratch,
+                    )
+                })?;
+                return Err(error).context("failed to produce deterministic parent auditor output");
+            }
+        };
+        drop(auditor_incoming_root);
+        drop(auditor_capture_root);
+        let auditor_thread_id = codex_thread_id_from_stdout(auditor_run.stdout_bytes());
+        record_shared_orchestration_event(
+            artifacts,
+            &auditor_id,
+            Some(&assignment.id),
+            OrchestrationRole::Auditor,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload(
+                if external_process_completed(&auditor_run) {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                Some(1),
+                auditor_thread_id.as_deref(),
+            ),
+        )?;
+        let auditor_containment_verified = external_safety_verified(&auditor_run, options.runtime);
+        if !auditor_containment_verified {
+            assignment_containment_verified = false;
+            outcome.external_containment_failed = true;
+            outcome.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "external parent auditor process containment was not verified empty for '{}'; evidence: {:?}; report: {}",
+                    auditor_id,
+                    (auditor_run.process_tree, auditor_run.side_effects),
+                    auditor_artifacts.raw_report_relative.display()
+                ),
+                paths: vec![auditor_artifacts.raw_report_relative.clone()],
+            });
+        }
+        let auditor_command_record = command_record_from_external(&auditor_run, &auditor_command);
+        outcome.command_records.push(auditor_command_record.clone());
+        child_report.commands_run.push(auditor_command_record);
+        let raw_auditor_validated = read_auditor_report(
+            auditor_run.output_last_message(),
+            &auditor_artifacts.raw_report_relative,
+        )
+        .is_ok();
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            import_external_attempt_evidence(
+                writer,
+                ExternalAttemptEvidenceContext {
+                    incoming_scratch: &auditor_incoming_scratch,
+                    capture_scratch: &auditor_capture_scratch,
+                    artifacts: &auditor_artifacts,
+                    external_run: &auditor_run,
+                    external_command: &auditor_command,
+                    raw_report_validated: raw_auditor_validated,
+                    runtime: options.runtime,
+                },
+            )
+        })?;
+        let primary_after_auditor = primary_worktree_snapshot(repo, *execution_runtime)?;
+        let primary_auditor_changes =
+            primary_integrity_changes(&primary_before_auditor, &primary_after_auditor);
+        let mut auditor_report = collect_parent_auditor_report(
+            assignment,
+            &auditor_artifacts.raw_report_relative,
+            &auditor_run,
+            &auditor_command,
+        );
+        if !primary_auditor_changes.is_empty() {
+            mark_auditor_primary_integrity_violation(
+                assignment,
+                &primary_auditor_changes,
+                &mut auditor_report,
+            );
+        }
+        child_report.audit_reports.push(auditor_report);
+    }
+    if child_containment_verified {
+        validate_auditor_reports(assignment, &final_report_path, &mut child_report);
+    }
+    with_supervisor_artifacts(artifacts, |writer, journal| {
+        write_child_report(writer, &final_report_relative, &child_report)?;
+        record_final_report_decisions(journal, writer, &options.run_id, &child_report);
+        Ok(())
+    })?;
+    if child_report.status != ReviewStatus::Succeeded {
+        outcome.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!("child orchestrator '{}' failed", assignment.id),
+            paths: vec![final_report_path.clone()],
+        });
+    }
+    if child_report.audit_reports.iter().any(report_failed) {
+        outcome.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' failed enforced parent review auditor gate",
+                assignment.id
+            ),
+            paths: vec![final_report_path.clone()],
+        });
+    }
+    if child_report.worker_reports.iter().any(report_failed) {
+        outcome.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' reported failed or rejected worker output",
+                assignment.id
+            ),
+            paths: child_report.files_changed.clone(),
+        });
+    }
+    outcome.report = Some(child_report);
+    if !assignment_containment_verified {
+        outcome.external_containment_failed = true;
+    }
+    Ok(())
+}
+
+fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssignment) -> bool {
+    left.assigned_paths.iter().any(|left_path| {
+        right
+            .assigned_paths
+            .iter()
+            .any(|right_path| paths_overlap(left_path, right_path))
+    })
+}
+
 #[cfg(test)]
 fn run_supervisor_plan_with_runner(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
     options: SupervisorRunOptions,
     execution_runtime: SupervisorExecutionRuntime,
-    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
+    let serialized_runner = Mutex::new(external_runner);
     run_supervisor_plan_with_runner_and_creation(
         plan,
         consultant,
         options,
         1,
         execution_runtime,
+        SupervisorWorktreeCreation::TestOnly,
+        &|command| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
+    )
+}
+
+#[cfg(test)]
+fn run_supervisor_plan_with_concurrent_runner(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    max_concurrent_children: usize,
+    external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
+) -> Result<SupervisorFinalReport> {
+    run_supervisor_plan_with_runner_and_creation(
+        plan,
+        consultant,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
         SupervisorWorktreeCreation::TestOnly,
         external_runner,
     )
@@ -1432,10 +2296,9 @@ fn run_supervisor_plan_with_runner_and_creation(
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
-    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+    external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
 ) -> Result<SupervisorFinalReport> {
     validate_max_concurrent_children(max_concurrent_children)?;
-    ensure_supported_max_concurrent_children(max_concurrent_children)?;
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
@@ -1467,7 +2330,10 @@ fn run_supervisor_plan_with_runner_and_creation(
     let mut orchestration_journal = None;
     let mut acquired_claim_tokens = Vec::new();
     let mut acquired_semantic_tokens = Vec::new();
-    let mut planned_semantic_intents = Vec::new();
+    let mut concurrently_released_claims = Vec::new();
+    let mut concurrent_release_errors = Vec::new();
+    let mut concurrently_released_semantic_intents = Vec::new();
+    let mut concurrent_semantic_release_errors = Vec::new();
     let mut command_records = Vec::new();
     let mut orchestrator_reports = Vec::new();
     let mut findings = Vec::new();
@@ -1532,671 +2398,178 @@ fn run_supervisor_plan_with_runner_and_creation(
         }
         primary_run_baseline = Some(baseline);
 
-        let existing = manager
+        let existing_ids = manager
             .list()?
             .into_iter()
-            .map(|record| (record.name.clone(), record))
-            .collect::<BTreeMap<_, _>>();
+            .map(|record| record.name)
+            .collect::<BTreeSet<_>>();
+        let (scheduler_result, indexed_outcomes) = {
+            let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
+                writer: &mut artifact_writer,
+                journal: &mut orchestration_journal,
+            });
+            let mut indexed_outcomes = (0..plan.assignments.len())
+                .map(|_| None)
+                .collect::<Vec<Option<AssignmentExecutionOutcome>>>();
 
-        for assignment in &plan.assignments {
-            let current_primary_head = current_head_oid(&repo)?;
-            let reused = existing.contains_key(&assignment.id);
-            if !reused {
-                let create_options = WorktreeCreateOptions {
-                    agent_id: assignment.id.clone(),
-                    branch: None,
-                    base: None,
-                    worktree_root: None,
-                };
-                match worktree_creation {
-                    SupervisorWorktreeCreation::Bound(cleanliness) => manager
-                        .create_with_repository_cleanliness(create_options, cleanliness)
-                        .with_context(|| {
-                            format!(
-                                "failed to create capability-bound child worktree '{}'",
-                                assignment.id
-                            )
-                        })?,
-                    #[cfg(test)]
-                    SupervisorWorktreeCreation::TestOnly => {
-                        manager.create_for_test(create_options)?
-                    }
-                };
-            }
-            let worktree_write_lease = manager
-                .acquire_write_execution_lease(&assignment.id)
-                .with_context(|| {
-                    format!(
-                        "failed to acquire exclusive execution lease for child worktree '{}'",
-                        assignment.id
-                    )
-                })?;
-            let worktree = worktree_write_lease.record().clone();
-            if reused {
-                ensure_reusable_child_worktree(&worktree, &current_primary_head)?;
-            }
-            let child_base_head = current_head_oid(&worktree.path).with_context(|| {
-                format!(
-                    "failed to capture base HEAD for child worktree '{}' at {}",
-                    assignment.id,
-                    worktree.path.display()
-                )
-            })?;
-            let claim = match sync_store
-                .claim_paths(&assignment.id, assignment.assigned_paths.iter())
-            {
-                Ok(claim) => claim,
-                Err(error) => {
-                    findings.push(claim_failure_finding(sync_store, assignment, &error));
-                    return Err(error)
-                        .with_context(|| format!("failed to claim paths for '{}'", assignment.id));
-                }
-            };
-            acquired_claim_tokens.push(claim.token);
-
-            let semantic_token = coordinate_semantic_assignment(
-                semantic_store,
-                assignment,
-                plan.semantic_coordination,
-                &mut acquired_semantic_tokens,
-                &mut planned_semantic_intents,
-                &mut findings,
-            )?;
-
-            let final_report_name = format!("{}.json", assignment.id);
-            let final_report_relative = PathBuf::from("reports").join(&final_report_name);
-            let final_report_path = dirs.reports.join(&final_report_name);
-            let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
-            let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
-            let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
-
-            let mut child_report = None;
-            let mut child_containment_verified = false;
-            let mut retry_feedback: Option<Vec<String>> = None;
-            let mut attempt_history = Vec::new();
-            let max_attempts = usize::from(plan.max_child_retries).saturating_add(1);
-            for attempt in 1..=max_attempts {
-                let incoming_path = run_dir.join("incoming");
-                let capture_path = run_dir.join("capture");
-                let attempt_artifacts = child_attempt_artifacts(
-                    &dirs,
-                    &incoming_path,
-                    &capture_path,
-                    &assignment.id,
-                    attempt,
-                    max_attempts > 1,
-                );
-                let corrective_retry_used = retry_feedback.is_some();
-                let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
-                    plan: &plan,
-                    assignment,
-                    run_dir: &run_dir,
-                    worktree: &worktree,
-                    report_path: &attempt_artifacts.report_path,
-                    schema_path: &schema_path,
-                    worker_schema_path: &worker_schema_path,
-                    auditor_schema_path: &auditor_schema_path,
-                    consultant: &consultant,
-                    claim_context: ChildPromptClaimContext {
-                        claim: &claim,
-                        semantic_intent_token: semantic_token,
-                    },
-                })?;
-                let attempt_prompt = match &retry_feedback {
-                    Some(problems) => prompt_with_corrective_feedback(&prompt, problems),
-                    None => prompt,
-                };
-                let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
-                if let Err(error) =
-                    write_private_prompt(&mut artifact_writer, &prompt_relative, &attempt_prompt)
-                {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to write prompt {}",
-                            attempt_artifacts.prompt_path.display()
-                        )
-                    });
-                }
-
-                let primary_before = primary_worktree_snapshot(&repo, execution_runtime)?;
-                if let Some(error) = primary_before.inspection_problem() {
-                    bail!("refusing to launch child without a complete primary integrity snapshot: {error}");
-                }
-                let (incoming_scratch, capture_scratch) =
-                    create_invocation_scratches(&mut artifact_writer)?;
-                if incoming_scratch.path() != incoming_path
-                    || capture_scratch.path() != capture_path
-                {
-                    discard_invocation_scratches(
-                        &mut artifact_writer,
-                        &incoming_scratch,
-                        &capture_scratch,
-                    )?;
-                    bail!("artifact scratch paths changed during child setup");
-                }
-                let incoming_output_root =
-                    match SecureOutputRoot::open_private(incoming_scratch.path()) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            discard_invocation_scratches(
-                                &mut artifact_writer,
-                                &incoming_scratch,
-                                &capture_scratch,
-                            )?;
-                            return Err(error)
-                                .context("failed to bind child incoming scratch root");
-                        }
-                    };
-                let capture_output_root =
-                    match SecureOutputRoot::open_private(capture_scratch.path()) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            drop(incoming_output_root);
-                            discard_invocation_scratches(
-                                &mut artifact_writer,
-                                &incoming_scratch,
-                                &capture_scratch,
-                            )?;
-                            return Err(error)
-                                .context("failed to bind parent capture scratch root");
-                        }
-                    };
-                if incoming_output_root.path() != incoming_scratch.path()
-                    || capture_output_root.path() != capture_scratch.path()
-                {
-                    drop(incoming_output_root);
-                    drop(capture_output_root);
-                    discard_invocation_scratches(
-                        &mut artifact_writer,
-                        &incoming_scratch,
-                        &capture_scratch,
-                    )?;
-                    bail!("descriptor-held invocation scratch roots changed during setup");
-                }
-                let mut command = ExternalAgentCommand::codex(
-                    &options.codex_bin,
-                    &worktree.path,
-                    &attempt_artifacts.prompt_path,
-                    &attempt_artifacts.log_path,
-                    &attempt_artifacts.report_path,
-                    Duration::from_secs(plan.child_timeout_seconds),
-                );
-                command.output_schema = Some(schema_path.clone());
-                command = command.with_hidden_root(&repo);
-
-                record_orchestration_event(
-                    &mut orchestration_journal,
-                    &mut artifact_writer,
-                    &assignment.id,
-                    Some(options.run_id.as_str()),
-                    OrchestrationRole::Orchestrator,
-                    OrchestrationEventKind::Spawn,
-                    json!({
-                        "attempt": attempt,
-                        "corrective_retry": corrective_retry_used,
-                    }),
-                );
-                record_orchestration_event(
-                    &mut orchestration_journal,
-                    &mut artifact_writer,
-                    &assignment.id,
-                    Some(options.run_id.as_str()),
-                    OrchestrationRole::Orchestrator,
-                    OrchestrationEventKind::Status,
-                    lifecycle_event_payload("running", Some(attempt), None),
-                );
-
-                let external_run_result = match runtime {
-                    SupervisorRuntime::Codex => Ok(external_runner(&command)),
-                    SupervisorRuntime::Fake => deterministic_fake_child_run(
-                        &command,
-                        assignment,
-                        claim.token.get(),
-                        semantic_token,
-                    ),
-                };
-                let external_run = match external_run_result {
-                    Ok(run) => run,
-                    Err(error) => {
-                        drop(incoming_output_root);
-                        drop(capture_output_root);
-                        discard_invocation_scratches(
-                            &mut artifact_writer,
-                            &incoming_scratch,
-                            &capture_scratch,
-                        )?;
-                        return Err(error).context("failed to produce deterministic child output");
-                    }
-                };
-                drop(incoming_output_root);
-                drop(capture_output_root);
-                let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
-                record_orchestration_event(
-                    &mut orchestration_journal,
-                    &mut artifact_writer,
-                    &assignment.id,
-                    Some(options.run_id.as_str()),
-                    OrchestrationRole::Orchestrator,
-                    OrchestrationEventKind::Status,
-                    lifecycle_event_payload(
-                        if external_process_completed(&external_run) {
-                            "completed"
-                        } else {
-                            "failed"
-                        },
-                        Some(attempt),
-                        child_thread_id.as_deref(),
-                    ),
-                );
-                let attempt_containment_verified = external_safety_verified(&external_run, runtime);
-                if !attempt_containment_verified {
-                    external_containment_failed = true;
-                    findings.push(Finding {
-                        severity: FindingSeverity::Error,
-                        message: format!(
-                            "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
-                            assignment.id,
-                            (external_run.process_tree, external_run.side_effects),
-                            attempt_artifacts.raw_report_relative.display()
-                        ),
-                        paths: vec![attempt_artifacts.raw_report_relative.clone()],
-                    });
-                }
-                command_records.push(command_record_from_external(&external_run, &command));
-                let raw_report_validated = read_child_report(
-                    external_run.output_last_message(),
-                    &attempt_artifacts.raw_report_relative,
-                )
-                .is_ok();
-                let worker_journal_evidence = import_worker_execution_journals(
-                    &mut artifact_writer,
-                    assignment,
-                    &incoming_scratch,
-                )?;
-                record_worker_journal_events(
-                    &mut orchestration_journal,
-                    &mut artifact_writer,
-                    assignment,
-                    &worker_journal_evidence,
-                );
-                import_external_attempt_evidence(
-                    &mut artifact_writer,
-                    ExternalAttemptEvidenceContext {
-                        incoming_scratch: &incoming_scratch,
-                        capture_scratch: &capture_scratch,
-                        artifacts: &attempt_artifacts,
-                        external_run: &external_run,
-                        external_command: &command,
-                        raw_report_validated,
-                        runtime,
-                    },
-                )?;
-                let primary_after = primary_worktree_snapshot(&repo, execution_runtime)?;
-                let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
-                let (mut attempt_report, report_shape_problems) = collect_child_report(
-                    assignment,
-                    &attempt_artifacts.raw_report_relative,
-                    &external_run,
-                    &command,
-                    &worktree.path,
-                    &child_base_head,
-                    &worker_journal_evidence,
-                );
-                if !primary_changes.is_empty() {
-                    mark_primary_integrity_violation(
-                        assignment,
-                        &primary_changes,
-                        &mut attempt_report,
-                    );
-                }
-                if !attempt_containment_verified {
-                    mark_child_containment_violation(
-                        assignment,
-                        &attempt_artifacts.raw_report_relative,
-                        external_run.process_tree,
-                        external_run.side_effects,
-                        &mut attempt_report,
-                    );
-                    attempt_history.push(ChildAttemptHistory {
-                        attempt,
-                        report_path: attempt_artifacts.raw_report_relative.clone(),
-                        structural_problems: report_shape_problems,
-                        corrective_retry_used,
-                    });
-                    child_report = Some(attempt_report);
-                    break;
-                }
-                let retry_used = should_retry_child_report(
-                    &attempt_report,
-                    &report_shape_problems,
-                    attempt,
-                    plan.max_child_retries,
-                );
-                attempt_history.push(ChildAttemptHistory {
-                    attempt,
-                    report_path: attempt_artifacts.raw_report_relative.clone(),
-                    structural_problems: report_shape_problems.clone(),
-                    corrective_retry_used,
-                });
-                if retry_used {
-                    record_orchestration_event(
-                        &mut orchestration_journal,
-                        &mut artifact_writer,
-                        &assignment.id,
-                        Some(options.run_id.as_str()),
-                        OrchestrationRole::Orchestrator,
-                        OrchestrationEventKind::Reject,
-                        json!({
-                            "scope": "attempt",
-                            "attempt": attempt,
-                            "reason": "structural report requires corrective retry",
-                            "structural_problems": report_shape_problems,
-                        }),
-                    );
-                    record_orchestration_event(
-                        &mut orchestration_journal,
-                        &mut artifact_writer,
-                        &assignment.id,
-                        Some(options.run_id.as_str()),
-                        OrchestrationRole::Orchestrator,
-                        OrchestrationEventKind::Status,
-                        lifecycle_event_payload("retrying", Some(attempt), None),
-                    );
-                    retry_feedback = Some(report_shape_problems);
-                    continue;
-                }
-                if attempt > 1 {
-                    attempt_report.findings.push(Finding {
-                        severity: FindingSeverity::Warning,
-                        message: format!(
-                            "child report accepted after corrective retry attempt {attempt}"
-                        ),
-                        paths: vec![attempt_artifacts.raw_report_relative.clone()],
-                    });
-                }
-                child_containment_verified = true;
-                child_report = Some(attempt_report);
-                break;
-            }
-
-            let mut child_report = child_report.with_context(|| {
-                format!(
-                    "child orchestrator '{}' did not produce a collected report after retries",
-                    assignment.id
-                )
-            })?;
-
-            if plan.max_child_retries > 0 {
-                append_child_attempt_history(&mut child_report, &attempt_history);
-            }
-            write_child_report(&mut artifact_writer, &final_report_relative, &child_report)?;
-
-            let mut assignment_containment_verified = child_containment_verified;
-            if child_containment_verified && parent_auditor_required(assignment, &child_report) {
-                let auditor_id = parent_auditor_id(assignment);
-                let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
-                let auditor_incoming_path = run_dir.join("incoming");
-                let auditor_capture_path = run_dir.join("capture");
-                let auditor_report_path = auditor_incoming_path.join(format!("{auditor_id}.json"));
-                let auditor_log_path = auditor_capture_path.join(format!("{auditor_id}.jsonl"));
-                let auditor_artifacts = ChildAttemptArtifacts {
-                    prompt_path: auditor_prompt_path.clone(),
-                    report_path: auditor_report_path.clone(),
-                    log_path: auditor_log_path.clone(),
-                    raw_report_relative: PathBuf::from("evidence")
-                        .join("incoming")
-                        .join(format!("{auditor_id}.json")),
-                    raw_stdout_relative: PathBuf::from("logs").join(format!("{auditor_id}.jsonl")),
-                    command_record_relative: PathBuf::from("logs")
-                        .join(format!("{auditor_id}.summary.json")),
-                };
-                let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
-                let auditor_prompt =
-                    parent_review_auditor_prompt(ParentReviewAuditorPromptContext {
+            let scheduler_result = if max_concurrent_children == 1 {
+                for (index, assignment) in plan.assignments.iter().enumerate() {
+                    let outcome = execute_supervisor_assignment(AssignmentExecutionContext {
+                        index,
+                        concurrent_mode: false,
                         plan: &plan,
+                        consultant: &consultant,
                         assignment,
+                        options: &options,
+                        repo: &repo,
                         run_dir: &run_dir,
-                        worktree_path: &worktree.path,
-                        child_report_path: &final_report_path,
-                        auditor_report_path: &auditor_report_path,
-                        schema_path: &auditor_schema_path,
-                        child_report: &child_report,
-                    })?;
-                write_private_prompt(
-                    &mut artifact_writer,
-                    &dirs.relative(&auditor_prompt_path)?,
-                    &auditor_prompt,
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to write auditor prompt {}",
-                        auditor_prompt_path.display()
-                    )
-                })?;
-
-                let primary_before_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
-                if let Some(error) = primary_before_auditor.inspection_problem() {
-                    bail!(
-                        "refusing to launch parent review auditor without a complete primary integrity snapshot: {error}"
-                    );
-                }
-                let (auditor_incoming_scratch, auditor_capture_scratch) =
-                    create_invocation_scratches(&mut artifact_writer)?;
-                if auditor_incoming_scratch.path() != auditor_incoming_path
-                    || auditor_capture_scratch.path() != auditor_capture_path
-                {
-                    discard_invocation_scratches(
-                        &mut artifact_writer,
-                        &auditor_incoming_scratch,
-                        &auditor_capture_scratch,
-                    )?;
-                    bail!("artifact scratch paths changed during parent auditor setup");
-                }
-                let auditor_incoming_root =
-                    match SecureOutputRoot::open_private(auditor_incoming_scratch.path()) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            discard_invocation_scratches(
-                                &mut artifact_writer,
-                                &auditor_incoming_scratch,
-                                &auditor_capture_scratch,
-                            )?;
-                            return Err(error)
-                                .context("failed to bind parent auditor incoming scratch root");
-                        }
-                    };
-                let auditor_capture_root =
-                    match SecureOutputRoot::open_private(auditor_capture_scratch.path()) {
-                        Ok(root) => root,
-                        Err(error) => {
-                            drop(auditor_incoming_root);
-                            discard_invocation_scratches(
-                                &mut artifact_writer,
-                                &auditor_incoming_scratch,
-                                &auditor_capture_scratch,
-                            )?;
-                            return Err(error)
-                                .context("failed to bind parent auditor capture scratch root");
-                        }
-                    };
-                if auditor_incoming_root.path() != auditor_incoming_scratch.path()
-                    || auditor_capture_root.path() != auditor_capture_scratch.path()
-                {
-                    drop(auditor_incoming_root);
-                    drop(auditor_capture_root);
-                    discard_invocation_scratches(
-                        &mut artifact_writer,
-                        &auditor_incoming_scratch,
-                        &auditor_capture_scratch,
-                    )?;
-                    bail!("descriptor-held auditor scratch roots changed during setup");
-                }
-
-                let mut auditor_command = ExternalAgentCommand::codex(
-                    &options.codex_bin,
-                    &worktree.path,
-                    &auditor_prompt_path,
-                    &auditor_log_path,
-                    &auditor_report_path,
-                    Duration::from_secs(plan.child_timeout_seconds),
-                );
-                auditor_command.output_schema = Some(auditor_schema_path);
-                auditor_command = auditor_command
-                    .with_workspace_access(WorkspaceAccess::ReadOnly)
-                    .with_hidden_root(&repo);
-                record_orchestration_event(
-                    &mut orchestration_journal,
-                    &mut artifact_writer,
-                    &auditor_id,
-                    Some(&assignment.id),
-                    OrchestrationRole::Auditor,
-                    OrchestrationEventKind::Spawn,
-                    json!({"attempt": 1}),
-                );
-                record_orchestration_event(
-                    &mut orchestration_journal,
-                    &mut artifact_writer,
-                    &auditor_id,
-                    Some(&assignment.id),
-                    OrchestrationRole::Auditor,
-                    OrchestrationEventKind::Status,
-                    lifecycle_event_payload("running", Some(1), None),
-                );
-                let auditor_run_result = match runtime {
-                    SupervisorRuntime::Codex => Ok(external_runner(&auditor_command)),
-                    SupervisorRuntime::Fake => {
-                        deterministic_fake_auditor_run(&auditor_command, assignment, &child_report)
-                    }
-                };
-                let auditor_run = match auditor_run_result {
-                    Ok(run) => run,
-                    Err(error) => {
-                        drop(auditor_incoming_root);
-                        drop(auditor_capture_root);
-                        discard_invocation_scratches(
-                            &mut artifact_writer,
-                            &auditor_incoming_scratch,
-                            &auditor_capture_scratch,
-                        )?;
-                        return Err(error)
-                            .context("failed to produce deterministic parent auditor output");
-                    }
-                };
-                drop(auditor_incoming_root);
-                drop(auditor_capture_root);
-                let auditor_thread_id = codex_thread_id_from_stdout(auditor_run.stdout_bytes());
-                record_orchestration_event(
-                    &mut orchestration_journal,
-                    &mut artifact_writer,
-                    &auditor_id,
-                    Some(&assignment.id),
-                    OrchestrationRole::Auditor,
-                    OrchestrationEventKind::Status,
-                    lifecycle_event_payload(
-                        if external_process_completed(&auditor_run) {
-                            "completed"
-                        } else {
-                            "failed"
-                        },
-                        Some(1),
-                        auditor_thread_id.as_deref(),
-                    ),
-                );
-                let auditor_containment_verified = external_safety_verified(&auditor_run, runtime);
-                if !auditor_containment_verified {
-                    assignment_containment_verified = false;
-                    external_containment_failed = true;
-                    findings.push(Finding {
-                        severity: FindingSeverity::Error,
-                        message: format!(
-                            "external parent auditor process containment was not verified empty for '{}'; evidence: {:?}; report: {}",
-                            auditor_id,
-                            (auditor_run.process_tree, auditor_run.side_effects),
-                            auditor_artifacts.raw_report_relative.display()
-                        ),
-                        paths: vec![auditor_artifacts.raw_report_relative.clone()],
+                        dirs: &dirs,
+                        execution_runtime,
+                        worktree_creation,
+                        manager: &manager,
+                        reused: existing_ids.contains(&assignment.id),
+                        sync_store,
+                        semantic_store,
+                        artifacts: &shared_artifacts,
+                        external_runner,
                     });
+                    let abort = outcome.requires_scheduler_abort();
+                    indexed_outcomes[index] = Some(outcome);
+                    if abort {
+                        break;
+                    }
                 }
-                let auditor_command_record =
-                    command_record_from_external(&auditor_run, &auditor_command);
-                command_records.push(auditor_command_record.clone());
-                child_report.commands_run.push(auditor_command_record);
-                let raw_auditor_validated = read_auditor_report(
-                    auditor_run.output_last_message(),
-                    &auditor_artifacts.raw_report_relative,
-                )
-                .is_ok();
-                import_external_attempt_evidence(
-                    &mut artifact_writer,
-                    ExternalAttemptEvidenceContext {
-                        incoming_scratch: &auditor_incoming_scratch,
-                        capture_scratch: &auditor_capture_scratch,
-                        artifacts: &auditor_artifacts,
-                        external_run: &auditor_run,
-                        external_command: &auditor_command,
-                        raw_report_validated: raw_auditor_validated,
-                        runtime,
-                    },
-                )?;
-                let primary_after_auditor = primary_worktree_snapshot(&repo, execution_runtime)?;
-                let primary_auditor_changes =
-                    primary_integrity_changes(&primary_before_auditor, &primary_after_auditor);
-                let mut auditor_report = collect_parent_auditor_report(
-                    assignment,
-                    &auditor_artifacts.raw_report_relative,
-                    &auditor_run,
-                    &auditor_command,
-                );
-                if !primary_auditor_changes.is_empty() {
-                    mark_auditor_primary_integrity_violation(
-                        assignment,
-                        &primary_auditor_changes,
-                        &mut auditor_report,
-                    );
-                }
-                child_report.audit_reports.push(auditor_report);
+                Ok(())
+            } else {
+                thread::scope(|scope| -> Result<()> {
+                    let plan_ref = &plan;
+                    let consultant_ref = &consultant;
+                    let options_ref = &options;
+                    let repo_ref = repo.as_path();
+                    let run_dir_ref = run_dir.as_path();
+                    let dirs_ref = &dirs;
+                    let manager_ref = &manager;
+                    let existing_ids_ref = &existing_ids;
+                    let artifacts_ref = &shared_artifacts;
+                    let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
+                    let mut pending = (0..plan.assignments.len()).collect::<BTreeSet<_>>();
+                    let mut active = BTreeMap::new();
+                    let mut stop_scheduling = false;
+
+                    while !pending.is_empty() || !active.is_empty() {
+                        if !stop_scheduling {
+                            while active.len() < max_concurrent_children {
+                                let next = pending.iter().copied().find(|candidate| {
+                                    active.keys().all(|active_index| {
+                                        !assignments_overlap(
+                                            &plan.assignments[*candidate],
+                                            &plan.assignments[*active_index],
+                                        )
+                                    })
+                                });
+                                let Some(index) = next else {
+                                    break;
+                                };
+                                pending.remove(&index);
+                                let assignment = &plan_ref.assignments[index];
+                                let completion_sender = completion_sender.clone();
+                                let handle = scope.spawn(move || {
+                                    let _completion = CompletionSignal {
+                                        index,
+                                        sender: completion_sender,
+                                    };
+                                    execute_supervisor_assignment(AssignmentExecutionContext {
+                                        index,
+                                        concurrent_mode: true,
+                                        plan: plan_ref,
+                                        consultant: consultant_ref,
+                                        assignment,
+                                        options: options_ref,
+                                        repo: repo_ref,
+                                        run_dir: run_dir_ref,
+                                        dirs: dirs_ref,
+                                        execution_runtime,
+                                        worktree_creation,
+                                        manager: manager_ref,
+                                        reused: existing_ids_ref.contains(&assignment.id),
+                                        sync_store,
+                                        semantic_store,
+                                        artifacts: artifacts_ref,
+                                        external_runner,
+                                    })
+                                });
+                                active.insert(index, handle);
+                            }
+                        }
+
+                        if active.is_empty() {
+                            if pending.is_empty() || stop_scheduling {
+                                break;
+                            }
+                            bail!("supervisor scheduler could not select a pending assignment");
+                        }
+
+                        let completed_index = completion_receiver
+                            .recv()
+                            .context("supervisor assignment completion channel closed")?;
+                        let handle = active
+                            .remove(&completed_index)
+                            .context("supervisor completion referenced an inactive assignment")?;
+                        let mut outcome = match handle.join() {
+                            Ok(outcome) => outcome,
+                            Err(_) => AssignmentExecutionOutcome::fatal(format!(
+                                "supervisor assignment '{}' thread panicked",
+                                plan.assignments[completed_index].id
+                            )),
+                        };
+                        release_concurrent_assignment(&mut outcome, sync_store, semantic_store);
+                        if outcome.requires_scheduler_abort() {
+                            stop_scheduling = true;
+                        }
+                        indexed_outcomes[completed_index] = Some(outcome);
+                    }
+
+                    for (index, handle) in active {
+                        let mut outcome = match handle.join() {
+                            Ok(outcome) => outcome,
+                            Err(_) => AssignmentExecutionOutcome::fatal(format!(
+                                "supervisor assignment '{}' thread panicked",
+                                plan.assignments[index].id
+                            )),
+                        };
+                        release_concurrent_assignment(&mut outcome, sync_store, semantic_store);
+                        indexed_outcomes[index] = Some(outcome);
+                    }
+                    Ok(())
+                })
+            };
+            (scheduler_result, indexed_outcomes)
+        };
+
+        let mut fatal_errors = Vec::new();
+        for outcome in indexed_outcomes.into_iter().flatten() {
+            command_records.extend(outcome.command_records);
+            findings.extend(outcome.findings);
+            external_containment_failed |= outcome.external_containment_failed;
+            if max_concurrent_children == 1 {
+                acquired_claim_tokens.extend(outcome.claim_tokens);
+                acquired_semantic_tokens.extend(outcome.semantic_tokens);
+            } else {
+                concurrently_released_claims.extend(outcome.released_claims);
+                concurrent_release_errors.extend(outcome.release_errors);
+                concurrently_released_semantic_intents.extend(outcome.released_semantic_intents);
+                concurrent_semantic_release_errors.extend(outcome.semantic_release_errors);
             }
-            if child_containment_verified {
-                validate_auditor_reports(assignment, &final_report_path, &mut child_report);
+            if let Some(report) = outcome.report {
+                orchestrator_reports.push(report);
             }
-            write_child_report(&mut artifact_writer, &final_report_relative, &child_report)?;
-            record_final_report_decisions(
-                &mut orchestration_journal,
-                &mut artifact_writer,
-                &options.run_id,
-                &child_report,
-            );
-            if child_report.status != ReviewStatus::Succeeded {
-                findings.push(Finding {
-                    severity: FindingSeverity::Error,
-                    message: format!("child orchestrator '{}' failed", assignment.id),
-                    paths: vec![final_report_path.clone()],
-                });
+            if let Some(error) = outcome.fatal_error {
+                fatal_errors.push(error);
             }
-            if child_report.audit_reports.iter().any(report_failed) {
-                findings.push(Finding {
-                    severity: FindingSeverity::Error,
-                    message: format!(
-                        "child orchestrator '{}' failed enforced parent review auditor gate",
-                        assignment.id
-                    ),
-                    paths: vec![final_report_path.clone()],
-                });
-            }
-            if child_report.worker_reports.iter().any(report_failed) {
-                findings.push(Finding {
-                    severity: FindingSeverity::Error,
-                    message: format!(
-                        "child orchestrator '{}' reported failed or rejected worker output",
-                        assignment.id
-                    ),
-                    paths: child_report.files_changed.clone(),
-                });
-            }
-            orchestrator_reports.push(child_report);
-            if !assignment_containment_verified {
-                break;
-            }
+        }
+        scheduler_result?;
+        if let Some(error) = fatal_errors.into_iter().next() {
+            bail!("{error}");
         }
         Ok(())
     })();
@@ -2209,14 +2582,19 @@ fn run_supervisor_plan_with_runner_and_creation(
         });
     }
 
-    let (released_claims, release_errors) = match sync_store_slot.as_ref() {
+    let (mut released_claims, mut release_errors) = match sync_store_slot.as_ref() {
         Some(store) => release_claims(store, acquired_claim_tokens),
         None => (Vec::new(), Vec::new()),
     };
-    let (released_semantic_intents, semantic_release_errors) = match semantic_store_slot.as_ref() {
-        Some(store) => release_semantic_intents(store, acquired_semantic_tokens),
-        None => (Vec::new(), Vec::new()),
-    };
+    released_claims.extend(concurrently_released_claims);
+    release_errors.extend(concurrent_release_errors);
+    let (mut released_semantic_intents, mut semantic_release_errors) =
+        match semantic_store_slot.as_ref() {
+            Some(store) => release_semantic_intents(store, acquired_semantic_tokens),
+            None => (Vec::new(), Vec::new()),
+        };
+    released_semantic_intents.extend(concurrently_released_semantic_intents);
+    semantic_release_errors.extend(concurrent_semantic_release_errors);
     let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
         Some(baseline) => match primary_worktree_snapshot(&repo, execution_runtime) {
             Ok(final_snapshot) => {
@@ -4837,17 +5215,46 @@ fn import_external_attempt_evidence(
     }
 }
 
+#[cfg(test)]
 fn create_invocation_scratches(
     writer: &mut ArtifactRunWriter,
 ) -> Result<(ArtifactScratchDirectory, ArtifactScratchDirectory)> {
-    let incoming = writer.create_scratch_dir("incoming")?;
-    match writer.create_scratch_dir("capture") {
+    create_named_invocation_scratches(writer, Path::new("incoming"), Path::new("capture"))
+}
+
+fn create_named_invocation_scratches(
+    writer: &mut ArtifactRunWriter,
+    incoming_name: &Path,
+    capture_name: &Path,
+) -> Result<(ArtifactScratchDirectory, ArtifactScratchDirectory)> {
+    let incoming = writer.create_scratch_dir(incoming_name)?;
+    match writer.create_scratch_dir(capture_name) {
         Ok(capture) => Ok((incoming, capture)),
         Err(error) => {
             writer.discard_scratch(&incoming)?;
             Err(error).context("failed to reserve parent capture scratch")
         }
     }
+}
+
+fn invocation_scratch_names(
+    assignment_index: usize,
+    attempt: usize,
+    auditor: bool,
+    concurrent_mode: bool,
+) -> (PathBuf, PathBuf) {
+    if !concurrent_mode {
+        return (PathBuf::from("incoming"), PathBuf::from("capture"));
+    }
+    let suffix = if auditor {
+        format!("assignment-{assignment_index:04}-auditor")
+    } else {
+        format!("assignment-{assignment_index:04}-attempt-{attempt:02}")
+    };
+    (
+        PathBuf::from(format!("incoming-{suffix}")),
+        PathBuf::from(format!("capture-{suffix}")),
+    )
 }
 
 fn discard_invocation_scratches(
@@ -6038,15 +6445,6 @@ pub(crate) fn validate_max_concurrent_children(max_concurrent_children: usize) -
     Ok(())
 }
 
-fn ensure_supported_max_concurrent_children(max_concurrent_children: usize) -> Result<()> {
-    if max_concurrent_children > 1 {
-        bail!(
-            "--max-concurrent-children greater than 1 is not yet supported by the supervisor executor"
-        );
-    }
-    Ok(())
-}
-
 fn display_paths(paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         return "<none>".to_string();
@@ -6143,6 +6541,10 @@ mod tests {
         process_runner::{ContainmentBackend, SideEffectConfinementProfileKind},
     };
     use git2::Signature;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Condvar,
+    };
 
     #[test]
     fn external_containment_gate_accepts_only_verified_empty_evidence() {
@@ -7009,6 +7411,22 @@ mod tests {
         let options = injected_options(&repo_path, temp.path(), "injected-retry");
         let mut invocations = Vec::new();
         let mut runner = |command: &ExternalAgentCommand| {
+            assert_eq!(
+                command
+                    .output_last_message
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(OsStr::to_str),
+                Some("incoming")
+            );
+            assert_eq!(
+                command
+                    .json_log
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(OsStr::to_str),
+                Some("capture")
+            );
             let name = command
                 .output_last_message
                 .file_name()
@@ -7097,6 +7515,514 @@ mod tests {
                 && event.payload["scope"] == "attempt"
                 && event.payload["attempt"] == 1
         }));
+    }
+
+    #[test]
+    fn concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order() {
+        #[derive(Default)]
+        struct GateState {
+            started: BTreeSet<String>,
+            child_b_finished: bool,
+            scratch_roots: BTreeSet<PathBuf>,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "Cargo.toml"),
+            injected_named_assignment("child-d", "RELEASE_NOTES.md"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "concurrent-plan-order");
+        let gate = Arc::new((Mutex::new(GateState::default()), Condvar::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let runner = {
+            let gate = Arc::clone(&gate);
+            let in_flight = Arc::clone(&in_flight);
+            let peak = Arc::clone(&peak);
+            let assignments = assignments.clone();
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let active = in_flight.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+                peak.fetch_max(active, Ordering::SeqCst);
+                let (lock, condvar) = &*gate;
+                let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.started.insert(id.clone());
+                if let Some(root) = command.output_last_message.parent() {
+                    state.scratch_roots.insert(root.to_path_buf());
+                }
+                condvar.notify_all();
+                if id == "child-a" {
+                    while !state.child_b_finished {
+                        state = condvar
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else {
+                    while !state.started.contains("child-a") {
+                        state = condvar
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                drop(state);
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                let run = injected_verified_run(command);
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                if id == "child-b" {
+                    let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.child_b_finished = true;
+                    condvar.notify_all();
+                }
+                run
+            }
+        };
+
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("run two disjoint assignments");
+
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            report
+                .orchestrator_reports
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-a", "child-b", "child-c", "child-d"]
+        );
+        assert_eq!(
+            report
+                .released_claims
+                .iter()
+                .map(|claim| claim.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-a", "child-b", "child-c", "child-d"]
+        );
+        assert_eq!(report.commands_run.len(), 4);
+
+        let state = gate
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.scratch_roots.len(), 4);
+        assert!(state.scratch_roots.iter().all(|path| {
+            !path.ends_with("incoming")
+                && path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("incoming-assignment-"))
+        }));
+        drop(state);
+
+        let run_id = RunId::new("concurrent-plan-order").expect("valid run id");
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized concurrent artifacts");
+        let journal = reader
+            .read(ORCHESTRATION_EVENT_PATH)
+            .expect("read synchronized event journal");
+        assert!(journal.ends_with(b"\n"));
+        for line in journal
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            serde_json::from_slice::<OrchestrationEvent>(line)
+                .expect("event journal line must remain well formed");
+        }
+        let run_root = repo_path.join(".maco/o2/runs/concurrent-plan-order");
+        for relative in [
+            "evidence/incoming/child-a.json",
+            "evidence/incoming/child-b.json",
+            "evidence/incoming/child-c.json",
+            "evidence/incoming/child-d.json",
+            "reports/child-a.json",
+            "reports/child-b.json",
+            "reports/child-c.json",
+            "reports/child-d.json",
+        ] {
+            assert!(run_root.join(relative).exists(), "missing {relative}");
+        }
+        assert!(fs::read_dir(&run_root)
+            .expect("read finalized run root")
+            .filter_map(std::result::Result::ok)
+            .all(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with("incoming-") && !name.starts_with("capture-")
+            }));
+    }
+
+    #[test]
+    fn concurrent_scheduler_serializes_overlap_without_head_of_line_blocking() {
+        #[derive(Default)]
+        struct ScheduleState {
+            events: Vec<String>,
+            child_c_started: bool,
+            child_a_finished: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "README.md"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "concurrent-overlap-scan");
+        let state = Arc::new((Mutex::new(ScheduleState::default()), Condvar::new()));
+        let runner = {
+            let state = Arc::clone(&state);
+            let assignments = assignments.clone();
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut schedule = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                schedule.events.push(format!("{id}-start"));
+                if id == "child-c" {
+                    schedule.child_c_started = true;
+                    condvar.notify_all();
+                }
+                if id == "child-a" {
+                    while !schedule.child_c_started {
+                        schedule = condvar
+                            .wait(schedule)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                if id == "child-b" {
+                    assert!(schedule.child_a_finished);
+                }
+                drop(schedule);
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                let run = injected_verified_run(command);
+                let mut schedule = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                schedule.events.push(format!("{id}-finish"));
+                if id == "child-a" {
+                    schedule.child_a_finished = true;
+                    condvar.notify_all();
+                }
+                run
+            }
+        };
+
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("run overlap-aware scheduler");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        let schedule = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let a_start = schedule
+            .events
+            .iter()
+            .position(|event| event == "child-a-start")
+            .expect("child A start");
+        let c_start = schedule
+            .events
+            .iter()
+            .position(|event| event == "child-c-start")
+            .expect("child C start");
+        let a_finish = schedule
+            .events
+            .iter()
+            .position(|event| event == "child-a-finish")
+            .expect("child A finish");
+        let b_start = schedule
+            .events
+            .iter()
+            .position(|event| event == "child-b-start")
+            .expect("child B start");
+        assert!(
+            c_start > a_start && c_start < a_finish,
+            "{:?}",
+            schedule.events
+        );
+        assert!(b_start > a_finish, "{:?}", schedule.events);
+    }
+
+    #[test]
+    fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
+        #[derive(Default)]
+        struct RetryState {
+            events: Vec<String>,
+            child_b_started: bool,
+            child_a_retry_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "Cargo.toml"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 1);
+        let options = injected_options(&repo_path, temp.path(), "concurrent-retry-slot");
+        let state = Arc::new((Mutex::new(RetryState::default()), Condvar::new()));
+        let runner = {
+            let state = Arc::clone(&state);
+            let assignments = assignments.clone();
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let file_name = command
+                    .output_last_message
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or_default();
+                let attempt = if file_name.contains("attempt-2") {
+                    2
+                } else {
+                    1
+                };
+                let (lock, condvar) = &*state;
+                let mut retry = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                retry.events.push(format!("{id}-attempt-{attempt}"));
+                if id == "child-b" {
+                    retry.child_b_started = true;
+                    condvar.notify_all();
+                    while !retry.child_a_retry_started {
+                        retry = condvar
+                            .wait(retry)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                if id == "child-a" && attempt == 1 {
+                    while !retry.child_b_started {
+                        retry = condvar
+                            .wait(retry)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                if id == "child-a" && attempt == 2 {
+                    retry.child_a_retry_started = true;
+                    condvar.notify_all();
+                }
+                if id == "child-c" {
+                    assert!(retry.child_a_retry_started);
+                }
+                drop(retry);
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                let mut report = injected_child_report(assignment);
+                if id == "child-a" && attempt == 1 {
+                    report.id = "wrong-id".to_string();
+                }
+                write_injected_json(&command.output_last_message, &report);
+                injected_verified_run(command)
+            }
+        };
+
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("run retry slot scheduler");
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert_eq!(
+            report
+                .orchestrator_reports
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-a", "child-b", "child-c"]
+        );
+        let retry = state
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retry_start = retry
+            .events
+            .iter()
+            .position(|event| event == "child-a-attempt-2")
+            .expect("child A retry start");
+        let child_c_start = retry
+            .events
+            .iter()
+            .position(|event| event == "child-c-attempt-1")
+            .expect("child C start");
+        assert!(retry_start < child_c_start, "{:?}", retry.events);
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("failed-child", "README.md"),
+            injected_named_assignment("healthy-child", "src/lib.rs"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "concurrent-failure-isolation");
+        let started = Arc::new(Mutex::new(BTreeSet::new()));
+        let runner = {
+            let started = Arc::clone(&started);
+            let assignments = assignments.clone();
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                started
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(id.clone());
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                let mut report = injected_child_report(assignment);
+                if id == "failed-child" {
+                    report.accepted = false;
+                    report.rejected = true;
+                    report.status = ReviewStatus::Failed;
+                }
+                write_injected_json(&command.output_last_message, &report);
+                injected_verified_run(command)
+            }
+        };
+        let report = run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+        .expect("normal child failure remains a finalized report");
+        assert!(!report.success);
+        assert_eq!(report.orchestrator_reports.len(), 2);
+        assert_eq!(
+            started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fatal_scheduler_abort_stops_new_starts_and_joins_active_assignment() {
+        #[derive(Default)]
+        struct AbortState {
+            child_a_returned: bool,
+            child_b_started: bool,
+            release_child_b: bool,
+            child_c_started: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "README.md/blocked-after-fatal"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "concurrent-fatal-join");
+        let state = Arc::new((Mutex::new(AbortState::default()), Condvar::new()));
+        let runner = {
+            let state = Arc::clone(&state);
+            let assignments = assignments.clone();
+            move |command: &ExternalAgentCommand| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if id == "child-b" {
+                    abort.child_b_started = true;
+                    condvar.notify_all();
+                    while !abort.release_child_b {
+                        abort = condvar
+                            .wait(abort)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-a" {
+                    while !abort.child_b_started {
+                        abort = condvar
+                            .wait(abort)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-c" {
+                    abort.child_c_started = true;
+                }
+                drop(abort);
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                write_injected_assignment_report(command, assignment);
+                let mut run = injected_verified_run(command);
+                if id == "child-a" {
+                    run.publishable = false;
+                    let mut abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    abort.child_a_returned = true;
+                    condvar.notify_all();
+                }
+                run
+            }
+        };
+        let (done_sender, done_receiver) = mpsc::channel();
+        let supervisor_thread = thread::spawn(move || {
+            let result = run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            );
+            let _ = done_sender.send(result);
+        });
+
+        let (lock, condvar) = &*state;
+        let mut abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !abort.child_a_returned {
+            abort = condvar
+                .wait(abort)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        assert!(!abort.child_c_started);
+        assert!(matches!(
+            done_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        abort.release_child_b = true;
+        condvar.notify_all();
+        drop(abort);
+
+        let report = done_receiver
+            .recv()
+            .expect("supervisor result after active child release")
+            .expect("fatal containment result remains reportable");
+        supervisor_thread
+            .join()
+            .unwrap_or_else(|_| panic!("supervisor test thread panicked"));
+        assert!(!report.success);
+        let abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!abort.child_c_started);
+        assert_eq!(report.orchestrator_reports.len(), 2);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("containment")));
     }
 
     #[test]
@@ -8416,6 +9342,59 @@ mod tests {
                 .collect(),
             notes: None,
         }
+    }
+
+    fn injected_named_assignment(id: &str, path: &str) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: id.to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from(path)],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            notes: None,
+        }
+    }
+
+    fn injected_multi_plan(
+        assignments: Vec<OrchestratorAssignment>,
+        max_child_retries: u8,
+    ) -> SupervisorPlan {
+        SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "injected concurrent supervisor fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: assignments.len(),
+            max_child_retries,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            assignments,
+        }
+    }
+
+    fn injected_command_assignment_id(command: &ExternalAgentCommand) -> String {
+        command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .trim_end_matches(".json")
+            .split(".attempt-")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn write_injected_assignment_report(
+        command: &ExternalAgentCommand,
+        assignment: &OrchestratorAssignment,
+    ) {
+        write_injected_json(
+            &command.output_last_message,
+            &injected_child_report(assignment),
+        );
     }
 
     fn injected_plan(assignment: OrchestratorAssignment, max_child_retries: u8) -> SupervisorPlan {
