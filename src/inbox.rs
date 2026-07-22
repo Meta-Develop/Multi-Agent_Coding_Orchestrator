@@ -107,6 +107,8 @@ pub struct InboxConfig {
     pub default_assigned_paths: Vec<PathBuf>,
     #[serde(default)]
     pub privacy: InboxPrivacyPolicy,
+    #[serde(default)]
+    pub allow_dirty_primary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +126,7 @@ impl Default for InboxConfig {
             default_validation_commands: Vec::new(),
             default_assigned_paths: default_assigned_paths(),
             privacy: InboxPrivacyPolicy::default(),
+            allow_dirty_primary: false,
             timeout_seconds: None,
             codex_bin: None,
         }
@@ -769,7 +772,7 @@ fn scan_inbox_with_overrides(
     let selected_count = items.iter().filter(|item| item.selected).count();
     let candidate_count = items.len();
     let target_paths = selected_target_paths(&items, &loaded.config)?;
-    let refusals = preflight_refusals(&repo, &target_paths)?;
+    let refusals = preflight_refusals(&repo, &target_paths, loaded.config.allow_dirty_primary)?;
     if !refusals.is_empty() {
         return Ok(InboxScanReport {
             version: INBOX_SCHEMA_VERSION,
@@ -1734,13 +1737,16 @@ fn run_inbox_item(input: InboxItemRunInput<'_>) -> Result<InboxItemRunReport> {
         });
     }
 
+    let allow_dirty_primary = config.allow_dirty_primary
+        || planning::any_path_overlaps(&plan.assigned_paths, &dirty_primary_paths(repo)?)
+            .is_empty();
     let autopilot_result = autopilot::run_autopilot_plan_file(AutopilotRunOptions {
         repo: repo.to_path_buf(),
         plan_file: plan_path.clone(),
         run_id: autopilot_run_id.clone(),
         codex_bin: context.codex_bin.clone(),
         reviewer_command: None,
-        allow_dirty_primary: false,
+        allow_dirty_primary,
     });
     let (autopilot_success, autopilot_message) = match autopilot_result {
         Ok(report) => {
@@ -2408,16 +2414,25 @@ fn review_feedback_from_value(value: &Value) -> GithubReviewFeedbackSummary {
     }
 }
 
-fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<InboxRefusal>> {
+fn preflight_refusals(
+    repo: &Path,
+    target_paths: &[PathBuf],
+    allow_dirty_primary: bool,
+) -> Result<Vec<InboxRefusal>> {
     let mut refusals = Vec::new();
-    let dirty_paths = dirty_primary_paths(repo)?;
-    if !dirty_paths.is_empty() {
-        refusals.push(InboxRefusal {
-            kind: "dirty_primary".to_string(),
-            message: "primary worktree has local changes outside ignored runtime paths".to_string(),
-            paths: dirty_paths,
-            lock_details: Vec::new(),
-        });
+    if !allow_dirty_primary {
+        let dirty_paths = dirty_primary_paths(repo)?;
+        let overlapping_dirty_paths = planning::any_path_overlaps(target_paths, &dirty_paths);
+        if !overlapping_dirty_paths.is_empty() {
+            refusals.push(InboxRefusal {
+                kind: "dirty_primary".to_string(),
+                message:
+                    "primary worktree has local changes overlapping selected inbox target paths"
+                        .to_string(),
+                paths: overlapping_dirty_paths,
+                lock_details: Vec::new(),
+            });
+        }
     }
 
     let sync_claims = SyncStore::open(repo)?.snapshot()?;
@@ -3208,10 +3223,47 @@ fn default_blocked_terms() -> Vec<String> {
         "secret",
         "security",
         "ssn",
-        "token",
         "vulnerability",
     ]
     .into_iter()
     .map(ToOwned::to_owned)
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_privacy_distinguishes_benign_token_prose_from_structural_secrets() {
+        let policy = InboxPrivacyPolicy::default();
+        assert!(!policy.blocked_terms.iter().any(|term| term == "token"));
+
+        let benign = privacy_scan("Explain how a token moves between parser stages.", &policy);
+        assert!(benign.safe);
+        assert!(benign.reasons.is_empty());
+
+        for (body, reason) in [
+            (
+                "Set API_TOKEN=secret-value before starting.",
+                "secret_like_content_redacted",
+            ),
+            (
+                "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----",
+                "private_key_material",
+            ),
+            (
+                "Inspect /home/example/project before continuing.",
+                "local_absolute_path",
+            ),
+        ] {
+            let result = privacy_scan(body, &policy);
+            assert!(!result.safe, "privacy scan unexpectedly allowed {reason}");
+            assert!(
+                result.reasons.iter().any(|candidate| candidate == reason),
+                "privacy scan did not report {reason}: {:?}",
+                result.reasons
+            );
+        }
+    }
 }

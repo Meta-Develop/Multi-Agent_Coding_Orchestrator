@@ -2230,6 +2230,7 @@ fn pr_options_from_preview_args(args: PrPreviewArgs) -> Result<PrPublicationOpti
         validations,
         forge: args.forge,
         draft: !args.ready,
+        allow_dirty_primary: false,
     })
 }
 
@@ -2242,6 +2243,7 @@ fn pr_options_from_publish_args(args: PrPublishArgs) -> Result<PrPublicationOpti
         validations,
         forge: args.forge,
         draft: !args.ready,
+        allow_dirty_primary: false,
     })
 }
 

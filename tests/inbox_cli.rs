@@ -55,6 +55,10 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
         &unsafe_item["privacy"]["reasons"],
         "local_absolute_path"
     )?);
+    assert!(array_contains(
+        &unsafe_item["privacy"]["reasons"],
+        "secret_like_content_redacted"
+    )?);
     assert!(
         unsafe_item["privacy"]["redactions"]["total_replacements"]
             .as_u64()
@@ -66,6 +70,51 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
     assert_public_json_is_sanitized(&serialized, &repo_path);
     assert!(!serialized.contains("secret-value"));
     assert!(!serialized.contains("/home/example"));
+
+    Ok(())
+}
+
+#[test]
+fn default_privacy_allows_benign_token_prose_without_github_full_bypass() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({"selection": {"pull_requests": false, "max_items": 1}}),
+    )?;
+    commit_all(&Repository::open(&repo_path)?, "inbox privacy config")?;
+    let gh = write_fake_gh_with_issues(
+        temp.path(),
+        &json!([{
+            "number": 11,
+            "title": "Document parser vocabulary",
+            "body": "Explain how a token moves between parser stages.",
+            "labels": [],
+            "author": {"login": "octo"},
+            "url": "https://github.test/acme/demo/issues/11",
+            "updatedAt": "2026-05-23T00:00:00Z"
+        }]),
+    )?;
+
+    let scan = run_success_json_with_path(
+        &[
+            "inbox",
+            "scan",
+            "--repo",
+            path_str(&repo_path)?,
+            "--permission",
+            "github_full",
+            "--json",
+        ],
+        &gh.path_dir,
+    )?;
+
+    assert_eq!(scan["permission_mode"], "github_full");
+    assert_eq!(scan["selected_count"], 1);
+    let benign = &scan["items"][0];
+    assert_eq!(benign["selected"], true);
+    assert_eq!(benign["privacy"]["safe"], true);
+    assert_eq!(benign["skip_reason"], Value::Null);
 
     Ok(())
 }
@@ -2047,12 +2096,16 @@ fn non_overlapping_locks_do_not_refuse_inbox_run() -> Result<()> {
 }
 
 #[test]
-fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Result<()> {
+fn dirty_primary_overlap_refuses_and_reports_only_selected_target_paths() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
     write_file(
         &repo_path.join("README.md"),
         "# Smoke\n\nreal dirty change\n",
+    )?;
+    write_file(
+        &repo_path.join("src/lib.rs"),
+        "pub fn ok() -> bool { false }\n",
     )?;
     write_file(&repo_path.join(".maco/inbox/runs/old/state.json"), "{}\n")?;
     write_file(&repo_path.join(".maco-cache/inbox/state.json"), "{}\n")?;
@@ -2060,6 +2113,10 @@ fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Resu
     let report = run_inbox_refusal(&repo_path, "dirty-primary")?;
 
     assert_refusal_kind(&report, "dirty_primary")?;
+    assert_eq!(
+        refusal_by_kind(&report, "dirty_primary")?["paths"],
+        json!(["README.md"])
+    );
     assert_eq!(report["repo"], ".");
     assert_eq!(
         report["item_reports"]
@@ -2077,6 +2134,84 @@ fn dirty_primary_real_file_refuses_run_while_runtime_paths_are_ignored() -> Resu
     assert_public_json_is_sanitized(&serialized, &repo_path);
     assert!(!serialized.contains(".maco-cache/inbox/state.json"));
     assert!(serialized.contains("README.md"));
+    assert!(!serialized.contains("src/lib.rs"));
+
+    Ok(())
+}
+
+#[test]
+fn non_overlapping_dirty_primary_path_is_allowed_and_preserved() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let dirty_contents = "pub fn ok() -> bool { false }\n";
+    write_file(&repo_path.join("src/lib.rs"), dirty_contents)?;
+
+    let report = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "non-overlapping-dirty-primary",
+        "--max-items",
+        "1",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    assert_eq!(report["selected_item_count"], 1);
+    assert_eq!(
+        fs::read_to_string(repo_path.join("src/lib.rs")).context("read dirty source")?,
+        dirty_contents
+    );
+
+    Ok(())
+}
+
+#[test]
+fn configured_dirty_primary_override_allows_overlap_and_preserves_content() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    write_json_file(
+        &repo_path.join("maco-inbox.json"),
+        &json!({
+            "allow_dirty_primary": true,
+            "selection": {"max_items": 1},
+            "default_assigned_paths": ["src"]
+        }),
+    )?;
+    commit_all(
+        &Repository::open(&repo_path)?,
+        "allow dirty primary inbox config",
+    )?;
+    let dirty_contents = "pub fn ok() -> bool { false }\n";
+    write_file(&repo_path.join("src/lib.rs"), dirty_contents)?;
+
+    let scan = run_success_json(&["inbox", "scan", "--repo", path_str(&repo_path)?, "--json"])?;
+    assert_eq!(scan["success"], true);
+    assert_eq!(scan["refused"], false);
+    assert!(scan["refusals"]
+        .as_array()
+        .context("scan refusals")?
+        .is_empty());
+
+    let report = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "allow-dirty-primary",
+        "--json",
+    ])?;
+
+    assert_eq!(report["status"], "succeeded");
+    assert_eq!(report["success"], true);
+    assert_eq!(
+        fs::read_to_string(repo_path.join("src/lib.rs")).context("read dirty source")?,
+        dirty_contents
+    );
 
     Ok(())
 }
@@ -2370,9 +2505,25 @@ struct FakeCodex {
 }
 
 fn write_fake_gh(root: &Path) -> Result<FakeGh> {
+    write_fake_gh_with_issues(
+        root,
+        &json!([{
+            "number": 11,
+            "title": "Live issue",
+            "body": "Please update the smoke README.",
+            "labels": [],
+            "author": {"login": "octo"},
+            "url": "https://github.test/acme/demo/issues/11",
+            "updatedAt": "2026-05-23T00:00:00Z"
+        }]),
+    )
+}
+
+fn write_fake_gh_with_issues(root: &Path, issues: &Value) -> Result<FakeGh> {
     let path_dir = root.join("bin");
     let script_path = path_dir.join("gh");
     let log_path = root.join("gh.log");
+    let issues_json = serde_json::to_string(issues).context("serialize fake gh issues")?;
     let script = format!(
         r#"#!/bin/sh
 set -eu
@@ -2380,7 +2531,7 @@ printf '%s\n' "$*" >> '{}'
 case "$1 $2" in
   "issue list")
     cat <<'JSON'
-[{{"number":11,"title":"Live issue","body":"Please update the smoke README.","labels":[],"author":{{"login":"octo"}},"url":"https://github.test/acme/demo/issues/11","updatedAt":"2026-05-23T00:00:00Z"}}]
+{}
 JSON
     ;;
   "pr list")
@@ -2397,7 +2548,8 @@ JSON
     ;;
 esac
 "#,
-        log_path.display()
+        log_path.display(),
+        issues_json
     );
     write_executable(&script_path, &script)?;
     Ok(FakeGh { path_dir, log_path })

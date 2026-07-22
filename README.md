@@ -679,6 +679,7 @@ Run the fake-first inbox reaction loop:
     {"name": "smoke", "command": "cargo test", "timeout_seconds": 60}
   ],
   "default_assigned_paths": ["README.md"],
+  "allow_dirty_primary": false,
   "privacy": {"allow_private_bodies": false}
 }
 ```
@@ -700,9 +701,12 @@ skipping evidence. Public JSON uses the typed schema fields `version`, `repo`,
 `action_policy`, `github_enabled`, `success`, `refused`, `refusals`,
 `candidate_count`, `selected_count`, `items`, and `next_action`; `repo` is the
 public `"."` placeholder rather than a local absolute path. Item bodies are
-bounded summaries with token-like values redacted, private key material refused,
-and local absolute paths such as `/mnt/...`, `/home/...`, or `C:\Users\...`
-rejected.
+bounded summaries with secret-like assignments and long token-like values
+redacted, private key material refused, and local absolute paths such as
+`/mnt/...`, `/home/...`, or `C:\Users\...` rejected. Benign prose that uses the
+word `token` is not refused by the default lexical policy. Permission modes,
+including `github_full`, do not bypass privacy refusal;
+`privacy.allow_private_bodies=true` is the separate explicit override.
 
 `maco inbox run` processes selected candidates through the same fake-first
 autopilot flow unless config `action_policy` or CLI `--dry-run` selects dry-run
@@ -730,13 +734,19 @@ not create a GitHub PR or comment on the source item. Hyphen aliases such as
 `github-read` are accepted. Legacy `--github` and `action_policy: "github"` keep
 the old full behavior unless `permission_mode` explicitly overrides them. Fake
 PR review and failing CI context are converted into autopilot repair plans with
-assigned paths, reasons, and validation expectations. Inbox also preserves the
-same path-scoped safety boundary as autopilot: it refuses dirty primary worktree
-files, active local locks, active sync claims, active semantic intents, and
+assigned paths, reasons, and validation expectations. Inbox preserves a
+path-scoped safety boundary: it refuses dirty primary worktree files, active
+local locks, active sync claims, active semantic intents, and
 active/blocked live claim locks only when they overlap selected target paths,
 while ignoring its own `.maco/**` and `.maco-cache/**` runtime artifacts.
-Refusal JSON includes paths and lock details. Inbox never performs automatic
-merge; human review remains the next action after a successful reaction.
+With the default `allow_dirty_primary=false`, a `dirty_primary` refusal reports
+only the dirty paths that overlap those selected target paths; unrelated dirty
+paths remain untouched and do not block the run. Setting
+`allow_dirty_primary=true` in `maco-inbox.json` explicitly skips only that Inbox
+dirty-primary gate and carries the authorization into each run/watch Autopilot
+item. Sync, semantic, and live-lock gates remain unchanged. Refusal JSON includes
+paths and lock details. Inbox never performs automatic merge; human review
+remains the next action after a successful reaction.
 
 Run the cross-repository inbox workspace supervisor:
 

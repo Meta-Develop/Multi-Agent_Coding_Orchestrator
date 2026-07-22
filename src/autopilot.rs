@@ -513,6 +513,7 @@ pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<Autopilot
             validations: validation_reports,
             forge: plan.forge_mode.into_publication_forge(),
             draft: plan.publish_mode == AutopilotPublishMode::DraftOnly,
+            allow_dirty_primary: options.allow_dirty_primary,
         })?;
         let sanitized_pr = sanitize_pr_report(&pr_report);
         attempt_summary.pr_status = Some(sanitized_pr.status.clone());

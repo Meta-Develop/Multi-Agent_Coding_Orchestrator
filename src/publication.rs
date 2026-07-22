@@ -43,6 +43,7 @@ pub struct PrPublicationOptions {
     pub validations: Vec<ValidationReport>,
     pub forge: ForgeKind,
     pub draft: bool,
+    pub allow_dirty_primary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -290,7 +291,10 @@ fn build_merge_preview(
             diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
             validations: options.validations.clone(),
         },
-        forces: MergeForceOptions::default(),
+        forces: MergeForceOptions {
+            allow_dirty_primary: options.allow_dirty_primary,
+            ..MergeForceOptions::default()
+        },
         require_validation,
     })
 }
