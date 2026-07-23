@@ -1041,16 +1041,21 @@ moves the claim to `done` or `handoff`; `override-release` is the audited
 stale-claim administrative exception.
 
 Supported API operations coordinate through the stable board lock. On Linux,
-create uses `renameat2(RENAME_NOREPLACE)` and existing-claim mutations use an
-exchange CAS that checks the exchanged old inode and bytes and rolls back a
-refused generation. Direct edits below `.agents/live/claims/` are unsupported:
-the lock and CAS narrow cooperating API races, but do not claim complete
-exclusion or detection of a non-cooperating same-UID process holding and
-editing a file descriptor across the operation. Audit growth is compacted into
-a bounded digest entry, and heartbeat writes reserve release headroom. Mutation
-timestamps always use the process's real system clock and refuse
-future/rollback heartbeat generations; public `--now` injection is available
-only for the observational `status` and `validate` commands.
+create uses `renameat2(RENAME_NOREPLACE)` and existing-claim mutations prefer
+an exchange CAS that checks the exchanged old inode and bytes and rolls back a
+refused generation. Filesystems that specifically report exchange as
+unsupported use a recoverable no-replace transaction instead: the old and new
+identities, content digests, and unchanged whole-board generation are bound into
+an old-generation residue, and the next lock-held board open rolls back or
+finalizes only an exact known crash state. Other exchange failures remain
+fail-closed. Direct edits below `.agents/live/claims/` are unsupported: the lock
+and CAS narrow cooperating API races, but do not claim complete exclusion or
+detection of a non-cooperating same-UID process holding and editing a file
+descriptor across the operation. Audit growth is compacted into a bounded
+digest entry, and heartbeat writes reserve release headroom. Mutation timestamps
+always use the process's real system clock and refuse future/rollback heartbeat
+generations; public `--now` injection is available only for the observational
+`status` and `validate` commands.
 
 Preview the local LLM boundary without credentials or network access:
 
