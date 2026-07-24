@@ -1,4 +1,5 @@
 use crate::agent_lifecycle::AgentLaunchMetadata;
+use crate::llm::provider::Usage;
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, CapturedBytes, EnvironmentMode,
     ExternalCodexProfile, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
@@ -45,6 +46,15 @@ pub struct ExternalAgentCommand {
     pub timeout: Duration,
     pub workspace_access: WorkspaceAccess,
     pub hidden_roots: Vec<PathBuf>,
+    /// Optional model for the primary Codex process. Absence deliberately leaves model selection
+    /// to the same runtime defaults used before this field existed.
+    pub model: Option<String>,
+    /// Optional reasoning effort for the primary Codex process.
+    pub reasoning_effort: Option<String>,
+    /// Optional default model inherited by Codex subagents spawned from this process.
+    pub subagent_model: Option<String>,
+    /// Optional default reasoning effort inherited by Codex subagents spawned from this process.
+    pub subagent_reasoning_effort: Option<String>,
     /// Optional lifecycle identity for the long-running provider process. `registry_repo` is the
     /// supervisor repository whose `.maco/agents` state operators inspect, which can differ from
     /// `cwd` when the provider runs inside a linked assignment worktree.
@@ -104,6 +114,10 @@ impl ExternalAgentCommand {
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
             hidden_roots: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            subagent_model: None,
+            subagent_reasoning_effort: None,
             agent_lifecycle: None,
         }
     }
@@ -127,6 +141,10 @@ impl ExternalAgentCommand {
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            subagent_model: None,
+            subagent_reasoning_effort: None,
             agent_lifecycle: None,
         }
     }
@@ -150,6 +168,10 @@ impl ExternalAgentCommand {
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            subagent_model: None,
+            subagent_reasoning_effort: None,
             agent_lifecycle: None,
         }
     }
@@ -161,6 +183,26 @@ impl ExternalAgentCommand {
 
     pub fn with_workspace_access(mut self, access: WorkspaceAccess) -> Self {
         self.workspace_access = access;
+        self
+    }
+
+    pub fn with_model_selection(
+        mut self,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        self.model = model;
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    pub fn with_subagent_model_selection(
+        mut self,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        self.subagent_model = model;
+        self.subagent_reasoning_effort = reasoning_effort;
         self
     }
 
@@ -1263,7 +1305,7 @@ fn append_external_error(existing: Option<String>, next: Option<String>) -> Opti
     }
 }
 
-fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     match spec.invocation {
         ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec),
         ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec),
@@ -1348,7 +1390,100 @@ fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
         argv.push(OsString::from("--disable"));
         argv.push(OsString::from(feature));
     }
+    if let Some(model) = &spec.model {
+        argv.push(OsString::from("-m"));
+        argv.push(OsString::from(model));
+    }
+    if let Some(reasoning_effort) = &spec.reasoning_effort {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model_reasoning_effort={}",
+            toml_basic_string(reasoning_effort)
+        )));
+    }
+    if let Some(model) = &spec.subagent_model {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "agents.default_subagent_model={}",
+            toml_basic_string(model)
+        )));
+    }
+    if let Some(reasoning_effort) = &spec.subagent_reasoning_effort {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "agents.default_subagent_reasoning_effort={}",
+            toml_basic_string(reasoning_effort)
+        )));
+    }
     argv
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len().saturating_add(2));
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            character if character.is_control() && u32::from(character) <= 0xffff => {
+                escaped.push_str(&format!("\\u{:04X}", u32::from(character)));
+            }
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\U{:08X}", u32::from(character)));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+pub(crate) fn codex_usage_from_jsonl(bytes: &[u8]) -> Result<Option<Usage>> {
+    let contents =
+        std::str::from_utf8(bytes).context("Codex JSONL usage capture is not valid UTF-8")?;
+    let mut aggregate = Usage::default();
+    let mut observed = false;
+    for (index, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(line).with_context(|| {
+            format!(
+                "Codex JSONL usage capture line {} is not valid JSON",
+                index.saturating_add(1)
+            )
+        })?;
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("turn.completed") {
+            continue;
+        }
+        let usage = event
+            .get("usage")
+            .and_then(serde_json::Value::as_object)
+            .context("Codex turn.completed event omitted its usage object")?;
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .context("Codex turn.completed usage omitted input_tokens")?;
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .context("Codex turn.completed usage omitted output_tokens")?;
+        let usage = Usage {
+            input_tokens: usize::try_from(input_tokens)
+                .context("Codex input token count does not fit this platform")?,
+            output_tokens: usize::try_from(output_tokens)
+                .context("Codex output token count does not fit this platform")?,
+            total_tokens: 0,
+        };
+        aggregate = aggregate.saturating_add(usage);
+        observed = true;
+    }
+    Ok(observed.then_some(aggregate))
 }
 
 fn claude_consultant_argv() -> Vec<OsString> {
@@ -1505,6 +1640,140 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
     use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
+
+    #[test]
+    fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        );
+        let actual = command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "-a",
+            "never",
+            "exec",
+            "--strict-config",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--ephemeral",
+            "--cd",
+            "/workspace",
+            "-c",
+            "default_permissions=\"maco_external_codex\"",
+            "-c",
+            "permissions.maco_external_codex.network={enabled=false}",
+            "-c",
+            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"}}",
+            "-c",
+            "shell_environment_policy.inherit=\"none\"",
+            "-c",
+            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
+            "-c",
+            "web_search=\"disabled\"",
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "--disable",
+            "hooks",
+            "--disable",
+            "in_app_browser",
+            "--disable",
+            "browser_use",
+            "--disable",
+            "browser_use_full_cdp_access",
+            "--disable",
+            "browser_use_external",
+            "--disable",
+            "computer_use",
+            "--disable",
+            "image_generation",
+            "--enable",
+            "goals",
+            "--enable",
+            "multi_agent",
+            "--json",
+            "--output-last-message",
+            "/run/report.json",
+            "-",
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn codex_argv_applies_distinct_primary_and_subagent_model_selection_safely() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        )
+        .with_model_selection(
+            Some("planner-model".to_string()),
+            Some("high\"\nweb_search=\"live".to_string()),
+        )
+        .with_subagent_model_selection(Some("worker\"model".to_string()), Some("low".to_string()));
+        let actual = command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(actual
+            .windows(2)
+            .any(|arguments| arguments == ["-m", "planner-model"]));
+        assert!(actual.windows(2).any(|arguments| {
+            arguments
+                == [
+                    "-c",
+                    "model_reasoning_effort=\"high\\\"\\nweb_search=\\\"live\"",
+                ]
+        }));
+        assert!(actual.windows(2).any(|arguments| {
+            arguments == ["-c", "agents.default_subagent_model=\"worker\\\"model\""]
+        }));
+        assert!(actual.windows(2).any(|arguments| {
+            arguments == ["-c", "agents.default_subagent_reasoning_effort=\"low\""]
+        }));
+        assert!(!actual
+            .iter()
+            .any(|argument| argument == "web_search=\"live\""));
+    }
+
+    #[test]
+    fn codex_usage_parser_sums_only_valid_completed_turns() -> Result<()> {
+        let usage = codex_usage_from_jsonl(
+            br#"{"type":"thread.started","thread_id":"thread-a"}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30}}
+{"type":"item.completed","item":{"type":"agent_message"}}
+{"type":"turn.completed","usage":{"input_tokens":80,"cached_input_tokens":0,"output_tokens":20}}
+"#,
+        )?
+        .context("completed usage")?;
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: 200,
+                output_tokens: 50,
+                total_tokens: 250,
+            }
+        );
+        assert!(codex_usage_from_jsonl(br#"{"type":"thread.started"}"#)?.is_none());
+        assert!(codex_usage_from_jsonl(
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1}}\n"
+        )
+        .is_err());
+        assert!(codex_usage_from_jsonl(b"{malformed}\n").is_err());
+        Ok(())
+    }
 
     #[test]
     fn external_errors_are_composed_and_success_requires_verified_empty_containment() {
