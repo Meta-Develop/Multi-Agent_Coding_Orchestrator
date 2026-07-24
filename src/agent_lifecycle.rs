@@ -253,9 +253,10 @@ impl AgentRegistry {
         }
         let mut live = Vec::new();
         self.update_state(|state| {
-            state.processes.retain(|record| {
-                match process_state(record.pid, &record.process_start_time) {
-                    Ok(ProcessIdentityState::Live) => {
+            let mut retained = Vec::with_capacity(state.processes.len());
+            for record in std::mem::take(&mut state.processes) {
+                match process_state(record.pid, &record.process_start_time)? {
+                    ProcessIdentityState::Live => {
                         if filter
                             .run_id
                             .as_ref()
@@ -263,12 +264,12 @@ impl AgentRegistry {
                         {
                             live.push(record.clone());
                         }
-                        true
+                        retained.push(record);
                     }
-                    Ok(ProcessIdentityState::Gone | ProcessIdentityState::Reused) => false,
-                    Err(_) => true,
+                    ProcessIdentityState::Gone | ProcessIdentityState::Reused => {}
                 }
-            });
+            }
+            state.processes = retained;
             Ok(())
         })?;
         live.sort_by_key(|process| {
@@ -482,6 +483,11 @@ fn process_identity(pid: u32) -> Result<(char, String)> {
         .parse::<u64>()
         .context("process start-time field is not an integer")?;
     Ok((state, token.to_string()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_identity(_pid: u32) -> Result<(char, String)> {
+    bail!("PID start-time identity is not implemented on this platform")
 }
 
 #[cfg(not(target_os = "linux"))]
