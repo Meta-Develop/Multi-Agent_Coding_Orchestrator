@@ -498,7 +498,31 @@ fn process_identity(pid: u32) -> Result<(char, String)> {
     let token = token
         .parse::<u64>()
         .context("process start-time field is not an integer")?;
-    Ok((state, token.to_string()))
+    let boot_time = linux_boot_time()?;
+    Ok((state, format!("{boot_time}:{token}")))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_time() -> Result<u64> {
+    let stat = std::fs::read_to_string("/proc/stat")
+        .context("failed to read Linux boot-time identity /proc/stat")?;
+    parse_linux_boot_time(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_boot_time(stat: &str) -> Result<u64> {
+    let value = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .context("Linux /proc/stat omits the btime field")?;
+    let boot_time = value
+        .trim()
+        .parse::<u64>()
+        .context("Linux /proc/stat btime field is not an integer")?;
+    if boot_time == 0 {
+        bail!("Linux /proc/stat btime field is zero");
+    }
+    Ok(boot_time)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -685,6 +709,20 @@ mod tests {
 
         assert!(registry.list(&AgentListFilter::default())?.is_empty());
         assert!(registry.snapshot_all()?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_start_time_is_boot_scoped() -> Result<()> {
+        let token = process_start_time(std::process::id())?;
+        let (boot_time, start_ticks) = token
+            .split_once(':')
+            .context("boot-scoped process identity separator")?;
+        assert_eq!(boot_time.parse::<u64>()?, linux_boot_time()?);
+        assert!(start_ticks.parse::<u64>()? > 0);
+        assert_eq!(parse_linux_boot_time("cpu 1 2 3\nbtime 12345\n")?, 12345);
+        assert!(parse_linux_boot_time("cpu 1 2 3\n").is_err());
         Ok(())
     }
 
