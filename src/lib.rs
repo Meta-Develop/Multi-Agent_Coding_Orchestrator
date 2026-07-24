@@ -8,6 +8,7 @@ pub mod autopilot;
 pub(crate) mod checkpoint_wire;
 pub mod cli;
 pub mod consult;
+pub mod decision_claim;
 pub(crate) mod effect_wal;
 pub mod external_agent;
 pub mod inbox;
