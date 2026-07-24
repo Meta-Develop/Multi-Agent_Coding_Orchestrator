@@ -66,9 +66,11 @@ The current implementation covers a local-first command-line slice:
 - `maco agent run` is temporarily unsupported because verified agent assignment creation depends on the disabled managed-worktree creation boundary.
 - `maco supervise plan` normalizes an opt-in supervisor task or JSON plan for
   Codex CLI subprocess orchestration.
-- `maco supervise run` is temporarily unsupported because verified supervisor
-  assignment creation depends on the disabled managed-worktree creation
-  boundary. `maco supervise plan/status/collect` remain available. The retained
+- `maco supervise run` uses the Codex runtime by default and is supported. It
+  internally acquires the repository-cleanliness capability and creates
+  capability-bound managed child worktrees. The in-process Fake file-entry
+  simulation path returns `Unsupported`. `maco supervise plan/status/collect`
+  remain available. The
   supervisor scheduler launches opt-in O1 child orchestrators through the
   Codex CLI in isolated child worktrees under an O2 supervisor, with
   `--max-concurrent-children` defaulting to the legacy serial behavior. Each child
@@ -1179,18 +1181,20 @@ Run an opt-in supervisor-of-orchestrators plan:
 
 ```bash
 cargo run -- supervise plan supervisor-plan.json --repo . --json
-# Temporarily returns Unsupported before reserving artifacts or assignments:
+# Uses the supported default Codex runtime and creates capability-bound child worktrees:
 cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --max-concurrent-children 2 --json
 cargo run -- supervise status supervise-demo --repo . --json
 cargo run -- supervise collect supervise-demo --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
 ```
 
-`maco supervise run` currently returns `Unsupported` before reserving artifacts,
-claims, or child worktrees. The retained process-level design shells out to the
-configured Codex-compatible executable, creates isolated child worktrees, claims
-each assignment's paths, records semantic coordination metadata when the plan
-requests it, and writes structured logs and reports under the run directory.
+`maco supervise run` is supported with the default Codex runtime. Its file-entry
+path internally acquires the repository-cleanliness capability used to create
+managed child worktrees, then shells out to the configured Codex-compatible
+executable, claims each assignment's paths, records semantic coordination
+metadata when the plan requests it, and writes structured logs and reports
+under the run directory. The in-process Fake file-entry simulation path instead
+returns `Unsupported` before repository access or artifact reservation.
 Child/model final-message bytes are confined to `incoming/`; normalized child
 reports and `supervisor-final.json` are parent-owned under `reports/`. Only the
 incoming root is granted writable to an external child. The parent retains file
@@ -1305,8 +1309,11 @@ Run the fake-first autopilot workflow:
 > the bounded before/after captures differ, but matching captures are not a
 > same-UID safety guarantee. Effectful Inbox run/watch entry points, managed
 > worktree creation, non-force managed worktree removal, `orchestrate run`,
-> `agent run`, `supervise run`, and Inbox run/watch/workspace run/watch are
-> disabled at their public entry points for the same reason. Inbox scan/status,
+> `agent run`, and Inbox run/watch/workspace run/watch are disabled at their
+> public entry points for the same reason. `supervise run` is not part of this
+> disabled group: its default Codex runtime internally acquires the
+> repository-cleanliness capability and creates capability-bound managed child
+> worktrees. Inbox scan/status,
 > worktree list/pending, worktree gc, and force cleanup remain available. `maco worktree
 > pending` opens only an existing authenticated snapshot and existing locks;
 > absent state returns no operations, and crash residue or transitional state is
