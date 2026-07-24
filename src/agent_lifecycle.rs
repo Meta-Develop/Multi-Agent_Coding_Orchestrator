@@ -439,7 +439,7 @@ fn process_state(pid: u32, expected_start_time: &str) -> Result<ProcessIdentityS
         return Ok(ProcessIdentityState::Gone);
     }
     match process_identity(pid) {
-        Ok((state, _)) if matches!(state, 'Z' | 'X') => Ok(ProcessIdentityState::Gone),
+        Ok(('Z' | 'X', _)) => Ok(ProcessIdentityState::Gone),
         Ok((_, observed)) if observed == expected_start_time => Ok(ProcessIdentityState::Live),
         Ok(_) => Ok(ProcessIdentityState::Reused),
         Err(error)
