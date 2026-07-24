@@ -10109,10 +10109,15 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         }
         let temp = tempfile::tempdir().expect("tempdir");
         let escaped_pid_path = temp.path().join("escaped.pid");
+        let target_ready_path = temp.path().join("target-ready");
+        let release_target_path = temp.path().join("release-target");
         let command = format!(
-            "exec 3<&0; setsid sh -c 'echo $$ > \"{}\"; sleep 30' <&3 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done",
+            "exec 3<&0; setsid sh -c 'echo $$ > \"{}\"; sleep 30' <&3 & i=0; while [ ! -s \"{}\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done; test -s \"{}\" || exit 1; touch \"{}\"; while [ ! -e \"{}\" ]; do sleep 0.01; done",
             escaped_pid_path.display(),
             escaped_pid_path.display(),
+            escaped_pid_path.display(),
+            target_ready_path.display(),
+            release_target_path.display(),
         );
         let spec = ProcessSpec::shell(
             "escaped pipe holder",
@@ -10122,10 +10127,36 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             1024,
         )
         .with_stdin(StdinMode::Bytes(vec![b'x'; 4 * 1024 * 1024]))
-        .with_timeout(Some(Duration::from_secs(3)));
-        let started = Instant::now();
+        // Allow shared systemd-slot and setup contention to settle before the target publishes
+        // readiness; the post-ready cleanup remains independently bounded below.
+        .with_timeout(Some(Duration::from_secs(10)));
+        let output = thread::scope(|scope| {
+            let worker = scope.spawn(move || run_process(spec));
+            let ready_deadline = Instant::now() + Duration::from_secs(10);
+            while !target_ready_path.exists() && !worker.is_finished() {
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "escaped pipe holder did not publish readiness"
+                );
+                thread::sleep(POLL_INTERVAL);
+            }
+            assert!(
+                target_ready_path.exists(),
+                "escaped pipe holder exited before publishing readiness"
+            );
 
-        let output = run_process(spec).expect("run escaped pipe holder");
+            // Shared systemd-slot and setup contention is not kill latency. Release the main
+            // shell only after its escaped stdin/pipe holder is ready, then keep the safety bound
+            // focused on finalization proving the complete contained tree empty.
+            let started = Instant::now();
+            fs::write(&release_target_path, b"release").expect("release escaped pipe holder");
+            let output = worker
+                .join()
+                .expect("escaped pipe holder worker")
+                .expect("run escaped pipe holder");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            output
+        });
 
         let escaped_pid = std::fs::read_to_string(&escaped_pid_path)
             .expect("escaped process pid")
@@ -10144,7 +10175,6 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             Some(libc::ESRCH),
             "escaped descendant survived return"
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(unix)]
