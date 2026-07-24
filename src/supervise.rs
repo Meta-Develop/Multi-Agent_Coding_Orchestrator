@@ -1011,6 +1011,7 @@ Rules:
 - Stay read-only. Inspect worker reports, child diffs, validation evidence, findings, remaining risk, and claimed path boundaries.
 - Do not edit files, create durable artifacts, apply patches, claim paths, or change Git state.
 - Produce structured AuditorReport JSON in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action.
+- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
 - Include "read_only": true in AuditorReport JSON to attest this audit stayed read-only.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
@@ -1091,6 +1092,7 @@ Review requirements:
 - Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
 - Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
 - Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
+- reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Set role="auditor", no_further_delegation=true, read_only=true.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 - Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
@@ -3637,21 +3639,23 @@ fn validate_auditor_reports(
             messages.push("auditor report was not accepted as succeeded".to_string());
         }
         if audit_report.id == required_parent_auditor_id {
-            match missing_auditor_review_paths(audit_report, &required_reviewed_paths) {
-                Ok(missing_paths) if missing_paths.is_empty() => {}
-                Ok(missing_paths) => {
-                    valid = false;
-                    messages.push(format!(
-                        "parent auditor reviewed_paths omitted required assignment/change path coverage for: {}",
-                        display_paths(&missing_paths)
-                    ));
-                }
-                Err(error) => {
-                    valid = false;
-                    messages.push(format!(
-                        "auditor report reviewed_paths are invalid: {error}"
-                    ));
-                }
+            let coverage = auditor_review_path_coverage(audit_report, &required_reviewed_paths);
+            if !coverage.excluded_paths.is_empty() {
+                audit_report.findings.push(Finding {
+                    severity: FindingSeverity::Warning,
+                    message: format!(
+                        "auditor reviewed_paths entries were retained as evidence but excluded from repository-relative coverage computation: {}",
+                        display_paths(&coverage.excluded_paths)
+                    ),
+                    paths: coverage.excluded_paths,
+                });
+            }
+            if !coverage.missing_paths.is_empty() {
+                valid = false;
+                messages.push(format!(
+                    "parent auditor reviewed_paths omitted required assignment/change path coverage for: {}",
+                    display_paths(&coverage.missing_paths)
+                ));
             }
         }
 
@@ -3816,13 +3820,27 @@ fn required_auditor_review_paths(
     )
 }
 
-fn missing_auditor_review_paths(
+struct AuditorReviewPathCoverage {
+    missing_paths: Vec<PathBuf>,
+    excluded_paths: Vec<PathBuf>,
+}
+
+fn auditor_review_path_coverage(
     audit_report: &AuditorReport,
     required_paths: &[PathBuf],
-) -> Result<Vec<PathBuf>> {
-    let reviewed_paths = normalize_paths(audit_report.reviewed_paths.clone())
-        .map_err(|error| anyhow::anyhow!(error))?;
-    Ok(required_paths
+) -> AuditorReviewPathCoverage {
+    let mut normalized_paths = BTreeSet::new();
+    let mut excluded_paths = Vec::new();
+    for path in &audit_report.reviewed_paths {
+        match normalize_repo_relative_path(path) {
+            Ok(path) => {
+                normalized_paths.insert(path);
+            }
+            Err(_) => excluded_paths.push(path.clone()),
+        }
+    }
+    let reviewed_paths = collapse_covered_paths(normalized_paths);
+    let missing_paths = required_paths
         .iter()
         .filter(|required| {
             !reviewed_paths
@@ -3830,7 +3848,11 @@ fn missing_auditor_review_paths(
                 .any(|reviewed| path_is_covered_by_claim(required, reviewed))
         })
         .cloned()
-        .collect())
+        .collect();
+    AuditorReviewPathCoverage {
+        missing_paths,
+        excluded_paths,
+    }
 }
 
 fn validate_worker_report_delegation_attestations(
@@ -7882,6 +7904,61 @@ mod tests {
     }
 
     #[test]
+    fn parent_auditor_coverage_ignores_non_repo_evidence_paths_without_voiding_report() {
+        let assignment = injected_assignment(true);
+        let mut child = injected_child_report(&assignment);
+        let mut auditor = injected_auditor_report(&assignment, &child);
+        let absolute_evidence_path = PathBuf::from("/tmp/evidence/log.txt");
+        auditor.reviewed_paths.push(absolute_evidence_path.clone());
+        auditor.commands_run.push(injected_command_record());
+        child.audit_reports.push(auditor);
+
+        validate_auditor_reports(&assignment, Path::new("absolute-evidence.json"), &mut child);
+
+        assert_eq!(child.status, ReviewStatus::Succeeded);
+        assert!(child.accepted);
+        assert!(!child.rejected);
+        assert!(child.audit_reports[0]
+            .reviewed_paths
+            .contains(&absolute_evidence_path));
+        assert!(child.audit_reports[0].findings.iter().any(|finding| {
+            finding.severity == FindingSeverity::Warning
+                && finding
+                    .message
+                    .contains("excluded from repository-relative coverage computation")
+                && finding.paths == vec![absolute_evidence_path.clone()]
+        }));
+    }
+
+    #[test]
+    fn parent_auditor_coverage_rejects_only_non_repo_evidence_paths() {
+        let assignment = injected_assignment(true);
+        let mut child = injected_child_report(&assignment);
+        let mut auditor = injected_auditor_report(&assignment, &child);
+        auditor.reviewed_paths = vec![PathBuf::from("/tmp/evidence/log.txt")];
+        auditor.commands_run.push(injected_command_record());
+        child.audit_reports.push(auditor);
+
+        validate_auditor_reports(
+            &assignment,
+            Path::new("absolute-only-evidence.json"),
+            &mut child,
+        );
+
+        assert_eq!(child.status, ReviewStatus::Failed);
+        assert!(child.audit_reports[0].findings.iter().any(|finding| {
+            finding.severity == FindingSeverity::Warning
+                && finding
+                    .message
+                    .contains("excluded from repository-relative coverage computation")
+        }));
+        assert!(child.audit_reports[0].findings.iter().any(|finding| {
+            finding.severity == FindingSeverity::Error
+                && finding.message.contains("reviewed_paths omitted")
+        }));
+    }
+
+    #[test]
     fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(true);
@@ -10618,6 +10695,41 @@ mod tests {
         assert!(prompt.contains("write a structured execution journal"));
         assert!(prompt.contains("\"start_timestamp\""));
         assert!(prompt.contains("\"changed_paths\""));
+    }
+
+    #[test]
+    fn auditor_prompts_explain_repo_relative_coverage_and_absolute_evidence() {
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let child = injected_child_report(&assignment);
+        let child_prompt = review_auditor_prompt(
+            &plan,
+            &assignment,
+            Path::new("/tmp/maco-run"),
+            Path::new("/tmp/maco-run/schemas/auditor-report.schema.json"),
+        )
+        .expect("render child review auditor prompt");
+        let parent_prompt = parent_review_auditor_prompt(ParentReviewAuditorPromptContext {
+            plan: &plan,
+            assignment: &assignment,
+            run_dir: Path::new("/tmp/maco-run"),
+            worktree_path: Path::new("/tmp/maco-worktree"),
+            child_report_path: Path::new("/tmp/maco-run/reports/child-a.json"),
+            auditor_report_path: Path::new("/tmp/maco-run/reports/child-a-review-auditor.json"),
+            schema_path: Path::new("/tmp/maco-run/schemas/auditor-report.schema.json"),
+            child_report: &child,
+        })
+        .expect("render parent review auditor prompt");
+
+        for prompt in [child_prompt, parent_prompt] {
+            assert!(prompt.contains(
+                "reviewed_paths coverage is computed over repository-relative entries only"
+            ));
+            assert!(prompt.contains(
+                "Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence"
+            ));
+            assert!(prompt.contains("excluded from coverage computation"));
+        }
     }
 
     fn read_finalized_orchestration_events(reader: &ArtifactRunReader) -> Vec<OrchestrationEvent> {
