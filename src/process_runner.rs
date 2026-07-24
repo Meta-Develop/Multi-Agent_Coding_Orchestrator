@@ -65,6 +65,10 @@ const MAX_CONCURRENT_SYSTEMD_UNITS: usize = 8;
 // capacity for parallel coverage without overwhelming the shared user systemd manager.
 #[cfg(all(target_os = "linux", test))]
 const MAX_CONCURRENT_SYSTEMD_UNITS: usize = 4;
+// These safety probes assert containment evidence rather than command latency. Allow the complete
+// bounded slot wait plus setup without changing any production deadline.
+#[cfg(all(target_os = "linux", test))]
+const CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(40);
 #[cfg(target_os = "linux")]
 const EXPEDITED_SYSTEMD_SLOT_THRESHOLD: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
@@ -9214,7 +9218,7 @@ mod tests {
                 temp.path(),
                 256,
             )
-            .with_timeout(Some(Duration::from_secs(2))),
+            .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
         );
 
         match result {
@@ -9961,7 +9965,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                 1024,
             )
             .with_environment(EnvironmentMode::ClearAndSet(environment))
-            .with_timeout(Some(Duration::from_secs(2))),
+            .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
         )
         .expect("run guardian collision environment");
 
@@ -10185,7 +10189,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                     temp.path(),
                     128,
                 )
-                .with_timeout(Some(Duration::from_secs(2))),
+                .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
             ) {
                 Ok(output) => {
                     assert!(output.safety_evidence_verified());
@@ -11197,7 +11201,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
         let registry = AgentRegistry::open(temp.path()).expect("agent registry");
         let runner = thread::spawn(move || run_process(spec));
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let registered = loop {
             let processes = registry
                 .list(&crate::agent_lifecycle::AgentListFilter::default())
