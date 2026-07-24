@@ -418,6 +418,43 @@ The project does not keep a separate crate mirror or RustSec database snapshot,
 so a completely empty machine still needs the explicit fetch steps before
 offline verification.
 
+### Coordination benchmarks
+
+Run the bounded Criterion suite with:
+
+```bash
+cargo bench --no-run
+cargo bench
+```
+
+Every case in `benches/coordination.rs` owns an isolated, committed
+`tempfile` plus `git2` repository fixture. Fixture construction and public-API
+success probes run outside the timed loops. The groups measure:
+
+- `claim_acquire_release`: persisted `SyncStore` claim plus release for one
+  path by token and a four-path claim by agent.
+- `claim_contention`: two disjoint successful claim/release cycles started
+  together, and an overlapping ownership handoff that completes two successful
+  claim/release cycles.
+- `claim_concurrency_disjoint`: successful disjoint claim/release throughput at
+  bounded thread counts of 1, 4, and 8.
+- `repository_queries`: public small-repository inventory scan, semantic scan,
+  and semantic risk query over a precomputed map.
+
+The suite uses 10 samples, a 300 ms warm-up, and a 700 ms measurement window per
+case so a complete local run stays modest.
+
+**DEFERRED SCOPE:** This first issue #25 increment does not benchmark:
+
+- managed-worktree registry create/list/remove lifecycle or merge preview/apply
+  throughput, because successful setup requires the capability-bound managed
+  worktree API tracked by issue #11;
+- semantic merge-conflict classification, because
+  `classify_semantic_conflicts` is currently crate-private;
+- ntfs3 filesystem-profile sweeps; p50/p95/p99 and lock wait/hold
+  instrumentation; state amplification; published concurrency limits; or CI
+  regression thresholds.
+
 ### Platform boundary
 
 Linux is the fully supported security-sensitive runtime path. macOS and Windows
