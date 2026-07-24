@@ -3,6 +3,7 @@ use crate::{
         self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
         ProviderCommandPolicy,
     },
+    agent_lifecycle::{AgentListFilter, AgentProcessRecord, AgentRegistry, AgentStopReport},
     artifacts::{self, ResolvedRunId, RunArtifactFamily},
     autopilot,
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
@@ -105,6 +106,7 @@ impl Cli {
             Command::Autopilot(command) => command.run(),
             Command::Review(command) => command.run(),
             Command::Agent(command) => command.run(),
+            Command::Agents(command) => command.run(),
             Command::Llm(command) => command.run(),
         }
     }
@@ -148,6 +150,8 @@ enum Command {
     Review(ReviewCommand),
     /// Run a provider-backed agent in an isolated worktree.
     Agent(AgentCommand),
+    /// Inspect and stop live MACO-launched agent processes.
+    Agents(AgentsCommand),
     /// Inspect local LLM adapter boundaries without network calls.
     Llm(LlmCommand),
 }
@@ -1393,6 +1397,90 @@ struct AgentRunFailureReport {
     provider_id: String,
     request_id: String,
     error: String,
+}
+
+#[derive(Debug, Args)]
+struct AgentsCommand {
+    #[command(subcommand)]
+    command: AgentsSubcommand,
+}
+
+impl AgentsCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            AgentsSubcommand::List(args) => {
+                let registry = AgentRegistry::open(args.repo)?;
+                let processes = registry.list(&AgentListFilter {
+                    run_id: args.run_id,
+                })?;
+                print_agent_processes(&processes, args.json)
+            }
+            AgentsSubcommand::Stop(args) => {
+                let registry = AgentRegistry::open(args.repo)?;
+                let wait = Duration::from_secs(args.wait_seconds);
+                let report = if args.all {
+                    if args.selector.is_some() {
+                        bail!("agents stop --all does not accept a selector");
+                    }
+                    let run_id = args
+                        .run_id
+                        .context("agents stop --all requires --run-id ID")?;
+                    registry.stop_run(&run_id, wait)?
+                } else {
+                    if args.run_id.is_some() {
+                        bail!("agents stop --run-id requires --all");
+                    }
+                    let selector = args
+                        .selector
+                        .context("agents stop requires a selector or --all --run-id ID")?;
+                    registry.stop_selector(&selector, wait)?
+                };
+                print_agent_stop_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentsSubcommand {
+    /// List live registered MACO agent processes and garbage-collect stale records.
+    List(ListAgentsArgs),
+    /// Stop one unambiguous process, or every process in one explicitly selected run.
+    Stop(StopAgentsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ListAgentsArgs {
+    /// Repository whose .maco/agents registry should be inspected.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Include only processes belonging to this run id.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StopAgentsArgs {
+    /// Run id, task/assignment id, or decimal PID. The selector must match exactly one process.
+    selector: Option<String>,
+    /// Stop every live process in the run selected by --run-id.
+    #[arg(long)]
+    all: bool,
+    /// Run id used with --all.
+    #[arg(long)]
+    run_id: Option<String>,
+    /// Repository whose .maco/agents registry should be inspected.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Seconds to wait after SIGTERM before escalating to SIGKILL.
+    #[arg(long, default_value_t = 3)]
+    wait_seconds: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -3435,6 +3523,47 @@ fn print_agent_run_report(report: &AgentRunReport, json: bool) -> Result<()> {
 
 fn print_agent_run_failure_report(report: &AgentRunFailureReport) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(report)?);
+    Ok(())
+}
+
+fn print_agent_processes(processes: &[AgentProcessRecord], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(processes)?);
+    } else if processes.is_empty() {
+        println!("No live MACO agents registered.");
+    } else {
+        for process in processes {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                process.pid,
+                process.role,
+                process.run_id,
+                process.task_id,
+                process.repo.display(),
+                process.launch_timestamp_ms,
+                process.argv.join(" ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_agent_stop_report(report: &AgentStopReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else if report.stopped.is_empty() {
+        println!("No live MACO agents matched the selected run.");
+    } else {
+        for stopped in &report.stopped {
+            println!(
+                "{:?}\t{}\t{}\t{}",
+                stopped.outcome,
+                stopped.process.pid,
+                stopped.process.run_id,
+                stopped.process.task_id
+            );
+        }
+    }
     Ok(())
 }
 

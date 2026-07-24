@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod agent;
+pub mod agent_lifecycle;
 pub mod artifacts;
 pub(crate) mod authenticated_snapshot;
 pub mod autopilot;
