@@ -18,6 +18,11 @@ use crate::{
     safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
     semantic_coord::{SemanticIntent, SemanticIntentRequest, SemanticIntentStore},
+    swarm_health::{
+        AssignmentHealthOutcome, CircuitBreakerTransition, CircuitBreakerTrip,
+        CircuitBreakerTripReason, SwarmHealthCircuitBreaker, SwarmHealthSignal,
+        SwarmHealthSnapshot,
+    },
     sync::{normalize_repo_relative_path, paths_overlap, ClaimToken, PathClaim},
     sync_store::SyncStore,
     worktree::{
@@ -59,6 +64,7 @@ const ARTIFACT_FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
 const MAX_DIRECTORY_FINGERPRINT_DEPTH: usize = 256;
+const BREAKER_RECOVERY_GUIDANCE: &str = "inspect the breaker window and child evidence, correct the repeated coordination failure, then start a new supervise run; pending assignments were not launched";
 const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".maco",
     b".maco-cache",
@@ -348,6 +354,8 @@ pub struct SupervisorFinalReport {
     #[serde(default)]
     pub findings: Vec<Finding>,
     #[serde(default)]
+    pub breaker_trip: Option<SupervisorBreakerTrip>,
+    #[serde(default)]
     pub orchestrator_reports: Vec<OrchestratorReviewReport>,
     #[serde(default)]
     pub released_claims: Vec<PathClaim>,
@@ -359,6 +367,13 @@ pub struct SupervisorFinalReport {
     pub semantic_release_errors: Vec<String>,
     pub remaining_risk: String,
     pub next_safe_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SupervisorBreakerTrip {
+    pub reason: CircuitBreakerTripReason,
+    pub window: SwarmHealthSnapshot,
+    pub recovery_guidance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -673,6 +688,7 @@ pub fn collect_supervisor_run(
             message: "supervisor final report is missing".to_string(),
             paths: vec![final_report_path],
         }],
+        breaker_trip: None,
         orchestrator_reports: Vec::new(),
         released_claims: Vec::new(),
         release_errors: Vec::new(),
@@ -1503,6 +1519,7 @@ struct AssignmentExecutionOutcome {
     release_errors: Vec<String>,
     released_semantic_intents: Vec<SemanticIntent>,
     semantic_release_errors: Vec<String>,
+    health_signals: Vec<SwarmHealthSignal>,
     assignment_failed: bool,
     external_containment_failed: bool,
     fatal_error: Option<String>,
@@ -1547,6 +1564,58 @@ impl AssignmentExecutionOutcome {
     }
 }
 
+fn assignment_health_outcome(outcome: &AssignmentExecutionOutcome) -> AssignmentHealthOutcome {
+    match outcome.report.as_ref() {
+        Some(report)
+            if report.rejected
+                || report.status == ReviewStatus::Rejected
+                || report.status == ReviewStatus::Missing =>
+        {
+            AssignmentHealthOutcome::Rejected
+        }
+        Some(report) if report_failed(report) => AssignmentHealthOutcome::Failed,
+        Some(_) => AssignmentHealthOutcome::Accepted,
+        None => AssignmentHealthOutcome::Failed,
+    }
+}
+
+fn observe_assignment_health(
+    breaker: &mut SwarmHealthCircuitBreaker,
+    outcome: &AssignmentExecutionOutcome,
+) -> Option<CircuitBreakerTrip> {
+    let final_outcome = SwarmHealthSignal::AssignmentOutcome(assignment_health_outcome(outcome));
+    outcome
+        .health_signals
+        .iter()
+        .copied()
+        .chain(std::iter::once(final_outcome))
+        .find_map(|signal| match breaker.observe(signal) {
+            Some(CircuitBreakerTransition::Opened(trip)) => Some(trip),
+            Some(CircuitBreakerTransition::EnteredHalfOpen | CircuitBreakerTransition::Closed)
+            | None => None,
+        })
+}
+
+fn record_breaker_trip(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    run_id: &RunId,
+    trip: &CircuitBreakerTrip,
+) -> Result<()> {
+    record_shared_orchestration_event(
+        artifacts,
+        run_id.as_str(),
+        None,
+        OrchestrationRole::Supervisor,
+        OrchestrationEventKind::Gate,
+        json!({
+            "gate": "swarm_health_circuit_breaker",
+            "transition": "closed_to_open",
+            "trip": trip,
+            "drain_policy": "finish_active_without_admitting_pending",
+        }),
+    )
+}
+
 fn record_assignment_spawn_failure(
     indexed_outcomes: &mut [Option<AssignmentExecutionOutcome>],
     stop_scheduling: &mut bool,
@@ -1582,6 +1651,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     semantic_store: &'a SemanticIntentStore,
     prepared_semantic_token: Option<u64>,
     prepared_semantic_findings: &'a [Finding],
+    prepared_semantic_signals: &'a [SwarmHealthSignal],
     prepared_semantic_failed: bool,
     serial_semantic_warn_intents: Option<&'a Mutex<Vec<SemanticIntent>>>,
     semantic_block_order: Option<usize>,
@@ -1734,6 +1804,7 @@ fn execute_supervisor_assignment_inner(
         semantic_store,
         prepared_semantic_token,
         prepared_semantic_findings,
+        prepared_semantic_signals,
         prepared_semantic_failed,
         serial_semantic_warn_intents,
         semantic_block_order,
@@ -1745,6 +1816,9 @@ fn execute_supervisor_assignment_inner(
     outcome
         .findings
         .extend(prepared_semantic_findings.iter().cloned());
+    outcome
+        .health_signals
+        .extend(prepared_semantic_signals.iter().copied());
     if *prepared_semantic_failed {
         outcome.assignment_failed = true;
         return Ok(());
@@ -1830,6 +1904,13 @@ fn execute_supervisor_assignment_inner(
     let claim = match sync_store.claim_paths(&assignment.id, assignment.assigned_paths.iter()) {
         Ok(claim) => claim,
         Err(error) => {
+            outcome.health_signals.push(
+                if claim_conflict_details(sync_store, &assignment.assigned_paths).is_empty() {
+                    SwarmHealthSignal::ClaimAcquisitionFailed
+                } else {
+                    SwarmHealthSignal::ClaimAcquisitionDenied
+                },
+            );
             outcome
                 .findings
                 .push(claim_failure_finding(sync_store, assignment, &error));
@@ -1853,6 +1934,7 @@ fn execute_supervisor_assignment_inner(
                     &mut outcome.semantic_tokens,
                     &mut planned_intents,
                     &mut outcome.findings,
+                    &mut outcome.health_signals,
                 )
             };
             let coordination = match coordination_result {
@@ -1884,6 +1966,7 @@ fn execute_supervisor_assignment_inner(
             &mut outcome.semantic_tokens,
             &mut planned_semantic_intents,
             &mut outcome.findings,
+            &mut outcome.health_signals,
         );
         drop(semantic_block_turn);
         let coordination = match coordination_result {
@@ -2198,6 +2281,11 @@ fn execute_supervisor_assignment_inner(
             corrective_retry_used,
         });
         if retry_used {
+            outcome
+                .health_signals
+                .push(SwarmHealthSignal::AssignmentOutcome(
+                    AssignmentHealthOutcome::Retried,
+                ));
             record_shared_orchestration_event(
                 artifacts,
                 &assignment.id,
@@ -2581,6 +2669,7 @@ fn plan_has_overlapping_assignments(plan: &SupervisorPlan) -> bool {
 struct PreparedSemanticAssignment {
     token: Option<u64>,
     findings: Vec<Finding>,
+    health_signals: Vec<SwarmHealthSignal>,
     assignment_failed: bool,
 }
 
@@ -2614,17 +2703,23 @@ fn prepare_semantic_warn_assignments(
             Err(error) => return Err(error),
         };
         if report.has_blocking_conflicts || report.has_advisory_conflicts {
+            let conflict_count = report
+                .blocking_conflict_count
+                .saturating_add(report.advisory_conflict_count);
             prepared[index].findings.push(Finding {
                 severity: FindingSeverity::Warning,
                 message: format!(
                     "semantic coordination warn-mode preview for assignment '{}' found {} conflict(s)",
                     assignment.id,
-                    report
-                        .blocking_conflict_count
-                        .saturating_add(report.advisory_conflict_count)
+                    conflict_count
                 ),
                 paths: assignment.assigned_paths.clone(),
             });
+            prepared[index]
+                .health_signals
+                .push(SwarmHealthSignal::SemanticConflictWarned {
+                    conflicts: conflict_count,
+                });
         }
         prepared[index].token = Some(report.intent.token.get());
         planned_preview_intents.push(report.intent);
@@ -2753,6 +2848,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let mut primary_run_baseline = None;
     let mut assignment_execution_failed = false;
     let mut external_containment_failed = false;
+    let mut circuit_breaker_trip = None;
 
     let run_result = (|| -> Result<()> {
         if !options.allow_dirty_primary {
@@ -2829,9 +2925,13 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .collect::<Vec<Option<AssignmentExecutionOutcome>>>();
             let semantic_block_gate = SemanticBlockGate::default();
             let serial_semantic_warn_intents = Mutex::new(Vec::new());
+            let mut health_breaker = SwarmHealthCircuitBreaker::default();
 
             let scheduler_result = if max_concurrent_children == 1 {
                 for (index, assignment) in plan.assignments.iter().enumerate() {
+                    if !health_breaker.permits_admission() {
+                        break;
+                    }
                     let outcome = execute_supervisor_assignment(AssignmentExecutionContext {
                         index,
                         concurrent_mode: false,
@@ -2850,6 +2950,8 @@ fn run_supervisor_plan_with_runner_and_creation(
                         semantic_store,
                         prepared_semantic_token: prepared_semantic_assignments[index].token,
                         prepared_semantic_findings: &prepared_semantic_assignments[index].findings,
+                        prepared_semantic_signals: &prepared_semantic_assignments[index]
+                            .health_signals,
                         prepared_semantic_failed: prepared_semantic_assignments[index]
                             .assignment_failed,
                         serial_semantic_warn_intents: Some(&serial_semantic_warn_intents),
@@ -2862,6 +2964,13 @@ fn run_supervisor_plan_with_runner_and_creation(
                     let mut outcome = outcome;
                     if release_per_assignment {
                         release_concurrent_assignment(&mut outcome, sync_store, semantic_store);
+                    }
+                    if circuit_breaker_trip.is_none() {
+                        if let Some(trip) = observe_assignment_health(&mut health_breaker, &outcome)
+                        {
+                            record_breaker_trip(&shared_artifacts, &options.run_id, &trip)?;
+                            circuit_breaker_trip = Some(trip);
+                        }
                     }
                     let abort = outcome.requires_scheduler_abort();
                     indexed_outcomes[index] = Some(outcome);
@@ -2892,6 +3001,10 @@ fn run_supervisor_plan_with_runner_and_creation(
                     while !pending.is_empty() || !active.is_empty() {
                         if !stop_scheduling {
                             while active.len() < max_concurrent_children {
+                                if !health_breaker.permits_admission() {
+                                    stop_scheduling = true;
+                                    break;
+                                }
                                 let next = pending.iter().copied().find(|candidate| {
                                     active.keys().all(|active_index| {
                                         !assignments_overlap(
@@ -2941,6 +3054,9 @@ fn run_supervisor_plan_with_runner_and_creation(
                                                 prepared_semantic_assignments_ref[index].token,
                                             prepared_semantic_findings:
                                                 &prepared_semantic_assignments_ref[index].findings,
+                                            prepared_semantic_signals:
+                                                &prepared_semantic_assignments_ref[index]
+                                                    .health_signals,
                                             prepared_semantic_failed:
                                                 prepared_semantic_assignments_ref[index]
                                                     .assignment_failed,
@@ -3006,6 +3122,17 @@ fn run_supervisor_plan_with_runner_and_creation(
                         if outcome.requires_scheduler_abort() {
                             cancellation.cancel();
                             stop_scheduling = true;
+                        } else if circuit_breaker_trip.is_none() {
+                            if let Some(trip) =
+                                observe_assignment_health(&mut health_breaker, &outcome)
+                            {
+                                record_breaker_trip(&shared_artifacts, &options.run_id, &trip)?;
+                                circuit_breaker_trip = Some(trip);
+                                // A breaker trip is a graceful scheduler stop: pending assignments
+                                // are not admitted, while already-active children retain their
+                                // existing cancellation tokens and are deterministically drained.
+                                stop_scheduling = true;
+                            }
                         }
                         indexed_outcomes[completed_index] = Some(outcome);
                     }
@@ -3060,6 +3187,22 @@ fn run_supervisor_plan_with_runner_and_creation(
         findings.push(Finding {
             severity: FindingSeverity::Error,
             message: format!("{error:#}"),
+            paths: Vec::new(),
+        });
+    }
+    let breaker_tripped = circuit_breaker_trip.is_some();
+    let supervisor_breaker_trip = circuit_breaker_trip.map(|trip| SupervisorBreakerTrip {
+        reason: trip.reason,
+        window: trip.window,
+        recovery_guidance: BREAKER_RECOVERY_GUIDANCE.to_string(),
+    });
+    if let Some(trip) = &supervisor_breaker_trip {
+        findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "swarm-health circuit breaker opened and drained active assignments: {:?}",
+                trip.reason
+            ),
             paths: Vec::new(),
         });
     }
@@ -3122,6 +3265,7 @@ fn run_supervisor_plan_with_runner_and_creation(
         || assignment_execution_failed
         || external_containment_failed
         || final_primary_integrity_failed
+        || breaker_tripped
         || orchestrator_reports.iter().any(report_failed);
     let success = !failed;
     let publishable = success && runtime == SupervisorRuntime::Codex;
@@ -3196,6 +3340,7 @@ fn run_supervisor_plan_with_runner_and_creation(
             .flat_map(|report| report.validation_results.iter().cloned())
             .collect(),
         findings,
+        breaker_trip: supervisor_breaker_trip,
         orchestrator_reports,
         released_claims,
         release_errors,
@@ -3212,6 +3357,9 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .to_string()
         } else if final_primary_integrity_failed {
             "primary worktree final integrity could not be established".to_string()
+        } else if breaker_tripped {
+            "the swarm-health circuit breaker stopped pending assignment admission after a repeated coordination failure"
+                .to_string()
         } else {
             "one or more child or worker reports failed, were rejected, or were missing".to_string()
         },
@@ -3226,6 +3374,8 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .to_string()
         } else if final_primary_integrity_failed {
             "inspect and restore the primary worktree before rerunning supervise".to_string()
+        } else if breaker_tripped {
+            BREAKER_RECOVERY_GUIDANCE.to_string()
         } else {
             "inspect run reports and rerun failed child scopes after correcting the issue"
                 .to_string()
@@ -3243,6 +3393,7 @@ fn run_supervisor_plan_with_runner_and_creation(
             "publishable": final_report.publishable,
             "accepted": final_report.accepted,
             "rejected": final_report.rejected,
+            "breaker_trip": final_report.breaker_trip,
         }),
     );
     record_orchestration_event(
@@ -3403,6 +3554,7 @@ fn coordinate_semantic_assignment(
     acquired_tokens: &mut Vec<crate::semantic_coord::SemanticIntentToken>,
     planned_preview_intents: &mut Vec<SemanticIntent>,
     findings: &mut Vec<Finding>,
+    health_signals: &mut Vec<SwarmHealthSignal>,
 ) -> Result<SemanticAssignmentCoordination> {
     if mode == SemanticCoordinationMode::Off {
         return Ok(SemanticAssignmentCoordination::Ready(None));
@@ -3419,21 +3571,28 @@ fn coordinate_semantic_assignment(
     };
     if mode == SemanticCoordinationMode::Warn {
         if report.has_blocking_conflicts || report.has_advisory_conflicts {
+            let conflict_count = report
+                .blocking_conflict_count
+                .saturating_add(report.advisory_conflict_count);
             findings.push(Finding {
                 severity: FindingSeverity::Warning,
                 message: format!(
                     "semantic coordination warn-mode preview for assignment '{}' found {} conflict(s)",
                     assignment.id,
-                    report
-                        .blocking_conflict_count
-                        .saturating_add(report.advisory_conflict_count)
+                    conflict_count
                 ),
                 paths: assignment.assigned_paths.clone(),
+            });
+            health_signals.push(SwarmHealthSignal::SemanticConflictWarned {
+                conflicts: conflict_count,
             });
         }
         planned_preview_intents.push(report.intent.clone());
     }
     if mode == SemanticCoordinationMode::Block && report.has_blocking_conflicts {
+        health_signals.push(SwarmHealthSignal::SemanticConflictBlocked {
+            conflicts: report.blocking_conflict_count,
+        });
         return Ok(SemanticAssignmentCoordination::Blocked(
             report.blocking_conflict_count,
         ));
@@ -7067,6 +7226,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc, Condvar,
     };
+    use std::time::Instant;
 
     #[test]
     fn external_containment_gate_accepts_only_verified_empty_evidence() {
@@ -8977,6 +9137,7 @@ mod tests {
         )
         .expect("normal child failure remains a finalized report");
         assert!(!report.success);
+        assert!(report.breaker_trip.is_none());
         assert_eq!(report.orchestrator_reports.len(), 2);
         assert_eq!(
             started
@@ -8985,6 +9146,173 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
+        #[derive(Default)]
+        struct BreakerState {
+            started: BTreeSet<String>,
+            release_child_d: bool,
+            child_d_finished: bool,
+            child_d_observed_cancellation: bool,
+        }
+
+        let (temp, repo_path) = injected_repository();
+        let assignments = vec![
+            injected_named_assignment("child-a", "README.md"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_assignment("child-c", "Cargo.toml"),
+            injected_named_assignment("child-d", "RELEASE_NOTES.md"),
+            injected_named_assignment("child-e", "SECURITY.md"),
+        ];
+        let plan = injected_multi_plan(assignments.clone(), 0);
+        let options = injected_options(&repo_path, temp.path(), "circuit-breaker-cascade");
+        let state = Arc::new((Mutex::new(BreakerState::default()), Condvar::new()));
+        let runner = {
+            let assignments = assignments.clone();
+            let state = Arc::clone(&state);
+            move |command: &ExternalAgentCommand, cancellation: &ProcessCancellation| {
+                let id = injected_command_assignment_id(command);
+                let (lock, condvar) = &*state;
+                let mut breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                breaker.started.insert(id.clone());
+                condvar.notify_all();
+                if id == "child-b" {
+                    while !breaker.started.contains("child-c") {
+                        breaker = condvar
+                            .wait(breaker)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-c" {
+                    while !breaker.started.contains("child-d") {
+                        breaker = condvar
+                            .wait(breaker)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                } else if id == "child-d" {
+                    while !breaker.release_child_d {
+                        breaker.child_d_observed_cancellation |= cancellation.is_cancelled();
+                        breaker = condvar
+                            .wait(breaker)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                drop(breaker);
+
+                let assignment = assignments
+                    .iter()
+                    .find(|assignment| assignment.id == id)
+                    .unwrap_or_else(|| panic!("missing assignment {id}"));
+                let mut report = injected_child_report(assignment);
+                if matches!(id.as_str(), "child-a" | "child-b" | "child-c") {
+                    report.accepted = false;
+                    report.rejected = true;
+                    report.status = ReviewStatus::Rejected;
+                }
+                write_injected_json(&command.output_last_message, &report);
+                let run = injected_verified_run(command);
+                if id == "child-d" {
+                    let mut breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    breaker.child_d_finished = true;
+                    condvar.notify_all();
+                }
+                run
+            }
+        };
+
+        let (done_sender, done_receiver) = mpsc::channel();
+        let supervisor_thread = thread::spawn(move || {
+            let result = run_supervisor_plan_with_concurrent_cancellable_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            );
+            let _ = done_sender.send(result);
+        });
+
+        let event_path = repo_path
+            .join(".maco/o2/runs/circuit-breaker-cascade")
+            .join(ORCHESTRATION_EVENT_PATH);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let breaker_recorded = fs::read_to_string(&event_path)
+                .is_ok_and(|events| events.contains("swarm_health_circuit_breaker"));
+            if breaker_recorded {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "breaker transition was not journaled before the deadline"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let (lock, condvar) = &*state;
+        let mut breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(breaker.started.contains("child-d"));
+        assert!(!breaker.started.contains("child-e"));
+        assert!(!breaker.child_d_finished);
+        assert!(!breaker.child_d_observed_cancellation);
+        assert!(matches!(
+            done_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        breaker.release_child_d = true;
+        condvar.notify_all();
+        drop(breaker);
+
+        let report = done_receiver
+            .recv()
+            .expect("supervisor breaker result after active child drain")
+            .expect("breaker trip remains reportable");
+        supervisor_thread
+            .join()
+            .unwrap_or_else(|_| panic!("supervisor test thread panicked"));
+
+        assert!(!report.success);
+        assert_eq!(report.orchestrator_reports.len(), 4);
+        assert_eq!(report.commands_run.len(), 4);
+        assert_eq!(report.released_claims.len(), 4);
+        assert!(report.release_errors.is_empty());
+        assert!(matches!(
+            report.breaker_trip.as_ref().map(|trip| &trip.reason),
+            Some(CircuitBreakerTripReason::RepeatedRejectionLoop {
+                rejections: 3,
+                retries: 0,
+                threshold: 3,
+            })
+        ));
+        assert!(report
+            .breaker_trip
+            .as_ref()
+            .is_some_and(|trip| trip.window.repeated_rejections == 3
+                && trip
+                    .recovery_guidance
+                    .contains("pending assignments were not launched")));
+        let breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(breaker.child_d_finished);
+        assert!(!breaker.child_d_observed_cancellation);
+        assert!(!breaker.started.contains("child-e"));
+        drop(breaker);
+        assert!(SyncStore::open(&repo_path)
+            .expect("open claims after breaker drain")
+            .snapshot()
+            .expect("snapshot claims after breaker drain")
+            .is_empty());
+
+        let run_id = RunId::new("circuit-breaker-cascade").expect("valid breaker run id");
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized breaker artifacts");
+        let events = read_finalized_orchestration_events(&reader);
+        assert!(events.iter().any(|event| {
+            event.kind == OrchestrationEventKind::Gate
+                && event.payload["gate"] == "swarm_health_circuit_breaker"
+                && event.payload["transition"] == "closed_to_open"
+                && event.payload["trip"]["reason"]["kind"] == "repeated_rejection_loop"
+        }));
     }
 
     #[test]
@@ -10981,6 +11309,7 @@ mod tests {
             files_changed: Vec::new(),
             validation_results: Vec::new(),
             findings: Vec::new(),
+            breaker_trip: None,
             orchestrator_reports: Vec::new(),
             released_claims: Vec::new(),
             release_errors: Vec::new(),
