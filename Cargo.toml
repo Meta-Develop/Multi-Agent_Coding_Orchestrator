@@ -28,6 +28,10 @@ path = "src/main.rs"
 name = "maco"
 path = "src/bin/maco.rs"
 
+[[bench]]
+name = "coordination"
+harness = false
+
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4", features = ["derive", "env"] }
@@ -59,4 +63,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 tempfile = "3"
