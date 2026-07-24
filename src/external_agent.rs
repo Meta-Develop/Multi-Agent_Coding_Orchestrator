@@ -1,3 +1,4 @@
+use crate::agent_lifecycle::AgentLaunchMetadata;
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, CapturedBytes, EnvironmentMode,
     ExternalCodexProfile, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
@@ -44,6 +45,18 @@ pub struct ExternalAgentCommand {
     pub timeout: Duration,
     pub workspace_access: WorkspaceAccess,
     pub hidden_roots: Vec<PathBuf>,
+    /// Optional lifecycle identity for the long-running provider process. `registry_repo` is the
+    /// supervisor repository whose `.maco/agents` state operators inspect, which can differ from
+    /// `cwd` when the provider runs inside a linked assignment worktree.
+    pub agent_lifecycle: Option<ExternalAgentLifecycleIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAgentLifecycleIdentity {
+    pub registry_repo: PathBuf,
+    pub role: String,
+    pub run_id: String,
+    pub task_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +104,7 @@ impl ExternalAgentCommand {
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
             hidden_roots: Vec::new(),
+            agent_lifecycle: None,
         }
     }
 
@@ -113,6 +127,7 @@ impl ExternalAgentCommand {
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
+            agent_lifecycle: None,
         }
     }
 
@@ -135,6 +150,7 @@ impl ExternalAgentCommand {
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
+            agent_lifecycle: None,
         }
     }
 
@@ -145,6 +161,22 @@ impl ExternalAgentCommand {
 
     pub fn with_workspace_access(mut self, access: WorkspaceAccess) -> Self {
         self.workspace_access = access;
+        self
+    }
+
+    pub fn with_agent_lifecycle(
+        mut self,
+        registry_repo: impl Into<PathBuf>,
+        role: impl Into<String>,
+        run_id: impl Into<String>,
+        task_id: impl Into<String>,
+    ) -> Self {
+        self.agent_lifecycle = Some(ExternalAgentLifecycleIdentity {
+            registry_repo: registry_repo.into(),
+            role: role.into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+        });
         self
     }
 }
@@ -437,6 +469,25 @@ fn run_external_agent_runtime(
         return report;
     }
 
+    let agent_lifecycle = match &spec.agent_lifecycle {
+        Some(identity) => match AgentLaunchMetadata::new(
+            &identity.registry_repo,
+            &identity.role,
+            &identity.run_id,
+            &identity.task_id,
+        ) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                report.error = Some(format!(
+                    "failed to prepare external-agent lifecycle identity: {error:#}"
+                ));
+                return report;
+            }
+        },
+        None => None,
+    };
+
     if let Err(error) = ensure_existing_output_parent(&spec.json_log)
         .and_then(|_| ensure_existing_output_parent(&spec.output_last_message))
         .and_then(|_| match &spec.output_schema {
@@ -547,6 +598,10 @@ fn run_external_agent_runtime(
             .tee_to(&spec.json_log)
             .with_tee_limit(OUTPUT_TEE_LIMIT_BYTES),
     );
+    let process_spec = match agent_lifecycle {
+        Some(metadata) => process_spec.with_agent_lifecycle(metadata),
+        None => process_spec,
+    };
     let process_spec = match runtime {
         ExternalExecutionRuntime::Verified => {
             let Some(side_effect_profile) = side_effect_profile else {
@@ -1447,6 +1502,8 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
     use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
 
     #[test]
@@ -1503,6 +1560,90 @@ mod tests {
             executable_identity: "identity".to_string(),
         });
         assert!(report.succeeded());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fake_provider_lifecycle_is_listed_in_supervisor_repo_and_gc_after_exit() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let supervisor_repo = temp.path().join("supervisor-repo");
+        let child_repo = temp.path().join("child-worktree");
+        git2::Repository::init(&supervisor_repo)?;
+        git2::Repository::init(&child_repo)?;
+
+        let provider = child_repo.join("fake-provider.sh");
+        fs::write(
+            &provider,
+            "#!/bin/sh\nroot=${0%/*}\nprintf '%s\\n%s\\n' \"$MACO_RUN_ID\" \"$MACO_TASK_ID\" > \"$root/lifecycle-env\"\n: > \"$root/provider-started\"\nwhile [ ! -f \"$root/provider-release\" ]; do sleep 0.01; done\n",
+        )?;
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700))?;
+        let prompt = child_repo.join("prompt.md");
+        fs::write(&prompt, "offline fake provider lifecycle test\n")?;
+        let incoming = child_repo.join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+
+        let command = ExternalAgentCommand::codex(
+            &provider,
+            &child_repo,
+            &prompt,
+            child_repo.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(10),
+        )
+        .with_agent_lifecycle(
+            &supervisor_repo,
+            "child_orchestrator",
+            "supervise-run",
+            "assignment-a",
+        );
+        let registry = AgentRegistry::open(&supervisor_repo)?;
+        let runner =
+            std::thread::spawn(move || run_external_agent_nonpublishable_simulation(&command));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observed = (|| -> Result<Option<_>> {
+            loop {
+                if let Some(record) = registry
+                    .list(&AgentListFilter::default())?
+                    .into_iter()
+                    .next()
+                {
+                    return Ok(Some(record));
+                }
+                if runner.is_finished() || Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })();
+
+        fs::write(child_repo.join("provider-release"), b"")?;
+        let report = runner
+            .join()
+            .map_err(|_| anyhow::anyhow!("fake provider runner thread panicked"))?;
+        let record = observed?
+            .context("fake provider lifecycle registration was not observable before exit")?;
+
+        assert!(
+            report.simulation_succeeded(),
+            "unexpected report: {report:#?}"
+        );
+        assert_eq!(record.role, "child_orchestrator");
+        assert_eq!(record.run_id, "supervise-run");
+        assert_eq!(record.task_id, "assignment-a");
+        assert_eq!(record.repo, supervisor_repo);
+        assert!(record.argv.iter().any(|argument| argument == "exec"));
+        assert_eq!(
+            fs::read_to_string(child_repo.join("lifecycle-env"))?,
+            "supervise-run\nassignment-a\n"
+        );
+        assert!(registry.list(&AgentListFilter::default())?.is_empty());
+        assert!(registry.registry_path().is_file());
+        assert!(!child_repo.join(".maco/agents/registry.json").exists());
+        Ok(())
     }
 
     #[cfg(unix)]
