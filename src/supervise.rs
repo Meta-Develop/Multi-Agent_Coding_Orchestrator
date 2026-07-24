@@ -205,6 +205,17 @@ pub enum AgentRole {
     Auditor,
 }
 
+impl AgentRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supervisor => "supervisor",
+            Self::ChildOrchestrator => "child_orchestrator",
+            Self::Worker => "worker",
+            Self::Auditor => "auditor",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WorkerReport {
     pub id: String,
@@ -2016,7 +2027,12 @@ fn execute_supervisor_assignment_inner(
             Duration::from_secs(plan.child_timeout_seconds),
         );
         command.output_schema = Some(schema_path.clone());
-        command = command.with_hidden_root(repo);
+        command = command.with_hidden_root(repo).with_agent_lifecycle(
+            repo,
+            assignment.role.as_str(),
+            options.run_id.as_str(),
+            &assignment.id,
+        );
 
         record_shared_orchestration_event(
             artifacts,
@@ -2359,7 +2375,13 @@ fn execute_supervisor_assignment_inner(
         auditor_command.output_schema = Some(auditor_schema_path);
         auditor_command = auditor_command
             .with_workspace_access(WorkspaceAccess::ReadOnly)
-            .with_hidden_root(repo);
+            .with_hidden_root(repo)
+            .with_agent_lifecycle(
+                repo,
+                AgentRole::Auditor.as_str(),
+                options.run_id.as_str(),
+                &auditor_id,
+            );
         record_shared_orchestration_event(
             artifacts,
             &auditor_id,
@@ -9522,13 +9544,23 @@ mod tests {
                 .file_name()
                 .and_then(OsStr::to_str)
                 .unwrap_or_default();
+            let lifecycle = command
+                .agent_lifecycle
+                .as_ref()
+                .expect("supervise provider command must carry lifecycle identity");
+            assert_eq!(lifecycle.registry_repo, repo_path);
+            assert_eq!(lifecycle.run_id, "injected-write-lease");
             if output_name.contains("review-auditor") {
+                assert_eq!(lifecycle.role, "auditor");
+                assert_eq!(lifecycle.task_id, parent_auditor_id(&assignment));
                 let child = injected_child_report(&assignment);
                 write_injected_json(
                     &command.output_last_message,
                     &injected_auditor_report(&assignment, &child),
                 );
             } else {
+                assert_eq!(lifecycle.role, "child_orchestrator");
+                assert_eq!(lifecycle.task_id, assignment.id);
                 write_injected_json(
                     &command.output_last_message,
                     &injected_child_report(&assignment),
