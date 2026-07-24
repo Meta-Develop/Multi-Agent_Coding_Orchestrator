@@ -1,6 +1,9 @@
-use crate::safe_state::{
-    stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock,
-    SafeRoot,
+use crate::{
+    artifacts::state_auth::sha256_hex,
+    safe_state::{
+        stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock,
+        SafeRoot,
+    },
 };
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -48,8 +51,20 @@ const MAX_DRAFT_PARENT_BYTES: usize = 4 * 1024;
 const MAX_DRAFT_LEAF_BYTES: usize = 255;
 const MAX_FUTURE_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 const VALID_STATUSES: &[&str] = &["active", "blocked", "ready-for-review", "handoff", "done"];
+#[cfg(target_os = "linux")]
+const CLAIM_FALLBACK_RESIDUE_PREFIX: &str = ".maco-live-old-v1.";
+#[cfg(target_os = "linux")]
+const CLAIM_FALLBACK_RESIDUE_SUFFIX: &str = ".txn";
 
 static CLAIM_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static CLAIM_TEST_EXCHANGE_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+    static CLAIM_TEST_FALLBACK_CRASH: std::cell::Cell<Option<ClaimFallbackCrashPoint>> =
+        const { std::cell::Cell::new(None) };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LiveClaimsStatusReport {
@@ -829,7 +844,7 @@ where
         updated,
         before_first_fence,
     )
-    .map_err(|_| anyhow::anyhow!("claim atomic mutation was refused"))?;
+    .context("claim atomic mutation was refused")?;
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (lock, initial_board, file_name, updated, before_first_fence);
@@ -846,6 +861,39 @@ struct StagedClaimFile {
     name: OsString,
     generation: ClaimFileGeneration,
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimFallbackTransaction {
+    name: OsString,
+    target_checksum: String,
+    old_checksum: String,
+    new_checksum: String,
+    other_board_checksum: String,
+    old_identity: FileIdentity,
+    new_identity: FileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimFallbackCrashPoint {
+    AfterOldDisplacement,
+    AfterNewPublication,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Debug)]
+struct InjectedClaimFallbackCrash(ClaimFallbackCrashPoint);
+
+#[cfg(all(test, target_os = "linux"))]
+impl std::fmt::Display for InjectedClaimFallbackCrash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "injected claim fallback crash at {:?}", self.0)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl std::error::Error for InjectedClaimFallbackCrash {}
 
 #[cfg(target_os = "linux")]
 fn atomic_publish_claim_linux<F>(
@@ -899,7 +947,16 @@ where
         }
     })();
     if let Err(error) = publish_result {
-        cleanup_claim_temp_if_exact(root, &directory, &staged.name, &staged.generation)?;
+        if is_injected_claim_fallback_crash(&error) {
+            return Err(error);
+        }
+        if let Err(cleanup_error) =
+            cleanup_claim_temp_if_exact(root, &directory, &staged.name, &staged.generation)
+        {
+            return Err(error.context(format!(
+                "claim publication cleanup also failed: {cleanup_error:#}"
+            )));
+        }
         return Err(error);
     }
     Ok(())
@@ -940,8 +997,22 @@ fn publish_existing_claim_exchange(
     initial_target: &ClaimFileGeneration,
     staged: &StagedClaimFile,
 ) -> Result<()> {
-    rename_claim_entry(directory, &staged.name, file_name, libc::RENAME_EXCHANGE)
-        .context("claim compare-and-swap exchange failed")?;
+    match rename_claim_entry(directory, &staged.name, file_name, libc::RENAME_EXCHANGE) {
+        Ok(()) => {}
+        Err(error) if rename_exchange_is_unsupported(&error) => {
+            return publish_existing_claim_noreplace_fallback(
+                root,
+                directory,
+                initial_board,
+                file_name,
+                updated,
+                initial_target,
+                staged,
+            )
+            .context("claim no-replace fallback failed after exchange was unsupported");
+        }
+        Err(error) => return Err(error).context("claim compare-and-swap exchange failed"),
+    }
     let validation = (|| -> Result<()> {
         directory
             .sync_all()
@@ -966,6 +1037,396 @@ fn publish_existing_claim_exchange(
     cleanup_claim_temp_if_exact(root, directory, &staged.name, initial_target)?;
     let observed = capture_claim_board_snapshot(root, None)?;
     verify_claim_board_replacement(initial_board, &observed, file_name, updated)
+}
+
+#[cfg(target_os = "linux")]
+fn publish_existing_claim_noreplace_fallback(
+    root: &SafeRoot,
+    directory: &File,
+    initial_board: &ClaimBoardSnapshot,
+    file_name: &OsStr,
+    updated: &[u8],
+    initial_target: &ClaimFileGeneration,
+    staged: &StagedClaimFile,
+) -> Result<()> {
+    let transaction =
+        ClaimFallbackTransaction::new(file_name, initial_board, initial_target, staged)?;
+    rename_claim_entry(
+        directory,
+        file_name,
+        &transaction.name,
+        libc::RENAME_NOREPLACE,
+    )
+    .context("failed to displace old claim generation for no-replace publication")?;
+    directory
+        .sync_all()
+        .context("failed to flush old claim displacement")?;
+    maybe_inject_claim_fallback_crash(ClaimFallbackCrashPoint::AfterOldDisplacement)?;
+
+    let transaction_result = (|| -> Result<()> {
+        let displaced = read_entry_generation(root, &transaction.name, MAX_CLAIM_BYTES)
+            .context("displaced old claim generation is unsafe")?;
+        transaction.verify_old_generation(&displaced)?;
+        let displaced_board = capture_claim_board_snapshot_excluding(
+            root,
+            &[
+                (&transaction.name, &displaced),
+                (&staged.name, &staged.generation),
+            ],
+        )?;
+        verify_other_claim_board_entries(initial_board, &displaced_board, file_name)?;
+        transaction.verify_other_board(&displaced_board, file_name)?;
+        if displaced_board.entries.contains_key(file_name) {
+            bail!("claim target reappeared after old-generation displacement");
+        }
+
+        rename_claim_entry(directory, &staged.name, file_name, libc::RENAME_NOREPLACE)
+            .context("failed to publish staged claim through vacant target")?;
+        directory
+            .sync_all()
+            .context("failed to flush no-replace claim publication")?;
+        maybe_inject_claim_fallback_crash(ClaimFallbackCrashPoint::AfterNewPublication)?;
+
+        let published_board =
+            capture_claim_board_snapshot_excluding(root, &[(&transaction.name, initial_target)])?;
+        verify_claim_board_replacement(initial_board, &published_board, file_name, updated)?;
+        transaction.verify_other_board(&published_board, file_name)?;
+        let published = published_board
+            .entries
+            .get(file_name)
+            .context("fallback-published claim generation disappeared")?;
+        transaction.verify_new_generation(published)?;
+        cleanup_claim_temp_if_exact(root, directory, &transaction.name, initial_target)?;
+        let finalized = capture_claim_board_snapshot(root, None)?;
+        verify_claim_board_replacement(initial_board, &finalized, file_name, updated)
+    })();
+
+    if let Err(error) = transaction_result {
+        if is_injected_claim_fallback_crash(&error) {
+            return Err(error);
+        }
+        if let Err(rollback_error) = rollback_claim_fallback_transaction(
+            root,
+            directory,
+            file_name,
+            initial_target,
+            staged,
+            &transaction,
+        ) {
+            return Err(error.context(format!(
+                "claim no-replace fallback rollback also failed; transaction residue was preserved: {rollback_error:#}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rollback_claim_fallback_transaction(
+    root: &SafeRoot,
+    directory: &File,
+    file_name: &OsStr,
+    initial_target: &ClaimFileGeneration,
+    staged: &StagedClaimFile,
+    transaction: &ClaimFallbackTransaction,
+) -> Result<()> {
+    let residue = read_optional_entry_generation(root, &transaction.name, MAX_CLAIM_BYTES)?;
+    let target = read_optional_entry_generation(root, file_name, MAX_CLAIM_BYTES)?;
+    let staged_generation = read_optional_entry_generation(root, &staged.name, MAX_CLAIM_BYTES)?;
+
+    let residue = residue.context(
+        "fallback rollback cannot prove the displaced old generation; preserving current state",
+    )?;
+    transaction.verify_old_generation(&residue)?;
+    if residue != *initial_target {
+        bail!("fallback rollback old generation changed; preserving current state");
+    }
+
+    match (target, staged_generation) {
+        (None, Some(observed_staged)) if observed_staged == staged.generation => {
+            rename_claim_entry(
+                directory,
+                &transaction.name,
+                file_name,
+                libc::RENAME_NOREPLACE,
+            )
+            .context("failed to restore old claim generation")?;
+            directory
+                .sync_all()
+                .context("failed to flush old claim restoration")?;
+            cleanup_claim_temp_if_exact(
+                root,
+                directory,
+                &staged.name,
+                &staged.generation,
+            )
+        }
+        (None, None) => {
+            rename_claim_entry(
+                directory,
+                &transaction.name,
+                file_name,
+                libc::RENAME_NOREPLACE,
+            )
+            .context("failed to restore old claim generation")?;
+            directory
+                .sync_all()
+                .context("failed to flush old claim restoration")
+        }
+        (Some(observed_target), None) if observed_target == staged.generation => {
+            rename_claim_entry(
+                directory,
+                file_name,
+                &staged.name,
+                libc::RENAME_NOREPLACE,
+            )
+            .context("failed to retract fallback-published claim generation")?;
+            directory
+                .sync_all()
+                .context("failed to flush fallback publication retraction")?;
+            rename_claim_entry(
+                directory,
+                &transaction.name,
+                file_name,
+                libc::RENAME_NOREPLACE,
+            )
+            .context("failed to restore old claim generation after retraction")?;
+            directory
+                .sync_all()
+                .context("failed to flush old claim restoration after retraction")?;
+            cleanup_claim_temp_if_exact(
+                root,
+                directory,
+                &staged.name,
+                &staged.generation,
+            )
+        }
+        _ => bail!(
+            "fallback rollback found an unexpected or ambiguous transaction state; preserving it for inspection"
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ClaimFallbackTransaction {
+    fn new(
+        file_name: &OsStr,
+        initial_board: &ClaimBoardSnapshot,
+        initial_target: &ClaimFileGeneration,
+        staged: &StagedClaimFile,
+    ) -> Result<Self> {
+        let target_checksum = compact_claim_checksum(file_name.as_bytes());
+        let old_checksum = compact_claim_checksum(&initial_target.bytes);
+        let new_checksum = compact_claim_checksum(&staged.generation.bytes);
+        let other_board_checksum = claim_board_other_checksum(initial_board, file_name);
+        let name = OsString::from(format!(
+            "{CLAIM_FALLBACK_RESIDUE_PREFIX}{target_checksum}.{old_checksum}.{new_checksum}.{other_board_checksum}.{:016x}.{:016x}.{:016x}.{:016x}{CLAIM_FALLBACK_RESIDUE_SUFFIX}",
+            initial_target.identity.device,
+            initial_target.identity.file,
+            staged.generation.identity.device,
+            staged.generation.identity.file,
+        ));
+        if name.as_bytes().len() > MAX_DRAFT_LEAF_BYTES {
+            bail!("claim fallback transaction name exceeds the bounded leaf length");
+        }
+        Ok(Self {
+            name,
+            target_checksum,
+            old_checksum,
+            new_checksum,
+            other_board_checksum,
+            old_identity: initial_target.identity.clone(),
+            new_identity: staged.generation.identity.clone(),
+        })
+    }
+
+    fn parse(name: &OsStr) -> Result<Option<Self>> {
+        let Some(text) = name.to_str() else {
+            return Ok(None);
+        };
+        let Some(body) = text
+            .strip_prefix(CLAIM_FALLBACK_RESIDUE_PREFIX)
+            .and_then(|value| value.strip_suffix(CLAIM_FALLBACK_RESIDUE_SUFFIX))
+        else {
+            return Ok(None);
+        };
+        let fields = body.split('.').collect::<Vec<_>>();
+        let [target_checksum, old_checksum, new_checksum, other_board_checksum, old_device, old_file, new_device, new_file] =
+            fields.as_slice()
+        else {
+            bail!("claim fallback transaction residue name is malformed");
+        };
+        for checksum in [
+            target_checksum,
+            old_checksum,
+            new_checksum,
+            other_board_checksum,
+        ] {
+            if !is_compact_claim_checksum(checksum) {
+                bail!("claim fallback transaction checksum is malformed");
+            }
+        }
+        Ok(Some(Self {
+            name: name.to_os_string(),
+            target_checksum: (*target_checksum).to_string(),
+            old_checksum: (*old_checksum).to_string(),
+            new_checksum: (*new_checksum).to_string(),
+            other_board_checksum: (*other_board_checksum).to_string(),
+            old_identity: FileIdentity {
+                device: parse_fixed_lower_hex_u64(old_device)?,
+                file: parse_fixed_lower_hex_u64(old_file)?,
+            },
+            new_identity: FileIdentity {
+                device: parse_fixed_lower_hex_u64(new_device)?,
+                file: parse_fixed_lower_hex_u64(new_file)?,
+            },
+        }))
+    }
+
+    fn verify_old_generation(&self, generation: &ClaimFileGeneration) -> Result<()> {
+        if generation.identity != self.old_identity
+            || compact_claim_checksum(&generation.bytes) != self.old_checksum
+        {
+            bail!("claim fallback old-generation residue was changed or rebound");
+        }
+        Ok(())
+    }
+
+    fn verify_new_generation(&self, generation: &ClaimFileGeneration) -> Result<()> {
+        if generation.identity != self.new_identity
+            || compact_claim_checksum(&generation.bytes) != self.new_checksum
+        {
+            bail!("claim fallback new generation was changed or rebound");
+        }
+        Ok(())
+    }
+
+    fn verify_other_board(&self, board: &ClaimBoardSnapshot, target: &OsStr) -> Result<()> {
+        if claim_board_other_checksum(board, target) != self.other_board_checksum {
+            bail!("another claim board entry changed during no-replace transaction");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compact_claim_checksum(bytes: &[u8]) -> String {
+    sha256_hex(bytes).chars().take(32).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn is_compact_claim_checksum(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_fixed_lower_hex_u64(value: &str) -> Result<u64> {
+    if !is_fixed_lower_hex(value) {
+        bail!("claim fallback transaction identity is malformed");
+    }
+    u64::from_str_radix(value, 16).context("claim fallback transaction identity is invalid")
+}
+
+#[cfg(target_os = "linux")]
+fn claim_board_other_checksum(snapshot: &ClaimBoardSnapshot, target: &OsStr) -> String {
+    let mut encoded = Vec::new();
+    for (name, generation) in &snapshot.entries {
+        if name == target {
+            continue;
+        }
+        encoded.extend_from_slice(name.as_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(format!("{:016x}", generation.identity.device).as_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(format!("{:016x}", generation.identity.file).as_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(compact_claim_checksum(&generation.bytes).as_bytes());
+        encoded.push(0xff);
+    }
+    compact_claim_checksum(&encoded)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_other_claim_board_entries(
+    before: &ClaimBoardSnapshot,
+    after: &ClaimBoardSnapshot,
+    target: &OsStr,
+) -> Result<()> {
+    let before_other = before
+        .entries
+        .iter()
+        .filter(|(name, _)| name.as_os_str() != target)
+        .collect::<Vec<_>>();
+    let after_other = after
+        .entries
+        .iter()
+        .filter(|(name, _)| name.as_os_str() != target)
+        .collect::<Vec<_>>();
+    if before_other != after_other {
+        bail!("another claim board entry changed during no-replace transaction");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_optional_entry_generation(
+    root: &SafeRoot,
+    file_name: &OsStr,
+    max_bytes: u64,
+) -> Result<Option<ClaimFileGeneration>> {
+    if !root.direct_child_exists(file_name)? {
+        return Ok(None);
+    }
+    read_entry_generation(root, file_name, max_bytes).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_exchange_is_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|code| {
+                code == libc::EINVAL || code == libc::EOPNOTSUPP || code == libc::ENOTSUP
+            })
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn maybe_inject_claim_fallback_crash(point: ClaimFallbackCrashPoint) -> Result<()> {
+    let injected = CLAIM_TEST_FALLBACK_CRASH.with(|value| {
+        if value.get() == Some(point) {
+            value.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        return Err(anyhow::Error::new(InjectedClaimFallbackCrash(point)));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn maybe_inject_claim_fallback_crash(_point: ClaimFallbackCrashPoint) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn is_injected_claim_fallback_crash(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<InjectedClaimFallbackCrash>().is_some())
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn is_injected_claim_fallback_crash(_error: &anyhow::Error) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -1112,6 +1573,13 @@ fn cleanup_claim_temp_if_exact(
 
 #[cfg(target_os = "linux")]
 fn rename_claim_entry(directory: &File, source: &OsStr, target: &OsStr, flags: u32) -> Result<()> {
+    #[cfg(test)]
+    if flags == libc::RENAME_EXCHANGE {
+        if let Some(errno) = CLAIM_TEST_EXCHANGE_ERRNO.with(std::cell::Cell::get) {
+            return Err(std::io::Error::from_raw_os_error(errno))
+                .context("claim renameat2 CAS was refused");
+        }
+    }
     let source = claim_c_string(source)?;
     let target = claim_c_string(target)?;
     if unsafe {
@@ -1176,6 +1644,8 @@ fn acquire_claim_board_lock(root: &SafeRoot) -> Result<KernelStateLock> {
 fn prepare_claim_board(root: &SafeRoot, lock: &KernelStateLock) -> Result<()> {
     lock.verify_direct_binding(root)
         .map_err(|_| anyhow::anyhow!("claim board lock binding changed"))?;
+    #[cfg(target_os = "linux")]
+    recover_claim_fallback_transactions(root, lock)?;
     scavenge_claim_board_residue(root)?;
     lock.verify_direct_binding(root)
         .map_err(|_| anyhow::anyhow!("claim board lock binding changed"))?;
@@ -1278,6 +1748,53 @@ fn capture_claim_board_snapshot(
     Ok(ClaimBoardSnapshot { entries })
 }
 
+#[cfg(target_os = "linux")]
+fn capture_claim_board_snapshot_excluding(
+    root: &SafeRoot,
+    permitted_artifacts: &[(&OsStr, &ClaimFileGeneration)],
+) -> Result<ClaimBoardSnapshot> {
+    let names = raw_claim_entry_names(
+        root,
+        MAX_CLAIM_ENTRIES.saturating_add(permitted_artifacts.len()),
+    )?;
+    let mut observed_artifacts = BTreeSet::new();
+    let mut entries = BTreeMap::new();
+    for file_name in names {
+        if let Some((_, expected)) = permitted_artifacts
+            .iter()
+            .find(|(name, _)| *name == file_name.as_os_str())
+        {
+            if !observed_artifacts.insert(file_name.clone()) {
+                bail!("claim transaction artifact name is duplicated");
+            }
+            let observed = read_entry_generation(root, &file_name, MAX_CLAIM_BYTES)
+                .context("claim transaction artifact is unsafe")?;
+            if &observed != *expected {
+                bail!("claim transaction artifact changed during bounded inspection");
+            }
+            continue;
+        }
+        let max_bytes = if file_name == OsStr::new(BOARD_LOCK_FILE) {
+            0
+        } else {
+            MAX_CLAIM_BYTES
+        };
+        if file_name != OsStr::new(TEMPLATE_FILE) && file_name != OsStr::new(BOARD_LOCK_FILE) {
+            let text = file_name
+                .to_str()
+                .context("claim board contains a non-UTF-8 entry name")?;
+            validate_claim_file_name(text)?;
+        }
+        let generation = read_entry_generation(root, &file_name, max_bytes)
+            .context("claim board entry is not a bounded regular file")?;
+        entries.insert(file_name, generation);
+    }
+    if observed_artifacts.len() != permitted_artifacts.len() {
+        bail!("claim transaction artifact is missing or ambiguous");
+    }
+    Ok(ClaimBoardSnapshot { entries })
+}
+
 fn bounded_claim_entry_names_with_writer(
     root: &SafeRoot,
     permitted_writer_target: Option<&OsStr>,
@@ -1325,6 +1842,143 @@ fn raw_claim_entry_names(root: &SafeRoot, max_entries: usize) -> Result<Vec<OsSt
         .map_err(|_| anyhow::anyhow!("claim board directory binding changed"))?;
     names.sort();
     Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn recover_claim_fallback_transactions(root: &SafeRoot, lock: &KernelStateLock) -> Result<()> {
+    let names = raw_claim_entry_names(
+        root,
+        MAX_CLAIM_ENTRIES.saturating_add(MAX_CLAIM_RESIDUE_ENTRIES),
+    )?;
+    let mut transactions = Vec::new();
+    for name in &names {
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        if !text.starts_with(CLAIM_FALLBACK_RESIDUE_PREFIX) {
+            continue;
+        }
+        let transaction = ClaimFallbackTransaction::parse(name)?
+            .context("claim fallback transaction residue is malformed")?;
+        transactions.push(transaction);
+    }
+    if transactions.is_empty() {
+        return Ok(());
+    }
+    if transactions.len() != 1 {
+        bail!(
+            "claim board contains duplicate or ambiguous fallback transaction residue; manual inspection is required"
+        );
+    }
+    let transaction = transactions
+        .pop()
+        .context("claim fallback transaction residue disappeared from recovery inventory")?;
+    lock.verify_direct_binding(root)
+        .map_err(|_| anyhow::anyhow!("claim board lock binding changed during recovery"))?;
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board root binding changed during recovery"))?;
+    let directory = open_claim_board_directory(root)?;
+    let old_generation = read_entry_generation(root, &transaction.name, MAX_CLAIM_BYTES)
+        .context("claim fallback transaction residue is unsafe")?;
+    transaction.verify_old_generation(&old_generation)?;
+    let old_content = std::str::from_utf8(&old_generation.bytes)
+        .context("claim fallback old generation is not valid UTF-8")?;
+    let preliminary = parse_claim_file(
+        PathBuf::from(CLAIMS_DIR).join("fallback-recovery.md"),
+        old_content,
+    );
+    let claim_id = preliminary
+        .claim_id
+        .as_deref()
+        .context("claim fallback old generation has no claim id")?;
+    validate_claim_id(claim_id, "claim fallback old-generation id")?;
+    let target = OsString::from(format!("{claim_id}.md"));
+    if compact_claim_checksum(target.as_bytes()) != transaction.target_checksum {
+        bail!("claim fallback transaction target binding does not match its old generation");
+    }
+    let old_claim = parse_claim_file(PathBuf::from(CLAIMS_DIR).join(&target), old_content);
+    ensure_claim_valid(&old_claim).context("claim fallback old generation is not a valid claim")?;
+
+    let mut staged = None;
+    for name in &names {
+        if is_canonical_claim_temp_for(name, &target) {
+            if staged.is_some() {
+                bail!(
+                    "claim fallback transaction has duplicate staged generations; preserving it for inspection"
+                );
+            }
+            let generation = read_entry_generation(root, name, MAX_CLAIM_BYTES)
+                .context("claim fallback staged generation is unsafe")?;
+            transaction.verify_new_generation(&generation)?;
+            staged = Some((name.clone(), generation));
+        }
+    }
+    let mut permitted = vec![(transaction.name.as_os_str(), &old_generation)];
+    if let Some((name, generation)) = &staged {
+        permitted.push((name.as_os_str(), generation));
+    }
+    let board = capture_claim_board_snapshot_excluding(root, &permitted)?;
+    transaction.verify_other_board(&board, &target)?;
+    let target_generation = board.entries.get(&target).cloned();
+    lock.verify_direct_binding(root)
+        .map_err(|_| anyhow::anyhow!("claim board lock binding changed during recovery"))?;
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board root binding changed during recovery"))?;
+
+    match (target_generation, staged) {
+        (None, staged) => {
+            rename_claim_entry(
+                &directory,
+                &transaction.name,
+                &target,
+                libc::RENAME_NOREPLACE,
+            )
+            .context("failed to recover displaced old claim generation")?;
+            directory
+                .sync_all()
+                .context("failed to flush recovered old claim generation")?;
+            let restored = read_entry_generation(root, &target, MAX_CLAIM_BYTES)
+                .context("recovered old claim generation is unsafe")?;
+            if restored != old_generation {
+                bail!("recovered old claim generation changed unexpectedly");
+            }
+            if let Some((staged_name, staged_generation)) = staged {
+                cleanup_claim_temp_if_exact(
+                    root,
+                    &directory,
+                    &staged_name,
+                    &staged_generation,
+                )?;
+            }
+        }
+        (Some(published), None) => {
+            transaction.verify_new_generation(&published)?;
+            let rebound = read_entry_generation(root, &target, MAX_CLAIM_BYTES)
+                .context("fallback-published claim changed before recovery finalization")?;
+            if rebound != published {
+                bail!(
+                    "fallback-published claim changed before recovery finalization; preserving residue"
+                );
+            }
+            cleanup_claim_temp_if_exact(
+                root,
+                &directory,
+                &transaction.name,
+                &old_generation,
+            )?;
+            let finalized = read_entry_generation(root, &target, MAX_CLAIM_BYTES)
+                .context("fallback-published claim changed after recovery finalization")?;
+            transaction.verify_new_generation(&finalized)?;
+        }
+        _ => bail!(
+            "claim fallback transaction state is unexpected or ambiguous; preserving it for manual inspection"
+        ),
+    }
+    lock.verify_direct_binding(root)
+        .map_err(|_| anyhow::anyhow!("claim board lock binding changed after recovery"))?;
+    root.verify()
+        .map_err(|_| anyhow::anyhow!("claim board root binding changed after recovery"))?;
+    Ok(())
 }
 
 fn scavenge_claim_board_residue(root: &SafeRoot) -> Result<()> {
@@ -2390,6 +3044,50 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[cfg(target_os = "linux")]
+    struct ClaimAtomicTestFaultGuard {
+        previous_errno: Option<i32>,
+        previous_crash: Option<ClaimFallbackCrashPoint>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ClaimAtomicTestFaultGuard {
+        fn install(
+            errno: Option<i32>,
+            crash: Option<ClaimFallbackCrashPoint>,
+        ) -> ClaimAtomicTestFaultGuard {
+            let previous_errno = CLAIM_TEST_EXCHANGE_ERRNO.with(|value| value.replace(errno));
+            let previous_crash = CLAIM_TEST_FALLBACK_CRASH.with(|value| value.replace(crash));
+            ClaimAtomicTestFaultGuard {
+                previous_errno,
+                previous_crash,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ClaimAtomicTestFaultGuard {
+        fn drop(&mut self) {
+            CLAIM_TEST_EXCHANGE_ERRNO.with(|value| value.set(self.previous_errno));
+            CLAIM_TEST_FALLBACK_CRASH.with(|value| value.set(self.previous_crash));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fallback_residue_paths(directory: &Path) -> Result<Vec<PathBuf>> {
+        let mut paths = std::fs::read_dir(directory)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(CLAIM_FALLBACK_RESIDUE_PREFIX))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        Ok(paths)
+    }
+
     fn claim_text(
         claim_id: &str,
         owner: &str,
@@ -2674,6 +3372,321 @@ mod tests {
             assert!(error.to_string().contains("atomic mutation was refused"));
             assert_eq!(std::fs::read_to_string(&path)?, replacement);
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_exchange_uses_noreplace_fallback_for_every_existing_claim_mutator() -> Result<()>
+    {
+        for (claim_id, actor, mutation, now, expected_status, expected_audit) in [
+            (
+                "fallback-heartbeat",
+                "fallback-heartbeat",
+                ClaimMutation::Heartbeat,
+                "2026-05-20T00:30:00Z",
+                "active",
+                " heartbeat",
+            ),
+            (
+                "fallback-release",
+                "fallback-release",
+                ClaimMutation::OwnerRelease {
+                    status: "done",
+                    reason: "bounded fallback release",
+                },
+                "2026-05-20T00:30:00Z",
+                "done",
+                "released claim as `done`",
+            ),
+            (
+                "fallback-override",
+                "project-owner",
+                ClaimMutation::OverrideRelease {
+                    reason: "bounded stale fallback override",
+                },
+                "2026-05-20T02:00:00Z",
+                "handoff",
+                "override-release",
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let path = write_claim(
+                temp.path(),
+                claim_id,
+                claim_id,
+                "active",
+                "2026-05-20T00:00:00Z",
+            )?;
+            let report = {
+                let _fault = ClaimAtomicTestFaultGuard::install(Some(libc::EINVAL), None);
+                mutate_claim(
+                    temp.path(),
+                    claim_id,
+                    actor,
+                    &LiveClock::parse(now)?,
+                    mutation,
+                    |_| Ok(()),
+                )?
+            };
+            assert_eq!(report.status.as_deref(), Some(expected_status));
+            assert!(report.audit_entry.contains(expected_audit));
+            assert!(std::fs::read_to_string(path)?.contains(expected_audit));
+            assert!(fallback_residue_paths(&claims_dir(temp.path()))?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_capability_exchange_error_preserves_cause_and_never_falls_back() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = write_claim(
+            temp.path(),
+            "exchange-eio",
+            "exchange-eio",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let original = std::fs::read(&path)?;
+        let error = {
+            let _fault = ClaimAtomicTestFaultGuard::install(Some(libc::EIO), None);
+            heartbeat_with_clock(
+                temp.path(),
+                "exchange-eio",
+                "exchange-eio",
+                &LiveClock::parse("2026-05-20T00:30:00Z")?,
+            )
+            .expect_err("non-capability exchange errors must not enter the fallback")
+        };
+        let chain = format!("{error:#}");
+        assert!(chain.contains("claim compare-and-swap exchange failed"));
+        assert!(chain.contains("Input/output error"), "{chain}");
+        assert_eq!(std::fs::read(&path)?, original);
+        assert!(fallback_residue_paths(&claims_dir(temp.path()))?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn noreplace_fallback_rejects_target_and_other_board_generation_races() -> Result<()> {
+        let target_race = tempfile::tempdir()?;
+        let target_path = write_claim(
+            target_race.path(),
+            "fallback-target-race",
+            "fallback-target-race",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let root =
+            open_claims_root(&claims_dir(target_race.path()))?.context("target race root")?;
+        let lock = acquire_claim_board_lock(&root)?;
+        prepare_claim_board(&root, &lock)?;
+        let (_, initial_board) = load_stable_claim_board(&root, &lock)?;
+        let target_name = OsStr::new("fallback-target-race.md");
+        let initial_target = initial_board
+            .entries
+            .get(target_name)
+            .context("target race initial generation")?
+            .clone();
+        let directory = open_claim_board_directory(&root)?;
+        let staged = stage_claim_file(&directory, target_name, b"bounded replacement")?;
+        std::fs::remove_file(&target_path)?;
+        std::fs::write(&target_path, b"racing direct replacement")?;
+        let target_error = publish_existing_claim_noreplace_fallback(
+            &root,
+            &directory,
+            &initial_board,
+            target_name,
+            &staged.generation.bytes,
+            &initial_target,
+            &staged,
+        )
+        .expect_err("fallback target CAS race must fail closed");
+        assert!(format!("{target_error:#}").contains("old-generation residue was changed"));
+        assert!(!target_path.exists());
+        assert_eq!(
+            fallback_residue_paths(&claims_dir(target_race.path()))?.len(),
+            1
+        );
+
+        let board_race = tempfile::tempdir()?;
+        let first_path = write_claim(
+            board_race.path(),
+            "fallback-board-first",
+            "fallback-board-first",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let second_path = write_claim(
+            board_race.path(),
+            "fallback-board-second",
+            "fallback-board-second",
+            "done",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let original_first = std::fs::read(&first_path)?;
+        let root = open_claims_root(&claims_dir(board_race.path()))?.context("board race root")?;
+        let lock = acquire_claim_board_lock(&root)?;
+        prepare_claim_board(&root, &lock)?;
+        let (_, initial_board) = load_stable_claim_board(&root, &lock)?;
+        let target_name = OsStr::new("fallback-board-first.md");
+        let initial_target = initial_board
+            .entries
+            .get(target_name)
+            .context("board race initial generation")?
+            .clone();
+        let directory = open_claim_board_directory(&root)?;
+        let staged = stage_claim_file(&directory, target_name, b"bounded replacement")?;
+        std::fs::write(
+            &second_path,
+            claim_text(
+                "fallback-board-second",
+                "fallback-board-second",
+                "done",
+                "2026-05-20T00:01:00Z",
+                "src/changed.rs",
+            ),
+        )?;
+        let board_error = publish_existing_claim_noreplace_fallback(
+            &root,
+            &directory,
+            &initial_board,
+            target_name,
+            &staged.generation.bytes,
+            &initial_target,
+            &staged,
+        )
+        .expect_err("fallback whole-board CAS race must fail closed");
+        assert!(format!("{board_error:#}").contains("another claim board entry changed"));
+        assert_eq!(std::fs::read(&first_path)?, original_first);
+        assert!(fallback_residue_paths(&claims_dir(board_race.path()))?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn noreplace_fallback_recovers_crashes_before_and_after_new_publication() -> Result<()> {
+        for (claim_id, crash, expected_heartbeats) in [
+            (
+                "fallback-crash-old",
+                ClaimFallbackCrashPoint::AfterOldDisplacement,
+                0,
+            ),
+            (
+                "fallback-crash-new",
+                ClaimFallbackCrashPoint::AfterNewPublication,
+                1,
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let path = write_claim(
+                temp.path(),
+                claim_id,
+                claim_id,
+                "active",
+                "2026-05-20T00:00:00Z",
+            )?;
+            let error = {
+                let _fault = ClaimAtomicTestFaultGuard::install(Some(libc::EINVAL), Some(crash));
+                heartbeat_with_clock(
+                    temp.path(),
+                    claim_id,
+                    claim_id,
+                    &LiveClock::parse("2026-05-20T00:30:00Z")?,
+                )
+                .expect_err("injected fallback crash must interrupt publication")
+            };
+            assert!(format!("{error:#}").contains("injected claim fallback crash"));
+            assert_eq!(fallback_residue_paths(&claims_dir(temp.path()))?.len(), 1);
+            assert_eq!(
+                status(temp.path(), &LiveClock::parse("2026-05-20T00:31:00Z")?)?.claim_count,
+                1
+            );
+            let recovered = std::fs::read_to_string(&path)?;
+            assert_eq!(recovered.matches(" heartbeat").count(), expected_heartbeats);
+            assert!(fallback_residue_paths(&claims_dir(temp.path()))?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_recovery_preserves_tampered_duplicate_and_unsafe_residue() -> Result<()> {
+        fn leave_old_displacement(repo: &Path, claim_id: &str) -> Result<PathBuf> {
+            write_claim(repo, claim_id, claim_id, "active", "2026-05-20T00:00:00Z")?;
+            {
+                let _fault = ClaimAtomicTestFaultGuard::install(
+                    Some(libc::EINVAL),
+                    Some(ClaimFallbackCrashPoint::AfterOldDisplacement),
+                );
+                heartbeat_with_clock(
+                    repo,
+                    claim_id,
+                    claim_id,
+                    &LiveClock::parse("2026-05-20T00:30:00Z")?,
+                )
+                .expect_err("old displacement crash must leave transaction residue");
+            }
+            fallback_residue_paths(&claims_dir(repo))?
+                .pop()
+                .context("missing fallback residue")
+        }
+
+        let tampered = tempfile::tempdir()?;
+        let tampered_residue = leave_old_displacement(tampered.path(), "tampered-residue")?;
+        std::fs::write(&tampered_residue, b"tampered old generation")?;
+        let tampered_error = status(tampered.path(), &LiveClock::parse("2026-05-20T00:31:00Z")?)
+            .expect_err("tampered fallback residue must fail closed");
+        assert!(format!("{tampered_error:#}").contains("old-generation residue was changed"));
+        assert!(tampered_residue.exists());
+
+        let duplicate = tempfile::tempdir()?;
+        let first_residue = leave_old_displacement(duplicate.path(), "duplicate-residue")?;
+        let directory = claims_dir(duplicate.path());
+        let first_name = first_residue.file_name().context("fallback residue name")?;
+        let transaction =
+            ClaimFallbackTransaction::parse(first_name)?.context("parse fallback transaction")?;
+        let duplicate_path = directory.join("duplicate-old-copy");
+        std::fs::copy(&first_residue, &duplicate_path)?;
+        let copied = read_entry_generation(
+            &open_claims_root(&directory)?.context("duplicate residue root")?,
+            OsStr::new("duplicate-old-copy"),
+            MAX_CLAIM_BYTES,
+        )?;
+        let duplicate_name = OsString::from(format!(
+            "{CLAIM_FALLBACK_RESIDUE_PREFIX}{}.{}.{}.{}.{:016x}.{:016x}.{:016x}.{:016x}{CLAIM_FALLBACK_RESIDUE_SUFFIX}",
+            transaction.target_checksum,
+            transaction.old_checksum,
+            transaction.new_checksum,
+            transaction.other_board_checksum,
+            copied.identity.device,
+            copied.identity.file,
+            transaction.new_identity.device,
+            transaction.new_identity.file,
+        ));
+        std::fs::rename(&duplicate_path, directory.join(&duplicate_name))?;
+        let duplicate_error = status(duplicate.path(), &LiveClock::parse("2026-05-20T00:31:00Z")?)
+            .expect_err("duplicate fallback residue must fail closed");
+        assert!(format!("{duplicate_error:#}").contains("duplicate or ambiguous"));
+        assert!(first_residue.exists());
+        assert!(directory.join(duplicate_name).exists());
+
+        let unsafe_residue = tempfile::tempdir()?;
+        let residue = leave_old_displacement(unsafe_residue.path(), "unsafe-residue")?;
+        let external = unsafe_residue.path().join("external-old-generation");
+        std::fs::write(&external, b"unsafe replacement")?;
+        std::fs::remove_file(&residue)?;
+        std::os::unix::fs::symlink(&external, &residue)?;
+        let unsafe_error = status(
+            unsafe_residue.path(),
+            &LiveClock::parse("2026-05-20T00:31:00Z")?,
+        )
+        .expect_err("unsafe fallback residue must fail closed");
+        assert!(format!("{unsafe_error:#}").contains("transaction residue is unsafe"));
+        assert!(std::fs::symlink_metadata(&residue)?
+            .file_type()
+            .is_symlink());
         Ok(())
     }
 
