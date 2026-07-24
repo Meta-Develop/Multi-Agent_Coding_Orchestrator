@@ -51,7 +51,7 @@ impl AgentLaunchMetadata {
         Ok(metadata)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         validate_text_field("agent role", &self.role, MAX_ROLE_BYTES)?;
         validate_text_field("run id", &self.run_id, MAX_IDENTIFIER_BYTES)?;
         validate_text_field("task id", &self.task_id, MAX_IDENTIFIER_BYTES)?;
@@ -59,6 +59,22 @@ impl AgentLaunchMetadata {
             bail!("agent lifecycle repository path must be absolute");
         }
         Ok(())
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn repo(&self) -> &Path {
+        &self.repo
     }
 }
 

@@ -17,8 +17,11 @@ use std::{
 };
 use thiserror::Error;
 
-use crate::pinned_exec::{
-    self, PinnedDirectExecutable, HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME,
+use crate::{
+    agent_lifecycle::{AgentLaunchMetadata, AgentRegistry, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV},
+    pinned_exec::{
+        self, PinnedDirectExecutable, HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME,
+    },
 };
 
 const PIPE_READ_CHUNK_SIZE: usize = 8 * 1024;
@@ -148,6 +151,8 @@ shift
 environment_fifo=$1
 shift
 start_fifo=$1
+shift
+target_pid_file=$1
 shift
 owner_fifo=$1
 shift
@@ -307,6 +312,7 @@ target_launcher() {
 exec 4<&0 || exit 125
 target_launcher "$environment_file" "$ready" "$start_fifo" "$@" <&4 &
 target=$!
+printf '%s\n' "$target" > "$target_pid_file" || fail_guardian "could not publish target PID"
 exec 4<&-
 while child_running "$target"; do
     "$sleep_program" 0.01 || exit 125
@@ -391,6 +397,28 @@ impl ProcessCommand {
                         .map(|argument| argument.to_string_lossy().into_owned()),
                 );
                 parts.join(" ")
+            }
+        }
+    }
+
+    fn lifecycle_argv(&self) -> Vec<String> {
+        match self {
+            Self::Shell { shell, command } => match shell {
+                Shell::UnixSh => {
+                    vec!["sh".to_string(), "-c".to_string(), command.clone()]
+                }
+                Shell::WindowsCmd => {
+                    vec!["cmd".to_string(), "/C".to_string(), command.clone()]
+                }
+            },
+            Self::Direct { program, args } => {
+                let mut argv = Vec::with_capacity(args.len().saturating_add(1));
+                argv.push(program.to_string_lossy().into_owned());
+                argv.extend(
+                    args.iter()
+                        .map(|argument| argument.to_string_lossy().into_owned()),
+                );
+                argv
             }
         }
     }
@@ -836,6 +864,9 @@ pub struct ProcessSpec {
     pub command: ProcessCommand,
     pub current_dir: PathBuf,
     pub environment: EnvironmentMode,
+    /// Explicit MACO lifecycle identity for a provider-backed agent process. When present, the
+    /// shared runner stamps its run/task environment and registers the exact launched PID.
+    pub agent_lifecycle: Option<AgentLaunchMetadata>,
     /// Required by default. Use [`ProcessSpec::with_containment`] to make a trusted compatibility
     /// decision explicit at the call site.
     pub containment: ContainmentPolicy,
@@ -920,6 +951,7 @@ impl ProcessSpec {
             },
             current_dir: current_dir.clone(),
             environment: EnvironmentMode::Inherit,
+            agent_lifecycle: None,
             containment: ContainmentPolicy::Required,
             side_effects: SideEffectConfinementProfile::StrictOfflineWorkspace(
                 StrictOfflineWorkspaceProfile::read_write(current_dir),
@@ -953,6 +985,7 @@ impl ProcessSpec {
             },
             current_dir: current_dir.clone(),
             environment: EnvironmentMode::Inherit,
+            agent_lifecycle: None,
             containment: ContainmentPolicy::Required,
             side_effects: SideEffectConfinementProfile::StrictOfflineWorkspace(
                 StrictOfflineWorkspaceProfile::read_write(current_dir),
@@ -972,6 +1005,16 @@ impl ProcessSpec {
 
     pub fn with_environment(mut self, environment: EnvironmentMode) -> Self {
         self.environment = environment;
+        self
+    }
+
+    /// Marks this spec as a MACO-managed agent launch.
+    ///
+    /// Environment stamping is applied both here for inspectable built-spec evidence and again at
+    /// [`run_process`] entry so later builder calls cannot accidentally discard the identifiers.
+    pub fn with_agent_lifecycle(mut self, metadata: AgentLaunchMetadata) -> Self {
+        stamp_agent_lifecycle_environment(&mut self.environment, &metadata);
+        self.agent_lifecycle = Some(metadata);
         self
     }
 
@@ -1262,10 +1305,13 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
 }
 
 pub fn run_process_cancellable(
-    spec: ProcessSpec,
+    mut spec: ProcessSpec,
     cancellation: &ProcessCancellation,
 ) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
+    if let Some(metadata) = &spec.agent_lifecycle {
+        stamp_agent_lifecycle_environment(&mut spec.environment, metadata);
+    }
     let command_display = spec.command_display();
     validate_process_spec_bounds(&spec).map_err(|source| ProcessRunError::Spawn {
         label: spec.label.clone(),
@@ -1467,6 +1513,66 @@ pub fn run_process_cancellable(
             &command_display,
             "containment start gate",
         ));
+    }
+    if let Some(metadata) = &spec.agent_lifecycle {
+        let pid = match attached_process_tree.agent_lifecycle_pid(
+            &mut child,
+            operation_deadline,
+            cancellation,
+        ) {
+            Ok(pid) => pid,
+            Err(source) => {
+                let cleanup = attached_process_tree.cleanup(
+                    &mut child,
+                    &spec.label,
+                    "agent lifecycle PID capture rollback",
+                );
+                let cleanup_error = append_error(
+                    cleanup.error,
+                    wait_for_child_cleanup(
+                        &mut child,
+                        &spec.label,
+                        "agent lifecycle PID capture rollback",
+                    ),
+                );
+                let source = append_error(Some(source.to_string()), cleanup_error)
+                    .map(std::io::Error::other)
+                    .unwrap_or(source);
+                return Err(ProcessRunError::ProcessOwnership {
+                    label: spec.label.clone(),
+                    command: command_display,
+                    source,
+                });
+            }
+        };
+        let registration = AgentRegistry::open(metadata.repo())
+            .and_then(|registry| registry.register(metadata, pid, spec.command.lifecycle_argv()));
+        if let Err(error) = registration {
+            let cleanup = attached_process_tree.cleanup(
+                &mut child,
+                &spec.label,
+                "agent lifecycle registration rollback",
+            );
+            let cleanup_error = append_error(
+                cleanup.error,
+                wait_for_child_cleanup(
+                    &mut child,
+                    &spec.label,
+                    "agent lifecycle registration rollback",
+                ),
+            );
+            let source = append_error(
+                Some(format!("failed to register launched agent: {error:#}")),
+                cleanup_error,
+            )
+            .map(std::io::Error::other)
+            .unwrap_or_else(|| std::io::Error::other("failed to register launched agent"));
+            return Err(ProcessRunError::ProcessOwnership {
+                label: spec.label.clone(),
+                command: command_display,
+                source,
+            });
+        }
     }
     let mut process_tree = match attached_process_tree.release(
         &mut child,
@@ -1754,6 +1860,11 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
             std::io::ErrorKind::InvalidInput,
             "process label is empty or exceeds its safety bound",
         ));
+    }
+    if let Some(metadata) = &spec.agent_lifecycle {
+        metadata
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     }
     let mut argument_count = 0usize;
     let mut argument_bytes = 0usize;
@@ -3343,6 +3454,21 @@ fn fail_closed_stuck_owner(label: &str) -> ! {
     std::process::abort()
 }
 
+fn stamp_agent_lifecycle_environment(
+    environment: &mut EnvironmentMode,
+    metadata: &AgentLaunchMetadata,
+) {
+    if matches!(environment, EnvironmentMode::Inherit) {
+        *environment = EnvironmentMode::InheritAndSet(BTreeMap::new());
+    }
+    let values = match environment {
+        EnvironmentMode::InheritAndSet(values) | EnvironmentMode::ClearAndSet(values) => values,
+        EnvironmentMode::Inherit => return,
+    };
+    values.insert(MACO_RUN_ID_ENV.to_string(), metadata.run_id().to_string());
+    values.insert(MACO_TASK_ID_ENV.to_string(), metadata.task_id().to_string());
+}
+
 fn configure_environment(command: &mut Command, environment: &EnvironmentMode) {
     match environment {
         EnvironmentMode::Inherit => {}
@@ -3655,6 +3781,32 @@ struct AttachedProcessTree {
 }
 
 impl AttachedProcessTree {
+    fn agent_lifecycle_pid(
+        &mut self,
+        child: &mut Child,
+        operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
+    ) -> std::io::Result<u32> {
+        if cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "agent lifecycle PID capture was cancelled",
+            ));
+        }
+        match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            ProcessTreeBackend::Systemd(unit) => {
+                unit.target_pid(child, operation_deadline, cancellation)
+            }
+            #[cfg(unix)]
+            ProcessTreeBackend::UnixProcessGroup => Ok(child.id()),
+            #[cfg(target_os = "windows")]
+            ProcessTreeBackend::WindowsJob(_) => Ok(child.id()),
+            #[cfg(not(any(unix, target_os = "windows")))]
+            ProcessTreeBackend::DirectChild => Ok(child.id()),
+        }
+    }
+
     fn cleanup(&mut self, child: &mut Child, label: &str, context: &str) -> TreeCleanup {
         cleanup_process_tree_backend(
             &mut self.backend,
@@ -5476,6 +5628,7 @@ struct SystemdUnit {
     waiting_path: PathBuf,
     environment_fifo_path: PathBuf,
     start_fifo_path: PathBuf,
+    target_pid_path: PathBuf,
     owner_fifo_path: PathBuf,
     fifo_waiting_path: PathBuf,
     sandbox_report_path: PathBuf,
@@ -5738,6 +5891,7 @@ impl SystemdUnit {
         let waiting_path = runtime_dir.join("guardian-waiting");
         let environment_fifo_path = runtime_dir.join("environment-gate");
         let start_fifo_path = runtime_dir.join("start-gate");
+        let target_pid_path = runtime_dir.join("target-pid");
         let owner_fifo_path = runtime_dir.join("owner-liveness");
         let fifo_waiting_path = runtime_dir.join("fifo-waiting");
         let sandbox_report_path = runtime_dir.join("sandbox-mount-report");
@@ -5759,6 +5913,7 @@ impl SystemdUnit {
             waiting_path,
             environment_fifo_path,
             start_fifo_path,
+            target_pid_path,
             owner_fifo_path,
             fifo_waiting_path,
             sandbox_report_path,
@@ -5910,6 +6065,7 @@ impl SystemdUnit {
             .arg(&self.waiting_path)
             .arg(&self.environment_fifo_path)
             .arg(&self.start_fifo_path)
+            .arg(&self.target_pid_path)
             .arg(&self.owner_fifo_path)
             .arg(&self.fifo_waiting_path)
             .arg(&self.sleep_program)
@@ -6151,6 +6307,107 @@ impl SystemdUnit {
         }
     }
 
+    fn target_pid(
+        &mut self,
+        child: &mut Child,
+        operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
+    ) -> std::io::Result<u32> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "systemd target PID capture was cancelled",
+                ));
+            }
+            let mut file = match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&self.target_pid_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(status) = child.try_wait()? {
+                        self.launcher_completed = true;
+                        return Err(std::io::Error::other(format!(
+                            "systemd-run exited with {status} before target PID publication"
+                        )));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "systemd target PID was not published before the setup deadline",
+                        ));
+                    }
+                    thread::sleep(IO_CANCEL_POLL_INTERVAL);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let metadata = file.metadata()?;
+            // SAFETY: geteuid has no preconditions and does not access Rust memory.
+            let effective_uid = unsafe { libc::geteuid() };
+            if !metadata.is_file()
+                || metadata.uid() != effective_uid
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o077 != 0
+                || metadata.len() > 32
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "systemd target PID record is not a bounded owner-private regular file",
+                ));
+            }
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)?;
+            let pid = contents.trim().parse::<u32>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("systemd target PID record is invalid: {error}"),
+                )
+            })?;
+            if pid == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "systemd target PID record contains PID 0",
+                ));
+            }
+            let rebound = fs::symlink_metadata(&self.target_pid_path)?;
+            if !rebound.is_file()
+                || rebound.dev() != metadata.dev()
+                || rebound.ino() != metadata.ino()
+            {
+                return Err(std::io::Error::other(
+                    "systemd target PID record changed while it was read",
+                ));
+            }
+            let cgroup_processes = fs::read_to_string(self.cgroup_path.join("cgroup.procs"))?;
+            let pid_text = pid.to_string();
+            if !cgroup_processes
+                .lines()
+                .any(|entry| entry.trim() == pid_text)
+            {
+                return Err(std::io::Error::other(format!(
+                    "systemd target PID {pid} is not owned by the prepared containment cgroup"
+                )));
+            }
+            crate::agent_lifecycle::process_start_time(pid)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let descriptor_metadata = file.metadata()?;
+            if descriptor_metadata.dev() != metadata.dev()
+                || descriptor_metadata.ino() != metadata.ino()
+            {
+                return Err(std::io::Error::other(
+                    "systemd target PID descriptor changed unexpectedly",
+                ));
+            }
+            return Ok(pid);
+        }
+    }
+
     fn cleanup(&mut self, _child: &mut Child, label: &str, context: &str) -> TreeCleanup {
         if self.cleaned {
             return TreeCleanup {
@@ -6299,6 +6556,7 @@ impl SystemdUnit {
         }
         let _ = fs::remove_file(&self.sandbox_report_path);
         let _ = fs::remove_file(&self.start_fifo_path);
+        let _ = fs::remove_file(&self.target_pid_path);
         let _ = fs::remove_file(&self.owner_fifo_path);
         let _ = fs::remove_file(&self.environment_fifo_path);
         let _ = fs::remove_file(&self.fifo_waiting_path);
@@ -6891,6 +7149,7 @@ fn validate_private_runtime_files(files: &[PrivateRuntimeFile]) -> std::io::Resu
                 | "guardian-waiting"
                 | "environment-gate"
                 | "start-gate"
+                | "target-pid"
                 | "owner-liveness"
                 | "fifo-waiting"
                 | "sandbox-mount-report"
@@ -10899,6 +11158,72 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
             }
         );
         assert!(spec.pinned_direct.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_lifecycle_metadata_stamps_environment_and_registers_running_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(temp.path()).expect("init repository");
+        let metadata = AgentLaunchMetadata::new(temp.path(), "worker", "runner-run", "runner-task")
+            .expect("lifecycle metadata");
+        let sleep = [
+            "/run/current-system/sw/bin/sleep",
+            "/usr/bin/sleep",
+            "/bin/sleep",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .expect("sleep executable")
+        .to_path_buf();
+        let spec = ProcessSpec::direct("lifecycle sleep", sleep, ["60"], temp.path(), 128)
+            .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::from([(
+                "PATH".to_string(),
+                "/run/current-system/sw/bin:/usr/bin:/bin".to_string(),
+            )])))
+            .with_agent_lifecycle(metadata);
+        let EnvironmentMode::ClearAndSet(environment) = &spec.environment else {
+            panic!("expected clear-and-set environment");
+        };
+        assert_eq!(
+            environment.get(MACO_RUN_ID_ENV).map(String::as_str),
+            Some("runner-run")
+        );
+        assert_eq!(
+            environment.get(MACO_TASK_ID_ENV).map(String::as_str),
+            Some("runner-task")
+        );
+
+        let registry = AgentRegistry::open(temp.path()).expect("agent registry");
+        let runner = thread::spawn(move || run_process(spec));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let registered = loop {
+            let processes = registry
+                .list(&crate::agent_lifecycle::AgentListFilter::default())
+                .expect("list lifecycle processes");
+            if let Some(process) = processes.first() {
+                break process.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process runner did not register its agent lifecycle identity"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(registered.run_id, "runner-run");
+        assert_eq!(registered.task_id, "runner-task");
+        assert_eq!(registered.argv.last().map(String::as_str), Some("60"));
+
+        let stopped = registry
+            .stop_selector("runner-task", Duration::from_secs(1))
+            .expect("stop lifecycle process");
+        assert_eq!(stopped.stopped.len(), 1);
+        let output = runner
+            .join()
+            .unwrap_or_else(|_| panic!("process runner thread panicked"))
+            .expect("process runner result");
+        assert!(output.status.is_some_and(|status| !status.success()));
     }
 
     #[test]
