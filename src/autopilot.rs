@@ -1171,6 +1171,8 @@ fn supervisor_plan_for_attempt(
         max_child_retries: 0,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
+        role_models: BTreeMap::new(),
+        model_pricing: BTreeMap::new(),
         assignments: vec![OrchestratorAssignment {
             id: agent_id.to_string(),
             role: AgentRole::ChildOrchestrator,
