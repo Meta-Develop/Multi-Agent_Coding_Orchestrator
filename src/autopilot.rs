@@ -2834,10 +2834,21 @@ mod tests {
         cell::{Cell, RefCell},
         fs::File,
         rc::Rc,
-        sync::mpsc,
+        sync::{mpsc, Mutex, MutexGuard, OnceLock},
         thread,
         time::Duration,
     };
+
+    // These fixtures each perform several bounded, strict-containment Git snapshots. Running them
+    // concurrently only multiplies systemd-slot contention; it is not part of their gate semantics.
+    static PREPUBLICATION_FIXTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn lock_prepublication_fixture_test() -> MutexGuard<'static, ()> {
+        PREPUBLICATION_FIXTURE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn effectful_autopilot_fails_closed_before_any_repository_or_runtime_side_effect() {
@@ -3403,6 +3414,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn strict_prepublication_orders_prepare_validate_review_publish_under_one_lease() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "order-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
@@ -3455,6 +3467,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn real_publication_rejects_fake_blocking_and_failed_review_before_publish() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "review-gate-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
@@ -3508,6 +3521,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn empty_validation_refuses_real_publication_before_review_or_publish() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "empty-validation-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
@@ -3544,6 +3558,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn review_mutation_changes_binding_and_prevents_publication() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "review-mutation-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
@@ -3582,6 +3597,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fake_forge_with_fake_reviewer_is_local_and_non_authoritative() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "fake-local-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
@@ -3617,6 +3633,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepublication_retry_reuses_prepared_commit_without_duplicate_effect() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "retry-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
@@ -3649,6 +3666,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn publication_hook_report_forge_and_base_mismatch_are_nonretryable() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "hook-mismatch-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
@@ -3727,6 +3745,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn write_lease_excludes_competing_access_through_review_and_releases_on_error() {
+        let _fixture_guard = lock_prepublication_fixture_test();
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_id = "review-lease-agent";
         let (repo, manager, _) = create_prepublication_fixture(temp.path(), agent_id);
