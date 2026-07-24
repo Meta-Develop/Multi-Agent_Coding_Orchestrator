@@ -3391,8 +3391,10 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .run_root()
                 .join(options.run_id.as_str())
         });
-    let (role_usage, total_usage, total_cost_usd) = role_usage_report(&plan, usage_samples);
     let usage_complete = !usage_incomplete && !nested_worker_usage_unseparated;
+    let (role_usage, total_usage, observed_total_cost_usd) =
+        role_usage_report(&plan, usage_samples);
+    let total_cost_usd = complete_total_cost(usage_complete, observed_total_cost_usd);
     let final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -6585,6 +6587,10 @@ fn role_usage_report(
     (reports, total_usage, total_cost_usd)
 }
 
+fn complete_total_cost(usage_complete: bool, observed_total_cost_usd: Option<f64>) -> Option<f64> {
+    usage_complete.then_some(observed_total_cost_usd).flatten()
+}
+
 fn command_record_from_external(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
@@ -7762,6 +7768,19 @@ mod tests {
         assert_eq!(unpriced_total, total);
         assert!(unpriced.values().all(|report| report.cost_usd.is_none()));
         assert!(unpriced_cost.is_none());
+    }
+
+    #[test]
+    fn incomplete_usage_suppresses_only_the_total_cost() {
+        let observed_total_cost_usd = Some(1.25);
+        let observed_worker_cost_usd = Some(0.75);
+
+        assert_eq!(complete_total_cost(false, observed_total_cost_usd), None);
+        assert_eq!(observed_worker_cost_usd, Some(0.75));
+        assert_eq!(
+            complete_total_cost(true, observed_total_cost_usd),
+            Some(1.25)
+        );
     }
 
     #[cfg(unix)]
