@@ -360,12 +360,12 @@ pub struct SupervisorFinalReport {
     pub semantic_intent_tokens: Vec<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_usage: BTreeMap<AgentRole, RoleUsageReport>,
-    #[serde(default)]
-    pub total_usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
-    /// True only when every model invocation in the run can be separated into a role-tagged usage
-    /// sample. Current Codex JSONL reports the outer process but not nested native subagents.
+    /// True only when usage was observed for every MACO-launched child-orchestrator and auditor
+    /// process. Nested workers are reported separately as not process-observable.
     #[serde(default)]
     pub usage_complete: bool,
     #[serde(default)]
@@ -396,9 +396,23 @@ pub struct SupervisorFinalReport {
 pub struct RoleUsageReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
-    pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub observation: RoleUsageObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleUsageObservation {
+    #[default]
+    ProcessObserved,
+    SupervisorAggregate,
+    NotProcessObservable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -715,7 +729,7 @@ pub fn collect_supervisor_run(
         claim_tokens: Vec::new(),
         semantic_intent_tokens: Vec::new(),
         role_usage: BTreeMap::new(),
-        total_usage: Usage::default(),
+        total_usage: None,
         total_cost_usd: None,
         usage_complete: false,
         commands_run: Vec::new(),
@@ -844,6 +858,9 @@ fn child_orchestrator_prompt_with_incoming_root(
         &assignment.id,
         None,
     );
+    let (child_model, child_reasoning_effort) =
+        role_model_selection(plan, AgentRole::ChildOrchestrator);
+    let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     let consultation_section = consultation_prompt_section(consultant);
     Ok(format!(
         r#"{role_prefix}You are a child orchestrator in an opt-in local Codex CLI supervisor run.
@@ -858,6 +875,13 @@ Ownership:
 - Semantic modules: {semantic_modules}
 - Path claim token: {claim_token}
 - Semantic intent token: {semantic_intent_token}
+
+Declared role selections:
+- Child orchestrator model: {child_model}
+- Child orchestrator reasoning effort: {child_reasoning_effort}
+- Nested worker model: {worker_model}
+- Nested worker reasoning effort: {worker_reasoning_effort}
+- Worker values are declarative context for the generated worker prompts. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
 
 Runtime hierarchy:
 - Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
@@ -930,6 +954,14 @@ Review auditor prompt template:
             .semantic_intent_token
             .map(|token| token.to_string())
             .unwrap_or_else(|| "<none>".to_string()),
+        child_model = child_model.as_deref().unwrap_or("<runtime default>"),
+        child_reasoning_effort = child_reasoning_effort
+            .as_deref()
+            .unwrap_or("<runtime default>"),
+        worker_model = worker_model.as_deref().unwrap_or("<runtime default>"),
+        worker_reasoning_effort = worker_reasoning_effort
+            .as_deref()
+            .unwrap_or("<runtime default>"),
         report_path = report_path.display(),
         schema_path = schema_path.display(),
         worker_schema_path = worker_schema_path.display(),
@@ -991,6 +1023,7 @@ fn worker_prompt_with_incoming_root(
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     let task = worker_task(plan, orchestrator, worker);
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
+    let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     Ok(format!(
         r#"{role_prefix}You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
@@ -1005,6 +1038,11 @@ Ownership:
 - Run artifact root: {run_dir}
 - Execution journal path: {journal_path}
 - Explicit report path: {report_path}
+
+Declared role selection:
+- Worker model: {worker_model}
+- Worker reasoning effort: {worker_reasoning_effort}
+- These values are declarative nested-worker context. MACO does not launch a separate worker process, so worker usage remains unavailable until runtime-side role-tagged usage reporting exists.
 
 Rules:
 - Edit only inside your assigned worktree and only inside claimed paths.
@@ -1037,6 +1075,10 @@ Worker assignment JSON:
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<none>".to_string()),
+        worker_model = worker_model.as_deref().unwrap_or("<runtime default>"),
+        worker_reasoning_effort = worker_reasoning_effort
+            .as_deref()
+            .unwrap_or("<runtime default>"),
         schema_path = schema_path.display(),
         task = task,
         worker_json = worker_json,
@@ -1219,14 +1261,6 @@ fn apply_role_model_selection(
 ) -> ExternalAgentCommand {
     let (model, reasoning_effort) = role_model_selection(plan, role);
     command.with_model_selection(model, reasoning_effort)
-}
-
-fn apply_worker_subagent_selection(
-    command: ExternalAgentCommand,
-    plan: &SupervisorPlan,
-) -> ExternalAgentCommand {
-    let (model, reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
-    command.with_subagent_model_selection(model, reasoning_effort)
 }
 
 #[derive(Debug, Clone)]
@@ -2176,10 +2210,7 @@ fn execute_supervisor_assignment_inner(
             &attempt_artifacts.report_path,
             Duration::from_secs(plan.child_timeout_seconds),
         );
-        command = apply_worker_subagent_selection(
-            apply_role_model_selection(command, plan, assignment.role),
-            plan,
-        );
+        command = apply_role_model_selection(command, plan, assignment.role);
         command.output_schema = Some(schema_path.clone());
         command = command.with_hidden_root(repo).with_agent_lifecycle(
             repo,
@@ -3351,20 +3382,23 @@ fn run_supervisor_plan_with_runner_and_creation(
         },
         None => true,
     };
-    let nested_worker_usage_unseparated = plan
+    let nested_workers_present = plan
         .assignments
         .iter()
         .any(|assignment| !assignment.worker_assignments.is_empty());
-    if usage_incomplete || nested_worker_usage_unseparated {
+    if nested_workers_present {
         findings.push(Finding {
             severity: FindingSeverity::Warning,
-            message: if nested_worker_usage_unseparated {
-                "per-role usage is incomplete because Codex JSONL does not expose role-tagged usage for nested native worker agents; outer child-orchestrator usage is reported only as outer-process usage"
-                    .to_string()
-            } else {
-                "per-role usage is incomplete because at least one external Codex JSONL capture was missing, truncated, or malformed"
-                    .to_string()
-            },
+            message: "worker usage is not process-observable because nested workers execute inside child Codex sessions; child-orchestrator and auditor process usage remains reportable, while runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
+                .to_string(),
+            paths: Vec::new(),
+        });
+    }
+    if usage_incomplete {
+        findings.push(Finding {
+            severity: FindingSeverity::Warning,
+            message: "process usage is incomplete because at least one external Codex JSONL capture was missing, truncated, or malformed"
+                .to_string(),
             paths: Vec::new(),
         });
     }
@@ -3391,8 +3425,14 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .run_root()
                 .join(options.run_id.as_str())
         });
-    let (role_usage, total_usage, total_cost_usd) = role_usage_report(&plan, usage_samples);
-    let usage_complete = !usage_incomplete && !nested_worker_usage_unseparated;
+    let usage_complete = !usage_incomplete;
+    let RoleUsageAggregation {
+        reports: mut role_usage,
+        total_usage,
+        total_cost_usd: observed_total_cost_usd,
+    } = role_usage_report(&plan, usage_samples)?;
+    let total_cost_usd =
+        finalize_supervisor_cost(usage_complete, &mut role_usage, observed_total_cost_usd);
     let final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -6529,14 +6569,29 @@ struct RoleUsageSample {
     usage: Usage,
 }
 
+struct RoleUsageAggregation {
+    reports: BTreeMap<AgentRole, RoleUsageReport>,
+    total_usage: Option<Usage>,
+    total_cost_usd: Option<f64>,
+}
+
 fn role_usage_report(
     plan: &SupervisorPlan,
     samples: Vec<RoleUsageSample>,
-) -> (BTreeMap<AgentRole, RoleUsageReport>, Usage, Option<f64>) {
+) -> Result<RoleUsageAggregation> {
     let mut aggregates = BTreeMap::<AgentRole, (Usage, BTreeSet<String>, Option<f64>)>::new();
     let mut total_usage = Usage::default();
     let mut total_cost_usd = Some(0.0);
     for sample in samples {
+        if !matches!(
+            sample.role,
+            AgentRole::ChildOrchestrator | AgentRole::Auditor
+        ) {
+            bail!(
+                "{} usage is not directly process-observable",
+                sample.role.as_str()
+            );
+        }
         total_usage = total_usage.saturating_add(sample.usage);
         let sample_cost_usd = sample
             .model
@@ -6566,6 +6621,7 @@ fn role_usage_report(
             _ => None,
         };
     }
+    let has_observed_samples = !aggregates.is_empty();
     let reports = aggregates
         .into_iter()
         .map(|(role, (usage, models, cost_usd))| {
@@ -6573,16 +6629,73 @@ fn role_usage_report(
                 role,
                 RoleUsageReport {
                     models: models.into_iter().collect(),
-                    usage,
+                    usage: Some(usage),
                     cost_usd,
+                    observation: RoleUsageObservation::ProcessObserved,
+                    unavailable_reason: None,
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
-    if reports.is_empty() {
+    let mut reports = reports;
+    reports.insert(
+        AgentRole::Worker,
+        RoleUsageReport {
+            models: Vec::new(),
+            usage: None,
+            cost_usd: None,
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: Some(
+                "nested workers execute inside child Codex sessions and are not separate MACO-launched processes; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
+                    .to_string(),
+            ),
+        },
+    );
+    if !has_observed_samples {
         total_cost_usd = None;
     }
-    (reports, total_usage, total_cost_usd)
+    let total_usage = has_observed_samples.then_some(total_usage);
+    reports.insert(
+        AgentRole::Supervisor,
+        RoleUsageReport {
+            models: reports
+                .values()
+                .flat_map(|report| report.models.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            usage: total_usage,
+            cost_usd: total_cost_usd,
+            observation: RoleUsageObservation::SupervisorAggregate,
+            unavailable_reason: total_usage.is_none().then(|| {
+                "no MACO-launched child-orchestrator or auditor process usage was observed"
+                    .to_string()
+            }),
+        },
+    );
+    Ok(RoleUsageAggregation {
+        reports,
+        total_usage,
+        total_cost_usd,
+    })
+}
+
+fn finalize_supervisor_cost(
+    usage_complete: bool,
+    role_usage: &mut BTreeMap<AgentRole, RoleUsageReport>,
+    observed_total_cost_usd: Option<f64>,
+) -> Option<f64> {
+    if usage_complete {
+        return observed_total_cost_usd;
+    }
+    if let Some(supervisor_usage) = role_usage.get_mut(&AgentRole::Supervisor) {
+        supervisor_usage.cost_usd = None;
+        supervisor_usage.unavailable_reason = Some(
+            "supervisor aggregate cost is unavailable because at least one MACO-launched process usage sample is missing"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn command_record_from_external(
@@ -7521,6 +7634,10 @@ mod tests {
         object.insert(
             "role_models".to_string(),
             json!({
+                "supervisor": {
+                    "model": "supervisor-model",
+                    "reasoning_effort": "xhigh"
+                },
                 "child_orchestrator": {
                     "model": " planner-model ",
                     "reasoning_effort": " high "
@@ -7552,6 +7669,19 @@ mod tests {
             &serde_json::to_string(&new_json).expect("serialize new plan"),
         )
         .expect("new model economics plan");
+        assert_eq!(
+            new.plan.role_models[&AgentRole::Supervisor]
+                .model
+                .as_deref(),
+            Some("supervisor-model")
+        );
+        assert_eq!(
+            new.plan.role_models[&AgentRole::Supervisor]
+                .reasoning_effort
+                .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(new.plan.role_models.len(), 4);
         assert_eq!(
             new.plan.role_models[&AgentRole::ChildOrchestrator]
                 .model
@@ -7598,7 +7728,7 @@ mod tests {
     }
 
     #[test]
-    fn role_selection_produces_distinct_child_worker_and_auditor_argv() {
+    fn role_selection_produces_distinct_launched_role_argv() {
         let mut plan = parse_supervisor_plan_with_consultant(
             std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
         )
@@ -7637,10 +7767,7 @@ mod tests {
                 Duration::from_secs(1),
             )
         };
-        let child = apply_worker_subagent_selection(
-            apply_role_model_selection(base_command(), &plan, AgentRole::ChildOrchestrator),
-            &plan,
-        );
+        let child = apply_role_model_selection(base_command(), &plan, AgentRole::ChildOrchestrator);
         let auditor = apply_role_model_selection(base_command(), &plan, AgentRole::Auditor);
         let child_argv = crate::external_agent::command_argv(&child)
             .into_iter()
@@ -7654,20 +7781,23 @@ mod tests {
         assert!(child_argv
             .windows(2)
             .any(|arguments| arguments == ["-m", "planner-model"]));
-        assert!(child_argv.windows(2).any(|arguments| {
-            arguments == ["-c", "agents.default_subagent_model=\"worker-model\""]
-        }));
+        assert!(child_argv
+            .windows(2)
+            .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"high\""] }));
         assert!(auditor_argv
             .windows(2)
             .any(|arguments| arguments == ["-m", "auditor-model"]));
-        assert!(!auditor_argv
+        assert!(auditor_argv
+            .windows(2)
+            .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
+        assert!(!child_argv
             .iter()
-            .any(|argument| argument.contains("default_subagent_model")));
+            .any(|argument| argument.contains("worker-model")));
         assert_ne!(child_argv, auditor_argv);
     }
 
     #[test]
-    fn role_usage_aggregation_sums_samples_and_prices_by_sample_model() {
+    fn process_role_usage_aggregation_prices_children_and_auditors() {
         let mut plan = parse_supervisor_plan_with_consultant(
             std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
         )
@@ -7679,13 +7809,6 @@ mod tests {
                 ModelPricing {
                     input_usd_per_million_tokens: 2.0,
                     output_usd_per_million_tokens: 8.0,
-                },
-            ),
-            (
-                "worker-model".to_string(),
-                ModelPricing {
-                    input_usd_per_million_tokens: 0.25,
-                    output_usd_per_million_tokens: 1.0,
                 },
             ),
             (
@@ -7707,21 +7830,12 @@ mod tests {
                 },
             },
             RoleUsageSample {
-                role: AgentRole::Worker,
-                model: Some("worker-model".to_string()),
+                role: AgentRole::ChildOrchestrator,
+                model: Some("planner-model".to_string()),
                 usage: Usage {
-                    input_tokens: 10_000,
-                    output_tokens: 2_000,
-                    total_tokens: 12_000,
-                },
-            },
-            RoleUsageSample {
-                role: AgentRole::Worker,
-                model: Some("worker-model".to_string()),
-                usage: Usage {
-                    input_tokens: 5_000,
-                    output_tokens: 1_000,
-                    total_tokens: 6_000,
+                    input_tokens: 500,
+                    output_tokens: 100,
+                    total_tokens: 600,
                 },
             },
             RoleUsageSample {
@@ -7733,35 +7847,101 @@ mod tests {
                     total_tokens: 600,
                 },
             },
+            RoleUsageSample {
+                role: AgentRole::Auditor,
+                model: Some("auditor-model".to_string()),
+                usage: Usage {
+                    input_tokens: 250,
+                    output_tokens: 50,
+                    total_tokens: 300,
+                },
+            },
         ];
-        let (by_role, total, cost) = role_usage_report(&plan, samples.clone());
+        let RoleUsageAggregation {
+            reports: by_role,
+            total_usage: total,
+            total_cost_usd: cost,
+        } = role_usage_report(&plan, samples.clone()).expect("aggregate process usage");
         assert_eq!(
-            by_role[&AgentRole::Worker].usage,
-            Usage {
-                input_tokens: 15_000,
-                output_tokens: 3_000,
-                total_tokens: 18_000,
-            }
+            by_role[&AgentRole::ChildOrchestrator].usage,
+            Some(Usage {
+                input_tokens: 1_500,
+                output_tokens: 300,
+                total_tokens: 1_800,
+            })
         );
         assert_eq!(
             total,
-            Usage {
-                input_tokens: 16_500,
-                output_tokens: 3_300,
-                total_tokens: 19_800,
-            }
+            Some(Usage {
+                input_tokens: 2_250,
+                output_tokens: 450,
+                total_tokens: 2_700,
+            })
         );
-        let expected_cost = 0.0036 + 0.00675 + 0.0009;
+        let expected_cost = 0.0054 + 0.00135;
         assert!((cost.expect("fully priced total") - expected_cost).abs() < 1e-12);
-        assert!(
-            (by_role[&AgentRole::Worker].cost_usd.expect("worker cost") - 0.00675).abs() < 1e-12
+        assert_eq!(
+            by_role[&AgentRole::Worker].observation,
+            RoleUsageObservation::NotProcessObservable
         );
+        assert!(by_role[&AgentRole::Worker].usage.is_none());
+        assert!(by_role[&AgentRole::Worker]
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("runtime-side role-tagged usage reporting")));
+        let serialized_worker =
+            serde_json::to_value(&by_role[&AgentRole::Worker]).expect("serialize worker marker");
+        assert_eq!(serialized_worker["observation"], "not_process_observable");
+        assert!(serialized_worker.get("usage").is_none());
+        assert!(serialized_worker["unavailable_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("runtime-side role-tagged usage reporting")));
+        assert_eq!(
+            by_role[&AgentRole::Supervisor].observation,
+            RoleUsageObservation::SupervisorAggregate
+        );
+        assert_eq!(by_role[&AgentRole::Supervisor].usage, total);
 
         plan.model_pricing.clear();
-        let (unpriced, unpriced_total, unpriced_cost) = role_usage_report(&plan, samples);
+        let RoleUsageAggregation {
+            reports: unpriced,
+            total_usage: unpriced_total,
+            total_cost_usd: unpriced_cost,
+        } = role_usage_report(&plan, samples).expect("aggregate unpriced process usage");
         assert_eq!(unpriced_total, total);
         assert!(unpriced.values().all(|report| report.cost_usd.is_none()));
         assert!(unpriced_cost.is_none());
+
+        let mut incomplete = by_role;
+        assert!(finalize_supervisor_cost(false, &mut incomplete, cost).is_none());
+        assert!(incomplete[&AgentRole::Supervisor].cost_usd.is_none());
+        assert!(incomplete[&AgentRole::Supervisor]
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("at least one MACO-launched process")));
+    }
+
+    #[test]
+    fn empty_process_usage_has_no_synthetic_supervisor_or_worker_totals() {
+        let plan = parse_supervisor_plan_with_consultant(
+            std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+        )
+        .expect("base plan")
+        .plan;
+        let RoleUsageAggregation {
+            reports: by_role,
+            total_usage: total,
+            total_cost_usd: cost,
+        } = role_usage_report(&plan, Vec::new()).expect("empty process aggregation");
+        assert!(total.is_none());
+        assert!(cost.is_none());
+        assert!(by_role[&AgentRole::Supervisor].usage.is_none());
+        assert!(by_role[&AgentRole::Supervisor].cost_usd.is_none());
+        assert!(by_role[&AgentRole::Worker].usage.is_none());
+        assert_eq!(
+            by_role[&AgentRole::Worker].observation,
+            RoleUsageObservation::NotProcessObservable
+        );
     }
 
     #[cfg(unix)]
@@ -11546,7 +11726,14 @@ mod tests {
     fn worker_prompt_includes_execution_journal_contract() {
         let assignment = injected_assignment(true);
         let worker = &assignment.worker_assignments[0];
-        let plan = injected_plan(assignment.clone(), 0);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some("worker-model".to_string()),
+                reasoning_effort: Some("low".to_string()),
+            },
+        );
         let prompt = worker_prompt(
             &plan,
             &assignment,
@@ -11562,6 +11749,9 @@ mod tests {
         assert!(prompt.contains("write a structured execution journal"));
         assert!(prompt.contains("\"start_timestamp\""));
         assert!(prompt.contains("\"changed_paths\""));
+        assert!(prompt.contains("Worker model: worker-model"));
+        assert!(prompt.contains("Worker reasoning effort: low"));
+        assert!(prompt.contains("runtime-side role-tagged usage reporting"));
     }
 
     #[test]
@@ -11817,7 +12007,7 @@ mod tests {
             claim_tokens: Vec::new(),
             semantic_intent_tokens: Vec::new(),
             role_usage: BTreeMap::new(),
-            total_usage: Usage::default(),
+            total_usage: None,
             total_cost_usd: None,
             usage_complete: false,
             commands_run: Vec::new(),

@@ -51,10 +51,6 @@ pub struct ExternalAgentCommand {
     pub model: Option<String>,
     /// Optional reasoning effort for the primary Codex process.
     pub reasoning_effort: Option<String>,
-    /// Optional default model inherited by Codex subagents spawned from this process.
-    pub subagent_model: Option<String>,
-    /// Optional default reasoning effort inherited by Codex subagents spawned from this process.
-    pub subagent_reasoning_effort: Option<String>,
     /// Optional lifecycle identity for the long-running provider process. `registry_repo` is the
     /// supervisor repository whose `.maco/agents` state operators inspect, which can differ from
     /// `cwd` when the provider runs inside a linked assignment worktree.
@@ -116,8 +112,6 @@ impl ExternalAgentCommand {
             hidden_roots: Vec::new(),
             model: None,
             reasoning_effort: None,
-            subagent_model: None,
-            subagent_reasoning_effort: None,
             agent_lifecycle: None,
         }
     }
@@ -143,8 +137,6 @@ impl ExternalAgentCommand {
             hidden_roots: Vec::new(),
             model: None,
             reasoning_effort: None,
-            subagent_model: None,
-            subagent_reasoning_effort: None,
             agent_lifecycle: None,
         }
     }
@@ -170,8 +162,6 @@ impl ExternalAgentCommand {
             hidden_roots: Vec::new(),
             model: None,
             reasoning_effort: None,
-            subagent_model: None,
-            subagent_reasoning_effort: None,
             agent_lifecycle: None,
         }
     }
@@ -193,16 +183,6 @@ impl ExternalAgentCommand {
     ) -> Self {
         self.model = model;
         self.reasoning_effort = reasoning_effort;
-        self
-    }
-
-    pub fn with_subagent_model_selection(
-        mut self,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-    ) -> Self {
-        self.subagent_model = model;
-        self.subagent_reasoning_effort = reasoning_effort;
         self
     }
 
@@ -1401,20 +1381,6 @@ fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
             toml_basic_string(reasoning_effort)
         )));
     }
-    if let Some(model) = &spec.subagent_model {
-        argv.push(OsString::from("-c"));
-        argv.push(OsString::from(format!(
-            "agents.default_subagent_model={}",
-            toml_basic_string(model)
-        )));
-    }
-    if let Some(reasoning_effort) = &spec.subagent_reasoning_effort {
-        argv.push(OsString::from("-c"));
-        argv.push(OsString::from(format!(
-            "agents.default_subagent_reasoning_effort={}",
-            toml_basic_string(reasoning_effort)
-        )));
-    }
     argv
 }
 
@@ -1708,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_argv_applies_distinct_primary_and_subagent_model_selection_safely() {
+    fn codex_argv_applies_primary_model_selection_safely() {
         let command = ExternalAgentCommand::codex(
             "codex",
             "/workspace",
@@ -1720,8 +1686,7 @@ mod tests {
         .with_model_selection(
             Some("planner-model".to_string()),
             Some("high\"\nweb_search=\"live".to_string()),
-        )
-        .with_subagent_model_selection(Some("worker\"model".to_string()), Some("low".to_string()));
+        );
         let actual = command_argv(&command)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -1736,12 +1701,6 @@ mod tests {
                     "-c",
                     "model_reasoning_effort=\"high\\\"\\nweb_search=\\\"live\"",
                 ]
-        }));
-        assert!(actual.windows(2).any(|arguments| {
-            arguments == ["-c", "agents.default_subagent_model=\"worker\\\"model\""]
-        }));
-        assert!(actual.windows(2).any(|arguments| {
-            arguments == ["-c", "agents.default_subagent_reasoning_effort=\"low\""]
         }));
         assert!(!actual
             .iter()
