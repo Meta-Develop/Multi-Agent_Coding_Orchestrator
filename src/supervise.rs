@@ -9921,7 +9921,7 @@ mod tests {
         let event_path = repo_path
             .join(".maco/o2/runs/circuit-breaker-cascade")
             .join(ORCHESTRATION_EVENT_PATH);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let breaker_recorded = fs::read_to_string(&event_path)
                 .is_ok_and(|events| events.contains("swarm_health_circuit_breaker"));

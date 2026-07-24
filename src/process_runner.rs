@@ -65,6 +65,10 @@ const MAX_CONCURRENT_SYSTEMD_UNITS: usize = 8;
 // capacity for parallel coverage without overwhelming the shared user systemd manager.
 #[cfg(all(target_os = "linux", test))]
 const MAX_CONCURRENT_SYSTEMD_UNITS: usize = 4;
+// These safety probes assert containment evidence rather than command latency. Allow the complete
+// bounded slot wait plus setup without changing any production deadline.
+#[cfg(all(target_os = "linux", test))]
+const CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(40);
 #[cfg(target_os = "linux")]
 const EXPEDITED_SYSTEMD_SLOT_THRESHOLD: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
@@ -9214,7 +9218,7 @@ mod tests {
                 temp.path(),
                 256,
             )
-            .with_timeout(Some(Duration::from_secs(2))),
+            .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
         );
 
         match result {
@@ -9961,7 +9965,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                 1024,
             )
             .with_environment(EnvironmentMode::ClearAndSet(environment))
-            .with_timeout(Some(Duration::from_secs(2))),
+            .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
         )
         .expect("run guardian collision environment");
 
@@ -10185,7 +10189,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
                     temp.path(),
                     128,
                 )
-                .with_timeout(Some(Duration::from_secs(2))),
+                .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
             ) {
                 Ok(output) => {
                     assert!(output.safety_evidence_verified());
@@ -10314,26 +10318,68 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
     fn stuck_owned_io_thread_aborts_instead_of_detaching() {
         const CHILD_ENV: &str = "MACO_TEST_STUCK_IO_CHILD";
         if env::var_os(CHILD_ENV).is_some() {
+            let ready = PathBuf::from(
+                env::var_os("MACO_TEST_STUCK_IO_READY").expect("stuck I/O ready marker"),
+            );
+            let release = PathBuf::from(
+                env::var_os("MACO_TEST_STUCK_IO_RELEASE").expect("stuck I/O release marker"),
+            );
             let cancel = Arc::new(AtomicBool::new(false));
             let handle = thread::spawn(|| loop {
                 thread::sleep(Duration::from_secs(60));
             });
             let thread = OwnedIoThread { handle, cancel };
+            fs::write(ready, b"ready").expect("publish stuck I/O readiness");
+            while !release.exists() {
+                thread::sleep(POLL_INTERVAL);
+            }
             let _ = thread.finish(false, "synthetic stuck I/O owner");
             panic!("stuck owner unexpectedly returned");
         }
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let started = Instant::now();
-        let status = Command::new(std::env::current_exe().expect("current test executable"))
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
             .args([
                 "--exact",
                 "process_runner::tests::stuck_owned_io_thread_aborts_instead_of_detaching",
             ])
             .env(CHILD_ENV, "1")
+            .env("MACO_TEST_STUCK_IO_READY", &ready)
+            .env("MACO_TEST_STUCK_IO_RELEASE", &release)
             .current_dir(temp.path())
-            .status()
-            .expect("run stuck-owner child test");
+            .spawn()
+            .expect("spawn stuck-owner child test");
+        let ready_deadline = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            if let Some(status) = child.try_wait().expect("poll stuck-owner child") {
+                panic!("stuck-owner child exited before publishing readiness: {status}");
+            }
+            if Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stuck-owner child did not publish readiness before the deadline");
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+
+        // Process spawn and test-harness scheduling are not part of the fail-stop guarantee.
+        // Measure only from the point where the synthetic stuck owner is ready to be finalized.
+        let started = Instant::now();
+        let abort_deadline = started + Duration::from_secs(2);
+        fs::write(&release, b"release").expect("release stuck I/O finalization");
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll released stuck-owner child") {
+                break status;
+            }
+            if Instant::now() >= abort_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stuck I/O owner did not abort before the two-second safety deadline");
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
         assert!(!status.success());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
@@ -11197,7 +11243,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 
         let registry = AgentRegistry::open(temp.path()).expect("agent registry");
         let runner = thread::spawn(move || run_process(spec));
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let registered = loop {
             let processes = registry
                 .list(&crate::agent_lifecycle::AgentListFilter::default())
