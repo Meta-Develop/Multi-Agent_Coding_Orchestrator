@@ -10,6 +10,10 @@ use crate::{
     inbox::{self, InboxPermissionMode, InboxScanOptions, InboxWorkspaceScanOptions},
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
+    megafile::{
+        MegafileAssessment, MegafileReport, MegafileStore, MegafileThresholdCalibration,
+        MegafileThresholds,
+    },
     merge::{
         self, CandidateValidationCommand, MergeApplyOptions, MergeApplyPreview, MergeApplyReport,
         MergeCandidate, MergeCollectOptions, MergeForceOptions, MergePreviewOptions,
@@ -224,6 +228,62 @@ impl RepoCommand {
                 }
             }
             RepoSubcommand::Query(command) => command.run(),
+            RepoSubcommand::Megafile(command) => command.run(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct RepoMegafileCommand {
+    #[command(subcommand)]
+    command: RepoMegafileSubcommand,
+}
+
+impl RepoMegafileCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            RepoMegafileSubcommand::Seed(args) => {
+                let samples = repo_map::scan_repository_file_samples(&args.repo)?;
+                let seeded_samples = samples.len();
+                let sampled_bytes = samples
+                    .iter()
+                    .try_fold(0_u64, |total, sample| total.checked_add(sample.bytes))
+                    .context("sampled repository byte count overflowed")?;
+                let store = args.thresholds.open_store(&args.repo)?;
+                let assessments = store.record_file_samples(samples)?;
+                let telemetry = store.report()?;
+                let report = MegafileSeedReport {
+                    seeded_samples,
+                    sampled_bytes,
+                    assessments,
+                    telemetry,
+                };
+                print_query_report(&report, args.json)
+            }
+            RepoMegafileSubcommand::Query(args) => {
+                let store = args.thresholds.open_existing_store(&args.repo)?;
+                let initialized = store.is_some();
+                if let Some(path) = args.path {
+                    let assessment = store
+                        .as_ref()
+                        .map(|store| store.assess_path(&path))
+                        .transpose()?
+                        .flatten();
+                    let report = MegafilePathQueryReport {
+                        initialized,
+                        path,
+                        assessment,
+                    };
+                    print_query_report(&report, args.json)
+                } else {
+                    let telemetry = store.as_ref().map(MegafileStore::report).transpose()?;
+                    let report = MegafileQueryReport {
+                        initialized,
+                        telemetry,
+                    };
+                    print_query_report(&report, args.json)
+                }
+            }
         }
     }
 }
@@ -262,6 +322,141 @@ enum RepoSubcommand {
     Map(MapRepoArgs),
     /// Query the semantic repository map.
     Query(RepoQueryCommand),
+    /// Explicitly seed and query durable megafile telemetry.
+    Megafile(RepoMegafileCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoMegafileSubcommand {
+    /// Explicitly sample regular repository files and persist their byte/line telemetry.
+    Seed(SeedMegafileArgs),
+    /// Query the complete telemetry report or one repository-relative path.
+    Query(QueryMegafileArgs),
+}
+
+#[derive(Debug, Args)]
+struct SeedMegafileArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[command(flatten)]
+    thresholds: MegafileThresholdArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct QueryMegafileArgs {
+    /// Optional repository-relative path. Omit it for the complete bounded report.
+    path: Option<PathBuf>,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[command(flatten)]
+    thresholds: MegafileThresholdArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args, Default)]
+struct MegafileThresholdArgs {
+    /// Configure the file-size warning threshold in bytes.
+    #[arg(long)]
+    file_bytes: Option<u64>,
+    /// Configure the physical-line warning threshold.
+    #[arg(long)]
+    file_lines: Option<u64>,
+    /// Configure the cross-sample byte-growth warning threshold.
+    #[arg(long)]
+    growth_bytes: Option<u64>,
+    /// Configure the cross-sample line-growth warning threshold.
+    #[arg(long)]
+    growth_lines: Option<u64>,
+    /// Configure the retained-window claim-frequency warning threshold.
+    #[arg(long)]
+    claim_count: Option<u64>,
+    /// Configure the retained-window collision-frequency warning threshold.
+    #[arg(long)]
+    collision_count: Option<u64>,
+    /// Configure how many retained records contribute to activity frequencies.
+    #[arg(long)]
+    activity_window_records: Option<usize>,
+}
+
+impl MegafileThresholdArgs {
+    fn open_store(&self, repo: &Path) -> Result<MegafileStore> {
+        let Some(thresholds) = self.configured_thresholds() else {
+            return MegafileStore::open(repo);
+        };
+        MegafileStore::open_with_thresholds(repo, thresholds)
+    }
+
+    fn open_existing_store(&self, repo: &Path) -> Result<Option<MegafileStore>> {
+        let Some(thresholds) = self.configured_thresholds() else {
+            return MegafileStore::open_existing(repo);
+        };
+        MegafileStore::open_existing_with_thresholds(repo, thresholds)
+    }
+
+    fn configured_thresholds(&self) -> Option<MegafileThresholds> {
+        if self.file_bytes.is_none()
+            && self.file_lines.is_none()
+            && self.growth_bytes.is_none()
+            && self.growth_lines.is_none()
+            && self.claim_count.is_none()
+            && self.collision_count.is_none()
+            && self.activity_window_records.is_none()
+        {
+            return None;
+        }
+        let mut thresholds = MegafileThresholds::provisional_bootstrap();
+        thresholds.calibration = MegafileThresholdCalibration::Configured;
+        if let Some(value) = self.file_bytes {
+            thresholds.file_bytes = value;
+        }
+        if let Some(value) = self.file_lines {
+            thresholds.file_lines = value;
+        }
+        if let Some(value) = self.growth_bytes {
+            thresholds.growth_bytes = value;
+        }
+        if let Some(value) = self.growth_lines {
+            thresholds.growth_lines = value;
+        }
+        if let Some(value) = self.claim_count {
+            thresholds.claim_count = value;
+        }
+        if let Some(value) = self.collision_count {
+            thresholds.collision_count = value;
+        }
+        if let Some(value) = self.activity_window_records {
+            thresholds.activity_window_records = value;
+        }
+        Some(thresholds)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MegafileSeedReport {
+    seeded_samples: usize,
+    sampled_bytes: u64,
+    assessments: Vec<MegafileAssessment>,
+    telemetry: MegafileReport,
+}
+
+#[derive(Debug, Serialize)]
+struct MegafileQueryReport {
+    initialized: bool,
+    telemetry: Option<MegafileReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct MegafilePathQueryReport {
+    initialized: bool,
+    path: PathBuf,
+    assessment: Option<MegafileAssessment>,
 }
 
 #[derive(Debug, Args)]
@@ -1595,8 +1790,16 @@ impl SyncCommand {
         match self.command {
             SyncSubcommand::Claim(args) => {
                 let store = SyncStore::open(args.repo)?;
-                let claim = store.claim_paths(&args.agent_id, args.paths)?;
-                print_path_claim("Claim", &claim, args.json)
+                let outcome = store.claim_paths_with_telemetry(&args.agent_id, args.paths)?;
+                if args.json {
+                    print_query_report(&outcome, true)
+                } else {
+                    print_path_claim("Claim", &outcome.claim, false)?;
+                    for warning in &outcome.warnings {
+                        println!("Warning: {warning:#?}");
+                    }
+                    Ok(())
+                }
             }
             SyncSubcommand::Release(args) => {
                 let store = SyncStore::open(args.repo)?;
