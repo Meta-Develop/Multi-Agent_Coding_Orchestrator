@@ -1310,13 +1310,15 @@ supervisor plan, and other UTF-8 text is treated as a task specification.
 treats the bounded UTF-8 file as a high-level goal/spec, even if its contents
 happen to be valid JSON.
 
-Goal/spec planning fragments the source, proposes one independent child
-orchestrator per disjoint workstream, and gives each assignment `assigned_paths`
-plus any parser-backed Rust `semantic_symbols` and `semantic_modules`. These are
-proposed path claims and semantic intents; `supervise run` still acquires and
-enforces the authoritative runtime claims. Fragments whose scopes overlap are
-coalesced, and the complete proposal is checked for path, module, and symbol
-disjointness before the validated plan is emitted or any child can launch.
+Goal/spec planning fragments the source and emits one nested subtree per
+disjoint workstream: a depth-2 read-only planning root followed by a depth-3
+execution child with a real `parent_assignment_id`. The execution child keeps
+the proposed `assigned_paths`, worker assignment, and any parser-backed Rust
+`semantic_symbols` and `semantic_modules`. These are proposed path claims and
+semantic intents; `supervise run` still acquires and enforces the authoritative
+runtime claims. Fragments whose scopes overlap are coalesced, and the complete
+proposal is checked for cross-subtree path, module, and symbol disjointness
+before the validated plan is emitted or any child can launch.
 
 The emitted document is directly usable as a supervisor plan and preserves
 lowering traceability through top-level `spec_fragment_ids`, per-assignment
@@ -1329,12 +1331,17 @@ and missing diff bindings add runtime coverage gaps.
 Depth is plan data. Authored plans may use recursive `child_assignments` up to
 their configured `max_depth` (currently 2 through 32), and normalization records
 each assignment's `parent_assignment_id`, depth, and flattened index. The
-goal/spec planner currently emits independent root O1 assignments at depth 2.
-The scheduler also currently executes recursive trees as a deterministic flat
-pre-order of MACO-visible O1 assignments: parent/depth fields provide
-traceability, but do **not** enforce a parent-completion dependency or launch a
-nested subprocess under that parent. Plans that require a parent result before
-a child starts must encode that work as separate serialized stages for now.
+scheduler validates that graph in parent-before-child order and admits a
+descendant only after its parent has produced an accepted successful outcome
+and released its assignment resources. A failed parent suppresses its
+descendants transitively without stopping unrelated roots. Every node that is
+actually admitted follows the ordinary assignment path: managed worktree
+creation, path claims, semantic coordination, hierarchy-parented journal
+events, child and worker reports, candidate inspection and binding,
+review-auditor evidence, traceability, resource release, and final acceptance.
+Admission uses validated assignment ids and parent links rather than generated
+name suffixes or a fixed tree depth, leaving the schedule representation
+available for future runtime-appended nodes.
 
 Zero-work plans fail closed. Goal/spec input with no repository path, Rust
 module, or Rust symbol match returns an actionable error asking for a concrete
@@ -1439,14 +1446,17 @@ decomposition. Only a later successful `merge apply --decomposition-target
 ... --decomposition-run-id ...` using that same finalized run evidence writes
 the authoritative `accepted_decomposition` history record.
 
-With `N > 1`, only assignments whose normalized path sets are disjoint can run
-at the same time. Equality, ancestor, and descendant relationships use the
-same overlap semantics as path claims. An overlapping assignment waits while
-the scheduler scans ahead for later disjoint work, so overlap does not impose
+With `N > 1`, hierarchy-ready assignments from independent roots can run
+concurrently only when their normalized path sets are disjoint. Equality,
+ancestor, and descendant relationships use the same overlap semantics as path
+claims. Same-lineage scope overlap is permitted by validation because parent
+admission gates ensure ancestors and descendants never run together;
+cross-subtree overlap remains rejected. The scheduler scans ahead for later
+ready, disjoint roots, so a waiting descendant or active overlap does not impose
 unnecessary head-of-line blocking. Retries and the parent review auditor remain
-inside the assignment's slot. An ordinary assignment failure does not stop
-unrelated work; a fatal scheduler abort stops new starts and joins every active
-call before returning.
+inside the assignment's slot. An ordinary assignment failure suppresses its
+descendants but does not stop unrelated roots; a fatal scheduler abort stops
+new starts and joins every active call before returning.
 
 Concurrent outcomes are stored by plan index, keeping final reports, command
 records, findings, releases, and deterministic artifacts in plan order. Event
