@@ -1122,6 +1122,53 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_missing_path_fails_closed_after_durable_claim() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let telemetry = MegafileStore::open(&repo_path).expect("open telemetry");
+        telemetry
+            .record_file_samples([
+                FileSizeSample {
+                    path: PathBuf::from("missing"),
+                    bytes: 1,
+                    lines: 1,
+                },
+                FileSizeSample {
+                    path: PathBuf::from("missing/child.rs"),
+                    bytes: 1,
+                    lines: 1,
+                },
+            ])
+            .expect("seed ambiguous missing-path evidence");
+        let before = telemetry
+            .report()
+            .expect("telemetry before ambiguous claim");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+
+        let error = store
+            .claim_paths_with_telemetry("ambiguous-agent", ["missing"])
+            .expect_err("ambiguous missing path must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains(
+            "authenticated megafile telemetry contains both an exact file subject and descendant file subjects"
+        ));
+        assert!(message.contains("claim token 1 remains durable"));
+        assert!(message.contains("explicitly release token 1"));
+
+        let claims = store.snapshot().expect("durable ambiguous claim");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].paths, vec![PathBuf::from("missing")]);
+        let after = MegafileStore::open_existing(&repo_path)
+            .expect("query telemetry")
+            .expect("initialized telemetry")
+            .report()
+            .expect("telemetry after ambiguous claim");
+        assert_eq!(after.next_record_sequence, before.next_record_sequence);
+        assert_eq!(after.retained_records, before.retained_records);
+    }
+
+    #[test]
     fn repository_root_claim_is_rejected_without_telemetry_mutation() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");

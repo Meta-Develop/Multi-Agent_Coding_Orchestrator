@@ -223,6 +223,13 @@ pub struct MegafileStore {
     thresholds: MegafileThresholds,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimPathState {
+    ExistingDirectory,
+    ExistingNonDirectory,
+    Missing,
+}
+
 impl MegafileStore {
     pub fn open(repo_path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_thresholds(repo_path, MegafileThresholds::provisional_bootstrap())
@@ -371,31 +378,35 @@ impl MegafileStore {
 
         let mut targets = BTreeSet::new();
         for claimed_path in normalized_claims {
-            let existing_directory = self.claim_path_is_existing_directory(&claimed_path)?;
-            let mut matched_sample = false;
-            for sampled_path in &active_sampled_paths {
-                if sampled_path == &claimed_path {
-                    if !existing_directory {
-                        matched_sample = true;
-                        targets.insert(sampled_path.clone());
-                    }
-                } else if sampled_path.starts_with(&claimed_path) {
-                    matched_sample = true;
-                    targets.insert(sampled_path.clone());
-                }
-                if targets.len() > MAX_CLAIM_TELEMETRY_TARGETS {
+            let exact_sample = active_sampled_paths.contains(&claimed_path);
+            let descendants = active_sampled_paths
+                .iter()
+                .filter(|sampled_path| {
+                    sampled_path.as_path() != claimed_path
+                        && sampled_path.starts_with(&claimed_path)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            // Current filesystem type is authoritative without walking the
+            // claimed subtree. Only a missing path needs history inference:
+            // exact evidence means file, descendant evidence means directory,
+            // neither preserves exact fallback, and both are ambiguous.
+            let inferred_targets = match self.claim_path_state(&claimed_path)? {
+                ClaimPathState::ExistingDirectory => descendants,
+                ClaimPathState::ExistingNonDirectory => vec![claimed_path.clone()],
+                ClaimPathState::Missing if exact_sample && !descendants.is_empty() => {
                     bail!(
-                        "megafile claim telemetry expansion exceeds its {}-target limit",
-                        MAX_CLAIM_TELEMETRY_TARGETS
+                        "missing claimed path '{}' is ambiguous because authenticated megafile telemetry contains both an exact file subject and descendant file subjects",
+                        claimed_path.display()
                     );
                 }
-            }
+                ClaimPathState::Missing if exact_sample => vec![claimed_path.clone()],
+                ClaimPathState::Missing if !descendants.is_empty() => descendants,
+                ClaimPathState::Missing => vec![claimed_path.clone()],
+            };
 
-            // Preserve exact-path claim frequency for files that have not yet
-            // been sampled. A current directory never receives this fallback:
-            // only its authenticated sampled descendants are file subjects.
-            if !matched_sample && !existing_directory {
-                targets.insert(claimed_path);
+            for target in inferred_targets {
+                targets.insert(target);
                 if targets.len() > MAX_CLAIM_TELEMETRY_TARGETS {
                     bail!(
                         "megafile claim telemetry expansion exceeds its {}-target limit",
@@ -407,11 +418,14 @@ impl MegafileStore {
         Ok(targets.into_iter().collect())
     }
 
-    fn claim_path_is_existing_directory(&self, path: &Path) -> Result<bool> {
+    fn claim_path_state(&self, path: &Path) -> Result<ClaimPathState> {
         let absolute = self.repo_path.join(path);
         match fs::symlink_metadata(&absolute) {
-            Ok(metadata) => Ok(metadata.file_type().is_dir()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(ClaimPathState::ExistingDirectory),
+            Ok(_) => Ok(ClaimPathState::ExistingNonDirectory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ClaimPathState::Missing)
+            }
             Err(error) => Err(error).with_context(|| {
                 format!(
                     "failed to distinguish claimed file from directory at {}",
@@ -1117,6 +1131,130 @@ mod tests {
         assert_eq!(assessments[0].path, PathBuf::from("src/new.rs"));
         assert_eq!(assessments[0].claims_in_window, 1);
         assert!(assessments[0].is_megafile);
+    }
+
+    #[test]
+    fn directory_to_file_type_churn_uses_current_exact_file_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create former directory");
+        fs::write(repo_path.join("src/item.rs"), b"former child\n").expect("write former child");
+        let thresholds = MegafileThresholds {
+            file_bytes: u64::MAX,
+            file_lines: u64::MAX,
+            growth_bytes: u64::MAX,
+            growth_lines: u64::MAX,
+            claim_count: 1,
+            collision_count: u64::MAX,
+            activity_window_records: 64,
+            ..MegafileThresholds::provisional_bootstrap()
+        };
+        let store = test_store(&repo_path, thresholds).expect("open store");
+        store
+            .record_file_samples([FileSizeSample {
+                path: PathBuf::from("src/item.rs"),
+                bytes: 13,
+                lines: 1,
+            }])
+            .expect("record former descendant");
+
+        fs::remove_file(repo_path.join("src/item.rs")).expect("remove former child");
+        fs::remove_dir(repo_path.join("src")).expect("remove former directory");
+        fs::write(repo_path.join("src"), b"current file\n").expect("replace directory with file");
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: "file-agent".to_string(),
+            paths: vec![PathBuf::from("src")],
+        };
+
+        let assessments = store
+            .record_claim(&claim)
+            .expect("record current file claim");
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].path, PathBuf::from("src"));
+        assert_eq!(assessments[0].claims_in_window, 1);
+        assert_eq!(
+            store
+                .assess_path("src/item.rs")
+                .expect("assess stale descendant")
+                .expect("retained former sample")
+                .claims_in_window,
+            0
+        );
+    }
+
+    #[test]
+    fn missing_path_inference_is_deterministic_and_ambiguous_history_fails_closed() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let thresholds = MegafileThresholds {
+            file_bytes: u64::MAX,
+            file_lines: u64::MAX,
+            growth_bytes: u64::MAX,
+            growth_lines: u64::MAX,
+            claim_count: 1,
+            collision_count: u64::MAX,
+            activity_window_records: 64,
+            ..MegafileThresholds::provisional_bootstrap()
+        };
+        let store = test_store(&repo_path, thresholds).expect("open store");
+        store
+            .record_file_samples([
+                FileSizeSample {
+                    path: PathBuf::from("missing-exact"),
+                    bytes: 1,
+                    lines: 1,
+                },
+                FileSizeSample {
+                    path: PathBuf::from("missing-directory/child.rs"),
+                    bytes: 1,
+                    lines: 1,
+                },
+                FileSizeSample {
+                    path: PathBuf::from("missing-ambiguous"),
+                    bytes: 1,
+                    lines: 1,
+                },
+                FileSizeSample {
+                    path: PathBuf::from("missing-ambiguous/child.rs"),
+                    bytes: 1,
+                    lines: 1,
+                },
+            ])
+            .expect("record missing-path evidence");
+
+        for (token, claimed, expected) in [
+            (1, "missing-exact", "missing-exact"),
+            (2, "missing-directory", "missing-directory/child.rs"),
+            (3, "missing-new", "missing-new"),
+        ] {
+            let claim = PathClaim {
+                token: ClaimToken::from_u64(token),
+                agent_id: format!("agent-{token}"),
+                paths: vec![PathBuf::from(claimed)],
+            };
+            let assessments = store.record_claim(&claim).expect("record inferred claim");
+            assert_eq!(assessments.len(), 1);
+            assert_eq!(assessments[0].path, PathBuf::from(expected));
+        }
+
+        let before = store.report().expect("report before ambiguous claim");
+        let ambiguous = PathClaim {
+            token: ClaimToken::from_u64(4),
+            agent_id: "ambiguous-agent".to_string(),
+            paths: vec![PathBuf::from("missing-ambiguous")],
+        };
+        let error = store
+            .record_claim(&ambiguous)
+            .expect_err("ambiguous missing path must fail closed");
+        assert!(error.to_string().contains(
+            "authenticated megafile telemetry contains both an exact file subject and descendant file subjects"
+        ));
+        let after = store.report().expect("report after ambiguous claim");
+        assert_eq!(after.next_record_sequence, before.next_record_sequence);
+        assert_eq!(after.retained_records, before.retained_records);
     }
 
     #[test]
