@@ -97,6 +97,10 @@ impl HostProcessCapacity {
         Self { parallelism }
     }
 
+    pub(crate) const fn supervisor_children(self) -> usize {
+        self.parallelism.get()
+    }
+
     #[cfg(target_os = "linux")]
     const fn systemd_unit_slots(self) -> usize {
         // Slot zero is reserved for expedited operations. Adding that control slot leaves the
