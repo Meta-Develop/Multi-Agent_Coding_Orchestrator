@@ -206,7 +206,7 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
 }
 
 #[test]
-fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignments() -> Result<()> {
+fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("aliases.json");
@@ -247,7 +247,7 @@ fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignment
           ]
         }"#,
     )?;
-    let overlap_plan = run_success_json(&[
+    let overlap_error = run_failure_stderr(&[
         "supervise",
         "plan",
         path_str(&overlap)?,
@@ -255,14 +255,138 @@ fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignment
         path_str(&repo_path)?,
         "--json",
     ])?;
+    assert!(
+        overlap_error.contains(
+            "assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"
+        ),
+        "unexpected overlap error: {overlap_error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_from_goal_emits_disjoint_claims_semantics_and_traceability() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("goal.md");
+    fs::write(
+        &goal_path,
+        "Coordinate independent child orchestrators.\n\
+         - Update README.\n\
+         - Clarify documentation in README.\n\
+         - Update the ok function in src/lib.rs.\n\
+         - Explain the unmatched frobnicator.\n",
+    )?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+
+    assert_eq!(plan["version"], 1);
+    assert_eq!(plan["max_depth"], 2);
+    assert_eq!(plan["max_child_assignments"], 4);
+    assert!(plan.get("task_file").is_none());
     assert_eq!(
-        overlap_plan["assignments"][0]["assigned_paths"],
-        serde_json::json!(["src"])
+        plan["spec_fragment_ids"],
+        serde_json::json!([
+            "fragment-001",
+            "fragment-002",
+            "fragment-003",
+            "fragment-004",
+            "fragment-005"
+        ])
+    );
+
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0]["id"], "assignment-001");
+    assert_eq!(assignments[0]["role"], "child_orchestrator");
+    assert_eq!(
+        assignments[0]["assigned_paths"],
+        serde_json::json!(["README.md"])
     );
     assert_eq!(
-        overlap_plan["assignments"][1]["assigned_paths"],
+        assignments[0]["spec_fragment_ids"],
+        serde_json::json!(["fragment-002", "fragment-003"])
+    );
+    assert_eq!(
+        assignments[0]["worker_assignments"][0]["id"],
+        "assignment-001-worker"
+    );
+    assert_eq!(
+        assignments[0]["worker_assignments"][0]["assigned_paths"],
+        serde_json::json!(["README.md"])
+    );
+
+    assert_eq!(assignments[1]["id"], "assignment-002");
+    assert_eq!(
+        assignments[1]["assigned_paths"],
         serde_json::json!(["src/lib.rs"])
     );
+    assert_eq!(
+        assignments[1]["semantic_symbols"],
+        serde_json::json!(["crate::ok"])
+    );
+    assert_eq!(
+        assignments[1]["spec_fragment_ids"],
+        serde_json::json!(["fragment-004"])
+    );
+    assert_eq!(
+        assignments[1]["worker_assignments"][0]["semantic_symbols"],
+        serde_json::json!(["crate::ok"])
+    );
+
+    assert_eq!(
+        plan["assignment_schedule"],
+        serde_json::json!([
+            {
+                "assignment_id": "assignment-001",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "assignment-002",
+                "depth": 2,
+                "flattened_index": 1
+            }
+        ])
+    );
+    assert_eq!(
+        plan["coverage_gaps"]
+            .as_array()
+            .context("coverage gaps")?
+            .iter()
+            .map(|gap| gap["spec_fragment_id"].as_str().context("gap fragment"))
+            .collect::<Result<Vec<_>>>()?,
+        vec!["fragment-001", "fragment-005"]
+    );
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let task_path = temp.path().join("empty-plan-task.txt");
+    fs::write(&task_path, "Explain the unmatched frobnicator.\n")?;
+
+    let error = run_failure_stderr(&[
+        "supervise",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert!(error.contains("goal/spec produced no actionable workstreams"));
+    assert!(error.contains("repository path, Rust module, or Rust symbol"));
+    assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }
 
@@ -651,7 +775,7 @@ fn supervise_prune_deletes_only_finalized_old_runs() -> Result<()> {
 }
 
 #[test]
-fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
+fn supervise_plan_rejects_cross_assignment_semantic_conflicts_even_in_warn_mode() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n")?;
@@ -683,7 +807,7 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         }))?,
     )?;
 
-    let plan = run_success_json(&[
+    let error = run_failure_stderr(&[
         "supervise",
         "plan",
         path_str(&plan_path)?,
@@ -691,25 +815,12 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert_eq!(plan["semantic_coordination"], "warn");
-    assert_eq!(
-        plan["assignments"].as_array().context("assignments")?.len(),
-        2
+    assert!(
+        error.contains(
+            "assignment 'child-a' and assignment 'child-b' overlap semantic symbol 'Shared' after normalization"
+        ),
+        "unexpected semantic conflict error: {error}"
     );
-
-    let stderr = run_failure_stderr(&[
-        "supervise",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "semantic-warn",
-        "--runtime",
-        "fake",
-        "--json",
-    ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     Ok(())
 }
 
@@ -796,7 +907,7 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
 }
 
 #[test]
-fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
+fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let cases = [
@@ -805,7 +916,7 @@ fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
             serde_json::json!({
                 "version": 1,
                 "task": "bad depth",
-                "max_depth": 3,
+                "max_depth": 33,
                 "max_child_assignments": 1,
                 "assignments": [{"id": "child-a", "assigned_paths": ["README.md"]}]
             }),

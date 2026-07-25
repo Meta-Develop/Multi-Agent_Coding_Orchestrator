@@ -76,6 +76,7 @@ const MAX_PROMPT_TASK_BYTES: u64 = 32 * 1024;
 const MAX_PROMPT_EXCERPT_BYTES: u64 = 32 * 1024;
 const MAX_PROMPT_EXCERPT_TOTAL_BYTES: usize = 48 * 1024;
 const MAX_PROMPT_PATHS: usize = 64;
+const MAX_SUPERVISE_GOAL_FILE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -730,58 +731,83 @@ struct SuperviseCommand {
 
 impl SuperviseCommand {
     fn run(self) -> Result<()> {
-        match self.command {
-            SuperviseSubcommand::Plan(args) => {
-                let plan =
-                    supervise::supervisor_plan_document_from_task_file(args.repo, args.task_file)?;
-                print_query_report(&plan, args.json)
-            }
-            SuperviseSubcommand::Run(args) => {
-                supervise::validate_max_concurrent_children(args.max_concurrent_children)?;
-                let resolved = resolve_run_id_for_run(
-                    &args.repo,
-                    RunArtifactFamily::Supervise,
-                    args.run_id.as_deref(),
-                    args.json,
-                )?;
-                let report = supervise::run_supervisor_plan_file_with_max_concurrent_children(
-                    SupervisorRunOptions {
-                        repo: resolved.repo,
-                        plan_file: args.supervisor_plan,
-                        run_id: resolved.run_id,
-                        codex_bin: args.codex_bin,
-                        runtime: args.runtime,
-                        allow_dirty_primary: args.allow_dirty_primary,
-                    },
-                    args.max_concurrent_children,
-                )?;
-                print_query_report(&report, args.json)?;
-                if !report.success {
-                    bail!("supervise run failed");
+        run_supervise_command(self.command)
+    }
+}
+
+fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
+    match command {
+        SuperviseSubcommand::Plan(args) => {
+            let PlanSuperviseArgs {
+                task_file,
+                from_goal,
+                repo,
+                json,
+            } = args;
+            let plan = match (task_file, from_goal) {
+                (Some(task_file), None) => {
+                    supervise::supervisor_plan_document_from_task_file(repo, task_file)?
                 }
-                Ok(())
-            }
-            SuperviseSubcommand::Status(args) => {
-                let report = supervise::supervisor_status(args.repo, RunId::new(&args.run_id)?)?;
-                print_query_report(&report, args.json)
-            }
-            SuperviseSubcommand::Collect(args) => {
-                let report =
-                    supervise::collect_supervisor_run(args.repo, RunId::new(&args.run_id)?)?;
-                print_query_report(&report, args.json)?;
-                if !report.success {
-                    bail!("supervise run failed");
+                (None, Some(goal_file)) => {
+                    let goal_spec = BoundedRegularReader::read_tree_no_follow_utf8(
+                        &goal_file,
+                        MAX_SUPERVISE_GOAL_FILE_BYTES,
+                    )
+                    .with_context(|| {
+                        format!("failed to read goal/spec file {}", goal_file.display())
+                    })?;
+                    supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec)?
                 }
-                Ok(())
-            }
-            SuperviseSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Supervise),
+                _ => bail!(
+                    "supervise plan requires exactly one positional TASK_FILE or --from-goal <FILE>"
+                ),
+            };
+            print_query_report(&plan, json)
         }
+        SuperviseSubcommand::Run(args) => {
+            supervise::validate_max_concurrent_children(args.max_concurrent_children)?;
+            let resolved = resolve_run_id_for_run(
+                &args.repo,
+                RunArtifactFamily::Supervise,
+                args.run_id.as_deref(),
+                args.json,
+            )?;
+            let report = supervise::run_supervisor_plan_file_with_max_concurrent_children(
+                SupervisorRunOptions {
+                    repo: resolved.repo,
+                    plan_file: args.supervisor_plan,
+                    run_id: resolved.run_id,
+                    codex_bin: args.codex_bin,
+                    runtime: args.runtime,
+                    allow_dirty_primary: args.allow_dirty_primary,
+                },
+                args.max_concurrent_children,
+            )?;
+            print_query_report(&report, args.json)?;
+            if !report.success {
+                bail!("supervise run failed");
+            }
+            Ok(())
+        }
+        SuperviseSubcommand::Status(args) => {
+            let report = supervise::supervisor_status(args.repo, RunId::new(&args.run_id)?)?;
+            print_query_report(&report, args.json)
+        }
+        SuperviseSubcommand::Collect(args) => {
+            let report = supervise::collect_supervisor_run(args.repo, RunId::new(&args.run_id)?)?;
+            print_query_report(&report, args.json)?;
+            if !report.success {
+                bail!("supervise run failed");
+            }
+            Ok(())
+        }
+        SuperviseSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Supervise),
     }
 }
 
 #[derive(Debug, Subcommand)]
 enum SuperviseSubcommand {
-    /// Convert a task file or JSON supervisor plan into a normalized supervisor plan.
+    /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
     /// Run a supervisor plan with child Codex CLI orchestrators.
     Run(RunSuperviseArgs),
@@ -795,8 +821,16 @@ enum SuperviseSubcommand {
 
 #[derive(Debug, Args)]
 struct PlanSuperviseArgs {
-    /// Task file or JSON supervisor plan file.
-    task_file: PathBuf,
+    /// Plain-text task/spec file or JSON supervisor plan file.
+    #[arg(
+        value_name = "TASK_FILE",
+        required_unless_present = "from_goal",
+        conflicts_with = "from_goal"
+    )]
+    task_file: Option<PathBuf>,
+    /// High-level goal/spec file to decompose, even when its contents are valid JSON.
+    #[arg(long, value_name = "FILE", conflicts_with = "task_file")]
+    from_goal: Option<PathBuf>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -4051,4 +4085,48 @@ fn print_owner_report(report: &OwnerReport, json: bool) -> Result<()> {
         println!("{}\t<unclaimed>", report.path.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervise_plan_requires_exactly_one_positional_or_goal_source() {
+        let positional =
+            Cli::try_parse_from(["maco", "supervise", "plan", "task.txt", "--repo", "repo"])
+                .expect("positional task source should parse");
+        let Command::Supervise(SuperviseCommand {
+            command: SuperviseSubcommand::Plan(positional),
+        }) = positional.command
+        else {
+            panic!("expected supervise plan command");
+        };
+        assert_eq!(positional.task_file, Some(PathBuf::from("task.txt")));
+        assert_eq!(positional.from_goal, None);
+        assert_eq!(positional.repo, PathBuf::from("repo"));
+
+        let from_goal =
+            Cli::try_parse_from(["maco", "supervise", "plan", "--from-goal", "goal.md"])
+                .expect("--from-goal source should parse");
+        let Command::Supervise(SuperviseCommand {
+            command: SuperviseSubcommand::Plan(from_goal),
+        }) = from_goal.command
+        else {
+            panic!("expected supervise plan command");
+        };
+        assert_eq!(from_goal.task_file, None);
+        assert_eq!(from_goal.from_goal, Some(PathBuf::from("goal.md")));
+
+        assert!(Cli::try_parse_from(["maco", "supervise", "plan"]).is_err());
+        assert!(Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "plan",
+            "task.txt",
+            "--from-goal",
+            "goal.md",
+        ])
+        .is_err());
+    }
 }

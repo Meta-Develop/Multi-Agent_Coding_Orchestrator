@@ -64,8 +64,10 @@ The current implementation covers a local-first command-line slice:
   blocked, ready-for-review, handoff, and done work.
 - `maco llm providers` and `maco llm prompt-preview` expose the provider-neutral prompt boundary without network calls.
 - `maco agent run` is temporarily unsupported because verified agent assignment creation depends on the disabled managed-worktree creation boundary.
-- `maco supervise plan` normalizes an opt-in supervisor task or JSON plan for
-  Codex CLI subprocess orchestration.
+- `maco supervise plan <task-or-plan-file>` normalizes the existing plain-text
+  task or JSON plan form, while `maco supervise plan --from-goal <file>`
+  explicitly decomposes a high-level goal/spec into a validated full supervisor
+  plan.
 - `maco supervise run` uses the Codex runtime by default and is supported. It
   internally acquires the repository-cleanliness capability and creates
   capability-bound managed child worktrees. The in-process Fake file-entry
@@ -138,10 +140,10 @@ Known limitations and roadmap for 0.3.0:
 1. Semantic merge conflict classification is advisory and Rust-only. It is
    bounded by parser-map coverage and reports degraded confidence when a
    conflict path cannot be resolved; Git safety checks remain authoritative.
-2. Semantic task planning, including automatic path-claim and orchestration-plan
-   proposal, is post-0.3.0 roadmap work. Current task-to-path proposals are
-   conservative helpers for autopilot and inbox defaults; claim gates remain
-   authoritative.
+2. Goal/spec planning now proposes independent supervisor assignments with path
+   and Rust semantic scopes. The proposal remains conservative and Rust-first;
+   richer semantic planning, broader language adapters, and automatic refinement
+   remain post-0.3.0 work. Runtime claim gates remain authoritative.
 3. PR and issue publication are intentionally narrow. The fake forge is
    deterministic and local-only. GitHub publication is opt-in with explicit
    `--forge github` and shells out to local `git` and `gh`; tests cover the
@@ -1246,6 +1248,14 @@ cargo run -- agent run task.md --agent-id agent-a --path README.md --fake-propos
 
 Run an opt-in supervisor-of-orchestrators plan:
 
+```markdown
+# goal.md
+
+- Update the README examples.
+- Update `src/cli.rs` and the `PlanSuperviseArgs` contract.
+- Add focused coverage in `tests/supervise_cli.rs`.
+```
+
 ```json
 {
   "version": 1,
@@ -1282,6 +1292,9 @@ Run an opt-in supervisor-of-orchestrators plan:
 ```
 
 ```bash
+# Explicitly decompose a high-level goal/spec:
+cargo run -- supervise plan --from-goal goal.md --repo . --json
+# Preserve the positional form for either plain-text tasks or authored JSON plans:
 cargo run -- supervise plan supervisor-plan.json --repo . --json
 # Uses the supported default Codex runtime and creates capability-bound child worktrees:
 cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --max-concurrent-children 2 --json
@@ -1289,6 +1302,47 @@ cargo run -- supervise status supervise-demo --repo . --json
 cargo run -- supervise collect supervise-demo --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
 ```
+
+`supervise plan` requires exactly one input source. The positional
+`TASK_FILE` keeps its existing contract: valid JSON is normalized as an authored
+supervisor plan, and other UTF-8 text is treated as a task specification.
+`--from-goal <FILE>` is mutually exclusive with the positional input and always
+treats the bounded UTF-8 file as a high-level goal/spec, even if its contents
+happen to be valid JSON.
+
+Goal/spec planning fragments the source, proposes one independent child
+orchestrator per disjoint workstream, and gives each assignment `assigned_paths`
+plus any parser-backed Rust `semantic_symbols` and `semantic_modules`. These are
+proposed path claims and semantic intents; `supervise run` still acquires and
+enforces the authoritative runtime claims. Fragments whose scopes overlap are
+coalesced, and the complete proposal is checked for path, module, and symbol
+disjointness before the validated plan is emitted or any child can launch.
+
+The emitted document is directly usable as a supervisor plan and preserves
+lowering traceability through top-level `spec_fragment_ids`, per-assignment
+`spec_fragment_ids`, and `assignment_schedule`. Unmatched fragments appear as
+`coverage_gaps` instead of disappearing. After execution, the final report's
+`assignment_traceability` connects those fragments and assignments to produced
+changed paths and candidate diff bindings; missing reports, no-change results,
+and missing diff bindings add runtime coverage gaps.
+
+Depth is plan data. Authored plans may use recursive `child_assignments` up to
+their configured `max_depth` (currently 2 through 32), and normalization records
+each assignment's `parent_assignment_id`, depth, and flattened index. The
+goal/spec planner currently emits independent root O1 assignments at depth 2.
+The scheduler also currently executes recursive trees as a deterministic flat
+pre-order of MACO-visible O1 assignments: parent/depth fields provide
+traceability, but do **not** enforce a parent-completion dependency or launch a
+nested subprocess under that parent. Plans that require a parent result before
+a child starts must encode that work as separate serialized stages for now.
+
+Zero-work plans fail closed. Goal/spec input with no repository path, Rust
+module, or Rust symbol match returns an actionable error asking for a concrete
+scope. The older Issue #14 description's claim that `supervise run` silently
+succeeded with an empty assignment list was already stale before this CLI
+surface: supervisor plan validation already rejected an empty `assignments`
+array. The run path continues to use that library validation and does not
+reimplement a second empty-plan check.
 
 `maco supervise run` is supported with the default Codex runtime. Its file-entry
 path internally acquires the repository-cleanliness capability used to create
