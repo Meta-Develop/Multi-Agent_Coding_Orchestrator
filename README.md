@@ -224,6 +224,8 @@ RECOVERY_BASE="$COMMON/maco/offline-recovery"
 
 test -x "$DEV"
 test -x "$PINNED"
+mv --version | grep -F 'GNU coreutils' >/dev/null
+mv --no-copy --help >/dev/null
 test -d "$STATE"
 test -d "$ORPHAN"
 test ! -L "$ORPHAN"
@@ -332,18 +334,21 @@ hash_tree "$ORPHAN" >"$RECOVERY/orphan.sha256.before"
 sync -f -- "$RECOVERY"
 ```
 
-Prove the recovery directory is on the same filesystem, then atomically
-quarantine the complete namespace with one rename. Do not copy individual
-journals or synthesize a locator. The quarantined namespace is forensic
-evidence and must never be adopted, re-anchored, restored into active state, or
-used as migration input.
+The prerequisite checks above require GNU Coreutils `mv` with `--no-copy`.
+Prove the orphan namespace and recovery directory are on the same filesystem,
+then atomically quarantine the complete namespace with one rename. `--no-copy`
+makes a failed rename fail closed instead of falling back to copy-and-delete.
+Do not copy individual journals or synthesize a locator. The quarantined
+namespace is forensic evidence and must never be adopted, re-anchored, restored
+into active state, or used as migration input.
 
 ```bash
+test "$(stat -c %d -- "$ORPHAN")" = "$(stat -c %d -- "$RECOVERY")"
 test "$(stat -c %d -- "$STATE")" = "$(stat -c %d -- "$RECOVERY")"
 QUARANTINED="$RECOVERY/authenticated-claims-state-v1"
 test ! -e "$QUARANTINED"
 
-mv -T -- "$ORPHAN" "$QUARANTINED"
+mv --no-copy -T -- "$ORPHAN" "$QUARANTINED"
 test ! -e "$ORPHAN"
 sync -f -- "$STATE" "$RECOVERY"
 
