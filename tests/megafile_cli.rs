@@ -166,6 +166,194 @@ fn sync_claim_threshold_overrides_are_applied_and_typed() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn sync_directory_claim_warns_for_seeded_files_in_deterministic_order() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("src/empty")).context("create source directories")?;
+    Repository::init(&repo_path).context("init repo")?;
+    fs::write(repo_path.join("src/large.rs"), b"large\n").context("write large source")?;
+    fs::write(repo_path.join("src/alpha.rs"), b"alpha\n").context("write alpha source")?;
+    let repo = path_str(&repo_path)?;
+
+    let seed = run_success_json(&[
+        "repo",
+        "megafile",
+        "seed",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--json",
+    ])?;
+    assert!(seed["assessments"]
+        .as_array()
+        .context("seed assessments")?
+        .iter()
+        .any(|assessment| {
+            assessment["path"] == "src/large.rs" && assessment["is_megafile"] == true
+        }));
+
+    let claim = run_success_json(&[
+        "sync",
+        "claim",
+        "directory-agent",
+        "src",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--claim-count",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(claim["claim"]["paths"][0], "src");
+    let warnings = claim["warnings"].as_array().context("typed warnings")?;
+    assert_eq!(warnings.len(), 2);
+    assert_eq!(warnings[0]["path"], "src/alpha.rs");
+    assert_eq!(warnings[1]["path"], "src/large.rs");
+    assert_eq!(warnings[1]["assessment"]["claims_in_window"], 1);
+    assert!(warnings[1]["assessment"]["signals"]
+        .as_array()
+        .context("large source warning signals")?
+        .iter()
+        .any(|signal| {
+            signal["kind"] == "claim_count" && signal["observed"] == 1 && signal["threshold"] == 1
+        }));
+
+    let file = run_success_json(&[
+        "repo",
+        "megafile",
+        "query",
+        "src/large.rs",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--claim-count",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(file["assessment"]["claims_in_window"], 1);
+    let directory = run_success_json(&[
+        "repo",
+        "megafile",
+        "query",
+        "src",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--json",
+    ])?;
+    assert!(
+        directory["assessment"].is_null(),
+        "a claimed directory must not become a source-file assessment"
+    );
+
+    run_success_json(&["sync", "release", "1", "--repo", repo, "--json"])?;
+    let empty = run_success_json(&[
+        "sync",
+        "claim",
+        "empty-directory-agent",
+        "src/empty",
+        "--repo",
+        repo,
+        "--claim-count",
+        "1",
+        "--json",
+    ])?;
+    assert!(empty["warnings"]
+        .as_array()
+        .context("empty directory warnings")?
+        .is_empty());
+    let empty_directory = run_success_json(&[
+        "repo",
+        "megafile",
+        "query",
+        "src/empty",
+        "--repo",
+        repo,
+        "--claim-count",
+        "1",
+        "--json",
+    ])?;
+    assert!(
+        empty_directory["assessment"].is_null(),
+        "an existing empty directory must not receive exact-file fallback"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn sync_directory_claim_frequency_crosses_threshold_across_releases() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("src")).context("create src")?;
+    Repository::init(&repo_path).context("init repo")?;
+    fs::write(repo_path.join("src/large.rs"), b"small\n").context("write source")?;
+    let repo = path_str(&repo_path)?;
+
+    run_success_json(&["repo", "megafile", "seed", "--repo", repo, "--json"])?;
+    let first = run_success_json(&[
+        "sync",
+        "claim",
+        "first-agent",
+        "src",
+        "--repo",
+        repo,
+        "--claim-count",
+        "2",
+        "--json",
+    ])?;
+    assert!(first["warnings"]
+        .as_array()
+        .context("first warnings")?
+        .is_empty());
+    run_success_json(&["sync", "release", "1", "--repo", repo, "--json"])?;
+
+    // Every CLI invocation reopens the authenticated claim and telemetry
+    // stores, exercising accumulation across independent runs.
+    let second = run_success_json(&[
+        "sync",
+        "claim",
+        "second-agent",
+        "src",
+        "--repo",
+        repo,
+        "--claim-count",
+        "2",
+        "--json",
+    ])?;
+    let warnings = second["warnings"].as_array().context("second warnings")?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["path"], "src/large.rs");
+    assert_eq!(warnings[0]["assessment"]["claims_in_window"], 2);
+    assert!(warnings[0]["assessment"]["signals"]
+        .as_array()
+        .context("second warning signals")?
+        .iter()
+        .any(|signal| {
+            signal["kind"] == "claim_count" && signal["observed"] == 2 && signal["threshold"] == 2
+        }));
+
+    let directory = run_success_json(&[
+        "repo",
+        "megafile",
+        "query",
+        "src",
+        "--repo",
+        repo,
+        "--claim-count",
+        "2",
+        "--json",
+    ])?;
+    assert!(directory["assessment"].is_null());
+
+    Ok(())
+}
+
 fn run_success_json(args: &[&str]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {
