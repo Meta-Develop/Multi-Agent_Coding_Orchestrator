@@ -423,7 +423,12 @@ impl MegafileStore {
         match fs::symlink_metadata(&absolute) {
             Ok(metadata) if metadata.file_type().is_dir() => Ok(ClaimPathState::ExistingDirectory),
             Ok(_) => Ok(ClaimPathState::ExistingNonDirectory),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 Ok(ClaimPathState::Missing)
             }
             Err(error) => Err(error).with_context(|| {
@@ -433,6 +438,31 @@ impl MegafileStore {
                 )
             }),
         }
+    }
+
+    fn current_directory_paths(&self, records: &[MegafileRecord]) -> Result<BTreeSet<PathBuf>> {
+        let paths = records
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut directories = BTreeSet::new();
+        for path in paths {
+            if self.claim_path_state(&path)? == ClaimPathState::ExistingDirectory {
+                directories.insert(path);
+            }
+        }
+        Ok(directories)
+    }
+
+    fn assess_current_path(
+        &self,
+        records: &[MegafileRecord],
+        path: &Path,
+    ) -> Result<Option<MegafileAssessment>> {
+        if self.claim_path_state(path)? == ClaimPathState::ExistingDirectory {
+            return Ok(None);
+        }
+        Ok(assess_path(records, path, &self.thresholds))
     }
 
     pub fn record_collision_paths<I, P>(&self, paths: I) -> Result<Vec<MegafileAssessment>>
@@ -490,12 +520,13 @@ impl MegafileStore {
     pub fn assess_path(&self, path: impl AsRef<Path>) -> Result<Option<MegafileAssessment>> {
         let path = normalize_telemetry_path(path.as_ref())?;
         let snapshot = self.read_snapshot()?;
-        let assessment = assess_path(&snapshot.records, &path, &self.thresholds);
-        Ok(assessment)
+        self.assess_current_path(&snapshot.records, &path)
     }
 
     pub fn report(&self) -> Result<MegafileReport> {
-        build_report(&self.read_snapshot()?, self.thresholds.clone())
+        let snapshot = self.read_snapshot()?;
+        let current_directories = self.current_directory_paths(&snapshot.records)?;
+        build_report(&snapshot, self.thresholds.clone(), &current_directories)
     }
 
     fn record_events_and_assess(
@@ -575,10 +606,15 @@ impl MegafileStore {
         self.validate_store(&store)?;
         affected_paths.sort();
         affected_paths.dedup();
-        Ok(affected_paths
-            .iter()
-            .filter_map(|path| assess_path(&store.current().value.records, path, &self.thresholds))
-            .collect())
+        let mut assessments = Vec::new();
+        for path in &affected_paths {
+            if let Some(assessment) =
+                self.assess_current_path(&store.current().value.records, path)?
+            {
+                assessments.push(assessment);
+            }
+        }
+        Ok(assessments)
     }
 
     fn ensure_initialized(&self) -> Result<()> {
@@ -789,6 +825,7 @@ fn set_physical_accounting(
 fn build_report(
     state: &AuthenticatedMegafileState,
     thresholds: MegafileThresholds,
+    current_directories: &BTreeSet<PathBuf>,
 ) -> Result<MegafileReport> {
     thresholds.validate()?;
     let paths = state
@@ -798,6 +835,7 @@ fn build_report(
         .collect::<BTreeSet<_>>();
     let assessments = paths
         .iter()
+        .filter(|path| !current_directories.contains(*path))
         .filter_map(|path| assess_path(&state.records, path, &thresholds))
         .collect();
     Ok(MegafileReport {
@@ -1185,6 +1223,52 @@ mod tests {
     }
 
     #[test]
+    fn file_to_directory_type_churn_excludes_current_directory_assessments() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create source parent");
+        fs::write(repo_path.join("src/large.rs"), b"former file\n").expect("write former file");
+        let thresholds = MegafileThresholds {
+            file_bytes: 1,
+            file_lines: u64::MAX,
+            growth_bytes: u64::MAX,
+            growth_lines: u64::MAX,
+            claim_count: u64::MAX,
+            collision_count: u64::MAX,
+            activity_window_records: 64,
+            ..MegafileThresholds::provisional_bootstrap()
+        };
+        let store = test_store(&repo_path, thresholds).expect("open store");
+        let seeded = store
+            .record_file_samples([FileSizeSample {
+                path: PathBuf::from("src/large.rs"),
+                bytes: 12,
+                lines: 1,
+            }])
+            .expect("record former file");
+        assert_eq!(seeded.len(), 1);
+        assert!(seeded[0].is_megafile);
+
+        fs::remove_file(repo_path.join("src/large.rs")).expect("remove former file");
+        fs::create_dir(repo_path.join("src/large.rs")).expect("replace file with directory");
+
+        assert!(store
+            .assess_path("src/large.rs")
+            .expect("assess current directory")
+            .is_none());
+        let report = store.report().expect("report current subjects");
+        assert!(report
+            .assessments
+            .iter()
+            .all(|assessment| assessment.path != Path::new("src/large.rs")));
+        assert!(report.records.iter().any(|record| {
+            record.path == Path::new("src/large.rs")
+                && matches!(record.kind, MegafileRecordKind::SizeSample { .. })
+        }));
+    }
+
+    #[test]
     fn missing_path_inference_is_deterministic_and_ambiguous_history_fails_closed() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -1305,7 +1389,8 @@ mod tests {
         assert!(rollover);
         assert_eq!(state.physical_snapshot_records, 1);
         assert!(state.physical_snapshot_bytes < MAX_ACCOUNTED_PHYSICAL_BYTES);
-        let report = build_report(&state, MegafileThresholds::default()).expect("report");
+        let report =
+            build_report(&state, MegafileThresholds::default(), &BTreeSet::new()).expect("report");
         assert_eq!(report.state_byte_limit, MAX_MEGAFILE_STATE_BYTES);
         assert!(report.serialized_state_bytes <= report.state_byte_limit);
     }

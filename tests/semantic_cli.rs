@@ -154,6 +154,67 @@ fn cli_semantic_risk_enriches_only_touched_threshold_crossing_paths() -> Result<
 }
 
 #[test]
+fn cli_semantic_risk_excludes_sampled_path_that_is_now_a_directory() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("src")).context("create src")?;
+    Repository::init(&repo_path).context("init repo")?;
+    fs::write(repo_path.join("src/churn.rs"), "pub fn former_file() {}\n")
+        .context("write former source file")?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+
+    let seeded = run_success_json([
+        "repo",
+        "megafile",
+        "seed",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--json",
+    ])?;
+    assert!(seeded["assessments"]
+        .as_array()
+        .context("seed assessments")?
+        .iter()
+        .any(|assessment| {
+            assessment["path"] == "src/churn.rs" && assessment["is_megafile"] == true
+        }));
+
+    fs::remove_file(repo_path.join("src/churn.rs")).context("remove former source file")?;
+    fs::create_dir(repo_path.join("src/churn.rs")).context("replace file with directory")?;
+
+    let telemetry = run_success_json([
+        "repo",
+        "megafile",
+        "query",
+        "src/churn.rs",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--json",
+    ])?;
+    assert!(telemetry["assessment"].is_null());
+
+    let risk = run_success_json([
+        "repo",
+        "query",
+        "risk",
+        "--path",
+        "src/churn.rs",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(risk["megafile_hotspots"], serde_json::json!([]));
+
+    Ok(())
+}
+
+#[test]
 fn cli_semantic_risk_propagates_authenticated_megafile_read_failures() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = temp.path().join("repo");
