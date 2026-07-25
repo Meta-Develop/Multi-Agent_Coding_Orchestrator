@@ -21,7 +21,12 @@
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
-use std::{fs, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    process::Command,
+};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
@@ -206,7 +211,7 @@ fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<(
 }
 
 #[test]
-fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignments() -> Result<()> {
+fn supervise_plan_normalizes_aliases_and_rejects_top_level_scope_conflicts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("aliases.json");
@@ -247,7 +252,7 @@ fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignment
           ]
         }"#,
     )?;
-    let overlap_plan = run_success_json(&[
+    let overlap_error = run_failure_stderr(&[
         "supervise",
         "plan",
         path_str(&overlap)?,
@@ -255,14 +260,256 @@ fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignment
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert_eq!(
-        overlap_plan["assignments"][0]["assigned_paths"],
-        serde_json::json!(["src"])
+    assert!(
+        overlap_error.contains(
+            "assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"
+        ),
+        "unexpected overlap error: {overlap_error}"
     );
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("goal.md");
+    fs::write(
+        &goal_path,
+        "Coordinate independent child orchestrators.\n\
+         - Update README.\n\
+         - Clarify documentation in README.\n\
+         - Update the ok function in src/lib.rs.\n\
+         - Explain the unmatched frobnicator.\n",
+    )?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+
+    assert_eq!(plan["version"], 1);
+    assert!(plan.get("task_file").is_none());
     assert_eq!(
-        overlap_plan["assignments"][1]["assigned_paths"],
-        serde_json::json!(["src/lib.rs"])
+        plan["spec_fragment_ids"],
+        serde_json::json!([
+            "fragment-001",
+            "fragment-002",
+            "fragment-003",
+            "fragment-004",
+            "fragment-005"
+        ])
     );
+
+    let string_array = |value: &Value, field: &str| -> Result<Vec<String>> {
+        value[field]
+            .as_array()
+            .with_context(|| format!("{field} must be an array"))?
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .map(str::to_string)
+                    .with_context(|| format!("{field} entry must be a string"))
+            })
+            .collect()
+    };
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    let assignments_by_id = assignments
+        .iter()
+        .map(|assignment| {
+            let id = assignment["id"]
+                .as_str()
+                .context("assignment id must be a string")?;
+            Ok((id.to_string(), assignment))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    assert_eq!(
+        assignments_by_id.len(),
+        assignments.len(),
+        "planner assignment ids must be unique"
+    );
+
+    let max_depth = plan["max_depth"]
+        .as_u64()
+        .context("max_depth must be an integer")?;
+    let max_child_assignments = plan["max_child_assignments"]
+        .as_u64()
+        .context("max_child_assignments must be an integer")?;
+    let schedule = plan["assignment_schedule"]
+        .as_array()
+        .context("assignment schedule")?;
+    assert_eq!(
+        schedule.len(),
+        assignments.len(),
+        "the schedule must cover every MACO-visible assignment"
+    );
+    assert!(
+        max_child_assignments >= schedule.len() as u64,
+        "the generated fan-out bound must admit the whole flattened schedule"
+    );
+
+    let mut scheduled_depths = BTreeMap::<String, u64>::new();
+    let mut root_ids = Vec::new();
+    let mut nested_entry_count = 0usize;
+    for (expected_index, entry) in schedule.iter().enumerate() {
+        let assignment_id = entry["assignment_id"]
+            .as_str()
+            .context("scheduled assignment id must be a string")?;
+        let depth = entry["depth"]
+            .as_u64()
+            .context("scheduled assignment depth must be an integer")?;
+        assert_eq!(
+            entry["flattened_index"].as_u64(),
+            Some(expected_index as u64),
+            "schedule order and flattened indexes must agree"
+        );
+        assert!(
+            assignments_by_id.contains_key(assignment_id),
+            "scheduled assignment {assignment_id} must be executable"
+        );
+        assert!(
+            (2..=max_depth).contains(&depth),
+            "scheduled depth must stay inside the declared plan bound"
+        );
+
+        if let Some(parent_id) = entry.get("parent_assignment_id").and_then(Value::as_str) {
+            let parent_depth = scheduled_depths.get(parent_id).copied().with_context(|| {
+                format!("nested assignment {assignment_id} must follow its parent {parent_id}")
+            })?;
+            assert_eq!(
+                depth,
+                parent_depth + 1,
+                "nested assignment depth must be exactly one below its parent"
+            );
+            assert!(depth > 2, "nested assignments must be deeper than O1 roots");
+            nested_entry_count += 1;
+        } else {
+            assert_eq!(
+                depth, 2,
+                "independent workstream roots must stay at depth 2"
+            );
+            root_ids.push(assignment_id.to_string());
+        }
+
+        assert!(
+            scheduled_depths
+                .insert(assignment_id.to_string(), depth)
+                .is_none(),
+            "each assignment must appear in the schedule exactly once"
+        );
+    }
+    assert!(
+        nested_entry_count > 0,
+        "goal planning must emit at least one genuine parented assignment"
+    );
+
+    let mut root_paths = root_ids
+        .iter()
+        .map(|root_id| {
+            let assignment = assignments_by_id
+                .get(root_id)
+                .with_context(|| format!("root assignment {root_id} must exist"))?;
+            string_array(assignment, "assigned_paths")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    root_paths.sort();
+    assert_eq!(
+        root_paths,
+        vec![
+            vec!["README.md".to_string()],
+            vec!["src/lib.rs".to_string()]
+        ],
+        "independent README and Rust workstreams must remain disjoint roots"
+    );
+
+    let mut readme_fragments = BTreeSet::new();
+    let mut rust_fragments = BTreeSet::new();
+    let mut rust_semantics = BTreeSet::new();
+    let mut readme_worker_preserves_path = false;
+    let mut rust_worker_preserves_path_and_semantics = false;
+    for assignment in assignments {
+        assert_eq!(assignment["role"], "child_orchestrator");
+        let assigned_paths = string_array(assignment, "assigned_paths")?;
+        let fragments = assignment
+            .get("spec_fragment_ids")
+            .map(|_| string_array(assignment, "spec_fragment_ids"))
+            .transpose()?
+            .unwrap_or_default();
+        let workers = assignment["worker_assignments"]
+            .as_array()
+            .context("worker assignments must be an array")?;
+
+        match assigned_paths.as_slice() {
+            [path] if path == "README.md" => {
+                readme_fragments.extend(fragments);
+                readme_worker_preserves_path |= workers.iter().any(|worker| {
+                    string_array(worker, "assigned_paths").is_ok_and(|paths| paths == ["README.md"])
+                });
+            }
+            [path] if path == "src/lib.rs" => {
+                rust_fragments.extend(fragments);
+                rust_semantics.extend(string_array(assignment, "semantic_symbols")?);
+                rust_worker_preserves_path_and_semantics |= workers.iter().any(|worker| {
+                    string_array(worker, "assigned_paths")
+                        .is_ok_and(|paths| paths == ["src/lib.rs"])
+                        && string_array(worker, "semantic_symbols")
+                            .is_ok_and(|symbols| symbols == ["crate::ok"])
+                });
+            }
+            other => panic!("unexpected generated assignment scope: {other:?}"),
+        }
+    }
+    assert_eq!(
+        readme_fragments,
+        BTreeSet::from(["fragment-002".to_string(), "fragment-003".to_string()])
+    );
+    assert_eq!(rust_fragments, BTreeSet::from(["fragment-004".to_string()]));
+    assert_eq!(rust_semantics, BTreeSet::from(["crate::ok".to_string()]));
+    assert!(
+        readme_worker_preserves_path,
+        "README execution must retain its worker path claim"
+    );
+    assert!(
+        rust_worker_preserves_path_and_semantics,
+        "Rust execution must retain its worker path and semantic traceability"
+    );
+
+    assert_eq!(
+        plan["coverage_gaps"]
+            .as_array()
+            .context("coverage gaps")?
+            .iter()
+            .map(|gap| gap["spec_fragment_id"].as_str().context("gap fragment"))
+            .collect::<Result<Vec<_>>>()?,
+        vec!["fragment-001", "fragment-005"]
+    );
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let task_path = temp.path().join("empty-plan-task.txt");
+    fs::write(&task_path, "Explain the unmatched frobnicator.\n")?;
+
+    let error = run_failure_stderr(&[
+        "supervise",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert!(error.contains("goal/spec produced no actionable workstreams"));
+    assert!(error.contains("repository path, Rust module, or Rust symbol"));
+    assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }
 
@@ -651,7 +898,7 @@ fn supervise_prune_deletes_only_finalized_old_runs() -> Result<()> {
 }
 
 #[test]
-fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
+fn supervise_plan_rejects_cross_assignment_semantic_conflicts_even_in_warn_mode() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n")?;
@@ -683,7 +930,7 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         }))?,
     )?;
 
-    let plan = run_success_json(&[
+    let error = run_failure_stderr(&[
         "supervise",
         "plan",
         path_str(&plan_path)?,
@@ -691,25 +938,12 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert_eq!(plan["semantic_coordination"], "warn");
-    assert_eq!(
-        plan["assignments"].as_array().context("assignments")?.len(),
-        2
+    assert!(
+        error.contains(
+            "assignment 'child-a' and assignment 'child-b' overlap semantic symbol 'Shared' after normalization"
+        ),
+        "unexpected semantic conflict error: {error}"
     );
-
-    let stderr = run_failure_stderr(&[
-        "supervise",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "semantic-warn",
-        "--runtime",
-        "fake",
-        "--json",
-    ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     Ok(())
 }
 
@@ -796,7 +1030,7 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
 }
 
 #[test]
-fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
+fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let cases = [
@@ -805,7 +1039,7 @@ fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
             serde_json::json!({
                 "version": 1,
                 "task": "bad depth",
-                "max_depth": 3,
+                "max_depth": 33,
                 "max_child_assignments": 1,
                 "assignments": [{"id": "child-a", "assigned_paths": ["README.md"]}]
             }),
