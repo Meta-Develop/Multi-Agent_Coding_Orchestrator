@@ -4972,8 +4972,8 @@ fn validate_supervisor_plan(
                 assignment.id
             );
         }
-        assignment.semantic_symbols = sorted_unique_strings(&assignment.semantic_symbols);
-        assignment.semantic_modules = sorted_unique_strings(&assignment.semantic_modules);
+        assignment.semantic_symbols = normalize_semantic_symbols(&assignment.semantic_symbols);
+        assignment.semantic_modules = normalize_semantic_modules(&assignment.semantic_modules);
         validate_worker_assignments(assignment)?;
 
         let schedule = &mut metadata.assignment_schedule[index];
@@ -5208,8 +5208,8 @@ fn validate_worker_assignments(assignment: &mut OrchestratorAssignment) -> Resul
             id: worker.id.clone(),
             path,
         }));
-        worker.semantic_symbols = sorted_unique_strings(&worker.semantic_symbols);
-        worker.semantic_modules = sorted_unique_strings(&worker.semantic_modules);
+        worker.semantic_symbols = normalize_semantic_symbols(&worker.semantic_symbols);
+        worker.semantic_modules = normalize_semantic_modules(&worker.semantic_modules);
     }
     for (left_index, left) in assignment.worker_assignments.iter().enumerate() {
         for right in assignment
@@ -9544,14 +9544,39 @@ fn normalize_agent_id(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn sorted_unique_strings(values: &[String]) -> Vec<String> {
+fn normalize_semantic_symbols(values: &[String]) -> Vec<String> {
     values
         .iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .filter_map(|value| canonical_semantic_path(value, false))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn normalize_semantic_modules(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| canonical_semantic_path(value, true))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn canonical_semantic_path(value: &str, require_crate_root: bool) -> Option<String> {
+    let mut parts = value
+        .trim()
+        .split("::")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    if require_crate_root && parts.first().is_some_and(|part| part != "crate") {
+        parts.insert(0, "crate".to_string());
+    }
+    Some(parts.join("::"))
 }
 
 fn normalize_spec_fragment_ids(values: Vec<String>) -> Result<Vec<String>> {
@@ -10032,25 +10057,25 @@ mod tests {
             json!({
                 "id": "child-a",
                 "assigned_paths": ["src/a.rs"],
-                "semantic_symbols": [" SharedSymbol "]
+                "semantic_symbols": [" crate :: SharedSymbol "]
             }),
             json!({
                 "id": "child-b",
                 "assigned_paths": ["src/b.rs"],
-                "semantic_symbols": ["SharedSymbol"]
+                "semantic_symbols": ["crate::SharedSymbol"]
             }),
         )
-        .contains("semantic symbol 'SharedSymbol'"));
+        .contains("semantic symbol 'crate::SharedSymbol'"));
         assert!(collision_error(
             json!({
                 "id": "child-a",
                 "assigned_paths": ["src/a.rs"],
-                "semantic_modules": [" crate::shared "]
+                "semantic_modules": [" shared "]
             }),
             json!({
                 "id": "child-b",
                 "assigned_paths": ["src/b.rs"],
-                "semantic_modules": ["crate::shared"]
+                "semantic_modules": ["crate :: shared"]
             }),
         )
         .contains("semantic module 'crate::shared'"));
@@ -10080,12 +10105,12 @@ mod tests {
             json!({
                 "id": "worker-a",
                 "assigned_paths": ["src/a.rs"],
-                "semantic_modules": [" crate::shared "]
+                "semantic_modules": [" shared "]
             }),
             json!({
                 "id": "worker-b",
                 "assigned_paths": ["src/b.rs"],
-                "semantic_modules": ["crate::shared"]
+                "semantic_modules": ["crate :: shared"]
             }),
         )
         .contains("workers 'worker-a' and 'worker-b'"));
@@ -10093,15 +10118,15 @@ mod tests {
             json!({
                 "id": "worker-a",
                 "assigned_paths": ["src/a.rs"],
-                "semantic_symbols": [" SharedSymbol "]
+                "semantic_symbols": [" crate :: SharedSymbol "]
             }),
             json!({
                 "id": "worker-b",
                 "assigned_paths": ["src/b.rs"],
-                "semantic_symbols": ["SharedSymbol"]
+                "semantic_symbols": ["crate::SharedSymbol"]
             }),
         )
-        .contains("semantic symbol 'SharedSymbol'"));
+        .contains("semantic symbol 'crate::SharedSymbol'"));
         assert!(worker_collision_error(
             json!({
                 "id": "worker-a",
@@ -10138,7 +10163,7 @@ mod tests {
                 "worker_assignments": [{
                     "id": "worker-a",
                     "assigned_paths": ["src/a/worker.rs"],
-                    "semantic_symbols": [" SharedSymbol "]
+                    "semantic_symbols": [" crate :: SharedSymbol "]
                 }]
             }),
             json!({
@@ -10147,7 +10172,7 @@ mod tests {
                 "worker_assignments": [{
                     "id": "worker-b",
                     "assigned_paths": ["src/b/worker.rs"],
-                    "semantic_symbols": ["SharedSymbol"]
+                    "semantic_symbols": ["crate::SharedSymbol"]
                 }]
             }),
         )
@@ -10156,7 +10181,7 @@ mod tests {
             json!({
                 "id": "child-a",
                 "assigned_paths": ["src/a"],
-                "semantic_modules": [" crate::shared "]
+                "semantic_modules": [" shared "]
             }),
             json!({
                 "id": "child-b",
@@ -10164,7 +10189,7 @@ mod tests {
                 "worker_assignments": [{
                     "id": "worker-b",
                     "assigned_paths": ["src/b/worker.rs"],
-                    "semantic_modules": ["crate::shared"]
+                    "semantic_modules": ["crate :: shared"]
                 }]
             }),
         )
