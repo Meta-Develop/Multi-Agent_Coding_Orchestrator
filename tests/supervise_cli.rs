@@ -775,7 +775,7 @@ fn supervise_prune_deletes_only_finalized_old_runs() -> Result<()> {
 }
 
 #[test]
-fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
+fn supervise_plan_rejects_cross_assignment_semantic_conflicts_even_in_warn_mode() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     fs::write(repo_path.join("src/lib.rs"), "pub struct Shared;\n")?;
@@ -807,7 +807,7 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         }))?,
     )?;
 
-    let plan = run_success_json(&[
+    let error = run_failure_stderr(&[
         "supervise",
         "plan",
         path_str(&plan_path)?,
@@ -815,25 +815,12 @@ fn supervise_warn_mode_reports_same_plan_semantic_conflict() -> Result<()> {
         path_str(&repo_path)?,
         "--json",
     ])?;
-    assert_eq!(plan["semantic_coordination"], "warn");
-    assert_eq!(
-        plan["assignments"].as_array().context("assignments")?.len(),
-        2
+    assert!(
+        error.contains(
+            "assignment 'child-a' and assignment 'child-b' overlap semantic symbol 'Shared' after normalization"
+        ),
+        "unexpected semantic conflict error: {error}"
     );
-
-    let stderr = run_failure_stderr(&[
-        "supervise",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "semantic-warn",
-        "--runtime",
-        "fake",
-        "--json",
-    ])?;
-    assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     Ok(())
 }
 
@@ -920,7 +907,7 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
 }
 
 #[test]
-fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
+fn supervise_plan_enforces_depth_assignment_and_retry_bounds() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let cases = [
@@ -929,7 +916,7 @@ fn supervise_run_enforces_max_depth_and_process_budget() -> Result<()> {
             serde_json::json!({
                 "version": 1,
                 "task": "bad depth",
-                "max_depth": 3,
+                "max_depth": 33,
                 "max_child_assignments": 1,
                 "assignments": [{"id": "child-a", "assigned_paths": ["README.md"]}]
             }),
