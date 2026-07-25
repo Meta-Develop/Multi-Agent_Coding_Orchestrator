@@ -9,6 +9,68 @@ use std::{
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const ISSUE33_CLAIMS_V1: &[u8] = include_bytes!("fixtures/issue33/agent-files-claims-v1.json");
+const ISSUE33_CLAIMS_V1_SHA256: &str =
+    "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
+
+#[test]
+fn cli_attested_claims_v1_migration_restores_sync_status_and_worktree_gc() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repository = Repository::open(&repo_path).context("open repo")?;
+    let state_root = repository.commondir().join("maco/state");
+    fs::create_dir_all(&state_root).context("create legacy state root")?;
+    fs::write(state_root.join("claims.json"), ISSUE33_CLAIMS_V1)
+        .context("write checksum-less claims-v1 fixture")?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+
+    let migration = run_success_json([
+        "state",
+        "migrate",
+        "--repo",
+        repo,
+        "--apply",
+        "--acknowledge-unauthenticated-claims-v1",
+        "--expected-claims-v1-sha256",
+        ISSUE33_CLAIMS_V1_SHA256,
+        "--json",
+    ])?;
+    assert_eq!(migration["mode"], "apply");
+    assert_eq!(migration["status"], "applied");
+    assert_eq!(migration["manifest_generation"], 1);
+    let claims_entry = migration["entries"]
+        .as_array()
+        .context("migration entries")?
+        .iter()
+        .find(|entry| entry["store"] == "claims")
+        .context("claims migration entry")?;
+    assert_eq!(
+        claims_entry["provenance"],
+        "operator_attested_unauthenticated_import"
+    );
+    assert_eq!(claims_entry["sha256"], ISSUE33_CLAIMS_V1_SHA256);
+
+    let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+    let claims = status.as_array().context("status claims")?;
+    assert_eq!(claims.len(), 3);
+    assert_eq!(
+        claims
+            .iter()
+            .map(|claim| claim["token"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(20), Some(44), Some(66)]
+    );
+    assert_eq!(claims[0]["agent_id"], "o1-worktree-cleanup");
+    assert_eq!(claims[0]["paths"][0], ".maco");
+
+    let gc = run_success_json(["worktree", "gc", "--repo", repo, "--dry-run", "--json"])?;
+    assert_eq!(gc["dry_run"], true);
+    assert_eq!(gc["considered_count"], 0);
+    assert_eq!(gc["removed_count"], 0);
+    assert_eq!(gc["orphan_removed_count"], 0);
+
+    Ok(())
+}
 
 #[test]
 fn cli_repo_map_orchestrate_and_sync_status_json() -> Result<()> {
