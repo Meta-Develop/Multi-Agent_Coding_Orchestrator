@@ -212,6 +212,8 @@ unexpected result:
 ```bash
 set -euo pipefail
 umask 077
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
 REPO=/absolute/path/to/repository
 DEV=/absolute/path/to/reviewed-current-dev-maco
@@ -258,12 +260,31 @@ grep -Fq "is not anchored by any signed logical state" \
   "$RECOVERY/dev-before.stderr"
 ```
 
-Next use only the attached registry-pinned binary to obtain the plaintext claim
-array that it understands. For this incident, the attached checkout must be
-commit `373550870f9986224bc8b57a9b13019a3da02516`. That commit reads and writes
-plaintext claims-v1 and contains no authenticated-claims journal writer. Its
-output therefore proves only which plaintext claim view it interpreted; it
-does not prove that the captured orphan journal was emitted by that pin.
+The development command acquires the live persistent kernel lock before
+reporting the inventory error. Bind that lock's identity and copy the exact
+plaintext claims bytes before invoking the pin:
+
+```bash
+test -f "$STATE/claims.lock"
+test ! -L "$STATE/claims.lock"
+LIVE_CLAIMS_LOCK_ID=$(stat -c '%d:%i:%s:%f:%h' -- "$STATE/claims.lock")
+
+cp -- "$STATE/claims.json" "$RECOVERY/claims-v1.reviewed.json"
+chmod 0600 -- "$RECOVERY/claims-v1.reviewed.json"
+cmp -s -- "$STATE/claims.json" "$RECOVERY/claims-v1.reviewed.json"
+```
+
+The registry pin must never run against the live repository: its legacy
+create-new PID lock is incompatible with the live persistent kernel lock and
+could otherwise fail on or remove a stale parseable `claims.lock`. Instead,
+create an isolated throwaway Git repository under the owner-private recovery
+directory, prove that it has a different Git common directory, and give it only
+the copied plaintext claims-v1. For this incident, the attached checkout must
+be commit `373550870f9986224bc8b57a9b13019a3da02516`. That commit reads and
+writes plaintext claims-v1 and contains no authenticated-claims journal writer.
+Its isolated output therefore proves only which copied plaintext claim view it
+interpreted; it does not prove that the captured orphan journal was emitted by
+that pin.
 
 ```bash
 PINNED_CHECKOUT=$(realpath -e -- \
@@ -272,13 +293,33 @@ PINNED_HEAD=$(git -C "$PINNED_CHECKOUT" rev-parse --verify HEAD)
 printf '%s\n' "$PINNED_HEAD" >"$RECOVERY/pinned-head.txt"
 test "$PINNED_HEAD" = 373550870f9986224bc8b57a9b13019a3da02516
 
-"$PINNED" sync status --repo "$REPO" --json \
+PINNED_STAGE="$RECOVERY/pinned-plaintext-stage"
+test ! -e "$PINNED_STAGE"
+git init --quiet -- "$PINNED_STAGE"
+PINNED_STAGE_COMMON=$(git -C "$PINNED_STAGE" \
+  rev-parse --path-format=absolute --git-common-dir)
+PINNED_STAGE_COMMON=$(realpath -e -- "$PINNED_STAGE_COMMON")
+test "$PINNED_STAGE_COMMON" != "$COMMON"
+test "$(stat -c %d -- "$PINNED_STAGE_COMMON")" \
+  = "$(stat -c %d -- "$RECOVERY")"
+
+PINNED_STATE="$PINNED_STAGE_COMMON/maco/state"
+test ! -L "$PINNED_STATE"
+install -d -m 0700 -- "$PINNED_STATE"
+test ! -L "$PINNED_STATE"
+cp -- "$RECOVERY/claims-v1.reviewed.json" "$PINNED_STATE/claims.json"
+chmod 0600 -- "$PINNED_STATE/claims.json"
+cmp -s -- \
+  "$RECOVERY/claims-v1.reviewed.json" \
+  "$PINNED_STATE/claims.json"
+
+"$PINNED" sync status --repo "$PINNED_STAGE" --json \
   >"$RECOVERY/pinned-claims-view.json" \
   2>"$RECOVERY/pinned-claims-view.stderr"
-
-cp -- "$STATE/claims.json" "$RECOVERY/claims-v1.reviewed.json"
-chmod 0600 -- "$RECOVERY/claims-v1.reviewed.json"
+test ! -e "$PINNED_STATE/claims.lock"
 cmp -s -- "$STATE/claims.json" "$RECOVERY/claims-v1.reviewed.json"
+test "$(stat -c '%d:%i:%s:%f:%h' -- "$STATE/claims.lock")" \
+  = "$LIVE_CLAIMS_LOCK_ID"
 
 jq -e 'type == "object" and .version == 1
   and (.next_token | type == "number")
@@ -440,13 +481,13 @@ sync -f -- "$STATE" "$RECOVERY"
 ```
 
 Review the migration, sync-status, and GC reports and keep the full quarantine
-before resuming writers. Never run the registry-pinned writer against this
-repository again after migration; it was used only for the pre-migration
-plaintext view. Resume only the reviewed development binary. The new
-authenticated claims snapshot is supported by the attested claims-v1
-migration; the captured orphan journal remains unanchored and unadopted.
-Neither its writer provenance nor its authorization as the current logical
-state was established.
+before resuming writers. Never run the registry-pinned writer against the live
+repository at any point; its only permitted invocation is against the isolated
+pre-migration staging repository above. After migration, resume only the
+reviewed development binary. The new authenticated claims snapshot is
+supported by the attested claims-v1 migration; the captured orphan journal
+remains unanchored and unadopted. Neither its writer provenance nor its
+authorization as the current logical state was established.
 
 The first open of each migrated claims, semantic-intent, or managed-worktree
 consumer performs a recoverable retirement transaction while holding its
