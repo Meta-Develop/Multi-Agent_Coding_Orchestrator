@@ -11,8 +11,8 @@ use crate::{
     safe_state::{stable_checksum, FileIdentity, KernelStateLock, SafeRoot},
     state_journal::JournalSpec,
     state_migration::{
-        finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
-        LEGACY_RETIREMENT_DOMAIN,
+        decode_checksumless_legacy_claims_state, finalize_legacy_retirement,
+        prepare_legacy_retirement, LegacyAdoption, LEGACY_RETIREMENT_DOMAIN,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -524,17 +524,29 @@ impl SyncStore {
                 claims: Vec::new(),
             },
             LegacyAdoption::Present(bytes) => {
-                let legacy: PersistedSyncState = serde_json::from_slice(&bytes)
-                    .context("signed legacy claims state is malformed")?;
-                if legacy.version != STATE_VERSION
-                    || legacy.repository != *self.state.binding()
-                    || legacy.checksum != sync_state_checksum(&legacy)?
-                {
-                    bail!("signed legacy claims state failed repository/checksum validation");
-                }
-                let snapshot = SyncSnapshot {
-                    next_token: legacy.next_token,
-                    claims: legacy.claims,
+                let snapshot = match serde_json::from_slice::<PersistedSyncState>(&bytes) {
+                    Ok(legacy) => {
+                        if legacy.version != STATE_VERSION
+                            || legacy.repository != *self.state.binding()
+                            || legacy.checksum != sync_state_checksum(&legacy)?
+                        {
+                            bail!(
+                                "signed legacy claims state failed repository/checksum validation"
+                            );
+                        }
+                        SyncSnapshot {
+                            next_token: legacy.next_token,
+                            claims: legacy.claims,
+                        }
+                    }
+                    Err(_) => {
+                        let legacy = decode_checksumless_legacy_claims_state(&bytes)
+                            .context("signed operator-attested claims-v1 state is malformed")?;
+                        SyncSnapshot {
+                            next_token: legacy.next_token,
+                            claims: legacy.claims,
+                        }
+                    }
                 };
                 validate_sync_snapshot(&snapshot)?;
                 AuthenticatedClaimsState {
@@ -775,11 +787,19 @@ mod tests {
             set_record_claim_fault, FileSizeSample, MegafileStore, MegafileThresholdCalibration,
             MAX_CLAIM_TELEMETRY_TARGETS,
         },
-        state_migration::{set_legacy_retirement_fault, LegacyRetirementFaultPoint},
+        state_migration::{
+            migrate_repository_state_with_options, set_legacy_retirement_fault,
+            LegacyRetirementFaultPoint, StateMigrationOptions,
+        },
         worktree::WorktreeManager,
     };
     use git2::{Oid, Repository, Signature};
     use tempfile::TempDir;
+
+    const ISSUE33_CLAIMS_V1: &[u8] =
+        include_bytes!("../tests/fixtures/issue33/agent-files-claims-v1.json");
+    const ISSUE33_CLAIMS_V1_SHA256: &str =
+        "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -891,6 +911,54 @@ mod tests {
         assert!(!state_root.join(authentication_key_file_name()).exists());
         assert!(!state_root.join("repository_auth_epoch_v1").exists());
         assert!(!state_root.join(ClaimsSnapshotSpec::ROOT_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_bound_operator_attested_claims_v1_is_adopted_exactly_once() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repository = Repository::open(&repo_path).expect("repository");
+        let state_root = SafeRoot::open_or_create(repository.commondir().join("maco/state"))
+            .expect("state root");
+        AtomicStateWriter::write_direct(&state_root, "claims.json", ISSUE33_CLAIMS_V1)
+            .expect("literal claims-v1");
+        let options = StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: true,
+            expected_claims_v1_sha256: Some(ISSUE33_CLAIMS_V1_SHA256.to_string()),
+        };
+        migrate_repository_state_with_options(&repo_path, true, &options)
+            .expect("signed operator-attested migration");
+
+        let store = SyncStore::open(&repo_path).expect("manifest-bound claims-v1 adoption");
+        let lock = store.state.lock().expect("claims lock");
+        let snapshot = store.load_snapshot(&lock).expect("authenticated snapshot");
+        assert_eq!(snapshot.next_token, 67);
+        assert_eq!(
+            snapshot
+                .claims
+                .iter()
+                .map(|claim| claim.token.get())
+                .collect::<Vec<_>>(),
+            vec![20, 44, 66]
+        );
+        drop(lock);
+        assert_eq!(
+            store.owner_of(".maco").expect("fixture owner").owner,
+            Some("o1-worktree-cleanup".to_string())
+        );
+
+        let tombstone: serde_json::Value = serde_json::from_slice(
+            &fs::read(state_root.path().join("claims.json")).expect("active tombstone"),
+        )
+        .expect("tombstone JSON");
+        assert_eq!(tombstone["version"], 3);
+        let reopened = SyncStore::open(&repo_path).expect("authenticated reopen");
+        assert_eq!(
+            reopened.snapshot().expect("reopened claims"),
+            snapshot.claims
+        );
     }
 
     #[cfg(unix)]

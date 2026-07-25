@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "next_token": 67,
+  "claims": [
+    {
+      "token": 20,
+      "agent_id": "o1-worktree-cleanup",
+      "paths": [
+        ".maco"
+      ]
+    },
+    {
+      "token": 44,
+      "agent_id": "o1-guard-fix",
+      "paths": [
+        "scripts/audit-codex-terminal-role-launches",
+        "scripts/check-development-handoff-clean"
+      ]
+    },
+    {
+      "token": 66,
+      "agent_id": "history-rewrite-otherproj-o1",
+      "paths": [
+        "machine-root/projects/example/other-repo"
+      ]
+    }
+  ]
+}

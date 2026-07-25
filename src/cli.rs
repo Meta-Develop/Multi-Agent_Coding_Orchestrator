@@ -183,7 +183,20 @@ impl StateCommand {
     fn run(self) -> Result<()> {
         match self.command {
             StateSubcommand::Migrate(args) => {
-                let report = state_migration::migrate_repository_state(args.repo, args.apply)?;
+                let use_default_options = !args.acknowledge_unauthenticated_claims_v1
+                    && args.expected_claims_v1_sha256.is_none();
+                let options = state_migration::StateMigrationOptions {
+                    acknowledge_unauthenticated_claims_v1: args
+                        .acknowledge_unauthenticated_claims_v1,
+                    expected_claims_v1_sha256: args.expected_claims_v1_sha256,
+                };
+                let report = if use_default_options {
+                    state_migration::migrate_repository_state(args.repo, args.apply)?
+                } else {
+                    state_migration::migrate_repository_state_with_options(
+                        args.repo, args.apply, &options,
+                    )?
+                };
                 print_query_report(&report, args.json)
             }
         }
@@ -204,6 +217,12 @@ struct MigrateStateArgs {
     /// Apply the validated migration; requires every known state lock to be idle.
     #[arg(long)]
     apply: bool,
+    /// Attest that checksum-less claims-v1 provenance and exact bytes were independently verified.
+    #[arg(long)]
+    acknowledge_unauthenticated_claims_v1: bool,
+    /// Independently computed lowercase SHA-256 of the exact checksum-less claims-v1 bytes.
+    #[arg(long, value_name = "SHA256")]
+    expected_claims_v1_sha256: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
