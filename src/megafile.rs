@@ -33,6 +33,10 @@ const MAX_MEGAFILE_RECORD_BYTES: u64 = 9 * 1024 * 1024;
 const MAX_HISTORY_RECORDS: usize = 16_384;
 const MAX_EVENTS_PER_UPDATE: usize = 4_096;
 const MAX_REPLACEMENT_PATHS: usize = 1_024;
+/// A directory claim may fan out only to this many authenticated file
+/// subjects. The claim remains durable and telemetry fails closed rather than
+/// silently truncating a broader expansion.
+pub const MAX_CLAIM_TELEMETRY_TARGETS: usize = 1_024;
 const MAX_SNAPSHOT_ENVELOPE_BYTES: u64 = 64 * 1024;
 const MAX_ACCOUNTED_PHYSICAL_BYTES: u64 = 120 * 1024 * 1024;
 const MEGAFILE_LOGICAL_ID: &str = "megafile-history";
@@ -317,19 +321,104 @@ impl MegafileStore {
 
     pub fn record_claim(&self, claim: &PathClaim) -> Result<Vec<MegafileAssessment>> {
         run_record_claim_fault()?;
-        let mut paths = Vec::new();
-        let mut events = Vec::new();
-        for path in &claim.paths {
-            let path = normalize_telemetry_path(path)?;
-            paths.push(path.clone());
-            events.push((
-                path,
-                MegafileRecordKind::Claim {
-                    claim_token: claim.token.get(),
-                },
-            ));
+        let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+        let state_root = authenticator.state_root().clone();
+        let operation_lock = BoundStateLock::acquire(&state_root, MEGAFILE_OPERATION_LOCK)?;
+        let result = (|| {
+            let store = self.open_store_with_authenticator(authenticator)?;
+            let targets =
+                self.claim_telemetry_targets(&store.current().value.records, &claim.paths)?;
+            let mut paths = Vec::new();
+            let mut events = Vec::new();
+            for path in targets {
+                paths.push(path.clone());
+                events.push((
+                    path,
+                    MegafileRecordKind::Claim {
+                        claim_token: claim.token.get(),
+                    },
+                ));
+            }
+            self.record_events_and_assess_in_store(store, events, paths)
+        })();
+        finish_operation(result, operation_lock.verify(&state_root))
+    }
+
+    fn claim_telemetry_targets(
+        &self,
+        records: &[MegafileRecord],
+        claimed_paths: &[PathBuf],
+    ) -> Result<Vec<PathBuf>> {
+        let mut active_sampled_paths = BTreeSet::new();
+        for record in records {
+            match &record.kind {
+                MegafileRecordKind::SizeSample { .. } => {
+                    active_sampled_paths.insert(record.path.clone());
+                }
+                MegafileRecordKind::AcceptedDecomposition { .. } => {
+                    active_sampled_paths.remove(&record.path);
+                }
+                MegafileRecordKind::Claim { .. } | MegafileRecordKind::Collision => {}
+            }
         }
-        self.record_events_and_assess(events, paths)
+
+        let mut normalized_claims = claimed_paths
+            .iter()
+            .map(|path| normalize_telemetry_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        normalized_claims.sort();
+        normalized_claims.dedup();
+
+        let mut targets = BTreeSet::new();
+        for claimed_path in normalized_claims {
+            let existing_directory = self.claim_path_is_existing_directory(&claimed_path)?;
+            let mut matched_sample = false;
+            for sampled_path in &active_sampled_paths {
+                if sampled_path == &claimed_path {
+                    if !existing_directory {
+                        matched_sample = true;
+                        targets.insert(sampled_path.clone());
+                    }
+                } else if sampled_path.starts_with(&claimed_path) {
+                    matched_sample = true;
+                    targets.insert(sampled_path.clone());
+                }
+                if targets.len() > MAX_CLAIM_TELEMETRY_TARGETS {
+                    bail!(
+                        "megafile claim telemetry expansion exceeds its {}-target limit",
+                        MAX_CLAIM_TELEMETRY_TARGETS
+                    );
+                }
+            }
+
+            // Preserve exact-path claim frequency for files that have not yet
+            // been sampled. A current directory never receives this fallback:
+            // only its authenticated sampled descendants are file subjects.
+            if !matched_sample && !existing_directory {
+                targets.insert(claimed_path);
+                if targets.len() > MAX_CLAIM_TELEMETRY_TARGETS {
+                    bail!(
+                        "megafile claim telemetry expansion exceeds its {}-target limit",
+                        MAX_CLAIM_TELEMETRY_TARGETS
+                    );
+                }
+            }
+        }
+        Ok(targets.into_iter().collect())
+    }
+
+    fn claim_path_is_existing_directory(&self, path: &Path) -> Result<bool> {
+        let absolute = self.repo_path.join(path);
+        match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => Ok(metadata.file_type().is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to distinguish claimed file from directory at {}",
+                    absolute.display()
+                )
+            }),
+        }
     }
 
     pub fn record_collision_paths<I, P>(&self, paths: I) -> Result<Vec<MegafileAssessment>>
@@ -398,7 +487,7 @@ impl MegafileStore {
     fn record_events_and_assess(
         &self,
         events: Vec<(PathBuf, MegafileRecordKind)>,
-        mut affected_paths: Vec<PathBuf>,
+        affected_paths: Vec<PathBuf>,
     ) -> Result<Vec<MegafileAssessment>> {
         if events.is_empty() {
             return Ok(Vec::new());
@@ -413,53 +502,69 @@ impl MegafileStore {
         let state_root = authenticator.state_root().clone();
         let operation_lock = BoundStateLock::acquire(&state_root, MEGAFILE_OPERATION_LOCK)?;
         let result = (|| {
-            let mut store = self.open_store_with_authenticator(authenticator)?;
-            let mut value = store.current().value.clone();
-            let revision = value
-                .snapshot_revision
-                .checked_add(1)
-                .context("authenticated megafile snapshot revision exhausted")?;
-            for (path, kind) in events {
-                validate_record_kind(&kind)?;
-                let sequence = value.next_record_sequence;
-                value.next_record_sequence = sequence
-                    .checked_add(1)
-                    .context("megafile record sequence exhausted")?;
-                value.records.push(MegafileRecord {
-                    version: RECORD_VERSION,
-                    sequence,
-                    path,
-                    kind,
-                });
-            }
-            if value.records.len() > MAX_HISTORY_RECORDS {
-                let remove = value.records.len() - MAX_HISTORY_RECORDS;
-                value.records.drain(..remove);
-            }
-            value.snapshot_revision = revision;
-            let rollover = prepare_physical_accounting(
-                &mut value,
-                store.current().value.physical_snapshot_records,
-                store.current().value.physical_snapshot_bytes,
-            )?;
-            validate_state(&value)?;
-            if rollover {
-                let authenticator = repository_authenticator_key_only(&self.repo_path)?;
-                store = store.rollover(authenticator, revision, value)?;
-            } else {
-                store.commit(revision, value)?;
-            }
-            self.validate_store(&store)?;
-            affected_paths.sort();
-            affected_paths.dedup();
-            Ok(affected_paths
-                .iter()
-                .filter_map(|path| {
-                    assess_path(&store.current().value.records, path, &self.thresholds)
-                })
-                .collect())
+            let store = self.open_store_with_authenticator(authenticator)?;
+            self.record_events_and_assess_in_store(store, events, affected_paths)
         })();
         finish_operation(result, operation_lock.verify(&state_root))
+    }
+
+    fn record_events_and_assess_in_store(
+        &self,
+        mut store: AuthenticatedSnapshotStore<MegafileSnapshotSpec, AuthenticatedMegafileState>,
+        events: Vec<(PathBuf, MegafileRecordKind)>,
+        mut affected_paths: Vec<PathBuf>,
+    ) -> Result<Vec<MegafileAssessment>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        if events.len() > MAX_EVENTS_PER_UPDATE {
+            bail!(
+                "megafile update exceeds its event budget of {}",
+                MAX_EVENTS_PER_UPDATE
+            );
+        }
+        let mut value = store.current().value.clone();
+        let revision = value
+            .snapshot_revision
+            .checked_add(1)
+            .context("authenticated megafile snapshot revision exhausted")?;
+        for (path, kind) in events {
+            validate_record_kind(&kind)?;
+            let sequence = value.next_record_sequence;
+            value.next_record_sequence = sequence
+                .checked_add(1)
+                .context("megafile record sequence exhausted")?;
+            value.records.push(MegafileRecord {
+                version: RECORD_VERSION,
+                sequence,
+                path,
+                kind,
+            });
+        }
+        if value.records.len() > MAX_HISTORY_RECORDS {
+            let remove = value.records.len() - MAX_HISTORY_RECORDS;
+            value.records.drain(..remove);
+        }
+        value.snapshot_revision = revision;
+        let rollover = prepare_physical_accounting(
+            &mut value,
+            store.current().value.physical_snapshot_records,
+            store.current().value.physical_snapshot_bytes,
+        )?;
+        validate_state(&value)?;
+        if rollover {
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            store = store.rollover(authenticator, revision, value)?;
+        } else {
+            store.commit(revision, value)?;
+        }
+        self.validate_store(&store)?;
+        affected_paths.sort();
+        affected_paths.dedup();
+        Ok(affected_paths
+            .iter()
+            .filter_map(|path| assess_path(&store.current().value.records, path, &self.thresholds))
+            .collect())
     }
 
     fn ensure_initialized(&self) -> Result<()> {
@@ -967,6 +1072,51 @@ mod tests {
         assert_eq!(completed.claims_in_window, 0);
         assert_eq!(completed.collisions_in_window, 0);
         assert_eq!(completed.accepted_decompositions, 1);
+    }
+
+    #[test]
+    fn exact_file_fallback_excludes_existing_empty_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::create_dir_all(repo_path.join("src/empty")).expect("create empty directory");
+        fs::write(repo_path.join("src/new.rs"), b"fn new() {}\n").expect("write exact file");
+        let thresholds = MegafileThresholds {
+            file_bytes: u64::MAX,
+            file_lines: u64::MAX,
+            growth_bytes: u64::MAX,
+            growth_lines: u64::MAX,
+            claim_count: 1,
+            collision_count: u64::MAX,
+            activity_window_records: 64,
+            ..MegafileThresholds::provisional_bootstrap()
+        };
+        let store = test_store(&repo_path, thresholds).expect("open store");
+
+        let directory = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: "directory-agent".to_string(),
+            paths: vec![PathBuf::from("src/empty")],
+        };
+        assert!(store
+            .record_claim(&directory)
+            .expect("record directory claim")
+            .is_empty());
+        assert!(store
+            .assess_path("src/empty")
+            .expect("assess directory")
+            .is_none());
+
+        let file = PathClaim {
+            token: ClaimToken::from_u64(2),
+            agent_id: "file-agent".to_string(),
+            paths: vec![PathBuf::from("src/new.rs")],
+        };
+        let assessments = store.record_claim(&file).expect("record exact file claim");
+        assert_eq!(assessments.len(), 1);
+        assert_eq!(assessments[0].path, PathBuf::from("src/new.rs"));
+        assert_eq!(assessments[0].claims_in_window, 1);
+        assert!(assessments[0].is_megafile);
     }
 
     #[test]

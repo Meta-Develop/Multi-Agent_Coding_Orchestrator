@@ -396,7 +396,7 @@ impl SyncStore {
                 claim.token.get()
             )
         })?;
-        let warnings = assessments
+        let mut warnings = assessments
             .into_iter()
             .filter(|assessment| assessment.is_megafile)
             .map(|assessment| MegafileClaimWarning {
@@ -404,7 +404,8 @@ impl SyncStore {
                 path: assessment.path.clone(),
                 assessment,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        warnings.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(ClaimTelemetryOutcome { claim, warnings })
     }
 
@@ -772,6 +773,7 @@ mod tests {
         artifacts::state_auth::{authentication_key_file_name, sha256_hex},
         megafile::{
             set_record_claim_fault, FileSizeSample, MegafileStore, MegafileThresholdCalibration,
+            MAX_CLAIM_TELEMETRY_TARGETS,
         },
         state_migration::{set_legacy_retirement_fault, LegacyRetirementFaultPoint},
         worktree::WorktreeManager,
@@ -1070,6 +1072,87 @@ mod tests {
             .assess_path("src/lib.rs")
             .expect("assessment")
             .is_none());
+    }
+
+    #[test]
+    fn oversized_directory_expansion_fails_closed_after_durable_claim() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::create_dir_all(repo_path.join("root")).expect("create claimed directory");
+        let telemetry = MegafileStore::open(&repo_path).expect("open telemetry");
+        telemetry
+            .record_file_samples(
+                (0..=MAX_CLAIM_TELEMETRY_TARGETS).map(|index| FileSizeSample {
+                    path: PathBuf::from(format!("root/file-{index:04}.rs")),
+                    bytes: 1,
+                    lines: 1,
+                }),
+            )
+            .expect("seed pathological authenticated file subjects");
+        let before = telemetry.report().expect("telemetry before broad claim");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+
+        let error = store
+            .claim_paths_with_telemetry("root-agent", ["root"])
+            .expect_err("oversized expansion must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!(
+            "megafile claim telemetry expansion exceeds its {}-target limit",
+            MAX_CLAIM_TELEMETRY_TARGETS
+        )));
+        assert!(message.contains("claim token 1 remains durable"));
+        assert!(message.contains("explicitly release token 1"));
+
+        let claims = store.snapshot().expect("durable broad claim");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].token.get(), 1);
+        assert_eq!(claims[0].paths, vec![PathBuf::from("root")]);
+        let after = MegafileStore::open_existing(&repo_path)
+            .expect("query telemetry")
+            .expect("initialized telemetry")
+            .report()
+            .expect("telemetry after broad claim");
+        assert_eq!(after.next_record_sequence, before.next_record_sequence);
+        assert_eq!(after.retained_records, before.retained_records);
+        assert!(after.records.iter().all(|record| !matches!(
+            record.kind,
+            crate::megafile::MegafileRecordKind::Claim { .. }
+        )));
+    }
+
+    #[test]
+    fn repository_root_claim_is_rejected_without_telemetry_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let telemetry = MegafileStore::open(&repo_path).expect("open telemetry");
+        telemetry
+            .record_file_samples([FileSizeSample {
+                path: PathBuf::from("src/lib.rs"),
+                bytes: 1,
+                lines: 1,
+            }])
+            .expect("seed telemetry");
+        let before = telemetry.report().expect("telemetry before root claim");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+
+        let error = store
+            .claim_paths_with_telemetry("root-agent", ["."])
+            .expect_err("repository root claim must be rejected");
+
+        assert!(error.to_string().contains("path cannot be empty"));
+        assert!(store
+            .snapshot()
+            .expect("claims after rejected root")
+            .is_empty());
+        let after = MegafileStore::open_existing(&repo_path)
+            .expect("query telemetry")
+            .expect("initialized telemetry")
+            .report()
+            .expect("telemetry after rejected root claim");
+        assert_eq!(after.next_record_sequence, before.next_record_sequence);
+        assert_eq!(after.retained_records, before.retained_records);
     }
 
     #[test]
