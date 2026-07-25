@@ -26,8 +26,8 @@ use crate::{
         SemanticIntentToken, SemanticSnapshotSpec,
     },
     state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec, JOURNAL_ROOT_NAME},
-    sync::PathClaim,
-    sync_store::ClaimsSnapshotSpec,
+    sync::{PathClaim, SyncCoordinator, SyncSnapshot},
+    sync_store::{validate_state_path, ClaimsSnapshotSpec},
     worktree::ManagedSnapshotSpec,
 };
 use anyhow::{bail, Context, Result};
@@ -123,6 +123,14 @@ pub(crate) struct LegacyStateEntry {
     pub sha256: Option<String>,
     pub legacy_checksum: Option<String>,
     pub file_identity: Option<FileIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<LegacyStateProvenance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LegacyStateProvenance {
+    OperatorAttestedUnauthenticatedImport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -144,6 +152,12 @@ pub(crate) struct StateMigrationReport {
     pub entries: Vec<LegacyStateEntry>,
     pub hardened: bool,
     pub manifest_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StateMigrationOptions {
+    pub acknowledge_unauthenticated_claims_v1: bool,
+    pub expected_claims_v1_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -810,6 +824,27 @@ pub(crate) fn authenticated_legacy_adoption(
     {
         bail!("legacy state no longer matches its signed migration manifest entry");
     }
+    match entry.provenance {
+        Some(LegacyStateProvenance::OperatorAttestedUnauthenticatedImport) => {
+            if store_name != "claims"
+                || file_name != "claims.json"
+                || entry.legacy_checksum.is_some()
+            {
+                bail!("signed operator-attested legacy provenance is inconsistent");
+            }
+            decode_checksumless_legacy_claims_state(&bytes)
+                .context("signed checksum-less claims-v1 state is malformed")?;
+        }
+        None if store_name == "claims"
+            && file_name == "claims.json"
+            && decode_checksumless_legacy_claims_state(&bytes).is_ok() =>
+        {
+            bail!(
+                "signed checksum-less claims-v1 state lacks its operator-attested unauthenticated-import provenance"
+            );
+        }
+        None => {}
+    }
     Ok(LegacyAdoption::Present(bytes))
 }
 
@@ -883,6 +918,15 @@ pub(crate) fn migrate_repository_state(
     repo_path: impl AsRef<Path>,
     apply: bool,
 ) -> Result<StateMigrationReport> {
+    migrate_repository_state_with_options(repo_path, apply, &StateMigrationOptions::default())
+}
+
+pub(crate) fn migrate_repository_state_with_options(
+    repo_path: impl AsRef<Path>,
+    apply: bool,
+    options: &StateMigrationOptions,
+) -> Result<StateMigrationReport> {
+    validate_migration_options(options)?;
     let repo_path = repo_path.as_ref();
     let repository = Repository::discover(repo_path).with_context(|| {
         format!(
@@ -905,7 +949,7 @@ pub(crate) fn migrate_repository_state(
         });
     }
 
-    let preflight = preflight_legacy_state(repo_path, &common_dir, &state_path)?;
+    let preflight = preflight_legacy_state(repo_path, &common_dir, &state_path, options)?;
     let mut locks = acquire_existing_locks(&preflight)?;
     let transaction = load_transaction_if_present(&preflight)?;
     if let Some(transaction) = &transaction {
@@ -972,6 +1016,34 @@ pub(crate) fn migrate_repository_state(
         locks,
         transaction_lock,
     )
+}
+
+fn validate_migration_options(options: &StateMigrationOptions) -> Result<()> {
+    match (
+        options.acknowledge_unauthenticated_claims_v1,
+        options.expected_claims_v1_sha256.as_deref(),
+    ) {
+        (false, None) => Ok(()),
+        (false, Some(_)) => {
+            bail!(
+                "expected claims-v1 SHA-256 requires explicit unauthenticated claims-v1 acknowledgement"
+            )
+        }
+        (true, None) => {
+            bail!("unauthenticated claims-v1 acknowledgement requires an expected SHA-256")
+        }
+        (true, Some(expected)) if is_lowercase_sha256(expected) => Ok(()),
+        (true, Some(_)) => {
+            bail!("expected claims-v1 SHA-256 must be exactly 64 lowercase hexadecimal characters")
+        }
+    }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn migration_mode(apply: bool) -> StateMigrationMode {
@@ -1069,6 +1141,7 @@ fn preflight_legacy_state(
     repo_path: &Path,
     common_dir: &Path,
     state_path: &Path,
+    options: &StateMigrationOptions,
 ) -> Result<LegacyPreflight> {
     let common_root = SafeRoot::open_existing(common_dir)
         .context("Git common directory is unsafe for state migration")?;
@@ -1162,15 +1235,16 @@ fn preflight_legacy_state(
                 entries.push(retired_manifest_entry(repo_path, store, file_name, &bytes)?);
                 continue;
             }
-            let checksum = validate_legacy_checksum(file_name, &bytes, &expected_bindings)?;
+            let validation = validate_legacy_state(file_name, &bytes, &expected_bindings, options)?;
             entries.push(LegacyStateEntry {
                 store: store.to_string(),
                 file: file_name.to_string(),
                 present: true,
                 size: u64::try_from(bytes.len()).context("legacy state size overflowed")?,
                 sha256: Some(sha256_hex(&bytes)),
-                legacy_checksum: Some(checksum),
+                legacy_checksum: validation.legacy_checksum,
                 file_identity: Some(identity_for_path(state_root.direct_child(file_name)?)?),
+                provenance: validation.provenance,
             });
         } else {
             entries.push(missing_manifest_entry(store, file_name));
@@ -1344,6 +1418,7 @@ fn missing_manifest_entry(store: &str, file: &str) -> LegacyStateEntry {
         sha256: None,
         legacy_checksum: None,
         file_identity: None,
+        provenance: None,
     }
 }
 
@@ -1528,6 +1603,98 @@ struct LegacySemanticState {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ChecksumlessLegacyClaimsStateWire {
+    version: u32,
+    next_token: u64,
+    claims: Vec<ChecksumlessLegacyPathClaimWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChecksumlessLegacyPathClaimWire {
+    token: u64,
+    agent_id: String,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChecksumlessLegacyClaimsState {
+    pub(crate) next_token: u64,
+    pub(crate) claims: Vec<PathClaim>,
+}
+
+const MAX_LEGACY_SYNC_CLAIMS: usize = 4_096;
+const MAX_LEGACY_SYNC_PATHS: usize = 16_384;
+const MAX_LEGACY_AGENT_ID_BYTES: usize = 128;
+
+pub(crate) fn decode_checksumless_legacy_claims_state(
+    bytes: &[u8],
+) -> Result<ChecksumlessLegacyClaimsState> {
+    let wire: ChecksumlessLegacyClaimsStateWire = serde_json::from_slice(bytes)
+        .context("failed to decode strict checksum-less claims-v1 state")?;
+    if wire.version != 1 {
+        bail!("checksum-less claims state is not supported version 1");
+    }
+    if wire.next_token == 0 {
+        bail!("checksum-less claims state next_token must be nonzero");
+    }
+    if wire.claims.len() > MAX_LEGACY_SYNC_CLAIMS {
+        bail!(
+            "checksum-less claims state exceeds its claim budget of {} records",
+            MAX_LEGACY_SYNC_CLAIMS
+        );
+    }
+
+    let mut path_count = 0usize;
+    let claims = wire
+        .claims
+        .into_iter()
+        .map(|claim| {
+            if claim.agent_id.len() > MAX_LEGACY_AGENT_ID_BYTES {
+                bail!(
+                    "checksum-less claims state agent id exceeds {} bytes",
+                    MAX_LEGACY_AGENT_ID_BYTES
+                );
+            }
+            path_count = path_count
+                .checked_add(claim.paths.len())
+                .context("checksum-less claims state path count overflow")?;
+            if path_count > MAX_LEGACY_SYNC_PATHS {
+                bail!(
+                    "checksum-less claims state exceeds its aggregate path budget of {}",
+                    MAX_LEGACY_SYNC_PATHS
+                );
+            }
+            for path in &claim.paths {
+                validate_state_path(path)?;
+            }
+            Ok(PathClaim {
+                token: crate::sync::ClaimToken::from_u64(claim.token),
+                agent_id: claim.agent_id,
+                paths: claim.paths,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let snapshot = SyncSnapshot {
+        next_token: wire.next_token,
+        claims,
+    };
+    let canonical = SyncCoordinator::from_snapshot(snapshot.clone())
+        .context("checksum-less claims-v1 state failed structural claim validation")?
+        .to_snapshot()
+        .context("failed to canonicalize checksum-less claims-v1 state")?;
+    if canonical != snapshot {
+        bail!("checksum-less claims-v1 state is not in the canonical pinned-writer form");
+    }
+    Ok(ChecksumlessLegacyClaimsState {
+        next_token: snapshot.next_token,
+        claims: snapshot.claims,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChecksumlessLegacySemanticStateWire {
     version: u32,
     next_token: u64,
@@ -1606,29 +1773,67 @@ pub(crate) fn decode_checksumless_legacy_semantic_state(
     })
 }
 
-fn validate_legacy_checksum(
+#[derive(Debug)]
+struct LegacyStateValidation {
+    legacy_checksum: Option<String>,
+    provenance: Option<LegacyStateProvenance>,
+}
+
+fn validate_legacy_state(
     file_name: &str,
     bytes: &[u8],
     expected: &ExpectedLegacyBindings,
-) -> Result<String> {
+    options: &StateMigrationOptions,
+) -> Result<LegacyStateValidation> {
     match file_name {
-        "claims.json" => {
-            let state: LegacyClaimsState = serde_json::from_slice(bytes)
-                .context("failed to decode checksummed claims state")?;
-            if state.version != 2 || state.next_token == 0 {
-                bail!("claims state is not supported checksummed version 2");
+        "claims.json" => match serde_json::from_slice::<LegacyClaimsState>(bytes) {
+            Ok(state) => {
+                if state.version != 2 || state.next_token == 0 {
+                    bail!("claims state is not supported checksummed version 2");
+                }
+                if state.repository != expected.repository_state {
+                    bail!(
+                        "claims state repository binding does not match the migration repository"
+                    );
+                }
+                let payload = serde_json::to_vec(&(
+                    state.version,
+                    &state.repository,
+                    state.next_token,
+                    &state.claims,
+                ))?;
+                Ok(LegacyStateValidation {
+                    legacy_checksum: Some(verify_legacy_checksum(
+                        &state.checksum,
+                        &payload,
+                        file_name,
+                    )?),
+                    provenance: None,
+                })
             }
-            if state.repository != expected.repository_state {
-                bail!("claims state repository binding does not match the migration repository");
+            Err(_) => {
+                decode_checksumless_legacy_claims_state(bytes)?;
+                let observed_sha256 = sha256_hex(bytes);
+                if !options.acknowledge_unauthenticated_claims_v1 {
+                    bail!(
+                        "checksum-less claims-v1 is unauthenticated; after independently verifying its provenance and exact bytes, retry with `--acknowledge-unauthenticated-claims-v1 --expected-claims-v1-sha256 {observed_sha256}`"
+                    );
+                }
+                let expected_sha256 = options
+                    .expected_claims_v1_sha256
+                    .as_deref()
+                    .context("validated claims-v1 acknowledgement lost its expected SHA-256")?;
+                if expected_sha256 != observed_sha256 {
+                    bail!(
+                        "checksum-less claims-v1 SHA-256 mismatch: expected {expected_sha256}, observed {observed_sha256}"
+                    );
+                }
+                Ok(LegacyStateValidation {
+                    legacy_checksum: None,
+                    provenance: Some(LegacyStateProvenance::OperatorAttestedUnauthenticatedImport),
+                })
             }
-            let payload = serde_json::to_vec(&(
-                state.version,
-                &state.repository,
-                state.next_token,
-                &state.claims,
-            ))?;
-            verify_legacy_checksum(&state.checksum, &payload, file_name)
-        }
+        },
         "semantic_intents.json" => match serde_json::from_slice::<LegacySemanticState>(bytes) {
             Ok(state) => {
                 if state.version != 2 || state.next_token == 0 {
@@ -1646,21 +1851,34 @@ fn validate_legacy_checksum(
                     state.next_token,
                     &state.intents,
                 ))?;
-                verify_legacy_checksum(&state.checksum, &payload, file_name)
+                Ok(LegacyStateValidation {
+                    legacy_checksum: Some(verify_legacy_checksum(
+                        &state.checksum,
+                        &payload,
+                        file_name,
+                    )?),
+                    provenance: None,
+                })
             }
             Err(_) => {
                 let state = decode_checksumless_legacy_semantic_state(bytes)?;
                 let payload = serde_json::to_vec(&(1_u32, state.next_token, &state.intents))?;
-                Ok(stable_checksum(&payload))
+                Ok(LegacyStateValidation {
+                    legacy_checksum: Some(stable_checksum(&payload)),
+                    provenance: None,
+                })
             }
         },
-        "managed_worktrees.json" => validate_managed_worktree_checksum(
-            bytes,
-            expected
-                .managed_repository
-                .as_ref()
-                .context("managed worktree migration binding is unavailable")?,
-        ),
+        "managed_worktrees.json" => Ok(LegacyStateValidation {
+            legacy_checksum: Some(validate_managed_worktree_checksum(
+                bytes,
+                expected
+                    .managed_repository
+                    .as_ref()
+                    .context("managed worktree migration binding is unavailable")?,
+            )?),
+            provenance: None,
+        }),
         _ => bail!("unsupported legacy state file: {file_name}"),
     }
 }
@@ -2312,9 +2530,36 @@ fn revalidate_preflight(preflight: &LegacyPreflight) -> Result<()> {
                 entry.file
             );
         }
-        validate_legacy_checksum(&entry.file, &bytes, &preflight.expected_bindings)?;
+        revalidate_legacy_state(entry, &bytes, &preflight.expected_bindings)?;
     }
     preflight.state_root.verify()
+}
+
+fn revalidate_legacy_state(
+    entry: &LegacyStateEntry,
+    bytes: &[u8],
+    expected: &ExpectedLegacyBindings,
+) -> Result<()> {
+    if entry.provenance == Some(LegacyStateProvenance::OperatorAttestedUnauthenticatedImport) {
+        if entry.store != "claims" || entry.file != "claims.json" || entry.legacy_checksum.is_some()
+        {
+            bail!("operator-attested unauthenticated-import provenance is inconsistent");
+        }
+        decode_checksumless_legacy_claims_state(bytes)?;
+        return Ok(());
+    }
+    let validation = validate_legacy_state(
+        &entry.file,
+        bytes,
+        expected,
+        &StateMigrationOptions::default(),
+    )?;
+    if validation.legacy_checksum != entry.legacy_checksum
+        || validation.provenance != entry.provenance
+    {
+        bail!("legacy state validation classification changed after preflight");
+    }
+    Ok(())
 }
 
 fn manifest_exists(state_root: &SafeRoot) -> Result<bool> {
@@ -3169,6 +3414,11 @@ mod tests {
     use crate::{semantic_coord::SemanticIntentStore, sync::ClaimToken, sync_store::SyncStore};
     use tempfile::TempDir;
 
+    const ISSUE33_CLAIMS_V1: &[u8] =
+        include_bytes!("../tests/fixtures/issue33/agent-files-claims-v1.json");
+    const ISSUE33_CLAIMS_V1_SHA256: &str =
+        "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
+
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -3216,6 +3466,13 @@ mod tests {
         let state = SafeRoot::open_or_create(repository.commondir().join("maco/state"))
             .expect("state root");
         (temp, path, state)
+    }
+
+    fn repository_with_checksumless_claims_v1() -> (TempDir, PathBuf, PathBuf) {
+        let (temp, path, state) = empty_repository_state();
+        AtomicStateWriter::write_direct(&state, "claims.json", ISSUE33_CLAIMS_V1)
+            .expect("literal checksum-less claims-v1 fixture");
+        (temp, path, state.path().to_path_buf())
     }
 
     fn repository_with_checksumless_semantic() -> (TempDir, PathBuf, PathBuf, SemanticIntent) {
@@ -3301,6 +3558,217 @@ mod tests {
         assert!(!owned_directory_attributes(0).are_safe_for(owner));
     }
 
+    #[test]
+    fn literal_issue33_claims_v1_fixture_matches_the_pinned_writer_bytes() {
+        assert_eq!(ISSUE33_CLAIMS_V1.len(), 524);
+        assert_eq!(sha256_hex(ISSUE33_CLAIMS_V1), ISSUE33_CLAIMS_V1_SHA256);
+        assert_eq!(
+            include_str!("../tests/fixtures/issue33/agent-files-claims-v1.sha256"),
+            format!("{ISSUE33_CLAIMS_V1_SHA256}  agent-files-claims-v1.json\n")
+        );
+
+        let decoded =
+            decode_checksumless_legacy_claims_state(ISSUE33_CLAIMS_V1).expect("strict fixture");
+        assert_eq!(decoded.next_token, 67);
+        assert_eq!(
+            decoded
+                .claims
+                .iter()
+                .map(|claim| claim.token.get())
+                .collect::<Vec<_>>(),
+            vec![20, 44, 66]
+        );
+    }
+
+    #[test]
+    fn claims_v1_migration_options_require_a_coherent_lowercase_digest_pair() {
+        assert!(validate_migration_options(&StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: false,
+            expected_claims_v1_sha256: Some(ISSUE33_CLAIMS_V1_SHA256.to_string()),
+        })
+        .is_err());
+        assert!(validate_migration_options(&StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: true,
+            expected_claims_v1_sha256: None,
+        })
+        .is_err());
+        assert!(validate_migration_options(&StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: true,
+            expected_claims_v1_sha256: Some(ISSUE33_CLAIMS_V1_SHA256.to_uppercase()),
+        })
+        .is_err());
+        validate_migration_options(&StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: true,
+            expected_claims_v1_sha256: Some(ISSUE33_CLAIMS_V1_SHA256.to_string()),
+        })
+        .expect("coherent acknowledgement and lowercase SHA-256");
+    }
+
+    #[test]
+    fn checksumless_claims_v1_decoder_rejects_noncanonical_or_ambiguous_state() {
+        let mut cases = Vec::new();
+
+        let mut low_next_token: serde_json::Value =
+            serde_json::from_slice(ISSUE33_CLAIMS_V1).expect("fixture JSON");
+        low_next_token["next_token"] = serde_json::json!(66);
+        cases.push(("next token", low_next_token));
+
+        let mut duplicate_token: serde_json::Value =
+            serde_json::from_slice(ISSUE33_CLAIMS_V1).expect("fixture JSON");
+        duplicate_token["claims"][1]["token"] = serde_json::json!(20);
+        cases.push(("duplicate token", duplicate_token));
+
+        let mut noncanonical_path: serde_json::Value =
+            serde_json::from_slice(ISSUE33_CLAIMS_V1).expect("fixture JSON");
+        noncanonical_path["claims"][0]["paths"][0] = serde_json::json!("src/../README.md");
+        cases.push(("noncanonical path", noncanonical_path));
+
+        let mut unknown_field: serde_json::Value =
+            serde_json::from_slice(ISSUE33_CLAIMS_V1).expect("fixture JSON");
+        unknown_field["claims"][0]["unexpected"] = serde_json::json!(true);
+        cases.push(("unknown field", unknown_field));
+
+        for (name, value) in cases {
+            let bytes = serde_json::to_vec_pretty(&value).expect("case JSON");
+            assert!(
+                decode_checksumless_legacy_claims_state(&bytes).is_err(),
+                "{name} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_entry_without_provenance_keeps_the_pre_provenance_wire_shape() {
+        let legacy = serde_json::json!({
+            "store": "claims",
+            "file": "claims.json",
+            "present": false,
+            "size": 0,
+            "sha256": null,
+            "legacy_checksum": null,
+            "file_identity": null
+        });
+        let entry: LegacyStateEntry =
+            serde_json::from_value(legacy.clone()).expect("pre-provenance entry");
+        assert_eq!(entry.provenance, None);
+        assert_eq!(
+            serde_json::to_value(entry).expect("entry serialization"),
+            legacy
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claims_v1_migration_requires_exact_operator_attestation_and_signs_it() {
+        let (_temp, path, state) = repository_with_checksumless_claims_v1();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).expect("state mode");
+        fs::set_permissions(state.join("claims.json"), fs::Permissions::from_mode(0o644))
+            .expect("claims mode");
+        let repository = Repository::open(&path).expect("repository");
+        let transaction_root = repository.commondir().join(TRANSACTION_ROOT_NAME);
+
+        let unauthenticated = migrate_repository_state(&path, false)
+            .expect_err("checksum-less claims-v1 needs acknowledgement");
+        let unauthenticated_message = format!("{unauthenticated:#}");
+        assert!(unauthenticated_message.contains("unauthenticated"));
+        assert!(unauthenticated_message.contains(ISSUE33_CLAIMS_V1_SHA256));
+        assert_eq!(mode(&state), 0o755);
+        assert_eq!(mode(&state.join("claims.json")), 0o644);
+        assert!(!transaction_root.exists());
+        assert!(!state.join(AUTH_KEY_FILE).exists());
+
+        let wrong = StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: true,
+            expected_claims_v1_sha256: Some("0".repeat(64)),
+        };
+        let mismatch = migrate_repository_state_with_options(&path, false, &wrong)
+            .expect_err("wrong digest must fail");
+        assert!(mismatch.to_string().contains("SHA-256 mismatch"));
+        assert!(!transaction_root.exists());
+        assert!(!state.join(AUTH_KEY_FILE).exists());
+
+        let options = StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: true,
+            expected_claims_v1_sha256: Some(ISSUE33_CLAIMS_V1_SHA256.to_string()),
+        };
+        let dry = migrate_repository_state_with_options(&path, false, &options)
+            .expect("attested dry run");
+        let claims_entry = dry
+            .entries
+            .iter()
+            .find(|entry| entry.store == "claims")
+            .expect("claims entry");
+        assert_eq!(dry.status, StateMigrationStatus::Ready);
+        assert_eq!(
+            claims_entry.sha256.as_deref(),
+            Some(ISSUE33_CLAIMS_V1_SHA256)
+        );
+        assert_eq!(claims_entry.legacy_checksum, None);
+        assert_eq!(
+            claims_entry.provenance,
+            Some(LegacyStateProvenance::OperatorAttestedUnauthenticatedImport)
+        );
+        assert!(!transaction_root.exists());
+        assert!(!state.join(AUTH_KEY_FILE).exists());
+
+        let applied =
+            migrate_repository_state_with_options(&path, true, &options).expect("attested apply");
+        assert_eq!(applied.status, StateMigrationStatus::Applied);
+        assert_eq!(applied.manifest_generation, Some(1));
+        assert_eq!(
+            applied
+                .entries
+                .iter()
+                .find(|entry| entry.store == "claims")
+                .expect("applied claims entry")
+                .provenance,
+            Some(LegacyStateProvenance::OperatorAttestedUnauthenticatedImport)
+        );
+
+        let repeated = migrate_repository_state_with_options(&path, true, &options)
+            .expect("idempotent attested apply");
+        assert_eq!(repeated.status, StateMigrationStatus::AlreadyApplied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_claims_v1_without_attested_provenance_is_refused() {
+        let (_temp, path, _state) = repository_with_checksumless_claims_v1();
+        let options = StateMigrationOptions {
+            acknowledge_unauthenticated_claims_v1: true,
+            expected_claims_v1_sha256: Some(ISSUE33_CLAIMS_V1_SHA256.to_string()),
+        };
+        migrate_repository_state_with_options(&path, true, &options)
+            .expect("signed operator-attested migration");
+
+        let authenticator =
+            repository_authenticator_key_only(&path).expect("repository authenticator");
+        let mut manifest_store = AuthenticatedSnapshotStore::<
+            StateMigrationManifestSpec,
+            StateMigrationManifest,
+        >::open_instance(authenticator, MANIFEST_INSTANCE_ID)
+        .expect("manifest store");
+        let mut manifest = manifest_store.current().value.clone();
+        manifest
+            .entries
+            .iter_mut()
+            .find(|entry| entry.store == "claims")
+            .expect("claims entry")
+            .provenance = None;
+        manifest_store
+            .commit(2, manifest)
+            .expect("signed misclassified manifest");
+        drop(manifest_store);
+
+        let error = authenticated_legacy_adoption(&path, "claims", "claims.json")
+            .expect_err("claims-v1 without provenance must fail closed");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("lacks its operator-attested"),
+            "unexpected error: {chain}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn migration_preflight_accepts_isolated_legacy_state_directory() {
@@ -3308,8 +3776,13 @@ mod tests {
         make_legacy_permissions(&state);
         let repository = Repository::open(&path).expect("repository");
 
-        let preflight = preflight_legacy_state(&path, repository.commondir(), &state)
-            .expect("isolated legacy state preflight");
+        let preflight = preflight_legacy_state(
+            &path,
+            repository.commondir(),
+            &state,
+            &StateMigrationOptions::default(),
+        )
+        .expect("isolated legacy state preflight");
 
         assert_eq!(preflight.state_root.path(), state);
         assert!(preflight.entries.iter().any(|entry| entry.present));

@@ -185,6 +185,32 @@ and manifest publication forward-recoverable; ordinary pre-publication errors
 restore original modes, and successful apply writes an idempotent audit
 receipt.
 
+Checksum-less version-1 `claims.json` has no cryptographic provenance that MACO
+can verify. Recover it only after taking the repository offline and independently
+verifying both the file's origin and its exact bytes. Compute the SHA-256 outside
+MACO, then provide the explicit acknowledgement and the matching lowercase
+digest together:
+
+```bash
+cargo run -- state migrate --repo . --apply \
+  --acknowledge-unauthenticated-claims-v1 \
+  --expected-claims-v1-sha256 <64-lowercase-hex-digest> \
+  --json
+```
+
+The digest pins the operator-reviewed bytes; it does not authenticate who
+created them or make untrusted claims trustworthy. MACO still validates the
+strict claims-v1 structure and repository-relative paths, rejects a digest
+mismatch, and records the operator-attested unauthenticated-import provenance
+in the signed migration manifest. After apply, verify the recovered claims
+before resuming writers, and inspect cleanup protection without removing
+worktrees:
+
+```bash
+maco sync status --repo . --json
+maco worktree gc --repo . --dry-run --json
+```
+
 The first open of each migrated claims, semantic-intent, or managed-worktree
 consumer performs a recoverable retirement transaction while holding its
 legacy kernel lock. It copies the exact signed-manifest legacy bytes into a
