@@ -50,6 +50,10 @@ const AUTHENTICATED_STATE_CONSUMERS: &[(&str, &str)] = &[
         "authenticated managed worktree state",
     ),
     (
+        "authenticated-megafile-history-v1",
+        "authenticated megafile history",
+    ),
+    (
         "state-migration-manifests-v1",
         "authenticated state migration manifests",
     ),
@@ -1006,6 +1010,21 @@ mod tests {
             .err()
             .expect("must refuse rekey");
         assert!(error.to_string().contains("authenticated effect WALs"));
+        assert!(!state.path().join(AUTH_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn orphaned_megafile_history_refuses_replacement_key_epoch() {
+        let (_temp, common_dir) = repository();
+        let state = SafeRoot::open_or_create(common_dir.join("maco/state")).expect("state root");
+        SafeRoot::open_or_create(state.path().join("authenticated-megafile-history-v1"))
+            .expect("megafile consumer root");
+
+        let error = RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .err()
+            .expect("must refuse replacement epoch");
+
+        assert!(error.to_string().contains("authenticated megafile history"));
         assert!(!state.path().join(AUTH_KEY_FILE).exists());
     }
 }
