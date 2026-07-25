@@ -308,8 +308,36 @@ impl RepoQueryCommand {
                 print_query_report(&report, args.json)
             }
             RepoQuerySubcommand::Risk(args) => {
-                let map = repo_semantic::scan_repository(args.repo)?;
-                let report = repo_semantic::risk_report_for_paths(&map, args.paths);
+                let map = repo_semantic::scan_repository(&args.repo)?;
+                let semantic = repo_semantic::risk_report_for_paths(&map, args.paths);
+                let store = args
+                    .megafile_thresholds
+                    .open_existing_store(&args.repo)
+                    .context(
+                        "authenticated megafile telemetry could not be opened for risk query",
+                    )?;
+                let megafile_hotspots = match store {
+                    Some(store) => store
+                        .report()
+                        .context(
+                            "authenticated megafile telemetry could not be read for risk query",
+                        )?
+                        .assessments
+                        .into_iter()
+                        .filter(|assessment| {
+                            assessment.is_megafile
+                                && semantic
+                                    .changed_paths
+                                    .binary_search(&assessment.path)
+                                    .is_ok()
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let report = SemanticRiskQueryReport {
+                    semantic,
+                    megafile_hotspots,
+                };
                 print_query_report(&report, args.json)
             }
         }
@@ -514,6 +542,8 @@ struct QueryRiskArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    #[command(flatten)]
+    megafile_thresholds: MegafileThresholdArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -3131,6 +3161,13 @@ fn validate_cli_validation_reports(reports: &[ValidationReport]) -> Result<()> {
 struct SemanticSymbolQueryReport {
     query: String,
     matches: Vec<repo_semantic::SemanticSymbol>,
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticRiskQueryReport {
+    #[serde(flatten)]
+    semantic: repo_semantic::SemanticRiskReport,
+    megafile_hotspots: Vec<MegafileAssessment>,
 }
 
 impl SemanticSymbolQueryReport {
