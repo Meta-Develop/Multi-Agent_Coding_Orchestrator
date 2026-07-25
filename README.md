@@ -228,8 +228,11 @@ test -d "$STATE"
 test -d "$ORPHAN"
 test ! -L "$ORPHAN"
 test -f "$STATE/claims.json"
+test ! -L "$STATE/claims.json"
+test ! -L "$RECOVERY_BASE"
 
 install -d -m 0700 -- "$RECOVERY_BASE"
+test ! -L "$RECOVERY_BASE"
 RECOVERY=$(mktemp -d "$RECOVERY_BASE/issue33.XXXXXXXX")
 chmod 0700 -- "$RECOVERY"
 test "$(stat -c %a -- "$RECOVERY")" = 700
@@ -432,9 +435,13 @@ sync -f -- "$STATE" "$RECOVERY"
 ```
 
 Review the migration, sync-status, and GC reports and keep the full quarantine
-before resuming writers. The new authenticated claims snapshot is supported by
-the attested claims-v1 migration; the captured orphan journal remains
-unauthenticated, unanchored, and provenance-unproven evidence.
+before resuming writers. Never run the registry-pinned writer against this
+repository again after migration; it was used only for the pre-migration
+plaintext view. Resume only the reviewed development binary. The new
+authenticated claims snapshot is supported by the attested claims-v1
+migration; the captured orphan journal remains unanchored and unadopted.
+Neither its writer provenance nor its authorization as the current logical
+state was established.
 
 The first open of each migrated claims, semantic-intent, or managed-worktree
 consumer performs a recoverable retirement transaction while holding its
