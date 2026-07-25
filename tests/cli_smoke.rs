@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::{self, File},
     path::Path,
@@ -12,17 +14,78 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 const ISSUE33_CLAIMS_V1: &[u8] = include_bytes!("fixtures/issue33/agent-files-claims-v1.json");
 const ISSUE33_CLAIMS_V1_SHA256: &str =
     "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
+const ISSUE33_PHYSICAL_JOURNAL_ID: &str =
+    "6ce2913c16ab9fe3388b4d29719afd3b2549aa6d90975b2cf8ddc4173d0999f4";
+const ISSUE33_PHYSICAL_JOURNAL_MANIFEST: &str =
+    include_str!("fixtures/issue33/authenticated-claims-state-v1.sha256");
 
+#[cfg(unix)]
 #[test]
-fn cli_attested_claims_v1_migration_restores_sync_status_and_worktree_gc() -> Result<()> {
+fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let repository = Repository::open(&repo_path).context("open repo")?;
     let state_root = repository.commondir().join("maco/state");
-    fs::create_dir_all(&state_root).context("create legacy state root")?;
+    fs::create_dir_all(&state_root).context("create temporary state root")?;
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+        .context("make temporary state root owner-private")?;
+    write_private_test_state_file(
+        &state_root.join("artifact_finalization_hmac_v1.key"),
+        &[0x33; 32],
+    )?;
+    write_private_test_state_file(&state_root.join("repository_auth_epoch_v1"), &[0x34; 32])?;
     fs::write(state_root.join("claims.json"), ISSUE33_CLAIMS_V1)
         .context("write checksum-less claims-v1 fixture")?;
+    fs::set_permissions(
+        state_root.join("claims.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .context("make checksum-less claims-v1 fixture owner-private")?;
+
+    let journal_root = state_root.join("authenticated-claims-state-v1");
+    fs::create_dir(&journal_root).context("create temporary authenticated claims journal root")?;
+    fs::set_permissions(&journal_root, fs::Permissions::from_mode(0o700))
+        .context("make temporary claims journal root owner-private")?;
+    let physical_journal = journal_root.join(ISSUE33_PHYSICAL_JOURNAL_ID);
+    let verified_manifest_files = verify_issue33_physical_journal_fixture()?;
+    let copied_files = copy_issue33_physical_journal_fixture(&physical_journal)?;
+    assert_eq!(
+        copied_files, verified_manifest_files,
+        "the regression must install every captured physical-journal file"
+    );
+
     let repo = repo_path.to_str().context("repo path utf8")?;
+    let blocked = Command::new(BIN)
+        .args(["sync", "status", "--repo", repo, "--json"])
+        .output()
+        .context("run sync status against unanchored physical journal")?;
+    assert!(!blocked.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&blocked.stderr).trim(),
+        format!(
+            "Error: authenticated snapshot physical journal '{}' is not anchored by any signed logical state",
+            ISSUE33_PHYSICAL_JOURNAL_ID
+        )
+    );
+
+    let fixture_source = issue33_physical_journal_fixture();
+    let quarantine_root = repository
+        .commondir()
+        .join("maco/issue33-option-2-quarantine");
+    fs::create_dir(&quarantine_root).context("create test-local option-2 quarantine")?;
+    fs::set_permissions(&quarantine_root, fs::Permissions::from_mode(0o700))
+        .context("make test-local quarantine owner-private")?;
+    let quarantined_namespace = quarantine_root.join("authenticated-claims-state-v1");
+    fs::rename(&journal_root, &quarantined_namespace)
+        .context("atomically quarantine the complete authenticated claims namespace")?;
+    assert!(!journal_root.exists());
+    assert!(quarantined_namespace.is_dir());
+    let quarantined_journal = quarantined_namespace.join(ISSUE33_PHYSICAL_JOURNAL_ID);
+    assert!(quarantined_journal.is_dir());
+    assert!(
+        fixture_source.is_dir(),
+        "the checked-in physical-journal fixture must remain untouched"
+    );
 
     let migration = run_success_json([
         "state",
@@ -61,15 +124,184 @@ fn cli_attested_claims_v1_migration_restores_sync_status_and_worktree_gc() -> Re
         vec![Some(20), Some(44), Some(66)]
     );
     assert_eq!(claims[0]["agent_id"], "o1-worktree-cleanup");
-    assert_eq!(claims[0]["paths"][0], ".maco");
+    assert_eq!(claims[0]["paths"], serde_json::json!([".maco"]));
+    assert_eq!(claims[1]["agent_id"], "o1-guard-fix");
+    assert_eq!(
+        claims[1]["paths"],
+        serde_json::json!([
+            "scripts/audit-codex-terminal-role-launches",
+            "scripts/check-development-handoff-clean"
+        ])
+    );
+    assert_eq!(claims[2]["agent_id"], "history-rewrite-otherproj-o1");
+    assert_eq!(
+        claims[2]["paths"],
+        serde_json::json!(["machine-root/projects/example/other-repo"])
+    );
 
     let gc = run_success_json(["worktree", "gc", "--repo", repo, "--dry-run", "--json"])?;
     assert_eq!(gc["dry_run"], true);
     assert_eq!(gc["considered_count"], 0);
     assert_eq!(gc["removed_count"], 0);
     assert_eq!(gc["orphan_removed_count"], 0);
+    assert!(
+        quarantined_namespace.is_dir(),
+        "successful consumers must preserve the complete quarantined namespace"
+    );
+    assert!(
+        quarantined_journal.is_dir(),
+        "the captured physical journal must remain inside the quarantined namespace"
+    );
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_test_state_file(path: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("make {} owner-private", path.display()))
+}
+
+#[cfg(unix)]
+fn issue33_physical_journal_fixture() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/issue33/authenticated-claims-state-v1")
+        .join(ISSUE33_PHYSICAL_JOURNAL_ID)
+}
+
+#[cfg(unix)]
+fn verify_issue33_physical_journal_fixture() -> Result<usize> {
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/issue33");
+    let expected_parent =
+        Path::new("authenticated-claims-state-v1").join(ISSUE33_PHYSICAL_JOURNAL_ID);
+    let mut manifest_names = Vec::new();
+
+    for (index, line) in ISSUE33_PHYSICAL_JOURNAL_MANIFEST.lines().enumerate() {
+        let (expected_hash, relative) = line
+            .split_once("  ")
+            .with_context(|| format!("parse physical-journal manifest line {}", index + 1))?;
+        anyhow::ensure!(
+            expected_hash.len() == 64
+                && expected_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "physical-journal manifest line {} has an invalid SHA-256",
+            index + 1
+        );
+
+        let relative = Path::new(relative);
+        anyhow::ensure!(
+            relative.parent() == Some(expected_parent.as_path()),
+            "physical-journal manifest line {} is outside the captured journal",
+            index + 1
+        );
+        let file_name = relative
+            .file_name()
+            .context("physical-journal manifest entry has no file name")?;
+        let fixture_path = fixture_root.join(relative);
+        let metadata = fs::symlink_metadata(&fixture_path).with_context(|| {
+            format!("inspect fixture manifest entry {}", fixture_path.display())
+        })?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "fixture manifest entry is not a regular file: {}",
+            fixture_path.display()
+        );
+
+        let output = Command::new("sha256sum")
+            .arg("--")
+            .arg(&fixture_path)
+            .output()
+            .with_context(|| format!("hash fixture manifest entry {}", fixture_path.display()))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "sha256sum failed for {}: {}",
+            fixture_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let stdout = std::str::from_utf8(&output.stdout)
+            .with_context(|| format!("decode sha256sum output for {}", fixture_path.display()))?;
+        let actual_hash = stdout
+            .split_ascii_whitespace()
+            .next()
+            .context("sha256sum returned no digest")?;
+        anyhow::ensure!(
+            actual_hash == expected_hash,
+            "fixture digest mismatch for {}: expected {}, got {}",
+            fixture_path.display(),
+            expected_hash,
+            actual_hash
+        );
+        manifest_names.push(file_name.to_os_string());
+    }
+
+    manifest_names.sort();
+    let source = issue33_physical_journal_fixture();
+    let mut captured_names = Vec::new();
+    for entry in fs::read_dir(&source)
+        .with_context(|| format!("enumerate captured journal {}", source.display()))?
+    {
+        let entry = entry.context("inspect captured physical-journal entry")?;
+        let metadata = entry
+            .metadata()
+            .context("inspect captured physical-journal metadata")?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "captured physical-journal entry is not a regular file: {}",
+            entry.path().display()
+        );
+        captured_names.push(entry.file_name());
+    }
+    captured_names.sort();
+    anyhow::ensure!(
+        captured_names == manifest_names,
+        "physical-journal manifest does not name the complete captured journal"
+    );
+
+    Ok(manifest_names.len())
+}
+
+#[cfg(unix)]
+fn copy_issue33_physical_journal_fixture(destination: &Path) -> Result<usize> {
+    let source = issue33_physical_journal_fixture();
+    fs::create_dir(destination)
+        .with_context(|| format!("create copied journal {}", destination.display()))?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "make copied journal {} owner-private",
+            destination.display()
+        )
+    })?;
+
+    let mut copied_files = 0usize;
+    for entry in fs::read_dir(&source)
+        .with_context(|| format!("enumerate captured journal {}", source.display()))?
+    {
+        let entry = entry.context("inspect captured physical-journal entry")?;
+        let metadata = entry
+            .metadata()
+            .context("inspect captured physical-journal metadata")?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "captured physical-journal entry is not a regular file: {}",
+                entry.path().display()
+            );
+        }
+        let copied = destination.join(entry.file_name());
+        fs::copy(entry.path(), &copied)
+            .with_context(|| format!("copy captured journal file {}", entry.path().display()))?;
+        fs::set_permissions(&copied, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "make copied journal file {} owner-private",
+                copied.display()
+            )
+        })?;
+        copied_files = copied_files
+            .checked_add(1)
+            .context("captured journal file count overflowed")?;
+    }
+    Ok(copied_files)
 }
 
 #[test]
