@@ -7,6 +7,7 @@ use crate::{
         state_auth::{AuthenticationDomain, RepositoryAuthBinding},
     },
     authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
+    megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     safe_state::{stable_checksum, FileIdentity, KernelStateLock, SafeRoot},
     state_journal::JournalSpec,
     state_migration::{
@@ -43,6 +44,21 @@ const MAX_STATE_PATH_COMPONENTS: usize = 256;
 pub struct SyncStore {
     repo_path: PathBuf,
     state: RepositoryStateRoot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MegafileClaimWarning {
+    pub version: u32,
+    pub path: PathBuf,
+    pub assessment: MegafileAssessment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimTelemetryOutcome {
+    pub claim: PathClaim,
+    pub warnings: Vec<MegafileClaimWarning>,
 }
 
 pub(crate) enum ClaimsSnapshotSpec {}
@@ -321,11 +337,75 @@ impl SyncStore {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        self.with_locked_update(|coordinator| {
+        Ok(self.claim_paths_with_telemetry(agent_id, paths)?.claim)
+    }
+
+    /// Persists the authenticated claim first, then records authoritative
+    /// megafile telemetry. A telemetry failure is returned to the caller so
+    /// work cannot proceed silently without its required history.
+    pub fn claim_paths_with_telemetry<I, P>(
+        &self,
+        agent_id: impl AsRef<str>,
+        paths: I,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.claim_paths_with_telemetry_thresholds(
+            agent_id,
+            paths,
+            MegafileThresholds::provisional_bootstrap(),
+        )
+    }
+
+    /// Uses caller-supplied, validated thresholds for claim-time assessment.
+    /// Threshold validation happens before the claim. For valid thresholds,
+    /// the authenticated claim remains the first durable write and telemetry
+    /// retains the same fail-closed recovery evidence as the default API.
+    pub fn claim_paths_with_telemetry_thresholds<I, P>(
+        &self,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        thresholds: MegafileThresholds,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        thresholds
+            .validate()
+            .context("configured megafile claim thresholds are invalid")?;
+        let claim = self.with_locked_update(|coordinator| {
             coordinator
                 .claim_paths(agent_id.as_ref(), paths)
                 .map_err(Into::into)
-        })
+        })?;
+        let assessments = (|| {
+            MegafileStore::open_with_thresholds(&self.repo_path, thresholds)
+                .context("megafile telemetry could not be opened")?
+                .record_claim(&claim)
+                .context("megafile telemetry could not be recorded")
+        })()
+        .with_context(|| {
+            format!(
+                "authenticated claim token {} remains durable for agent '{}' and paths {:?}, but its required megafile telemetry failed; do not retry the claim blindly: inspect the authenticated claim list and explicitly release token {} before retrying if rollback is intended",
+                claim.token.get(),
+                claim.agent_id,
+                claim.paths,
+                claim.token.get()
+            )
+        })?;
+        let warnings = assessments
+            .into_iter()
+            .filter(|assessment| assessment.is_megafile)
+            .map(|assessment| MegafileClaimWarning {
+                version: 1,
+                path: assessment.path.clone(),
+                assessment,
+            })
+            .collect();
+        Ok(ClaimTelemetryOutcome { claim, warnings })
     }
 
     pub fn release(&self, token: ClaimToken) -> Result<PathClaim> {
@@ -690,6 +770,9 @@ mod tests {
     use super::*;
     use crate::{
         artifacts::state_auth::{authentication_key_file_name, sha256_hex},
+        megafile::{
+            set_record_claim_fault, FileSizeSample, MegafileStore, MegafileThresholdCalibration,
+        },
         state_migration::{set_legacy_retirement_fault, LegacyRetirementFaultPoint},
         worktree::WorktreeManager,
     };
@@ -948,6 +1031,150 @@ mod tests {
             .claim_paths("agent-b", ["README.md"])
             .expect_err("overlap should fail");
         assert!(error.to_string().contains("already claimed by agent-a"));
+        let assessment = MegafileStore::open_existing(&repo_path)
+            .expect("query telemetry")
+            .expect("initialized telemetry")
+            .assess_path("README.md")
+            .expect("assess path")
+            .expect("recorded claim");
+        assert_eq!(assessment.claims_in_window, 1);
+    }
+
+    #[test]
+    fn post_claim_telemetry_failure_reports_durable_recovery_evidence() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let thresholds = MegafileThresholds {
+            calibration: MegafileThresholdCalibration::Configured,
+            file_bytes: 1,
+            ..MegafileThresholds::provisional_bootstrap()
+        };
+        set_record_claim_fault();
+
+        let error = store
+            .claim_paths_with_telemetry_thresholds("agent-a", ["src/lib.rs"], thresholds)
+            .expect_err("telemetry fault must fail closed");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("claim token 1 remains durable"));
+        assert!(message.contains("explicitly release token 1"));
+        let claims = store.snapshot().expect("durable claim evidence");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].token.get(), 1);
+        assert_eq!(claims[0].paths, vec![PathBuf::from("src/lib.rs")]);
+        assert!(MegafileStore::open_existing(&repo_path)
+            .expect("query telemetry")
+            .expect("initialized telemetry")
+            .assess_path("src/lib.rs")
+            .expect("assessment")
+            .is_none());
+    }
+
+    #[test]
+    fn claim_time_warning_contains_typed_authenticated_assessment() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open store");
+        let mut final_outcome = None;
+
+        for index in 0..MegafileThresholds::default().claim_count {
+            let outcome = store
+                .claim_paths_with_telemetry(format!("agent-{index}"), ["src/hotspot.rs"])
+                .expect("claim with telemetry");
+            store.release(outcome.claim.token).expect("release claim");
+            final_outcome = Some(outcome);
+        }
+
+        let outcome = final_outcome.expect("final outcome");
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(outcome.warnings[0].version, 1);
+        assert_eq!(outcome.warnings[0].path, PathBuf::from("src/hotspot.rs"));
+        assert!(outcome.warnings[0].assessment.is_megafile);
+        assert!(outcome.warnings[0]
+            .assessment
+            .signals
+            .iter()
+            .any(|signal| matches!(signal, crate::megafile::MegafileSignal::ClaimCount { .. })));
+    }
+
+    #[test]
+    fn configured_threshold_changes_claim_time_warning_without_changing_defaults() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        MegafileStore::open(&repo_path)
+            .expect("open telemetry")
+            .record_file_samples([
+                FileSizeSample {
+                    path: PathBuf::from("src/default.rs"),
+                    bytes: 128,
+                    lines: 4,
+                },
+                FileSizeSample {
+                    path: PathBuf::from("src/configured.rs"),
+                    bytes: 128,
+                    lines: 4,
+                },
+            ])
+            .expect("record samples");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+
+        let default = store
+            .claim_paths_with_telemetry("default-agent", ["src/default.rs"])
+            .expect("default claim");
+        assert!(default.warnings.is_empty());
+
+        let configured_thresholds = MegafileThresholds {
+            calibration: MegafileThresholdCalibration::Configured,
+            file_bytes: 64,
+            ..MegafileThresholds::provisional_bootstrap()
+        };
+        let configured = store
+            .claim_paths_with_telemetry_thresholds(
+                "configured-agent",
+                ["src/configured.rs"],
+                configured_thresholds,
+            )
+            .expect("configured claim");
+
+        assert_eq!(configured.warnings.len(), 1);
+        assert!(configured.warnings[0]
+            .assessment
+            .signals
+            .iter()
+            .any(|signal| matches!(
+                signal,
+                crate::megafile::MegafileSignal::FileBytes {
+                    observed: 128,
+                    threshold: 64
+                }
+            )));
+    }
+
+    #[test]
+    fn invalid_configured_threshold_is_rejected_before_claim_persistence() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let mut thresholds = MegafileThresholds::provisional_bootstrap();
+        thresholds.calibration = MegafileThresholdCalibration::Configured;
+        thresholds.file_bytes = 0;
+
+        let error = store
+            .claim_paths_with_telemetry_thresholds("agent-a", ["src/lib.rs"], thresholds)
+            .expect_err("invalid thresholds must fail before claim");
+
+        assert!(error
+            .to_string()
+            .contains("configured megafile claim thresholds are invalid"));
+        assert!(store.snapshot().expect("claim snapshot").is_empty());
+        assert!(MegafileStore::open_existing(&repo_path)
+            .expect("query telemetry")
+            .is_none());
     }
 
     #[test]
