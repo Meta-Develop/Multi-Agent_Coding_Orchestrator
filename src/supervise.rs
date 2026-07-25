@@ -8,6 +8,10 @@ use crate::{
         ExternalAgentRun, ExternalProgramTrust,
     },
     llm::provider::{ModelPricing, Usage},
+    merge::{
+        collect_agent_result_with_evidence_and_write_lease, CandidateValidationBinding,
+        MergeCollectOptions, ValidationEvidenceBundle,
+    },
     orchestration_event::{OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole},
     orchestrator::{RunId, SemanticCoordinationMode},
     process_runner::{
@@ -27,7 +31,8 @@ use crate::{
     sync::{normalize_repo_relative_path, paths_overlap, ClaimToken, PathClaim},
     sync_store::SyncStore,
     worktree::{
-        RepositoryCleanlinessCapability, WorktreeCreateOptions, WorktreeManager, WorktreeRecord,
+        ManagedWorktreeWriteLease, RepositoryCleanlinessCapability, WorktreeCreateOptions,
+        WorktreeManager, WorktreeRecord,
     },
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -61,6 +66,8 @@ const MAX_SUPERVISOR_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUPERVISOR_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_SUPERVISOR_INPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WORKER_EXECUTION_JOURNAL_BYTES: usize = 1024 * 1024;
+const MAX_BLOATED_FILE_FLAGS_PER_WORKER: usize = 64;
+const MAX_DECOMPOSITION_REPLACEMENT_PATHS: usize = 256;
 const ARTIFACT_FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
 const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 const MAX_NESTED_REPOSITORY_DEPTH: usize = 32;
@@ -173,6 +180,21 @@ impl SupervisorConsultantPlan {
 struct LoadedSupervisorPlan {
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
+    assignment_metadata: AssignmentMetadata,
+}
+
+type AssignmentMetadata = BTreeMap<(String, String), WorkerAssignmentMetadata>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+struct WorkerAssignmentMetadata {
+    #[serde(default)]
+    kind: AssignmentKind,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_path"
+    )]
+    target_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -235,10 +257,59 @@ impl AgentRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentKind {
+    #[default]
+    Ordinary,
+    MegafileDecomposition,
+}
+
+impl AssignmentKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::MegafileDecomposition => "megafile_decomposition",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct BloatedFileFlag {
+    #[serde(serialize_with = "serialize_path")]
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct DecompositionCompletion {
+    #[serde(serialize_with = "serialize_path")]
+    pub target_path: PathBuf,
+    #[serde(default, serialize_with = "serialize_paths")]
+    pub replacement_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_candidate_binding: Option<CandidateValidationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedMegafileDecompositionEvidence {
+    pub run_id: RunId,
+    pub orchestrator_id: String,
+    pub worker_id: String,
+    #[serde(serialize_with = "serialize_path")]
+    pub target_path: PathBuf,
+    #[serde(serialize_with = "serialize_paths")]
+    pub replacement_paths: Vec<PathBuf>,
+    pub supervisor_candidate_binding: CandidateValidationBinding,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WorkerReport {
     pub id: String,
     pub role: AgentRole,
+    #[serde(default)]
+    pub assignment_kind: AssignmentKind,
+    #[serde(default, serialize_with = "serialize_optional_path")]
+    pub target_path: Option<PathBuf>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -257,6 +328,10 @@ pub struct WorkerReport {
     pub validation_results: Vec<ValidationResult>,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub bloated_file_flags: Vec<BloatedFileFlag>,
+    #[serde(default)]
+    pub decomposition_completion: Option<DecompositionCompletion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_further_delegation: Option<bool>,
     pub accepted: bool,
@@ -321,6 +396,8 @@ pub struct OrchestratorReviewReport {
     pub worker_reports: Vec<WorkerReport>,
     #[serde(default)]
     pub audit_reports: Vec<AuditorReport>,
+    #[serde(default)]
+    pub decomposition_completions: Vec<DecompositionCompletion>,
     pub accepted: bool,
     pub rejected: bool,
     pub status: ReviewStatus,
@@ -376,6 +453,10 @@ pub struct SupervisorFinalReport {
     pub validation_results: Vec<ValidationResult>,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub bloated_file_flags: Vec<BloatedFileFlag>,
+    #[serde(default)]
+    pub decomposition_candidates: Vec<DecompositionCompletion>,
     #[serde(default)]
     pub breaker_trip: Option<SupervisorBreakerTrip>,
     #[serde(default)]
@@ -523,7 +604,11 @@ pub fn supervisor_plan_document_from_task_file(
     task_file: impl AsRef<Path>,
 ) -> Result<Value> {
     let loaded = supervisor_plan_and_consultant_from_task_file(repo, task_file)?;
-    supervisor_plan_value(&loaded.plan, &loaded.consultant)
+    supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+    )
 }
 
 fn supervisor_plan_and_consultant_from_task_file(
@@ -553,6 +638,7 @@ fn supervisor_plan_and_consultant_from_task_file(
             assignments: Vec::new(),
         },
         consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
     })
 }
 
@@ -583,10 +669,15 @@ fn parse_supervisor_plan_with_consultant(contents: &str) -> Result<LoadedSupervi
     let value: Value = serde_json::from_str(contents).context("supervisor plan is not JSON")?;
     let consultant = consultant_from_plan_value(&value)?;
     let plan: SupervisorPlan =
-        serde_json::from_value(value).context("supervisor plan fields are invalid")?;
+        serde_json::from_value(value.clone()).context("supervisor plan fields are invalid")?;
     let plan = validate_supervisor_plan(plan)?;
+    let assignment_metadata = assignment_metadata_from_plan_value(&value, &plan)?;
     validate_consultant_plan(&consultant)?;
-    Ok(LoadedSupervisorPlan { plan, consultant })
+    Ok(LoadedSupervisorPlan {
+        plan,
+        consultant,
+        assignment_metadata,
+    })
 }
 
 fn consultant_from_plan_value(value: &Value) -> Result<SupervisorConsultantPlan> {
@@ -598,12 +689,113 @@ fn consultant_from_plan_value(value: &Value) -> Result<SupervisorConsultantPlan>
     }
 }
 
+fn assignment_metadata_from_plan_value(
+    value: &Value,
+    plan: &SupervisorPlan,
+) -> Result<AssignmentMetadata> {
+    let raw_assignments = match value.get("assignments") {
+        Some(assignments) => assignments
+            .as_array()
+            .context("supervisor plan assignments must be an array")?
+            .as_slice(),
+        None => &[],
+    };
+    let mut metadata_by_worker = AssignmentMetadata::new();
+    for (raw_assignment, assignment) in raw_assignments.iter().zip(&plan.assignments) {
+        let raw_workers = raw_assignment
+            .get("worker_assignments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for (raw_worker, worker) in raw_workers.iter().zip(&assignment.worker_assignments) {
+            let mut metadata: WorkerAssignmentMetadata = serde_json::from_value(raw_worker.clone())
+                .with_context(|| {
+                    format!(
+                        "worker assignment '{}' kind/target_path is invalid",
+                        worker.id
+                    )
+                })?;
+            metadata.target_path = match (metadata.kind, metadata.target_path.take()) {
+                (AssignmentKind::Ordinary, None) => None,
+                (AssignmentKind::Ordinary, Some(_)) => {
+                    bail!(
+                        "ordinary worker assignment '{}' must not declare target_path",
+                        worker.id
+                    )
+                }
+                (AssignmentKind::MegafileDecomposition, None) => {
+                    bail!(
+                        "megafile decomposition worker assignment '{}' must declare target_path",
+                        worker.id
+                    )
+                }
+                (AssignmentKind::MegafileDecomposition, Some(path)) => {
+                    let normalized = normalize_repo_relative_path(&path).with_context(|| {
+                        format!(
+                            "megafile decomposition worker assignment '{}' has invalid target_path '{}'",
+                            worker.id,
+                            path.display()
+                        )
+                    })?;
+                    if normalized.as_os_str().is_empty() {
+                        bail!(
+                            "megafile decomposition worker assignment '{}' target_path must name a repository file",
+                            worker.id
+                        );
+                    }
+                    if !worker
+                        .assigned_paths
+                        .iter()
+                        .any(|assigned| path_is_covered_by_claim(&normalized, assigned))
+                    {
+                        bail!(
+                            "megafile decomposition worker assignment '{}' target_path '{}' is outside assigned_paths",
+                            worker.id,
+                            normalized.display()
+                        );
+                    }
+                    Some(normalized)
+                }
+            };
+            metadata_by_worker.insert((assignment.id.clone(), worker.id.clone()), metadata);
+        }
+    }
+    Ok(metadata_by_worker)
+}
+
 fn supervisor_plan_value(
     plan: &SupervisorPlan,
     consultant: &SupervisorConsultantPlan,
+    assignment_metadata: &AssignmentMetadata,
 ) -> Result<Value> {
     let mut value =
         serde_json::to_value(plan).context("failed to serialize normalized supervisor plan")?;
+    let assignments = value
+        .get_mut("assignments")
+        .and_then(Value::as_array_mut)
+        .context("normalized supervisor plan assignments did not serialize to an array")?;
+    for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        let workers = assignment_value
+            .get_mut("worker_assignments")
+            .and_then(Value::as_array_mut)
+            .context("normalized worker_assignments did not serialize to an array")?;
+        for (worker_value, worker) in workers.iter_mut().zip(&assignment.worker_assignments) {
+            let Some(metadata) =
+                assignment_metadata.get(&(assignment.id.clone(), worker.id.clone()))
+            else {
+                continue;
+            };
+            let metadata_value = serde_json::to_value(metadata)
+                .context("failed to serialize worker assignment metadata")?;
+            let worker_object = worker_value
+                .as_object_mut()
+                .context("normalized worker assignment did not serialize to an object")?;
+            let metadata_object = metadata_value
+                .as_object()
+                .context("worker assignment metadata did not serialize to an object")?;
+            worker_object.extend(metadata_object.clone());
+        }
+    }
     if !consultant.is_default() {
         let object = value
             .as_object_mut()
@@ -665,8 +857,7 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     run_supervisor_plan_with_runner_and_creation(
-        loaded.plan,
-        loaded.consultant,
+        loaded,
         options,
         max_concurrent_children,
         SupervisorExecutionRuntime::Verified,
@@ -740,6 +931,8 @@ pub fn collect_supervisor_run(
             message: "supervisor final report is missing".to_string(),
             paths: vec![final_report_path],
         }],
+        bloated_file_flags: Vec::new(),
+        decomposition_candidates: Vec::new(),
         breaker_trip: None,
         orchestrator_reports: Vec::new(),
         released_claims: Vec::new(),
@@ -749,6 +942,419 @@ pub fn collect_supervisor_run(
         remaining_risk: "run artifacts are incomplete".to_string(),
         next_safe_action: "rerun supervise run for this run id".to_string(),
     })
+}
+
+pub fn verified_megafile_decomposition_evidence(
+    repo: impl AsRef<Path>,
+    run_id: RunId,
+    orchestrator_id: &str,
+    target_path: &Path,
+    candidate_changed_paths: &[PathBuf],
+) -> Result<VerifiedMegafileDecompositionEvidence> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    let normalized_target = normalize_report_target_path(
+        Some(target_path.to_path_buf()),
+        "megafile decomposition target",
+    )?
+    .context("megafile decomposition target is required")?;
+    let normalized_candidate_paths =
+        normalize_paths(candidate_changed_paths.to_vec()).context("candidate paths are invalid")?;
+    if normalized_candidate_paths.is_empty() {
+        bail!("candidate has no changed paths");
+    }
+    let run_dir = run_dir(&repo, &run_id);
+    let report = read_finalized_supervisor_report(&repo, &run_id, &run_dir)?
+        .with_context(|| format!("supervisor run '{}' is not finalized", run_id.as_str()))?;
+    if report.run_id != run_id {
+        bail!(
+            "finalized supervisor report run id '{}' does not match requested run '{}'",
+            report.run_id.as_str(),
+            run_id.as_str()
+        );
+    }
+    if report.runtime != SupervisorRuntime::Codex
+        || !report.publishable
+        || !report.success
+        || !report.accepted
+        || report.rejected
+        || report.status != ReviewStatus::Succeeded
+        || report.breaker_trip.is_some()
+        || !report.release_errors.is_empty()
+        || !report.semantic_release_errors.is_empty()
+    {
+        bail!(
+            "supervisor run '{}' is not accepted successful publishable evidence",
+            run_id.as_str()
+        );
+    }
+    let normalized_supervisor_paths = normalize_paths(report.files_changed.clone())
+        .context("supervisor files_changed invalid")?;
+    if normalized_supervisor_paths != normalized_candidate_paths {
+        bail!(
+            "supervisor run '{}' files_changed does not exactly match the merge candidate",
+            run_id.as_str()
+        );
+    }
+
+    let matching_children = report
+        .orchestrator_reports
+        .iter()
+        .filter(|child| child.id == orchestrator_id)
+        .collect::<Vec<_>>();
+    let child = match matching_children.as_slice() {
+        [child] => *child,
+        [] => bail!(
+            "supervisor run '{}' has no child orchestrator report for merge candidate agent '{}'",
+            run_id.as_str(),
+            orchestrator_id
+        ),
+        _ => bail!(
+            "supervisor run '{}' has ambiguous child orchestrator reports for merge candidate agent '{}'",
+            run_id.as_str(),
+            orchestrator_id
+        ),
+    };
+    if child.role != AgentRole::ChildOrchestrator || report_failed(child) {
+        bail!(
+            "child orchestrator '{}' is not accepted successful evidence",
+            orchestrator_id
+        );
+    }
+    let normalized_child_paths =
+        normalize_paths(child.files_changed.clone()).context("child files_changed invalid")?;
+    if normalized_child_paths != normalized_candidate_paths {
+        bail!(
+            "child orchestrator '{}' files_changed does not exactly match the merge candidate",
+            orchestrator_id
+        );
+    }
+
+    let mut matching_workers = Vec::new();
+    for worker in &child.worker_reports {
+        if worker.assignment_kind != AssignmentKind::MegafileDecomposition {
+            continue;
+        }
+        let worker_target =
+            normalize_report_target_path(worker.target_path.clone(), "worker target_path")?;
+        if worker_target.as_ref() == Some(&normalized_target) {
+            matching_workers.push(worker);
+        }
+    }
+    let worker = match matching_workers.as_slice() {
+        [worker] => *worker,
+        [] => bail!(
+            "child orchestrator '{}' has no megafile_decomposition worker for exact target '{}'",
+            orchestrator_id,
+            normalized_target.display()
+        ),
+        _ => bail!(
+            "child orchestrator '{}' has ambiguous megafile_decomposition workers for exact target '{}'",
+            orchestrator_id,
+            normalized_target.display()
+        ),
+    };
+    if worker.role != AgentRole::Worker
+        || report_failed(worker)
+        || worker.no_further_delegation != Some(true)
+    {
+        bail!(
+            "megafile_decomposition worker '{}' is not accepted successful terminal evidence",
+            worker.id
+        );
+    }
+    let completion = worker
+        .decomposition_completion
+        .clone()
+        .map(normalize_decomposition_completion)
+        .transpose()?
+        .context("accepted megafile_decomposition worker omitted completion evidence")?;
+    if completion.target_path != normalized_target {
+        bail!("worker decomposition completion target does not match the merge target");
+    }
+    let supervisor_candidate_binding = completion
+        .supervisor_candidate_binding
+        .clone()
+        .context(
+            "accepted megafile_decomposition worker evidence is missing the supervisor-inspected candidate binding",
+        )?;
+    if supervisor_candidate_binding.agent_id != child.id {
+        bail!(
+            "supervisor-inspected decomposition candidate binding agent '{}' does not match child orchestrator '{}'",
+            supervisor_candidate_binding.agent_id,
+            child.id
+        );
+    }
+    let worker_paths =
+        normalize_paths(worker.files_changed.clone()).context("worker files_changed invalid")?;
+    let expected_decomposition_paths = std::iter::once(completion.target_path.clone())
+        .chain(completion.replacement_paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if worker_paths != expected_decomposition_paths {
+        bail!(
+            "worker files_changed must exactly equal the decomposition target plus evidence-bound replacement paths"
+        );
+    }
+    if normalized_candidate_paths != expected_decomposition_paths {
+        bail!(
+            "merge candidate changed paths must exactly equal the decomposition target plus evidence-bound replacement paths"
+        );
+    }
+
+    let child_completions = child
+        .decomposition_completions
+        .iter()
+        .cloned()
+        .map(normalize_decomposition_completion)
+        .collect::<Result<BTreeSet<_>>>()?;
+    if !child_completions.contains(&completion) {
+        bail!("child orchestrator omitted the accepted worker decomposition completion");
+    }
+    let final_completions = report
+        .decomposition_candidates
+        .iter()
+        .cloned()
+        .map(normalize_decomposition_completion)
+        .collect::<Result<BTreeSet<_>>>()?;
+    if !final_completions.contains(&completion) {
+        bail!("supervisor final report omitted the accepted decomposition completion");
+    }
+
+    let expected_auditor_id = format!("{}-review-auditor", child.id);
+    let audit = child
+        .audit_reports
+        .iter()
+        .find(|audit| audit.id == expected_auditor_id)
+        .context("accepted parent review-auditor evidence is missing")?;
+    if audit.role != AgentRole::Auditor
+        || report_failed(audit)
+        || audit.no_further_delegation != Some(true)
+        || !audit.read_only
+        || audit.commands_run.is_empty()
+        || audit.validation_results.is_empty()
+        || audit.validation_results.iter().any(validation_failed)
+        || !audit.reviewed_worker_ids.iter().any(|id| id == &worker.id)
+    {
+        bail!("parent review-auditor evidence does not accept the successful decomposition worker");
+    }
+    let reviewed_paths = audit
+        .reviewed_paths
+        .iter()
+        .filter_map(|path| normalize_repo_relative_path(path).ok())
+        .collect::<BTreeSet<_>>();
+    let missing_audit_paths = normalized_candidate_paths
+        .iter()
+        .filter(|required| {
+            !reviewed_paths
+                .iter()
+                .any(|reviewed| path_is_covered_by_claim(required, reviewed))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_audit_paths.is_empty() {
+        bail!(
+            "parent review-auditor evidence does not cover exact candidate paths: {}",
+            display_paths(&missing_audit_paths)
+        );
+    }
+
+    Ok(VerifiedMegafileDecompositionEvidence {
+        run_id,
+        orchestrator_id: child.id.clone(),
+        worker_id: worker.id.clone(),
+        target_path: completion.target_path,
+        replacement_paths: completion.replacement_paths,
+        supervisor_candidate_binding,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_finalized_megafile_decomposition_evidence(
+    repo: &Path,
+    run_id: RunId,
+    orchestrator_id: &str,
+    worker_id: &str,
+    target_path: PathBuf,
+    replacement_paths: Vec<PathBuf>,
+) -> Result<()> {
+    write_test_finalized_megafile_decomposition_evidence_with_binding(
+        repo,
+        run_id,
+        orchestrator_id,
+        worker_id,
+        target_path,
+        replacement_paths,
+        true,
+    )
+}
+
+#[cfg(test)]
+fn write_test_finalized_megafile_decomposition_evidence_with_binding(
+    repo: &Path,
+    run_id: RunId,
+    orchestrator_id: &str,
+    worker_id: &str,
+    target_path: PathBuf,
+    replacement_paths: Vec<PathBuf>,
+    include_supervisor_binding: bool,
+) -> Result<()> {
+    let mut completion = normalize_decomposition_completion(DecompositionCompletion {
+        target_path,
+        replacement_paths,
+        supervisor_candidate_binding: None,
+    })?;
+    let files_changed = std::iter::once(completion.target_path.clone())
+        .chain(completion.replacement_paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let candidate = crate::merge::collect_agent_result(MergeCollectOptions {
+        repo: repo.to_path_buf(),
+        agent_id: orchestrator_id.to_string(),
+        claimed_paths: files_changed.clone(),
+        include_full_diff: false,
+        diff_summary_char_limit: 1,
+        validations: Vec::new(),
+    })
+    .context("capture finalized test decomposition candidate")?;
+    let candidate_paths =
+        normalize_paths(candidate.changed_paths).context("test candidate paths invalid")?;
+    if candidate_paths != files_changed {
+        bail!("test decomposition candidate paths do not match finalized evidence");
+    }
+    if include_supervisor_binding {
+        completion.supervisor_candidate_binding = Some(candidate.validation_binding);
+    }
+    let validation = ValidationResult {
+        name: "test decomposition validation".to_string(),
+        status: ReviewStatus::Succeeded,
+        command: vec!["test-validation".to_string()],
+        message: None,
+    };
+    let command = CommandRunRecord {
+        command: vec!["test-command".to_string()],
+        cwd: PathBuf::from("."),
+        exit_code: Some(0),
+        status: ReviewStatus::Succeeded,
+        timeout_seconds: 1,
+        duration_ms: 1,
+        timed_out: false,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: None,
+    };
+    let worker = WorkerReport {
+        id: worker_id.to_string(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::MegafileDecomposition,
+        target_path: Some(completion.target_path.clone()),
+        assigned_paths: files_changed.clone(),
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        claim_token: None,
+        semantic_intent_token: None,
+        commands_run: vec![command.clone()],
+        files_changed: files_changed.clone(),
+        validation_results: vec![validation.clone()],
+        findings: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: Some(completion.clone()),
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "test evidence".to_string(),
+        next_safe_action: "merge preview".to_string(),
+    };
+    let audit = AuditorReport {
+        id: format!("{orchestrator_id}-review-auditor"),
+        role: AgentRole::Auditor,
+        reviewed_worker_ids: vec![worker_id.to_string()],
+        reviewed_paths: files_changed.clone(),
+        commands_run: vec![command.clone()],
+        validation_results: vec![validation.clone()],
+        findings: Vec::new(),
+        no_further_delegation: Some(true),
+        read_only: true,
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "test evidence".to_string(),
+        next_safe_action: "merge preview".to_string(),
+    };
+    let child = OrchestratorReviewReport {
+        id: orchestrator_id.to_string(),
+        role: AgentRole::ChildOrchestrator,
+        assigned_paths: files_changed.clone(),
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        claim_token: Some(1),
+        semantic_intent_token: None,
+        commands_run: vec![command.clone()],
+        files_changed: files_changed.clone(),
+        validation_results: vec![validation.clone()],
+        findings: Vec::new(),
+        worker_reports: vec![worker],
+        audit_reports: vec![audit],
+        decomposition_completions: vec![completion.clone()],
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "test evidence".to_string(),
+        next_safe_action: "merge preview".to_string(),
+    };
+    let report = SupervisorFinalReport {
+        version: SUPERVISOR_SCHEMA_VERSION,
+        run_id: run_id.clone(),
+        role: AgentRole::Supervisor,
+        repo: PathBuf::from("."),
+        plan_file: PathBuf::from("test-plan.json"),
+        run_dir: RunArtifactFamily::Supervise
+            .run_root()
+            .join(run_id.as_str()),
+        runtime: SupervisorRuntime::Codex,
+        publishable: true,
+        success: true,
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        assigned_paths: files_changed.clone(),
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        claim_tokens: vec![1],
+        semantic_intent_tokens: Vec::new(),
+        role_usage: BTreeMap::new(),
+        total_usage: None,
+        total_cost_usd: None,
+        usage_complete: true,
+        commands_run: vec![command],
+        files_changed,
+        validation_results: vec![validation],
+        findings: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_candidates: vec![completion],
+        breaker_trip: None,
+        orchestrator_reports: vec![child],
+        released_claims: Vec::new(),
+        release_errors: Vec::new(),
+        released_semantic_intents: Vec::new(),
+        semantic_release_errors: Vec::new(),
+        remaining_risk: "test evidence".to_string(),
+        next_safe_action: "merge preview".to_string(),
+    };
+    let mut writer = ArtifactRunWriter::reserve(
+        repo,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "megafile-decomposition-test",
+    )?;
+    write_final_report(&mut writer, &report)?;
+    writer.finalize(
+        RunArtifactFamily::Supervise.final_report_relative_path(),
+        true,
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -815,12 +1421,17 @@ pub fn supervise_role_prefix(
 
 pub fn child_orchestrator_prompt(context: ChildOrchestratorPromptContext<'_>) -> Result<String> {
     let incoming_root = context.run_dir.join("incoming");
-    child_orchestrator_prompt_with_incoming_root(context, &incoming_root)
+    child_orchestrator_prompt_with_incoming_root(
+        context,
+        &incoming_root,
+        &AssignmentMetadata::new(),
+    )
 }
 
 fn child_orchestrator_prompt_with_incoming_root(
     context: ChildOrchestratorPromptContext<'_>,
     incoming_root: &Path,
+    assignment_metadata: &AssignmentMetadata,
 ) -> Result<String> {
     let ChildOrchestratorPromptContext {
         plan,
@@ -834,16 +1445,21 @@ fn child_orchestrator_prompt_with_incoming_root(
         consultant,
         claim_context,
     } = context;
-    let assignment_json = serde_json::to_string_pretty(assignment)
-        .context("failed to serialize orchestrator assignment")?;
+    let assignment_json = serde_json::to_string_pretty(&orchestrator_assignment_value(
+        assignment,
+        assignment_metadata,
+    )?)
+    .context("failed to serialize orchestrator assignment")?;
     let worker_prompts = assignment
         .worker_assignments
         .iter()
         .map(|worker| {
+            let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
             worker_prompt_with_incoming_root(
                 plan,
                 assignment,
                 worker,
+                &metadata,
                 run_dir,
                 incoming_root,
                 worker_schema_path,
@@ -851,7 +1467,13 @@ fn child_orchestrator_prompt_with_incoming_root(
         })
         .collect::<Result<Vec<_>>>()?
         .join("\n\n--- worker prompt contract ---\n\n");
-    let auditor_prompt = review_auditor_prompt(plan, assignment, run_dir, auditor_schema_path)?;
+    let auditor_prompt = review_auditor_prompt_with_metadata(
+        plan,
+        assignment,
+        assignment_metadata,
+        run_dir,
+        auditor_schema_path,
+    )?;
     let task = assignment_task(plan, assignment);
     let role_prefix = supervise_role_prefix(
         SupervisePromptRole::O1ChildOrchestrator,
@@ -870,6 +1492,7 @@ Primary worktree mutation is forbidden. Work only in this assigned child worktre
 
 Ownership:
 - Child orchestrator id: {child_id}
+- Megafile decomposition worker targets: {decomposition_targets}
 - Assigned paths: {assigned_paths}
 - Semantic symbols: {semantic_symbols}
 - Semantic modules: {semantic_modules}
@@ -914,6 +1537,7 @@ Required behavior:
 - Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
 - Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
 - Review every WorkerReport before writing your own OrchestratorReviewReport.
+- Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
 - Include at least one accepted review-auditor report in audit_reports that covers all assigned worker ids; MACO rejects child reports with worker assignments that omit terminal audit evidence.
 {consultation_section}
 
@@ -946,6 +1570,7 @@ Review auditor prompt template:
         role_prefix = role_prefix,
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
+        decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
         assigned_paths = display_paths(&assignment.assigned_paths),
         semantic_symbols = assignment.semantic_symbols.join(", "),
         semantic_modules = assignment.semantic_modules.join(", "),
@@ -1000,10 +1625,12 @@ pub fn worker_prompt(
     run_dir: &Path,
     schema_path: &Path,
 ) -> Result<String> {
+    let metadata = WorkerAssignmentMetadata::default();
     worker_prompt_with_incoming_root(
         plan,
         orchestrator,
         worker,
+        &metadata,
         run_dir,
         &run_dir.join("incoming"),
         schema_path,
@@ -1014,12 +1641,13 @@ fn worker_prompt_with_incoming_root(
     plan: &SupervisorPlan,
     orchestrator: &OrchestratorAssignment,
     worker: &WorkerAssignment,
+    metadata: &WorkerAssignmentMetadata,
     run_dir: &Path,
     incoming_root: &Path,
     schema_path: &Path,
 ) -> Result<String> {
-    let worker_json =
-        serde_json::to_string_pretty(worker).context("failed to serialize worker assignment")?;
+    let worker_json = serde_json::to_string_pretty(&worker_assignment_value(worker, metadata)?)
+        .context("failed to serialize worker assignment")?;
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
     let task = worker_task(plan, orchestrator, worker);
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative(worker));
@@ -1032,6 +1660,8 @@ Do not launch further workers, delegate to another worker, or spawn/impersonate 
 
 Ownership:
 - Worker id: {worker_id}
+- Assignment kind: {assignment_kind}
+- Decomposition target path: {target_path}
 - Assigned paths: {assigned_paths}
 - Semantic symbols: {semantic_symbols}
 - Semantic modules: {semantic_modules}
@@ -1049,7 +1679,9 @@ Rules:
 - Do not mutate the primary worktree.
 - Before returning your WorkerReport, write a structured execution journal to the exact execution journal path above; this is the only allowed non-source artifact write for this worker. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
 - Run validation or record why validation was not run.
-- Return WorkerReport JSON in your final response with changed files, commands run, validation results, findings, remaining risk, and next safe action.
+- Return WorkerReport JSON in your final response with assignment_kind, target_path, changed files, commands run, validation results, findings, bloated_file_flags, decomposition_completion, remaining risk, and next safe action.
+- bloated_file_flags is bounded to at most {max_bloated_file_flags} unique objects of the form {{"path":"repo/relative/file"}}. Every path must be canonical, repository-relative, and inside this worker's assigned paths. Thresholds are intentionally not inferred by this report schema.
+- For a successful megafile_decomposition, include the exact target and every concrete replacement in files_changed, then set decomposition_completion to {{"target_path":"the exact canonical target path","replacement_paths":["one or more canonical newly created files"]}}. Otherwise set it to null. Renames, unrelated edits, and no-op target reports are not decomposition completion evidence. This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.
 - Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
 - If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over. O2-to-O2 follow-up belongs to the user-root O2 or autonomous O2 durable queue, not this terminal role.
 - Only write a report file when an explicit report_path is assigned.
@@ -1065,6 +1697,12 @@ Worker assignment JSON:
         role_prefix = role_prefix,
         orchestrator_id = orchestrator.id,
         worker_id = worker.id,
+        assignment_kind = metadata.kind.as_str(),
+        target_path = metadata
+            .target_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
         assigned_paths = display_paths(&worker.assigned_paths),
         semantic_symbols = worker.semantic_symbols.join(", "),
         semantic_modules = worker.semantic_modules.join(", "),
@@ -1080,6 +1718,7 @@ Worker assignment JSON:
             .as_deref()
             .unwrap_or("<runtime default>"),
         schema_path = schema_path.display(),
+        max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
         task = task,
         worker_json = worker_json,
     ))
@@ -1088,6 +1727,22 @@ Worker assignment JSON:
 pub fn review_auditor_prompt(
     plan: &SupervisorPlan,
     orchestrator: &OrchestratorAssignment,
+    run_dir: &Path,
+    schema_path: &Path,
+) -> Result<String> {
+    review_auditor_prompt_with_metadata(
+        plan,
+        orchestrator,
+        &AssignmentMetadata::new(),
+        run_dir,
+        schema_path,
+    )
+}
+
+fn review_auditor_prompt_with_metadata(
+    plan: &SupervisorPlan,
+    orchestrator: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
     run_dir: &Path,
     schema_path: &Path,
 ) -> Result<String> {
@@ -1109,6 +1764,7 @@ Do not launch further workers, delegate, mutate files, run mutating commands, or
 Ownership:
 - Review auditor id: {auditor_id}
 - Assigned worker ids to audit: {worker_ids}
+- Megafile decomposition worker targets: {decomposition_targets}
 - Assigned paths to review: {assigned_paths}
 - Semantic symbols: {semantic_symbols}
 - Semantic modules: {semantic_modules}
@@ -1116,6 +1772,7 @@ Ownership:
 
 Rules:
 - Stay read-only. Inspect worker reports, child diffs, validation evidence, findings, remaining risk, and claimed path boundaries.
+- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
 - Do not edit files, create durable artifacts, apply patches, claim paths, or change Git state.
 - Produce structured AuditorReport JSON in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action.
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
@@ -1135,6 +1792,7 @@ Supervisor task:
         } else {
             worker_ids
         },
+        decomposition_targets = display_decomposition_targets(orchestrator, assignment_metadata),
         assigned_paths = display_paths(&orchestrator.assigned_paths),
         semantic_symbols = orchestrator.semantic_symbols.join(", "),
         semantic_modules = orchestrator.semantic_modules.join(", "),
@@ -1147,6 +1805,7 @@ Supervisor task:
 struct ParentReviewAuditorPromptContext<'a> {
     plan: &'a SupervisorPlan,
     assignment: &'a OrchestratorAssignment,
+    assignment_metadata: &'a AssignmentMetadata,
     run_dir: &'a Path,
     worktree_path: &'a Path,
     child_report_path: &'a Path,
@@ -1159,6 +1818,7 @@ fn parent_review_auditor_prompt(context: ParentReviewAuditorPromptContext<'_>) -
     let ParentReviewAuditorPromptContext {
         plan,
         assignment,
+        assignment_metadata,
         run_dir,
         worktree_path,
         child_report_path,
@@ -1186,6 +1846,7 @@ Runtime boundary:
 Evidence to review:
 - Supervisor task: {task}
 - Child assignment id: {assignment_id}
+- Megafile decomposition worker targets: {decomposition_targets}
 - Child worktree path: {worktree_path}
 - Run artifact root: {run_dir}
 - Child report path: {child_report_path}
@@ -1199,6 +1860,7 @@ Review requirements:
 - Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
 - Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
 - Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
+- For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Set role="auditor", no_further_delegation=true, read_only=true.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
@@ -1210,6 +1872,7 @@ Child report JSON:
         role_prefix = role_prefix,
         task = task,
         assignment_id = assignment.id,
+        decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
         worktree_path = worktree_path.display(),
         run_dir = run_dir.display(),
         child_report_path = child_report_path.display(),
@@ -1739,6 +2402,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     concurrent_mode: bool,
     plan: &'a SupervisorPlan,
     consultant: &'a SupervisorConsultantPlan,
+    assignment_metadata: &'a AssignmentMetadata,
     assignment: &'a OrchestratorAssignment,
     options: &'a SupervisorRunOptions,
     repo: &'a Path,
@@ -1892,6 +2556,7 @@ fn execute_supervisor_assignment_inner(
         concurrent_mode,
         plan,
         consultant,
+        assignment_metadata,
         assignment,
         options,
         repo,
@@ -2141,6 +2806,7 @@ fn execute_supervisor_assignment_inner(
                 },
             },
             &incoming_path,
+            assignment_metadata,
         )?;
         let attempt_prompt = match &retry_feedback {
             Some(problems) => prompt_with_corrective_feedback(&prompt, problems),
@@ -2264,6 +2930,7 @@ fn execute_supervisor_assignment_inner(
             SupervisorRuntime::Fake => deterministic_fake_child_run(
                 &command,
                 assignment,
+                assignment_metadata,
                 claim.token.get(),
                 semantic_token,
             ),
@@ -2349,15 +3016,17 @@ fn execute_supervisor_assignment_inner(
         })?;
         let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
         let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
-        let (mut attempt_report, report_shape_problems) = collect_child_report(
-            assignment,
-            &attempt_artifacts.raw_report_relative,
-            &external_run,
-            &command,
-            &worktree.path,
-            &child_base_head,
-            &worker_journal_evidence,
-        );
+        let (mut attempt_report, report_shape_problems) =
+            collect_child_report(ChildReportCollectionContext {
+                assignment,
+                assignment_metadata,
+                report_path: &attempt_artifacts.raw_report_relative,
+                external_run: &external_run,
+                external_command: &command,
+                worktree_path: &worktree.path,
+                child_base_head: &child_base_head,
+                worker_journals: &worker_journal_evidence,
+            });
         if !primary_changes.is_empty() {
             mark_primary_integrity_violation(assignment, &primary_changes, &mut attempt_report);
         }
@@ -2443,6 +3112,26 @@ fn execute_supervisor_assignment_inner(
     if plan.max_child_retries > 0 {
         append_child_attempt_history(&mut child_report, &attempt_history);
     }
+    let pre_auditor_candidate = if child_containment_verified {
+        match bind_supervisor_decomposition_candidate(
+            repo,
+            assignment,
+            &mut child_report,
+            &worktree_write_lease,
+        ) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                reject_supervisor_decomposition_binding(
+                    &mut child_report,
+                    &final_report_path,
+                    &error,
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     with_supervisor_artifacts(artifacts, |writer, _| {
         write_child_report(writer, &final_report_relative, &child_report)
     })?;
@@ -2472,6 +3161,7 @@ fn execute_supervisor_assignment_inner(
         let auditor_prompt = parent_review_auditor_prompt(ParentReviewAuditorPromptContext {
             plan,
             assignment,
+            assignment_metadata,
             run_dir,
             worktree_path: &worktree.path,
             child_report_path: &final_report_path,
@@ -2724,6 +3414,25 @@ fn execute_supervisor_assignment_inner(
     if child_containment_verified {
         validate_auditor_reports(assignment, &final_report_path, &mut child_report);
     }
+    if !report_failed(&child_report) && !child_report.decomposition_completions.is_empty() {
+        let post_auditor_candidate =
+            inspect_supervisor_decomposition_candidate(repo, assignment, &worktree_write_lease);
+        let stable = match (pre_auditor_candidate.as_ref(), post_auditor_candidate.as_ref()) {
+            (Some(before), Ok(after)) if before == after => Ok(()),
+            (Some(before), Ok(after)) => Err(anyhow!(
+                "candidate content, paths, or base changed across parent auditor review: before={before:?}, after={after:?}"
+            )),
+            (Some(_), Err(error)) => Err(anyhow!(
+                "failed to recapture decomposition candidate after parent auditor review: {error:#}"
+            )),
+            (None, _) => Err(anyhow!(
+                "accepted decomposition evidence has no pre-auditor supervisor candidate binding"
+            )),
+        };
+        if let Err(error) = stable {
+            reject_supervisor_decomposition_binding(&mut child_report, &final_report_path, &error);
+        }
+    }
     with_supervisor_artifacts(artifacts, |writer, journal| {
         write_child_report(writer, &final_report_relative, &child_report)?;
         record_final_report_decisions(journal, writer, &options.run_id, &child_report);
@@ -2856,8 +3565,11 @@ fn run_supervisor_plan_with_runner(
 ) -> Result<SupervisorFinalReport> {
     let serialized_runner = Mutex::new(external_runner);
     run_supervisor_plan_with_runner_and_creation(
-        plan,
-        consultant,
+        LoadedSupervisorPlan {
+            plan,
+            consultant,
+            assignment_metadata: AssignmentMetadata::new(),
+        },
         options,
         1,
         execution_runtime,
@@ -2878,8 +3590,11 @@ fn run_supervisor_plan_with_concurrent_runner(
     external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
 ) -> Result<SupervisorFinalReport> {
     run_supervisor_plan_with_runner_and_creation(
-        plan,
-        consultant,
+        LoadedSupervisorPlan {
+            plan,
+            consultant,
+            assignment_metadata: AssignmentMetadata::new(),
+        },
         options,
         max_concurrent_children,
         SupervisorExecutionRuntime::NonpublishableSimulation,
@@ -2897,8 +3612,11 @@ fn run_supervisor_plan_with_concurrent_cancellable_runner(
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     run_supervisor_plan_with_runner_and_creation(
-        plan,
-        consultant,
+        LoadedSupervisorPlan {
+            plan,
+            consultant,
+            assignment_metadata: AssignmentMetadata::new(),
+        },
         options,
         max_concurrent_children,
         SupervisorExecutionRuntime::NonpublishableSimulation,
@@ -2908,14 +3626,18 @@ fn run_supervisor_plan_with_concurrent_cancellable_runner(
 }
 
 fn run_supervisor_plan_with_runner_and_creation(
-    plan: SupervisorPlan,
-    consultant: SupervisorConsultantPlan,
+    loaded: LoadedSupervisorPlan,
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
+    let LoadedSupervisorPlan {
+        plan,
+        consultant,
+        assignment_metadata,
+    } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
@@ -2980,6 +3702,7 @@ fn run_supervisor_plan_with_runner_and_creation(
             Path::new("assignments/supervisor-plan.json"),
             &plan,
             &consultant,
+            &assignment_metadata,
         )?;
         write_orchestrator_schema(
             &mut artifact_writer,
@@ -3058,6 +3781,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                         concurrent_mode: false,
                         plan: &plan,
                         consultant: &consultant,
+                        assignment_metadata: &assignment_metadata,
                         assignment,
                         options: &options,
                         repo: &repo,
@@ -3104,6 +3828,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                 thread::scope(|scope| -> Result<()> {
                     let plan_ref = &plan;
                     let consultant_ref = &consultant;
+                    let assignment_metadata_ref = &assignment_metadata;
                     let options_ref = &options;
                     let repo_ref = repo.as_path();
                     let run_dir_ref = run_dir.as_path();
@@ -3160,6 +3885,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                                             concurrent_mode: true,
                                             plan: plan_ref,
                                             consultant: consultant_ref,
+                                            assignment_metadata: assignment_metadata_ref,
                                             assignment,
                                             options: options_ref,
                                             repo: repo_ref,
@@ -3433,6 +4159,8 @@ fn run_supervisor_plan_with_runner_and_creation(
     } = role_usage_report(&plan, usage_samples)?;
     let total_cost_usd =
         finalize_supervisor_cost(usage_complete, &mut role_usage, observed_total_cost_usd);
+    let bloated_file_flags = accepted_bloated_file_flags(&orchestrator_reports);
+    let decomposition_candidates = accepted_decomposition_candidates(&orchestrator_reports);
     let final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -3495,6 +4223,8 @@ fn run_supervisor_plan_with_runner_and_creation(
             .flat_map(|report| report.validation_results.iter().cloned())
             .collect(),
         findings,
+        bloated_file_flags,
+        decomposition_candidates,
         breaker_trip: supervisor_breaker_trip,
         orchestrator_reports,
         released_claims,
@@ -3816,15 +4546,30 @@ fn semantic_assignment_request(assignment: &OrchestratorAssignment) -> SemanticI
     }
 }
 
+struct ChildReportCollectionContext<'a> {
+    assignment: &'a OrchestratorAssignment,
+    assignment_metadata: &'a AssignmentMetadata,
+    report_path: &'a Path,
+    external_run: &'a ExternalAgentRun,
+    external_command: &'a ExternalAgentCommand,
+    worktree_path: &'a Path,
+    child_base_head: &'a Oid,
+    worker_journals: &'a WorkerExecutionJournalEvidenceSet,
+}
+
 fn collect_child_report(
-    assignment: &OrchestratorAssignment,
-    report_path: &Path,
-    external_run: &ExternalAgentRun,
-    external_command: &ExternalAgentCommand,
-    worktree_path: &Path,
-    child_base_head: &Oid,
-    worker_journals: &WorkerExecutionJournalEvidenceSet,
+    context: ChildReportCollectionContext<'_>,
 ) -> (OrchestratorReviewReport, Vec<String>) {
+    let ChildReportCollectionContext {
+        assignment,
+        assignment_metadata,
+        report_path,
+        external_run,
+        external_command,
+        worktree_path,
+        child_base_head,
+        worker_journals,
+    } = context;
     let mut report_shape_problems = Vec::new();
     let mut report = match read_child_report(external_run.output_last_message(), report_path) {
         Ok(parsed) => {
@@ -3890,7 +4635,8 @@ fn collect_child_report(
     };
     validate_worker_report_delegation_attestations(assignment, report_path, &mut report);
     verify_child_report_paths(assignment, worktree_path, child_base_head, &mut report);
-    validate_worker_report_evidence(assignment, report_path, &mut report);
+    validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
+    validate_assignment_report_plumbing(assignment, assignment_metadata, report_path, &mut report);
     validate_worker_execution_journal_evidence(
         assignment,
         report_path,
@@ -4159,6 +4905,108 @@ fn parent_auditor_required(
         || (assignment.worker_assignments.is_empty() && !report.files_changed.is_empty())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupervisorCandidateInspection {
+    binding: CandidateValidationBinding,
+    changed_paths: Vec<PathBuf>,
+}
+
+fn inspect_supervisor_decomposition_candidate(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    worktree_write_lease: &ManagedWorktreeWriteLease,
+) -> Result<SupervisorCandidateInspection> {
+    let candidate = collect_agent_result_with_evidence_and_write_lease(
+        MergeCollectOptions {
+            repo: repo.to_path_buf(),
+            agent_id: assignment.id.clone(),
+            claimed_paths: assignment.assigned_paths.clone(),
+            include_full_diff: false,
+            diff_summary_char_limit: 1,
+            validations: Vec::new(),
+        },
+        ValidationEvidenceBundle::default(),
+        worktree_write_lease,
+    )
+    .context("failed to capture supervisor-inspected decomposition candidate")?;
+    Ok(SupervisorCandidateInspection {
+        binding: candidate.validation_binding,
+        changed_paths: normalize_paths(candidate.changed_paths)
+            .context("supervisor-inspected decomposition candidate paths are invalid")?,
+    })
+}
+
+fn bind_supervisor_decomposition_candidate(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    report: &mut OrchestratorReviewReport,
+    worktree_write_lease: &ManagedWorktreeWriteLease,
+) -> Result<Option<SupervisorCandidateInspection>> {
+    if report_failed(report) || report.decomposition_completions.is_empty() {
+        return Ok(None);
+    }
+    if report
+        .decomposition_completions
+        .iter()
+        .any(|completion| completion.supervisor_candidate_binding.is_some())
+        || report.worker_reports.iter().any(|worker| {
+            worker
+                .decomposition_completion
+                .as_ref()
+                .is_some_and(|completion| completion.supervisor_candidate_binding.is_some())
+        })
+    {
+        bail!(
+            "incoming worker or child decomposition evidence self-asserted supervisor_candidate_binding"
+        );
+    }
+
+    let inspection =
+        inspect_supervisor_decomposition_candidate(repo, assignment, worktree_write_lease)?;
+    let report_paths =
+        normalize_paths(report.files_changed.clone()).context("child files_changed invalid")?;
+    if inspection.changed_paths != report_paths {
+        bail!(
+            "supervisor-inspected decomposition candidate paths changed after child report validation"
+        );
+    }
+
+    for worker in &mut report.worker_reports {
+        if report_failed(worker) {
+            continue;
+        }
+        if let Some(completion) = &mut worker.decomposition_completion {
+            completion.supervisor_candidate_binding = Some(inspection.binding.clone());
+        }
+    }
+    for completion in &mut report.decomposition_completions {
+        completion.supervisor_candidate_binding = Some(inspection.binding.clone());
+    }
+    Ok(Some(inspection))
+}
+
+fn reject_supervisor_decomposition_binding(
+    report: &mut OrchestratorReviewReport,
+    report_path: &Path,
+    error: &anyhow::Error,
+) {
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: format!(
+            "supervisor could not bind the exact decomposition candidate reviewed by the parent auditor: {error:#}"
+        ),
+        paths: vec![report_path.to_path_buf()],
+    });
+    report.remaining_risk =
+        "the finalized evidence does not bind the exact reviewed candidate content".to_string();
+    report.next_safe_action =
+        "rerun the child scope and parent auditor against one stable candidate snapshot"
+            .to_string();
+}
+
 fn required_auditor_review_subject_ids(
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
@@ -4392,8 +5240,329 @@ fn verify_child_report_paths(
             .to_string();
 }
 
+fn validate_assignment_report_plumbing(
+    assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    let result = (|| -> Result<()> {
+        if report.decomposition_completions.len() > assignment.worker_assignments.len() {
+            bail!("decomposition_completions exceeds the worker assignment count");
+        }
+        let mut normalized = BTreeSet::new();
+        for completion in std::mem::take(&mut report.decomposition_completions) {
+            normalized.insert(normalize_unbound_decomposition_completion(completion)?);
+        }
+        let expected = report
+            .worker_reports
+            .iter()
+            .filter(|worker_report| !report_failed(*worker_report))
+            .filter_map(|worker_report| worker_report.decomposition_completion.clone())
+            .collect::<BTreeSet<_>>();
+        let successful =
+            report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded;
+        if !successful && !normalized.is_empty() {
+            bail!(
+                "decomposition_completions cannot claim success on an unaccepted or unsuccessful child report"
+            );
+        }
+        if successful && normalized != expected {
+            bail!("decomposition_completions does not match accepted successful worker evidence");
+        }
+        for completion in &normalized {
+            if !assignment.worker_assignments.iter().any(|worker| {
+                let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
+                metadata.kind == AssignmentKind::MegafileDecomposition
+                    && metadata.target_path.as_ref() == Some(&completion.target_path)
+            }) {
+                bail!(
+                    "decomposition completion target_path '{}' is not declared by a worker assignment",
+                    completion.target_path.display()
+                );
+            }
+        }
+        report.decomposition_completions = normalized.into_iter().collect();
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        report.decomposition_completions.clear();
+        report.status = ReviewStatus::Failed;
+        report.accepted = false;
+        report.rejected = true;
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "child orchestrator '{}' has invalid assignment/decomposition report plumbing: {error}",
+                report.id
+            ),
+            paths: vec![report_path.to_path_buf()],
+        });
+        report.remaining_risk =
+            "typed assignment or decomposition completion evidence is invalid".to_string();
+        report.next_safe_action =
+            "rerun the child scope with report fields matching the normalized assignment"
+                .to_string();
+    }
+}
+
+fn normalize_worker_report_plumbing(
+    assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
+    workers_by_id: &BTreeMap<&str, &WorkerAssignment>,
+    report: &mut WorkerReport,
+) -> Result<()> {
+    let worker = workers_by_id
+        .get(report.id.as_str())
+        .context("worker is not declared in the assignment")?;
+    let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
+    if report.assignment_kind != metadata.kind {
+        bail!(
+            "assignment_kind '{}' does not match planned kind '{}'",
+            report.assignment_kind.as_str(),
+            metadata.kind.as_str()
+        );
+    }
+    report.target_path = normalize_report_target_path(report.target_path.take(), "target_path")?;
+    if report.target_path != metadata.target_path {
+        bail!(
+            "target_path '{}' does not match planned target_path '{}'",
+            display_optional_path(report.target_path.as_deref()),
+            display_optional_path(metadata.target_path.as_deref())
+        );
+    }
+
+    match metadata.kind {
+        AssignmentKind::Ordinary => {
+            if report.decomposition_completion.is_some() {
+                bail!("ordinary assignment must not report decomposition_completion");
+            }
+        }
+        AssignmentKind::MegafileDecomposition => {
+            let target_path = metadata
+                .target_path
+                .as_deref()
+                .context("validated megafile decomposition assignment has no target_path")?;
+            let completion = report
+                .decomposition_completion
+                .take()
+                .map(normalize_unbound_decomposition_completion)
+                .transpose()?;
+            let successful =
+                report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded;
+            if successful && completion.is_none() {
+                bail!(
+                    "accepted successful megafile_decomposition worker omitted decomposition_completion"
+                );
+            }
+            if completion.is_some() && !successful {
+                bail!("decomposition_completion requires an accepted successful worker");
+            }
+            if completion.as_ref().map(|value| value.target_path.as_path()) != Some(target_path)
+                && completion.is_some()
+            {
+                bail!("decomposition_completion target_path does not match the assignment");
+            }
+            if let Some(completion) = &completion {
+                let files_changed = normalize_paths(report.files_changed.clone())
+                    .context("megafile_decomposition worker files_changed is invalid")?;
+                if !files_changed.iter().any(|path| path == target_path) {
+                    bail!(
+                        "accepted megafile_decomposition worker files_changed omits the exact target"
+                    );
+                }
+                for replacement in &completion.replacement_paths {
+                    if !files_changed.contains(replacement) {
+                        bail!(
+                            "decomposition replacement path '{}' is not reported in files_changed",
+                            replacement.display()
+                        );
+                    }
+                    if !worker
+                        .assigned_paths
+                        .iter()
+                        .any(|assigned| path_is_covered_by_claim(replacement, assigned))
+                    {
+                        bail!(
+                            "decomposition replacement path '{}' is outside assigned_paths",
+                            replacement.display()
+                        );
+                    }
+                }
+            }
+            report.decomposition_completion = completion;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_bloated_file_flags(
+    report: &mut WorkerReport,
+    workers_by_id: &BTreeMap<&str, &WorkerAssignment>,
+) -> Result<()> {
+    if report.bloated_file_flags.len() > MAX_BLOATED_FILE_FLAGS_PER_WORKER {
+        bail!(
+            "contains {} flags but at most {} are allowed",
+            report.bloated_file_flags.len(),
+            MAX_BLOATED_FILE_FLAGS_PER_WORKER
+        );
+    }
+    let worker = workers_by_id
+        .get(report.id.as_str())
+        .context("worker is not declared in the assignment")?;
+    let mut normalized = BTreeSet::new();
+    for flag in std::mem::take(&mut report.bloated_file_flags) {
+        let path = normalize_repo_relative_path(&flag.path)
+            .with_context(|| format!("invalid path '{}'", flag.path.display()))?;
+        if path.as_os_str().is_empty() {
+            bail!("flag path must name a repository file");
+        }
+        if !worker
+            .assigned_paths
+            .iter()
+            .any(|assigned| path_is_covered_by_claim(&path, assigned))
+        {
+            bail!("flag path '{}' is outside assigned_paths", path.display());
+        }
+        normalized.insert(BloatedFileFlag { path });
+    }
+    report.bloated_file_flags = normalized.into_iter().collect();
+    Ok(())
+}
+
+fn normalize_report_target_path(value: Option<PathBuf>, field: &str) -> Result<Option<PathBuf>> {
+    value
+        .map(|path| {
+            let normalized = normalize_repo_relative_path(&path)
+                .with_context(|| format!("{field} '{}' is invalid", path.display()))?;
+            if normalized.as_os_str().is_empty() {
+                bail!("{field} must name a repository file");
+            }
+            Ok(normalized)
+        })
+        .transpose()
+}
+
+fn normalize_decomposition_completion(
+    mut completion: DecompositionCompletion,
+) -> Result<DecompositionCompletion> {
+    completion.target_path = normalize_report_target_path(
+        Some(completion.target_path),
+        "decomposition_completion.target_path",
+    )?
+    .context("decomposition_completion.target_path is required")?;
+    if completion.replacement_paths.len() > MAX_DECOMPOSITION_REPLACEMENT_PATHS {
+        bail!(
+            "decomposition_completion contains {} replacement paths but at most {} are allowed",
+            completion.replacement_paths.len(),
+            MAX_DECOMPOSITION_REPLACEMENT_PATHS
+        );
+    }
+    completion.replacement_paths = normalize_paths(completion.replacement_paths)
+        .context("decomposition_completion.replacement_paths is invalid")?;
+    if completion.replacement_paths.is_empty() {
+        bail!("decomposition_completion requires at least one replacement path");
+    }
+    if completion
+        .replacement_paths
+        .contains(&completion.target_path)
+    {
+        bail!("decomposition_completion replacement_paths must not include target_path");
+    }
+    completion.supervisor_candidate_binding = completion
+        .supervisor_candidate_binding
+        .map(CandidateValidationBinding::canonicalized)
+        .transpose()
+        .context("decomposition_completion supervisor candidate binding is invalid")?;
+    Ok(completion)
+}
+
+fn normalize_unbound_decomposition_completion(
+    completion: DecompositionCompletion,
+) -> Result<DecompositionCompletion> {
+    if completion.supervisor_candidate_binding.is_some() {
+        bail!(
+            "incoming worker or child decomposition evidence must not self-assert supervisor_candidate_binding"
+        );
+    }
+    normalize_decomposition_completion(completion)
+}
+
+fn display_optional_path(path: Option<&Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn worker_assignment_metadata(
+    assignment_metadata: &AssignmentMetadata,
+    assignment: &OrchestratorAssignment,
+    worker: &WorkerAssignment,
+) -> WorkerAssignmentMetadata {
+    assignment_metadata
+        .get(&(assignment.id.clone(), worker.id.clone()))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn worker_assignment_value(
+    worker: &WorkerAssignment,
+    metadata: &WorkerAssignmentMetadata,
+) -> Result<Value> {
+    let mut value =
+        serde_json::to_value(worker).context("failed to serialize worker assignment fields")?;
+    let object = value
+        .as_object_mut()
+        .context("worker assignment did not serialize to an object")?;
+    let metadata_value = serde_json::to_value(metadata)
+        .context("failed to serialize worker assignment kind/target_path")?;
+    let metadata_object = metadata_value
+        .as_object()
+        .context("worker assignment metadata did not serialize to an object")?;
+    object.extend(metadata_object.clone());
+    Ok(value)
+}
+
+fn orchestrator_assignment_value(
+    assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(assignment)
+        .context("failed to serialize orchestrator assignment fields")?;
+    let workers = value
+        .get_mut("worker_assignments")
+        .and_then(Value::as_array_mut)
+        .context("worker_assignments did not serialize to an array")?;
+    for (worker_value, worker) in workers.iter_mut().zip(&assignment.worker_assignments) {
+        let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
+        *worker_value = worker_assignment_value(worker, &metadata)?;
+    }
+    Ok(value)
+}
+
+fn display_decomposition_targets(
+    assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
+) -> String {
+    let targets = assignment
+        .worker_assignments
+        .iter()
+        .filter_map(|worker| {
+            worker_assignment_metadata(assignment_metadata, assignment, worker)
+                .target_path
+                .map(|path| format!("{}={}", worker.id, path.display()))
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        "<none>".to_string()
+    } else {
+        targets.join(", ")
+    }
+}
+
 fn validate_worker_report_evidence(
     assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
     report_path: &Path,
     report: &mut OrchestratorReviewReport,
 ) {
@@ -4412,6 +5581,36 @@ fn validate_worker_report_evidence(
     let mut blocking_messages = Vec::new();
 
     for worker_report in &mut report.worker_reports {
+        if let Err(error) = normalize_worker_report_plumbing(
+            assignment,
+            assignment_metadata,
+            &workers_by_id,
+            worker_report,
+        ) {
+            let message = format!(
+                "worker '{}' has invalid assignment/decomposition report plumbing: {error}",
+                worker_report.id
+            );
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                vec![report_path.to_path_buf()],
+            );
+            blocking_messages.push((message, vec![report_path.to_path_buf()]));
+        }
+        if let Err(error) = normalize_bloated_file_flags(worker_report, &workers_by_id) {
+            let message = format!(
+                "worker '{}' has invalid bloated_file_flags: {error}",
+                worker_report.id
+            );
+            worker_report.bloated_file_flags.clear();
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                vec![report_path.to_path_buf()],
+            );
+            blocking_messages.push((message, vec![report_path.to_path_buf()]));
+        }
         let normalized_files_changed = match normalize_paths(worker_report.files_changed.clone()) {
             Ok(paths) => {
                 worker_report.files_changed = paths.clone();
@@ -6289,6 +7488,7 @@ fn missing_child_report(
         }],
         worker_reports: Vec::new(),
         audit_reports: Vec::new(),
+        decomposition_completions: Vec::new(),
         accepted: false,
         rejected: true,
         status: ReviewStatus::Missing,
@@ -6330,6 +7530,30 @@ fn missing_parent_auditor_report(
 
 fn report_failed<T: ReportStatus>(report: &T) -> bool {
     !report.accepted() || report.rejected() || report.status() != ReviewStatus::Succeeded
+}
+
+fn accepted_bloated_file_flags(reports: &[OrchestratorReviewReport]) -> Vec<BloatedFileFlag> {
+    reports
+        .iter()
+        .filter(|report| !report_failed(*report))
+        .flat_map(|report| report.worker_reports.iter())
+        .filter(|report| !report_failed(*report))
+        .flat_map(|report| report.bloated_file_flags.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn accepted_decomposition_candidates(
+    reports: &[OrchestratorReviewReport],
+) -> Vec<DecompositionCompletion> {
+    reports
+        .iter()
+        .filter(|report| !report_failed(*report))
+        .flat_map(|report| report.decomposition_completions.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 trait ReportStatus {
@@ -6383,6 +7607,7 @@ impl ReportStatus for AuditorReport {
 fn deterministic_fake_child_run(
     command: &ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
     claim_token: u64,
     semantic_intent_token: Option<u64>,
 ) -> Result<ExternalAgentRun> {
@@ -6390,30 +7615,47 @@ fn deterministic_fake_child_run(
     let worker_reports = assignment
         .worker_assignments
         .iter()
-        .map(|worker| WorkerReport {
-            id: worker.id.clone(),
-            role: AgentRole::Worker,
-            assigned_paths: worker.assigned_paths.clone(),
-            semantic_symbols: worker.semantic_symbols.clone(),
-            semantic_modules: worker.semantic_modules.clone(),
-            claim_token: None,
-            semantic_intent_token: None,
-            commands_run: Vec::new(),
-            files_changed: Vec::new(),
-            validation_results: vec![ValidationResult {
-                name: "deterministic fake worker validation".to_string(),
+        .map(|worker| {
+            let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
+            WorkerReport {
+                id: worker.id.clone(),
+                role: AgentRole::Worker,
+                assignment_kind: metadata.kind,
+                target_path: metadata.target_path.clone(),
+                assigned_paths: worker.assigned_paths.clone(),
+                semantic_symbols: worker.semantic_symbols.clone(),
+                semantic_modules: worker.semantic_modules.clone(),
+                claim_token: None,
+                semantic_intent_token: None,
+                commands_run: Vec::new(),
+                files_changed: Vec::new(),
+                validation_results: vec![ValidationResult {
+                    name: "deterministic fake worker validation".to_string(),
+                    status: ReviewStatus::Succeeded,
+                    command: Vec::new(),
+                    message: None,
+                }],
+                findings: Vec::new(),
+                bloated_file_flags: Vec::new(),
+                decomposition_completion: metadata.target_path.map(|target_path| {
+                    DecompositionCompletion {
+                        target_path,
+                        replacement_paths: Vec::new(),
+                        supervisor_candidate_binding: None,
+                    }
+                }),
+                no_further_delegation: Some(true),
+                accepted: true,
+                rejected: false,
                 status: ReviewStatus::Succeeded,
-                command: Vec::new(),
-                message: None,
-            }],
-            findings: Vec::new(),
-            no_further_delegation: Some(true),
-            accepted: true,
-            rejected: false,
-            status: ReviewStatus::Succeeded,
-            remaining_risk: "simulation-only evidence".to_string(),
-            next_safe_action: "rerun with the verified Codex runtime".to_string(),
+                remaining_risk: "simulation-only evidence".to_string(),
+                next_safe_action: "rerun with the verified Codex runtime".to_string(),
+            }
         })
+        .collect::<Vec<_>>();
+    let decomposition_completions = worker_reports
+        .iter()
+        .filter_map(|report| report.decomposition_completion.clone())
         .collect();
     let report = OrchestratorReviewReport {
         id: assignment.id.clone(),
@@ -6434,6 +7676,7 @@ fn deterministic_fake_child_run(
         findings: Vec::new(),
         worker_reports,
         audit_reports: Vec::new(),
+        decomposition_completions,
         accepted: true,
         rejected: false,
         status: ReviewStatus::Succeeded,
@@ -6992,8 +8235,9 @@ fn write_plan_snapshot(
     relative: &Path,
     plan: &SupervisorPlan,
     consultant: &SupervisorConsultantPlan,
+    assignment_metadata: &AssignmentMetadata,
 ) -> Result<()> {
-    let value = supervisor_plan_value(plan, consultant)?;
+    let value = supervisor_plan_value(plan, consultant, assignment_metadata)?;
     write_artifact_json(
         writer,
         relative,
@@ -7028,6 +8272,7 @@ fn orchestrator_report_schema_value() -> serde_json::Value {
             "findings",
             "worker_reports",
             "audit_reports",
+            "decomposition_completions",
             "accepted",
             "rejected",
             "status",
@@ -7048,6 +8293,11 @@ fn orchestrator_report_schema_value() -> serde_json::Value {
             "findings": {"type": "array", "items": finding_schema_value()},
             "worker_reports": {"type": "array", "items": worker_report_schema_value()},
             "audit_reports": {"type": "array", "items": auditor_report_schema_value()},
+            "decomposition_completions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": decomposition_completion_object_schema_value()
+            },
             "accepted": {"type": "boolean"},
             "rejected": {"type": "boolean"},
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
@@ -7115,6 +8365,8 @@ fn worker_report_schema_value() -> serde_json::Value {
         "required": [
             "id",
             "role",
+            "assignment_kind",
+            "target_path",
             "assigned_paths",
             "semantic_symbols",
             "semantic_modules",
@@ -7124,6 +8376,8 @@ fn worker_report_schema_value() -> serde_json::Value {
             "files_changed",
             "validation_results",
             "findings",
+            "bloated_file_flags",
+            "decomposition_completion",
             "no_further_delegation",
             "accepted",
             "rejected",
@@ -7134,6 +8388,8 @@ fn worker_report_schema_value() -> serde_json::Value {
         "properties": {
             "id": {"type": "string"},
             "role": {"type": "string", "const": "worker"},
+            "assignment_kind": assignment_kind_schema_value(),
+            "target_path": {"type": ["string", "null"]},
             "assigned_paths": {"type": "array", "items": {"type": "string"}},
             "semantic_symbols": {"type": "array", "items": {"type": "string"}},
             "semantic_modules": {"type": "array", "items": {"type": "string"}},
@@ -7143,12 +8399,73 @@ fn worker_report_schema_value() -> serde_json::Value {
             "files_changed": {"type": "array", "items": {"type": "string"}},
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
             "findings": {"type": "array", "items": finding_schema_value()},
+            "bloated_file_flags": {
+                "type": "array",
+                "maxItems": MAX_BLOATED_FILE_FLAGS_PER_WORKER,
+                "uniqueItems": true,
+                "items": bloated_file_flag_schema_value()
+            },
+            "decomposition_completion": decomposition_completion_schema_value(),
             "no_further_delegation": {"type": "boolean", "const": true},
             "accepted": {"type": "boolean"},
             "rejected": {"type": "boolean"},
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
             "remaining_risk": {"type": "string"},
             "next_safe_action": {"type": "string"}
+        }
+    })
+}
+
+fn assignment_kind_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["ordinary", "megafile_decomposition"]
+    })
+}
+
+fn bloated_file_flag_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn decomposition_completion_schema_value() -> serde_json::Value {
+    json!({
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "required": ["target_path", "replacement_paths"],
+        "properties": {
+            "target_path": {"type": "string", "minLength": 1},
+            "replacement_paths": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
+                "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1}
+            }
+        }
+    })
+}
+
+fn decomposition_completion_object_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_path", "replacement_paths"],
+        "properties": {
+            "target_path": {"type": "string", "minLength": 1},
+            "replacement_paths": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
+                "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1}
+            }
         }
     })
 }
@@ -7625,7 +8942,8 @@ mod tests {
         assert!(old.plan.role_models.is_empty());
         assert!(old.plan.model_pricing.is_empty());
         let old_round_trip =
-            supervisor_plan_value(&old.plan, &old.consultant).expect("serialize old plan");
+            supervisor_plan_value(&old.plan, &old.consultant, &old.assignment_metadata)
+                .expect("serialize old plan");
         assert!(old_round_trip.get("role_models").is_none());
         assert!(old_round_trip.get("model_pricing").is_none());
 
@@ -7695,7 +9013,8 @@ mod tests {
             Some("high")
         );
         let normalized =
-            supervisor_plan_value(&new.plan, &new.consultant).expect("serialize new plan");
+            supervisor_plan_value(&new.plan, &new.consultant, &new.assignment_metadata)
+                .expect("serialize new plan");
         let reparsed = parse_supervisor_plan_with_consultant(
             &serde_json::to_string(&normalized).expect("serialize normalized new plan"),
         )
@@ -8560,6 +9879,8 @@ mod tests {
             worker_reports: vec![WorkerReport {
                 id: worker_id.to_string(),
                 role: AgentRole::Worker,
+                assignment_kind: AssignmentKind::Ordinary,
+                target_path: None,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),
@@ -8569,6 +9890,8 @@ mod tests {
                 files_changed: Vec::new(),
                 validation_results: Vec::new(),
                 findings: Vec::new(),
+                bloated_file_flags: Vec::new(),
+                decomposition_completion: None,
                 no_further_delegation: Some(true),
                 accepted: true,
                 rejected: false,
@@ -8577,6 +9900,7 @@ mod tests {
                 next_safe_action: "review".to_string(),
             }],
             audit_reports: Vec::new(),
+            decomposition_completions: Vec::new(),
             accepted: true,
             rejected: false,
             status: ReviewStatus::Succeeded,
@@ -8731,6 +10055,7 @@ mod tests {
         unauthorized.worker_reports[0].files_changed = vec![PathBuf::from("Cargo.toml")];
         validate_worker_report_evidence(
             &assignment,
+            &AssignmentMetadata::new(),
             Path::new("unauthorized-worker.json"),
             &mut unauthorized,
         );
@@ -8742,6 +10067,7 @@ mod tests {
             ReviewStatus::Failed;
         validate_worker_report_evidence(
             &assignment,
+            &AssignmentMetadata::new(),
             Path::new("failed-validation.json"),
             &mut inconsistent_validation,
         );
@@ -10998,6 +12324,7 @@ mod tests {
         extra_worker.worker_reports.push(undeclared);
         validate_worker_report_evidence(
             &assignment,
+            &AssignmentMetadata::new(),
             Path::new("extra-worker.json"),
             &mut extra_worker,
         );
@@ -11045,6 +12372,7 @@ mod tests {
                 "orchestrator",
                 orchestrator_report_schema_value(),
                 &[
+                    "decomposition_completions",
                     "worker_reports",
                     "audit_reports",
                     "remaining_risk",
@@ -11055,6 +12383,10 @@ mod tests {
                 "worker",
                 worker_report_schema_value(),
                 &[
+                    "assignment_kind",
+                    "target_path",
+                    "bloated_file_flags",
+                    "decomposition_completion",
                     "no_further_delegation",
                     "validation_results",
                     "remaining_risk",
@@ -11086,6 +12418,461 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn typed_decomposition_prompt_report_and_final_evidence_remain_gated() {
+        let mut assignment = injected_assignment(true);
+        assignment
+            .assigned_paths
+            .push(PathBuf::from("src/readme_part.md"));
+        assignment.worker_assignments[0]
+            .assigned_paths
+            .push(PathBuf::from("src/readme_part.md"));
+        let worker = &assignment.worker_assignments[0];
+        let metadata = WorkerAssignmentMetadata {
+            kind: AssignmentKind::MegafileDecomposition,
+            target_path: Some(PathBuf::from("README.md")),
+        };
+        let assignment_metadata =
+            BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata.clone())]);
+
+        let worker_value =
+            worker_assignment_value(worker, &metadata).expect("serialize typed worker assignment");
+        assert_eq!(worker_value["kind"], "megafile_decomposition");
+        assert_eq!(worker_value["target_path"], "README.md");
+        let assignment_value = orchestrator_assignment_value(&assignment, &assignment_metadata)
+            .expect("serialize typed orchestrator assignment");
+        assert_eq!(
+            assignment_value["worker_assignments"][0]["kind"],
+            "megafile_decomposition"
+        );
+        assert_eq!(
+            assignment_value["worker_assignments"][0]["target_path"],
+            "README.md"
+        );
+
+        let plan = injected_plan(assignment.clone(), 0);
+        let prompt = worker_prompt_with_incoming_root(
+            &plan,
+            &assignment,
+            worker,
+            &metadata,
+            Path::new("/tmp/maco-run"),
+            Path::new("/tmp/maco-run/incoming"),
+            Path::new("/tmp/maco-run/schemas/worker-report.schema.json"),
+        )
+        .expect("render typed worker prompt");
+        assert!(prompt.contains("Assignment kind: megafile_decomposition"));
+        assert!(prompt.contains("Decomposition target path: README.md"));
+        assert!(prompt.contains("\"kind\": \"megafile_decomposition\""));
+        assert!(prompt.contains("\"target_path\": \"README.md\""));
+        assert!(prompt.contains("does not bypass the isolated worktree, hard claim"));
+
+        let mut child = injected_child_report(&assignment);
+        child.worker_reports[0].assignment_kind = AssignmentKind::MegafileDecomposition;
+        child.worker_reports[0].target_path = Some(PathBuf::from("./README.md"));
+        child.worker_reports[0].files_changed = vec![
+            PathBuf::from("./README.md"),
+            PathBuf::from("./src/readme_part.md"),
+        ];
+        child.files_changed = vec![
+            PathBuf::from("README.md"),
+            PathBuf::from("src/readme_part.md"),
+        ];
+        child.worker_reports[0].bloated_file_flags = vec![
+            BloatedFileFlag {
+                path: PathBuf::from("./README.md"),
+            },
+            BloatedFileFlag {
+                path: PathBuf::from("README.md"),
+            },
+        ];
+        child.worker_reports[0].decomposition_completion = Some(DecompositionCompletion {
+            target_path: PathBuf::from("./README.md"),
+            replacement_paths: vec![PathBuf::from("./src/readme_part.md")],
+            supervisor_candidate_binding: None,
+        });
+        child.decomposition_completions = vec![DecompositionCompletion {
+            target_path: PathBuf::from("./README.md"),
+            replacement_paths: vec![PathBuf::from("./src/readme_part.md")],
+            supervisor_candidate_binding: None,
+        }];
+        validate_worker_report_evidence(
+            &assignment,
+            &assignment_metadata,
+            Path::new("typed-worker.json"),
+            &mut child,
+        );
+        validate_assignment_report_plumbing(
+            &assignment,
+            &assignment_metadata,
+            Path::new("typed-child.json"),
+            &mut child,
+        );
+        assert_eq!(child.status, ReviewStatus::Succeeded);
+        assert_eq!(
+            child.worker_reports[0].bloated_file_flags,
+            vec![BloatedFileFlag {
+                path: PathBuf::from("README.md")
+            }]
+        );
+        assert_eq!(
+            child.decomposition_completions,
+            vec![DecompositionCompletion {
+                target_path: PathBuf::from("README.md"),
+                replacement_paths: vec![PathBuf::from("src/readme_part.md")],
+                supervisor_candidate_binding: None,
+            }]
+        );
+
+        let reports = vec![child.clone(), child];
+        assert_eq!(
+            accepted_bloated_file_flags(&reports),
+            vec![BloatedFileFlag {
+                path: PathBuf::from("README.md")
+            }]
+        );
+        assert_eq!(
+            accepted_decomposition_candidates(&reports),
+            vec![DecompositionCompletion {
+                target_path: PathBuf::from("README.md"),
+                replacement_paths: vec![PathBuf::from("src/readme_part.md")],
+                supervisor_candidate_binding: None,
+            }]
+        );
+        let mut final_report =
+            artifact_test_final_report(&RunId::new("typed-megafile-final").expect("run id"));
+        final_report.bloated_file_flags = accepted_bloated_file_flags(&reports);
+        final_report.decomposition_candidates = accepted_decomposition_candidates(&reports);
+        let final_value = serde_json::to_value(final_report).expect("serialize final report");
+        assert_eq!(final_value["bloated_file_flags"][0]["path"], "README.md");
+        assert_eq!(
+            final_value["decomposition_candidates"][0]["target_path"],
+            "README.md"
+        );
+        assert!(final_value.get("successful_decompositions").is_none());
+    }
+
+    #[test]
+    fn typed_decomposition_rejects_missing_target_replacements_and_ordinary_pseudo_evidence() {
+        let mut assignment = injected_assignment(true);
+        assignment
+            .assigned_paths
+            .push(PathBuf::from("src/readme_part.md"));
+        assignment.worker_assignments[0]
+            .assigned_paths
+            .push(PathBuf::from("src/readme_part.md"));
+        let worker = &assignment.worker_assignments[0];
+        let metadata = WorkerAssignmentMetadata {
+            kind: AssignmentKind::MegafileDecomposition,
+            target_path: Some(PathBuf::from("README.md")),
+        };
+        let assignment_metadata =
+            BTreeMap::from([((assignment.id.clone(), worker.id.clone()), metadata)]);
+
+        let mut no_replacements = injected_child_report(&assignment);
+        no_replacements.files_changed = vec![
+            PathBuf::from("README.md"),
+            PathBuf::from("src/readme_part.md"),
+        ];
+        no_replacements.worker_reports[0].assignment_kind = AssignmentKind::MegafileDecomposition;
+        no_replacements.worker_reports[0].target_path = Some(PathBuf::from("README.md"));
+        no_replacements.worker_reports[0].files_changed = no_replacements.files_changed.clone();
+        no_replacements.worker_reports[0].decomposition_completion =
+            Some(DecompositionCompletion {
+                target_path: PathBuf::from("README.md"),
+                replacement_paths: Vec::new(),
+                supervisor_candidate_binding: None,
+            });
+        validate_worker_report_evidence(
+            &assignment,
+            &assignment_metadata,
+            Path::new("no-replacements.json"),
+            &mut no_replacements,
+        );
+        assert_eq!(no_replacements.status, ReviewStatus::Failed);
+        assert!(finding_messages(&no_replacements).contains("at least one replacement path"));
+
+        let mut no_target_change = injected_child_report(&assignment);
+        no_target_change.files_changed = vec![PathBuf::from("src/readme_part.md")];
+        no_target_change.worker_reports[0].assignment_kind = AssignmentKind::MegafileDecomposition;
+        no_target_change.worker_reports[0].target_path = Some(PathBuf::from("README.md"));
+        no_target_change.worker_reports[0].files_changed = no_target_change.files_changed.clone();
+        no_target_change.worker_reports[0].decomposition_completion =
+            Some(DecompositionCompletion {
+                target_path: PathBuf::from("README.md"),
+                replacement_paths: vec![PathBuf::from("src/readme_part.md")],
+                supervisor_candidate_binding: None,
+            });
+        validate_worker_report_evidence(
+            &assignment,
+            &assignment_metadata,
+            Path::new("no-target-change.json"),
+            &mut no_target_change,
+        );
+        assert_eq!(no_target_change.status, ReviewStatus::Failed);
+        assert!(
+            finding_messages(&no_target_change).contains("files_changed omits the exact target")
+        );
+
+        let ordinary_metadata = AssignmentMetadata::new();
+        let mut ordinary = injected_child_report(&assignment);
+        ordinary.worker_reports[0].decomposition_completion = Some(DecompositionCompletion {
+            target_path: PathBuf::from("README.md"),
+            replacement_paths: vec![PathBuf::from("src/readme_part.md")],
+            supervisor_candidate_binding: None,
+        });
+        validate_worker_report_evidence(
+            &assignment,
+            &ordinary_metadata,
+            Path::new("ordinary-pseudo-decomposition.json"),
+            &mut ordinary,
+        );
+        assert_eq!(ordinary.status, ReviewStatus::Failed);
+        assert!(finding_messages(&ordinary)
+            .contains("ordinary assignment must not report decomposition_completion"));
+
+        let mut self_asserted = injected_child_report(&assignment);
+        self_asserted.files_changed = vec![
+            PathBuf::from("README.md"),
+            PathBuf::from("src/readme_part.md"),
+        ];
+        self_asserted.worker_reports[0].assignment_kind = AssignmentKind::MegafileDecomposition;
+        self_asserted.worker_reports[0].target_path = Some(PathBuf::from("README.md"));
+        self_asserted.worker_reports[0].files_changed = self_asserted.files_changed.clone();
+        self_asserted.worker_reports[0].decomposition_completion = Some(DecompositionCompletion {
+            target_path: PathBuf::from("README.md"),
+            replacement_paths: vec![PathBuf::from("src/readme_part.md")],
+            supervisor_candidate_binding: Some(CandidateValidationBinding {
+                version: 1,
+                agent_id: assignment.id.clone(),
+                primary_head: None,
+                agent_head: None,
+                merge_base: None,
+                diff_oid: "0000000000000000000000000000000000000000".to_string(),
+            }),
+        });
+        validate_worker_report_evidence(
+            &assignment,
+            &assignment_metadata,
+            Path::new("worker-self-asserted-binding.json"),
+            &mut self_asserted,
+        );
+        assert_eq!(self_asserted.status, ReviewStatus::Failed);
+        assert!(finding_messages(&self_asserted)
+            .contains("must not self-assert supervisor_candidate_binding"));
+        assert!(decomposition_completion_schema_value()["properties"]
+            .get("supervisor_candidate_binding")
+            .is_none());
+    }
+
+    #[test]
+    fn finalized_decomposition_evidence_binds_exact_candidate_and_exposes_chain_ids() {
+        let (_temp, repo_path) = injected_repository();
+        let manager = WorktreeManager::new(&repo_path);
+        let agent = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create finalized-evidence agent worktree");
+        fs::write(agent.path.join("README.md"), "x\n").expect("shrink test target");
+        fs::create_dir_all(agent.path.join("src")).expect("create test replacement parent");
+        fs::write(agent.path.join("src/readme_part.md"), "part\n").expect("write test replacement");
+        let run_id = RunId::new("verified-decomposition-chain").expect("run id");
+        write_test_finalized_megafile_decomposition_evidence(
+            &repo_path,
+            run_id.clone(),
+            "agent-a",
+            "worker-a",
+            PathBuf::from("README.md"),
+            vec![PathBuf::from("src/readme_part.md")],
+        )
+        .expect("write finalized decomposition evidence");
+        let exact_paths = vec![
+            PathBuf::from("README.md"),
+            PathBuf::from("src/readme_part.md"),
+        ];
+        let evidence = verified_megafile_decomposition_evidence(
+            &repo_path,
+            run_id.clone(),
+            "agent-a",
+            Path::new("README.md"),
+            &exact_paths,
+        )
+        .expect("verify exact finalized evidence");
+        assert_eq!(evidence.run_id, run_id);
+        assert_eq!(evidence.orchestrator_id, "agent-a");
+        assert_eq!(evidence.worker_id, "worker-a");
+        assert_eq!(evidence.target_path, PathBuf::from("README.md"));
+        assert_eq!(
+            evidence.replacement_paths,
+            vec![PathBuf::from("src/readme_part.md")]
+        );
+        assert_eq!(evidence.supervisor_candidate_binding.agent_id, "agent-a");
+
+        let missing_binding_run =
+            RunId::new("missing-decomposition-content-binding").expect("missing binding run id");
+        write_test_finalized_megafile_decomposition_evidence_with_binding(
+            &repo_path,
+            missing_binding_run.clone(),
+            "agent-a",
+            "worker-a",
+            PathBuf::from("README.md"),
+            vec![PathBuf::from("src/readme_part.md")],
+            false,
+        )
+        .expect("write finalized evidence without supervisor binding");
+        let missing_error = verified_megafile_decomposition_evidence(
+            &repo_path,
+            missing_binding_run,
+            "agent-a",
+            Path::new("README.md"),
+            &exact_paths,
+        )
+        .expect_err("missing finalized content binding must fail closed");
+        assert!(missing_error
+            .to_string()
+            .contains("missing the supervisor-inspected candidate binding"));
+
+        let mut extra_paths = exact_paths;
+        extra_paths.push(PathBuf::from("unrelated.txt"));
+        let error = verified_megafile_decomposition_evidence(
+            &repo_path,
+            run_id,
+            "agent-a",
+            Path::new("README.md"),
+            &extra_paths,
+        )
+        .expect_err("unrelated candidate path must break exact run binding");
+        assert!(error
+            .to_string()
+            .contains("files_changed does not exactly match the merge candidate"));
+    }
+
+    #[test]
+    fn supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes() {
+        let (_temp, repo_path) = injected_repository();
+        let mut assignment = injected_assignment(true);
+        assignment
+            .assigned_paths
+            .push(PathBuf::from("src/readme_part.md"));
+        assignment.worker_assignments[0]
+            .assigned_paths
+            .push(PathBuf::from("src/readme_part.md"));
+        let metadata = WorkerAssignmentMetadata {
+            kind: AssignmentKind::MegafileDecomposition,
+            target_path: Some(PathBuf::from("README.md")),
+        };
+        let assignment_metadata = BTreeMap::from([(
+            (
+                assignment.id.clone(),
+                assignment.worker_assignments[0].id.clone(),
+            ),
+            metadata,
+        )]);
+
+        let manager = WorktreeManager::new(&repo_path);
+        let agent = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: assignment.id.clone(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create supervisor-inspection worktree");
+        fs::write(agent.path.join("README.md"), "x\n").expect("shrink inspected target");
+        fs::create_dir_all(agent.path.join("src")).expect("create inspected replacement parent");
+        fs::write(agent.path.join("src/readme_part.md"), "reviewed\n")
+            .expect("write inspected replacement");
+
+        let mut child = injected_child_report(&assignment);
+        child.files_changed = vec![
+            PathBuf::from("README.md"),
+            PathBuf::from("src/readme_part.md"),
+        ];
+        child.worker_reports[0].assignment_kind = AssignmentKind::MegafileDecomposition;
+        child.worker_reports[0].target_path = Some(PathBuf::from("README.md"));
+        child.worker_reports[0].files_changed = child.files_changed.clone();
+        let completion = DecompositionCompletion {
+            target_path: PathBuf::from("README.md"),
+            replacement_paths: vec![PathBuf::from("src/readme_part.md")],
+            supervisor_candidate_binding: None,
+        };
+        child.worker_reports[0].decomposition_completion = Some(completion.clone());
+        child.decomposition_completions = vec![completion];
+        validate_worker_report_evidence(
+            &assignment,
+            &assignment_metadata,
+            Path::new("stable-candidate-worker.json"),
+            &mut child,
+        );
+        validate_assignment_report_plumbing(
+            &assignment,
+            &assignment_metadata,
+            Path::new("stable-candidate-child.json"),
+            &mut child,
+        );
+        assert_eq!(child.status, ReviewStatus::Succeeded);
+
+        let lease = manager
+            .acquire_write_execution_lease(&assignment.id)
+            .expect("acquire supervisor candidate lease");
+        let before =
+            bind_supervisor_decomposition_candidate(&repo_path, &assignment, &mut child, &lease)
+                .expect("bind supervisor candidate")
+                .expect("typed decomposition inspection");
+        assert_eq!(
+            child.decomposition_completions[0].supervisor_candidate_binding,
+            Some(before.binding.clone())
+        );
+        assert_eq!(
+            child.worker_reports[0]
+                .decomposition_completion
+                .as_ref()
+                .and_then(|completion| completion.supervisor_candidate_binding.clone()),
+            Some(before.binding.clone())
+        );
+
+        fs::write(agent.path.join("src/readme_part.md"), "substituted\n")
+            .expect("substitute inspected replacement bytes");
+        let after = inspect_supervisor_decomposition_candidate(&repo_path, &assignment, &lease)
+            .expect("recapture substituted candidate");
+        assert_eq!(after.changed_paths, before.changed_paths);
+        assert_ne!(after.binding, before.binding);
+    }
+
+    #[test]
+    fn worker_bloated_file_flags_are_bounded_and_fail_closed() {
+        let assignment = injected_assignment(true);
+        let mut child = injected_child_report(&assignment);
+        child.worker_reports[0].bloated_file_flags = (0..=MAX_BLOATED_FILE_FLAGS_PER_WORKER)
+            .map(|_| BloatedFileFlag {
+                path: PathBuf::from("README.md"),
+            })
+            .collect();
+        validate_worker_report_evidence(
+            &assignment,
+            &AssignmentMetadata::new(),
+            Path::new("too-many-flags.json"),
+            &mut child,
+        );
+        assert_eq!(child.status, ReviewStatus::Failed);
+        assert!(child.worker_reports[0].bloated_file_flags.is_empty());
+        assert!(finding_messages(&child).contains("at most 64 are allowed"));
+
+        let schema = worker_report_schema_value();
+        assert_eq!(
+            schema["properties"]["bloated_file_flags"]["maxItems"],
+            MAX_BLOATED_FILE_FLAGS_PER_WORKER
+        );
+        assert_eq!(
+            schema["properties"]["bloated_file_flags"]["items"]["additionalProperties"],
+            false
+        );
     }
 
     #[test]
@@ -11769,6 +13556,7 @@ mod tests {
         let parent_prompt = parent_review_auditor_prompt(ParentReviewAuditorPromptContext {
             plan: &plan,
             assignment: &assignment,
+            assignment_metadata: &AssignmentMetadata::new(),
             run_dir: Path::new("/tmp/maco-run"),
             worktree_path: Path::new("/tmp/maco-worktree"),
             child_report_path: Path::new("/tmp/maco-run/reports/child-a.json"),
@@ -12014,6 +13802,8 @@ mod tests {
             files_changed: Vec::new(),
             validation_results: Vec::new(),
             findings: Vec::new(),
+            bloated_file_flags: Vec::new(),
+            decomposition_candidates: Vec::new(),
             breaker_trip: None,
             orchestrator_reports: Vec::new(),
             released_claims: Vec::new(),
@@ -12032,6 +13822,8 @@ mod tests {
             .map(|worker| WorkerReport {
                 id: worker.id.clone(),
                 role: AgentRole::Worker,
+                assignment_kind: AssignmentKind::Ordinary,
+                target_path: None,
                 assigned_paths: worker.assigned_paths.clone(),
                 semantic_symbols: worker.semantic_symbols.clone(),
                 semantic_modules: worker.semantic_modules.clone(),
@@ -12046,6 +13838,8 @@ mod tests {
                     message: None,
                 }],
                 findings: Vec::new(),
+                bloated_file_flags: Vec::new(),
+                decomposition_completion: None,
                 no_further_delegation: Some(true),
                 accepted: true,
                 rejected: false,
@@ -12073,6 +13867,7 @@ mod tests {
             findings: Vec::new(),
             worker_reports,
             audit_reports: Vec::new(),
+            decomposition_completions: Vec::new(),
             accepted: true,
             rejected: false,
             status: ReviewStatus::Succeeded,

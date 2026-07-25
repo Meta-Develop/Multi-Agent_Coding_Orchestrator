@@ -267,6 +267,131 @@ fn supervise_plan_normalizes_aliases_and_allows_overlapping_top_level_assignment
 }
 
 #[test]
+fn supervise_plan_normalizes_typed_decomposition_and_defaults_legacy_workers() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("typed-decomposition.json");
+    fs::write(
+        &plan_path,
+        br#"{
+          "version": 1,
+          "task": "typed decomposition",
+          "assignments": [{
+            "id": "child-a",
+            "assigned_paths": ["src"],
+            "worker_assignments": [
+              {"id": "ordinary-worker", "assigned_paths": ["src/lib.rs"]},
+              {
+                "id": "decomposition-worker",
+                "kind": "megafile_decomposition",
+                "target_path": "src/./supervise.rs",
+                "assigned_paths": ["src/supervise.rs"]
+              }
+            ]
+          }]
+        }"#,
+    )?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(
+        plan["assignments"][0]["worker_assignments"][0]["kind"],
+        "ordinary"
+    );
+    assert!(plan["assignments"][0]["worker_assignments"][0]
+        .get("target_path")
+        .is_none());
+    assert_eq!(
+        plan["assignments"][0]["worker_assignments"][1]["kind"],
+        "megafile_decomposition"
+    );
+    assert_eq!(
+        plan["assignments"][0]["worker_assignments"][1]["target_path"],
+        "src/supervise.rs"
+    );
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_fails_closed_on_invalid_typed_decomposition_values() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    for (name, worker, expected) in [
+        (
+            "unknown-kind",
+            serde_json::json!({
+                "id": "worker-a",
+                "kind": "decompose_maybe",
+                "assigned_paths": ["src/lib.rs"]
+            }),
+            "kind/target_path is invalid",
+        ),
+        (
+            "ordinary-target",
+            serde_json::json!({
+                "id": "worker-a",
+                "kind": "ordinary",
+                "target_path": "src/lib.rs",
+                "assigned_paths": ["src/lib.rs"]
+            }),
+            "ordinary worker assignment 'worker-a' must not declare target_path",
+        ),
+        (
+            "missing-target",
+            serde_json::json!({
+                "id": "worker-a",
+                "kind": "megafile_decomposition",
+                "assigned_paths": ["src/lib.rs"]
+            }),
+            "must declare target_path",
+        ),
+        (
+            "outside-target",
+            serde_json::json!({
+                "id": "worker-a",
+                "kind": "megafile_decomposition",
+                "target_path": "README.md",
+                "assigned_paths": ["src/lib.rs"]
+            }),
+            "is outside assigned_paths",
+        ),
+    ] {
+        let plan_path = temp.path().join(format!("{name}.json"));
+        fs::write(
+            &plan_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "task": "invalid typed decomposition",
+                "assignments": [{
+                    "id": "child-a",
+                    "assigned_paths": ["README.md", "src"],
+                    "worker_assignments": [worker]
+                }]
+            }))?,
+        )?;
+        let stderr = run_failure_stderr(&[
+            "supervise",
+            "plan",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--json",
+        ])?;
+        assert!(
+            stderr.contains(expected),
+            "{name} did not fail with {expected:?}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_still_rejects_overlapping_worker_siblings() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;

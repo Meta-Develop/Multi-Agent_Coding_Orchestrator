@@ -1372,6 +1372,253 @@ fn merge_preview_candidate_capture_does_not_write_unreachable_real_objects() -> 
     Ok(())
 }
 
+#[test]
+fn megafile_merge_defaults_to_typed_warn_only_and_opt_in_blocking() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    run_success_json(&[
+        "repo",
+        "megafile",
+        "seed",
+        "--repo",
+        repo,
+        "--file-bytes",
+        "1",
+        "--json",
+    ])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# Smoke\n\nsplit me\n").context("edit worktree")?;
+    let validation_path = temp.path().join("validation.json");
+    fs::write(
+        &validation_path,
+        r#"[{"name":"megafile-unit","status":"passed","paths":["README.md"]}]"#,
+    )
+    .context("write validation report")?;
+
+    let warning = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--file-bytes",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(warning["safety"]["readiness"]["status"], "safe");
+    assert_eq!(warning["safety"]["megafile_blocking"], false);
+    assert_eq!(warning["safety"]["megafile"]["status"], "passed");
+    assert_eq!(
+        warning["safety"]["megafile_warnings"][0]["path"],
+        "README.md"
+    );
+    assert!(warning["safety"]["megafile"]["message"]
+        .as_str()
+        .context("warn-only message")?
+        .contains("warn-only"));
+
+    let blocked = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-report",
+        validation_path.to_str().context("validation path utf8")?,
+        "--file-bytes",
+        "1",
+        "--block-megafiles",
+        "--json",
+    ])?;
+    assert_eq!(blocked["safety"]["readiness"]["status"], "blocked");
+    assert_contains(
+        &blocked["safety"]["readiness"]["blockers"],
+        "excluded_reference",
+    )?;
+    let detail = blocked["safety"]["readiness"]["details"]
+        .as_array()
+        .context("blocker details")?
+        .iter()
+        .find(|detail| detail["kind"] == "excluded_reference")
+        .context("megafile policy detail")?;
+    assert_eq!(detail["check_status"], "failed");
+    assert_eq!(detail["paths"], serde_json::json!(["README.md"]));
+    assert!(detail["message"]
+        .as_str()
+        .context("megafile blocker message")?
+        .contains("threshold-crossing megafiles"));
+    assert_eq!(detail["validation_reports"][0]["name"], "megafile-unit");
+    assert_eq!(detail["validation_commands"], serde_json::json!([]));
+    assert!(detail["next_safe_operation"]
+        .as_str()
+        .context("megafile next safe operation")?
+        .contains("megafile_decomposition assignment"));
+    Ok(())
+}
+
+#[test]
+fn merge_apply_records_collision_history_at_the_blocked_decision() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# agent version\n")
+        .context("edit agent worktree")?;
+    fs::write(repo_path.join("README.md"), "# primary version\n").context("edit primary")?;
+
+    let report = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(
+        report["recorded_collision_paths"],
+        serde_json::json!(["README.md"])
+    );
+
+    let telemetry = run_success_json(&[
+        "repo",
+        "megafile",
+        "query",
+        "README.md",
+        "--repo",
+        repo,
+        "--collision-count",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(telemetry["initialized"], true);
+    assert_eq!(telemetry["assessment"]["collisions_in_window"], 1);
+    assert!(telemetry["assessment"]["signals"]
+        .as_array()
+        .context("collision signals")?
+        .iter()
+        .any(|signal| signal["kind"] == "collision_count"));
+    Ok(())
+}
+
+#[test]
+fn decomposition_cli_rejects_bare_target_and_unpaired_run_before_worktree_lookup() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let bare = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--block-megafiles",
+            "--decomposition-target",
+            "README.md",
+            "--json",
+        ])
+        .output()
+        .context("run bare decomposition target")?;
+    assert!(!bare.status.success());
+    assert!(
+        String::from_utf8_lossy(&bare.stderr)
+            .contains("--decomposition-target requires --decomposition-run-id"),
+        "unexpected bare-target failure: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+
+    let unpaired_run = Command::new(BIN)
+        .args([
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--decomposition-run-id",
+            "finalized-run",
+            "--json",
+        ])
+        .output()
+        .context("run unpaired decomposition run id")?;
+    assert!(!unpaired_run.status.success());
+    assert!(
+        String::from_utf8_lossy(&unpaired_run.stderr)
+            .contains("--decomposition-run-id requires --decomposition-target"),
+        "unexpected unpaired-run failure: {}",
+        String::from_utf8_lossy(&unpaired_run.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read unchanged primary")?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn authenticated_megafile_read_failure_refuses_merge_before_primary_apply() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    if assert_worktree_creation_unsupported(repo)? {
+        return Ok(());
+    }
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    run_success_json(&["repo", "megafile", "seed", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# candidate\n").context("edit candidate")?;
+    let history_root = repo_path.join(".git/maco/state/authenticated-megafile-history-v1");
+    let snapshot = newest_numeric_json(&history_root)?.context("authenticated snapshot")?;
+    fs::write(&snapshot, b"{\"tampered\":true}\n").context("tamper authenticated snapshot")?;
+
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--json",
+        ])
+        .output()
+        .context("run merge against tampered telemetry")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("authenticated megafile telemetry")
+            || stderr.contains("authenticated snapshot"),
+        "unexpected failure: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md")).context("read primary")?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
 fn write_bound_validation(path: &Path, binding: &Value) -> Result<()> {
     let evidence = serde_json::json!({
         "validation_binding": binding,
@@ -1419,6 +1666,35 @@ fn run_failure_json(args: &[&str]) -> Result<Value> {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
     serde_json::from_slice(&output.stdout).context("parse failure json")
+}
+
+fn newest_numeric_json(root: &Path) -> Result<Option<std::path::PathBuf>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut candidates = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("read state directory {}", directory.display()))?
+        {
+            let entry = entry.context("read state entry")?;
+            let path = entry.path();
+            let file_type = entry.file_type().context("read state entry type")?;
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some("json")
+                && path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|stem| {
+                        !stem.is_empty() && stem.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort();
+    Ok(candidates.pop())
 }
 
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {

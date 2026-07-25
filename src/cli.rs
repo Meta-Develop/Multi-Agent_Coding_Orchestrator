@@ -10,10 +10,14 @@ use crate::{
     inbox::{self, InboxPermissionMode, InboxScanOptions, InboxWorkspaceScanOptions},
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
+    megafile::{
+        MegafileAssessment, MegafileReport, MegafileStore, MegafileThresholdCalibration,
+        MegafileThresholds,
+    },
     merge::{
-        self, CandidateValidationCommand, MergeApplyOptions, MergeApplyPreview, MergeApplyReport,
-        MergeCandidate, MergeCollectOptions, MergeForceOptions, MergePreviewOptions,
-        ValidationEvidenceBundle, ValidationReport,
+        self, CandidateValidationCommand, MegafileMergePolicy, MergeApplyOptions,
+        MergeApplyPreview, MergeApplyReport, MergeCandidate, MergeCollectOptions,
+        MergeForceOptions, MergePreviewOptions, ValidationEvidenceBundle, ValidationReport,
     },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
@@ -35,7 +39,7 @@ use crate::{
     state_migration,
     supervise::{self, SupervisorRunOptions},
     sync::{normalize_repo_relative_path, ClaimToken},
-    sync_store::{OwnerReport, SyncStore},
+    sync_store::{ClaimTelemetryOutcome, MegafileClaimWarning, OwnerReport, SyncStore},
     worktree::{
         RepositoryInfo, WorktreeCreateOptions, WorktreeGcOptions, WorktreeGcReason,
         WorktreeGcReport, WorktreeGcStatus, WorktreeManager, WorktreeRecord,
@@ -224,6 +228,62 @@ impl RepoCommand {
                 }
             }
             RepoSubcommand::Query(command) => command.run(),
+            RepoSubcommand::Megafile(command) => command.run(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct RepoMegafileCommand {
+    #[command(subcommand)]
+    command: RepoMegafileSubcommand,
+}
+
+impl RepoMegafileCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            RepoMegafileSubcommand::Seed(args) => {
+                let samples = repo_map::scan_repository_file_samples(&args.repo)?;
+                let seeded_samples = samples.len();
+                let sampled_bytes = samples
+                    .iter()
+                    .try_fold(0_u64, |total, sample| total.checked_add(sample.bytes))
+                    .context("sampled repository byte count overflowed")?;
+                let store = args.thresholds.open_store(&args.repo)?;
+                let assessments = store.record_file_samples(samples)?;
+                let telemetry = store.report()?;
+                let report = MegafileSeedReport {
+                    seeded_samples,
+                    sampled_bytes,
+                    assessments,
+                    telemetry,
+                };
+                print_query_report(&report, args.json)
+            }
+            RepoMegafileSubcommand::Query(args) => {
+                let store = args.thresholds.open_existing_store(&args.repo)?;
+                let initialized = store.is_some();
+                if let Some(path) = args.path {
+                    let assessment = store
+                        .as_ref()
+                        .map(|store| store.assess_path(&path))
+                        .transpose()?
+                        .flatten();
+                    let report = MegafilePathQueryReport {
+                        initialized,
+                        path,
+                        assessment,
+                    };
+                    print_query_report(&report, args.json)
+                } else {
+                    let telemetry = store.as_ref().map(MegafileStore::report).transpose()?;
+                    let report = MegafileQueryReport {
+                        initialized,
+                        telemetry,
+                    };
+                    print_query_report(&report, args.json)
+                }
+            }
         }
     }
 }
@@ -248,8 +308,36 @@ impl RepoQueryCommand {
                 print_query_report(&report, args.json)
             }
             RepoQuerySubcommand::Risk(args) => {
-                let map = repo_semantic::scan_repository(args.repo)?;
-                let report = repo_semantic::risk_report_for_paths(&map, args.paths);
+                let map = repo_semantic::scan_repository(&args.repo)?;
+                let semantic = repo_semantic::risk_report_for_paths(&map, args.paths);
+                let store = args
+                    .megafile_thresholds
+                    .open_existing_store(&args.repo)
+                    .context(
+                        "authenticated megafile telemetry could not be opened for risk query",
+                    )?;
+                let megafile_hotspots = match store {
+                    Some(store) => store
+                        .report()
+                        .context(
+                            "authenticated megafile telemetry could not be read for risk query",
+                        )?
+                        .assessments
+                        .into_iter()
+                        .filter(|assessment| {
+                            assessment.is_megafile
+                                && semantic
+                                    .changed_paths
+                                    .binary_search(&assessment.path)
+                                    .is_ok()
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let report = SemanticRiskQueryReport {
+                    semantic,
+                    megafile_hotspots,
+                };
                 print_query_report(&report, args.json)
             }
         }
@@ -262,6 +350,141 @@ enum RepoSubcommand {
     Map(MapRepoArgs),
     /// Query the semantic repository map.
     Query(RepoQueryCommand),
+    /// Explicitly seed and query durable megafile telemetry.
+    Megafile(RepoMegafileCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoMegafileSubcommand {
+    /// Explicitly sample regular repository files and persist their byte/line telemetry.
+    Seed(SeedMegafileArgs),
+    /// Query the complete telemetry report or one repository-relative path.
+    Query(QueryMegafileArgs),
+}
+
+#[derive(Debug, Args)]
+struct SeedMegafileArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[command(flatten)]
+    thresholds: MegafileThresholdArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct QueryMegafileArgs {
+    /// Optional repository-relative path. Omit it for the complete bounded report.
+    path: Option<PathBuf>,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[command(flatten)]
+    thresholds: MegafileThresholdArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args, Default)]
+struct MegafileThresholdArgs {
+    /// Configure the file-size warning threshold in bytes.
+    #[arg(long)]
+    file_bytes: Option<u64>,
+    /// Configure the physical-line warning threshold.
+    #[arg(long)]
+    file_lines: Option<u64>,
+    /// Configure the cross-sample byte-growth warning threshold.
+    #[arg(long)]
+    growth_bytes: Option<u64>,
+    /// Configure the cross-sample line-growth warning threshold.
+    #[arg(long)]
+    growth_lines: Option<u64>,
+    /// Configure the retained-window claim-frequency warning threshold.
+    #[arg(long)]
+    claim_count: Option<u64>,
+    /// Configure the retained-window collision-frequency warning threshold.
+    #[arg(long)]
+    collision_count: Option<u64>,
+    /// Configure how many retained records contribute to activity frequencies.
+    #[arg(long)]
+    activity_window_records: Option<usize>,
+}
+
+impl MegafileThresholdArgs {
+    fn open_store(&self, repo: &Path) -> Result<MegafileStore> {
+        let Some(thresholds) = self.configured_thresholds() else {
+            return MegafileStore::open(repo);
+        };
+        MegafileStore::open_with_thresholds(repo, thresholds)
+    }
+
+    fn open_existing_store(&self, repo: &Path) -> Result<Option<MegafileStore>> {
+        let Some(thresholds) = self.configured_thresholds() else {
+            return MegafileStore::open_existing(repo);
+        };
+        MegafileStore::open_existing_with_thresholds(repo, thresholds)
+    }
+
+    fn configured_thresholds(&self) -> Option<MegafileThresholds> {
+        if self.file_bytes.is_none()
+            && self.file_lines.is_none()
+            && self.growth_bytes.is_none()
+            && self.growth_lines.is_none()
+            && self.claim_count.is_none()
+            && self.collision_count.is_none()
+            && self.activity_window_records.is_none()
+        {
+            return None;
+        }
+        let mut thresholds = MegafileThresholds::provisional_bootstrap();
+        thresholds.calibration = MegafileThresholdCalibration::Configured;
+        if let Some(value) = self.file_bytes {
+            thresholds.file_bytes = value;
+        }
+        if let Some(value) = self.file_lines {
+            thresholds.file_lines = value;
+        }
+        if let Some(value) = self.growth_bytes {
+            thresholds.growth_bytes = value;
+        }
+        if let Some(value) = self.growth_lines {
+            thresholds.growth_lines = value;
+        }
+        if let Some(value) = self.claim_count {
+            thresholds.claim_count = value;
+        }
+        if let Some(value) = self.collision_count {
+            thresholds.collision_count = value;
+        }
+        if let Some(value) = self.activity_window_records {
+            thresholds.activity_window_records = value;
+        }
+        Some(thresholds)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MegafileSeedReport {
+    seeded_samples: usize,
+    sampled_bytes: u64,
+    assessments: Vec<MegafileAssessment>,
+    telemetry: MegafileReport,
+}
+
+#[derive(Debug, Serialize)]
+struct MegafileQueryReport {
+    initialized: bool,
+    telemetry: Option<MegafileReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct MegafilePathQueryReport {
+    initialized: bool,
+    path: PathBuf,
+    assessment: Option<MegafileAssessment>,
 }
 
 #[derive(Debug, Args)]
@@ -319,6 +542,8 @@ struct QueryRiskArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    #[command(flatten)]
+    megafile_thresholds: MegafileThresholdArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1595,8 +1820,16 @@ impl SyncCommand {
         match self.command {
             SyncSubcommand::Claim(args) => {
                 let store = SyncStore::open(args.repo)?;
-                let claim = store.claim_paths(&args.agent_id, args.paths)?;
-                print_path_claim("Claim", &claim, args.json)
+                let configured_thresholds = args.thresholds.configured_thresholds();
+                let outcome = match configured_thresholds {
+                    Some(thresholds) => store.claim_paths_with_telemetry_thresholds(
+                        &args.agent_id,
+                        args.paths,
+                        thresholds,
+                    )?,
+                    None => store.claim_paths_with_telemetry(&args.agent_id, args.paths)?,
+                };
+                print_claim_telemetry_outcome(&outcome, args.json)
             }
             SyncSubcommand::Release(args) => {
                 let store = SyncStore::open(args.repo)?;
@@ -1646,6 +1879,8 @@ struct ClaimSyncArgs {
     /// Repository-relative paths to claim.
     #[arg(required = true)]
     paths: Vec<PathBuf>,
+    #[command(flatten)]
+    thresholds: MegafileThresholdArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2219,16 +2454,18 @@ fn preview_merge_from_args(
     validation_report_paths: Vec<PathBuf>,
     forces: MergeForceOptions,
     require_validation: bool,
+    megafile_policy: MegafileMergePolicy,
 ) -> Result<MergeApplyPreview> {
     let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
     let validation_evidence = load_validation_evidence(&validation_report_paths, &agent_id)?;
-    merge::preview_merge_apply_with_evidence(
+    merge::preview_merge_apply_with_megafile_policy(
         MergePreviewOptions {
             collect: collect_options_from_claims(&repo, &agent_id, claims, true, Vec::new()),
             forces,
             require_validation,
         },
         validation_evidence,
+        megafile_policy,
     )
 }
 
@@ -2242,6 +2479,7 @@ impl MergeCommand {
     fn run(self) -> Result<()> {
         match self.command {
             MergeSubcommand::Preview(args) => {
+                let megafile_policy = args.megafile_policy()?;
                 let preview = preview_merge_from_args(
                     args.repo,
                     args.agent_id,
@@ -2249,10 +2487,12 @@ impl MergeCommand {
                     args.validation_report,
                     args.forces.into_force_options(),
                     args.require_validation,
+                    megafile_policy,
                 )?;
                 print_merge_preview(&preview, args.json)
             }
             MergeSubcommand::Apply(args) => {
+                let megafile_policy = args.megafile_policy()?;
                 let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
                 let validation_evidence =
                     load_validation_evidence(&args.validation_report, &args.agent_id)?;
@@ -2272,32 +2512,24 @@ impl MergeCommand {
                     forces: args.forces.into_force_options(),
                     require_validation: args.require_validation,
                 };
-                let report = if args.json {
-                    let report = merge::merge_apply_report_with_evidence(
-                        MergeApplyOptions {
-                            preview: preview_options,
-                            candidate_validation_commands,
-                        },
-                        validation_evidence,
-                    )?;
-                    if report.status == merge::MergeApplyReportStatus::Blocked {
+                let report = merge::merge_apply_report_with_megafile_policy(
+                    MergeApplyOptions {
+                        preview: preview_options,
+                        candidate_validation_commands,
+                    },
+                    validation_evidence,
+                    megafile_policy,
+                )?;
+                if report.status == merge::MergeApplyReportStatus::Blocked {
+                    if args.json {
                         print_merge_apply_report(&report, true)?;
-                        let message = report
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "merge apply refused".to_string());
-                        bail!("{message}");
                     }
-                    report
-                } else {
-                    merge::apply_merge_result_with_evidence(
-                        MergeApplyOptions {
-                            preview: preview_options,
-                            candidate_validation_commands,
-                        },
-                        validation_evidence,
-                    )?
-                };
+                    let message = report
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "merge apply refused".to_string());
+                    bail!("{message}");
+                }
                 print_merge_apply_report(&report, args.json)
             }
         }
@@ -2328,6 +2560,17 @@ struct MergePreviewArgs {
     /// Require passed validation evidence bound exactly to the current candidate snapshot.
     #[arg(long)]
     require_validation: bool,
+    /// Block threshold-crossing megafiles unless this is their exact typed decomposition.
+    #[arg(long)]
+    block_megafiles: bool,
+    /// Exact threshold-crossing file handled by a typed megafile_decomposition assignment.
+    #[arg(long)]
+    decomposition_target: Option<PathBuf>,
+    /// Finalized accepted supervise run containing the typed decomposition evidence.
+    #[arg(long)]
+    decomposition_run_id: Option<String>,
+    #[command(flatten)]
+    megafile_thresholds: MegafileThresholdArgs,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
@@ -2354,11 +2597,78 @@ struct MergeApplyArgs {
     /// Validate a temporary merged candidate; recursive candidate or submodule changes block apply.
     #[arg(long = "validation-command")]
     validation_command: Vec<String>,
+    /// Block threshold-crossing megafiles unless this is their exact typed decomposition.
+    #[arg(long)]
+    block_megafiles: bool,
+    /// Exact threshold-crossing file handled by a typed megafile_decomposition assignment.
+    #[arg(long)]
+    decomposition_target: Option<PathBuf>,
+    /// Finalized accepted supervise run containing the typed decomposition evidence.
+    #[arg(long)]
+    decomposition_run_id: Option<String>,
+    #[command(flatten)]
+    megafile_thresholds: MegafileThresholdArgs,
     #[command(flatten)]
     forces: MergeForceArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+impl MergePreviewArgs {
+    fn megafile_policy(&self) -> Result<MegafileMergePolicy> {
+        let decomposition_run_id = self
+            .decomposition_run_id
+            .as_deref()
+            .map(RunId::new)
+            .transpose()?;
+        validate_decomposition_cli_pair(
+            self.decomposition_target.as_deref(),
+            decomposition_run_id.as_ref(),
+        )?;
+        Ok(MegafileMergePolicy {
+            block: self.block_megafiles,
+            decomposition_target: self.decomposition_target.clone(),
+            decomposition_run_id,
+            thresholds: self
+                .megafile_thresholds
+                .configured_thresholds()
+                .unwrap_or_else(MegafileThresholds::provisional_bootstrap),
+        })
+    }
+}
+
+impl MergeApplyArgs {
+    fn megafile_policy(&self) -> Result<MegafileMergePolicy> {
+        let decomposition_run_id = self
+            .decomposition_run_id
+            .as_deref()
+            .map(RunId::new)
+            .transpose()?;
+        validate_decomposition_cli_pair(
+            self.decomposition_target.as_deref(),
+            decomposition_run_id.as_ref(),
+        )?;
+        Ok(MegafileMergePolicy {
+            block: self.block_megafiles,
+            decomposition_target: self.decomposition_target.clone(),
+            decomposition_run_id,
+            thresholds: self
+                .megafile_thresholds
+                .configured_thresholds()
+                .unwrap_or_else(MegafileThresholds::provisional_bootstrap),
+        })
+    }
+}
+
+fn validate_decomposition_cli_pair(target: Option<&Path>, run_id: Option<&RunId>) -> Result<()> {
+    match (target, run_id) {
+        (Some(_), None) => {
+            bail!("--decomposition-target requires --decomposition-run-id with finalized evidence")
+        }
+        (None, Some(_)) => bail!("--decomposition-run-id requires --decomposition-target"),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -2851,6 +3161,13 @@ fn validate_cli_validation_reports(reports: &[ValidationReport]) -> Result<()> {
 struct SemanticSymbolQueryReport {
     query: String,
     matches: Vec<repo_semantic::SemanticSymbol>,
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticRiskQueryReport {
+    #[serde(flatten)]
+    semantic: repo_semantic::SemanticRiskReport,
+    megafile_hotspots: Vec<MegafileAssessment>,
 }
 
 impl SemanticSymbolQueryReport {
@@ -3380,6 +3697,13 @@ fn print_merge_preview(preview: &MergeApplyPreview, json: bool) -> Result<()> {
         if !preview.safety.readiness.forced.is_empty() {
             println!("Forced: {:?}", preview.safety.readiness.forced);
         }
+        for warning in &preview.safety.megafile_warnings {
+            println!(
+                "Megafile warning: {} ({:?})",
+                warning.path.display(),
+                warning.signals
+            );
+        }
     }
     Ok(())
 }
@@ -3397,6 +3721,18 @@ fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()>
             }
         );
         println!("Readiness: {:?}", report.preview.safety.readiness.status);
+        if !report.recorded_collision_paths.is_empty() {
+            println!("Recorded merge collision paths:");
+            for path in &report.recorded_collision_paths {
+                println!("  {}", path.display());
+            }
+        }
+        if let Some(decomposition) = &report.accepted_decomposition {
+            println!(
+                "Accepted megafile decomposition: {}",
+                decomposition.path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -3660,6 +3996,31 @@ fn print_path_claim(label: &str, claim: &crate::sync::PathClaim, json: bool) -> 
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ClaimTelemetryCliReport<'a> {
+    #[serde(flatten)]
+    legacy_claim: &'a crate::sync::PathClaim,
+    claim: &'a crate::sync::PathClaim,
+    warnings: &'a [MegafileClaimWarning],
+}
+
+fn print_claim_telemetry_outcome(outcome: &ClaimTelemetryOutcome, json: bool) -> Result<()> {
+    if json {
+        let report = ClaimTelemetryCliReport {
+            legacy_claim: &outcome.claim,
+            claim: &outcome.claim,
+            warnings: &outcome.warnings,
+        };
+        print_query_report(&report, true)
+    } else {
+        print_path_claim("Claim", &outcome.claim, false)?;
+        for warning in &outcome.warnings {
+            println!("Warning: {warning:#?}");
+        }
+        Ok(())
+    }
 }
 
 fn print_claims(claims: &[crate::sync::PathClaim], json: bool, empty_message: &str) -> Result<()> {

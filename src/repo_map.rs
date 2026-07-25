@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::megafile::FileSizeSample;
 use crate::safe_state::{
     BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
     BoundedTreeWalker,
@@ -16,6 +17,8 @@ const REPOSITORY_MAP_MAX_DEPTH: usize = 128;
 const REPOSITORY_MAP_MAX_ENTRIES: usize = 100_000;
 const REPOSITORY_MAP_MAX_PATH_BYTES: usize = 4096;
 const REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES: usize = 64 * 1024 * 1024;
+const REPOSITORY_SAMPLE_MAX_FILES: usize = 4_096;
+const REPOSITORY_SAMPLE_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(not(test))]
 const REPOSITORY_MAP_MAX_DURATION: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -93,6 +96,78 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
     remaining_map_time(deadline, "after repository map")?;
 
     Ok(RepoMap { root, entries })
+}
+
+/// Explicitly reads every regular file in a bounded coarse repository map and
+/// returns language-agnostic byte/line samples. Unlike [`scan_repository`],
+/// callers use this only when they intend to seed durable megafile telemetry.
+pub fn scan_repository_file_samples(repo_path: impl AsRef<Path>) -> Result<Vec<FileSizeSample>> {
+    let map = scan_repository(repo_path)?;
+    let repository_binding = crate::worktree::RepositoryBindingGuard::bind(&map.root)?;
+    let deadline = Instant::now()
+        .checked_add(REPOSITORY_MAP_MAX_DURATION)
+        .context("repository file sampling deadline overflowed")?;
+    let entries = map
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == RepoEntryKind::File)
+        .collect::<Vec<_>>();
+    if entries.len() > REPOSITORY_SAMPLE_MAX_FILES {
+        anyhow::bail!(
+            "repository file sampling exceeds its {}-file update limit",
+            REPOSITORY_SAMPLE_MAX_FILES
+        );
+    }
+    let mut total_bytes = 0_u64;
+    let mut samples = Vec::new();
+
+    for entry in entries {
+        if Instant::now() >= deadline {
+            anyhow::bail!("repository file sampling exceeded its total time limit");
+        }
+        let expected_bytes = entry
+            .size_bytes
+            .context("regular repository file is missing its byte size")?;
+        total_bytes = total_bytes
+            .checked_add(expected_bytes)
+            .context("repository file sample byte count overflowed")?;
+        if total_bytes > REPOSITORY_SAMPLE_MAX_TOTAL_BYTES {
+            anyhow::bail!(
+                "repository file sampling exceeds its {}-byte aggregate content limit",
+                REPOSITORY_SAMPLE_MAX_TOTAL_BYTES
+            );
+        }
+        let contents = repository_binding
+            .worktree_binding()
+            .read_relative(&entry.path, expected_bytes)?;
+        let observed_bytes =
+            u64::try_from(contents.len()).context("sampled file size does not fit u64")?;
+        if observed_bytes != expected_bytes {
+            anyhow::bail!(
+                "repository file size changed after map capture: {}",
+                entry.path.display()
+            );
+        }
+        samples.push(FileSizeSample {
+            path: entry.path,
+            bytes: observed_bytes,
+            lines: physical_line_count(&contents)?,
+        });
+    }
+
+    repository_binding.verify()?;
+    if Instant::now() >= deadline {
+        anyhow::bail!("repository file sampling exceeded its total time limit");
+    }
+    Ok(samples)
+}
+
+fn physical_line_count(contents: &[u8]) -> Result<u64> {
+    let newline_count = contents.iter().filter(|byte| **byte == b'\n').count();
+    let lines = newline_count.saturating_add(usize::from(
+        !contents.is_empty() && contents.last() != Some(&b'\n'),
+    ));
+    u64::try_from(lines).context("sampled file line count does not fit u64")
 }
 
 fn capture_repository_map_snapshot(
@@ -306,6 +381,31 @@ mod tests {
         assert_eq!(map.entries[3].category, "rust");
         assert_eq!(map.entries[3].git_status, RepoGitStatus::Untracked);
         assert_eq!(map.entries[3].size_bytes, Some(15));
+    }
+
+    #[test]
+    fn explicit_file_sampling_is_language_agnostic_and_does_not_create_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::create_dir_all(repo_path.join("assets")).expect("create assets");
+        fs::write(repo_path.join("README.md"), b"one\ntwo\n").expect("write text");
+        fs::write(repo_path.join("assets/blob.bin"), b"\0one\n\0two").expect("write binary");
+
+        let samples = scan_repository_file_samples(&repo_path).expect("sample files");
+
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("README.md"), PathBuf::from("assets/blob.bin")]
+        );
+        assert_eq!(samples[0].bytes, 8);
+        assert_eq!(samples[0].lines, 2);
+        assert_eq!(samples[1].bytes, 9);
+        assert_eq!(samples[1].lines, 2);
+        assert!(!repo_path.join(".git/maco/state").exists());
     }
 
     #[test]

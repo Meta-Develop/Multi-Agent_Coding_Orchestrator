@@ -14,6 +14,7 @@ pub mod external_agent;
 pub mod inbox;
 pub mod live_claim;
 pub mod llm;
+pub mod megafile;
 pub mod merge;
 pub(crate) mod merge_semantic;
 pub mod orchestration_event;

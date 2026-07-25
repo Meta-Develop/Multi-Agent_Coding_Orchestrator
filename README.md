@@ -474,10 +474,38 @@ Inspect a repository:
 ```bash
 cargo run -- repo map --repo . --json
 cargo run -- repo map --semantic --repo . --json
+cargo run -- repo megafile query --repo . --json
+cargo run -- repo megafile seed --repo . --json
+cargo run -- repo megafile query src/lib.rs --repo . --json
 cargo run -- repo query symbol WorktreeManager --repo . --json
 cargo run -- repo query path src/worktree.rs --repo . --json
 cargo run -- repo query risk --path src/worktree.rs --repo . --json
 ```
+
+`repo map` and `repo megafile query` are read-only. In particular, querying an
+uninitialized repository reports `initialized=false` and does not create an
+authentication key, state directory, lock, or telemetry snapshot. Size
+telemetry is written only by the explicit `repo megafile seed` command. The
+sampler is language-agnostic: it reads bounded regular repository files and
+records bytes and physical lines, including binary files, without requiring a
+Rust parser. The authenticated report exposes the bounded retained event
+history as `records` plus current per-path `assessments`; events include size
+samples, claims, merge collisions, and accepted decompositions.
+
+All megafile thresholds are configurable with `--file-bytes`, `--file-lines`,
+`--growth-bytes`, `--growth-lines`, `--claim-count`, `--collision-count`, and
+`--activity-window-records`. When none is supplied, the JSON calibration is
+`bootstrap_provisional`: the defaults are operating starting points, not
+empirically calibrated policy. Any override labels the assessment
+`configured`. Before using megafile blocking or decomposition acceptance in a
+real run, operators must review authenticated telemetry produced by real
+repository activity and revise the provisional values with explicit configured
+thresholds; bootstrap values are not production acceptance criteria. Continue
+revising configured values when later real-run size, claim, or collision data
+shows that the calibration no longer represents the repository. History is
+bounded to 16,384 logical records and authenticated
+snapshot storage is also bounded; older logical events are evicted, so this is
+operational recent history rather than an indefinite audit archive.
 
 Managed worktree creation currently returns `Unsupported` before repository access:
 
@@ -520,7 +548,18 @@ Claim paths for an agent:
 
 ```bash
 cargo run -- sync claim agent-a src README.md --repo . --json
+cargo run -- sync claim agent-b src/large.c --repo . --file-lines 2000 --claim-count 4 --json
 ```
+
+Claims remain backward compatible at the top-level JSON fields and also return
+the typed `claim` and `warnings` fields. A threshold crossing is warn-only at
+claim time; it does not weaken or bypass the exclusive claim gate. The
+authenticated claim is committed first and its claim-frequency event is then
+written to the authenticated megafile history. If that second write fails, the
+command fails closed and states that the claim token remains durable; inspect
+`sync status` and explicitly release that token before retrying instead of
+blindly creating a second claim. The event journal is observability only and is
+not a megafile authority.
 
 Check the current owner for a path:
 
@@ -665,8 +704,10 @@ cargo run -- orchestrate collect summary.json --repo . --json
 cargo run -- merge preview agent-a --repo . --claim src --json
 cargo run -- merge preview agent-a --repo . --claim src --validation-report validation.json --json
 cargo run -- merge preview agent-a --repo . --claim src --require-validation --validation-report validation.json --json
+cargo run -- merge preview agent-a --repo . --claim src/large.c --block-megafiles --json
 cargo run -- merge apply agent-a --repo . --claim src --validation-report validation.json
 cargo run -- merge apply agent-a --repo . --claim src --require-validation --validation-command "cargo test" --json
+cargo run -- merge apply split-large-c --repo . --claim src/large.c --claim src/large/ --block-megafiles --decomposition-target src/large.c --decomposition-run-id issue19-split-large-c --json
 cargo run -- merge apply agent-a --repo . --claim src --force-dirty-primary --force-stale-base --force-unclaimed-edits
 ```
 
@@ -674,6 +715,67 @@ Merge apply refuses dirty primary worktrees, stale agent bases, unclaimed edits,
 validation failures, and apply conflicts unless the matching explicit force flag
 is passed. Apply-check failures themselves are still blocking unless
 `--force-apply-conflicts` allows a successful three-way apply check.
+
+Megafile merge policy is also warn-only by default. `safety.megafile_warnings`
+contains the authenticated threshold assessments without changing readiness.
+`--block-megafiles` makes threshold-crossing changed paths blocking. For CLI
+schema compatibility this policy currently reuses the existing
+`excluded_reference` `ApplyBlocker`; its `ApplyBlockerDetail` is unambiguous:
+the exact paths, a megafile-specific message, available validation
+reports/commands, and a `megafile_decomposition` next-safe operation are
+included, while `safety.megafile` and `safety.megafile_warnings` carry the
+typed assessment. A future dedicated `megafile_threshold_exceeded` blocker
+would require a coordinated versioned update of all exhaustive blocker
+consumers.
+
+`merge preview` never records a collision. `merge apply` records paths when its
+direct apply check detects a collision, including the direct-check failure that
+is allowed to continue via a successful opt-in three-way check. That write uses
+the authenticated durable megafile store before a blocked merge decision is
+returned. An authenticity or persistence failure aborts the decision and never
+turns a blocked merge into an apply.
+
+`--decomposition-target` never self-authorizes decomposition work. It must be
+paired with `--decomposition-run-id` naming a verified finalized supervise
+artifact. That run must be real/publishable and accepted successful, and its
+accepted O1 id must equal the merge candidate agent id. The exact candidate,
+supervisor, O1, and successful typed worker `files_changed` sets must all equal
+the target plus the completion's normalized non-empty `replacement_paths`.
+The worker completion must match the accepted child aggregation and supervisor
+final `decomposition_candidates`, while the parent-launched accepted read-only
+auditor must cover the worker and every candidate path. This reuses the
+authenticated finalized artifact reader; an arbitrary JSON report, unfinished
+run directory, fake run, bare target, mismatched agent, or unrelated extra edit
+is rejected.
+
+The worker and child cannot self-assert the content identity. After path,
+journal, and diff inspection, the supervisor uses the isolated two-matching
+candidate snapshot gate to derive the full candidate validation binding
+(primary HEAD, agent HEAD, merge base, agent id, and raw-diff object id), writes
+that binding into the normalized completion evidence before launching the
+parent auditor, and re-captures it after the auditor. A missing capture or any
+content, path, or base change across that review fails the run before
+finalization.
+
+Merge independently re-captures the current candidate under the same isolated
+two-matching snapshot gate and requires its full canonical binding to equal the
+supervisor-derived binding in the authenticated finalized run. Thus changing
+target or replacement bytes after review is rejected even when the exact path
+set and run id are reused. The exact target must also be modified smaller than
+its primary candidate base or deleted. Every evidence-bound replacement must
+be a new regular file absent from that base and non-empty in the candidate.
+Only those evidence-bound replacement paths are recorded; ordinary changed
+paths cannot be relabeled as decomposition output. The target also must be the
+exact authenticated threshold-crossing path and have an exact (not merely
+ancestor) path claim. All ordinary dirty-primary, stale-base, claim,
+validation, review, and apply gates remain in force; verified evidence bypasses
+only its target's opt-in megafile policy blocker. An
+`accepted_decomposition` history event is written only after the primary patch
+was successfully applied. A blocked/failed/no-op candidate cannot create it.
+If the post-apply authenticated write fails, the command reports that the merge
+was already applied and must not be retried blindly. The accepted event starts
+a new activity/size epoch; run a later explicit seed to establish the new file
+size baseline.
 
 When an apply check reports overlapping paths, both commands add
 `safety.semantic_conflicts` to the existing JSON report. The parser-backed Rust
@@ -1265,6 +1367,23 @@ to `1`. The default preserves legacy plan order, reports, artifact paths, and
 the literal `incoming` and `capture` scratch roots. Zero is rejected before run
 artifacts are reserved. `max_child_assignments` separately bounds plan fan-out;
 it is not the concurrency limit.
+
+A worker assignment may opt into `"kind":"megafile_decomposition"` only with an
+exact canonical `"target_path"` inside its assigned paths. Ordinary assignments
+must omit `target_path`. Accepted worker reports preserve that typed pair,
+bounded `bloated_file_flags`, and exact decomposition output evidence through
+the child report. A successful decomposition worker must list the exact target
+in `files_changed` and return
+`decomposition_completion={"target_path":"...","replacement_paths":["..."]}`
+with at least one distinct canonical replacement also present in
+`files_changed`; target-only, ordinary, unrelated, and no-op pseudo-completions
+are rejected. The supervisor final report deduplicates flags into
+`bloated_file_flags` and merge-ready output evidence into
+`decomposition_candidates`. The latter name is deliberate: supervisor work
+remains isolated, so successful worker/report evidence is not an accepted
+decomposition. Only a later successful `merge apply --decomposition-target
+... --decomposition-run-id ...` using that same finalized run evidence writes
+the authoritative `accepted_decomposition` history record.
 
 With `N > 1`, only assignments whose normalized path sets are disjoint can run
 at the same time. Equality, ancestor, and descendant relationships use the
