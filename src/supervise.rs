@@ -10845,7 +10845,7 @@ mod tests {
 
     #[test]
     fn hierarchy_admission_waits_for_accepted_successful_parent() {
-        let assignments = vec![
+        let assignments = [
             injected_named_assignment("planning-root", "src/shared.rs"),
             injected_named_assignment("execution-child", "src/shared.rs"),
         ];
@@ -11667,12 +11667,44 @@ mod tests {
 
         let plain = temp.path().join("task.txt");
         fs::write(&plain, "Update README.md.\n").expect("write plain task");
-        let task = supervisor_plan_from_task_file(&repo, &plain).expect("load plain task");
-        assert_eq!(task.task, "Update README.md.\n");
-        assert_eq!(task.assignments.len(), 1);
+        let loaded =
+            supervisor_plan_and_consultant_from_task_file(&repo, &plain).expect("load plain task");
+        assert_eq!(loaded.plan.task, "Update README.md.\n");
         assert_eq!(
-            task.assignments[0].assigned_paths,
+            loaded
+                .plan
+                .assignments
+                .iter()
+                .map(|assignment| assignment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["assignment-001-planning", "assignment-001"]
+        );
+        assert_eq!(
+            loaded.plan.assignments[0].assigned_paths,
             vec![PathBuf::from("README.md")]
+        );
+        assert!(loaded.plan.assignments[0].worker_assignments.is_empty());
+        assert_eq!(
+            loaded.plan.assignments[1].assigned_paths,
+            vec![PathBuf::from("README.md")]
+        );
+        assert_eq!(loaded.plan.assignments[1].worker_assignments.len(), 1);
+        assert_eq!(
+            loaded.plan_metadata.assignment_schedule,
+            vec![
+                AssignmentScheduleEntry {
+                    assignment_id: "assignment-001-planning".to_string(),
+                    parent_assignment_id: None,
+                    depth: 2,
+                    flattened_index: 0,
+                },
+                AssignmentScheduleEntry {
+                    assignment_id: "assignment-001".to_string(),
+                    parent_assignment_id: Some("assignment-001-planning".to_string()),
+                    depth: 3,
+                    flattened_index: 1,
+                },
+            ]
         );
 
         let plan = temp.path().join("plan.json");
