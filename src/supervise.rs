@@ -14,6 +14,7 @@ use crate::{
     },
     orchestration_event::{OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole},
     orchestrator::{RunId, SemanticCoordinationMode},
+    planning,
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
         EnvironmentMode, ProcessCancellation, ProcessSpec, ProcessTreeEvidence,
@@ -663,6 +664,30 @@ pub fn supervisor_plan_from_task_file(
     Ok(supervisor_plan_and_consultant_from_task_file(repo, task_file)?.plan)
 }
 
+pub fn supervisor_plan_from_goal_spec(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+) -> Result<SupervisorPlan> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    Ok(supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?.plan)
+}
+
+pub fn supervisor_plan_document_from_goal_spec(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+) -> Result<Value> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+}
+
 pub fn supervisor_plan_document_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -688,23 +713,114 @@ fn supervisor_plan_and_consultant_from_task_file(
             .with_context(|| format!("failed to parse supervisor plan {}", task_file.display()));
     }
 
+    supervisor_plan_and_consultant_from_goal_spec(
+        &repo,
+        "",
+        &task,
+        Some(path_relative_to(&repo, task_file)),
+    )
+    .map_err(|error| {
+        anyhow!(
+            "failed to plan plain-text task specification {}: {error}",
+            task_file.display()
+        )
+    })
+}
+
+fn supervisor_plan_and_consultant_from_goal_spec(
+    repo: &Path,
+    goal: &str,
+    spec: &str,
+    task_file: Option<PathBuf>,
+) -> Result<LoadedSupervisorPlan> {
+    let proposal = planning::propose_task_decomposition(repo, goal, spec)
+        .context("failed to decompose goal/spec into repository workstreams")?;
+    if proposal.assignments.is_empty() {
+        bail!(
+            "goal/spec produced no actionable workstreams; name at least one repository path, Rust module, or Rust symbol to change"
+        );
+    }
+    planning::validate_task_assignment_disjointness(&proposal.assignments)
+        .context("goal/spec workstreams are not independently assignable")?;
+
+    let spec_fragment_ids = proposal
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .collect::<Vec<_>>();
+    let mut spec_fragment_ids_by_assignment = BTreeMap::new();
+    let mut assignment_metadata = AssignmentMetadata::new();
+    let assignments = proposal
+        .assignments
+        .into_iter()
+        .map(|assignment| {
+            spec_fragment_ids_by_assignment
+                .insert(assignment.id.clone(), assignment.fragment_ids.clone());
+            let worker = WorkerAssignment {
+                id: format!("{}-worker", assignment.id),
+                role: AgentRole::Worker,
+                assigned_paths: assignment.assigned_paths.clone(),
+                semantic_symbols: assignment.semantic_symbols.clone(),
+                semantic_modules: assignment.semantic_modules.clone(),
+                task: Some(assignment.task.clone()),
+                report_path: None,
+            };
+            assignment_metadata.insert(
+                (assignment.id.clone(), worker.id.clone()),
+                WorkerAssignmentMetadata::default(),
+            );
+            OrchestratorAssignment {
+                id: assignment.id,
+                role: AgentRole::ChildOrchestrator,
+                assigned_paths: assignment.assigned_paths,
+                semantic_symbols: assignment.semantic_symbols,
+                semantic_modules: assignment.semantic_modules,
+                task: Some(assignment.task),
+                worker_assignments: vec![worker],
+                notes: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let assignment_schedule = assignments
+        .iter()
+        .enumerate()
+        .map(|(flattened_index, assignment)| AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: MIN_SUPERVISOR_DEPTH,
+            flattened_index,
+        })
+        .collect();
+    let task = match (goal.is_empty(), spec.is_empty()) {
+        (false, false) => format!("{goal}\n\n{spec}"),
+        (false, true) => goal.to_string(),
+        (true, _) => spec.to_string(),
+    };
+    let plan = SupervisorPlan {
+        version: SUPERVISOR_SCHEMA_VERSION,
+        task,
+        task_file,
+        max_depth: default_max_depth(),
+        max_child_assignments: assignments.len().max(DEFAULT_MAX_CHILD_ASSIGNMENTS),
+        max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
+        child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+        semantic_coordination: SemanticCoordinationMode::Off,
+        role_models: BTreeMap::new(),
+        model_pricing: BTreeMap::new(),
+        assignments,
+    };
+    let metadata = SupervisorPlanMetadata {
+        spec_fragment_ids,
+        spec_fragment_ids_by_assignment,
+        assignment_schedule,
+        coverage_gaps: Vec::new(),
+    };
+    let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
-        plan: SupervisorPlan {
-            version: SUPERVISOR_SCHEMA_VERSION,
-            task,
-            task_file: Some(path_relative_to(&repo, task_file)),
-            max_depth: default_max_depth(),
-            max_child_assignments: DEFAULT_MAX_CHILD_ASSIGNMENTS,
-            max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
-            child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
-            semantic_coordination: SemanticCoordinationMode::Off,
-            role_models: BTreeMap::new(),
-            model_pricing: BTreeMap::new(),
-            assignments: Vec::new(),
-        },
+        plan,
         consultant: SupervisorConsultantPlan::default(),
-        assignment_metadata: AssignmentMetadata::new(),
-        plan_metadata: SupervisorPlanMetadata::default(),
+        assignment_metadata,
+        plan_metadata,
     })
 }
 
@@ -2664,6 +2780,7 @@ struct AssignmentExecutionOutcome {
     usage_samples: Vec<RoleUsageSample>,
     usage_incomplete: bool,
     report: Option<OrchestratorReviewReport>,
+    candidate_inspection: Option<SupervisorCandidateInspection>,
     findings: Vec<Finding>,
     claim_tokens: Vec<ClaimToken>,
     semantic_tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
@@ -3507,7 +3624,11 @@ fn execute_supervisor_assignment_inner(
             &mut child_report,
             &worktree_write_lease,
         ) {
-            Ok(inspection) => inspection,
+            Ok(Some(inspection)) => Some(inspection),
+            Ok(None) if !report_failed(&child_report) => {
+                inspect_supervisor_candidate(repo, assignment, &worktree_write_lease).ok()
+            }
+            Ok(None) => None,
             Err(error) => {
                 reject_supervisor_decomposition_binding(
                     &mut child_report,
@@ -3802,25 +3923,68 @@ fn execute_supervisor_assignment_inner(
     if child_containment_verified {
         validate_auditor_reports(assignment, &final_report_path, &mut child_report);
     }
-    if !report_failed(&child_report) && !child_report.decomposition_completions.is_empty() {
+    let mut traceability_candidate = None;
+    if !report_failed(&child_report) {
         let post_auditor_candidate =
-            inspect_supervisor_decomposition_candidate(repo, assignment, &worktree_write_lease);
-        let stable = match (pre_auditor_candidate.as_ref(), post_auditor_candidate.as_ref()) {
-            (Some(before), Ok(after)) if before == after => Ok(()),
-            (Some(before), Ok(after)) => Err(anyhow!(
-                "candidate content, paths, or base changed across parent auditor review: before={before:?}, after={after:?}"
-            )),
-            (Some(_), Err(error)) => Err(anyhow!(
-                "failed to recapture decomposition candidate after parent auditor review: {error:#}"
-            )),
-            (None, _) => Err(anyhow!(
-                "accepted decomposition evidence has no pre-auditor supervisor candidate binding"
-            )),
-        };
-        if let Err(error) = stable {
-            reject_supervisor_decomposition_binding(&mut child_report, &final_report_path, &error);
+            inspect_supervisor_candidate(repo, assignment, &worktree_write_lease);
+        match (pre_auditor_candidate.as_ref(), post_auditor_candidate) {
+            (Some(before), Ok(after)) if before == &after => {
+                traceability_candidate = Some(after);
+            }
+            (Some(before), Ok(after)) if !child_report.decomposition_completions.is_empty() => {
+                let error = anyhow!(
+                    "candidate content, paths, or base changed across parent auditor review: before={before:?}, after={after:?}"
+                );
+                reject_supervisor_decomposition_binding(
+                    &mut child_report,
+                    &final_report_path,
+                    &error,
+                );
+            }
+            (Some(_), Err(error)) if !child_report.decomposition_completions.is_empty() => {
+                let error = anyhow!(
+                    "failed to recapture decomposition candidate after parent auditor review: {error:#}"
+                );
+                reject_supervisor_decomposition_binding(
+                    &mut child_report,
+                    &final_report_path,
+                    &error,
+                );
+            }
+            (None, _) if !child_report.decomposition_completions.is_empty() => {
+                let error = anyhow!(
+                    "accepted decomposition evidence has no pre-auditor supervisor candidate binding"
+                );
+                reject_supervisor_decomposition_binding(
+                    &mut child_report,
+                    &final_report_path,
+                    &error,
+                );
+            }
+            _ => {}
         }
     }
+    if !report_failed(&child_report) {
+        if let Some(candidate) = traceability_candidate.as_ref() {
+            if candidate.changed_paths != child_report.files_changed {
+                let error = anyhow!(
+                    "supervisor-observed candidate paths differ from the accepted child report"
+                );
+                if !child_report.decomposition_completions.is_empty() {
+                    reject_supervisor_decomposition_binding(
+                        &mut child_report,
+                        &final_report_path,
+                        &error,
+                    );
+                }
+                traceability_candidate = None;
+            }
+        }
+    }
+    if report_failed(&child_report) {
+        traceability_candidate = None;
+    }
+    outcome.candidate_inspection = traceability_candidate;
     with_supervisor_artifacts(artifacts, |writer, journal| {
         write_child_report(writer, &final_report_relative, &child_report)?;
         record_final_report_decisions(journal, writer, &options.run_id, &child_report);
@@ -4070,6 +4234,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let mut usage_samples = Vec::new();
     let mut usage_incomplete = false;
     let mut orchestrator_reports = Vec::new();
+    let mut candidate_inspections = BTreeMap::new();
     let mut findings = Vec::new();
     if runtime == SupervisorRuntime::Fake {
         findings.push(Finding {
@@ -4411,6 +4576,11 @@ fn run_supervisor_plan_with_runner_and_creation(
                 concurrently_released_semantic_intents.extend(outcome.released_semantic_intents);
                 concurrent_semantic_release_errors.extend(outcome.semantic_release_errors);
             }
+            if let (Some(report), Some(inspection)) =
+                (outcome.report.as_ref(), outcome.candidate_inspection)
+            {
+                candidate_inspections.insert(report.id.clone(), inspection);
+            }
             if let Some(report) = outcome.report {
                 orchestrator_reports.push(report);
             }
@@ -4566,8 +4736,12 @@ fn run_supervisor_plan_with_runner_and_creation(
         finalize_supervisor_cost(usage_complete, &mut role_usage, observed_total_cost_usd);
     let bloated_file_flags = accepted_bloated_file_flags(&orchestrator_reports);
     let decomposition_candidates = accepted_decomposition_candidates(&orchestrator_reports);
-    let (assignment_traceability, runtime_coverage_gaps) =
-        supervisor_assignment_traceability(&plan, &plan_metadata, &orchestrator_reports);
+    let (assignment_traceability, runtime_coverage_gaps) = supervisor_assignment_traceability(
+        &plan,
+        &plan_metadata,
+        &orchestrator_reports,
+        &candidate_inspections,
+    );
     let mut coverage_gaps = plan_metadata.coverage_gaps.clone();
     coverage_gaps.extend(runtime_coverage_gaps);
     let final_report = SupervisorFinalReport {
@@ -4733,6 +4907,7 @@ fn supervisor_assignment_traceability(
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
     reports: &[OrchestratorReviewReport],
+    candidate_inspections: &BTreeMap<String, SupervisorCandidateInspection>,
 ) -> (Vec<AssignmentTraceability>, Vec<SupervisorCoverageGap>) {
     let fallback_schedule;
     let schedule = if metadata.assignment_schedule.is_empty() {
@@ -4780,15 +4955,21 @@ fn supervisor_assignment_traceability(
             .cloned()
             .unwrap_or_default();
         let report = reports.get(assignment.id.as_str()).copied();
-        let produced_changed_paths = report
-            .map(|report| report.files_changed.clone())
+        let inspection = candidate_inspections.get(&assignment.id);
+        let produced_changed_paths = inspection
+            .map(|inspection| inspection.changed_paths.clone())
+            .or_else(|| report.map(|report| report.files_changed.clone()))
             .unwrap_or_default();
-        let produced_diff_binding = report.and_then(|report| {
-            report
-                .decomposition_completions
-                .iter()
-                .find_map(|completion| completion.supervisor_candidate_binding.clone())
-        });
+        let produced_diff_binding = inspection
+            .map(|inspection| inspection.binding.clone())
+            .or_else(|| {
+                report.and_then(|report| {
+                    report
+                        .decomposition_completions
+                        .iter()
+                        .find_map(|completion| completion.supervisor_candidate_binding.clone())
+                })
+            });
         if report.is_none() {
             append_assignment_coverage_gap(
                 &mut gaps,
@@ -5092,6 +5273,36 @@ fn validate_cross_assignment_semantic_collisions(
                     module
                 );
             }
+            if let Some((left_module, right_module)) = first_semantic_module_hierarchy_overlap(
+                left_scope.semantic_modules,
+                right_scope.semantic_modules,
+            ) {
+                bail!(
+                    "{} and {} overlap semantic module hierarchy '{}' and '{}' after normalization",
+                    left_scope.label,
+                    right_scope.label,
+                    left_module,
+                    right_module
+                );
+            }
+            if let Some((module, symbol)) = first_semantic_module_symbol_overlap(
+                left_scope.semantic_modules,
+                right_scope.semantic_symbols,
+            )
+            .or_else(|| {
+                first_semantic_module_symbol_overlap(
+                    right_scope.semantic_modules,
+                    left_scope.semantic_symbols,
+                )
+            }) {
+                bail!(
+                    "{} and {} overlap semantic module '{}' and symbol '{}' after normalization",
+                    left_scope.label,
+                    right_scope.label,
+                    module,
+                    symbol
+                );
+            }
         }
     }
     Ok(())
@@ -5133,6 +5344,42 @@ fn first_shared_string<'a>(left: &'a [String], right: &[String]) -> Option<&'a s
     left.iter()
         .find(|value| right.binary_search(value).is_ok())
         .map(String::as_str)
+}
+
+fn first_semantic_module_hierarchy_overlap<'a>(
+    left: &'a [String],
+    right: &'a [String],
+) -> Option<(&'a str, &'a str)> {
+    left.iter().find_map(|left_module| {
+        right
+            .iter()
+            .find(|right_module| {
+                left_module != *right_module && semantic_path_is_ancestor(left_module, right_module)
+            })
+            .map(|right_module| (left_module.as_str(), right_module.as_str()))
+    })
+}
+
+fn first_semantic_module_symbol_overlap<'a>(
+    modules: &'a [String],
+    symbols: &'a [String],
+) -> Option<(&'a str, &'a str)> {
+    modules.iter().find_map(|module| {
+        symbols
+            .iter()
+            .find(|symbol| semantic_path_contains(module, symbol))
+            .map(|symbol| (module.as_str(), symbol.as_str()))
+    })
+}
+
+fn semantic_path_is_ancestor(left: &str, right: &str) -> bool {
+    semantic_path_contains(left, right) || semantic_path_contains(right, left)
+}
+
+fn semantic_path_contains(parent: &str, child: &str) -> bool {
+    let parent = parent.split("::").collect::<Vec<_>>();
+    let child = child.split("::").collect::<Vec<_>>();
+    child.len() >= parent.len() && child.starts_with(&parent)
 }
 
 fn normalize_optional_model_field(value: Option<String>, field: &str) -> Result<Option<String>> {
@@ -5237,6 +5484,38 @@ fn validate_worker_assignments(assignment: &mut OrchestratorAssignment) -> Resul
                     right.id,
                     assignment.id,
                     module
+                );
+            }
+            if let Some((left_module, right_module)) = first_semantic_module_hierarchy_overlap(
+                &left.semantic_modules,
+                &right.semantic_modules,
+            ) {
+                bail!(
+                    "workers '{}' and '{}' under assignment '{}' overlap semantic module hierarchy '{}' and '{}' after normalization",
+                    left.id,
+                    right.id,
+                    assignment.id,
+                    left_module,
+                    right_module
+                );
+            }
+            if let Some((module, symbol)) = first_semantic_module_symbol_overlap(
+                &left.semantic_modules,
+                &right.semantic_symbols,
+            )
+            .or_else(|| {
+                first_semantic_module_symbol_overlap(
+                    &right.semantic_modules,
+                    &left.semantic_symbols,
+                )
+            }) {
+                bail!(
+                    "workers '{}' and '{}' under assignment '{}' overlap semantic module '{}' and symbol '{}' after normalization",
+                    left.id,
+                    right.id,
+                    assignment.id,
+                    module,
+                    symbol
                 );
             }
         }
@@ -5683,7 +5962,7 @@ struct SupervisorCandidateInspection {
     changed_paths: Vec<PathBuf>,
 }
 
-fn inspect_supervisor_decomposition_candidate(
+fn inspect_supervisor_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
     worktree_write_lease: &ManagedWorktreeWriteLease,
@@ -5733,8 +6012,7 @@ fn bind_supervisor_decomposition_candidate(
         );
     }
 
-    let inspection =
-        inspect_supervisor_decomposition_candidate(repo, assignment, worktree_write_lease)?;
+    let inspection = inspect_supervisor_candidate(repo, assignment, worktree_write_lease)?;
     let report_paths =
         normalize_paths(report.files_changed.clone()).context("child files_changed invalid")?;
     if inspection.changed_paths != report_paths {
@@ -9969,6 +10247,106 @@ mod tests {
     }
 
     #[test]
+    fn goal_spec_planning_lowers_independent_workstreams_with_workers_and_gaps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        Repository::init(repo).expect("initialize repository");
+        fs::create_dir_all(repo.join("src")).expect("create src");
+        fs::write(repo.join("src/alpha.rs"), "pub struct AlphaHandler;\n").expect("write alpha");
+        fs::write(repo.join("src/beta.rs"), "pub struct BetaHandler;\n").expect("write beta");
+
+        let document = supervisor_plan_document_from_goal_spec(
+            repo,
+            "Implement the requested changes.",
+            "- Update AlphaHandler.\n- Update BetaHandler.\n- Explain the unmatched frobnicator.",
+        )
+        .expect("plan goal/spec");
+        let assignments = document["assignments"]
+            .as_array()
+            .expect("assignments array");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0]["id"], "assignment-001");
+        assert_eq!(assignments[0]["assigned_paths"], json!(["src/alpha.rs"]));
+        assert_eq!(
+            assignments[0]["semantic_symbols"],
+            json!(["crate::alpha::AlphaHandler"])
+        );
+        assert_eq!(assignments[0]["spec_fragment_ids"], json!(["fragment-002"]));
+        assert_eq!(
+            assignments[0]["worker_assignments"][0]["id"],
+            "assignment-001-worker"
+        );
+        assert_eq!(
+            assignments[0]["worker_assignments"][0]["task"],
+            "Update AlphaHandler."
+        );
+        assert_eq!(assignments[1]["id"], "assignment-002");
+        assert_eq!(assignments[1]["assigned_paths"], json!(["src/beta.rs"]));
+        assert_eq!(assignments[1]["spec_fragment_ids"], json!(["fragment-003"]));
+        assert_eq!(
+            document["assignment_schedule"],
+            json!([
+                {
+                    "assignment_id": "assignment-001",
+                    "depth": 2,
+                    "flattened_index": 0
+                },
+                {
+                    "assignment_id": "assignment-002",
+                    "depth": 2,
+                    "flattened_index": 1
+                }
+            ])
+        );
+        assert_eq!(
+            document["coverage_gaps"]
+                .as_array()
+                .expect("coverage gaps")
+                .iter()
+                .map(|gap| gap["spec_fragment_id"].as_str().expect("fragment id"))
+                .collect::<Vec<_>>(),
+            vec!["fragment-001", "fragment-004"]
+        );
+
+        let repeated = supervisor_plan_document_from_goal_spec(
+            repo,
+            "Implement the requested changes.",
+            "- Update AlphaHandler.\n- Update BetaHandler.\n- Explain the unmatched frobnicator.",
+        )
+        .expect("repeat goal/spec planning");
+        assert_eq!(repeated, document);
+
+        let reparsed = parse_supervisor_plan_with_consultant(
+            &serde_json::to_string(&document).expect("serialize generated plan"),
+        )
+        .expect("reparse generated plan");
+        let renormalized = supervisor_plan_value(
+            &reparsed.plan,
+            &reparsed.consultant,
+            &reparsed.assignment_metadata,
+            &reparsed.plan_metadata,
+        )
+        .expect("renormalize generated plan");
+        assert_eq!(renormalized, document);
+    }
+
+    #[test]
+    fn plain_text_task_without_actionable_scope_returns_guidance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize repository");
+        fs::write(repo.join("README.md"), "# fixture\n").expect("write readme");
+        let task_file = temp.path().join("task.txt");
+        fs::write(&task_file, "Explain the unmatched frobnicator.\n").expect("write task");
+
+        let error = supervisor_plan_document_from_task_file(&repo, &task_file)
+            .expect_err("scope-free task must fail")
+            .to_string();
+        assert!(error.contains("produced no actionable workstreams"));
+        assert!(error.contains("repository path, Rust module, or Rust symbol"));
+    }
+
+    #[test]
     fn supervisor_depth_bounds_are_configurable_and_enforced() {
         let recursive = |max_depth| {
             json!({
@@ -10013,6 +10391,66 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn supervisor_represents_and_validates_assignment_trees_to_arbitrary_configured_depth() {
+        let source = json!({
+            "version": 1,
+            "task": "deep recursive plan",
+            "max_depth": 5,
+            "max_child_assignments": 4,
+            "assignments": [{
+                "id": "depth-2",
+                "assigned_paths": ["src/depth_2.rs"],
+                "child_assignments": [{
+                    "id": "depth-3",
+                    "assigned_paths": ["src/depth_3.rs"],
+                    "child_assignments": [{
+                        "id": "depth-4",
+                        "assigned_paths": ["src/depth_4.rs"],
+                        "child_assignments": [{
+                            "id": "depth-5",
+                            "assigned_paths": ["src/depth_5.rs"]
+                        }]
+                    }]
+                }]
+            }]
+        });
+        let loaded = parse_supervisor_plan_with_consultant(
+            &serde_json::to_string(&source).expect("serialize deep plan"),
+        )
+        .expect("parse deep plan");
+        assert_eq!(
+            loaded
+                .plan_metadata
+                .assignment_schedule
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.assignment_id.as_str(),
+                        entry.parent_assignment_id.as_deref(),
+                        entry.depth,
+                        entry.flattened_index,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("depth-2", None, 2, 0),
+                ("depth-3", Some("depth-2"), 3, 1),
+                ("depth-4", Some("depth-3"), 4, 2),
+                ("depth-5", Some("depth-4"), 5, 3),
+            ]
+        );
+
+        let mut too_shallow = source;
+        too_shallow["max_depth"] = json!(4);
+        assert!(parse_supervisor_plan_with_consultant(
+            &serde_json::to_string(&too_shallow).expect("serialize shallow bound")
+        )
+        .expect_err("deepest assignment must exceed configured bound")
+        .to_string()
+        .contains("depth 5"));
     }
 
     #[test]
@@ -10079,6 +10517,32 @@ mod tests {
             }),
         )
         .contains("semantic module 'crate::shared'"));
+        assert!(collision_error(
+            json!({
+                "id": "child-a",
+                "assigned_paths": ["src/a.rs"],
+                "semantic_modules": ["crate::shared"]
+            }),
+            json!({
+                "id": "child-b",
+                "assigned_paths": ["src/b.rs"],
+                "semantic_modules": ["crate::shared::nested"]
+            }),
+        )
+        .contains("semantic module hierarchy 'crate::shared' and 'crate::shared::nested'"));
+        assert!(collision_error(
+            json!({
+                "id": "child-a",
+                "assigned_paths": ["src/a.rs"],
+                "semantic_modules": ["crate::shared"]
+            }),
+            json!({
+                "id": "child-b",
+                "assigned_paths": ["src/b.rs"],
+                "semantic_symbols": ["crate::shared::SharedSymbol"]
+            }),
+        )
+        .contains("semantic module 'crate::shared' and symbol 'crate::shared::SharedSymbol'"));
     }
 
     #[test]
@@ -10231,8 +10695,12 @@ mod tests {
         report_a.files_changed = vec![PathBuf::from("src/a.rs")];
         let mut report_b = injected_child_report(&plan.assignments[1]);
         report_b.files_changed.clear();
-        let (traceability, gaps) =
-            supervisor_assignment_traceability(&plan, &metadata, &[report_a, report_b]);
+        let (traceability, gaps) = supervisor_assignment_traceability(
+            &plan,
+            &metadata,
+            &[report_a, report_b],
+            &BTreeMap::new(),
+        );
         assert_eq!(traceability.len(), 2);
         assert_eq!(
             traceability[0].produced_changed_paths,
@@ -10249,6 +10717,55 @@ mod tests {
                 && gap.assignment_id.as_deref() == Some("child-b")
                 && gap.spec_fragment_id.as_deref() == Some("SPEC-b")
         }));
+    }
+
+    #[test]
+    fn supervisor_traceability_binds_ordinary_success_to_observed_paths_and_diff() {
+        let plan = injected_multi_plan(vec![injected_named_assignment("child-a", "src/a.rs")], 0);
+        let metadata = SupervisorPlanMetadata {
+            spec_fragment_ids: vec!["SPEC-a".to_string()],
+            spec_fragment_ids_by_assignment: BTreeMap::from([(
+                "child-a".to_string(),
+                vec!["SPEC-a".to_string()],
+            )]),
+            assignment_schedule: vec![AssignmentScheduleEntry {
+                assignment_id: "child-a".to_string(),
+                parent_assignment_id: None,
+                depth: 2,
+                flattened_index: 0,
+            }],
+            coverage_gaps: Vec::new(),
+        };
+        let mut report = injected_child_report(&plan.assignments[0]);
+        report.files_changed = vec![PathBuf::from("src/a.rs")];
+        let binding = CandidateValidationBinding {
+            version: 1,
+            agent_id: "child-a".to_string(),
+            primary_head: Some("1111111111111111111111111111111111111111".to_string()),
+            agent_head: Some("2222222222222222222222222222222222222222".to_string()),
+            merge_base: Some("1111111111111111111111111111111111111111".to_string()),
+            diff_oid: "3333333333333333333333333333333333333333".to_string(),
+        };
+        let inspections = BTreeMap::from([(
+            "child-a".to_string(),
+            SupervisorCandidateInspection {
+                binding: binding.clone(),
+                changed_paths: vec![PathBuf::from("src/a.rs")],
+            },
+        )]);
+
+        let (traceability, gaps) =
+            supervisor_assignment_traceability(&plan, &metadata, &[report], &inspections);
+
+        assert!(gaps.is_empty());
+        assert_eq!(traceability.len(), 1);
+        assert_eq!(traceability[0].spec_fragment_ids, vec!["SPEC-a"]);
+        assert_eq!(
+            traceability[0].produced_changed_paths,
+            vec![PathBuf::from("src/a.rs")]
+        );
+        assert_eq!(traceability[0].produced_diff_binding, Some(binding));
+        assert_eq!(traceability[0].report_status, Some(ReviewStatus::Succeeded));
     }
 
     #[test]
@@ -10480,9 +10997,14 @@ mod tests {
         fs::write(repo.join("README.md"), "# test\n").expect("write readme");
 
         let plain = temp.path().join("task.txt");
-        fs::write(&plain, "ordinary direct UTF-8 task\n").expect("write plain task");
+        fs::write(&plain, "Update README.md.\n").expect("write plain task");
         let task = supervisor_plan_from_task_file(&repo, &plain).expect("load plain task");
-        assert_eq!(task.task, "ordinary direct UTF-8 task\n");
+        assert_eq!(task.task, "Update README.md.\n");
+        assert_eq!(task.assignments.len(), 1);
+        assert_eq!(
+            task.assignments[0].assigned_paths,
+            vec![PathBuf::from("README.md")]
+        );
 
         let plan = temp.path().join("plan.json");
         fs::write(&plan, bounded_loader_plan_json()).expect("write plan");
@@ -14044,7 +14566,7 @@ mod tests {
 
         fs::write(agent.path.join("src/readme_part.md"), "substituted\n")
             .expect("substitute inspected replacement bytes");
-        let after = inspect_supervisor_decomposition_candidate(&repo_path, &assignment, &lease)
+        let after = inspect_supervisor_candidate(&repo_path, &assignment, &lease)
             .expect("recapture substituted candidate");
         assert_eq!(after.changed_paths, before.changed_paths);
         assert_ne!(after.binding, before.binding);
