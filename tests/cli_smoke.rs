@@ -47,10 +47,10 @@ fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> 
     fs::set_permissions(&journal_root, fs::Permissions::from_mode(0o700))
         .context("make temporary claims journal root owner-private")?;
     let physical_journal = journal_root.join(ISSUE33_PHYSICAL_JOURNAL_ID);
+    let verified_manifest_files = verify_issue33_physical_journal_fixture()?;
     let copied_files = copy_issue33_physical_journal_fixture(&physical_journal)?;
     assert_eq!(
-        copied_files,
-        ISSUE33_PHYSICAL_JOURNAL_MANIFEST.lines().count(),
+        copied_files, verified_manifest_files,
         "the regression must install every captured physical-journal file"
     );
 
@@ -75,10 +75,12 @@ fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> 
     fs::create_dir(&quarantine_root).context("create test-local option-2 quarantine")?;
     fs::set_permissions(&quarantine_root, fs::Permissions::from_mode(0o700))
         .context("make test-local quarantine owner-private")?;
-    let quarantined_journal = quarantine_root.join(ISSUE33_PHYSICAL_JOURNAL_ID);
-    fs::rename(&physical_journal, &quarantined_journal)
-        .context("quarantine only the copied unanchored physical journal")?;
-    assert!(!physical_journal.exists());
+    let quarantined_namespace = quarantine_root.join("authenticated-claims-state-v1");
+    fs::rename(&journal_root, &quarantined_namespace)
+        .context("atomically quarantine the complete authenticated claims namespace")?;
+    assert!(!journal_root.exists());
+    assert!(quarantined_namespace.is_dir());
+    let quarantined_journal = quarantined_namespace.join(ISSUE33_PHYSICAL_JOURNAL_ID);
     assert!(quarantined_journal.is_dir());
     assert!(
         fixture_source.is_dir(),
@@ -143,8 +145,12 @@ fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> 
     assert_eq!(gc["removed_count"], 0);
     assert_eq!(gc["orphan_removed_count"], 0);
     assert!(
+        quarantined_namespace.is_dir(),
+        "successful consumers must preserve the complete quarantined namespace"
+    );
+    assert!(
         quarantined_journal.is_dir(),
-        "successful consumers must not silently delete the quarantined evidence"
+        "the captured physical journal must remain inside the quarantined namespace"
     );
 
     Ok(())
@@ -162,6 +168,98 @@ fn issue33_physical_journal_fixture() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/issue33/authenticated-claims-state-v1")
         .join(ISSUE33_PHYSICAL_JOURNAL_ID)
+}
+
+#[cfg(unix)]
+fn verify_issue33_physical_journal_fixture() -> Result<usize> {
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/issue33");
+    let expected_parent =
+        Path::new("authenticated-claims-state-v1").join(ISSUE33_PHYSICAL_JOURNAL_ID);
+    let mut manifest_names = Vec::new();
+
+    for (index, line) in ISSUE33_PHYSICAL_JOURNAL_MANIFEST.lines().enumerate() {
+        let (expected_hash, relative) = line
+            .split_once("  ")
+            .with_context(|| format!("parse physical-journal manifest line {}", index + 1))?;
+        anyhow::ensure!(
+            expected_hash.len() == 64
+                && expected_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "physical-journal manifest line {} has an invalid SHA-256",
+            index + 1
+        );
+
+        let relative = Path::new(relative);
+        anyhow::ensure!(
+            relative.parent() == Some(expected_parent.as_path()),
+            "physical-journal manifest line {} is outside the captured journal",
+            index + 1
+        );
+        let file_name = relative
+            .file_name()
+            .context("physical-journal manifest entry has no file name")?;
+        let fixture_path = fixture_root.join(relative);
+        let metadata = fs::symlink_metadata(&fixture_path).with_context(|| {
+            format!("inspect fixture manifest entry {}", fixture_path.display())
+        })?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "fixture manifest entry is not a regular file: {}",
+            fixture_path.display()
+        );
+
+        let output = Command::new("sha256sum")
+            .arg("--")
+            .arg(&fixture_path)
+            .output()
+            .with_context(|| format!("hash fixture manifest entry {}", fixture_path.display()))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "sha256sum failed for {}: {}",
+            fixture_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let stdout = std::str::from_utf8(&output.stdout)
+            .with_context(|| format!("decode sha256sum output for {}", fixture_path.display()))?;
+        let actual_hash = stdout
+            .split_ascii_whitespace()
+            .next()
+            .context("sha256sum returned no digest")?;
+        anyhow::ensure!(
+            actual_hash == expected_hash,
+            "fixture digest mismatch for {}: expected {}, got {}",
+            fixture_path.display(),
+            expected_hash,
+            actual_hash
+        );
+        manifest_names.push(file_name.to_os_string());
+    }
+
+    manifest_names.sort();
+    let source = issue33_physical_journal_fixture();
+    let mut captured_names = Vec::new();
+    for entry in fs::read_dir(&source)
+        .with_context(|| format!("enumerate captured journal {}", source.display()))?
+    {
+        let entry = entry.context("inspect captured physical-journal entry")?;
+        let metadata = entry
+            .metadata()
+            .context("inspect captured physical-journal metadata")?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "captured physical-journal entry is not a regular file: {}",
+            entry.path().display()
+        );
+        captured_names.push(entry.file_name());
+    }
+    captured_names.sort();
+    anyhow::ensure!(
+        captured_names == manifest_names,
+        "physical-journal manifest does not name the complete captured journal"
+    );
+
+    Ok(manifest_names.len())
 }
 
 #[cfg(unix)]

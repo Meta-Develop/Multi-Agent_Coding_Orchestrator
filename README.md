@@ -216,8 +216,13 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
 unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
 REPO=/absolute/path/to/repository
+REPO=$(realpath -e -- "$REPO")
 DEV=/absolute/path/to/reviewed-current-dev-maco
-PINNED="$REPO/.agents/scripts/maco"
+PINNED_PATH="$REPO/.agents/scripts/maco"
+test -x "$PINNED_PATH"
+test -f "$PINNED_PATH"
+test ! -L "$PINNED_PATH"
+PINNED=$(realpath -e -- "$PINNED_PATH")
 COMMON=$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)
 COMMON=$(realpath -e -- "$COMMON")
 STATE="$COMMON/maco/state"
@@ -225,7 +230,6 @@ ORPHAN="$STATE/authenticated-claims-state-v1"
 RECOVERY_BASE="$COMMON/maco/offline-recovery"
 
 test -x "$DEV"
-test -x "$PINNED"
 mv --version | grep -F 'GNU coreutils' >/dev/null
 mv --no-copy --help >/dev/null
 test -d "$STATE"
@@ -279,19 +283,39 @@ create-new PID lock is incompatible with the live persistent kernel lock and
 could otherwise fail on or remove a stale parseable `claims.lock`. Instead,
 create an isolated throwaway Git repository under the owner-private recovery
 directory, prove that it has a different Git common directory, and give it only
-the copied plaintext claims-v1. For this incident, the attached checkout must
-be commit `373550870f9986224bc8b57a9b13019a3da02516`. That commit reads and
-writes plaintext claims-v1 and contains no authenticated-claims journal writer.
-Its isolated output therefore proves only which copied plaintext claim view it
-interpreted; it does not prove that the captured orphan journal was emitted by
-that pin.
+the copied plaintext claims-v1. For this incident, the exact reviewed wrapper
+has SHA-256
+`93b76ebff318fb75e44f8ce48b5b48b4bad5435045d9fe736c4e1fc587a0d814`.
+Its own project-root resolution must bind it to `REPO`, and its manifest path
+must resolve inside the reviewed attached checkout. That checkout must be
+commit `373550870f9986224bc8b57a9b13019a3da02516` with a clean index and
+worktree, including no untracked files. The commit reads and writes plaintext
+claims-v1 and contains no authenticated-claims journal writer. Its isolated
+output therefore proves only which copied plaintext claim view it interpreted;
+it does not prove that the captured orphan journal was emitted by that pin.
 
 ```bash
+PINNED_WRAPPER_SHA256=93b76ebff318fb75e44f8ce48b5b48b4bad5435045d9fe736c4e1fc587a0d814
+test "$(sha256sum -- "$PINNED" | cut -d ' ' -f 1)" \
+  = "$PINNED_WRAPPER_SHA256"
+PINNED_WRAPPER_ID=$(stat -c '%d:%i:%s:%f:%h' -- "$PINNED")
+PINNED_PROJECT_ROOT=$(cd -- "$(dirname -- "$PINNED")/../.." && pwd -P)
+test "$PINNED_PROJECT_ROOT" = "$REPO"
+
 PINNED_CHECKOUT=$(realpath -e -- \
-  "$REPO/.agents/external/multi-agent-coding-orchestrator")
-PINNED_HEAD=$(git -C "$PINNED_CHECKOUT" rev-parse --verify HEAD)
+  "$PINNED_PROJECT_ROOT/.agents/external/multi-agent-coding-orchestrator")
+test "$(realpath -e -- \
+  "$PINNED_PROJECT_ROOT/.agents/external/multi-agent-coding-orchestrator/Cargo.toml")" \
+  = "$PINNED_CHECKOUT/Cargo.toml"
+test "$(realpath -e -- "$(git -C "$PINNED_CHECKOUT" rev-parse --show-toplevel)")" \
+  = "$PINNED_CHECKOUT"
+PINNED_HEAD=$(git -C "$PINNED_CHECKOUT" rev-parse --verify 'HEAD^{commit}')
 printf '%s\n' "$PINNED_HEAD" >"$RECOVERY/pinned-head.txt"
 test "$PINNED_HEAD" = 373550870f9986224bc8b57a9b13019a3da02516
+git -C "$PINNED_CHECKOUT" status --porcelain=v1 \
+  --untracked-files=all --ignore-submodules=none \
+  >"$RECOVERY/pinned-checkout-status.before"
+test ! -s "$RECOVERY/pinned-checkout-status.before"
 
 PINNED_STAGE="$RECOVERY/pinned-plaintext-stage"
 test ! -e "$PINNED_STAGE"
@@ -313,10 +337,25 @@ cmp -s -- \
   "$RECOVERY/claims-v1.reviewed.json" \
   "$PINNED_STATE/claims.json"
 
-"$PINNED" sync status --repo "$PINNED_STAGE" --json \
+CARGO_NET_OFFLINE=true \
+CARGO_INCREMENTAL=0 \
+CARGO_TARGET_DIR="$RECOVERY/pinned-cargo-target" \
+  "$PINNED" sync status --repo "$PINNED_STAGE" --json \
   >"$RECOVERY/pinned-claims-view.json" \
   2>"$RECOVERY/pinned-claims-view.stderr"
 test ! -e "$PINNED_STATE/claims.lock"
+test "$(stat -c '%d:%i:%s:%f:%h' -- "$PINNED")" = "$PINNED_WRAPPER_ID"
+test "$(sha256sum -- "$PINNED" | cut -d ' ' -f 1)" \
+  = "$PINNED_WRAPPER_SHA256"
+test "$(git -C "$PINNED_CHECKOUT" rev-parse --verify 'HEAD^{commit}')" \
+  = "$PINNED_HEAD"
+git -C "$PINNED_CHECKOUT" status --porcelain=v1 \
+  --untracked-files=all --ignore-submodules=none \
+  >"$RECOVERY/pinned-checkout-status.after"
+test ! -s "$RECOVERY/pinned-checkout-status.after"
+cmp -s -- \
+  "$RECOVERY/pinned-checkout-status.before" \
+  "$RECOVERY/pinned-checkout-status.after"
 cmp -s -- "$STATE/claims.json" "$RECOVERY/claims-v1.reviewed.json"
 test "$(stat -c '%d:%i:%s:%f:%h' -- "$STATE/claims.lock")" \
   = "$LIVE_CLAIMS_LOCK_ID"
@@ -487,7 +526,13 @@ pre-migration staging repository above. After migration, resume only the
 reviewed development binary. The new authenticated claims snapshot is
 supported by the attested claims-v1 migration; the captured orphan journal
 remains unanchored and unadopted. Neither its writer provenance nor its
-authorization as the current logical state was established.
+authorization as the current logical state was established. The wrapper checks
+bind the reviewed script bytes, its project root, its resolved manifest, and the
+clean pinned source checkout before and after the isolated invocation. They do
+not independently attest Cargo, rustc, cached dependencies, or the wider
+toolchain, and they do not defend against a hostile same-UID process racing and
+restoring checked paths during execution; the exclusive offline operator
+boundary remains a prerequisite.
 
 The first open of each migrated claims, semantic-intent, or managed-worktree
 consumer performs a recoverable retirement transaction while holding its
