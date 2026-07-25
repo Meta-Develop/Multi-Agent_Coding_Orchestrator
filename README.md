@@ -75,7 +75,13 @@ The current implementation covers a local-first command-line slice:
   remain available. The
   supervisor scheduler launches opt-in O1 child orchestrators through the
   Codex CLI in isolated child worktrees under an O2 supervisor, with
-  `--max-concurrent-children` defaulting to the legacy serial behavior. Each child
+  automatic resource-bounded fan-out as the default. It measures host capacity
+  and launches hierarchy-ready assignments concurrently only while their
+  normalized claim scopes are disjoint; `--max-concurrent-children 1` is the
+  explicit serial opt-out. Overlapping scopes are never admitted together. The
+  swarm-health cascade circuit breaker from Issue #24 is the admission safety
+  backstop for this higher default: a trip stops pending admissions and drains
+  active assignments without weakening the resource or claim gates. Each child
   is instructed to read `AGENTS.md` and project-local `.agents` guidance before
   acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
   worker/researcher assignments when available, preserve the O1/O2 subprocess
@@ -85,8 +91,7 @@ The current implementation covers a local-first command-line slice:
   supervisor role, leave O1/O2 hierarchy and enforced audit gates to MACO/Codex
   CLI subprocess workflows, report peer-O2 escalation candidates instead of
   taking them over, and preserve structured reporting without applying worker
-  changes to the primary worktree
-  automatically.
+  changes to the primary worktree automatically.
 - `maco supervise status` reports durable supervisor run artifact state without
   launching workers or applying changes.
 - `maco supervise collect` reads the structured supervisor final report and
@@ -1645,8 +1650,10 @@ Run an opt-in supervisor-of-orchestrators plan:
 cargo run -- supervise plan --from-goal goal.md --repo . --json
 # Preserve the positional form for either plain-text tasks or authored JSON plans:
 cargo run -- supervise plan supervisor-plan.json --repo . --json
-# Uses the supported default Codex runtime and creates capability-bound child worktrees:
-cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --max-concurrent-children 2 --json
+# Uses the supported default Codex runtime and automatic resource-bounded fan-out:
+cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --json
+# Explicit serial opt-out:
+cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-serial --codex-bin codex --max-concurrent-children 1 --json
 cargo run -- supervise status supervise-demo --repo . --json
 cargo run -- supervise collect supervise-demo --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
@@ -1772,11 +1779,13 @@ assignments but leaves a non-empty child worktree diff, the retained runner
 still launches the parent read-only `REVIEW_AUDITOR` and requires it to cover
 the child orchestrator id and changed paths.
 The retained supervisor runner does not apply worker changes to the primary worktree
-automatically. `--max-concurrent-children N` bounds child execution and defaults
-to `1`. The default preserves legacy plan order, reports, artifact paths, and
-the literal `incoming` and `capture` scratch roots. Zero is rejected before run
-artifacts are reserved. `max_child_assignments` separately bounds plan fan-out;
-it is not the concurrency limit.
+automatically. Omitting `--max-concurrent-children` selects `auto`, which derives
+the effective child-execution bound from measured host capacity instead of a
+hardcoded constant. `--max-concurrent-children auto` spells out that same mode,
+while `--max-concurrent-children 1` is the explicit serial opt-out. Zero is
+rejected before run artifacts are reserved. `max_child_assignments` separately
+bounds plan fan-out; it is not the concurrency limit. This default keeps the
+goal-to-swarm path tracked by Issue #22 free of an extra concurrency flag.
 
 A worker assignment may opt into `"kind":"megafile_decomposition"` only with an
 exact canonical `"target_path"` inside its assigned paths. Ordinary assignments
@@ -1795,23 +1804,32 @@ decomposition. Only a later successful `merge apply --decomposition-target
 ... --decomposition-run-id ...` using that same finalized run evidence writes
 the authoritative `accepted_decomposition` history record.
 
-With `N > 1`, hierarchy-ready assignments from independent roots can run
-concurrently only when their normalized path sets are disjoint. Equality,
-ancestor, and descendant relationships use the same overlap semantics as path
-claims. Same-lineage scope overlap is permitted by validation because parent
-admission gates ensure ancestors and descendants never run together;
-cross-subtree overlap remains rejected. The scheduler scans ahead for later
-ready, disjoint roots, so a waiting descendant or active overlap does not impose
-unnecessary head-of-line blocking. Retries and the parent review auditor remain
-inside the assignment's slot. An ordinary assignment failure suppresses its
-descendants but does not stop unrelated roots; a fatal scheduler abort stops
-new starts and joins every active call before returning.
+In `auto` mode, every hierarchy-ready assignment from independent roots can run
+concurrently up to the measured host-capacity bound, but only when normalized
+path sets are disjoint. Equality, ancestor, and descendant relationships use
+the same overlap semantics as path claims. Same-lineage scope overlap is
+permitted by validation because parent admission gates serialize ancestors and
+descendants; cross-subtree overlap remains rejected. The scheduler scans ahead
+for later ready, disjoint roots, so a waiting descendant or active overlap does
+not impose unnecessary head-of-line blocking. Retries and the parent review
+auditor remain inside the assignment's slot. An ordinary assignment failure
+suppresses its descendants but does not stop unrelated roots; a fatal scheduler
+abort stops new starts and joins every active call before returning.
+
+Before admitting more ready work, the Issue #24 swarm-health cascade circuit
+breaker evaluates recent coordination outcomes. Repeated coordination failures
+trip the breaker, journal the transition, stop pending assignment admission,
+drain active assignments, release their resources, and expose the trip plus
+recovery guidance in status/final-report evidence. The breaker is the safety
+backstop that makes a higher automatic default practical; it does not raise the
+measured capacity bound or allow overlapping claims to run together.
 
 Concurrent outcomes are stored by plan index, keeping final reports, command
 records, findings, releases, and deterministic artifacts in plan order. Event
 journal appends are synchronized and well formed, although completion events
 may interleave. Concurrent invocations use unique bounded scratch roots to
-avoid collisions; `N = 1` retains the legacy literal scratch names.
+avoid collisions; an effective width of `1` retains the legacy literal scratch
+names.
 `max_child_retries` defaults to `0` and may be set up to `2`; retries are only
 used for child report-shape failures such as missing or invalid report JSON or
 the wrong report id/role, and the retry prompt includes corrective feedback.
