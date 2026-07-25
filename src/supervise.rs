@@ -5058,29 +5058,75 @@ fn validate_orchestrator_assignment_collisions(
                     right_path.display()
                 );
             }
+            validate_cross_assignment_semantic_collisions(left, right)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_cross_assignment_semantic_collisions(
+    left: &OrchestratorAssignment,
+    right: &OrchestratorAssignment,
+) -> Result<()> {
+    let left_scopes = assignment_semantic_scopes(left);
+    let right_scopes = assignment_semantic_scopes(right);
+    for left_scope in &left_scopes {
+        for right_scope in &right_scopes {
             if let Some(symbol) =
-                first_shared_string(&left.semantic_symbols, &right.semantic_symbols)
+                first_shared_string(left_scope.semantic_symbols, right_scope.semantic_symbols)
             {
                 bail!(
-                    "assignments '{}' and '{}' overlap semantic symbol '{}' after normalization",
-                    left.id,
-                    right.id,
+                    "{} and {} overlap semantic symbol '{}' after normalization",
+                    left_scope.label,
+                    right_scope.label,
                     symbol
                 );
             }
             if let Some(module) =
-                first_shared_string(&left.semantic_modules, &right.semantic_modules)
+                first_shared_string(left_scope.semantic_modules, right_scope.semantic_modules)
             {
                 bail!(
-                    "assignments '{}' and '{}' overlap semantic module '{}' after normalization",
-                    left.id,
-                    right.id,
+                    "{} and {} overlap semantic module '{}' after normalization",
+                    left_scope.label,
+                    right_scope.label,
                     module
                 );
             }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentSemanticScope<'a> {
+    label: String,
+    semantic_symbols: &'a [String],
+    semantic_modules: &'a [String],
+}
+
+fn assignment_semantic_scopes(
+    assignment: &OrchestratorAssignment,
+) -> Vec<AssignmentSemanticScope<'_>> {
+    let mut scopes = Vec::with_capacity(assignment.worker_assignments.len().saturating_add(1));
+    scopes.push(AssignmentSemanticScope {
+        label: format!("assignment '{}'", assignment.id),
+        semantic_symbols: &assignment.semantic_symbols,
+        semantic_modules: &assignment.semantic_modules,
+    });
+    scopes.extend(
+        assignment
+            .worker_assignments
+            .iter()
+            .map(|worker| AssignmentSemanticScope {
+                label: format!(
+                    "worker '{}' under assignment '{}'",
+                    worker.id, assignment.id
+                ),
+                semantic_symbols: &worker.semantic_symbols,
+                semantic_modules: &worker.semantic_modules,
+            }),
+    );
+    scopes
 }
 
 fn first_shared_string<'a>(left: &'a [String], right: &[String]) -> Option<&'a str> {
@@ -10067,6 +10113,62 @@ mod tests {
             }),
         )
         .contains("overlaps worker"));
+    }
+
+    #[test]
+    fn supervisor_rejects_cross_assignment_worker_semantic_collisions() {
+        let collision_error = |left: Value, right: Value| {
+            let source = json!({
+                "version": 1,
+                "task": "cross assignment worker collision",
+                "max_depth": 2,
+                "max_child_assignments": 2,
+                "assignments": [left, right]
+            });
+            parse_supervisor_plan_with_consultant(
+                &serde_json::to_string(&source).expect("serialize cross assignment collision"),
+            )
+            .expect_err("cross assignment worker semantics must fail")
+            .to_string()
+        };
+        assert!(collision_error(
+            json!({
+                "id": "child-a",
+                "assigned_paths": ["src/a"],
+                "worker_assignments": [{
+                    "id": "worker-a",
+                    "assigned_paths": ["src/a/worker.rs"],
+                    "semantic_symbols": [" SharedSymbol "]
+                }]
+            }),
+            json!({
+                "id": "child-b",
+                "assigned_paths": ["src/b"],
+                "worker_assignments": [{
+                    "id": "worker-b",
+                    "assigned_paths": ["src/b/worker.rs"],
+                    "semantic_symbols": ["SharedSymbol"]
+                }]
+            }),
+        )
+        .contains("worker 'worker-a' under assignment 'child-a' and worker 'worker-b'"));
+        assert!(collision_error(
+            json!({
+                "id": "child-a",
+                "assigned_paths": ["src/a"],
+                "semantic_modules": [" crate::shared "]
+            }),
+            json!({
+                "id": "child-b",
+                "assigned_paths": ["src/b"],
+                "worker_assignments": [{
+                    "id": "worker-b",
+                    "assigned_paths": ["src/b/worker.rs"],
+                    "semantic_modules": ["crate::shared"]
+                }]
+            }),
+        )
+        .contains("assignment 'child-a' and worker 'worker-b'"));
     }
 
     #[test]
