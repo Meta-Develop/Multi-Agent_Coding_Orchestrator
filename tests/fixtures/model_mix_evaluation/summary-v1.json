@@ -72,17 +72,47 @@
       },
       "aggregate_cost_usd": 0.10997036,
       "mean_cost_usd": 0.03665678666666667,
-      "mean_wall_time_ms": 3977,
-      "mean_churn_count": 6,
-      "mean_conflict_count": 3,
-      "mean_loc_added": 211,
-      "mean_loc_deleted": 112,
-      "mean_diff_bytes": 12320,
+      "mean_wall_time_ms": {
+        "total": 1442455,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 18,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 635,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 338,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 36961,
+        "count": 3
+      },
       "mean_quality": {
-        "held_out_basis_points": 8726,
-        "breadth_basis_points": 10000,
-        "anti_shortcut_basis_points": 6666,
-        "overall_basis_points": 8529
+        "held_out_basis_points": {
+          "total": 26180,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 30000,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 19998,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 25589,
+          "count": 3
+        }
       },
       "pareto_optimal": true
     },
@@ -146,17 +176,47 @@
       },
       "aggregate_cost_usd": 0.17353475000000002,
       "mean_cost_usd": 0.05784491666666667,
-      "mean_wall_time_ms": 5809,
-      "mean_churn_count": 8,
-      "mean_conflict_count": 2,
-      "mean_loc_added": 286,
-      "mean_loc_deleted": 54,
-      "mean_diff_bytes": 13081,
+      "mean_wall_time_ms": {
+        "total": 1583102,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 25,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 6,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 859,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 164,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 39243,
+        "count": 3
+      },
       "mean_quality": {
-        "held_out_basis_points": 7959,
-        "breadth_basis_points": 10000,
-        "anti_shortcut_basis_points": 5000,
-        "overall_basis_points": 7729
+        "held_out_basis_points": {
+          "total": 23877,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 30000,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 15000,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 23188,
+          "count": 3
+        }
       },
       "pareto_optimal": false
     },
@@ -220,17 +280,47 @@
       },
       "aggregate_cost_usd": 0.22429235999999997,
       "mean_cost_usd": 0.07476411999999999,
-      "mean_wall_time_ms": 6737,
-      "mean_churn_count": 6,
-      "mean_conflict_count": 3,
-      "mean_loc_added": 181,
-      "mean_loc_deleted": 101,
-      "mean_diff_bytes": 11109,
+      "mean_wall_time_ms": {
+        "total": 1515474,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 20,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 544,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 303,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 33327,
+        "count": 3
+      },
       "mean_quality": {
-        "held_out_basis_points": 8565,
-        "breadth_basis_points": 8750,
-        "anti_shortcut_basis_points": 8333,
-        "overall_basis_points": 8553
+        "held_out_basis_points": {
+          "total": 25695,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 26250,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 24999,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 25659,
+          "count": 3
+        }
       },
       "pareto_optimal": true
     },
@@ -294,17 +384,47 @@
       },
       "aggregate_cost_usd": 0.24086288000000003,
       "mean_cost_usd": 0.08028762666666668,
-      "mean_wall_time_ms": 7329,
-      "mean_churn_count": 5,
-      "mean_conflict_count": 3,
-      "mean_loc_added": 419,
-      "mean_loc_deleted": 142,
-      "mean_diff_bytes": 21213,
+      "mean_wall_time_ms": {
+        "total": 2195314,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 15,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 1257,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 427,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 63640,
+        "count": 3
+      },
       "mean_quality": {
-        "held_out_basis_points": 7757,
-        "breadth_basis_points": 7500,
-        "anti_shortcut_basis_points": 5000,
-        "overall_basis_points": 7003
+        "held_out_basis_points": {
+          "total": 23271,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 22500,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 15000,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 21010,
+          "count": 3
+        }
       },
       "pareto_optimal": false
     }
@@ -313,18 +433,42 @@
     {
       "profile_id": "frontier-all-v1",
       "mean_cost_usd": 0.03665678666666667,
-      "quality_basis_points": 8529,
-      "held_out_basis_points": 8726,
-      "breadth_basis_points": 10000,
-      "anti_shortcut_basis_points": 6666
+      "quality_basis_points": {
+        "total": 25589,
+        "count": 3
+      },
+      "held_out_basis_points": {
+        "total": 26180,
+        "count": 3
+      },
+      "breadth_basis_points": {
+        "total": 30000,
+        "count": 3
+      },
+      "anti_shortcut_basis_points": {
+        "total": 19998,
+        "count": 3
+      }
     },
     {
       "profile_id": "balanced-all-v1",
       "mean_cost_usd": 0.07476411999999999,
-      "quality_basis_points": 8553,
-      "held_out_basis_points": 8565,
-      "breadth_basis_points": 8750,
-      "anti_shortcut_basis_points": 8333
+      "quality_basis_points": {
+        "total": 25659,
+        "count": 3
+      },
+      "held_out_basis_points": {
+        "total": 25695,
+        "count": 3
+      },
+      "breadth_basis_points": {
+        "total": 26250,
+        "count": 3
+      },
+      "anti_shortcut_basis_points": {
+        "total": 24999,
+        "count": 3
+      }
     }
   ]
 }

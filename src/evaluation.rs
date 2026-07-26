@@ -23,6 +23,7 @@ use thiserror::Error;
 pub const EVALUATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EVALUATION_REPETITIONS: u32 = 100;
+pub const MAX_EXECUTION_ERROR_EVIDENCE_BYTES: usize = 256;
 pub const COMMITTED_FIXTURE_FAKE_SEED: u64 = 26;
 pub const PROVISIONAL_FAKE_EVIDENCE_NOTICE: &str = "deterministic fake-provider evidence only; \
      not eligible to justify production model economics or a named default";
@@ -284,6 +285,71 @@ pub struct QualityScore {
     pub overall_basis_points: u32,
 }
 
+/// An exact arithmetic mean represented as a rational value.
+///
+/// JSON consumers can compare or render `total / count` without relying on lossy integer division
+/// or binary floating-point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreciseMean {
+    pub total: u64,
+    pub count: u32,
+}
+
+impl PreciseMean {
+    fn new(total: u64, count: u32) -> Result<Self, EvaluationError> {
+        if count == 0 {
+            return Err(invalid_results(
+                "profile_summaries",
+                "precise mean count must be greater than zero",
+            ));
+        }
+        Ok(Self { total, count })
+    }
+
+    fn cmp_value(&self, other: &Self) -> std::cmp::Ordering {
+        (u128::from(self.total) * u128::from(other.count))
+            .cmp(&(u128::from(other.total) * u128::from(self.count)))
+    }
+}
+
+/// Exact per-component mean quality over all repetitions, including unsuccessful ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreciseQualityScore {
+    pub held_out_basis_points: PreciseMean,
+    pub breadth_basis_points: PreciseMean,
+    pub anti_shortcut_basis_points: PreciseMean,
+    pub overall_basis_points: PreciseMean,
+}
+
+/// Outcome of one phase-A deterministic fake repetition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationExecutionOutcome {
+    Success,
+    Failure,
+    Timeout,
+}
+
+/// Bounded, synthetic error evidence for an unsuccessful repetition.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionErrorEvidence {
+    pub message: String,
+    /// True when the producer omitted trailing detail to satisfy the schema's byte bound.
+    pub truncated: bool,
+}
+
+/// Observable execution state retained for every repetition, successful or otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepetitionExecution {
+    pub observed_dispatch_count: u32,
+    pub outcome: EvaluationExecutionOutcome,
+    pub error_evidence: Option<ExecutionErrorEvidence>,
+}
+
 /// Complete observation for one profile repetition.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -312,6 +378,7 @@ pub struct EvaluationRepetitionResult {
     pub repetition: u32,
     pub comparability_digest: String,
     pub isolated_state: IsolatedRunState,
+    pub execution: RepetitionExecution,
     pub metrics: EvaluationMetrics,
 }
 
@@ -328,13 +395,13 @@ pub struct ProfileSummary {
     pub aggregate_usage: Usage,
     pub aggregate_cost_usd: f64,
     pub mean_cost_usd: f64,
-    pub mean_wall_time_ms: u64,
-    pub mean_churn_count: u64,
-    pub mean_conflict_count: u64,
-    pub mean_loc_added: u64,
-    pub mean_loc_deleted: u64,
-    pub mean_diff_bytes: u64,
-    pub mean_quality: QualityScore,
+    pub mean_wall_time_ms: PreciseMean,
+    pub mean_churn_count: PreciseMean,
+    pub mean_conflict_count: PreciseMean,
+    pub mean_loc_added: PreciseMean,
+    pub mean_loc_deleted: PreciseMean,
+    pub mean_diff_bytes: PreciseMean,
+    pub mean_quality: PreciseQualityScore,
     pub pareto_optimal: bool,
 }
 
@@ -344,10 +411,10 @@ pub struct ProfileSummary {
 pub struct ParetoPoint {
     pub profile_id: String,
     pub mean_cost_usd: f64,
-    pub quality_basis_points: u32,
-    pub held_out_basis_points: u32,
-    pub breadth_basis_points: u32,
-    pub anti_shortcut_basis_points: u32,
+    pub quality_basis_points: PreciseMean,
+    pub held_out_basis_points: PreciseMean,
+    pub breadth_basis_points: PreciseMean,
+    pub anti_shortcut_basis_points: PreciseMean,
 }
 
 /// Versioned, machine-readable result schema.
@@ -614,7 +681,8 @@ pub fn run_deterministic_fake(
     for profile in &manifest.profiles {
         let profile_fingerprint = profile_fingerprint(profile);
         for repetition in 0..manifest.repetitions {
-            let metrics = fake_metrics(manifest, profile, &profile_fingerprint, repetition, seed)?;
+            let (execution, metrics) =
+                fake_metrics(manifest, profile, &profile_fingerprint, repetition, seed)?;
             runs.push(EvaluationRepetitionResult {
                 profile_id: profile.id.clone(),
                 repetition,
@@ -629,6 +697,7 @@ pub fn run_deterministic_fake(
                     ),
                     starting_state_fingerprint: starting_state_fingerprint.clone(),
                 },
+                execution,
                 metrics,
             });
         }
@@ -788,6 +857,12 @@ pub fn validate_run_comparability(
                 ),
             ));
         }
+        validate_execution(
+            manifest,
+            &run.execution,
+            run.metrics.wall_time_ms,
+            run_index,
+        )?;
         validate_metrics(manifest, profile, &run.metrics, run_index)?;
     }
 
@@ -803,6 +878,64 @@ pub fn validate_run_comparability(
             "pareto_frontier",
             "frontier does not match cost-versus-quality dominance over profile summaries",
         ));
+    }
+    Ok(())
+}
+
+fn validate_execution(
+    manifest: &EvaluationManifest,
+    execution: &RepetitionExecution,
+    wall_time_ms: u64,
+    run_index: usize,
+) -> Result<(), EvaluationError> {
+    let field = |suffix: &str| format!("runs[{run_index}].execution.{suffix}");
+    if execution.observed_dispatch_count > manifest.limits.max_dispatches {
+        return Err(invalid_results(
+            field("observed_dispatch_count"),
+            format!(
+                "exceeds manifest limit {}; observed {}",
+                manifest.limits.max_dispatches, execution.observed_dispatch_count
+            ),
+        ));
+    }
+
+    let wall_time_limit_ms = evaluation_wall_time_limit_ms(manifest)?;
+    if wall_time_ms > wall_time_limit_ms {
+        return Err(invalid_results(
+            format!("runs[{run_index}].metrics.wall_time_ms"),
+            format!("exceeds manifest limit {wall_time_limit_ms} ms; observed {wall_time_ms} ms"),
+        ));
+    }
+
+    match (execution.outcome, &execution.error_evidence) {
+        (EvaluationExecutionOutcome::Success, None) => {}
+        (EvaluationExecutionOutcome::Success, Some(_)) => {
+            return Err(invalid_results(
+                field("error_evidence"),
+                "must be absent when outcome is success",
+            ));
+        }
+        (EvaluationExecutionOutcome::Failure | EvaluationExecutionOutcome::Timeout, None) => {
+            return Err(invalid_results(
+                field("error_evidence"),
+                "is required when outcome is failure or timeout",
+            ));
+        }
+        (
+            EvaluationExecutionOutcome::Failure | EvaluationExecutionOutcome::Timeout,
+            Some(error),
+        ) => {
+            require_result_nonempty(&field("error_evidence.message"), &error.message)?;
+            if error.message.len() > MAX_EXECUTION_ERROR_EVIDENCE_BYTES {
+                return Err(invalid_results(
+                    field("error_evidence.message"),
+                    format!(
+                        "must be at most {MAX_EXECUTION_ERROR_EVIDENCE_BYTES} UTF-8 bytes; got {}",
+                        error.message.len()
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -940,7 +1073,7 @@ fn fake_metrics(
     profile_fingerprint: &str,
     repetition: u32,
     seed: u64,
-) -> Result<EvaluationMetrics, EvaluationError> {
+) -> Result<(RepetitionExecution, EvaluationMetrics), EvaluationError> {
     let run_material = format!(
         "{}:{}:{}:{}",
         manifest.target.spec_or_goal_digest,
@@ -949,6 +1082,36 @@ fn fake_metrics(
         repetition
     );
     let run_hash = stable_hash(seed, run_material.as_bytes());
+    let outcome = match repetition % 3 {
+        0 => EvaluationExecutionOutcome::Success,
+        1 => EvaluationExecutionOutcome::Failure,
+        _ => EvaluationExecutionOutcome::Timeout,
+    };
+    let observed_dispatch_count =
+        1 + ((run_hash >> 41) % u64::from(manifest.limits.max_dispatches)) as u32;
+    let error_evidence = match outcome {
+        EvaluationExecutionOutcome::Success => None,
+        EvaluationExecutionOutcome::Failure => Some(ExecutionErrorEvidence {
+            message: "deterministic fake repetition reported a synthetic failure".to_string(),
+            truncated: false,
+        }),
+        EvaluationExecutionOutcome::Timeout => Some(ExecutionErrorEvidence {
+            message: "deterministic fake repetition reached its synthetic timeout".to_string(),
+            truncated: false,
+        }),
+    };
+    let wall_time_limit_ms = evaluation_wall_time_limit_ms(manifest)?;
+    let wall_time_ms = match outcome {
+        EvaluationExecutionOutcome::Timeout => wall_time_limit_ms,
+        EvaluationExecutionOutcome::Success | EvaluationExecutionOutcome::Failure => {
+            1 + ((run_hash >> 5) % wall_time_limit_ms)
+        }
+    };
+    let execution = RepetitionExecution {
+        observed_dispatch_count,
+        outcome,
+        error_evidence,
+    };
     let mut role_usage = BTreeMap::new();
     let mut total_usage = Usage::default();
     let mut total_cost_usd = 0.0;
@@ -1070,20 +1233,23 @@ fn fake_metrics(
         .and_then(|value| value.checked_add((run_hash >> 29) % 997))
         .ok_or_else(|| overflow("fake diff bytes"))?;
 
-    Ok(EvaluationMetrics {
-        role_usage,
-        total_usage,
-        total_cost_usd,
-        wall_time_ms: 1_000 + ((run_hash >> 5) % 9_001),
-        churn_count: 1 + ((run_hash >> 13) % 12),
-        conflict_count: (run_hash >> 19) % 4,
-        loc_added,
-        loc_deleted,
-        diff_bytes,
-        held_out_validation,
-        review,
-        quality,
-    })
+    Ok((
+        execution,
+        EvaluationMetrics {
+            role_usage,
+            total_usage,
+            total_cost_usd,
+            wall_time_ms,
+            churn_count: 1 + ((run_hash >> 13) % 12),
+            conflict_count: (run_hash >> 19) % 4,
+            loc_added,
+            loc_deleted,
+            diff_bytes,
+            held_out_validation,
+            review,
+            quality,
+        },
+    ))
 }
 
 fn validate_metrics(
@@ -1441,7 +1607,6 @@ fn summarize_profiles(
             )?;
         }
         require_finite_nonnegative("profile_summaries.aggregate_cost_usd", aggregate_cost_usd)?;
-        let repetitions_u64 = u64::from(manifest.repetitions);
         let repetitions_f64 = f64::from(manifest.repetitions);
         summaries.push(ProfileSummary {
             profile_id: profile.id.clone(),
@@ -1450,20 +1615,20 @@ fn summarize_profiles(
             aggregate_usage,
             aggregate_cost_usd,
             mean_cost_usd: aggregate_cost_usd / repetitions_f64,
-            mean_wall_time_ms: wall_time_ms / repetitions_u64,
-            mean_churn_count: churn_count / repetitions_u64,
-            mean_conflict_count: conflict_count / repetitions_u64,
-            mean_loc_added: loc_added / repetitions_u64,
-            mean_loc_deleted: loc_deleted / repetitions_u64,
-            mean_diff_bytes: diff_bytes / repetitions_u64,
-            mean_quality: QualityScore {
-                held_out_basis_points: average_basis_points(held_out_quality, repetitions_u64)?,
-                breadth_basis_points: average_basis_points(breadth_quality, repetitions_u64)?,
-                anti_shortcut_basis_points: average_basis_points(
+            mean_wall_time_ms: PreciseMean::new(wall_time_ms, manifest.repetitions)?,
+            mean_churn_count: PreciseMean::new(churn_count, manifest.repetitions)?,
+            mean_conflict_count: PreciseMean::new(conflict_count, manifest.repetitions)?,
+            mean_loc_added: PreciseMean::new(loc_added, manifest.repetitions)?,
+            mean_loc_deleted: PreciseMean::new(loc_deleted, manifest.repetitions)?,
+            mean_diff_bytes: PreciseMean::new(diff_bytes, manifest.repetitions)?,
+            mean_quality: PreciseQualityScore {
+                held_out_basis_points: PreciseMean::new(held_out_quality, manifest.repetitions)?,
+                breadth_basis_points: PreciseMean::new(breadth_quality, manifest.repetitions)?,
+                anti_shortcut_basis_points: PreciseMean::new(
                     anti_shortcut_quality,
-                    repetitions_u64,
+                    manifest.repetitions,
                 )?,
-                overall_basis_points: average_basis_points(overall_quality, repetitions_u64)?,
+                overall_basis_points: PreciseMean::new(overall_quality, manifest.repetitions)?,
             },
             pareto_optimal: false,
         });
@@ -1490,7 +1655,11 @@ fn summarize_profiles(
     frontier.sort_by(|left, right| {
         left.mean_cost_usd
             .total_cmp(&right.mean_cost_usd)
-            .then_with(|| right.quality_basis_points.cmp(&left.quality_basis_points))
+            .then_with(|| {
+                right
+                    .quality_basis_points
+                    .cmp_value(&left.quality_basis_points)
+            })
             .then_with(|| left.profile_id.cmp(&right.profile_id))
     });
     Ok((summaries, frontier))
@@ -1498,10 +1667,12 @@ fn summarize_profiles(
 
 fn dominates(candidate: &ProfileSummary, other: &ProfileSummary) -> bool {
     let no_more_expensive = candidate.mean_cost_usd <= other.mean_cost_usd;
-    let no_lower_quality =
-        candidate.mean_quality.overall_basis_points >= other.mean_quality.overall_basis_points;
-    let strictly_better = candidate.mean_cost_usd < other.mean_cost_usd
-        || candidate.mean_quality.overall_basis_points > other.mean_quality.overall_basis_points;
+    let quality_order = candidate
+        .mean_quality
+        .overall_basis_points
+        .cmp_value(&other.mean_quality.overall_basis_points);
+    let no_lower_quality = quality_order.is_ge();
+    let strictly_better = candidate.mean_cost_usd < other.mean_cost_usd || quality_order.is_gt();
     no_more_expensive && no_lower_quality && strictly_better
 }
 
@@ -1571,11 +1742,6 @@ fn pareto_frontiers_equivalent(left: &[ParetoPoint], right: &[ParetoPoint]) -> b
         })
 }
 
-fn average_basis_points(total: u64, count: u64) -> Result<u32, EvaluationError> {
-    let average = total / count;
-    u32::try_from(average).map_err(|_| overflow("mean quality basis points"))
-}
-
 fn validate_usage(usage: Usage, field: &str) -> Result<(), EvaluationError> {
     let expected = usage
         .input_tokens
@@ -1624,6 +1790,14 @@ fn checked_add_u64(
 ) -> Result<u64, EvaluationError> {
     let context = context.into();
     left.checked_add(right).ok_or_else(|| overflow(context))
+}
+
+fn evaluation_wall_time_limit_ms(manifest: &EvaluationManifest) -> Result<u64, EvaluationError> {
+    manifest
+        .limits
+        .wall_time_seconds
+        .checked_mul(1_000)
+        .ok_or_else(|| overflow("manifest wall-time limit in milliseconds"))
 }
 
 fn ratio_basis_points(passed: u64, total: u64) -> u32 {
@@ -1881,6 +2055,27 @@ mod tests {
         serde_json::from_str(FIXTURE_SUMMARY).expect("deserialize committed evaluation summary")
     }
 
+    fn precise_quality(score: QualityScore) -> PreciseQualityScore {
+        PreciseQualityScore {
+            held_out_basis_points: PreciseMean {
+                total: u64::from(score.held_out_basis_points),
+                count: 1,
+            },
+            breadth_basis_points: PreciseMean {
+                total: u64::from(score.breadth_basis_points),
+                count: 1,
+            },
+            anti_shortcut_basis_points: PreciseMean {
+                total: u64::from(score.anti_shortcut_basis_points),
+                count: 1,
+            },
+            overall_basis_points: PreciseMean {
+                total: u64::from(score.overall_basis_points),
+                count: 1,
+            },
+        }
+    }
+
     #[test]
     fn committed_fixtures_match_the_deterministic_harness() {
         let manifest = committed_manifest();
@@ -1993,10 +2188,10 @@ mod tests {
 
         assert!(!results.pareto_frontier.is_empty());
         assert!(results.pareto_frontier.iter().all(|point| {
-            point.quality_basis_points > 0
-                && point.held_out_basis_points > 0
-                && point.breadth_basis_points > 0
-                && point.anti_shortcut_basis_points > 0
+            point.quality_basis_points.total > 0
+                && point.held_out_basis_points.total > 0
+                && point.breadth_basis_points.total > 0
+                && point.anti_shortcut_basis_points.total > 0
         }));
         let frontier_profiles = results
             .pareto_frontier
@@ -2110,6 +2305,182 @@ mod tests {
         first
             .validate_against(&manifest)
             .expect("generated results remain comparable");
+    }
+
+    #[test]
+    fn deterministic_fake_retains_all_outcomes_and_obeys_execution_limits() {
+        let mut manifest = manifest();
+        manifest.limits = EvaluationLimits {
+            wall_time_seconds: 1,
+            max_dispatches: 1,
+        };
+        let results = run_deterministic_fake(&manifest, 31).expect("bounded fake results");
+
+        assert_eq!(
+            results.runs.len(),
+            manifest.profiles.len() * manifest.repetitions as usize
+        );
+        let outcomes = results
+            .runs
+            .iter()
+            .map(|run| run.execution.outcome)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            outcomes,
+            BTreeSet::from([
+                EvaluationExecutionOutcome::Success,
+                EvaluationExecutionOutcome::Failure,
+                EvaluationExecutionOutcome::Timeout,
+            ])
+        );
+        assert_eq!(
+            results
+                .runs
+                .iter()
+                .filter(|run| run.execution.outcome != EvaluationExecutionOutcome::Success)
+                .count(),
+            manifest.profiles.len() * 2
+        );
+
+        for run in &results.runs {
+            assert!(run.execution.observed_dispatch_count <= manifest.limits.max_dispatches);
+            assert!(run.metrics.wall_time_ms <= manifest.limits.wall_time_seconds * 1_000);
+            match run.execution.outcome {
+                EvaluationExecutionOutcome::Success => {
+                    assert!(run.execution.error_evidence.is_none());
+                }
+                EvaluationExecutionOutcome::Failure | EvaluationExecutionOutcome::Timeout => {
+                    let error = run
+                        .execution
+                        .error_evidence
+                        .as_ref()
+                        .expect("unsuccessful fake run retains bounded error evidence");
+                    assert!(!error.message.trim().is_empty());
+                    assert!(error.message.len() <= MAX_EXECUTION_ERROR_EVIDENCE_BYTES);
+                }
+            }
+        }
+        assert!(results
+            .profile_summaries
+            .iter()
+            .all(|summary| summary.repetitions == manifest.repetitions));
+        results
+            .validate_against(&manifest)
+            .expect("successes and retained unsuccessful runs validate together");
+    }
+
+    #[test]
+    fn execution_validation_enforces_limits_and_bounded_outcome_evidence() {
+        let manifest = manifest();
+
+        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        results.runs[0].execution.observed_dispatch_count = manifest.limits.max_dispatches + 1;
+        let error = results
+            .validate_against(&manifest)
+            .expect_err("dispatch limit must be enforced");
+        assert!(error.to_string().contains("exceeds manifest limit"));
+        assert!(error.to_string().contains("observed_dispatch_count"));
+
+        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        results.runs[0].metrics.wall_time_ms = manifest.limits.wall_time_seconds * 1_000 + 1;
+        let error = results
+            .validate_against(&manifest)
+            .expect_err("wall-time limit must be enforced");
+        assert!(error.to_string().contains("exceeds manifest limit"));
+        assert!(error.to_string().contains("wall_time_ms"));
+
+        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let failed = results
+            .runs
+            .iter_mut()
+            .find(|run| run.execution.outcome == EvaluationExecutionOutcome::Failure)
+            .expect("fake failure");
+        failed.execution.error_evidence = None;
+        let error = results
+            .validate_against(&manifest)
+            .expect_err("failure evidence is required");
+        assert!(error
+            .to_string()
+            .contains("required when outcome is failure"));
+
+        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let successful = results
+            .runs
+            .iter_mut()
+            .find(|run| run.execution.outcome == EvaluationExecutionOutcome::Success)
+            .expect("fake success");
+        successful.execution.error_evidence = Some(ExecutionErrorEvidence {
+            message: "unexpected evidence".to_string(),
+            truncated: false,
+        });
+        let error = results
+            .validate_against(&manifest)
+            .expect_err("success cannot carry error evidence");
+        assert!(error.to_string().contains("must be absent"));
+
+        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let timed_out = results
+            .runs
+            .iter_mut()
+            .find(|run| run.execution.outcome == EvaluationExecutionOutcome::Timeout)
+            .expect("fake timeout");
+        timed_out
+            .execution
+            .error_evidence
+            .as_mut()
+            .expect("timeout evidence")
+            .message = "x".repeat(MAX_EXECUTION_ERROR_EVIDENCE_BYTES + 1);
+        let error = results
+            .validate_against(&manifest)
+            .expect_err("oversized error evidence must fail closed");
+        assert!(error
+            .to_string()
+            .contains("must be at most 256 UTF-8 bytes"));
+    }
+
+    #[test]
+    fn precise_profile_means_retain_non_divisible_totals() {
+        let manifest = manifest();
+        let mut results = run_deterministic_fake(&manifest, 41).expect("fake results");
+        let profile_id = manifest.profiles[0].id.as_str();
+        for (index, run) in results
+            .runs
+            .iter_mut()
+            .filter(|run| run.profile_id == profile_id)
+            .enumerate()
+        {
+            let value = if index == 0 { 1 } else { 2 };
+            run.metrics.wall_time_ms = value;
+            run.metrics.churn_count = value;
+            run.metrics.conflict_count = value;
+            run.metrics.loc_added = value;
+            run.metrics.loc_deleted = value;
+            run.metrics.diff_bytes = value;
+            run.metrics.quality = QualityScore {
+                held_out_basis_points: value as u32,
+                breadth_basis_points: value as u32,
+                anti_shortcut_basis_points: value as u32,
+                overall_basis_points: value as u32,
+            };
+        }
+
+        let (summaries, _) =
+            summarize_profiles(&manifest, &results.runs).expect("summarize exact totals");
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.profile_id == profile_id)
+            .expect("profile summary");
+        let five_thirds = PreciseMean { total: 5, count: 3 };
+        assert_eq!(summary.mean_wall_time_ms, five_thirds);
+        assert_eq!(summary.mean_churn_count, five_thirds);
+        assert_eq!(summary.mean_conflict_count, five_thirds);
+        assert_eq!(summary.mean_loc_added, five_thirds);
+        assert_eq!(summary.mean_loc_deleted, five_thirds);
+        assert_eq!(summary.mean_diff_bytes, five_thirds);
+        assert_eq!(summary.mean_quality.held_out_basis_points, five_thirds);
+        assert_eq!(summary.mean_quality.breadth_basis_points, five_thirds);
+        assert_eq!(summary.mean_quality.anti_shortcut_basis_points, five_thirds);
+        assert_eq!(summary.mean_quality.overall_basis_points, five_thirds);
     }
 
     #[test]
@@ -2387,12 +2758,15 @@ mod tests {
         let results = run_deterministic_fake(&manifest(), 23).expect("fake results");
         let mut high_quality = results.profile_summaries[0].clone();
         high_quality.mean_cost_usd = 1.0;
-        high_quality.mean_loc_added = 1_000;
-        high_quality.mean_quality = full_quality;
+        high_quality.mean_loc_added = PreciseMean {
+            total: 1_000,
+            count: 1,
+        };
+        high_quality.mean_quality = precise_quality(full_quality);
         let mut shortcut = results.profile_summaries[1].clone();
         shortcut.mean_cost_usd = 1.0;
-        shortcut.mean_loc_added = 1;
-        shortcut.mean_quality = shortcut_quality;
+        shortcut.mean_loc_added = PreciseMean { total: 1, count: 1 };
+        shortcut.mean_quality = precise_quality(shortcut_quality);
 
         assert!(dominates(&high_quality, &shortcut));
         assert!(!dominates(&shortcut, &high_quality));

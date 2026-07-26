@@ -830,15 +830,21 @@ The version-1 fixture set contains:
   base commit, plan digest, wall-time and dispatch limits, held-out commands,
   three repetitions, and every complete role/model profile;
 - `runs-v1.json`, a strict `EvaluationResults` snapshot generated with fake
-  seed 26. Its 12 isolated runs cover four profiles and record per-role and
-  total tokens/cost, wall time, churn, conflicts, added/deleted lines, diff
-  bytes, held-out results, review findings, and separate breadth and
-  anti-shortcut scores; and
+  seed 26. Its 12 isolated runs cover four profiles and retain deterministic
+  fake success, failure, and timeout outcomes. Every repetition records its
+  observed dispatch count, bounded synthetic error evidence when unsuccessful,
+  per-role and total tokens/cost, wall time, churn, conflicts, added/deleted
+  lines, diff bytes, held-out results, review findings, and separate breadth
+  and anti-shortcut scores. Result validation rejects dispatch or wall-time
+  observations above the manifest limits and rejects missing, unexpected, or
+  over-256-byte execution error evidence; and
 - `summary-v1.json`, a strict `EvaluationSummary` projection containing the
   validated aggregates and cost-versus-quality Pareto frontier. The Pareto
   quality axis retains held-out validation, breadth, and anti-shortcut
   components, so test pass rate, LOC, or low cost alone cannot stand in for
-  quality.
+  quality. Integral metric and quality means are exact machine-readable
+  rationals with `total` and `count` fields, including when the total is not
+  divisible by the number of repetitions.
 
 Validate the typed fixture contract and exact deterministic snapshot without
 running a supervisor, provider, or held-out command:
@@ -858,14 +864,18 @@ Real-provider experiments are a strict future opt-in boundary. A future runner
 must require an explicit operator choice of provider and models, obtain
 credentials outside committed fixtures, start every repetition from a freshly
 verified equivalent isolated state, retain failures rather than filtering them,
-and write new evidence without replacing phase-A fixtures. Merely having
-credentials or real-looking model labels must never opt in.
+and write new evidence without replacing phase-A fixtures. The v1 phase-A
+schema and fake harness exercise unsuccessful-result retention and bounded
+limit/outcome observability only; they do not execute Issue #22 or a real
+provider. Merely having credentials or real-looking model labels must never opt
+in.
 
 Phase B remains required: once the Issue #22 path is available, one command
 must rerun every profile and repetition from the bound goal and base through
-goal-to-integration, enforce the same limits and held-out grading contract, and
-emit schema-compatible run and Pareto results without replacing these phase-A
-fixtures. The phase-A fixtures do not claim that command exists.
+goal-to-integration, use the v1 outcome and observed-dispatch fields, enforce
+the same limits and held-out grading contract, and emit schema-compatible run
+and Pareto results without replacing these phase-A fixtures. The phase-A
+fixtures do not claim that command exists.
 Gate-policy/classifier corpus experiments remain separate and depend on the
 Issue #28 production broker path.
 
