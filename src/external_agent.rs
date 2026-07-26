@@ -1311,6 +1311,7 @@ struct ProtectedWorktreeControls {
     read_only_files: Vec<ProtectedWorktreeControl>,
     read_write_roots: Vec<ProtectedWorktreeControl>,
     read_write_files: Vec<ProtectedWorktreeControl>,
+    writable_artifact_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1331,7 +1332,10 @@ impl ProtectedWorktreeControls {
 }
 
 fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedWorktreeControls> {
-    protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)
+    let mut controls =
+        protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)?;
+    controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
+    Ok(controls)
 }
 
 fn protected_worktree_controls_for(
@@ -1348,6 +1352,7 @@ fn protected_worktree_controls_for(
         workspace,
         Path::new(".git"),
         SandboxDenialRetryability::NotRetryable,
+        true,
         &mut controls,
     )?;
     for relative in PERMANENT_CONTROL_ROOTS {
@@ -1355,6 +1360,7 @@ fn protected_worktree_controls_for(
             workspace,
             Path::new(relative),
             SandboxDenialRetryability::NotRetryable,
+            true,
             &mut controls,
         )?;
     }
@@ -1363,6 +1369,7 @@ fn protected_worktree_controls_for(
             workspace,
             Path::new(relative),
             SandboxDenialRetryability::RequiresDeclaredException,
+            true,
             &mut controls,
         )?;
     }
@@ -1371,6 +1378,7 @@ fn protected_worktree_controls_for(
             workspace,
             Path::new(relative),
             SandboxDenialRetryability::RequiresDeclaredException,
+            false,
             &mut controls,
         )?;
     }
@@ -1418,21 +1426,32 @@ fn collect_protected_control(
     workspace: &Path,
     relative: &Path,
     retryability: SandboxDenialRetryability,
+    required: bool,
     controls: &mut ProtectedWorktreeControls,
 ) -> Result<()> {
     let path = workspace.join(relative);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "mandatory protected worktree control is absent: {}",
+                relative.display()
+            );
+        }
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect worktree control {}", path.display()));
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect protected worktree control {}",
+                    relative.display()
+                )
+            });
         }
     };
     if metadata.file_type().is_symlink() {
         bail!(
             "protected worktree control may not be a symlink: {}",
-            path.display()
+            relative.display()
         );
     }
     let control = ProtectedWorktreeControl {
@@ -1447,10 +1466,46 @@ fn collect_protected_control(
     } else {
         bail!(
             "protected worktree control is not a regular file or directory: {}",
-            control.absolute.display()
+            control.relative.display()
         );
     }
     Ok(())
+}
+
+fn validate_artifact_parent_disjoint(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Result<PathBuf> {
+    let parent = normalized_absolute_path(
+        required_parent(&spec.output_last_message)?,
+        "external-agent output parent",
+    )?;
+    for control in controls.iter() {
+        let protected = normalized_absolute_path(&control.absolute, "protected worktree control")?;
+        if parent.starts_with(&protected) || protected.starts_with(&parent) {
+            bail!("external-agent output parent overlaps a protected worktree control");
+        }
+    }
+    Ok(parent)
+}
+
+fn normalized_absolute_path(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("{label} must be absolute");
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                bail!("{label} must already be normalized");
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 fn normalize_control_exception(path: &Path) -> Result<PathBuf> {
@@ -1591,8 +1646,12 @@ fn external_side_effect_profile(
         .parent()
         .with_context(|| format!("executable has no parent: {}", program.display()))?;
     // The parent tee owns and holds `json_log`; the child never needs that directory writable.
-    // Only the isolated incoming final-message directory is exposed as a child artifact root.
-    let artifact_roots = [required_parent(&spec.output_last_message)?];
+    // Only the validated, disjoint incoming final-message directory is exposed as a child
+    // artifact root.
+    let artifact_root = protected_controls
+        .writable_artifact_root
+        .as_ref()
+        .context("external-agent output parent was not validated against protected controls")?;
     match spec.invocation {
         ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant => {
             let mut profile = match spec.workspace_access {
@@ -1618,9 +1677,7 @@ fn external_side_effect_profile(
             if let Some(schema) = &spec.output_schema {
                 profile = profile.with_visible_read_only_file(schema);
             }
-            for root in artifact_roots {
-                profile = profile.with_writable_artifact_root(root);
-            }
+            profile = profile.with_writable_artifact_root(artifact_root);
             for root in &spec.hidden_roots {
                 profile = profile.with_hidden_root(root);
             }
@@ -1907,7 +1964,13 @@ fn append_external_error(existing: Option<String>, next: Option<String>) -> Opti
 
 #[cfg(test)]
 pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
-    let controls = protected_worktree_controls(spec).unwrap_or_default();
+    let controls = protected_worktree_controls(spec).unwrap_or_else(|_| {
+        let mut controls = ProtectedWorktreeControls::default();
+        controls.writable_artifact_root = required_parent(&spec.output_last_message)
+            .ok()
+            .map(PathBuf::from);
+        controls
+    });
     command_argv_with_controls(spec, &controls)
 }
 
@@ -2038,11 +2101,7 @@ fn codex_filesystem_permissions(
             path_permissions.insert(relative.to_string(), "write");
         }
     }
-    if let Some(parent) = spec
-        .output_last_message
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
+    if let Some(parent) = &controls.writable_artifact_root {
         let permission_path = parent
             .strip_prefix(&spec.cwd)
             .ok()
@@ -2290,6 +2349,15 @@ mod tests {
     use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
     use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
 
+    fn create_mandatory_control_roots(workspace: &Path) -> Result<()> {
+        fs::create_dir_all(workspace)?;
+        fs::create_dir_all(workspace.join(".git"))?;
+        for root in PERMANENT_CONTROL_ROOTS.iter().chain(POLICY_CONTROL_ROOTS) {
+            fs::create_dir_all(workspace.join(root))?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
         let command = ExternalAgentCommand::codex(
@@ -2483,6 +2551,7 @@ mod tests {
         let child_repo = temp.path().join("child-worktree");
         git2::Repository::init(&supervisor_repo)?;
         git2::Repository::init(&child_repo)?;
+        create_mandatory_control_roots(&child_repo)?;
 
         let provider = child_repo.join("fake-provider.sh");
         fs::write(
@@ -2564,6 +2633,7 @@ mod tests {
         use std::process::ExitStatus;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let incoming = temp.path().join("incoming");
         fs::create_dir(&incoming)?;
         fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
@@ -2720,6 +2790,95 @@ mod tests {
     }
 
     #[test]
+    fn mandatory_controls_must_exist_while_policy_files_remain_optional() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for missing in [".git", ".maco", ".maco-cache", ".codex", ".agents"] {
+            let workspace = temp.path().join(missing.trim_start_matches('.'));
+            create_mandatory_control_roots(&workspace)?;
+            fs::remove_dir(workspace.join(missing))?;
+
+            let error = protected_worktree_controls_for(&workspace, &[])
+                .expect_err("missing mandatory control must fail closed");
+            let message = error.to_string();
+            assert!(message.contains(missing), "unexpected error: {message}");
+            assert!(!message.contains(&workspace.display().to_string()));
+            assert!(message.len() < 256);
+        }
+
+        let workspace = temp.path().join("optional-policy-files");
+        create_mandatory_control_roots(&workspace)?;
+        let controls = protected_worktree_controls_for(&workspace, &[])?;
+        assert!(controls.iter().all(|control| {
+            !POLICY_CONTROL_FILES
+                .iter()
+                .any(|policy| control.relative == Path::new(policy))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_parent_rejects_protected_overlap_and_allows_incoming() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        create_mandatory_control_roots(&workspace)?;
+        fs::write(workspace.join(".cursorignore"), "ignored\n")?;
+        let incoming = workspace.join("incoming");
+        fs::create_dir(&incoming)?;
+
+        for output in [
+            workspace.join(".git/report.json"),
+            workspace.join(".maco/report.json"),
+            workspace.join(".maco/nested/report.json"),
+            workspace.join(".maco-cache/report.json"),
+            workspace.join(".codex/report.json"),
+            workspace.join(".agents/report.json"),
+            workspace.join(".agents/docs/report.json"),
+            workspace.join(".cursorignore/report.json"),
+            workspace.join("report.json"),
+        ] {
+            let command = ExternalAgentCommand::codex(
+                "codex",
+                &workspace,
+                workspace.join("prompt.md"),
+                workspace.join("events.jsonl"),
+                output,
+                Duration::from_secs(1),
+            );
+            let error = protected_worktree_controls(&command)
+                .expect_err("protected artifact overlap must fail closed");
+            let message = error.to_string();
+            assert_eq!(
+                message,
+                "external-agent output parent overlaps a protected worktree control"
+            );
+            assert!(!message.contains(&workspace.display().to_string()));
+        }
+
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        );
+        let controls = protected_worktree_controls(&command)?;
+        let permissions = codex_filesystem_permissions(&command, &controls);
+        assert!(permissions.contains("\"incoming\"=\"write\""));
+        let profile = external_side_effect_profile(
+            &command,
+            &workspace.join("codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+            bail!("expected external Codex profile");
+        };
+        assert_eq!(profile.writable_artifact_roots(), &[incoming]);
+        Ok(())
+    }
+
+    #[test]
     fn protected_worktree_controls_use_exact_descendant_exceptions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
@@ -2864,6 +3023,7 @@ mod tests {
     fn policy_controls_include_non_git_ignores_and_construct_deterministically() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
+        create_mandatory_control_roots(&workspace)?;
         fs::create_dir_all(workspace.join(".agents/docs"))?;
         fs::write(workspace.join(".agents/docs/policy.md"), "policy\n")?;
         fs::write(workspace.join(".cursorignore"), "ignored\n")?;
@@ -2911,7 +3071,7 @@ mod tests {
     fn structured_failed_command_denials_are_typed_deduplicated_and_redacted() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
-        fs::create_dir(&workspace)?;
+        create_mandatory_control_roots(&workspace)?;
         fs::write(workspace.join("AGENTS.md"), "policy\n")?;
         let command = ExternalAgentCommand::codex(
             "codex",
@@ -3091,7 +3251,7 @@ mod tests {
     fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
-        fs::create_dir(&workspace)?;
+        create_mandatory_control_roots(&workspace)?;
         let container = temp.path().join("run");
         let trusted = container.join("trusted");
         let incoming = container.join("incoming");
@@ -3258,6 +3418,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let marker = temp.path().join("must-not-run");
         let agent = temp.path().join("fake-agent.sh");
         fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
@@ -3266,12 +3427,14 @@ mod tests {
         fs::set_permissions(&agent, permissions)?;
         let prompt = temp.path().join("prompt.txt");
         fs::write(&prompt, "do not start\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
         let spec = ExternalAgentCommand::codex(
             agent,
             temp.path(),
             &prompt,
             temp.path().join("events.jsonl"),
-            temp.path().join("last-message.txt"),
+            incoming.join("last-message.txt"),
             Duration::ZERO,
         );
 
@@ -3294,6 +3457,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let marker = temp.path().join("actual-target-ran");
         let agent = temp.path().join("custom-codex.sh");
         fs::write(
@@ -3306,12 +3470,14 @@ mod tests {
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
         let prompt = temp.path().join("prompt.txt");
         fs::write(&prompt, "never run custom target\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
         let spec = ExternalAgentCommand::codex(
             agent,
             temp.path(),
             &prompt,
             temp.path().join("events.jsonl"),
-            temp.path().join("last-message.txt"),
+            incoming.join("last-message.txt"),
             Duration::from_secs(3),
         );
 
@@ -3338,6 +3504,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let agent = temp.path().join("fake-agent.sh");
         fs::write(
             &agent,
@@ -3408,6 +3575,7 @@ printf '\n{"type":"done"}\n'
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let agent = temp.path().join("fake-agent.sh");
         fs::write(
             &agent,
@@ -3446,6 +3614,7 @@ printf 'A\377B\n'
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let agent = temp.path().join("fake-agent.sh");
         fs::write(
             &agent,
@@ -3513,6 +3682,7 @@ exit 0
         use std::thread;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let started = temp.path().join("started");
         let delayed = temp.path().join("delayed");
         let agent = temp.path().join("fake-agent.sh");
@@ -3574,6 +3744,7 @@ exit 0
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
         let sentinel = temp.path().join("sentinel");
         fs::write(&sentinel, "untouched")?;
         let agent = temp.path().join("fake-agent.sh");
