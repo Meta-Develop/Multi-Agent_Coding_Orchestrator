@@ -1532,9 +1532,16 @@ fn validate_artifact_parent_disjoint(
     )?;
     for control in controls.iter() {
         let protected = normalized_absolute_path(&control.absolute, "protected worktree control")?;
-        if parent.starts_with(&protected) || protected.starts_with(&parent) {
-            bail!("external-agent output parent overlaps a protected worktree control");
+        if !parent.starts_with(&protected) && !protected.starts_with(&parent) {
+            continue;
         }
+        if control.relative == Path::new(".maco")
+            && parent != protected
+            && parent.starts_with(&protected)
+        {
+            continue;
+        }
+        bail!("external-agent output parent overlaps a protected worktree control");
     }
     Ok(parent)
 }
@@ -3200,10 +3207,12 @@ mod tests {
 
         for output in [
             workspace.join(".git/report.json"),
+            workspace.join(".git/nested/report.json"),
             workspace.join(".maco/report.json"),
-            workspace.join(".maco/nested/report.json"),
             workspace.join(".maco-cache/report.json"),
+            workspace.join(".maco-cache/nested/report.json"),
             workspace.join(".codex/report.json"),
+            workspace.join(".codex/nested/report.json"),
             workspace.join(".agents/report.json"),
             workspace.join(".agents/docs/report.json"),
             workspace.join(".cursorignore/report.json"),
@@ -3226,6 +3235,36 @@ mod tests {
             );
             assert!(!message.contains(&workspace.display().to_string()));
         }
+
+        let maco_incoming = workspace.join(".maco/consult/runs/test/incoming");
+        fs::create_dir_all(&maco_incoming)?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join("events.jsonl"),
+            maco_incoming.join("report.json"),
+            Duration::from_secs(1),
+        );
+        let controls = protected_worktree_controls(&command)?;
+        assert_eq!(
+            controls.writable_artifact_root.as_deref(),
+            Some(maco_incoming.as_path())
+        );
+        assert!(controls
+            .read_only_roots
+            .iter()
+            .any(|control| control.relative == Path::new(".maco")));
+        let profile = external_side_effect_profile(
+            &command,
+            &workspace.join("codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+            bail!("expected external Codex profile");
+        };
+        assert_eq!(profile.writable_artifact_roots(), &[maco_incoming]);
 
         let command = ExternalAgentCommand::codex(
             "codex",
