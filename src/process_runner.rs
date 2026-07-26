@@ -60,6 +60,10 @@ const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const SYSTEMD_OPERATION_GRACE: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
 const SYSTEMD_SLOT_WAIT: Duration = Duration::from_secs(30);
+// The unit-test binary can issue many strict-containment commands concurrently. Keep its
+// containment width deterministic without changing the production host-derived capacity.
+#[cfg(all(target_os = "linux", test))]
+const TEST_MAX_CONCURRENT_SYSTEMD_UNITS: usize = 4;
 // These safety probes assert containment evidence rather than command latency. Allow the complete
 // bounded slot wait plus setup without changing any production deadline.
 #[cfg(all(target_os = "linux", test))]
@@ -85,7 +89,11 @@ pub(crate) struct HostProcessCapacity {
 
 impl HostProcessCapacity {
     pub(crate) fn measured() -> Self {
-        let parallelism = match thread::available_parallelism() {
+        Self::from_measurement(thread::available_parallelism())
+    }
+
+    fn from_measurement(measurement: io::Result<NonZeroUsize>) -> Self {
+        let parallelism = match measurement {
             Ok(parallelism) => parallelism,
             Err(_) => NonZeroUsize::MIN,
         };
@@ -109,6 +117,16 @@ impl HostProcessCapacity {
             .get()
             .saturating_add(RESERVED_EXPEDITED_SYSTEMD_SLOTS)
     }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn max_concurrent_systemd_units() -> usize {
+    HostProcessCapacity::measured().systemd_unit_slots()
+}
+
+#[cfg(all(target_os = "linux", test))]
+const fn max_concurrent_systemd_units() -> usize {
+    TEST_MAX_CONCURRENT_SYSTEMD_UNITS
 }
 
 /// A run-scoped cancellation signal for independently contained child processes.
@@ -5704,7 +5722,7 @@ impl SystemdUnitPermit {
         // SAFETY: geteuid has no preconditions and does not access Rust memory.
         let effective_uid = unsafe { libc::geteuid() };
         let deadline = bounded_operation_deadline(SYSTEMD_SLOT_WAIT, operation_deadline)?;
-        let max_concurrent_units = HostProcessCapacity::measured().systemd_unit_slots();
+        let max_concurrent_units = max_concurrent_systemd_units();
         loop {
             if cancellation.is_cancelled() {
                 return Err(std::io::Error::new(
@@ -8349,6 +8367,19 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_host_capacity_measurement_falls_back_to_one_lane() {
+        let capacity =
+            HostProcessCapacity::from_measurement(Err(io::Error::other("injected failure")));
+
+        assert_eq!(capacity.supervisor_children(), 1);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            capacity.systemd_unit_slots(),
+            1 + RESERVED_EXPEDITED_SYSTEMD_SLOTS
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn containment_slot_bound_tracks_pinned_host_capacity_without_a_fixed_ceiling() {
@@ -8357,6 +8388,52 @@ mod tests {
             let capacity = HostProcessCapacity::from_parallelism(parallelism);
             assert_eq!(capacity.systemd_unit_slots(), expected_slots);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_containment_slot_limit_constrains_real_permit_acquisition() {
+        let runtime_root = tempfile::tempdir().expect("tempdir");
+        let cancellation = ProcessCancellation::new();
+        let mut ordinary_permits = Vec::new();
+        for _ in RESERVED_EXPEDITED_SYSTEMD_SLOTS..TEST_MAX_CONCURRENT_SYSTEMD_UNITS {
+            ordinary_permits.push(
+                SystemdUnitPermit::acquire(runtime_root.path(), None, &cancellation)
+                    .expect("acquire ordinary test containment permit"),
+            );
+        }
+        assert_eq!(ordinary_permits.len(), 3);
+
+        let expedited_permit = SystemdUnitPermit::acquire(
+            runtime_root.path(),
+            Some(Instant::now() + Duration::from_millis(500)),
+            &cancellation,
+        )
+        .expect("acquire reserved expedited test containment permit");
+
+        let overflow_result = SystemdUnitPermit::acquire(
+            runtime_root.path(),
+            Some(Instant::now() + Duration::from_secs(2)),
+            &cancellation,
+        );
+        let error = match overflow_result {
+            Ok(_) => panic!("test containment limit must prevent acquisition beyond four slots"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !runtime_root
+                .path()
+                .join(format!(
+                    "maco-process-runner-slot-{}.lock",
+                    TEST_MAX_CONCURRENT_SYSTEMD_UNITS
+                ))
+                .exists(),
+            "real acquisition path must not probe a host-derived slot beyond the test limit"
+        );
+
+        drop(expedited_permit);
+        drop(ordinary_permits);
     }
 
     #[test]
