@@ -857,6 +857,21 @@ impl ExternalCodexProfile {
     pub(crate) fn writable_artifact_roots(&self) -> &[PathBuf] {
         &self.config.writable_artifact_roots
     }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_only_roots(&self) -> &[PathBuf] {
+        &self.config.visible_read_only_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_write_roots(&self) -> &[PathBuf] {
+        &self.config.visible_read_write_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_write_files(&self) -> &[PathBuf] {
+        &self.config.visible_read_write_files
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8722,6 +8737,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("worktree");
         let control_root = workspace.join(".maco");
+        let cache_root = workspace.join(".maco-cache");
         let control_file = workspace.join(".git");
         let policy_root = workspace.join(".agents");
         let exception_root = policy_root.join("docs");
@@ -8729,6 +8745,7 @@ mod tests {
         let runtime = temp.path().join("runtime");
         fs::create_dir(&workspace).expect("workspace");
         fs::create_dir(&control_root).expect("control root");
+        fs::create_dir(&cache_root).expect("cache root");
         fs::create_dir(&policy_root).expect("policy root");
         fs::create_dir(&exception_root).expect("exception root");
         fs::write(&control_file, "gitdir: ../primary/.git/worktrees/child\n")
@@ -8738,6 +8755,7 @@ mod tests {
 
         let profile = ExternalCodexProfile::read_write(&workspace)
             .with_visible_read_only_root(&control_root)
+            .with_visible_read_only_root(&cache_root)
             .with_visible_read_only_root(&policy_root)
             .with_visible_read_only_file(&control_file)
             .with_visible_read_write_root(&exception_root)
@@ -8765,7 +8783,11 @@ mod tests {
         assert_eq!(sandbox.workspace_root, workspace);
         assert_eq!(
             sandbox.visible_read_only_roots,
-            vec![policy_root.clone(), control_root.clone()]
+            vec![
+                policy_root.clone(),
+                control_root.clone(),
+                cache_root.clone()
+            ]
         );
         assert_eq!(sandbox.visible_read_only_files, vec![control_file.clone()]);
         assert_eq!(
@@ -8779,6 +8801,7 @@ mod tests {
         for (path, access) in [
             (&workspace, SandboxMountAccess::ReadWrite),
             (&control_root, SandboxMountAccess::ReadOnly),
+            (&cache_root, SandboxMountAccess::ReadOnly),
             (&policy_root, SandboxMountAccess::ReadOnly),
             (&control_file, SandboxMountAccess::ReadOnly),
             (&exception_root, SandboxMountAccess::ReadWrite),
@@ -8809,6 +8832,8 @@ mod tests {
             format!("--property=ReadWritePaths={}", workspace.display()),
             format!("--property=BindReadOnlyPaths={}", control_root.display()),
             format!("--property=ReadOnlyPaths={}", control_root.display()),
+            format!("--property=BindReadOnlyPaths={}", cache_root.display()),
+            format!("--property=ReadOnlyPaths={}", cache_root.display()),
             format!("--property=BindReadOnlyPaths={}", policy_root.display()),
             format!("--property=ReadOnlyPaths={}", policy_root.display()),
             format!("--property=BindReadOnlyPaths={}", control_file.display()),
@@ -8824,6 +8849,16 @@ mod tests {
                 arguments.contains(&expected),
                 "missing appended systemd property {expected}"
             );
+        }
+        for permanently_read_only in [&control_root, &cache_root, &policy_root] {
+            assert!(!arguments.contains(&format!(
+                "--property=BindPaths={}",
+                permanently_read_only.display()
+            )));
+            assert!(!arguments.contains(&format!(
+                "--property=ReadWritePaths={}",
+                permanently_read_only.display()
+            )));
         }
     }
 

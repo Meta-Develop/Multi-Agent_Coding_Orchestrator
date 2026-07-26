@@ -28,9 +28,20 @@ const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
 const INNER_CODEX_POLICY_ID: &str = "maco_external_codex_inner_v1";
-const PERMANENT_CONTROL_ROOTS: &[&str] = &[".maco", ".codex"];
+const PERMANENT_CONTROL_ROOTS: &[&str] = &[".maco", ".maco-cache", ".codex"];
 const POLICY_CONTROL_ROOTS: &[&str] = &[".agents"];
-const POLICY_CONTROL_FILES: &[&str] = &[".gitignore", ".gitattributes", "AGENTS.md", "CLAUDE.md"];
+const POLICY_CONTROL_FILES: &[&str] = &[
+    ".gitignore",
+    ".gitattributes",
+    ".ignore",
+    ".rgignore",
+    ".dockerignore",
+    ".cursorignore",
+    ".cursorindexingignore",
+    ".codexignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+];
 const MAX_WORKTREE_CONTROL_EXCEPTIONS: usize = 128;
 const MAX_CODEX_JSONL_EVENT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_EVENT_TEXT_BYTES: usize = 64 * 1024;
@@ -1493,6 +1504,15 @@ fn validate_control_exception_target(workspace: &Path, relative: &Path) -> Resul
             relative.display()
         );
     }
+    if POLICY_CONTROL_ROOTS
+        .iter()
+        .any(|root| relative == Path::new(root))
+    {
+        bail!(
+            "worktree policy root is an ancestor boundary and cannot be excepted directly: {}",
+            relative.display()
+        );
+    }
     let protected_policy_path = POLICY_CONTROL_ROOTS
         .iter()
         .any(|root| relative.starts_with(root))
@@ -2708,12 +2728,12 @@ mod tests {
             workspace.join(".git"),
             "gitdir: ../primary/.git/worktrees/child\n",
         )?;
-        for root in [".maco", ".codex", ".agents"] {
+        for root in [".maco", ".maco-cache", ".codex", ".agents"] {
             fs::create_dir(workspace.join(root))?;
         }
         fs::create_dir(workspace.join(".agents/docs"))?;
         fs::write(workspace.join(".agents/docs/worker.md"), "worker policy\n")?;
-        for file in [".gitignore", ".gitattributes", "AGENTS.md", "CLAUDE.md"] {
+        for file in POLICY_CONTROL_FILES {
             fs::write(workspace.join(file), "protected\n")?;
         }
         let command = ExternalAgentCommand::codex(
@@ -2743,14 +2763,21 @@ mod tests {
                 Path::new(".agents"),
                 Path::new(".codex"),
                 Path::new(".maco"),
+                Path::new(".maco-cache"),
             ])
         );
         assert_eq!(
             files,
             BTreeSet::from([
+                Path::new(".codexignore"),
+                Path::new(".cursorignore"),
+                Path::new(".cursorindexingignore"),
+                Path::new(".dockerignore"),
                 Path::new(".git"),
                 Path::new(".gitattributes"),
                 Path::new(".gitignore"),
+                Path::new(".ignore"),
+                Path::new(".rgignore"),
                 Path::new("AGENTS.md"),
                 Path::new("CLAUDE.md"),
             ])
@@ -2763,6 +2790,32 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([Path::new(".agents/docs/worker.md")])
         );
+
+        let profile = external_side_effect_profile(
+            &command,
+            &workspace.join("codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+            bail!("expected external Codex profile");
+        };
+        assert!(profile
+            .visible_read_only_roots()
+            .contains(&workspace.join(".maco-cache")));
+        assert!(profile
+            .visible_read_only_roots()
+            .contains(&workspace.join(".agents")));
+        assert_eq!(
+            profile.visible_read_write_files(),
+            &[workspace.join(".agents/docs/worker.md")]
+        );
+        assert!(!profile
+            .visible_read_write_roots()
+            .contains(&workspace.join(".agents")));
+        assert!(!profile
+            .visible_read_write_files()
+            .contains(&workspace.join(".agents")));
         Ok(())
     }
 
@@ -2771,7 +2824,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace)?;
-        for root in [".git", ".maco", ".codex", ".agents"] {
+        for root in [".git", ".maco", ".maco-cache", ".codex", ".agents"] {
             fs::create_dir(workspace.join(root))?;
         }
         fs::create_dir(workspace.join(".agents/docs"))?;
@@ -2790,7 +2843,9 @@ mod tests {
             vec![PathBuf::from("src")],
             vec![PathBuf::from(".git")],
             vec![PathBuf::from(".maco")],
+            vec![PathBuf::from(".maco-cache")],
             vec![PathBuf::from(".codex")],
+            vec![PathBuf::from(".agents")],
             vec![PathBuf::from(".agents/link")],
             vec![
                 PathBuf::from(".agents/docs"),
@@ -2802,6 +2857,53 @@ mod tests {
                 "invalid exception set was accepted: {paths:?}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn policy_controls_include_non_git_ignores_and_construct_deterministically() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join(".agents/docs"))?;
+        fs::write(workspace.join(".agents/docs/policy.md"), "policy\n")?;
+        fs::write(workspace.join(".cursorignore"), "ignored\n")?;
+        fs::write(workspace.join(".rgignore"), "ignored\n")?;
+
+        let forward = protected_worktree_controls_for(
+            &workspace,
+            &[
+                PathBuf::from(".agents/docs/policy.md"),
+                PathBuf::from(".cursorignore"),
+            ],
+        )?;
+        let reverse = protected_worktree_controls_for(
+            &workspace,
+            &[
+                PathBuf::from(".cursorignore"),
+                PathBuf::from(".agents/docs/policy.md"),
+            ],
+        )?;
+
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward
+                .read_only_files
+                .iter()
+                .map(|control| control.relative.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new(".rgignore")]
+        );
+        assert_eq!(
+            forward
+                .read_write_files
+                .iter()
+                .map(|control| control.relative.as_path())
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new(".agents/docs/policy.md"),
+                Path::new(".cursorignore")
+            ]
+        );
         Ok(())
     }
 
@@ -2869,12 +2971,14 @@ mod tests {
             workspace.join(".git"),
             "gitdir: ../primary/.git/worktrees/child\n",
         )?;
-        for root in [".maco", ".codex", ".agents"] {
+        for root in [".maco", ".maco-cache", ".codex", ".agents"] {
             fs::create_dir(workspace.join(root))?;
         }
         let exception = PathBuf::from(".agents/policy\"quoted.md");
         fs::write(workspace.join(&exception), "policy\n")?;
         fs::write(workspace.join(".gitattributes"), "* text=auto\n")?;
+        fs::write(workspace.join(".cursorignore"), "ignored\n")?;
+        fs::write(workspace.join(".codexignore"), "ignored\n")?;
         let command = ExternalAgentCommand::codex(
             "codex",
             &workspace,
@@ -2889,7 +2993,16 @@ mod tests {
 
         assert!(permissions.contains("\":minimal\"=\"read\""));
         assert!(permissions.contains("\":workspace_roots\"={\".\"=\"write\"}"));
-        for path in [".git", ".maco", ".codex", ".agents", ".gitattributes"] {
+        for path in [
+            ".git",
+            ".maco",
+            ".maco-cache",
+            ".codex",
+            ".agents",
+            ".gitattributes",
+            ".cursorignore",
+            ".codexignore",
+        ] {
             assert!(
                 permissions.contains(&format!("{}=\"read\"", toml_basic_string(path))),
                 "missing exact read entry for {path}: {permissions}"
@@ -2897,6 +3010,7 @@ mod tests {
         }
         assert!(permissions.contains("\".agents/policy\\\"quoted.md\"=\"write\""));
         assert!(!permissions.contains("\".agents\"=\"write\""));
+        assert!(!permissions.contains("\".maco-cache\"=\"write\""));
         assert!(permissions.contains(&format!(
             "{}=\"write\"",
             toml_basic_string(incoming.to_str().context("UTF-8 incoming path")?)
