@@ -24,7 +24,7 @@ use crate::{
         finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
         LEGACY_RETIREMENT_DOMAIN,
     },
-    sync_store::SyncStore,
+    sync_store::{LockedClaimsSnapshot, SyncStore},
 };
 use anyhow::{bail, Context, Result};
 use git2::{
@@ -401,6 +401,122 @@ pub struct WorktreeCreateOptions {
     pub branch: Option<String>,
     pub base: Option<String>,
     pub worktree_root: Option<PathBuf>,
+}
+
+/// Inputs for creating a structurally neutral arbitration worktree.
+///
+/// The arbiter identity is checked against both normalized source identities,
+/// and the exact base OID is bound to a fresh MACO-owned default branch. The
+/// caller cannot supply or reuse a branch.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct NeutralWorktreeCreateOptions {
+    pub arbiter_agent_id: String,
+    pub source_agent_ids: [String; 2],
+    pub base_oid: Oid,
+    pub worktree_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorktreeCreationPolicy {
+    Standard,
+    NeutralFresh { exact_base_oid: Oid },
+}
+
+impl WorktreeCreationPolicy {
+    fn is_neutral_fresh(self) -> bool {
+        matches!(self, Self::NeutralFresh { .. })
+    }
+
+    fn exact_base_oid(self) -> Option<Oid> {
+        match self {
+            Self::Standard => None,
+            Self::NeutralFresh { exact_base_oid } => Some(exact_base_oid),
+        }
+    }
+}
+
+struct ValidatedNeutralWorktreeCreate {
+    options: WorktreeCreateOptions,
+    exact_base_oid: Oid,
+}
+
+impl NeutralWorktreeCreateOptions {
+    fn validate(self) -> Result<ValidatedNeutralWorktreeCreate> {
+        let arbiter_agent_id = normalize_agent_id(&self.arbiter_agent_id)
+            .context("neutral arbiter agent id is invalid")?;
+        let [first_source, second_source] = self.source_agent_ids;
+        let first_source =
+            normalize_agent_id(&first_source).context("first source agent id is invalid")?;
+        let second_source =
+            normalize_agent_id(&second_source).context("second source agent id is invalid")?;
+        if arbiter_agent_id == first_source || arbiter_agent_id == second_source {
+            bail!("neutral arbiter agent id must differ from both normalized source agent ids");
+        }
+
+        Ok(ValidatedNeutralWorktreeCreate {
+            options: WorktreeCreateOptions {
+                agent_id: arbiter_agent_id,
+                branch: None,
+                base: Some(self.base_oid.to_string()),
+                worktree_root: self.worktree_root,
+            },
+            exact_base_oid: self.base_oid,
+        })
+    }
+}
+
+/// Holds the durable path-claim serialization lock across neutral creation.
+///
+/// This gives the "no inherited claim" check one real linearization boundary:
+/// no claim writer can add or release an arbiter claim between the signed
+/// snapshot check and the completed managed-worktree creation.
+#[derive(Debug)]
+struct NeutralClaimBoundary {
+    snapshot: LockedClaimsSnapshot,
+}
+
+impl NeutralClaimBoundary {
+    fn acquire(repo: &Repository, arbiter_agent_id: &str) -> Result<Self> {
+        let repo_path = repo.workdir().unwrap_or_else(|| repo.path());
+        let store = SyncStore::open(repo_path)
+            .context("failed to authenticate durable claims for neutral worktree creation")?;
+        let snapshot = store
+            .lock_authenticated_snapshot()
+            .context("failed to lock authenticated claims for neutral worktree creation")?;
+        let result = (|| -> Result<()> {
+            if snapshot
+                .claims()
+                .iter()
+                .any(|claim| claim.agent_id == arbiter_agent_id)
+            {
+                bail!(
+                    "neutral arbiter '{arbiter_agent_id}' has an active durable path claim; refusing inherited claim authority"
+                );
+            }
+            Ok(())
+        })();
+        finish_with_neutral_claim_lock_verification(result, snapshot.verify())?;
+        Ok(Self { snapshot })
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.snapshot.verify()
+    }
+}
+
+fn finish_with_neutral_claim_lock_verification<T>(
+    result: Result<T>,
+    verification: Result<()>,
+) -> Result<T> {
+    match (result, verification) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(lock_error)) => Err(lock_error),
+        (Err(error), Err(lock_error)) => Err(error.context(format!(
+            "operation also lost its durable claims lock-path binding: {lock_error:#}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -831,8 +947,11 @@ impl WorktreeManager {
         cleanliness.require_clean_for_manager(self)?;
         let exclude_agent_id = Some(normalize_agent_id(&options.agent_id)?);
         let worktree_root = options.worktree_root.clone();
-        let record =
-            self.create_disabled_legacy(options, CreationCleanliness::Bound(cleanliness))?;
+        let record = self.create_disabled_legacy(
+            options,
+            CreationCleanliness::Bound(cleanliness),
+            WorktreeCreationPolicy::Standard,
+        )?;
         cleanliness.require_clean_for_manager(self)?;
         if retention.max_age.is_some() || retention.max_count.is_some() {
             let retention = WorktreeRetentionPolicy {
@@ -853,6 +972,34 @@ impl WorktreeManager {
         Ok(record)
     }
 
+    /// Creates a fresh arbitration worktree while structurally enforcing that
+    /// its normalized identity is not either colliding source, it inherits no
+    /// active durable path claim, and its default branch is newly created at
+    /// the requested exact base OID.
+    #[allow(dead_code)]
+    pub(crate) fn create_neutral_with_repository_cleanliness(
+        &self,
+        options: NeutralWorktreeCreateOptions,
+        cleanliness: &RepositoryCleanlinessCapability,
+    ) -> Result<WorktreeRecord> {
+        let validated = options.validate()?;
+        cleanliness.require_clean_for_manager(self)?;
+        let repo = self.open_repository()?;
+        let claim_boundary = NeutralClaimBoundary::acquire(&repo, &validated.options.agent_id)?;
+        let result = (|| -> Result<WorktreeRecord> {
+            let record = self.create_disabled_legacy(
+                validated.options,
+                CreationCleanliness::Bound(cleanliness),
+                WorktreeCreationPolicy::NeutralFresh {
+                    exact_base_oid: validated.exact_base_oid,
+                },
+            )?;
+            cleanliness.require_clean_for_manager(self)?;
+            Ok(record)
+        })();
+        finish_with_neutral_claim_lock_verification(result, claim_boundary.verify())
+    }
+
     /// Unit-test-only capability seam for exercising the internal durable
     /// worktree machinery. This method is absent from production libraries
     /// and integration-test binaries.
@@ -869,7 +1016,11 @@ impl WorktreeManager {
     ) -> Result<WorktreeRecord> {
         let exclude_agent_id = Some(normalize_agent_id(&options.agent_id)?);
         let worktree_root = options.worktree_root.clone();
-        let record = self.create_disabled_legacy(options, CreationCleanliness::TestOnly)?;
+        let record = self.create_disabled_legacy(
+            options,
+            CreationCleanliness::TestOnly,
+            WorktreeCreationPolicy::Standard,
+        )?;
         if retention.max_age.is_some() || retention.max_count.is_some() {
             let retention = WorktreeRetentionPolicy {
                 max_age: retention.max_age,
@@ -888,17 +1039,53 @@ impl WorktreeManager {
         Ok(record)
     }
 
+    #[cfg(test)]
+    fn create_neutral_for_test(
+        &self,
+        options: NeutralWorktreeCreateOptions,
+    ) -> Result<WorktreeRecord> {
+        let validated = options.validate()?;
+        let repo = self.open_repository()?;
+        let claim_boundary = NeutralClaimBoundary::acquire(&repo, &validated.options.agent_id)?;
+        let result = self.create_disabled_legacy(
+            validated.options,
+            CreationCleanliness::TestOnly,
+            WorktreeCreationPolicy::NeutralFresh {
+                exact_base_oid: validated.exact_base_oid,
+            },
+        );
+        finish_with_neutral_claim_lock_verification(result, claim_boundary.verify())
+    }
+
     #[allow(dead_code)]
     fn create_disabled_legacy(
         &self,
         options: WorktreeCreateOptions,
         cleanliness: CreationCleanliness<'_>,
+        creation_policy: WorktreeCreationPolicy,
     ) -> Result<WorktreeRecord> {
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
         cleanliness.require_clean_for_repository(&registry_store.repository)?;
         let registry_lock = registry_store.lock()?;
         let mut registry = registry_store.load(&registry_lock)?;
+        let neutral_identity = match creation_policy {
+            WorktreeCreationPolicy::Standard => None,
+            WorktreeCreationPolicy::NeutralFresh { .. } => {
+                if options.branch.is_some() {
+                    bail!("neutral worktree creation does not accept a caller-supplied branch");
+                }
+                let name = normalize_agent_id(&options.agent_id)?;
+                let branch_name = default_branch_name(&name);
+                validate_branch_name(&branch_name)?;
+                if registry.records.contains_key(&name) || registry.operations.contains_key(&name) {
+                    bail!(
+                        "neutral arbiter identity '{name}' already has managed worktree state; refusing reuse"
+                    );
+                }
+                Some((name, branch_name))
+            }
+        };
         recover_pending_operations_with_creation_cleanliness(
             &repo,
             &registry_store,
@@ -906,9 +1093,15 @@ impl WorktreeManager {
             &mut registry,
             cleanliness,
         )?;
-        let name = normalize_agent_id(&options.agent_id)?;
-        let branch_name = options.branch.unwrap_or_else(|| default_branch_name(&name));
-        validate_branch_name(&branch_name)?;
+        let (name, branch_name) = match neutral_identity {
+            Some(identity) => identity,
+            None => {
+                let name = normalize_agent_id(&options.agent_id)?;
+                let branch_name = options.branch.unwrap_or_else(|| default_branch_name(&name));
+                validate_branch_name(&branch_name)?;
+                (name, branch_name)
+            }
+        };
         if registry.records.contains_key(&name) {
             bail!("managed worktree '{name}' already has a registry binding");
         }
@@ -917,6 +1110,19 @@ impl WorktreeManager {
         }
         if registry.operations.len() >= MAX_MANAGED_OPERATIONS {
             bail!("managed worktree registry has no remaining operation capacity");
+        }
+        let commit = resolve_base_commit(&repo, options.base.as_deref())?;
+        if let Some(exact_base_oid) = creation_policy.exact_base_oid() {
+            if commit.id() != exact_base_oid {
+                bail!(
+                    "neutral worktree base did not resolve to the requested exact commit {exact_base_oid}"
+                );
+            }
+            if local_branch_oid(&repo, &branch_name)?.is_some() {
+                bail!(
+                    "neutral worktree requires a fresh MACO-owned default branch; '{branch_name}' already exists"
+                );
+            }
         }
         let requested_root = options
             .worktree_root
@@ -936,9 +1142,13 @@ impl WorktreeManager {
         }
         root.ensure_direct_child_absent(&name)?;
 
-        let commit = resolve_base_commit(&repo, options.base.as_deref())?;
         let branch_preexisting_oid =
             local_branch_oid(&repo, &branch_name)?.map(|oid| oid.to_string());
+        if creation_policy.is_neutral_fresh() && branch_preexisting_oid.is_some() {
+            bail!(
+                "neutral worktree requires a fresh MACO-owned default branch; '{branch_name}' appeared before creation"
+            );
+        }
         let branch_ownership = if branch_preexisting_oid.is_some() {
             ManagedBranchOwnership::Preexisting
         } else {
@@ -1051,7 +1261,8 @@ impl WorktreeManager {
         let create_result =
             (|| -> Result<()> {
                 reserved.verify(&root)?;
-                let (branch, created_by_maco) = ensure_branch(&repo, &branch_name, &commit)?;
+                let (branch, created_by_maco) =
+                    ensure_branch_for_creation(&repo, &branch_name, &commit, creation_policy)?;
                 let branch_oid = branch.get().target().with_context(|| {
                     format!("local branch '{branch_name}' has no direct target")
                 })?;
@@ -4570,6 +4781,23 @@ fn ensure_branch<'repo>(
     }
 }
 
+fn ensure_branch_for_creation<'repo>(
+    repo: &'repo Repository,
+    branch_name: &str,
+    commit: &git2::Commit<'repo>,
+    creation_policy: WorktreeCreationPolicy,
+) -> Result<(git2::Branch<'repo>, bool)> {
+    match creation_policy {
+        WorktreeCreationPolicy::Standard => ensure_branch(repo, branch_name, commit),
+        WorktreeCreationPolicy::NeutralFresh { .. } => repo
+            .branch(branch_name, commit, false)
+            .map(|branch| (branch, true))
+            .with_context(|| {
+                format!("failed to create fresh neutral worktree branch '{branch_name}'")
+            }),
+    }
+}
+
 fn find_worktree(repo: &Repository, name: &str) -> Result<Option<git2::Worktree>> {
     match repo.find_worktree(name) {
         Ok(worktree) => Ok(Some(worktree)),
@@ -6293,6 +6521,246 @@ mod tests {
         assert!(create_error.to_string().contains("capability-bound"));
         assert!(remove_error.to_string().contains("capability-bound"));
         assert_eq!(fs::read_dir(temp.path()).expect("read temp").count(), 0);
+    }
+
+    #[test]
+    fn neutral_worktree_rejects_each_normalized_source_identity_before_repository_access() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo-must-not-be-opened");
+        let worktree_root = temp.path().join("must-not-be-created");
+        let manager = WorktreeManager::new(&repo_path);
+
+        for source_agent_ids in [
+            [" arbiter ".to_string(), "source-b".to_string()],
+            ["source-a".to_string(), "\tarbiter\n".to_string()],
+        ] {
+            let error = manager
+                .create_neutral_for_test(NeutralWorktreeCreateOptions {
+                    arbiter_agent_id: "arbiter".to_string(),
+                    source_agent_ids,
+                    base_oid: Oid::ZERO_SHA1,
+                    worktree_root: Some(worktree_root.clone()),
+                })
+                .expect_err("arbiter identity equal to either source must be refused");
+            assert!(error
+                .to_string()
+                .contains("must differ from both normalized source agent ids"));
+        }
+
+        assert!(!repo_path.exists());
+        assert!(!worktree_root.exists());
+    }
+
+    #[test]
+    fn neutral_worktree_refuses_inherited_durable_claim_without_mutating_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let base_oid = commit_readme(&repo).expect("initial commit");
+        let claims = SyncStore::open(&repo_path).expect("open claims");
+        let inherited = claims
+            .claim_paths("neutral-arbiter", ["src"])
+            .expect("seed inherited claim");
+        let manager = WorktreeManager::new(&repo_path);
+
+        let error = manager
+            .create_neutral_for_test(NeutralWorktreeCreateOptions {
+                arbiter_agent_id: "neutral-arbiter".to_string(),
+                source_agent_ids: ["source-a".to_string(), "source-b".to_string()],
+                base_oid,
+                worktree_root: Some(worktree_root.clone()),
+            })
+            .expect_err("inherited durable claim must be refused");
+
+        assert!(error
+            .to_string()
+            .contains("active durable path claim; refusing inherited claim authority"));
+        assert_eq!(
+            claims.snapshot().expect("claims after refusal"),
+            vec![inherited]
+        );
+        assert!(repo
+            .find_branch("maco/neutral-arbiter", BranchType::Local)
+            .is_err());
+        assert!(!worktree_root.join("neutral-arbiter").exists());
+    }
+
+    #[test]
+    fn neutral_worktree_refuses_preexisting_default_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let base_oid = commit_readme(&repo).expect("initial commit");
+        let base = repo.find_commit(base_oid).expect("find base commit");
+        repo.branch("maco/neutral-arbiter", &base, false)
+            .expect("seed branch");
+        let manager = WorktreeManager::new(&repo_path);
+
+        let error = manager
+            .create_neutral_for_test(NeutralWorktreeCreateOptions {
+                arbiter_agent_id: "neutral-arbiter".to_string(),
+                source_agent_ids: ["source-a".to_string(), "source-b".to_string()],
+                base_oid,
+                worktree_root: Some(worktree_root.clone()),
+            })
+            .expect_err("preexisting default branch must be refused");
+
+        assert!(error
+            .to_string()
+            .contains("requires a fresh MACO-owned default branch"));
+        assert_eq!(
+            repo.find_branch("maco/neutral-arbiter", BranchType::Local)
+                .expect("preexisting branch remains")
+                .get()
+                .target(),
+            Some(base_oid)
+        );
+        assert!(manager
+            .list_managed_verified()
+            .expect("list managed worktrees")
+            .is_empty());
+        assert!(!worktree_root.join("neutral-arbiter").exists());
+    }
+
+    #[test]
+    fn neutral_worktree_refuses_existing_managed_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let base_oid = commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let existing = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "neutral-arbiter".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root.clone()),
+            })
+            .expect("seed managed worktree");
+
+        let error = manager
+            .create_neutral_for_test(NeutralWorktreeCreateOptions {
+                arbiter_agent_id: "neutral-arbiter".to_string(),
+                source_agent_ids: ["source-a".to_string(), "source-b".to_string()],
+                base_oid,
+                worktree_root: Some(worktree_root),
+            })
+            .expect_err("existing managed identity must be refused");
+
+        assert!(error
+            .to_string()
+            .contains("already has managed worktree state; refusing reuse"));
+        assert_eq!(
+            manager
+                .list_managed_verified()
+                .expect("list existing managed worktree"),
+            vec![existing]
+        );
+    }
+
+    #[test]
+    fn neutral_worktree_uses_fresh_default_branch_at_exact_base_without_claim() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let exact_base_oid = commit_readme(&repo).expect("initial commit");
+        let newer_oid = commit_descendant(&repo, "README.md", "# Newer\n").expect("newer commit");
+        let manager = WorktreeManager::new(&repo_path);
+
+        let record = manager
+            .create_neutral_for_test(NeutralWorktreeCreateOptions {
+                arbiter_agent_id: "neutral-arbiter".to_string(),
+                source_agent_ids: ["source-a".to_string(), "source-b".to_string()],
+                base_oid: exact_base_oid,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create neutral worktree");
+
+        assert_eq!(record.name, "neutral-arbiter");
+        assert_eq!(record.branch, "maco/neutral-arbiter");
+        assert_eq!(
+            repo.find_branch(&record.branch, BranchType::Local)
+                .expect("fresh neutral branch")
+                .get()
+                .target(),
+            Some(exact_base_oid)
+        );
+        assert_eq!(
+            repo.head()
+                .expect("primary HEAD")
+                .target()
+                .expect("primary HEAD target"),
+            newer_oid
+        );
+        assert_eq!(
+            fs::read_to_string(record.path.join("README.md")).expect("read neutral README"),
+            "# Test\n"
+        );
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let lock = store.lock().expect("registry lock");
+        let registry = store.load(&lock).expect("registry");
+        let binding = registry
+            .records
+            .get("neutral-arbiter")
+            .expect("neutral binding");
+        assert!(binding.branch_created_by_maco);
+        assert_eq!(binding.base_oid, exact_base_oid.to_string());
+        assert_eq!(binding.created_branch_oid, exact_base_oid.to_string());
+        assert!(SyncStore::open(&repo_path)
+            .expect("open claims")
+            .snapshot()
+            .expect("claims after neutral create")
+            .is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let exact_base_oid = commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("capture clean repository capability");
+
+        let record = manager
+            .create_neutral_with_repository_cleanliness(
+                NeutralWorktreeCreateOptions {
+                    arbiter_agent_id: "neutral-production-arbiter".to_string(),
+                    source_agent_ids: ["agent-a".to_string(), "agent-b".to_string()],
+                    base_oid: exact_base_oid,
+                    worktree_root: Some(worktree_root),
+                },
+                &cleanliness,
+            )
+            .expect("create production capability-bound neutral worktree");
+
+        assert_eq!(record.name, "neutral-production-arbiter");
+        assert_eq!(record.branch, "maco/neutral-production-arbiter");
+        assert_eq!(
+            repo.find_branch("maco/neutral-production-arbiter", BranchType::Local)
+                .expect("fresh neutral branch")
+                .get()
+                .target(),
+            Some(exact_base_oid)
+        );
+        assert!(SyncStore::open(&repo_path)
+            .expect("open claims")
+            .snapshot()
+            .expect("claims after production neutral create")
+            .is_empty());
     }
 
     #[cfg(target_os = "linux")]

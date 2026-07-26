@@ -13,6 +13,125 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
+fn merge_arbitrate_help_exposes_only_the_explicit_neutral_entrypoint() -> Result<()> {
+    let output = Command::new(BIN)
+        .args(["merge", "arbitrate", "--help"])
+        .output()
+        .context("run merge arbitrate help")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).context("arbitrate help utf8")?;
+    for expected in [
+        "FIRST_SIDE",
+        "SECOND_SIDE",
+        "--arbiter-id",
+        "--run-id",
+        "--first-claim",
+        "--second-claim",
+        "--validation-command",
+        "--approve",
+        "--codex-bin",
+        "--timeout-seconds",
+        "--worktree-root",
+    ] {
+        assert!(help.contains(expected), "missing {expected} in:\n{help}");
+    }
+    assert!(help.contains("later ordinary merge apply is still required"));
+    Ok(())
+}
+
+#[test]
+fn merge_preview_and_apply_help_do_not_inherit_arbitration_options() -> Result<()> {
+    for subcommand in ["preview", "apply"] {
+        let output = Command::new(BIN)
+            .args(["merge", subcommand, "--help"])
+            .output()
+            .with_context(|| format!("run merge {subcommand} help"))?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8(output.stdout).context("merge help utf8")?;
+        for arbitration_only in [
+            "--arbiter-id",
+            "--run-id",
+            "--first-claim",
+            "--second-claim",
+            "--approve",
+            "--codex-bin",
+            "--timeout-seconds",
+            "--worktree-root",
+        ] {
+            assert!(
+                !help.contains(arbitration_only),
+                "merge {subcommand} unexpectedly exposes {arbitration_only}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn merge_arbitrate_refuses_primary_claim_before_repository_or_runner_access() -> Result<()> {
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "arbitrate",
+            "agent-a",
+            "primary",
+            "--arbiter-id",
+            "neutral-review",
+            "--run-id",
+            "primary-claim-refusal",
+            "--second-claim",
+            "src/lib.rs",
+            "--validation-command",
+            "cargo test",
+            "--repo",
+            "/definitely/not/a/repository",
+            "--json",
+        ])
+        .output()
+        .context("run pre-repository arbitration refusal")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--second-claim is not applicable"));
+    assert!(!stderr.contains("repository"));
+    Ok(())
+}
+
+#[test]
+fn merge_arbitrate_refuses_duplicate_sides_before_repository_or_runner_access() -> Result<()> {
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "arbitrate",
+            "agent-a",
+            "agent-a",
+            "--arbiter-id",
+            "neutral-review",
+            "--run-id",
+            "duplicate-side-refusal",
+            "--validation-command",
+            "cargo test",
+            "--repo",
+            "/definitely/not/a/repository",
+            "--json",
+        ])
+        .output()
+        .context("run duplicate-side arbitration refusal")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("arbitration sides must be distinct"));
+    assert!(!stderr.contains("failed to discover repository"));
+    Ok(())
+}
+
+#[test]
 fn merge_apply_accepts_external_validation_report_and_applies() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;

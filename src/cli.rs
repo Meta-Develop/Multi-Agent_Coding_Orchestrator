@@ -15,9 +15,10 @@ use crate::{
         MegafileThresholds,
     },
     merge::{
-        self, CandidateValidationCommand, MegafileMergePolicy, MergeApplyOptions,
-        MergeApplyPreview, MergeApplyReport, MergeCandidate, MergeCollectOptions,
-        MergeForceOptions, MergePreviewOptions, ValidationEvidenceBundle, ValidationReport,
+        self, ArbitrationSideSpec, CandidateValidationCommand, MegafileMergePolicy,
+        MergeApplyOptions, MergeApplyPreview, MergeApplyReport, MergeArbitrationOptions,
+        MergeArbitrationReport, MergeCandidate, MergeCollectOptions, MergeForceOptions,
+        MergePreviewOptions, ValidationEvidenceBundle, ValidationReport,
     },
     orchestrator::{
         self, AgentRunStatus, OrchestrationResumeOptions, OrchestrationRunControls,
@@ -2584,6 +2585,28 @@ impl MergeCommand {
                 }
                 print_merge_apply_report(&report, args.json)
             }
+            MergeSubcommand::Arbitrate(args) => {
+                let first_side =
+                    arbitration_side_from_cli(args.first_side, args.first_claim, "first")?;
+                let second_side =
+                    arbitration_side_from_cli(args.second_side, args.second_claim, "second")?;
+                let report = merge::arbitrate_merge(MergeArbitrationOptions {
+                    repo: args.repo,
+                    run_id: RunId::new(args.run_id)?,
+                    arbiter_agent_id: args.arbiter_id,
+                    sides: [first_side, second_side],
+                    validation_commands: args
+                        .validation_command
+                        .into_iter()
+                        .map(|command| CandidateValidationCommand { command })
+                        .collect(),
+                    approve: args.approve,
+                    codex_bin: args.codex_bin,
+                    timeout: Duration::from_secs(args.timeout_seconds),
+                    worktree_root: args.worktree_root,
+                })?;
+                print_merge_arbitration_report(&report, args.json)
+            }
         }
     }
 }
@@ -2594,6 +2617,8 @@ enum MergeSubcommand {
     Preview(MergePreviewArgs),
     /// Apply an agent worktree diff to the primary worktree after safety checks.
     Apply(MergeApplyArgs),
+    /// Ask a structurally neutral arbiter to prepare, but never apply, a collision resolution.
+    Arbitrate(MergeArbitrateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -2665,6 +2690,69 @@ struct MergeApplyArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MergeArbitrateArgs {
+    /// First collision side: a stable agent id or the reserved literal `primary`.
+    #[arg(value_name = "FIRST_SIDE")]
+    first_side: String,
+    /// Second collision side: a distinct stable agent id or the reserved literal `primary`.
+    #[arg(value_name = "SECOND_SIDE")]
+    second_side: String,
+    /// Stable identity for the fresh neutral arbiter; must differ from both sides.
+    #[arg(long)]
+    arbiter_id: String,
+    /// Stable run id for private, digest-bound arbitration artifacts.
+    #[arg(long)]
+    run_id: String,
+    /// Repository path. Arbitration never mutates its primary worktree.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Explicit claim for an agent first side. Repeat to provide multiple claims.
+    #[arg(long = "first-claim")]
+    first_claim: Vec<PathBuf>,
+    /// Explicit claim for an agent second side. Repeat to provide multiple claims.
+    #[arg(long = "second-claim")]
+    second_claim: Vec<PathBuf>,
+    /// Candidate-bound validation command. At least one is required.
+    #[arg(long = "validation-command", required = true)]
+    validation_command: Vec<String>,
+    /// Explicitly accept a preserved, validated proposal. A later ordinary merge apply is still required.
+    #[arg(long)]
+    approve: bool,
+    /// Codex-compatible executable used through the existing trusted local agent boundary.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+    /// Seconds before the neutral arbiter subprocess is terminated.
+    #[arg(long, default_value_t = 600)]
+    timeout_seconds: u64,
+    /// Optional managed-worktree root for the fresh neutral arbitration worktree.
+    #[arg(long)]
+    worktree_root: Option<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+fn arbitration_side_from_cli(
+    participant: String,
+    claimed_paths: Vec<PathBuf>,
+    position: &str,
+) -> Result<ArbitrationSideSpec> {
+    if participant == "primary" {
+        if !claimed_paths.is_empty() {
+            bail!(
+                "{position} arbitration side is primary, so --{position}-claim is not applicable"
+            );
+        }
+        Ok(ArbitrationSideSpec::Primary)
+    } else {
+        Ok(ArbitrationSideSpec::Agent {
+            agent_id: participant,
+            claimed_paths,
+        })
+    }
 }
 
 impl MergePreviewArgs {
@@ -3789,6 +3877,55 @@ fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()>
     Ok(())
 }
 
+fn print_merge_arbitration_report(report: &MergeArbitrationReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Merge arbitration outcome: {:?}", report.outcome);
+    println!("Run: {}", report.run_id);
+    println!("Neutral arbiter: {}", report.arbiter_id);
+    println!(
+        "Neutral worktree: {} ({})",
+        report.neutral_worktree.path.display(),
+        report.neutral_worktree.branch
+    );
+    println!("Exact reviewed base: {}", report.reviewed_base_oid);
+    println!("First side: {:?}", report.sides[0]);
+    println!("Second side: {:?}", report.sides[1]);
+    println!("Approved: {}", report.approved);
+    println!(
+        "Rationale artifact: {} sha256={}",
+        report.rationale_artifact, report.rationale_sha256
+    );
+    if let Some(candidate_artifact) = &report.candidate_artifact {
+        let candidate_sha256 = report
+            .candidate_sha256
+            .as_deref()
+            .context("arbitration candidate artifact is missing its digest")?;
+        println!(
+            "Candidate artifact: {} sha256={}",
+            candidate_artifact, candidate_sha256
+        );
+    } else {
+        println!("Candidate artifact: none");
+    }
+    println!("Candidate status: {:?}", report.candidate_status);
+    println!("Validation commands:");
+    for command in &report.validation_commands {
+        println!("  {command}");
+    }
+    println!("Primary worktree mutated: {}", report.primary_mutated);
+    println!(
+        "Later ordinary human-invoked merge apply required: {}",
+        report.later_ordinary_merge_apply_required
+    );
+    println!(
+        "Arbitration never applies to primary; use a later ordinary merge preview/apply gate."
+    );
+    Ok(())
+}
+
 fn print_pr_publication_report(report: &PrPublicationReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
@@ -4108,6 +4245,136 @@ fn print_owner_report(report: &OwnerReport, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_arbitration_is_an_explicit_typed_opt_in() {
+        let agent_primary = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "arbitrate",
+            "agent-a",
+            "primary",
+            "--arbiter-id",
+            "neutral-review",
+            "--run-id",
+            "collision-1",
+            "--first-claim",
+            "src/lib.rs",
+            "--validation-command",
+            "cargo test",
+            "--approve",
+        ])
+        .expect("agent-primary arbitration should parse");
+        let Command::Merge(MergeCommand {
+            command: MergeSubcommand::Arbitrate(agent_primary),
+        }) = agent_primary.command
+        else {
+            panic!("expected merge arbitrate command");
+        };
+        assert_eq!(agent_primary.first_side, "agent-a");
+        assert_eq!(agent_primary.second_side, "primary");
+        assert_eq!(agent_primary.first_claim, vec![PathBuf::from("src/lib.rs")]);
+        assert!(agent_primary.second_claim.is_empty());
+        assert_eq!(agent_primary.arbiter_id, "neutral-review");
+        assert_eq!(agent_primary.validation_command, vec!["cargo test"]);
+        assert!(agent_primary.approve);
+
+        let agent_agent = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "arbitrate",
+            "agent-a",
+            "agent-b",
+            "--arbiter-id",
+            "neutral-review",
+            "--run-id",
+            "collision-2",
+            "--first-claim",
+            "src",
+            "--second-claim",
+            "src/lib.rs",
+            "--validation-command",
+            "cargo check",
+        ])
+        .expect("agent-agent arbitration should parse");
+        let Command::Merge(MergeCommand {
+            command: MergeSubcommand::Arbitrate(agent_agent),
+        }) = agent_agent.command
+        else {
+            panic!("expected merge arbitrate command");
+        };
+        assert_eq!(agent_agent.first_side, "agent-a");
+        assert_eq!(agent_agent.second_side, "agent-b");
+        assert_eq!(agent_agent.second_claim, vec![PathBuf::from("src/lib.rs")]);
+        assert!(!agent_agent.approve);
+
+        assert!(Cli::try_parse_from(["maco", "merge", "arbitrate"]).is_err());
+        assert!(Cli::try_parse_from([
+            "maco",
+            "merge",
+            "arbitrate",
+            "agent-a",
+            "primary",
+            "--arbiter-id",
+            "neutral-review",
+            "--run-id",
+            "collision-3",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn existing_merge_preview_and_apply_parsing_remains_separate_from_arbitration() {
+        let preview = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "preview",
+            "agent-a",
+            "--claim",
+            "src/lib.rs",
+            "--require-validation",
+            "--json",
+        ])
+        .expect("existing preview command should still parse");
+        assert!(matches!(
+            preview.command,
+            Command::Merge(MergeCommand {
+                command: MergeSubcommand::Preview(_)
+            })
+        ));
+
+        let apply = Cli::try_parse_from([
+            "maco",
+            "merge",
+            "apply",
+            "agent-a",
+            "--claim",
+            "src/lib.rs",
+            "--validation-command",
+            "cargo test",
+            "--json",
+        ])
+        .expect("existing apply command should still parse");
+        assert!(matches!(
+            apply.command,
+            Command::Merge(MergeCommand {
+                command: MergeSubcommand::Apply(_)
+            })
+        ));
+    }
+
+    #[test]
+    fn primary_arbitration_side_rejects_agent_claims_before_execution() {
+        let error = arbitration_side_from_cli(
+            "primary".to_string(),
+            vec![PathBuf::from("src/lib.rs")],
+            "second",
+        )
+        .expect_err("primary side must not accept an agent claim");
+        assert!(error
+            .to_string()
+            .contains("--second-claim is not applicable"));
+    }
 
     #[test]
     fn supervise_plan_requires_exactly_one_positional_or_goal_source() {
