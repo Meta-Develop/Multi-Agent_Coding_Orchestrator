@@ -59,6 +59,8 @@ const REVIEW_SANDBOX_POLICY_VERSION: u32 = 2;
 const EXTERNAL_REVIEWER_BINDING_DOMAIN: &[u8] = b"MACO\0external-reviewer-binding\0v1\0";
 const EXTERNAL_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0external-review-request\0v1\0";
 const FAKE_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0fake-review-request\0v1\0";
+const REVIEW_LENS_BACKEND_CONFIG_DOMAIN: &[u8] = b"MACO\0review-lens-backend-config\0v1\0";
+const REVIEW_LENS_REQUEST_DOMAIN: &[u8] = b"MACO\0review-lens-request\0v1\0";
 const SANITIZED_REVIEW_VIEW_DOMAIN: &[u8] = b"MACO\0sanitized-review-view\0v1\0";
 
 pub const DEFAULT_DIFF_REVIEW_LENS_ID: &str = "default-diff-review";
@@ -394,7 +396,7 @@ pub struct ReviewLensConfig {
 /// verified evidence, such as future process evidence, participate in the same
 /// aggregation without pretending that it was produced by a model invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ReviewLensBackendConfig {
     Model {
         backend_id: String,
@@ -450,10 +452,12 @@ pub struct ReviewLensRequestSources<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLensRequest {
+    #[serde(deserialize_with = "deserialize_review_schema_version")]
     pub version: u32,
     pub lens_id: String,
     pub backend_id: String,
     pub model: String,
+    pub request_binding: String,
     pub information: ReviewLensScopedInformation,
 }
 
@@ -463,7 +467,7 @@ pub struct ReviewLensRequest {
 /// Their serialized representation therefore cannot disclose a transcript or
 /// report merely because a caller populated the parent-side sources.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "scope", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "scope", rename_all = "snake_case")]
 pub enum ReviewLensScopedInformation {
     FullChildTranscript {
         child_transcript: String,
@@ -478,6 +482,14 @@ pub enum ReviewLensScopedInformation {
     },
 }
 
+#[derive(Serialize)]
+struct ReviewLensRequestBindingPayload<'a> {
+    version: u32,
+    lens: &'a ReviewLensDescriptor,
+    backend_configuration_id: &'a str,
+    information: &'a ReviewLensScopedInformation,
+}
+
 pub fn build_review_lens_request(
     lens: &ReviewLensConfig,
     sources: ReviewLensRequestSources<'_>,
@@ -486,6 +498,7 @@ pub fn build_review_lens_request(
     if matches!(lens.backend, ReviewLensBackendConfig::Precomputed { .. }) {
         bail!("precomputed review lenses do not receive model request material");
     }
+    validate_review_lens_selected_input(lens.information_scope, sources)?;
     let information = match lens.information_scope {
         ReviewInformationScope::FullChildTranscript => {
             ReviewLensScopedInformation::FullChildTranscript {
@@ -501,17 +514,68 @@ pub fn build_review_lens_request(
             output_report: sources.output_report.to_string(),
         },
     };
-    Ok(ReviewLensRequest {
+    let descriptor = ReviewLensDescriptor::from(lens);
+    let backend_configuration_id = review_lens_backend_configuration_id(&lens.backend)?;
+    let binding_payload = serde_json::to_vec(&ReviewLensRequestBindingPayload {
         version: REVIEW_SCHEMA_VERSION,
-        lens_id: lens.id.clone(),
-        backend_id: lens.backend.backend_id().to_string(),
-        model: lens.backend.model().to_string(),
-        information,
+        lens: &descriptor,
+        backend_configuration_id: &backend_configuration_id,
+        information: &information,
     })
+    .context("failed to serialize review lens request identity")?;
+    if binding_payload.len() > REVIEW_INPUT_LIMIT_BYTES {
+        bail!(
+            "review lens scoped request payload exceeds its {} byte limit",
+            REVIEW_INPUT_LIMIT_BYTES
+        );
+    }
+    let request_binding = domain_sha256(REVIEW_LENS_REQUEST_DOMAIN, &binding_payload);
+    let request = ReviewLensRequest {
+        version: REVIEW_SCHEMA_VERSION,
+        lens_id: descriptor.id,
+        backend_id: descriptor.backend_id,
+        model: descriptor.model,
+        request_binding,
+        information,
+    };
+    let serialized =
+        serde_json::to_vec(&request).context("failed to serialize bounded review lens request")?;
+    if serialized.len() > REVIEW_INPUT_LIMIT_BYTES {
+        bail!(
+            "review lens scoped request exceeds its {} byte limit",
+            REVIEW_INPUT_LIMIT_BYTES
+        );
+    }
+    Ok(request)
 }
 
-/// The default review set is intentionally cheap: neither lens receives the
-/// full child transcript.
+fn validate_review_lens_selected_input(
+    scope: ReviewInformationScope,
+    sources: ReviewLensRequestSources<'_>,
+) -> Result<()> {
+    let included_bytes = match scope {
+        ReviewInformationScope::FullChildTranscript => sources
+            .child_transcript
+            .len()
+            .checked_add(sources.diff.len())
+            .and_then(|total| total.checked_add(sources.output_report.len())),
+        ReviewInformationScope::DiffOnly => Some(sources.diff.len()),
+        ReviewInformationScope::OutputReportOnly => Some(sources.output_report.len()),
+    }
+    .context("review lens scoped input byte total overflow")?;
+    if included_bytes > REVIEW_INPUT_LIMIT_BYTES {
+        bail!(
+            "review lens scoped input exceeds its {} byte limit",
+            REVIEW_INPUT_LIMIT_BYTES
+        );
+    }
+    Ok(())
+}
+
+/// Cheap local scope templates. Neither lens receives the full child
+/// transcript, but both use the same deterministic fake reviewer and are not
+/// independent production authorities. Integrations must replace their
+/// backend/model selections before treating them as authoritative lenses.
 pub fn cheap_default_review_lenses() -> Vec<ReviewLensConfig> {
     let backend = || ReviewLensBackendConfig::Model {
         backend_id: "deterministic-local-reviewer".to_string(),
@@ -540,11 +604,70 @@ pub enum ReviewLensEvidenceKind {
     ExternalValidation,
 }
 
+/// Public-safe identity for a configured lens. Execution configuration such as
+/// reviewer programs, arguments, and fake findings remains parent-private.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLensDescriptor {
+    pub id: String,
+    pub backend_id: String,
+    pub model: String,
+    pub information_scope: ReviewInformationScope,
+    pub expected_evidence_kind: ReviewLensEvidenceKind,
+}
+
+impl ReviewLensDescriptor {
+    fn from_config(lens: &ReviewLensConfig) -> Self {
+        Self {
+            id: lens.id.clone(),
+            backend_id: lens.backend.backend_id().to_string(),
+            model: lens.backend.model().to_string(),
+            information_scope: lens.information_scope,
+            expected_evidence_kind: lens.backend.expected_evidence_kind(),
+        }
+    }
+}
+
+impl From<&ReviewLensConfig> for ReviewLensDescriptor {
+    fn from(lens: &ReviewLensConfig) -> Self {
+        Self::from_config(lens)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLensEvidence {
     pub kind: ReviewLensEvidenceKind,
+    /// Opaque content/provenance identity supplied by the evidence producer.
+    /// This core checks metadata consistency but does not authenticate the
+    /// binding or claim cryptographic provenance.
     pub binding: String,
+    pub lens: ReviewLensDescriptor,
+    pub backend_configuration_id: String,
+    pub request_binding: String,
+    pub coverage: ReviewLensCoverage,
+}
+
+impl ReviewLensEvidence {
+    pub fn for_lens(
+        lens: &ReviewLensConfig,
+        kind: ReviewLensEvidenceKind,
+        binding: String,
+        request_binding: String,
+        coverage: ReviewLensCoverage,
+    ) -> Result<Self> {
+        validate_review_lens_config(lens)?;
+        let evidence = Self {
+            kind,
+            binding,
+            lens: ReviewLensDescriptor::from(lens),
+            backend_configuration_id: review_lens_backend_configuration_id(&lens.backend)?,
+            request_binding,
+            coverage,
+        };
+        validate_review_evidence(&evidence)?;
+        Ok(evidence)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -576,7 +699,12 @@ pub enum ReviewLensVerdictStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLensVerdict {
+    /// Stable routing id used to associate a returned verdict with its
+    /// configured lens. The separately reported descriptor is validated
+    /// against that configuration.
     pub lens_id: String,
+    pub lens: ReviewLensDescriptor,
+    pub request_binding: String,
     pub verdict: ReviewLensVerdictStatus,
     pub coverage: ReviewLensCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -584,9 +712,53 @@ pub struct ReviewLensVerdict {
 }
 
 impl ReviewLensVerdict {
-    fn missing(lens_id: String) -> Self {
+    pub fn for_lens(
+        lens: &ReviewLensConfig,
+        request_binding: String,
+        verdict: ReviewLensVerdictStatus,
+        coverage: ReviewLensCoverage,
+        evidence: Vec<(ReviewLensEvidenceKind, String)>,
+    ) -> Result<Self> {
+        validate_review_lens_config(lens)?;
+        validate_review_digest_identity(&request_binding, "review lens request binding")?;
+        validate_review_coverage_metadata(&coverage, "review lens verdict coverage")?;
+        if evidence.len() > REVIEW_FINDING_LIMIT {
+            bail!("review lens evidence exceeds its item limit");
+        }
+        if verdict != ReviewLensVerdictStatus::ProceduralFailure
+            && !evidence
+                .iter()
+                .any(|(kind, _)| *kind == lens.backend.expected_evidence_kind())
+        {
+            bail!("review lens verdict lacks its configured evidence kind");
+        }
+        let evidence = evidence
+            .into_iter()
+            .map(|(kind, binding)| {
+                ReviewLensEvidence::for_lens(
+                    lens,
+                    kind,
+                    binding,
+                    request_binding.clone(),
+                    coverage.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            lens_id: lens.id.clone(),
+            lens: ReviewLensDescriptor::from(lens),
+            request_binding,
+            verdict,
+            coverage,
+            evidence,
+        })
+    }
+
+    fn missing(lens: &ReviewLensConfig) -> Self {
         Self {
-            lens_id,
+            lens_id: lens.id.clone(),
+            lens: ReviewLensDescriptor::from(lens),
+            request_binding: String::new(),
             verdict: ReviewLensVerdictStatus::ProceduralFailure,
             coverage: ReviewLensCoverage::default(),
             evidence: Vec::new(),
@@ -595,7 +767,7 @@ impl ReviewLensVerdict {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ReviewAggregationPolicy {
     AllMustAccept,
     ValidatedQuorum { minimum_accepts: usize },
@@ -612,8 +784,10 @@ pub enum ReviewAggregationDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AggregatedReviewLensVerdict {
-    pub lens: ReviewLensConfig,
+    pub lens: ReviewLensDescriptor,
     pub reported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_binding: Option<String>,
     pub reported_verdict: ReviewLensVerdictStatus,
     pub effective_verdict: ReviewLensVerdictStatus,
     pub coverage: ReviewLensCoverage,
@@ -625,6 +799,7 @@ pub struct AggregatedReviewLensVerdict {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLensAggregate {
+    #[serde(deserialize_with = "deserialize_review_schema_version")]
     pub version: u32,
     pub policy: ReviewAggregationPolicy,
     pub decision: ReviewAggregationDecision,
@@ -644,6 +819,12 @@ pub fn aggregate_review_lenses(
 ) -> Result<ReviewLensAggregate> {
     validate_review_lens_set(lenses)?;
     validate_review_coverage_requirement(&required_coverage)?;
+    if verdicts.len() > REVIEW_LENS_LIMIT {
+        bail!(
+            "review lens verdict list exceeds its {} item limit",
+            REVIEW_LENS_LIMIT
+        );
+    }
     let required_accepts = match policy {
         ReviewAggregationPolicy::AllMustAccept => lenses.len(),
         ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts } => {
@@ -684,7 +865,7 @@ pub fn aggregate_review_lenses(
             } else {
                 (
                     false,
-                    ReviewLensVerdict::missing(lens.id.clone()),
+                    ReviewLensVerdict::missing(lens),
                     vec!["review lens did not report a verdict".to_string()],
                 )
             };
@@ -695,13 +876,29 @@ pub fn aggregate_review_lenses(
             validation_errors.dedup();
             ReviewLensVerdictStatus::ProceduralFailure
         };
+        let request_binding = (reported
+            && validate_review_digest_identity(
+                &verdict.request_binding,
+                "review lens request binding",
+            )
+            .is_ok())
+        .then(|| verdict.request_binding.clone());
+        let coverage =
+            if validate_review_coverage_metadata(&verdict.coverage, "review lens coverage").is_ok()
+            {
+                verdict.coverage.clone()
+            } else {
+                ReviewLensCoverage::default()
+            };
+        let evidence = public_safe_review_lens_evidence(lens, &verdict);
         lens_verdicts.push(AggregatedReviewLensVerdict {
-            lens: lens.clone(),
+            lens: ReviewLensDescriptor::from(lens),
             reported,
+            request_binding,
             reported_verdict: verdict.verdict,
             effective_verdict,
-            coverage: verdict.coverage,
-            evidence: verdict.evidence,
+            coverage,
+            evidence,
             validation_errors,
         });
     }
@@ -804,6 +1001,45 @@ fn validate_review_lens_config(lens: &ReviewLensConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_review_lens_descriptor(descriptor: &ReviewLensDescriptor, label: &str) -> Result<()> {
+    validate_review_lens_id(&descriptor.id, &format!("{label} id"))?;
+    validate_review_lens_id(&descriptor.backend_id, &format!("{label} backend id"))?;
+    validate_bounded_scalar(
+        &descriptor.model,
+        &format!("{label} model"),
+        REVIEW_SHORT_TEXT_LIMIT_BYTES,
+        false,
+    )?;
+    if contains_private_key_material(&descriptor.model)
+        || Redactor::new()
+            .redact(&descriptor.model)
+            .summary
+            .total_replacements
+            > 0
+        || contains_external_absolute_path(&descriptor.model)
+    {
+        bail!("{label} model contains unsafe private or external evidence");
+    }
+    Ok(())
+}
+
+fn review_lens_backend_configuration_id(backend: &ReviewLensBackendConfig) -> Result<String> {
+    let payload = serde_json::to_vec(backend)
+        .context("failed to serialize review lens backend configuration identity")?;
+    Ok(domain_sha256(REVIEW_LENS_BACKEND_CONFIG_DOMAIN, &payload))
+}
+
+fn validate_review_digest_identity(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("{label} must be a lowercase SHA-256 content identity");
+    }
+    Ok(())
+}
+
 fn validate_review_lens_id(value: &str, label: &str) -> Result<()> {
     validate_bounded_scalar(value, label, REVIEW_SHORT_TEXT_LIMIT_BYTES, false)?;
     if !value
@@ -863,6 +1099,36 @@ fn review_lens_verdict_errors(
     verdict: &ReviewLensVerdict,
 ) -> Vec<String> {
     let mut errors = Vec::new();
+    let expected_lens = ReviewLensDescriptor::from(lens);
+    if let Err(error) = validate_review_lens_descriptor(&verdict.lens, "review lens verdict") {
+        errors.push(error.to_string());
+    }
+    if verdict.lens_id != lens.id {
+        errors.push("review lens verdict routing id does not match configuration".to_string());
+    }
+    if verdict.lens.id != expected_lens.id {
+        errors.push("review lens verdict id does not match configuration".to_string());
+    }
+    if verdict.lens.backend_id != expected_lens.backend_id {
+        errors.push("review lens verdict backend id does not match configuration".to_string());
+    }
+    if verdict.lens.model != expected_lens.model {
+        errors.push("review lens verdict model does not match configuration".to_string());
+    }
+    if verdict.lens.information_scope != expected_lens.information_scope {
+        errors
+            .push("review lens verdict information scope does not match configuration".to_string());
+    }
+    if verdict.lens.expected_evidence_kind != expected_lens.expected_evidence_kind {
+        errors.push(
+            "review lens verdict expected evidence kind does not match configuration".to_string(),
+        );
+    }
+    if let Err(error) =
+        validate_review_digest_identity(&verdict.request_binding, "review lens request binding")
+    {
+        errors.push(error.to_string());
+    }
     let coverage =
         match validate_review_coverage_metadata(&verdict.coverage, "review lens coverage") {
             Ok(coverage) => Some(coverage),
@@ -871,11 +1137,74 @@ fn review_lens_verdict_errors(
                 None
             }
         };
+    if verdict.evidence.len() > REVIEW_FINDING_LIMIT {
+        errors.push(format!(
+            "review lens evidence exceeds its {} item limit",
+            REVIEW_FINDING_LIMIT
+        ));
+    }
+    let expected_backend_configuration_id =
+        match review_lens_backend_configuration_id(&lens.backend) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                errors.push(error.to_string());
+                None
+            }
+        };
     let mut valid_evidence_kinds = BTreeSet::new();
-    for evidence in &verdict.evidence {
+    for evidence in verdict.evidence.iter().take(REVIEW_FINDING_LIMIT) {
         if let Err(error) = validate_review_evidence(evidence) {
             errors.push(error.to_string());
-        } else {
+            continue;
+        }
+        let mut metadata_matches = true;
+        if evidence.lens.id != expected_lens.id {
+            errors.push("review lens evidence lens id does not match configuration".to_string());
+            metadata_matches = false;
+        }
+        if evidence.lens.backend_id != expected_lens.backend_id {
+            errors.push("review lens evidence backend id does not match configuration".to_string());
+            metadata_matches = false;
+        }
+        if evidence.lens.model != expected_lens.model {
+            errors.push("review lens evidence model does not match configuration".to_string());
+            metadata_matches = false;
+        }
+        if evidence.lens.information_scope != expected_lens.information_scope {
+            errors.push(
+                "review lens evidence information scope does not match configuration".to_string(),
+            );
+            metadata_matches = false;
+        }
+        if evidence.lens.expected_evidence_kind != expected_lens.expected_evidence_kind {
+            errors.push(
+                "review lens evidence expected kind does not match configuration".to_string(),
+            );
+            metadata_matches = false;
+        }
+        if expected_backend_configuration_id
+            .as_ref()
+            .is_none_or(|identity| evidence.backend_configuration_id != identity.as_str())
+        {
+            errors.push(
+                "review lens evidence backend configuration identity does not match configuration"
+                    .to_string(),
+            );
+            metadata_matches = false;
+        }
+        if evidence.request_binding != verdict.request_binding {
+            errors.push(
+                "review lens evidence request identity does not match verdict request identity"
+                    .to_string(),
+            );
+            metadata_matches = false;
+        }
+        if evidence.coverage != verdict.coverage {
+            errors
+                .push("review lens evidence coverage does not match verdict coverage".to_string());
+            metadata_matches = false;
+        }
+        if metadata_matches {
             valid_evidence_kinds.insert(evidence.kind);
         }
     }
@@ -910,6 +1239,30 @@ fn review_lens_verdict_errors(
     errors
 }
 
+fn public_safe_review_lens_evidence(
+    lens: &ReviewLensConfig,
+    verdict: &ReviewLensVerdict,
+) -> Vec<ReviewLensEvidence> {
+    let expected_lens = ReviewLensDescriptor::from(lens);
+    let Ok(expected_backend_configuration_id) = review_lens_backend_configuration_id(&lens.backend)
+    else {
+        return Vec::new();
+    };
+    verdict
+        .evidence
+        .iter()
+        .take(REVIEW_FINDING_LIMIT)
+        .filter(|evidence| {
+            validate_review_evidence(evidence).is_ok()
+                && evidence.lens == expected_lens
+                && evidence.backend_configuration_id == expected_backend_configuration_id
+                && evidence.request_binding == verdict.request_binding
+                && evidence.coverage == verdict.coverage
+        })
+        .cloned()
+        .collect()
+}
+
 fn validate_review_evidence(evidence: &ReviewLensEvidence) -> Result<()> {
     validate_bounded_scalar(
         &evidence.binding,
@@ -927,6 +1280,16 @@ fn validate_review_evidence(evidence: &ReviewLensEvidence) -> Result<()> {
     {
         bail!("review lens evidence binding contains unsafe private or external evidence");
     }
+    validate_review_lens_descriptor(&evidence.lens, "review lens evidence")?;
+    validate_review_digest_identity(
+        &evidence.backend_configuration_id,
+        "review lens backend configuration identity",
+    )?;
+    validate_review_digest_identity(
+        &evidence.request_binding,
+        "review lens evidence request binding",
+    )?;
+    validate_review_coverage_metadata(&evidence.coverage, "review lens evidence coverage")?;
     Ok(())
 }
 
@@ -4683,6 +5046,19 @@ fn review_schema_version() -> u32 {
     REVIEW_SCHEMA_VERSION
 }
 
+fn deserialize_review_schema_version<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version != REVIEW_SCHEMA_VERSION {
+        return Err(D::Error::custom(
+            "review wire version is unsupported; expected version 1",
+        ));
+    }
+    Ok(version)
+}
+
 fn sha256_hex(input: &[u8]) -> String {
     let mut output = String::with_capacity(64);
     for byte in sha256_bytes(input) {
@@ -4848,22 +5224,23 @@ mod tests {
     }
 
     fn bound_lens_verdict(
-        lens_id: &str,
+        lens: &ReviewLensConfig,
         verdict: ReviewLensVerdictStatus,
         binding: &str,
     ) -> ReviewLensVerdict {
-        ReviewLensVerdict {
-            lens_id: lens_id.to_string(),
+        let coverage = ReviewLensCoverage {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("src/review.rs")],
+        };
+        let request_binding = sha256_hex(format!("request-{binding}").as_bytes());
+        ReviewLensVerdict::for_lens(
+            lens,
+            request_binding,
             verdict,
-            coverage: ReviewLensCoverage {
-                worker_ids: vec!["worker-a".to_string()],
-                paths: vec![PathBuf::from("src/review.rs")],
-            },
-            evidence: vec![ReviewLensEvidence {
-                kind: ReviewLensEvidenceKind::ModelReview,
-                binding: binding.to_string(),
-            }],
-        }
+            coverage,
+            vec![(ReviewLensEvidenceKind::ModelReview, binding.to_string())],
+        )
+        .expect("test lens verdict must serialize")
     }
 
     #[cfg(unix)]
@@ -4935,7 +5312,164 @@ mod tests {
     }
 
     #[test]
-    fn review_lens_defaults_are_stable_and_cheap() {
+    fn review_lens_scoped_request_bounds_only_included_information() -> Result<()> {
+        let lens = model_review_lens(
+            "bounded-diff-lens",
+            "bounded-backend",
+            "bounded-model",
+            ReviewInformationScope::DiffOnly,
+        );
+        let oversized_excluded = "t".repeat(REVIEW_INPUT_LIMIT_BYTES + 1);
+        let request = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: &oversized_excluded,
+                diff: "small included diff",
+                output_report: &oversized_excluded,
+            },
+        )?;
+        assert!(matches!(
+            request.information,
+            ReviewLensScopedInformation::DiffOnly { .. }
+        ));
+
+        let oversized_included = "d".repeat(REVIEW_INPUT_LIMIT_BYTES + 1);
+        let error = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: "excluded",
+                diff: &oversized_included,
+                output_report: "excluded",
+            },
+        )
+        .expect_err("oversized included diff must fail before cloning");
+        assert!(error.to_string().contains("scoped input exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_versioned_wires_reject_unsupported_versions() -> Result<()> {
+        let lens = model_review_lens(
+            "version-lens",
+            "version-backend",
+            "version-model",
+            ReviewInformationScope::DiffOnly,
+        );
+        let request = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: "transcript",
+                diff: "diff",
+                output_report: "report",
+            },
+        )?;
+        let mut request_value = serde_json::to_value(request)?;
+        request_value["version"] = serde_json::json!(REVIEW_SCHEMA_VERSION + 1);
+        assert!(serde_json::from_value::<ReviewLensRequest>(request_value)
+            .expect_err("unsupported request version must fail")
+            .to_string()
+            .contains("version is unsupported"));
+
+        let aggregate = aggregate_review_lenses(
+            std::slice::from_ref(&lens),
+            ReviewAggregationPolicy::AllMustAccept,
+            ReviewCoverageRequirement {
+                worker_ids: vec!["worker-a".to_string()],
+                paths: vec![PathBuf::from("src/review.rs")],
+            },
+            vec![bound_lens_verdict(
+                &lens,
+                ReviewLensVerdictStatus::Accept,
+                "version-binding",
+            )],
+        )?;
+        let mut aggregate_value = serde_json::to_value(aggregate)?;
+        aggregate_value["version"] = serde_json::json!(REVIEW_SCHEMA_VERSION + 1);
+        assert!(
+            serde_json::from_value::<ReviewLensAggregate>(aggregate_value)
+                .expect_err("unsupported aggregate version must fail")
+                .to_string()
+                .contains("version is unsupported")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_tagged_wires_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<ReviewLensBackendConfig>(serde_json::json!({
+                "kind": "model",
+                "backend_id": "backend-a",
+                "model": "model-a",
+                "reviewer": {"mode": "fake"},
+                "unknown": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReviewLensScopedInformation>(serde_json::json!({
+                "scope": "diff_only",
+                "diff": "bounded",
+                "unknown": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ReviewAggregationPolicy>(serde_json::json!({
+                "kind": "validated_quorum",
+                "minimum_accepts": 1,
+                "unknown": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn review_lens_public_constructors_bind_safe_identity() -> Result<()> {
+        let lens = model_review_lens(
+            "constructor-lens",
+            "constructor-backend",
+            "constructor-model",
+            ReviewInformationScope::OutputReportOnly,
+        );
+        let descriptor = ReviewLensDescriptor::from(&lens);
+        assert_eq!(descriptor.id, lens.id);
+        assert_eq!(descriptor.backend_id, "constructor-backend");
+        assert_eq!(descriptor.model, "constructor-model");
+        assert_eq!(
+            descriptor.information_scope,
+            ReviewInformationScope::OutputReportOnly
+        );
+        assert_eq!(
+            descriptor.expected_evidence_kind,
+            ReviewLensEvidenceKind::ModelReview
+        );
+
+        let request_binding = sha256_hex(b"constructor-request");
+        let coverage = ReviewLensCoverage {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("src/review.rs")],
+        };
+        let verdict = ReviewLensVerdict::for_lens(
+            &lens,
+            request_binding.clone(),
+            ReviewLensVerdictStatus::Accept,
+            coverage.clone(),
+            vec![(
+                ReviewLensEvidenceKind::ModelReview,
+                "constructor-evidence".to_string(),
+            )],
+        )?;
+        assert_eq!(verdict.lens, descriptor);
+        assert_eq!(verdict.request_binding, request_binding);
+        assert_eq!(verdict.evidence[0].lens, verdict.lens);
+        assert_eq!(verdict.evidence[0].coverage, coverage);
+        assert_eq!(verdict.evidence[0].request_binding, verdict.request_binding);
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_default_scope_templates_are_stable_cheap_and_local() {
         let lenses = cheap_default_review_lenses();
 
         assert_eq!(lenses.len(), 2);
@@ -4954,6 +5488,88 @@ mod tests {
                 && !lens.backend.backend_id().is_empty()
                 && !lens.backend.model().is_empty()
         }));
+        assert_eq!(lenses[0].backend, lenses[1].backend);
+        assert!(lenses.iter().all(|lens| matches!(
+            &lens.backend,
+            ReviewLensBackendConfig::Model {
+                reviewer: ReviewerConfig {
+                    mode: ReviewerMode::Fake,
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn review_lens_aggregate_omits_private_backend_configuration() -> Result<()> {
+        let lenses = vec![
+            ReviewLensConfig {
+                id: "fake-private-config".to_string(),
+                backend: ReviewLensBackendConfig::Model {
+                    backend_id: "fake-local".to_string(),
+                    model: "fake-model".to_string(),
+                    reviewer: ReviewerConfig {
+                        blocking_attempts: 1,
+                        finding: Some(FakeReviewFindingTemplate {
+                            severity: "warning".to_string(),
+                            path: None,
+                            summary: "PRIVATE_FAKE_SUMMARY_MARKER".to_string(),
+                            suggested_fix: "PRIVATE_FAKE_FIX_MARKER".to_string(),
+                        }),
+                        ..ReviewerConfig::default()
+                    },
+                },
+                information_scope: ReviewInformationScope::OutputReportOnly,
+            },
+            ReviewLensConfig {
+                id: "external-private-config".to_string(),
+                backend: ReviewLensBackendConfig::Model {
+                    backend_id: "external-direct".to_string(),
+                    model: "external-model".to_string(),
+                    reviewer: ReviewerConfig {
+                        mode: ReviewerMode::ExternalCommand,
+                        program: Some(PathBuf::from("tools/PRIVATE_PROGRAM_MARKER")),
+                        args: vec!["PRIVATE_ARG_MARKER".to_string()],
+                        timeout_seconds: Some(30),
+                        ..ReviewerConfig::default()
+                    },
+                },
+                information_scope: ReviewInformationScope::DiffOnly,
+            },
+        ];
+        let aggregate = aggregate_review_lenses(
+            &lenses,
+            ReviewAggregationPolicy::AllMustAccept,
+            ReviewCoverageRequirement {
+                worker_ids: vec!["worker-a".to_string()],
+                paths: vec![PathBuf::from("src/review.rs")],
+            },
+            vec![
+                bound_lens_verdict(&lenses[0], ReviewLensVerdictStatus::Accept, "private-a"),
+                bound_lens_verdict(&lenses[1], ReviewLensVerdictStatus::Accept, "private-b"),
+            ],
+        )?;
+        let serialized = serde_json::to_string(&aggregate)?;
+
+        for marker in [
+            "PRIVATE_FAKE_SUMMARY_MARKER",
+            "PRIVATE_FAKE_FIX_MARKER",
+            "PRIVATE_PROGRAM_MARKER",
+            "PRIVATE_ARG_MARKER",
+            "\"reviewer\"",
+            "\"program\"",
+            "\"args\"",
+            "\"finding\"",
+        ] {
+            assert!(
+                !serialized.contains(marker),
+                "aggregate leaked private backend marker {marker}"
+            );
+        }
+        assert!(serialized.contains("\"backend_id\":\"external-direct\""));
+        assert!(serialized.contains("\"model\":\"external-model\""));
+        Ok(())
     }
 
     #[test]
@@ -4981,8 +5597,8 @@ mod tests {
             ReviewAggregationPolicy::AllMustAccept,
             required.clone(),
             vec![
-                bound_lens_verdict("lens-a", ReviewLensVerdictStatus::Accept, "binding-a"),
-                bound_lens_verdict("lens-b", ReviewLensVerdictStatus::Accept, "binding-b"),
+                bound_lens_verdict(&lenses[0], ReviewLensVerdictStatus::Accept, "binding-a"),
+                bound_lens_verdict(&lenses[1], ReviewLensVerdictStatus::Accept, "binding-b"),
             ],
         )?;
         assert_eq!(accepted.decision, ReviewAggregationDecision::Accept);
@@ -4993,8 +5609,8 @@ mod tests {
             ReviewAggregationPolicy::AllMustAccept,
             required.clone(),
             vec![
-                bound_lens_verdict("lens-a", ReviewLensVerdictStatus::Accept, "binding-a"),
-                bound_lens_verdict("lens-b", ReviewLensVerdictStatus::Reject, "binding-b"),
+                bound_lens_verdict(&lenses[0], ReviewLensVerdictStatus::Accept, "binding-a"),
+                bound_lens_verdict(&lenses[1], ReviewLensVerdictStatus::Reject, "binding-b"),
             ],
         )?;
         assert_eq!(rejected.decision, ReviewAggregationDecision::Reject);
@@ -5009,7 +5625,7 @@ mod tests {
             ReviewAggregationPolicy::AllMustAccept,
             required,
             vec![bound_lens_verdict(
-                "lens-a",
+                &lenses[0],
                 ReviewLensVerdictStatus::Accept,
                 "binding-a",
             )],
@@ -5043,7 +5659,9 @@ mod tests {
                 paths: vec![PathBuf::from("src/review.rs")],
             },
             vec![ReviewLensVerdict {
-                lens_id: "lens-a".to_string(),
+                lens_id: lenses[0].id.clone(),
+                lens: ReviewLensDescriptor::from(&lenses[0]),
+                request_binding: sha256_hex(b"request-binding-a"),
                 verdict: ReviewLensVerdictStatus::Accept,
                 coverage: ReviewLensCoverage::default(),
                 evidence: Vec::new(),
@@ -5066,6 +5684,248 @@ mod tests {
         assert!(errors.contains("lacks bound ModelReview evidence"));
         assert!(errors.contains("omitted required worker coverage"));
         assert!(errors.contains("omitted required path coverage"));
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_aggregation_enforces_verdict_and_evidence_bounds() -> Result<()> {
+        let lens = model_review_lens(
+            "bounded-verdict-lens",
+            "bounded-verdict-backend",
+            "bounded-verdict-model",
+            ReviewInformationScope::DiffOnly,
+        );
+        let required = ReviewCoverageRequirement {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("src/review.rs")],
+        };
+        let base = bound_lens_verdict(
+            &lens,
+            ReviewLensVerdictStatus::Accept,
+            "bounded-verdict-binding",
+        );
+
+        let mut oversized_evidence = base.clone();
+        oversized_evidence.evidence = vec![base.evidence[0].clone(); REVIEW_FINDING_LIMIT + 1];
+        let aggregate = aggregate_review_lenses(
+            std::slice::from_ref(&lens),
+            ReviewAggregationPolicy::AllMustAccept,
+            required.clone(),
+            vec![oversized_evidence],
+        )?;
+        assert_eq!(
+            aggregate.decision,
+            ReviewAggregationDecision::ProceduralFailure
+        );
+        assert_eq!(
+            aggregate.lens_verdicts[0].evidence.len(),
+            REVIEW_FINDING_LIMIT
+        );
+        assert!(aggregate.lens_verdicts[0]
+            .validation_errors
+            .join("\n")
+            .contains("evidence exceeds"));
+
+        let error = aggregate_review_lenses(
+            std::slice::from_ref(&lens),
+            ReviewAggregationPolicy::AllMustAccept,
+            required,
+            vec![base; REVIEW_LENS_LIMIT + 1],
+        )
+        .expect_err("oversized verdict list must fail before map construction");
+        assert!(error.to_string().contains("verdict list exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_procedural_aggregate_omits_rejected_unsafe_metadata() -> Result<()> {
+        let lens = model_review_lens(
+            "sanitized-aggregate-lens",
+            "sanitized-aggregate-backend",
+            "sanitized-aggregate-model",
+            ReviewInformationScope::DiffOnly,
+        );
+        let mut verdict = bound_lens_verdict(
+            &lens,
+            ReviewLensVerdictStatus::Accept,
+            "initial-safe-binding",
+        );
+        verdict.request_binding = "PRIVATE_REQUEST_MARKER".to_string();
+        verdict.coverage = ReviewLensCoverage {
+            worker_ids: vec!["PRIVATE COVERAGE MARKER".to_string()],
+            paths: vec![PathBuf::from("/private/ABSOLUTE_COVERAGE_MARKER")],
+        };
+        let mut secret_evidence = verdict.evidence[0].clone();
+        secret_evidence.binding = "API_TOKEN=PRIVATE_SECRET_EVIDENCE_MARKER".to_string();
+        secret_evidence.request_binding = verdict.request_binding.clone();
+        secret_evidence.coverage = verdict.coverage.clone();
+        let mut absolute_evidence = secret_evidence.clone();
+        absolute_evidence.binding = "/private/ABSOLUTE_EVIDENCE_MARKER".to_string();
+        verdict.evidence = vec![secret_evidence, absolute_evidence];
+
+        let aggregate = aggregate_review_lenses(
+            std::slice::from_ref(&lens),
+            ReviewAggregationPolicy::AllMustAccept,
+            ReviewCoverageRequirement {
+                worker_ids: vec!["worker-a".to_string()],
+                paths: vec![PathBuf::from("src/review.rs")],
+            },
+            vec![verdict],
+        )?;
+        assert_eq!(
+            aggregate.decision,
+            ReviewAggregationDecision::ProceduralFailure
+        );
+        assert!(aggregate.lens_verdicts[0].request_binding.is_none());
+        assert_eq!(
+            aggregate.lens_verdicts[0].coverage,
+            ReviewLensCoverage::default()
+        );
+        assert!(aggregate.lens_verdicts[0].evidence.is_empty());
+        let serialized = serde_json::to_string(&aggregate)?;
+        for marker in [
+            "PRIVATE_REQUEST_MARKER",
+            "PRIVATE COVERAGE MARKER",
+            "ABSOLUTE_COVERAGE_MARKER",
+            "PRIVATE_SECRET_EVIDENCE_MARKER",
+            "ABSOLUTE_EVIDENCE_MARKER",
+        ] {
+            assert!(
+                !serialized.contains(marker),
+                "procedural aggregate leaked rejected marker {marker}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_mismatched_evidence_metadata_fails_procedurally() -> Result<()> {
+        let lens = model_review_lens(
+            "metadata-lens",
+            "metadata-backend",
+            "metadata-model",
+            ReviewInformationScope::DiffOnly,
+        );
+        let required = ReviewCoverageRequirement {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("src/review.rs")],
+        };
+        let base = bound_lens_verdict(&lens, ReviewLensVerdictStatus::Accept, "metadata-binding");
+        let mut cases = Vec::new();
+
+        let mut lens_id = base.clone();
+        lens_id.evidence[0].lens.id = "other-lens".to_string();
+        cases.push((lens_id, "evidence lens id"));
+
+        let mut backend = base.clone();
+        backend.evidence[0].lens.backend_id = "other-backend".to_string();
+        cases.push((backend, "evidence backend id"));
+
+        let mut model = base.clone();
+        model.evidence[0].lens.model = "other-model".to_string();
+        cases.push((model, "evidence model"));
+
+        let mut scope = base.clone();
+        scope.evidence[0].lens.information_scope = ReviewInformationScope::OutputReportOnly;
+        cases.push((scope, "evidence information scope"));
+
+        let mut coverage = base.clone();
+        coverage.evidence[0].coverage = ReviewLensCoverage::default();
+        cases.push((coverage, "evidence coverage"));
+
+        let mut backend_configuration = base.clone();
+        backend_configuration.evidence[0].backend_configuration_id =
+            sha256_hex(b"other-backend-configuration");
+        cases.push((backend_configuration, "backend configuration identity"));
+
+        let mut request = base.clone();
+        request.evidence[0].request_binding = sha256_hex(b"other-request");
+        cases.push((request, "evidence request identity"));
+
+        for (verdict, expected_error) in cases {
+            let aggregate = aggregate_review_lenses(
+                std::slice::from_ref(&lens),
+                ReviewAggregationPolicy::AllMustAccept,
+                required.clone(),
+                vec![verdict],
+            )?;
+            assert_eq!(
+                aggregate.decision,
+                ReviewAggregationDecision::ProceduralFailure
+            );
+            assert_eq!(
+                aggregate.lens_verdicts[0].reported_verdict,
+                ReviewLensVerdictStatus::Accept
+            );
+            assert_eq!(
+                aggregate.lens_verdicts[0].effective_verdict,
+                ReviewLensVerdictStatus::ProceduralFailure
+            );
+            assert!(
+                aggregate.lens_verdicts[0]
+                    .validation_errors
+                    .join("\n")
+                    .contains(expected_error),
+                "missing validation error for {expected_error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_mismatched_verdict_identity_fails_procedurally() -> Result<()> {
+        let lens = model_review_lens(
+            "verdict-metadata-lens",
+            "verdict-backend",
+            "verdict-model",
+            ReviewInformationScope::OutputReportOnly,
+        );
+        let required = ReviewCoverageRequirement {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("src/review.rs")],
+        };
+        let base = bound_lens_verdict(&lens, ReviewLensVerdictStatus::Accept, "verdict-binding");
+        let mut cases = Vec::new();
+
+        let mut id = base.clone();
+        id.lens.id = "wrong-verdict-lens".to_string();
+        cases.push((id, "verdict id"));
+
+        let mut backend = base.clone();
+        backend.lens.backend_id = "wrong-verdict-backend".to_string();
+        cases.push((backend, "verdict backend id"));
+
+        let mut model = base.clone();
+        model.lens.model = "wrong-verdict-model".to_string();
+        cases.push((model, "verdict model"));
+
+        let mut scope = base.clone();
+        scope.lens.information_scope = ReviewInformationScope::DiffOnly;
+        cases.push((scope, "verdict information scope"));
+
+        let mut request = base;
+        request.request_binding = sha256_hex(b"wrong-verdict-request");
+        cases.push((request, "evidence request identity"));
+
+        for (verdict, expected_error) in cases {
+            let aggregate = aggregate_review_lenses(
+                std::slice::from_ref(&lens),
+                ReviewAggregationPolicy::AllMustAccept,
+                required.clone(),
+                vec![verdict],
+            )?;
+            assert_eq!(
+                aggregate.decision,
+                ReviewAggregationDecision::ProceduralFailure
+            );
+            assert!(
+                aggregate.lens_verdicts[0]
+                    .validation_errors
+                    .join("\n")
+                    .contains(expected_error),
+                "missing validation error for {expected_error}"
+            );
+        }
         Ok(())
     }
 
@@ -5099,9 +5959,9 @@ mod tests {
                 paths: vec![PathBuf::from("src/review.rs")],
             },
             vec![
-                bound_lens_verdict("lens-a", ReviewLensVerdictStatus::Accept, "binding-a"),
-                bound_lens_verdict("lens-b", ReviewLensVerdictStatus::Accept, "binding-b"),
-                bound_lens_verdict("lens-c", ReviewLensVerdictStatus::Reject, "binding-c"),
+                bound_lens_verdict(&lenses[0], ReviewLensVerdictStatus::Accept, "binding-a"),
+                bound_lens_verdict(&lenses[1], ReviewLensVerdictStatus::Accept, "binding-b"),
+                bound_lens_verdict(&lenses[2], ReviewLensVerdictStatus::Reject, "binding-c"),
             ],
         )?;
 
@@ -5134,18 +5994,19 @@ mod tests {
                 worker_ids: vec!["worker-a".to_string()],
                 paths: vec![PathBuf::from("src/review.rs")],
             },
-            vec![ReviewLensVerdict {
-                lens_id: "process-evidence".to_string(),
-                verdict: ReviewLensVerdictStatus::Accept,
-                coverage: ReviewLensCoverage {
+            vec![ReviewLensVerdict::for_lens(
+                &lenses[0],
+                sha256_hex(b"process-evidence-request"),
+                ReviewLensVerdictStatus::Accept,
+                ReviewLensCoverage {
                     worker_ids: vec!["worker-a".to_string()],
                     paths: vec![PathBuf::from("src/review.rs")],
                 },
-                evidence: vec![ReviewLensEvidence {
-                    kind: ReviewLensEvidenceKind::ProcessEvidence,
-                    binding: "process-binding-v1".to_string(),
-                }],
-            }],
+                vec![(
+                    ReviewLensEvidenceKind::ProcessEvidence,
+                    "process-binding-v1".to_string(),
+                )],
+            )?],
         )?;
 
         assert_eq!(aggregate.decision, ReviewAggregationDecision::Accept);
