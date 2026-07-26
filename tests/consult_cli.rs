@@ -375,9 +375,13 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
     assert!(command
         .iter()
         .any(|arg| arg == "default_permissions=\"maco_external_codex\""));
-    assert!(command.iter().any(|arg| {
-        arg == "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\"}"
-    }));
+    assert!(
+        command.iter().any(|arg| {
+            arg
+                == "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\".agents\"=\"read\",\".codex\"=\"read\",\".git\"=\"read\",\".gitignore\"=\"read\",\".maco\"=\"read\",\".maco-cache\"=\"read\",\".maco/consult/runs/consult-codex/incoming\"=\"write\"}"
+        }),
+        "unexpected command: {command:?}"
+    );
     assert!(command
         .iter()
         .any(|arg| { arg == "permissions.maco_external_codex.network={enabled=false}" }));
@@ -687,6 +691,10 @@ fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
         .context("init repo")?;
     if !output.status.success() {
         anyhow::bail!("init failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    for protected_root in [".maco", ".maco-cache", ".codex", ".agents"] {
+        fs::create_dir_all(repo_path.join(protected_root))
+            .with_context(|| format!("create protected root {protected_root}"))?;
     }
     fs::write(repo_path.join(".gitignore"), ".maco/\n").context("write gitignore")?;
     fs::write(repo_path.join("README.md"), "# Test Repo\n").context("write readme")?;
