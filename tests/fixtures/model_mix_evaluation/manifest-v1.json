@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "experiment_id": "issue26-phase-a-readme-v1",
+  "target": {
+    "spec_or_goal_id": "readme-model-mix-note-v1",
+    "spec_or_goal_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
+    "hand_authored_plan_digest": "sha256:97287ddff8f50f671fc95e2930277e4279580eeba7ac9cb4a86e7043fbe6eb9b"
+  },
+  "repository_base_snapshot": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+  "limits": {
+    "wall_time_seconds": 900,
+    "max_dispatches": 4
+  },
+  "held_out_validation": [
+    {
+      "id": "readme-contract",
+      "command": [
+        "cargo",
+        "test",
+        "evaluation::tests::committed_fixtures_match_the_deterministic_harness"
+      ]
+    },
+    {
+      "id": "provider-boundary",
+      "command": [
+        "cargo",
+        "test",
+        "evaluation::tests::real_provider_execution_has_opt_in_and_phase_a_refusal_gates"
+      ]
+    }
+  ],
+  "repetitions": 3,
+  "profiles": [
+    {
+      "id": "frontier-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "id": "hybrid-frontier-economy-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "id": "balanced-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "id": "economy-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    }
+  ]
+}
