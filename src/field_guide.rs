@@ -52,6 +52,43 @@ const CONTEXT_HEX_FIELD_PREFIX: &str = "context_utf8_hex=";
 const DATE_FIELD_PREFIX: &str = "date=";
 const SOURCE_RUN_FIELD_PREFIX: &str = "source_run=";
 
+/// One validated entry decoded by trusted code from the canonical lower-hex
+/// transport grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedFieldGuidePromptEntry {
+    finding: String,
+    context: String,
+    date: String,
+    source_run: String,
+}
+
+impl DecodedFieldGuidePromptEntry {
+    pub(crate) fn finding(&self) -> &str {
+        &self.finding
+    }
+
+    pub(crate) fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub(crate) fn date(&self) -> &str {
+        &self.date
+    }
+
+    pub(crate) fn source_run(&self) -> &str {
+        &self.source_run
+    }
+
+    pub(crate) fn decoded_payloads(&self) -> [&str; 4] {
+        [
+            self.finding(),
+            self.context(),
+            self.date(),
+            self.source_run(),
+        ]
+    }
+}
+
 enum FieldGuideSnapshotSpec {}
 
 impl JournalSpec for FieldGuideSnapshotSpec {
@@ -633,11 +670,13 @@ pub(crate) fn encode_utf8_lower_hex(value: &str) -> String {
     encoded
 }
 
-/// Validates one exact prompt-record line without exposing decoded agent text.
-///
-/// The fixed field order and lowercase-hex alphabet are the grammar. Agent
-/// bytes therefore cannot create fields, line breaks, or guide delimiters.
-pub(crate) fn validate_canonical_prompt_entry_line(line: &str) -> Result<()> {
+/// Decodes one exact canonical transport record after validating every
+/// untrusted content and trusted provenance field. The fixed field order and
+/// lowercase-hex alphabet prevent agent bytes from creating transport fields
+/// or lines before trusted decoding.
+pub(crate) fn decode_canonical_prompt_entry_line(
+    line: &str,
+) -> Result<DecodedFieldGuidePromptEntry> {
     if !line.is_ascii() || line.chars().any(char::is_control) {
         bail!("field-guide prompt record is outside the canonical ASCII grammar");
     }
@@ -652,10 +691,16 @@ pub(crate) fn validate_canonical_prompt_entry_line(line: &str) -> Result<()> {
     if fields.next().is_some() {
         bail!("field-guide prompt record has extra fields");
     }
-    validate_decoded_prompt_field("finding", finding_hex, MAX_FINDING_BYTES)?;
-    validate_decoded_prompt_field("context", context_hex, MAX_CONTEXT_BYTES)?;
+    let finding = decode_prompt_field("finding", finding_hex, MAX_FINDING_BYTES)?;
+    let context = decode_prompt_field("context", context_hex, MAX_CONTEXT_BYTES)?;
     validate_date(date)?;
-    validate_source_run(source_run)
+    validate_source_run(source_run)?;
+    Ok(DecodedFieldGuidePromptEntry {
+        finding,
+        context,
+        date: date.to_string(),
+        source_run: source_run.to_string(),
+    })
 }
 
 fn canonical_field<'a>(
@@ -672,12 +717,13 @@ fn canonical_field<'a>(
         ))
 }
 
-fn validate_decoded_prompt_field(name: &str, encoded: &str, max_bytes: usize) -> Result<()> {
+fn decode_prompt_field(name: &str, encoded: &str, max_bytes: usize) -> Result<String> {
     let decoded = decode_lower_hex(encoded)
         .with_context(|| format!("field-guide prompt {name} is not canonical lowercase hex"))?;
     let decoded = String::from_utf8(decoded)
         .with_context(|| format!("field-guide prompt {name} is not valid UTF-8"))?;
-    validate_untrusted_field(name, &decoded, max_bytes)
+    validate_untrusted_field(name, &decoded, max_bytes)?;
+    Ok(decoded)
 }
 
 fn decode_lower_hex(encoded: &str) -> Result<Vec<u8>> {
@@ -985,7 +1031,7 @@ mod tests {
                 "{class} remained as prompt text"
             );
             let line = rendered.lines().nth(index + 1).expect("entry line");
-            validate_canonical_prompt_entry_line(line).expect("canonical record");
+            decode_canonical_prompt_entry_line(line).expect("canonical record");
             assert!(line.contains(&encode_utf8_lower_hex(attack)));
         }
         assert_eq!(
@@ -1023,7 +1069,12 @@ mod tests {
             encode_utf8_lower_hex("finding"),
             encode_utf8_lower_hex("context")
         );
-        validate_canonical_prompt_entry_line(&canonical).expect("canonical record");
+        let decoded =
+            decode_canonical_prompt_entry_line(&canonical).expect("decode canonical record");
+        assert_eq!(decoded.finding(), "finding");
+        assert_eq!(decoded.context(), "context");
+        assert_eq!(decoded.date(), "2026-07-26");
+        assert_eq!(decoded.source_run(), "run-1");
 
         for invalid in [
             canonical.replacen("6669", "666I", 1),
@@ -1037,7 +1088,7 @@ mod tests {
             canonical.replacen("finding_utf8_hex=66696e64696e67", "finding_utf8_hex=ff", 1),
         ] {
             assert!(
-                validate_canonical_prompt_entry_line(&invalid).is_err(),
+                decode_canonical_prompt_entry_line(&invalid).is_err(),
                 "accepted noncanonical record: {invalid}"
             );
         }
