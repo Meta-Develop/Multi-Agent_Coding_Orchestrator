@@ -60,6 +60,10 @@ const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const SYSTEMD_OPERATION_GRACE: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
 const SYSTEMD_SLOT_WAIT: Duration = Duration::from_secs(30);
+// Keep both supervise admission and strict containment deterministic in the unit-test binary.
+// Slot zero remains reserved, so three child lanes produce four total systemd unit slots.
+#[cfg(test)]
+const TEST_HOST_PROCESS_PARALLELISM: usize = 3;
 // These safety probes assert containment evidence rather than command latency. Allow the complete
 // bounded slot wait plus setup without changing any production deadline.
 #[cfg(all(target_os = "linux", test))]
@@ -75,17 +79,32 @@ const SYSTEMD_ORPHAN_SAFETY_FUSE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cgroup-aware process capacity shared by supervise admission and strict containment.
 ///
-/// `available_parallelism` reflects the runtime's effective CPU quota/affinity where the standard
-/// library can observe it. A failed measurement degrades to one usable lane instead of removing
-/// the containment bound.
+/// Production uses `available_parallelism`, which reflects the runtime's effective CPU
+/// quota/affinity where the standard library can observe it. A failed production measurement
+/// degrades to one usable lane instead of removing the containment bound. Unit tests pin the
+/// shared capacity so both supervise admission and strict containment have deterministic width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostProcessCapacity {
     parallelism: NonZeroUsize,
 }
 
 impl HostProcessCapacity {
+    #[cfg(not(test))]
     pub(crate) fn measured() -> Self {
-        let parallelism = match thread::available_parallelism() {
+        Self::from_measurement(thread::available_parallelism())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn measured() -> Self {
+        let parallelism = match NonZeroUsize::new(TEST_HOST_PROCESS_PARALLELISM) {
+            Some(parallelism) => parallelism,
+            None => NonZeroUsize::MIN,
+        };
+        Self { parallelism }
+    }
+
+    fn from_measurement(measurement: io::Result<NonZeroUsize>) -> Self {
+        let parallelism = match measurement {
             Ok(parallelism) => parallelism,
             Err(_) => NonZeroUsize::MIN,
         };
@@ -8349,14 +8368,80 @@ fn duration_millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_host_capacity_measurement_falls_back_to_one_lane() {
+        let capacity =
+            HostProcessCapacity::from_measurement(Err(io::Error::other("injected failure")));
+
+        assert_eq!(capacity.supervisor_children(), 1);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            capacity.systemd_unit_slots(),
+            1 + RESERVED_EXPEDITED_SYSTEMD_SLOTS
+        );
+    }
+
+    #[test]
+    fn measured_host_capacity_is_pinned_for_test_supervise_and_containment() {
+        let capacity = HostProcessCapacity::measured();
+
+        assert_eq!(capacity.supervisor_children(), 3);
+        #[cfg(target_os = "linux")]
+        assert_eq!(capacity.systemd_unit_slots(), 4);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn containment_slot_bound_tracks_pinned_host_capacity_without_a_fixed_ceiling() {
+    fn containment_slot_bound_tracks_injected_host_capacity_without_a_fixed_ceiling() {
         for (parallelism, expected_slots) in [(1, 2), (4, 5), (17, 18)] {
             let parallelism = NonZeroUsize::new(parallelism).expect("test parallelism is non-zero");
             let capacity = HostProcessCapacity::from_parallelism(parallelism);
             assert_eq!(capacity.systemd_unit_slots(), expected_slots);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_containment_slot_limit_constrains_real_permit_acquisition() {
+        let runtime_root = tempfile::tempdir().expect("tempdir");
+        let cancellation = ProcessCancellation::new();
+        let test_slot_limit = HostProcessCapacity::measured().systemd_unit_slots();
+        let mut ordinary_permits = Vec::new();
+        for _ in RESERVED_EXPEDITED_SYSTEMD_SLOTS..test_slot_limit {
+            ordinary_permits.push(
+                SystemdUnitPermit::acquire(runtime_root.path(), None, &cancellation)
+                    .expect("acquire ordinary test containment permit"),
+            );
+        }
+        assert_eq!(ordinary_permits.len(), 3);
+
+        let expedited_permit = SystemdUnitPermit::acquire(
+            runtime_root.path(),
+            Some(Instant::now() + Duration::from_millis(500)),
+            &cancellation,
+        )
+        .expect("acquire reserved expedited test containment permit");
+
+        let overflow_result = SystemdUnitPermit::acquire(
+            runtime_root.path(),
+            Some(Instant::now() + Duration::from_secs(2)),
+            &cancellation,
+        );
+        let error = match overflow_result {
+            Ok(_) => panic!("test containment limit must prevent acquisition beyond four slots"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !runtime_root
+                .path()
+                .join(format!("maco-process-runner-slot-{}.lock", test_slot_limit))
+                .exists(),
+            "real acquisition path must not probe a host-derived slot beyond the test limit"
+        );
+
+        drop(expedited_permit);
+        drop(ordinary_permits);
     }
 
     #[test]
