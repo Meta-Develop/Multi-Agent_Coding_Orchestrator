@@ -2009,7 +2009,29 @@ fn external_side_effect_profile(
                 profile = profile.with_visible_read_write_root(&control.absolute);
             }
             for control in &protected_controls.read_write_files {
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
+                if let Some(held) = &control.held_materialized_file {
+                    held.verify_path(&spec.cwd, &control.relative)
+                        .with_context(|| {
+                            format!(
+                                "materialized worktree control changed before sandbox admission: {}",
+                                control.relative.display()
+                            )
+                        })?;
+                    profile = profile
+                        .with_visible_read_write_file_capability(
+                            &control.absolute,
+                            std::sync::Arc::clone(&held._file),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "materialized worktree control capability is invalid: {}",
+                                control.relative.display()
+                            )
+                        })?;
+                    continue;
+                }
+                #[cfg(all(unix, not(target_os = "linux")))]
                 if let Some(held) = &control.held_materialized_file {
                     held.verify_path(&spec.cwd, &control.relative)
                         .with_context(|| {

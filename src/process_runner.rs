@@ -613,6 +613,102 @@ impl Default for ProcessResourceLimits {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ExternalCodexWritableFileCapability {
+    path: PathBuf,
+    held_file: Arc<File>,
+    identity: ExternalCodexWritableFileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl ExternalCodexWritableFileCapability {
+    fn new(path: PathBuf, held_file: Arc<File>) -> std::io::Result<Self> {
+        let identity = external_codex_writable_file_identity(&held_file.metadata()?)?;
+        Ok(Self {
+            path,
+            held_file,
+            identity,
+        })
+    }
+
+    fn with_resolved_path(&self, path: PathBuf) -> Self {
+        Self {
+            path,
+            held_file: Arc::clone(&self.held_file),
+            identity: self.identity,
+        }
+    }
+
+    fn verify_path(&self) -> std::io::Result<()> {
+        let held_identity = external_codex_writable_file_identity(&self.held_file.metadata()?)?;
+        let observed_identity =
+            external_codex_writable_file_identity(&fs::symlink_metadata(&self.path)?)?;
+        if held_identity != self.identity || observed_identity != self.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "ExternalCodex writable file capability identity changed: {}",
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for ExternalCodexWritableFileCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalCodexWritableFileCapability")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for ExternalCodexWritableFileCapability {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.identity == other.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for ExternalCodexWritableFileCapability {}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalCodexWritableFileIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+    links: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn external_codex_writable_file_identity(
+    metadata: &fs::Metadata,
+) -> std::io::Result<ExternalCodexWritableFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ExternalCodex writable file capability is not a regular file",
+        ));
+    }
+    Ok(ExternalCodexWritableFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkspaceSandboxConfig {
     workspace_root: PathBuf,
@@ -621,6 +717,8 @@ struct WorkspaceSandboxConfig {
     visible_read_only_files: Vec<PathBuf>,
     visible_read_write_roots: Vec<PathBuf>,
     visible_read_write_files: Vec<PathBuf>,
+    #[cfg(target_os = "linux")]
+    external_codex_writable_file_capabilities: Vec<ExternalCodexWritableFileCapability>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -636,6 +734,8 @@ impl WorkspaceSandboxConfig {
             visible_read_only_files: Vec::new(),
             visible_read_write_roots: Vec::new(),
             visible_read_write_files: Vec::new(),
+            #[cfg(target_os = "linux")]
+            external_codex_writable_file_capabilities: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             isolated_host_view: false,
@@ -666,6 +766,20 @@ impl WorkspaceSandboxConfig {
     fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.visible_read_write_files.push(file.into());
         self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_external_codex_writable_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        let path = file.into();
+        let capability = ExternalCodexWritableFileCapability::new(path.clone(), held_file)?;
+        self.visible_read_write_files.push(path);
+        self.external_codex_writable_file_capabilities
+            .push(capability);
+        Ok(self)
     }
 
     fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
@@ -852,6 +966,18 @@ impl ExternalCodexProfile {
     pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_file(file);
         self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_visible_read_write_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_codex_writable_file_capability(file, held_file)?;
+        Ok(self)
     }
 
     pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
@@ -2127,6 +2253,27 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
         }
         for path in paths {
             validate_bounded_path(path, label)?;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if config.external_codex_writable_file_capabilities.len() > MAX_SANDBOX_PATHS_PER_CLASS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalCodex writable file capabilities exceed their vector limit",
+            ));
+        }
+        let mut capability_paths = BTreeSet::new();
+        for capability in &config.external_codex_writable_file_capabilities {
+            validate_bounded_path(&capability.path, "ExternalCodex writable file capability")?;
+            if !config.visible_read_write_files.contains(&capability.path)
+                || !capability_paths.insert(&capability.path)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ExternalCodex writable file capability is duplicate or lacks an exact writable file",
+                ));
+            }
         }
     }
     let total = 1usize
@@ -4136,6 +4283,7 @@ struct ResolvedSystemdSandbox {
     visible_read_only_files: Vec<PathBuf>,
     visible_read_write_roots: Vec<PathBuf>,
     visible_read_write_files: Vec<PathBuf>,
+    external_codex_writable_file_capabilities: Vec<ExternalCodexWritableFileCapability>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -4289,6 +4437,9 @@ impl ResolvedSystemdSandbox {
     fn verify_path_identities(&self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
 
+        for capability in &self.external_codex_writable_file_capabilities {
+            capability.verify_path()?;
+        }
         for identity in &self.path_identities {
             let metadata = fs::symlink_metadata(&identity.path)?;
             if metadata.file_type().is_symlink()
@@ -5159,6 +5310,23 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .collect::<std::io::Result<Vec<_>>>()?;
     visible_read_write_files.sort();
     visible_read_write_files.dedup();
+    let mut external_codex_writable_file_capabilities = Vec::new();
+    let mut capability_paths = BTreeSet::new();
+    for capability in &config.external_codex_writable_file_capabilities {
+        let canonical_path =
+            canonical_sandbox_file(&capability.path, "ExternalCodex writable file capability")?;
+        if !visible_read_write_files.contains(&canonical_path)
+            || !capability_paths.insert(canonical_path.clone())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalCodex writable file capability is duplicate or lacks an exact writable file",
+            ));
+        }
+        let resolved_capability = capability.with_resolved_path(canonical_path);
+        resolved_capability.verify_path()?;
+        external_codex_writable_file_capabilities.push(resolved_capability);
+    }
 
     let mut hidden_roots = config
         .hidden_roots
@@ -5250,6 +5418,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         visible_read_only_files,
         visible_read_write_roots,
         visible_read_write_files,
+        external_codex_writable_file_capabilities,
         writable_artifact_roots,
         hidden_roots,
         isolated_host_view: config.isolated_host_view,
@@ -9566,6 +9735,69 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn external_codex_held_file_capability_rejects_replacement_before_resolution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("worktree");
+        let policy_root = workspace.join(".agents");
+        let exception = policy_root.join("docs/worker.md");
+        fs::create_dir_all(exception.parent().expect("exception parent")).expect("policy tree");
+        fs::write(&exception, "worker policy\n").expect("writable exception");
+        fs::set_permissions(&exception, fs::Permissions::from_mode(0o600)).expect("exception mode");
+        let held_file = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&exception)
+                .expect("held exception"),
+        );
+
+        let profile = ExternalCodexProfile::read_write(&workspace)
+            .with_visible_read_only_root(&policy_root)
+            .with_visible_read_write_file_capability(&exception, held_file)
+            .expect("held exact exception capability");
+        let spec = ProcessSpec::direct(
+            "external Codex held exact exception",
+            PathBuf::from("/bin/true"),
+            Vec::<OsString>::new(),
+            &workspace,
+            128,
+        )
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+        let sandbox = resolve_systemd_sandbox(&spec)
+            .expect("unchanged held exception")
+            .expect("resolved sandbox");
+        assert_eq!(
+            sandbox
+                .effective_path_access(&exception)
+                .expect("effective exception access"),
+            Some(SandboxMountAccess::ReadWrite)
+        );
+
+        fs::rename(&exception, workspace.join("original-worker.md"))
+            .expect("exchange original exception");
+        fs::write(&exception, "replacement\n").expect("replacement exception");
+        fs::set_permissions(&exception, fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+        assert!(
+            sandbox.verify_path_identities().is_err(),
+            "resolved sandbox must retain and revalidate the held capability"
+        );
+        let error = match resolve_systemd_sandbox(&spec) {
+            Err(error) => error,
+            Ok(_) => panic!("replacement must not inherit the held writable capability"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("writable file capability identity changed"),
+            "unexpected replacement rejection: {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
         const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_WRITE_BOUNDARY_CHILD";
         const ASSIGNED_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_ASSIGNED_PATH";
@@ -9780,6 +10012,7 @@ mod tests {
             visible_read_only_files: vec![protected_file.clone()],
             visible_read_write_roots: Vec::new(),
             visible_read_write_files: vec![exception.clone()],
+            external_codex_writable_file_capabilities: Vec::new(),
             writable_artifact_roots: vec![incoming.clone()],
             hidden_roots: Vec::new(),
             isolated_host_view: false,
@@ -9837,6 +10070,7 @@ mod tests {
             visible_read_only_files: vec![PathBuf::from("/worktree/.git")],
             visible_read_write_roots: vec![PathBuf::from("/worktree/.agents/docs")],
             visible_read_write_files: vec![PathBuf::from("/worktree/AGENTS.md")],
+            external_codex_writable_file_capabilities: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: vec![PathBuf::from("/primary")],
             isolated_host_view: false,
@@ -10050,6 +10284,7 @@ mod tests {
             visible_read_only_files: Vec::new(),
             visible_read_write_roots: Vec::new(),
             visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: vec![PathBuf::from("/source")],
             isolated_host_view: true,
@@ -10292,6 +10527,7 @@ mod tests {
             visible_read_only_files: Vec::new(),
             visible_read_write_roots: Vec::new(),
             visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             isolated_host_view: false,
