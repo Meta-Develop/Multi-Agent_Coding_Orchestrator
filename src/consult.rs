@@ -1376,6 +1376,9 @@ mod tests {
         let repo = root.join("repo");
         fs::create_dir(&repo)?;
         git2::Repository::init(&repo)?;
+        for control_root in [".maco", ".maco-cache", ".codex", ".agents"] {
+            fs::create_dir(repo.join(control_root))?;
+        }
         fs::write(repo.join("README.md"), "# Test repository\n")?;
         Ok(repo)
     }
