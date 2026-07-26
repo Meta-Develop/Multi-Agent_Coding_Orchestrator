@@ -1,11 +1,21 @@
-use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+use std::{
+    path::Path,
+    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
+};
 
 use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter};
+use crate::{
+    merge::{CandidateValidationBinding, ValidationStatus},
+    sync::normalize_repo_relative_path,
+    worktree::normalize_agent_id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 pub const ORCHESTRATION_EVENT_PATH: &str = "events/orchestration.jsonl";
+const MAX_ARBITRATION_REASON_BYTES: usize = 4 * 1024;
+const MAX_ARBITRATION_REPORT_PATH_BYTES: usize = 4 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -59,37 +69,140 @@ pub enum ArbitrationSide {
     Primary,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArbitrationCandidateStatus {
-    NotRun,
-    Passed,
-    Failed,
-    Skipped,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArbitrationCandidateBinding {
-    pub version: u32,
-    pub agent_id: String,
-    pub primary_head: Option<String>,
-    pub agent_head: Option<String>,
-    pub merge_base: Option<String>,
-    pub diff_oid: String,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArbitrationOutcomeDetails {
     pub outcome: ArbitrationOutcome,
     pub arbiter_id: String,
     pub sides: [ArbitrationSide; 2],
-    pub candidate_binding: Option<ArbitrationCandidateBinding>,
-    pub candidate_status: ArbitrationCandidateStatus,
+    pub candidate_binding: Option<CandidateValidationBinding>,
+    pub candidate_status: ValidationStatus,
     pub rationale_report: Option<String>,
     pub rationale_sha256: Option<String>,
     pub reason: String,
+}
+
+impl ArbitrationOutcomeDetails {
+    fn validate(&self) -> Result<(), String> {
+        let arbiter_id = canonical_arbitration_agent_id(&self.arbiter_id, "arbiter_id")?;
+        let mut side_ids = Vec::with_capacity(2);
+        let mut primary_count = 0usize;
+        for (index, side) in self.sides.iter().enumerate() {
+            match side {
+                ArbitrationSide::Agent { id } => {
+                    let side_id =
+                        canonical_arbitration_agent_id(id, &format!("sides[{index}].id"))?;
+                    if side_id == arbiter_id {
+                        return Err("neutral arbiter id must differ from both arbitration sides"
+                            .to_string());
+                    }
+                    side_ids.push(side_id);
+                }
+                ArbitrationSide::Primary => {
+                    primary_count += 1;
+                }
+            }
+        }
+        if primary_count > 1
+            || (side_ids.len() == 2 && side_ids.first() == side_ids.get(1))
+            || side_ids.is_empty()
+        {
+            return Err("arbitration sides must be two distinct participants".to_string());
+        }
+
+        let binding_required = match (self.outcome, self.candidate_status) {
+            (ArbitrationOutcome::Accepted, ValidationStatus::Passed)
+            | (ArbitrationOutcome::Rejected, ValidationStatus::Failed)
+            | (ArbitrationOutcome::Rejected, ValidationStatus::Skipped)
+            | (ArbitrationOutcome::Escalated, ValidationStatus::Skipped) => true,
+            (ArbitrationOutcome::Escalated, ValidationStatus::NotRun) => false,
+            _ => {
+                return Err(format!(
+                    "arbitration outcome {:?} is inconsistent with candidate status {:?}",
+                    self.outcome, self.candidate_status
+                ));
+            }
+        };
+        if self.candidate_binding.is_some() != binding_required {
+            return Err(format!(
+                "candidate binding presence is inconsistent with candidate status {:?}",
+                self.candidate_status
+            ));
+        }
+        if let Some(binding) = &self.candidate_binding {
+            binding
+                .clone()
+                .canonicalized()
+                .map_err(|error| format!("candidate binding is not canonical: {error:#}"))?;
+            if binding.agent_id != arbiter_id {
+                return Err(
+                    "candidate binding agent_id must equal the neutral arbiter id".to_string(),
+                );
+            }
+        }
+
+        let report = paired_arbitration_rationale(
+            self.rationale_report.as_deref(),
+            self.rationale_sha256.as_deref(),
+        )?;
+        if report.len() > MAX_ARBITRATION_REPORT_PATH_BYTES {
+            return Err(format!(
+                "arbitration rationale report path exceeds its {MAX_ARBITRATION_REPORT_PATH_BYTES}-byte limit"
+            ));
+        }
+        let normalized = normalize_repo_relative_path(Path::new(report))
+            .map_err(|error| format!("arbitration rationale report path is invalid: {error:#}"))?;
+        if normalized != Path::new(report) {
+            return Err("arbitration rationale report path must be canonical".to_string());
+        }
+
+        let reason = self.reason.trim();
+        if reason.is_empty() {
+            return Err("arbitration outcome reason cannot be empty".to_string());
+        }
+        if reason != self.reason {
+            return Err(
+                "arbitration outcome reason must not have surrounding whitespace".to_string(),
+            );
+        }
+        if reason.len() > MAX_ARBITRATION_REASON_BYTES {
+            return Err(format!(
+                "arbitration outcome reason exceeds its {MAX_ARBITRATION_REASON_BYTES}-byte limit"
+            ));
+        }
+        if reason.chars().any(char::is_control) {
+            return Err("arbitration outcome reason cannot contain control characters".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn canonical_arbitration_agent_id(value: &str, field: &str) -> Result<String, String> {
+    let normalized =
+        normalize_agent_id(value).map_err(|error| format!("{field} is invalid: {error:#}"))?;
+    if normalized != value {
+        return Err(format!("{field} must be canonical"));
+    }
+    Ok(normalized)
+}
+
+fn paired_arbitration_rationale<'a>(
+    report: Option<&'a str>,
+    digest: Option<&str>,
+) -> Result<&'a str, String> {
+    let (Some(report), Some(digest)) = (report, digest) else {
+        return Err(
+            "arbitration rationale report and SHA-256 digest must both be present".to_string(),
+        );
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("arbitration rationale digest must be canonical lowercase SHA-256".to_string());
+    }
+    Ok(report)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -112,6 +225,8 @@ pub enum OrchestrationEventError {
     TimestampOutOfRange,
     #[error("failed to encode orchestration event payload: {0}")]
     PayloadEncode(#[from] serde_json::Error),
+    #[error("invalid arbitration outcome details: {0}")]
+    InvalidArbitration(String),
     #[error("failed to append orchestration event journal: {0}")]
     ArtifactAppend(String),
     #[cfg(test)]
@@ -191,6 +306,9 @@ impl OrchestrationEventJournal {
         if !self.enabled {
             return Ok(());
         }
+        details
+            .validate()
+            .map_err(OrchestrationEventError::InvalidArbitration)?;
         let kind = details.outcome.event_kind();
         let node = details.arbiter_id.clone();
         let payload = match serde_json::to_value(details) {
@@ -382,17 +500,17 @@ mod tests {
             (
                 ArbitrationOutcome::Accepted,
                 OrchestrationEventKind::Accept,
-                ArbitrationCandidateStatus::Passed,
+                ValidationStatus::Passed,
             ),
             (
                 ArbitrationOutcome::Rejected,
                 OrchestrationEventKind::Reject,
-                ArbitrationCandidateStatus::Failed,
+                ValidationStatus::Failed,
             ),
             (
                 ArbitrationOutcome::Escalated,
                 OrchestrationEventKind::Escalate,
-                ArbitrationCandidateStatus::NotRun,
+                ValidationStatus::NotRun,
             ),
         ] {
             journal
@@ -417,6 +535,18 @@ mod tests {
         .enumerate()
         {
             let record = &records[index];
+            let expected_binding = if expected_status == "not_run" {
+                Value::Null
+            } else {
+                json!({
+                    "version": 1,
+                    "agent_id": "neutral-arbiter",
+                    "primary_head": null,
+                    "agent_head": null,
+                    "merge_base": null,
+                    "diff_oid": "1111111111111111111111111111111111111111"
+                })
+            };
             assert_eq!(record["node"], "neutral-arbiter");
             assert_eq!(record["parent"], "merge-controller");
             assert_eq!(record["role"], "worker");
@@ -430,17 +560,10 @@ mod tests {
                         {"kind": "agent", "id": "agent-a"},
                         {"kind": "primary"}
                     ],
-                    "candidate_binding": {
-                        "version": 1,
-                        "agent_id": "neutral-arbiter",
-                        "primary_head": null,
-                        "agent_head": null,
-                        "merge_base": null,
-                        "diff_oid": "candidate-diff"
-                    },
+                    "candidate_binding": expected_binding,
                     "candidate_status": expected_status,
                     "rationale_report": "reports/arbitration.json",
-                    "rationale_sha256": "rationale-digest",
+                    "rationale_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
                     "reason": "collision arbitration completed"
                 })
             );
@@ -465,10 +588,7 @@ mod tests {
                 &mut writer,
                 Some("merge-controller"),
                 OrchestrationRole::Worker,
-                arbitration_details(
-                    ArbitrationOutcome::Accepted,
-                    ArbitrationCandidateStatus::Passed,
-                ),
+                arbitration_details(ArbitrationOutcome::Accepted, ValidationStatus::Passed),
             )
             .expect_err("injected append failure");
         assert!(matches!(error, OrchestrationEventError::InjectedAppend));
@@ -480,13 +600,78 @@ mod tests {
                 &mut writer,
                 Some("merge-controller"),
                 OrchestrationRole::Worker,
-                arbitration_details(
-                    ArbitrationOutcome::Rejected,
-                    ArbitrationCandidateStatus::Failed,
-                ),
+                arbitration_details(ArbitrationOutcome::Rejected, ValidationStatus::Failed),
             )
             .expect("disabled journal is a no-op");
         assert!(!writer.run_dir().join(ORCHESTRATION_EVENT_PATH).exists());
+    }
+
+    #[test]
+    fn arbitration_outcome_invariants_fail_before_append_without_disabling_journal() {
+        let (_temp, repo_path) = committed_repo();
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            RunId::new("arbitration-invariants").expect("run id"),
+            "supervise",
+        )
+        .expect("reserve artifact writer");
+        let mut journal = OrchestrationEventJournal::new("repo-id", "run-1");
+        let mut invalid =
+            arbitration_details(ArbitrationOutcome::Accepted, ValidationStatus::Passed);
+        invalid.sides[1] = invalid.sides[0].clone();
+
+        let error = journal
+            .append_arbitration_outcome(
+                &mut writer,
+                Some("merge-controller"),
+                OrchestrationRole::Worker,
+                invalid,
+            )
+            .expect_err("duplicate sides must fail");
+
+        assert!(matches!(
+            error,
+            OrchestrationEventError::InvalidArbitration(_)
+        ));
+        assert!(journal.is_enabled());
+        assert!(!writer.run_dir().join(ORCHESTRATION_EVENT_PATH).exists());
+
+        let mut invalid =
+            arbitration_details(ArbitrationOutcome::Accepted, ValidationStatus::Passed);
+        invalid.candidate_status = ValidationStatus::Failed;
+        assert!(invalid.validate().is_err());
+
+        let mut invalid =
+            arbitration_details(ArbitrationOutcome::Rejected, ValidationStatus::Failed);
+        invalid
+            .candidate_binding
+            .as_mut()
+            .expect("binding")
+            .agent_id = "different-arbiter".to_string();
+        assert!(invalid.validate().is_err());
+
+        let mut invalid =
+            arbitration_details(ArbitrationOutcome::Accepted, ValidationStatus::Passed);
+        invalid.rationale_sha256 = Some("not-a-sha256".to_string());
+        assert!(invalid.validate().is_err());
+
+        let mut invalid =
+            arbitration_details(ArbitrationOutcome::Accepted, ValidationStatus::Passed);
+        invalid.rationale_report = Some("/tmp/arbitration.json".to_string());
+        assert!(invalid.validate().is_err());
+
+        let mut invalid =
+            arbitration_details(ArbitrationOutcome::Escalated, ValidationStatus::NotRun);
+        invalid.candidate_binding = Some(CandidateValidationBinding {
+            version: 1,
+            agent_id: "neutral-arbiter".to_string(),
+            primary_head: None,
+            agent_head: None,
+            merge_base: None,
+            diff_oid: "1111111111111111111111111111111111111111".to_string(),
+        });
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -524,8 +709,17 @@ mod tests {
 
     fn arbitration_details(
         outcome: ArbitrationOutcome,
-        candidate_status: ArbitrationCandidateStatus,
+        candidate_status: ValidationStatus,
     ) -> ArbitrationOutcomeDetails {
+        let candidate_binding =
+            (candidate_status != ValidationStatus::NotRun).then(|| CandidateValidationBinding {
+                version: 1,
+                agent_id: "neutral-arbiter".to_string(),
+                primary_head: None,
+                agent_head: None,
+                merge_base: None,
+                diff_oid: "1111111111111111111111111111111111111111".to_string(),
+            });
         ArbitrationOutcomeDetails {
             outcome,
             arbiter_id: "neutral-arbiter".to_string(),
@@ -535,17 +729,12 @@ mod tests {
                 },
                 ArbitrationSide::Primary,
             ],
-            candidate_binding: Some(ArbitrationCandidateBinding {
-                version: 1,
-                agent_id: "neutral-arbiter".to_string(),
-                primary_head: None,
-                agent_head: None,
-                merge_base: None,
-                diff_oid: "candidate-diff".to_string(),
-            }),
+            candidate_binding,
             candidate_status,
             rationale_report: Some("reports/arbitration.json".to_string()),
-            rationale_sha256: Some("rationale-digest".to_string()),
+            rationale_sha256: Some(
+                "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+            ),
             reason: "collision arbitration completed".to_string(),
         }
     }

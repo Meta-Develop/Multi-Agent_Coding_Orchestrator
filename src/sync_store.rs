@@ -46,6 +46,29 @@ pub struct SyncStore {
     state: RepositoryStateRoot,
 }
 
+/// Authenticated claims observed while holding the durable claims writer lock.
+///
+/// Keeping this value alive prevents cooperating claim writers from changing
+/// the snapshot until the caller completes its claim-sensitive operation.
+/// Callers can inspect the already authenticated claims and revalidate the
+/// stable lock binding, but cannot construct or mutate the claims schema.
+#[derive(Debug)]
+pub(crate) struct LockedClaimsSnapshot {
+    state: RepositoryStateRoot,
+    lock: RepositoryStateLock,
+    claims: Vec<PathClaim>,
+}
+
+impl LockedClaimsSnapshot {
+    pub(crate) fn claims(&self) -> &[PathClaim] {
+        &self.claims
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        self.state.verify(&self.lock)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MegafileClaimWarning {
@@ -299,7 +322,6 @@ fn run_repository_state_after_precheck_hook() {
     }
 }
 
-#[cfg(test)]
 #[allow(dead_code)]
 fn finish_with_lock_verification<T>(result: Result<T>, verification: Result<()>) -> Result<T> {
     match (result, verification) {
@@ -431,6 +453,30 @@ impl SyncStore {
 
     pub fn snapshot(&self) -> Result<Vec<PathClaim>> {
         self.with_locked_read(|coordinator| coordinator.snapshot().map_err(Into::into))
+    }
+
+    /// Opens and authenticates the canonical claims schema, then retains its
+    /// durable writer lock for a caller that must make a claim-sensitive
+    /// decision and complete another operation at the same linearization
+    /// boundary.
+    pub(crate) fn lock_authenticated_snapshot(&self) -> Result<LockedClaimsSnapshot> {
+        let lock = self.state.lock()?;
+        let claims = finish_with_lock_verification(
+            (|| {
+                let store = self.open_authenticated_store(&lock)?;
+                let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
+                    next_token: store.current().value.next_token,
+                    claims: store.current().value.claims.clone(),
+                })?;
+                coordinator.snapshot().map_err(Into::into)
+            })(),
+            self.state.verify(&lock),
+        )?;
+        Ok(LockedClaimsSnapshot {
+            state: self.state.clone(),
+            lock,
+            claims,
+        })
     }
 
     fn with_locked_update<T>(
@@ -800,6 +846,51 @@ mod tests {
         include_bytes!("../tests/fixtures/issue33/agent-files-claims-v1.json");
     const ISSUE33_CLAIMS_V1_SHA256: &str =
         "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_authenticated_snapshot_excludes_a_concurrent_claim_writer_until_drop() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let boundary = store
+            .lock_authenticated_snapshot()
+            .expect("lock authenticated claims snapshot");
+        assert!(boundary.claims().is_empty());
+        boundary.verify().expect("verify claims boundary");
+
+        let lock_error =
+            KernelStateLock::try_acquire_exclusive_direct(boundary.state.root(), "claims.lock")
+                .expect_err("claims boundary must exclude another writer lock");
+        assert!(lock_error.to_string().contains("already held"));
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let writer = store.clone();
+        let writer_thread = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal ready");
+            start_rx.recv().expect("receive start");
+            writer.with_locked_update(|coordinator| {
+                coordinator
+                    .claim_paths("neutral-arbiter", ["src"])
+                    .map_err(Into::into)
+            })
+        });
+        ready_rx.recv().expect("writer ready");
+        start_tx.send(()).expect("start writer");
+        drop(boundary);
+
+        let claim = writer_thread
+            .join()
+            .expect("join writer")
+            .expect("claim after boundary release");
+        assert_eq!(claim.agent_id, "neutral-arbiter");
+        assert_eq!(
+            store.snapshot().expect("snapshot after writer"),
+            vec![claim]
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

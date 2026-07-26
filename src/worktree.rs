@@ -24,8 +24,7 @@ use crate::{
         finalize_legacy_retirement, prepare_legacy_retirement, LegacyAdoption,
         LEGACY_RETIREMENT_DOMAIN,
     },
-    sync::{PathClaim, SyncCoordinator, SyncSnapshot},
-    sync_store::{ClaimsSnapshotSpec, RepositoryStateLock, RepositoryStateRoot, SyncStore},
+    sync_store::{LockedClaimsSnapshot, SyncStore},
 };
 use anyhow::{bail, Context, Result};
 use git2::{
@@ -467,16 +466,6 @@ impl NeutralWorktreeCreateOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct NeutralClaimsState {
-    version: u32,
-    snapshot_revision: u64,
-    repository: RepositoryAuthBinding,
-    next_token: u64,
-    claims: Vec<PathClaim>,
-}
-
 /// Holds the durable path-claim serialization lock across neutral creation.
 ///
 /// This gives the "no inherited claim" check one real linearization boundary:
@@ -484,44 +473,20 @@ struct NeutralClaimsState {
 /// snapshot check and the completed managed-worktree creation.
 #[derive(Debug)]
 struct NeutralClaimBoundary {
-    state: RepositoryStateRoot,
-    lock: RepositoryStateLock,
+    snapshot: LockedClaimsSnapshot,
 }
 
 impl NeutralClaimBoundary {
     fn acquire(repo: &Repository, arbiter_agent_id: &str) -> Result<Self> {
         let repo_path = repo.workdir().unwrap_or_else(|| repo.path());
-        // Authenticate, validate, and recover the claims store before taking
-        // its stable outer lock for the complete creation boundary. This does
-        // not add, release, or otherwise rewrite a claim.
-        SyncStore::open(repo_path)
+        let store = SyncStore::open(repo_path)
             .context("failed to authenticate durable claims for neutral worktree creation")?;
-        let state = RepositoryStateRoot::open(repo, "claims.json", "claims.lock")?;
-        let lock = state.lock()?;
+        let snapshot = store
+            .lock_authenticated_snapshot()
+            .context("failed to lock authenticated claims for neutral worktree creation")?;
         let result = (|| -> Result<()> {
-            state.verify(&lock)?;
-            let authenticator = repository_authenticator_key_only(repo_path)?;
-            let store =
-                AuthenticatedSnapshotStore::<ClaimsSnapshotSpec, NeutralClaimsState>::open_instance(
-                    authenticator,
-                    "claims",
-                )?;
-            let snapshot = store.current();
-            if snapshot.value.version != 1
-                || snapshot.value.snapshot_revision != snapshot.generation
-                || snapshot.value.snapshot_revision != snapshot.token
-                || snapshot.value.repository != store.identity().repository
-            {
-                bail!("authenticated claims snapshot binding or revision is inconsistent");
-            }
-            let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
-                next_token: snapshot.value.next_token,
-                claims: snapshot.value.claims.clone(),
-            })
-            .context("authenticated claims snapshot is invalid")?;
-            if coordinator
-                .snapshot()
-                .context("failed to read authenticated claims snapshot")?
+            if snapshot
+                .claims()
                 .iter()
                 .any(|claim| claim.agent_id == arbiter_agent_id)
             {
@@ -531,12 +496,12 @@ impl NeutralClaimBoundary {
             }
             Ok(())
         })();
-        finish_with_neutral_claim_lock_verification(result, state.verify(&lock))?;
-        Ok(Self { state, lock })
+        finish_with_neutral_claim_lock_verification(result, snapshot.verify())?;
+        Ok(Self { snapshot })
     }
 
     fn verify(&self) -> Result<()> {
-        self.state.verify(&self.lock)
+        self.snapshot.verify()
     }
 }
 
@@ -6753,6 +6718,48 @@ mod tests {
             .expect("open claims")
             .snapshot()
             .expect("claims after neutral create")
+            .is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn neutral_worktree_production_cleanliness_seam_uses_exact_base_without_claim() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        let exact_base_oid = commit_readme(&repo).expect("initial commit");
+        let manager = WorktreeManager::new(&repo_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("capture clean repository capability");
+
+        let record = manager
+            .create_neutral_with_repository_cleanliness(
+                NeutralWorktreeCreateOptions {
+                    arbiter_agent_id: "neutral-production-arbiter".to_string(),
+                    source_agent_ids: ["agent-a".to_string(), "agent-b".to_string()],
+                    base_oid: exact_base_oid,
+                    worktree_root: Some(worktree_root),
+                },
+                &cleanliness,
+            )
+            .expect("create production capability-bound neutral worktree");
+
+        assert_eq!(record.name, "neutral-production-arbiter");
+        assert_eq!(record.branch, "maco/neutral-production-arbiter");
+        assert_eq!(
+            repo.find_branch("maco/neutral-production-arbiter", BranchType::Local)
+                .expect("fresh neutral branch")
+                .get()
+                .target(),
+            Some(exact_base_oid)
+        );
+        assert!(SyncStore::open(&repo_path)
+            .expect("open claims")
+            .snapshot()
+            .expect("claims after production neutral create")
             .is_empty());
     }
 
