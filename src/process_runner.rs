@@ -5042,73 +5042,96 @@ fn verify_systemd_sandbox_properties(
             root,
         )?;
     }
-    if sandbox.kind == SideEffectConfinementProfileKind::TrustedFixedNetwork
-        || sandbox.isolated_host_view
-    {
-        let mut inaccessible = sandbox
-            .hidden_roots
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        inaccessible.extend(known_sensitive_socket_paths());
-        verify_exact_property_paths(
-            "InaccessiblePaths",
-            property_value(properties, "InaccessiblePaths")?,
-            &inaccessible,
-        )?;
+    verify_exact_systemd_path_properties(sandbox, properties, runtime_dir)
+}
 
-        let mut read_only = sandbox
-            .visible_read_only_roots
-            .iter()
-            .chain(&sandbox.visible_read_only_files)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut read_only_bindings = sandbox
-            .visible_read_only_roots
-            .iter()
-            .chain(&sandbox.visible_read_only_files)
-            .map(|path| (path.clone(), path.clone()))
-            .collect::<BTreeSet<_>>();
-        let mut read_write = sandbox
-            .writable_artifact_roots
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        match sandbox.workspace_access {
-            WorkspaceAccess::ReadOnly => {
-                read_only.insert(sandbox.workspace_root.clone());
-                read_only_bindings.insert((
-                    sandbox.workspace_root.clone(),
-                    sandbox.workspace_root.clone(),
-                ));
-            }
-            WorkspaceAccess::ReadWrite => {
-                read_write.insert(sandbox.workspace_root.clone());
-            }
-        }
-        read_write.insert(runtime_dir.to_path_buf());
-        verify_exact_property_bindings(
-            "BindReadOnlyPaths",
-            property_value(properties, "BindReadOnlyPaths")?,
-            &read_only_bindings,
-        )?;
-        verify_exact_property_paths(
-            "ReadOnlyPaths",
-            property_value(properties, "ReadOnlyPaths")?,
-            &read_only,
-        )?;
-        verify_exact_property_paths(
-            "BindPaths",
-            property_value(properties, "BindPaths")?,
-            &read_write,
-        )?;
-        verify_exact_property_paths(
-            "ReadWritePaths",
-            property_value(properties, "ReadWritePaths")?,
-            &read_write,
-        )?;
+#[cfg(target_os = "linux")]
+fn verify_exact_systemd_path_properties(
+    sandbox: &ResolvedSystemdSandbox,
+    properties: &BTreeMap<String, String>,
+    runtime_dir: &Path,
+) -> std::io::Result<()> {
+    if !matches!(
+        sandbox.kind,
+        SideEffectConfinementProfileKind::TrustedFixedNetwork
+            | SideEffectConfinementProfileKind::ExternalCodex
+    ) && !sandbox.isolated_host_view
+    {
+        return Ok(());
     }
-    Ok(())
+
+    let mut inaccessible = sandbox
+        .hidden_roots
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    inaccessible.extend(known_sensitive_socket_paths());
+    verify_exact_property_paths(
+        "InaccessiblePaths",
+        property_value(properties, "InaccessiblePaths")?,
+        &inaccessible,
+    )?;
+
+    let mut read_only = sandbox
+        .visible_read_only_roots
+        .iter()
+        .chain(&sandbox.visible_read_only_files)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut read_only_bindings = sandbox
+        .visible_read_only_roots
+        .iter()
+        .chain(&sandbox.visible_read_only_files)
+        .map(|path| (path.clone(), path.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut read_write = sandbox
+        .writable_artifact_roots
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut read_write_bindings = sandbox
+        .writable_artifact_roots
+        .iter()
+        .map(|path| (path.clone(), path.clone()))
+        .collect::<BTreeSet<_>>();
+    match sandbox.workspace_access {
+        WorkspaceAccess::ReadOnly => {
+            read_only.insert(sandbox.workspace_root.clone());
+            read_only_bindings.insert((
+                sandbox.workspace_root.clone(),
+                sandbox.workspace_root.clone(),
+            ));
+        }
+        WorkspaceAccess::ReadWrite => {
+            read_write.insert(sandbox.workspace_root.clone());
+            read_write_bindings.insert((
+                sandbox.workspace_root.clone(),
+                sandbox.workspace_root.clone(),
+            ));
+        }
+    }
+    read_write.insert(runtime_dir.to_path_buf());
+    read_write_bindings.insert((runtime_dir.to_path_buf(), runtime_dir.to_path_buf()));
+    verify_exact_property_bindings(
+        "BindReadOnlyPaths",
+        property_value(properties, "BindReadOnlyPaths")?,
+        &read_only_bindings,
+    )?;
+    verify_exact_property_paths(
+        "ReadOnlyPaths",
+        property_value(properties, "ReadOnlyPaths")?,
+        &read_only,
+    )?;
+    verify_exact_property_bindings(
+        "BindPaths",
+        property_value(properties, "BindPaths")?,
+        &read_write_bindings,
+    )?;
+    verify_exact_property_paths(
+        "ReadWritePaths",
+        property_value(properties, "ReadWritePaths")?,
+        &read_write,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -8534,6 +8557,189 @@ mod tests {
             &properties,
         )
         .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_codex_writable_workspace_resolves_nested_read_only_controls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("worktree");
+        let control_root = workspace.join(".maco");
+        let control_file = workspace.join(".git");
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&workspace).expect("workspace");
+        fs::create_dir(&control_root).expect("control root");
+        fs::write(&control_file, "gitdir: ../primary/.git/worktrees/child\n")
+            .expect("linked-worktree marker");
+        fs::create_dir(&runtime).expect("runtime");
+
+        let profile = ExternalCodexProfile::read_write(&workspace)
+            .with_visible_read_only_root(&control_root)
+            .with_visible_read_only_file(&control_file);
+        let spec = ProcessSpec::direct(
+            "external Codex protected controls",
+            PathBuf::from("/bin/true"),
+            Vec::<OsString>::new(),
+            &workspace,
+            128,
+        )
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+        let mut sandbox = resolve_systemd_sandbox(&spec)
+            .expect("resolve ExternalCodex sandbox")
+            .expect("workspace sandbox");
+        sandbox
+            .add_private_runtime_root(&runtime)
+            .expect("private runtime mount");
+
+        assert_eq!(
+            sandbox.kind,
+            SideEffectConfinementProfileKind::ExternalCodex
+        );
+        assert_eq!(sandbox.workspace_access, WorkspaceAccess::ReadWrite);
+        assert_eq!(sandbox.workspace_root, workspace);
+        assert_eq!(sandbox.visible_read_only_roots, vec![control_root.clone()]);
+        assert_eq!(sandbox.visible_read_only_files, vec![control_file.clone()]);
+        for (path, access) in [
+            (&workspace, SandboxMountAccess::ReadWrite),
+            (&control_root, SandboxMountAccess::ReadOnly),
+            (&control_file, SandboxMountAccess::ReadOnly),
+            (&runtime, SandboxMountAccess::PrivateRuntime),
+        ] {
+            assert!(
+                sandbox
+                    .mount_checks
+                    .iter()
+                    .any(|check| check.path == *path && check.access == access && !check.optional),
+                "missing {access:?} mount check for {}",
+                path.display()
+            );
+        }
+
+        let mut command = Command::new("systemd-run");
+        apply_systemd_sandbox_properties(&mut command, &sandbox);
+        command
+            .arg(systemd_path_property("BindPaths=", &runtime, false))
+            .arg(systemd_path_property("ReadWritePaths=", &runtime, false));
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            format!("--property=BindPaths={}", workspace.display()),
+            format!("--property=ReadWritePaths={}", workspace.display()),
+            format!("--property=BindReadOnlyPaths={}", control_root.display()),
+            format!("--property=ReadOnlyPaths={}", control_root.display()),
+            format!("--property=BindReadOnlyPaths={}", control_file.display()),
+            format!("--property=ReadOnlyPaths={}", control_file.display()),
+            format!("--property=BindPaths={}", runtime.display()),
+            format!("--property=ReadWritePaths={}", runtime.display()),
+        ] {
+            assert!(
+                arguments.contains(&expected),
+                "missing appended systemd property {expected}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_external_codex_exact_path_properties_reject_drift() {
+        let sandbox = ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::ExternalCodex,
+            workspace_root: PathBuf::from("/worktree"),
+            current_dir: PathBuf::from("/worktree"),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            visible_read_only_roots: vec![PathBuf::from("/worktree/.maco")],
+            visible_read_only_files: vec![PathBuf::from("/worktree/.git")],
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: vec![PathBuf::from("/primary")],
+            isolated_host_view: false,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        };
+        let runtime = Path::new("/run/user/1000/maco-process");
+        let mut inaccessible = BTreeSet::from([PathBuf::from("/primary")]);
+        inaccessible.extend(known_sensitive_socket_paths());
+        let exact = BTreeMap::from([
+            (
+                "InaccessiblePaths".to_string(),
+                joined_property_paths(&inaccessible),
+            ),
+            (
+                "ReadOnlyPaths".to_string(),
+                "/worktree/.git /worktree/.maco".to_string(),
+            ),
+            (
+                "BindReadOnlyPaths".to_string(),
+                "/worktree/.maco /worktree/.git".to_string(),
+            ),
+            (
+                "ReadWritePaths".to_string(),
+                "/worktree /run/user/1000/maco-process".to_string(),
+            ),
+            (
+                "BindPaths".to_string(),
+                "/run/user/1000/maco-process /worktree".to_string(),
+            ),
+        ]);
+        verify_exact_systemd_path_properties(&sandbox, &exact, runtime)
+            .expect("exact ordinary ExternalCodex properties");
+
+        for name in [
+            "ReadOnlyPaths",
+            "BindReadOnlyPaths",
+            "BindPaths",
+            "ReadWritePaths",
+            "InaccessiblePaths",
+        ] {
+            let mut extra = exact.clone();
+            extra
+                .get_mut(name)
+                .expect("fixture property")
+                .push_str(" /unexpected");
+            let error = verify_exact_systemd_path_properties(&sandbox, &extra, runtime)
+                .expect_err("unexpected effective path must fail closed");
+            assert!(
+                error.to_string().contains(name),
+                "unexpected {name} extra-entry failure: {error}"
+            );
+
+            let mut omitted = exact.clone();
+            let remaining = omitted[name]
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ");
+            omitted.insert(name.to_string(), remaining);
+            let error = verify_exact_systemd_path_properties(&sandbox, &omitted, runtime)
+                .expect_err("omitted effective path must fail closed");
+            assert!(
+                error.to_string().contains(name),
+                "unexpected {name} omission failure: {error}"
+            );
+        }
+
+        let mut remapped = exact;
+        remapped.insert(
+            "BindPaths".to_string(),
+            format!(
+                "/worktree:/unexpected {runtime_path}",
+                runtime_path = runtime.display()
+            ),
+        );
+        let error = verify_exact_systemd_path_properties(&sandbox, &remapped, runtime)
+            .expect_err("remapped writable bind must fail closed");
+        assert!(error.to_string().contains("BindPaths"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn joined_property_paths(paths: &BTreeSet<PathBuf>) -> String {
+        paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[cfg(target_os = "linux")]
