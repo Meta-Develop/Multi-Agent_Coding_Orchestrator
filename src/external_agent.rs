@@ -1321,6 +1321,12 @@ struct ProtectedWorktreeControl {
     retryability: SandboxDenialRetryability,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlExceptionTarget {
+    Existing,
+    AbsentRegularFile,
+}
+
 impl ProtectedWorktreeControls {
     fn iter(&self) -> impl Iterator<Item = &ProtectedWorktreeControl> {
         self.read_only_roots
@@ -1386,27 +1392,30 @@ fn protected_worktree_controls_for(
     let mut normalized_exceptions = Vec::with_capacity(declared_exceptions.len());
     for declared in declared_exceptions {
         let relative = normalize_control_exception(declared)?;
-        validate_control_exception_target(workspace, &relative)?;
-        if normalized_exceptions.iter().any(|existing: &PathBuf| {
-            existing == &relative
-                || existing.starts_with(&relative)
-                || relative.starts_with(existing)
-        }) {
+        let target = validate_control_exception_target(workspace, &relative)?;
+        if normalized_exceptions
+            .iter()
+            .any(|(existing, _): &(PathBuf, ControlExceptionTarget)| {
+                existing == &relative
+                    || existing.starts_with(&relative)
+                    || relative.starts_with(existing)
+            })
+        {
             bail!(
                 "worktree control exceptions may not duplicate or overlap: {}",
                 relative.display()
             );
         }
-        normalized_exceptions.push(relative);
+        normalized_exceptions.push((relative, target));
     }
-    for relative in normalized_exceptions {
+    for (relative, target) in normalized_exceptions {
         controls
             .read_only_roots
             .retain(|control| control.relative != relative);
         controls
             .read_only_files
             .retain(|control| control.relative != relative);
-        collect_control_exception(workspace, &relative, &mut controls)?;
+        collect_control_exception(workspace, &relative, target, &mut controls)?;
     }
     controls.read_only_roots.sort_by(control_path_order);
     controls.read_only_files.sort_by(control_path_order);
@@ -1548,7 +1557,10 @@ fn normalize_control_exception(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn validate_control_exception_target(workspace: &Path, relative: &Path) -> Result<()> {
+fn validate_control_exception_target(
+    workspace: &Path,
+    relative: &Path,
+) -> Result<ControlExceptionTarget> {
     if relative.starts_with(".git")
         || PERMANENT_CONTROL_ROOTS
             .iter()
@@ -1581,8 +1593,15 @@ fn validate_control_exception_target(workspace: &Path, relative: &Path) -> Resul
         );
     }
 
+    let workspace_metadata = fs::symlink_metadata(workspace)
+        .context("failed to inspect worktree control exception workspace")?;
+    if workspace_metadata.file_type().is_symlink() || !workspace_metadata.is_dir() {
+        bail!("worktree control exception workspace must be a non-symlink directory");
+    }
+
+    let component_count = relative.components().count();
     let mut current = workspace.to_path_buf();
-    for component in relative.components() {
+    for (index, component) in relative.components().enumerate() {
         let std::path::Component::Normal(component) = component else {
             bail!(
                 "worktree control exception is not normalized: {}",
@@ -1590,21 +1609,98 @@ fn validate_control_exception_target(workspace: &Path, relative: &Path) -> Resul
             );
         };
         current.push(component);
-        let metadata = fs::symlink_metadata(&current).with_context(|| {
-            format!(
-                "worktree control exception must name an existing path: {}",
-                relative.display()
-            )
-        })?;
+        let is_final = index + 1 == component_count;
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_final => {
+                return Ok(ControlExceptionTarget::AbsentRegularFile);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!(
+                    "worktree control exception parent chain must already exist: {}",
+                    relative.display()
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect worktree control exception parent: {}",
+                        relative.display()
+                    )
+                });
+            }
+        };
         if metadata.file_type().is_symlink() {
             bail!(
                 "worktree control exception may not traverse or name a symlink: {}",
                 relative.display()
             );
         }
+        if !is_final && !metadata.is_dir() {
+            bail!(
+                "worktree control exception parent chain must contain only directories: {}",
+                relative.display()
+            );
+        }
+        if is_final && !metadata.is_file() && !metadata.is_dir() {
+            bail!(
+                "worktree control exception must name a regular file or directory: {}",
+                relative.display()
+            );
+        }
     }
-    let metadata = fs::symlink_metadata(&current)?;
-    if !metadata.is_file() && !metadata.is_dir() {
+    Ok(ControlExceptionTarget::Existing)
+}
+
+fn collect_control_exception(
+    workspace: &Path,
+    relative: &Path,
+    target: ControlExceptionTarget,
+    controls: &mut ProtectedWorktreeControls,
+) -> Result<()> {
+    let absolute = workspace.join(relative);
+    if target == ControlExceptionTarget::AbsentRegularFile {
+        match materialize_control_exception_file(workspace, relative) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to materialize exact worktree control exception: {}",
+                        relative.display()
+                    )
+                });
+            }
+        }
+    }
+    let metadata = fs::symlink_metadata(&absolute).with_context(|| {
+        format!(
+            "failed to inspect exact worktree control exception: {}",
+            relative.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "worktree control exception may not name a symlink: {}",
+            relative.display()
+        );
+    }
+    if target == ControlExceptionTarget::AbsentRegularFile && !metadata.is_file() {
+        bail!(
+            "new worktree control exception must materialize as a regular file: {}",
+            relative.display()
+        );
+    }
+    let control = ProtectedWorktreeControl {
+        absolute,
+        relative: relative.to_path_buf(),
+        retryability: SandboxDenialRetryability::NotRetryable,
+    };
+    if metadata.is_dir() {
+        controls.read_write_roots.push(control);
+    } else if metadata.is_file() {
+        controls.read_write_files.push(control);
+    } else {
         bail!(
             "worktree control exception must name a regular file or directory: {}",
             relative.display()
@@ -1613,24 +1709,97 @@ fn validate_control_exception_target(workspace: &Path, relative: &Path) -> Resul
     Ok(())
 }
 
-fn collect_control_exception(
-    workspace: &Path,
-    relative: &Path,
-    controls: &mut ProtectedWorktreeControls,
-) -> Result<()> {
-    let absolute = workspace.join(relative);
-    let metadata = fs::symlink_metadata(&absolute)?;
-    let control = ProtectedWorktreeControl {
-        absolute,
-        relative: relative.to_path_buf(),
-        retryability: SandboxDenialRetryability::NotRetryable,
+#[cfg(unix)]
+fn materialize_control_exception_file(workspace: &Path, relative: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
     };
-    if metadata.is_dir() {
-        controls.read_write_roots.push(control);
-    } else {
-        controls.read_write_files.push(control);
+
+    let invalid_path = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "worktree control exception contains an invalid path component",
+        )
+    };
+    let workspace_name =
+        CString::new(workspace.as_os_str().as_bytes()).map_err(|_| invalid_path())?;
+    let workspace_fd = unsafe {
+        libc::open(
+            workspace_name.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+        )
+    };
+    if workspace_fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    Ok(())
+    // SAFETY: `open` returned a new owned descriptor.
+    let mut parent = unsafe { fs::File::from_raw_fd(workspace_fd) };
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(invalid_path());
+        };
+        let name = CString::new(component.as_bytes()).map_err(|_| invalid_path())?;
+        if components.peek().is_none() {
+            let file_fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC
+                        | libc::O_NONBLOCK,
+                    0o600 as libc::mode_t,
+                )
+            };
+            if file_fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `openat` returned a new owned descriptor.
+            let file = unsafe { fs::File::from_raw_fd(file_fd) };
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "materialized worktree control exception is not a regular file",
+                ));
+            }
+            return Ok(());
+        }
+        let directory_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+            )
+        };
+        if directory_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        parent = unsafe { fs::File::from_raw_fd(directory_fd) };
+    }
+    Err(invalid_path())
+}
+
+#[cfg(not(unix))]
+fn materialize_control_exception_file(workspace: &Path, relative: &Path) -> std::io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(workspace.join(relative))
+        .map(drop)
 }
 
 fn external_side_effect_profile(
@@ -1964,13 +2133,13 @@ fn append_external_error(existing: Option<String>, next: Option<String>) -> Opti
 
 #[cfg(test)]
 pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
-    let controls = protected_worktree_controls(spec).unwrap_or_else(|_| {
-        let mut controls = ProtectedWorktreeControls::default();
-        controls.writable_artifact_root = required_parent(&spec.output_last_message)
-            .ok()
-            .map(PathBuf::from);
-        controls
-    });
+    let controls =
+        protected_worktree_controls(spec).unwrap_or_else(|_| ProtectedWorktreeControls {
+            writable_artifact_root: required_parent(&spec.output_last_message)
+                .ok()
+                .map(PathBuf::from),
+            ..ProtectedWorktreeControls::default()
+        });
     command_argv_with_controls(spec, &controls)
 }
 
@@ -2975,6 +3144,93 @@ mod tests {
         assert!(!profile
             .visible_read_write_files()
             .contains(&workspace.join(".agents")));
+        Ok(())
+    }
+
+    #[test]
+    fn absent_exact_policy_exceptions_materialize_only_regular_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        create_mandatory_control_roots(&workspace)?;
+        fs::create_dir_all(workspace.join(".agents/docs"))?;
+        let exceptions = [
+            PathBuf::from(".agents/docs/new-policy.md"),
+            PathBuf::from(".gitignore"),
+            PathBuf::from("AGENTS.md"),
+        ];
+
+        let controls = protected_worktree_controls_for(&workspace, &exceptions)?;
+
+        assert!(controls.read_write_roots.is_empty());
+        assert_eq!(
+            controls
+                .read_write_files
+                .iter()
+                .map(|control| control.relative.clone())
+                .collect::<BTreeSet<_>>(),
+            exceptions.iter().cloned().collect()
+        );
+        for relative in &exceptions {
+            let metadata = fs::symlink_metadata(workspace.join(relative))?;
+            assert!(metadata.is_file(), "{} was not a file", relative.display());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(metadata.len(), 0);
+        }
+
+        let repeated = protected_worktree_controls_for(&workspace, &exceptions)?;
+        assert_eq!(repeated, controls);
+        Ok(())
+    }
+
+    #[test]
+    fn absent_policy_exception_rejects_missing_and_nondirectory_parents() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        create_mandatory_control_roots(&workspace)?;
+        fs::write(workspace.join(".agents/not-a-directory"), "policy\n")?;
+
+        for relative in [
+            PathBuf::from(".agents/missing/new-policy.md"),
+            PathBuf::from(".agents/not-a-directory/new-policy.md"),
+        ] {
+            let error =
+                protected_worktree_controls_for(&workspace, std::slice::from_ref(&relative))
+                    .expect_err("unsafe parent chain must fail closed");
+            assert!(
+                error.to_string().contains("parent chain"),
+                "unexpected error for {}: {error}",
+                relative.display()
+            );
+            assert!(!workspace.join(relative).exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_policy_exception_rejects_symlinked_parent_and_workspace() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        create_mandatory_control_roots(&workspace)?;
+        fs::create_dir(&outside)?;
+        symlink(&outside, workspace.join(".agents/link"))?;
+
+        let relative = PathBuf::from(".agents/link/new-policy.md");
+        let error = protected_worktree_controls_for(&workspace, &[relative])
+            .expect_err("symlinked parent must fail closed");
+        assert!(error.to_string().contains("symlink"));
+        assert!(!outside.join("new-policy.md").exists());
+
+        let workspace_alias = temp.path().join("workspace-alias");
+        symlink(&workspace, &workspace_alias)?;
+        let error =
+            protected_worktree_controls_for(&workspace_alias, &[PathBuf::from(".gitignore")])
+                .expect_err("symlinked workspace must fail closed");
+        assert!(error.to_string().contains("non-symlink directory"));
+        assert!(!workspace.join(".gitignore").exists());
         Ok(())
     }
 

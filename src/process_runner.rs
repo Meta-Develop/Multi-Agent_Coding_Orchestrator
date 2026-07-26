@@ -9566,6 +9566,182 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
+        const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_WRITE_BOUNDARY_CHILD";
+        const ASSIGNED_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_ASSIGNED_PATH";
+        const REPORT_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_REPORT_PATH";
+        const PROTECTED_PATH_ENVS: &[&str] = &[
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_0",
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_1",
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_2",
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_3",
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_4",
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_5",
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_6",
+            "MACO_TEST_EXTERNAL_CODEX_PROTECTED_7",
+        ];
+
+        if env::var_os(CHILD_ENV).is_some() {
+            let protected = PROTECTED_PATH_ENVS
+                .iter()
+                .map(|name| PathBuf::from(env::var_os(name).expect("protected-path fixture")))
+                .collect::<Vec<_>>();
+            for path in protected {
+                assert!(
+                    fs::write(&path, b"forbidden mutation\n").is_err(),
+                    "outer sandbox allowed a protected write to {}",
+                    path.display()
+                );
+            }
+            let assigned =
+                PathBuf::from(env::var_os(ASSIGNED_PATH_ENV).expect("assigned-path fixture"));
+            let report = PathBuf::from(env::var_os(REPORT_PATH_ENV).expect("report-path fixture"));
+            fs::write(assigned, b"assigned writable\n").expect("write ordinary assigned file");
+            fs::write(report, b"incoming writable\n").expect("write designated incoming report");
+            return;
+        }
+
+        if !strict_backend_available_for_tests() {
+            return;
+        }
+
+        let test_binary = env::current_exe().expect("current test executable");
+        let test_output_root = test_binary
+            .parent()
+            .and_then(Path::parent)
+            .expect("test output root");
+        let temp = tempfile::tempdir_in(test_output_root).expect("test output tempdir");
+        let primary = temp.path().join("primary");
+        let primary_git = primary.join(".git");
+        let common_state = primary_git.join("maco/state");
+        let workspace = temp.path().join("worktree");
+        let permanent_control = workspace.join(".maco/control");
+        let cache_control = workspace.join(".maco-cache/state");
+        let codex_control = workspace.join(".codex/state");
+        let policy_control = workspace.join(".agents/policy.md");
+        let git_marker = workspace.join(".git");
+        let ignore_control = workspace.join(".gitignore");
+        let assigned = workspace.join("src/assigned.txt");
+        let incoming = temp.path().join("incoming");
+        let report = incoming.join("report.txt");
+        fs::create_dir_all(primary_git.join("worktrees/child")).expect("primary worktree state");
+        fs::create_dir_all(&common_state).expect("common claim state");
+        fs::create_dir_all(workspace.join(".maco")).expect("MACO control root");
+        fs::create_dir_all(workspace.join(".maco-cache")).expect("MACO cache root");
+        fs::create_dir_all(workspace.join(".codex")).expect("Codex control root");
+        fs::create_dir_all(workspace.join(".agents")).expect("policy control root");
+        fs::create_dir_all(workspace.join("src")).expect("assigned source root");
+        fs::create_dir(&incoming).expect("incoming report root");
+        fs::write(primary_git.join("config"), "primary-config\n").expect("primary config");
+        fs::write(common_state.join("claims.json"), "common-state\n").expect("common state");
+        fs::write(
+            &git_marker,
+            format!(
+                "gitdir: {}\n",
+                primary_git.join("worktrees/child").display()
+            ),
+        )
+        .expect("linked-worktree marker");
+        fs::write(&permanent_control, "MACO control\n").expect("MACO control");
+        fs::write(&cache_control, "cache control\n").expect("cache control");
+        fs::write(&codex_control, "Codex control\n").expect("Codex control");
+        fs::write(&policy_control, "policy control\n").expect("policy control");
+        fs::write(&ignore_control, "ignore control\n").expect("ignore control");
+        fs::write(&assigned, "assigned original\n").expect("assigned file");
+
+        let protected = [
+            primary_git.join("config"),
+            common_state.join("claims.json"),
+            git_marker.clone(),
+            permanent_control.clone(),
+            cache_control.clone(),
+            codex_control.clone(),
+            policy_control.clone(),
+            ignore_control.clone(),
+        ];
+        let mut environment = BTreeMap::new();
+        environment.insert(CHILD_ENV.to_string(), "1".to_string());
+        for (name, path) in PROTECTED_PATH_ENVS.iter().zip(&protected) {
+            environment.insert((*name).to_string(), path.display().to_string());
+        }
+        environment.insert(
+            ASSIGNED_PATH_ENV.to_string(),
+            assigned.display().to_string(),
+        );
+        environment.insert(REPORT_PATH_ENV.to_string(), report.display().to_string());
+        let profile = ExternalCodexProfile::read_write(&workspace)
+            .with_visible_read_only_root(workspace.join(".maco"))
+            .with_visible_read_only_root(workspace.join(".maco-cache"))
+            .with_visible_read_only_root(workspace.join(".codex"))
+            .with_visible_read_only_root(workspace.join(".agents"))
+            .with_visible_read_only_file(&git_marker)
+            .with_visible_read_only_file(&ignore_control)
+            .with_writable_artifact_root(&incoming)
+            .with_hidden_root(&primary);
+        let output = run_process(
+            ProcessSpec::direct(
+                "ExternalCodex live write-boundary probe",
+                env::current_exe().expect("current test executable"),
+                [
+                    OsString::from("--exact"),
+                    OsString::from(
+                        "process_runner::tests::external_codex_outer_sandbox_enforces_control_and_report_write_boundaries",
+                    ),
+                ],
+                &workspace,
+                4 * 1024,
+            )
+            .with_environment(EnvironmentMode::InheritAndSet(environment))
+            .with_stdin(StdinMode::Null)
+            .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT))
+            .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile)),
+        )
+        .expect("run ExternalCodex live write-boundary probe");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(output.safety_evidence_verified());
+        assert_eq!(
+            output.side_effects,
+            SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(primary_git.join("config")).expect("primary config evidence"),
+            "primary-config\n"
+        );
+        assert_eq!(
+            fs::read_to_string(common_state.join("claims.json")).expect("common state evidence"),
+            "common-state\n"
+        );
+        for (path, expected) in [
+            (&permanent_control, "MACO control\n"),
+            (&cache_control, "cache control\n"),
+            (&codex_control, "Codex control\n"),
+            (&policy_control, "policy control\n"),
+            (&ignore_control, "ignore control\n"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(path).expect("protected control evidence"),
+                expected
+            );
+        }
+        assert!(fs::read_to_string(&git_marker)
+            .expect("linked-worktree marker evidence")
+            .starts_with("gitdir: "));
+        assert_eq!(
+            fs::read_to_string(&assigned).expect("assigned write evidence"),
+            "assigned writable\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&report).expect("incoming report evidence"),
+            "incoming writable\n"
+        );
+        assert_current_runner_has_no_systemd_residue();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn mountinfo_parser_decodes_paths_and_rejects_malformed_or_oversized_input() {
         let parsed = parse_sandbox_mountinfo(
             b"10 1 8:1 / / rw,relatime - ext4 /dev/root rw\n\
