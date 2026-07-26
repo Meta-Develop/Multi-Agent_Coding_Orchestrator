@@ -34,6 +34,64 @@ pub enum OrchestrationEventKind {
     Claim,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArbitrationOutcome {
+    Accepted,
+    Rejected,
+    Escalated,
+}
+
+impl ArbitrationOutcome {
+    pub const fn event_kind(self) -> OrchestrationEventKind {
+        match self {
+            Self::Accepted => OrchestrationEventKind::Accept,
+            Self::Rejected => OrchestrationEventKind::Reject,
+            Self::Escalated => OrchestrationEventKind::Escalate,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArbitrationSide {
+    Agent { id: String },
+    Primary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArbitrationCandidateStatus {
+    NotRun,
+    Passed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArbitrationCandidateBinding {
+    pub version: u32,
+    pub agent_id: String,
+    pub primary_head: Option<String>,
+    pub agent_head: Option<String>,
+    pub merge_base: Option<String>,
+    pub diff_oid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArbitrationOutcomeDetails {
+    pub outcome: ArbitrationOutcome,
+    pub arbiter_id: String,
+    pub sides: [ArbitrationSide; 2],
+    pub candidate_binding: Option<ArbitrationCandidateBinding>,
+    pub candidate_status: ArbitrationCandidateStatus,
+    pub rationale_report: Option<String>,
+    pub rationale_sha256: Option<String>,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct OrchestrationEvent {
     pub ts: String,
@@ -52,6 +110,8 @@ pub enum OrchestrationEventError {
     Clock(#[from] SystemTimeError),
     #[error("event timestamp is outside the supported RFC3339 range")]
     TimestampOutOfRange,
+    #[error("failed to encode orchestration event payload: {0}")]
+    PayloadEncode(#[from] serde_json::Error),
     #[error("failed to append orchestration event journal: {0}")]
     ArtifactAppend(String),
     #[cfg(test)]
@@ -119,6 +179,28 @@ impl OrchestrationEventJournal {
             self.enabled = false;
         }
         result
+    }
+
+    pub fn append_arbitration_outcome(
+        &mut self,
+        writer: &mut ArtifactRunWriter,
+        parent: Option<&str>,
+        role: OrchestrationRole,
+        details: ArbitrationOutcomeDetails,
+    ) -> Result<(), OrchestrationEventError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let kind = details.outcome.event_kind();
+        let node = details.arbiter_id.clone();
+        let payload = match serde_json::to_value(details) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.enabled = false;
+                return Err(OrchestrationEventError::PayloadEncode(error));
+            }
+        };
+        self.append(writer, node, parent, role, kind, payload)
     }
 
     fn create_event_at(
@@ -207,9 +289,15 @@ fn run_append_fault() -> Result<(), OrchestrationEventError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use crate::artifacts::RunArtifactFamily;
+    use crate::orchestrator::RunId;
+    use git2::{Repository, Signature};
     use serde_json::{json, Value};
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -279,6 +367,129 @@ mod tests {
     }
 
     #[test]
+    fn arbitration_outcomes_append_exact_typed_events() {
+        let (_temp, repo_path) = committed_repo();
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            RunId::new("arbitration-outcomes").expect("run id"),
+            "supervise",
+        )
+        .expect("reserve artifact writer");
+        let mut journal = OrchestrationEventJournal::new("repo-id", "run-1");
+
+        for (outcome, expected_kind, candidate_status) in [
+            (
+                ArbitrationOutcome::Accepted,
+                OrchestrationEventKind::Accept,
+                ArbitrationCandidateStatus::Passed,
+            ),
+            (
+                ArbitrationOutcome::Rejected,
+                OrchestrationEventKind::Reject,
+                ArbitrationCandidateStatus::Failed,
+            ),
+            (
+                ArbitrationOutcome::Escalated,
+                OrchestrationEventKind::Escalate,
+                ArbitrationCandidateStatus::NotRun,
+            ),
+        ] {
+            journal
+                .append_arbitration_outcome(
+                    &mut writer,
+                    Some("merge-controller"),
+                    OrchestrationRole::Worker,
+                    arbitration_details(outcome, candidate_status),
+                )
+                .expect("append arbitration outcome");
+            assert_eq!(outcome.event_kind(), expected_kind);
+        }
+
+        let records = read_event_records(&writer);
+        assert_eq!(records.len(), 3);
+        for (index, (expected_outcome, expected_kind, expected_status)) in [
+            ("accepted", "accept", "passed"),
+            ("rejected", "reject", "failed"),
+            ("escalated", "escalate", "not_run"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = &records[index];
+            assert_eq!(record["node"], "neutral-arbiter");
+            assert_eq!(record["parent"], "merge-controller");
+            assert_eq!(record["role"], "worker");
+            assert_eq!(record["kind"], expected_kind);
+            assert_eq!(
+                record["payload"],
+                json!({
+                    "outcome": expected_outcome,
+                    "arbiter_id": "neutral-arbiter",
+                    "sides": [
+                        {"kind": "agent", "id": "agent-a"},
+                        {"kind": "primary"}
+                    ],
+                    "candidate_binding": {
+                        "version": 1,
+                        "agent_id": "neutral-arbiter",
+                        "primary_head": null,
+                        "agent_head": null,
+                        "merge_base": null,
+                        "diff_oid": "candidate-diff"
+                    },
+                    "candidate_status": expected_status,
+                    "rationale_report": "reports/arbitration.json",
+                    "rationale_sha256": "rationale-digest",
+                    "reason": "collision arbitration completed"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn arbitration_append_failure_disables_the_journal_without_writing() {
+        let (_temp, repo_path) = committed_repo();
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            RunId::new("arbitration-append-failure").expect("run id"),
+            "supervise",
+        )
+        .expect("reserve artifact writer");
+        let mut journal = OrchestrationEventJournal::new("repo-id", "run-1");
+        set_orchestration_event_append_fault();
+
+        let error = journal
+            .append_arbitration_outcome(
+                &mut writer,
+                Some("merge-controller"),
+                OrchestrationRole::Worker,
+                arbitration_details(
+                    ArbitrationOutcome::Accepted,
+                    ArbitrationCandidateStatus::Passed,
+                ),
+            )
+            .expect_err("injected append failure");
+        assert!(matches!(error, OrchestrationEventError::InjectedAppend));
+        assert!(!journal.is_enabled());
+        assert!(!writer.run_dir().join(ORCHESTRATION_EVENT_PATH).exists());
+
+        journal
+            .append_arbitration_outcome(
+                &mut writer,
+                Some("merge-controller"),
+                OrchestrationRole::Worker,
+                arbitration_details(
+                    ArbitrationOutcome::Rejected,
+                    ArbitrationCandidateStatus::Failed,
+                ),
+            )
+            .expect("disabled journal is a no-op");
+        assert!(!writer.run_dir().join(ORCHESTRATION_EVENT_PATH).exists());
+    }
+
+    #[test]
     fn every_supported_role_and_kind_uses_the_normalized_name() {
         let roles = [
             (OrchestrationRole::Supervisor, "supervisor"),
@@ -309,5 +520,64 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn arbitration_details(
+        outcome: ArbitrationOutcome,
+        candidate_status: ArbitrationCandidateStatus,
+    ) -> ArbitrationOutcomeDetails {
+        ArbitrationOutcomeDetails {
+            outcome,
+            arbiter_id: "neutral-arbiter".to_string(),
+            sides: [
+                ArbitrationSide::Agent {
+                    id: "agent-a".to_string(),
+                },
+                ArbitrationSide::Primary,
+            ],
+            candidate_binding: Some(ArbitrationCandidateBinding {
+                version: 1,
+                agent_id: "neutral-arbiter".to_string(),
+                primary_head: None,
+                agent_head: None,
+                merge_base: None,
+                diff_oid: "candidate-diff".to_string(),
+            }),
+            candidate_status,
+            rationale_report: Some("reports/arbitration.json".to_string()),
+            rationale_sha256: Some("rationale-digest".to_string()),
+            reason: "collision arbitration completed".to_string(),
+        }
+    }
+
+    fn read_event_records(writer: &ArtifactRunWriter) -> Vec<Value> {
+        fs::read(writer.run_dir().join(ORCHESTRATION_EVENT_PATH))
+            .expect("read event journal")
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("valid event record"))
+            .collect()
+    }
+
+    fn committed_repo() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        Repository::init(&repo_path).expect("initialize repository");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+        let repo = Repository::open(&repo_path).expect("open repository");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage README");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit repository");
+        drop(tree);
+        drop(repo);
+        (temp, repo_path)
     }
 }
