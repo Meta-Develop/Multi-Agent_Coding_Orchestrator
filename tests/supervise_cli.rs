@@ -20,6 +20,7 @@
 
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
+use multi_agent_coding_orchestrator::supervise::FieldGuideEntrySuggestion;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -32,6 +33,27 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 const SUPERVISE_RUN_UNSUPPORTED: &str =
     "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input";
+
+#[test]
+fn field_guide_suggestion_public_contract_accepts_content_only_and_rejects_provenance() -> Result<()>
+{
+    let suggestion: FieldGuideEntrySuggestion = serde_json::from_value(serde_json::json!({
+        "finding": "bounded operational finding",
+        "context": "bounded operational context"
+    }))?;
+    assert_eq!(suggestion.finding, "bounded operational finding");
+    assert_eq!(suggestion.context, "bounded operational context");
+
+    let forged = serde_json::from_value::<FieldGuideEntrySuggestion>(serde_json::json!({
+        "finding": "bounded operational finding",
+        "context": "bounded operational context",
+        "date": "1999-01-01",
+        "source_run": "agent-selected"
+    }))
+    .expect_err("agent-selected provenance must be rejected");
+    assert!(forged.to_string().contains("unknown field"));
+    Ok(())
+}
 
 #[cfg(unix)]
 #[test]
