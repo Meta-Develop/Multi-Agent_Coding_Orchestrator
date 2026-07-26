@@ -5,6 +5,7 @@
 //! economics or as evidence for a named default.
 
 use crate::{
+    artifacts::state_auth::sha256_hex,
     llm::provider::Usage,
     supervise::{
         AgentRole, Finding, FindingSeverity, RoleModelSelection, RoleUsageObservation,
@@ -22,6 +23,7 @@ use thiserror::Error;
 pub const EVALUATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EVALUATION_REPETITIONS: u32 = 100;
+pub const COMMITTED_FIXTURE_FAKE_SEED: u64 = 26;
 pub const PROVISIONAL_FAKE_EVIDENCE_NOTICE: &str = "deterministic fake-provider evidence only; \
      not eligible to justify production model economics or a named default";
 
@@ -126,6 +128,22 @@ impl EvaluationManifest {
         }
         validate_held_out_bindings(&self.held_out_validation)?;
         validate_profiles(&self.profiles)?;
+        Ok(())
+    }
+
+    /// Verify that plan bytes are exactly the plan bound by this manifest.
+    pub fn validate_hand_authored_plan(&self, plan: &[u8]) -> Result<(), EvaluationError> {
+        let observed = format!("sha256:{}", sha256_hex(plan));
+        if self.target.hand_authored_plan_digest != observed {
+            return Err(invalid_manifest(
+                "target.hand_authored_plan_digest",
+                format!(
+                    "does not bind the supplied hand-authored plan; expected '{}', observed \
+                     '{observed}'",
+                    self.target.hand_authored_plan_digest
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -339,6 +357,8 @@ pub struct EvaluationResults {
     pub version: u32,
     pub manifest_version: u32,
     pub experiment_id: String,
+    /// Stable seed used by the deterministic fake harness.
+    pub fake_seed: u64,
     pub evidence: EvaluationEvidence,
     pub comparability: ComparabilityBinding,
     pub comparability_digest: String,
@@ -352,6 +372,53 @@ impl EvaluationResults {
     /// against the manifest.
     pub fn validate_against(&self, manifest: &EvaluationManifest) -> Result<(), EvaluationError> {
         validate_run_comparability(manifest, self)
+    }
+
+    /// Build the strict aggregate projection stored beside committed run fixtures.
+    pub fn summary(&self) -> EvaluationSummary {
+        EvaluationSummary {
+            version: self.version,
+            manifest_version: self.manifest_version,
+            experiment_id: self.experiment_id.clone(),
+            fake_seed: self.fake_seed,
+            evidence: self.evidence.clone(),
+            comparability_digest: self.comparability_digest.clone(),
+            profile_summaries: self.profile_summaries.clone(),
+            pareto_frontier: self.pareto_frontier.clone(),
+        }
+    }
+}
+
+/// Strict aggregate projection of one evaluation result set.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationSummary {
+    pub version: u32,
+    pub manifest_version: u32,
+    pub experiment_id: String,
+    pub fake_seed: u64,
+    pub evidence: EvaluationEvidence,
+    pub comparability_digest: String,
+    pub profile_summaries: Vec<ProfileSummary>,
+    pub pareto_frontier: Vec<ParetoPoint>,
+}
+
+impl EvaluationSummary {
+    /// Verify that this summary is the exact aggregate projection of validated results.
+    pub fn validate_against(
+        &self,
+        manifest: &EvaluationManifest,
+        results: &EvaluationResults,
+    ) -> Result<(), EvaluationError> {
+        results.validate_against(manifest)?;
+        self.evidence.validate()?;
+        if !evaluation_summaries_equivalent(self, &results.summary()) {
+            return Err(invalid_results(
+                "summary",
+                "does not exactly project the validated result aggregates and Pareto frontier",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -572,6 +639,7 @@ pub fn run_deterministic_fake(
         version: EVALUATION_RESULTS_SCHEMA_VERSION,
         manifest_version: manifest.version,
         experiment_id: manifest.experiment_id.clone(),
+        fake_seed: seed,
         evidence: EvaluationEvidence::provisional_fake_only(),
         comparability,
         comparability_digest,
@@ -724,13 +792,13 @@ pub fn validate_run_comparability(
     }
 
     let (expected_summaries, expected_frontier) = summarize_profiles(manifest, &results.runs)?;
-    if results.profile_summaries != expected_summaries {
+    if !profile_summaries_equivalent(&results.profile_summaries, &expected_summaries) {
         return Err(invalid_results(
             "profile_summaries",
             "aggregates do not match the repetition observations",
         ));
     }
-    if results.pareto_frontier != expected_frontier {
+    if !pareto_frontiers_equivalent(&results.pareto_frontier, &expected_frontier) {
         return Err(invalid_results(
             "pareto_frontier",
             "frontier does not match cost-versus-quality dominance over profile summaries",
@@ -1437,6 +1505,72 @@ fn dominates(candidate: &ProfileSummary, other: &ProfileSummary) -> bool {
     no_more_expensive && no_lower_quality && strictly_better
 }
 
+fn profile_summaries_equivalent(left: &[ProfileSummary], right: &[ProfileSummary]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.profile_id == right.profile_id
+                && left.repetitions == right.repetitions
+                && role_usage_maps_equivalent(
+                    &left.aggregate_role_usage,
+                    &right.aggregate_role_usage,
+                )
+                && left.aggregate_usage == right.aggregate_usage
+                && approximately_equal(left.aggregate_cost_usd, right.aggregate_cost_usd)
+                && approximately_equal(left.mean_cost_usd, right.mean_cost_usd)
+                && left.mean_wall_time_ms == right.mean_wall_time_ms
+                && left.mean_churn_count == right.mean_churn_count
+                && left.mean_conflict_count == right.mean_conflict_count
+                && left.mean_loc_added == right.mean_loc_added
+                && left.mean_loc_deleted == right.mean_loc_deleted
+                && left.mean_diff_bytes == right.mean_diff_bytes
+                && left.mean_quality == right.mean_quality
+                && left.pareto_optimal == right.pareto_optimal
+        })
+}
+
+fn evaluation_summaries_equivalent(left: &EvaluationSummary, right: &EvaluationSummary) -> bool {
+    left.version == right.version
+        && left.manifest_version == right.manifest_version
+        && left.experiment_id == right.experiment_id
+        && left.fake_seed == right.fake_seed
+        && left.evidence == right.evidence
+        && left.comparability_digest == right.comparability_digest
+        && profile_summaries_equivalent(&left.profile_summaries, &right.profile_summaries)
+        && pareto_frontiers_equivalent(&left.pareto_frontier, &right.pareto_frontier)
+}
+
+fn role_usage_maps_equivalent(
+    left: &BTreeMap<AgentRole, RoleUsageReport>,
+    right: &BTreeMap<AgentRole, RoleUsageReport>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(role, left)| {
+            right.get(role).is_some_and(|right| {
+                left.models == right.models
+                    && left.usage == right.usage
+                    && match (left.cost_usd, right.cost_usd) {
+                        (Some(left), Some(right)) => approximately_equal(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                    && left.observation == right.observation
+                    && left.unavailable_reason == right.unavailable_reason
+            })
+        })
+}
+
+fn pareto_frontiers_equivalent(left: &[ParetoPoint], right: &[ParetoPoint]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.profile_id == right.profile_id
+                && approximately_equal(left.mean_cost_usd, right.mean_cost_usd)
+                && left.quality_basis_points == right.quality_basis_points
+                && left.held_out_basis_points == right.held_out_basis_points
+                && left.breadth_basis_points == right.breadth_basis_points
+                && left.anti_shortcut_basis_points == right.anti_shortcut_basis_points
+        })
+}
+
 fn average_basis_points(total: u64, count: u64) -> Result<u32, EvaluationError> {
     let average = total / count;
     u32::try_from(average).map_err(|_| overflow("mean quality basis points"))
@@ -1662,6 +1796,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const FIXTURE_PLAN: &[u8] =
+        include_bytes!("../tests/fixtures/model_mix_evaluation/hand-authored-plan-v1.json");
+    const FIXTURE_MANIFEST: &str =
+        include_str!("../tests/fixtures/model_mix_evaluation/manifest-v1.json");
+    const FIXTURE_RESULTS: &str =
+        include_str!("../tests/fixtures/model_mix_evaluation/runs-v1.json");
+    const FIXTURE_SUMMARY: &str =
+        include_str!("../tests/fixtures/model_mix_evaluation/summary-v1.json");
+
     fn model(model: &str, reasoning_effort: &str) -> RoleModelSelection {
         RoleModelSelection {
             model: Some(model.to_string()),
@@ -1724,6 +1867,199 @@ mod tests {
                 profile("all-frontier", "frontier-v1", "frontier-v1"),
             ],
         }
+    }
+
+    fn committed_manifest() -> EvaluationManifest {
+        serde_json::from_str(FIXTURE_MANIFEST).expect("deserialize committed evaluation manifest")
+    }
+
+    fn committed_results() -> EvaluationResults {
+        serde_json::from_str(FIXTURE_RESULTS).expect("deserialize committed evaluation results")
+    }
+
+    fn committed_summary() -> EvaluationSummary {
+        serde_json::from_str(FIXTURE_SUMMARY).expect("deserialize committed evaluation summary")
+    }
+
+    #[test]
+    fn committed_fixtures_match_the_deterministic_harness() {
+        let manifest = committed_manifest();
+        manifest.validate().expect("validate committed manifest");
+        manifest
+            .validate_hand_authored_plan(FIXTURE_PLAN)
+            .expect("manifest binds the exact committed plan bytes");
+
+        let results = committed_results();
+        assert_eq!(results.fake_seed, COMMITTED_FIXTURE_FAKE_SEED);
+        results
+            .validate_against(&manifest)
+            .expect("committed results validate against their manifest");
+        let reproduced = run_deterministic_fake(&manifest, COMMITTED_FIXTURE_FAKE_SEED)
+            .expect("reproduce committed deterministic results");
+        assert_eq!(
+            FIXTURE_RESULTS,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&reproduced)
+                    .expect("serialize reproduced deterministic results")
+            )
+        );
+
+        let summary = committed_summary();
+        summary
+            .validate_against(&manifest, &results)
+            .expect("committed summary is an exact validated projection");
+        assert_eq!(
+            FIXTURE_SUMMARY,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&reproduced.summary())
+                    .expect("serialize reproduced deterministic summary")
+            )
+        );
+    }
+
+    #[test]
+    fn committed_fixtures_repeat_from_unique_equivalent_isolated_state() {
+        let manifest = committed_manifest();
+        let results = committed_results();
+        results
+            .validate_against(&manifest)
+            .expect("fixture comparability validation");
+
+        let expected_runs = manifest.profiles.len() * manifest.repetitions as usize;
+        assert_eq!(results.runs.len(), expected_runs);
+        for profile in &manifest.profiles {
+            let repetitions = results
+                .runs
+                .iter()
+                .filter(|run| run.profile_id == profile.id)
+                .map(|run| run.repetition)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                repetitions,
+                (0..manifest.repetitions).collect::<BTreeSet<_>>()
+            );
+        }
+
+        let isolation_ids = results
+            .runs
+            .iter()
+            .map(|run| run.isolated_state.isolation_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let starting_states = results
+            .runs
+            .iter()
+            .map(|run| run.isolated_state.starting_state_fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(isolation_ids.len(), expected_runs);
+        assert_eq!(starting_states.len(), 1);
+        assert!(results
+            .runs
+            .iter()
+            .all(|run| run.comparability_digest == results.comparability_digest));
+    }
+
+    #[test]
+    fn committed_fixtures_have_complete_metrics_and_anti_shortcut_aware_pareto_results() {
+        let manifest = committed_manifest();
+        let results = committed_results();
+        results
+            .validate_against(&manifest)
+            .expect("fixture metric and Pareto validation");
+
+        for run in &results.runs {
+            let profile = manifest
+                .profiles
+                .iter()
+                .find(|profile| profile.id == run.profile_id)
+                .expect("run profile is manifest-bound");
+            assert_eq!(run.metrics.role_usage.len(), profile.role_models.len());
+            assert!(run
+                .metrics
+                .role_usage
+                .values()
+                .all(|report| report.usage.is_some() && report.cost_usd.is_some()));
+            assert_eq!(
+                run.metrics.held_out_validation.len(),
+                manifest.held_out_validation.len()
+            );
+            assert!(run.metrics.review.breadth.checks_run > 0);
+            assert!(run.metrics.review.anti_shortcut.checks_run > 0);
+            assert!(run.metrics.quality.held_out_basis_points <= BASIS_POINTS);
+            assert!(run.metrics.quality.breadth_basis_points <= BASIS_POINTS);
+            assert!(run.metrics.quality.anti_shortcut_basis_points <= BASIS_POINTS);
+        }
+
+        assert!(!results.pareto_frontier.is_empty());
+        assert!(results.pareto_frontier.iter().all(|point| {
+            point.quality_basis_points > 0
+                && point.held_out_basis_points > 0
+                && point.breadth_basis_points > 0
+                && point.anti_shortcut_basis_points > 0
+        }));
+        let frontier_profiles = results
+            .pareto_frontier
+            .iter()
+            .map(|point| point.profile_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            frontier_profiles,
+            results
+                .profile_summaries
+                .iter()
+                .filter(|summary| summary.pareto_optimal)
+                .map(|summary| summary.profile_id.as_str())
+                .collect()
+        );
+    }
+
+    #[test]
+    fn committed_fixtures_are_schema_labeled_provisional_fake_only() {
+        let results = committed_results();
+        let summary = committed_summary();
+        for evidence in [&results.evidence, &summary.evidence] {
+            assert_eq!(
+                evidence.kind,
+                EvaluationEvidenceKind::ProvisionalDeterministicFakeOnly
+            );
+            assert!(!evidence.real_provider_executed);
+            assert!(!evidence.eligible_for_production_economics);
+            assert!(!evidence.eligible_to_justify_named_default);
+            assert_eq!(evidence.notice, PROVISIONAL_FAKE_EVIDENCE_NOTICE);
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit snapshot regeneration only"]
+    fn regenerate_committed_evaluation_fixtures() {
+        let manifest = committed_manifest();
+        manifest.validate().expect("validate committed manifest");
+        manifest
+            .validate_hand_authored_plan(FIXTURE_PLAN)
+            .expect("manifest binds committed plan");
+        let results = run_deterministic_fake(&manifest, COMMITTED_FIXTURE_FAKE_SEED)
+            .expect("generate deterministic fixture results");
+        let summary = results.summary();
+        let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/model_mix_evaluation");
+
+        std::fs::write(
+            fixture_root.join("runs-v1.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&results).expect("serialize fixture results")
+            ),
+        )
+        .expect("write fixture results");
+        std::fs::write(
+            fixture_root.join("summary-v1.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&summary).expect("serialize fixture summary")
+            ),
+        )
+        .expect("write fixture summary");
     }
 
     #[test]

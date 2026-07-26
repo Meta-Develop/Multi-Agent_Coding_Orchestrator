@@ -1,263 +1,119 @@
 {
-  "schema_version": 1,
-  "artifact_kind": "model_mix_experiment_manifest",
+  "version": 1,
   "experiment_id": "issue26-phase-a-readme-v1",
-  "fixture_status": "provisional_fake_only",
-  "production_eligible": false,
-  "description": "Deterministic phase-A fixture for comparing hand-authored-plan role/model mixes without provider execution.",
-  "goal": {
-    "goal_id": "readme-model-mix-note-v1",
-    "kind": "hand_authored_plan_task",
-    "summary": "Improve the README model-mix fixture note without changing Rust code.",
-    "content_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24"
+  "target": {
+    "spec_or_goal_id": "readme-model-mix-note-v1",
+    "spec_or_goal_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
+    "hand_authored_plan_digest": "sha256:97287ddff8f50f671fc95e2930277e4279580eeba7ac9cb4a86e7043fbe6eb9b"
   },
-  "repository_base_snapshot": {
-    "commit_oid": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
-    "tree_oid": "f4261a4b81e8e39cb0772829ecbe166aaa7ab15b",
-    "dirty_paths": [],
-    "submodules": []
-  },
-  "hand_authored_plan": {
-    "path": "tests/fixtures/model_mix_evaluation/hand-authored-plan-v1.json",
-    "sha256": "97287ddff8f50f671fc95e2930277e4279580eeba7ac9cb4a86e7043fbe6eb9b",
-    "plan_schema_version": 1
-  },
+  "repository_base_snapshot": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
   "limits": {
-    "limits_digest": "sha256:f17fa384395dda77e20efda0016f61475463efa9c8f3f1c12f2a445fd1e0b829",
-    "per_run_wall_time_seconds": 900,
-    "child_timeout_seconds": 600,
-    "max_dispatches": 4,
-    "max_concurrent_children": 2,
-    "max_child_retries": 0
+    "wall_time_seconds": 900,
+    "max_dispatches": 4
   },
-  "repetitions_per_profile": 3,
-  "expected_run_count": 12,
-  "isolated_start_state": {
-    "fingerprint_algorithm": "sha256",
-    "expected_fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-    "required_checks": [
-      "base_commit_matches",
-      "base_tree_matches",
-      "index_clean",
-      "worktree_clean",
-      "untracked_paths_empty",
-      "runtime_artifacts_absent",
-      "provider_credentials_absent"
-    ],
-    "reset_between_repetitions": true
-  },
-  "pricing": {
-    "currency": "fake_microcredit",
-    "non_monetary": true,
-    "rates_per_token": {
-      "fake-frontier-v1": {
-        "input": 4,
-        "output": 12
-      },
-      "fake-balanced-v1": {
-        "input": 2,
-        "output": 6
-      },
-      "fake-economy-v1": {
-        "input": 1,
-        "output": 2
-      }
-    }
-  },
-  "profiles": [
+  "held_out_validation": [
     {
-      "profile_id": "frontier-all-v1",
-      "roles": {
-        "supervisor": {
-          "model": "fake-frontier-v1",
-          "reasoning_effort": "high"
-        },
-        "child_orchestrator": {
-          "model": "fake-frontier-v1",
-          "reasoning_effort": "high"
-        },
-        "worker": {
-          "model": "fake-frontier-v1",
-          "reasoning_effort": "medium"
-        },
-        "review_auditor": {
-          "model": "fake-frontier-v1",
-          "reasoning_effort": "high"
-        }
-      }
+      "id": "readme-contract",
+      "command": [
+        "cargo",
+        "test",
+        "evaluation::tests::committed_fixtures_match_the_deterministic_harness"
+      ]
     },
     {
-      "profile_id": "hybrid-frontier-economy-v1",
-      "roles": {
-        "supervisor": {
-          "model": "fake-frontier-v1",
-          "reasoning_effort": "high"
-        },
-        "child_orchestrator": {
-          "model": "fake-balanced-v1",
-          "reasoning_effort": "high"
-        },
-        "worker": {
-          "model": "fake-economy-v1",
-          "reasoning_effort": "medium"
-        },
-        "review_auditor": {
-          "model": "fake-balanced-v1",
-          "reasoning_effort": "high"
-        }
-      }
-    },
-    {
-      "profile_id": "balanced-all-v1",
-      "roles": {
-        "supervisor": {
-          "model": "fake-balanced-v1",
-          "reasoning_effort": "high"
-        },
-        "child_orchestrator": {
-          "model": "fake-balanced-v1",
-          "reasoning_effort": "high"
-        },
-        "worker": {
-          "model": "fake-balanced-v1",
-          "reasoning_effort": "medium"
-        },
-        "review_auditor": {
-          "model": "fake-balanced-v1",
-          "reasoning_effort": "high"
-        }
-      }
-    },
-    {
-      "profile_id": "economy-all-v1",
-      "roles": {
-        "supervisor": {
-          "model": "fake-economy-v1",
-          "reasoning_effort": "high"
-        },
-        "child_orchestrator": {
-          "model": "fake-economy-v1",
-          "reasoning_effort": "high"
-        },
-        "worker": {
-          "model": "fake-economy-v1",
-          "reasoning_effort": "medium"
-        },
-        "review_auditor": {
-          "model": "fake-economy-v1",
-          "reasoning_effort": "high"
-        }
-      }
+      "id": "provider-boundary",
+      "command": [
+        "cargo",
+        "test",
+        "evaluation::tests::real_provider_execution_has_opt_in_and_phase_a_refusal_gates"
+      ]
     }
   ],
-  "held_out_validation": {
-    "suite_id": "readme-model-mix-held-out-v1",
-    "suite_digest": "sha256:dcdc2019fd377cf537cdba5d7831596b68c1988fe53954f76b8419b4aa21dbab",
-    "test_count": 12,
-    "visibility": "withheld_until_after_candidate_capture",
-    "present_in_agent_prompt": false,
-    "deterministic": true
-  },
-  "grading": {
-    "rubric_id": "implementation-quality-rubric-v1",
-    "config_digest": "sha256:b0a5d6344a6b43e9a5e330fbb0ff51f50ac5059e0e9de078e82de79c7575cb35",
-    "blinded_to": [
-      "profile_id",
-      "role_models",
-      "token_usage",
-      "cost"
-    ],
-    "graders": [
-      {
-        "grader_id": "breadth",
-        "model": "fake-grader-v1",
-        "prompt_version": 1,
-        "policy_version": 1
-      },
-      {
-        "grader_id": "anti_shortcut",
-        "model": "fake-grader-v1",
-        "prompt_version": 1,
-        "policy_version": 1
+  "repetitions": 3,
+  "profiles": [
+    {
+      "id": "frontier-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        }
       }
-    ],
-    "quality_formula": {
-      "held_out_pass_rate_weight": 0.6,
-      "breadth_score_weight": 0.2,
-      "anti_shortcut_score_weight": 0.2
     },
-    "inter_grader_disagreement": "absolute_score_difference"
-  },
-  "metrics_contract": {
-    "required_per_role": [
-      "input_tokens",
-      "output_tokens",
-      "total_tokens",
-      "cost"
-    ],
-    "required_per_run": [
-      "wall_time_ms",
-      "churn",
-      "conflicts",
-      "changed_files",
-      "lines_added",
-      "lines_deleted",
-      "diff_lines",
-      "net_loc",
-      "held_out_validation",
-      "review_findings",
-      "quality_score",
-      "comparability"
-    ],
-    "negative_examples": {
-      "retain_malformed_tool_calls": true,
-      "retain_typed_environment_failures": true,
-      "filter_failures_from_averages": false
+    {
+      "id": "hybrid-frontier-economy-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-frontier-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        }
+      }
     },
-    "outcome_label_schema_version": 1,
-    "allowed_outcome_labels": [
-      "accepted",
-      "rejected",
-      "accepted_with_modifications"
-    ]
-  },
-  "comparability_contract": {
-    "required_equal_bindings": [
-      "manifest_digest",
-      "goal_digest",
-      "base_commit",
-      "base_tree",
-      "plan_digest",
-      "limits_digest",
-      "isolated_state_fingerprint",
-      "held_out_suite_digest",
-      "grader_config_digest"
-    ],
-    "excluded_run_policy": "A failed equality check makes the run non-comparable; preserve it in machine-readable output but exclude it from profile aggregates and Pareto ranking."
-  },
-  "pareto_contract": {
-    "minimize": "mean_total_cost",
-    "maximize": "mean_quality_score",
-    "dominance": "Profile A dominates profile B when A costs no more and scores no lower, with at least one strict improvement."
-  },
-  "real_provider_boundary": {
-    "default": "disabled",
-    "provider_execution_performed": false,
-    "requirements": [
-      "explicit operator opt-in",
-      "explicit provider and model selection",
-      "available credentials supplied outside committed fixtures",
-      "fresh equivalent isolated states",
-      "no overwrite of provisional fake evidence"
-    ]
-  },
-  "phase_b_requirement": {
-    "status": "remaining",
-    "required_capability": "one_command_goal_to_integration_rerun",
-    "requirement": "A future phase-B command must rerun every profile and repetition from the bound goal and base snapshot, enforce the same limits and held-out grading contract, and emit the same machine-readable run and Pareto shapes."
-  },
-  "outputs": {
-    "run_fixture_path": "tests/fixtures/model_mix_evaluation/runs-v1.json",
-    "summary_fixture_path": "tests/fixtures/model_mix_evaluation/summary-v1.json"
-  }
+    {
+      "id": "balanced-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-balanced-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    },
+    {
+      "id": "economy-all-v1",
+      "role_models": {
+        "supervisor": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        },
+        "child_orchestrator": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        },
+        "worker": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "medium"
+        },
+        "auditor": {
+          "model": "fake-economy-v1",
+          "reasoning_effort": "high"
+        }
+      }
+    }
+  ]
 }

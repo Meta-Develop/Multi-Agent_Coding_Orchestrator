@@ -1,442 +1,330 @@
 {
-  "schema_version": 1,
-  "artifact_kind": "model_mix_experiment_summary",
-  "fixture_status": "provisional_fake_only",
-  "production_eligible": false,
+  "version": 1,
+  "manifest_version": 1,
   "experiment_id": "issue26-phase-a-readme-v1",
-  "sources": {
-    "manifest": {
-      "path": "tests/fixtures/model_mix_evaluation/manifest-v1.json",
-      "sha256": "73f91a23fd45a4a08ca57dea445cf2b019a5f8a9a8e9bcfd5aab61e037df4bb9"
-    },
-    "runs": {
-      "path": "tests/fixtures/model_mix_evaluation/runs-v1.json",
-      "sha256": "a2ff8c40af1af30bb6edd65c188ec62b4bee2b49870a9945d6a61fa3d1d27db9"
-    }
+  "fake_seed": 26,
+  "evidence": {
+    "kind": "provisional_deterministic_fake_only",
+    "real_provider_executed": false,
+    "eligible_for_production_economics": false,
+    "eligible_to_justify_named_default": false,
+    "notice": "deterministic fake-provider evidence only; not eligible to justify production model economics or a named default"
   },
-  "aggregation": {
-    "method": "arithmetic_mean_over_comparable_runs",
-    "decimal_rounding": 6,
-    "expected_profiles": 4,
-    "expected_repetitions_per_profile": 3,
-    "expected_runs": 12,
-    "observed_runs": 12,
-    "comparable_runs": 12,
-    "non_comparable_runs": 0
-  },
-  "comparability": {
-    "verdict": "all_runs_comparable",
-    "equal_bindings": {
-      "manifest_digest": true,
-      "goal_digest": true,
-      "base_commit": true,
-      "base_tree": true,
-      "plan_digest": true,
-      "limits_digest": true,
-      "isolated_state_fingerprint": true,
-      "held_out_suite_digest": true,
-      "grader_config_digest": true
-    },
-    "limit_checks": {
-      "all_time_limits_respected": true,
-      "all_dispatch_limits_respected": true
-    },
-    "isolated_state_checks": {
-      "all_base_commits_matched": true,
-      "all_base_trees_matched": true,
-      "all_indexes_clean": true,
-      "all_worktrees_clean": true,
-      "all_untracked_path_sets_empty": true,
-      "all_runtime_artifact_sets_absent": true,
-      "all_provider_credentials_absent": true
-    },
-    "excluded_run_ids": []
-  },
-  "profile_aggregates": [
+  "comparability_digest": "fnv1a64:e61ad897c605b51a",
+  "profile_summaries": [
     {
       "profile_id": "frontier-all-v1",
-      "run_count": 3,
-      "mean_total_tokens": 12320,
-      "mean_total_cost": {
-        "amount": 77360,
-        "currency": "fake_microcredit"
-      },
-      "mean_wall_time_ms": 420000,
-      "mean_quality_score": 0.95,
-      "mean_held_out_pass_rate": 1.0,
-      "mean_breadth_score": 0.916667,
-      "mean_anti_shortcut_score": 0.833333,
-      "mean_inter_grader_disagreement": 0.083333,
-      "mean_churn": {
-        "commit_count": 3,
-        "revision_rounds": 1,
-        "changed_files": 4,
-        "lines_added": 120.666667,
-        "lines_deleted": 30,
-        "diff_lines": 150.666667,
-        "net_loc": 90.666667
-      },
-      "conflict_totals": {
-        "claim_conflicts": 0,
-        "merge_conflicts": 0,
-        "review_rework_cycles": 0
-      },
-      "per_role_means": [
-        {
-          "role": "supervisor",
-          "total_tokens": 1400,
-          "cost": {
-            "amount": 8800,
-            "currency": "fake_microcredit"
-          }
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 2524,
+            "output_tokens": 1424,
+            "total_tokens": 3948
+          },
+          "cost_usd": 0.01870136,
+          "observation": "process_observed"
         },
-        {
-          "role": "child_orchestrator",
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 15600,
-            "currency": "fake_microcredit"
-          }
+        "child_orchestrator": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3869,
+            "output_tokens": 2159,
+            "total_tokens": 6028
+          },
+          "cost_usd": 0.02861341,
+          "observation": "process_observed"
         },
-        {
-          "role": "worker",
-          "total_tokens": 6800,
-          "cost": {
-            "amount": 43200,
-            "currency": "fake_microcredit"
-          }
+        "worker": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4504,
+            "output_tokens": 1578,
+            "total_tokens": 6082
+          },
+          "cost_usd": 0.03120506,
+          "observation": "process_observed"
         },
-        {
-          "role": "review_auditor",
-          "total_tokens": 1620,
-          "cost": {
-            "amount": 9760,
-            "currency": "fake_microcredit"
-          }
+        "auditor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4227,
+            "output_tokens": 2443,
+            "total_tokens": 6670
+          },
+          "cost_usd": 0.031450530000000004,
+          "observation": "process_observed"
         }
-      ],
-      "outcome_counts": {
-        "accepted": 3,
-        "accepted_with_modifications": 0,
-        "rejected": 0
-      }
+      },
+      "aggregate_usage": {
+        "input_tokens": 15124,
+        "output_tokens": 7604,
+        "total_tokens": 22728
+      },
+      "aggregate_cost_usd": 0.10997036,
+      "mean_cost_usd": 0.03665678666666667,
+      "mean_wall_time_ms": 3977,
+      "mean_churn_count": 6,
+      "mean_conflict_count": 3,
+      "mean_loc_added": 211,
+      "mean_loc_deleted": 112,
+      "mean_diff_bytes": 12320,
+      "mean_quality": {
+        "held_out_basis_points": 8726,
+        "breadth_basis_points": 10000,
+        "anti_shortcut_basis_points": 6666,
+        "overall_basis_points": 8529
+      },
+      "pareto_optimal": true
     },
     {
       "profile_id": "hybrid-frontier-economy-v1",
-      "run_count": 3,
-      "mean_total_tokens": 12320,
-      "mean_total_cost": {
-        "amount": 30280,
-        "currency": "fake_microcredit"
-      },
-      "mean_wall_time_ms": 355000,
-      "mean_quality_score": 0.95,
-      "mean_held_out_pass_rate": 1.0,
-      "mean_breadth_score": 0.916667,
-      "mean_anti_shortcut_score": 0.833333,
-      "mean_inter_grader_disagreement": 0.083333,
-      "mean_churn": {
-        "commit_count": 3,
-        "revision_rounds": 1,
-        "changed_files": 4,
-        "lines_added": 118.666667,
-        "lines_deleted": 30,
-        "diff_lines": 148.666667,
-        "net_loc": 88.666667
-      },
-      "conflict_totals": {
-        "claim_conflicts": 0,
-        "merge_conflicts": 0,
-        "review_rework_cycles": 0
-      },
-      "per_role_means": [
-        {
-          "role": "supervisor",
-          "total_tokens": 1400,
-          "cost": {
-            "amount": 8800,
-            "currency": "fake_microcredit"
-          }
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3275,
+            "output_tokens": 2115,
+            "total_tokens": 5390
+          },
+          "cost_usd": 0.024867249999999997,
+          "observation": "process_observed"
         },
-        {
-          "role": "child_orchestrator",
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 7800,
-            "currency": "fake_microcredit"
-          }
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3438,
+            "output_tokens": 1603,
+            "total_tokens": 5041
+          },
+          "cost_usd": 0.04611424,
+          "observation": "process_observed"
         },
-        {
-          "role": "worker",
-          "total_tokens": 6800,
-          "cost": {
-            "amount": 8800,
-            "currency": "fake_microcredit"
-          }
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 3531,
+            "output_tokens": 1953,
+            "total_tokens": 5484
+          },
+          "cost_usd": 0.05581392,
+          "observation": "process_observed"
         },
-        {
-          "role": "review_auditor",
-          "total_tokens": 1620,
-          "cost": {
-            "amount": 4880,
-            "currency": "fake_microcredit"
-          }
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3198,
+            "output_tokens": 1698,
+            "total_tokens": 4896
+          },
+          "cost_usd": 0.046739340000000004,
+          "observation": "process_observed"
         }
-      ],
-      "outcome_counts": {
-        "accepted": 3,
-        "accepted_with_modifications": 0,
-        "rejected": 0
-      }
+      },
+      "aggregate_usage": {
+        "input_tokens": 13442,
+        "output_tokens": 7369,
+        "total_tokens": 20811
+      },
+      "aggregate_cost_usd": 0.17353475000000002,
+      "mean_cost_usd": 0.05784491666666667,
+      "mean_wall_time_ms": 5809,
+      "mean_churn_count": 8,
+      "mean_conflict_count": 2,
+      "mean_loc_added": 286,
+      "mean_loc_deleted": 54,
+      "mean_diff_bytes": 13081,
+      "mean_quality": {
+        "held_out_basis_points": 7959,
+        "breadth_basis_points": 10000,
+        "anti_shortcut_basis_points": 5000,
+        "overall_basis_points": 7729
+      },
+      "pareto_optimal": false
     },
     {
       "profile_id": "balanced-all-v1",
-      "run_count": 3,
-      "mean_total_tokens": 13293.333333,
-      "mean_total_cost": {
-        "amount": 41946.666667,
-        "currency": "fake_microcredit"
-      },
-      "mean_wall_time_ms": 335000,
-      "mean_quality_score": 0.89,
-      "mean_held_out_pass_rate": 0.944444,
-      "mean_breadth_score": 0.833333,
-      "mean_anti_shortcut_score": 0.783333,
-      "mean_inter_grader_disagreement": 0.05,
-      "mean_churn": {
-        "commit_count": 3.666667,
-        "revision_rounds": 1.666667,
-        "changed_files": 4.666667,
-        "lines_added": 135,
-        "lines_deleted": 40,
-        "diff_lines": 175,
-        "net_loc": 95
-      },
-      "conflict_totals": {
-        "claim_conflicts": 1,
-        "merge_conflicts": 0,
-        "review_rework_cycles": 2
-      },
-      "per_role_means": [
-        {
-          "role": "supervisor",
-          "total_tokens": 1483.333333,
-          "cost": {
-            "amount": 4686.666667,
-            "currency": "fake_microcredit"
-          }
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3902,
+            "output_tokens": 2438,
+            "total_tokens": 6340
+          },
+          "cost_usd": 0.06383254,
+          "observation": "process_observed"
         },
-        {
-          "role": "child_orchestrator",
-          "total_tokens": 2660,
-          "cost": {
-            "amount": 8360,
-            "currency": "fake_microcredit"
-          }
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4952,
+            "output_tokens": 1393,
+            "total_tokens": 6345
+          },
+          "cost_usd": 0.04940394,
+          "observation": "process_observed"
         },
-        {
-          "role": "worker",
-          "total_tokens": 7400,
-          "cost": {
-            "amount": 23600,
-            "currency": "fake_microcredit"
-          }
+        "worker": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3262,
+            "output_tokens": 1900,
+            "total_tokens": 5162
+          },
+          "cost_usd": 0.050796499999999994,
+          "observation": "process_observed"
         },
-        {
-          "role": "review_auditor",
-          "total_tokens": 1750,
-          "cost": {
-            "amount": 5300,
-            "currency": "fake_microcredit"
-          }
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4820,
+            "output_tokens": 2011,
+            "total_tokens": 6831
+          },
+          "cost_usd": 0.060259379999999994,
+          "observation": "process_observed"
         }
-      ],
-      "outcome_counts": {
-        "accepted": 0,
-        "accepted_with_modifications": 3,
-        "rejected": 0
-      }
+      },
+      "aggregate_usage": {
+        "input_tokens": 16936,
+        "output_tokens": 7742,
+        "total_tokens": 24678
+      },
+      "aggregate_cost_usd": 0.22429235999999997,
+      "mean_cost_usd": 0.07476411999999999,
+      "mean_wall_time_ms": 6737,
+      "mean_churn_count": 6,
+      "mean_conflict_count": 3,
+      "mean_loc_added": 181,
+      "mean_loc_deleted": 101,
+      "mean_diff_bytes": 11109,
+      "mean_quality": {
+        "held_out_basis_points": 8565,
+        "breadth_basis_points": 8750,
+        "anti_shortcut_basis_points": 8333,
+        "overall_basis_points": 8553
+      },
+      "pareto_optimal": true
     },
     {
       "profile_id": "economy-all-v1",
-      "run_count": 3,
-      "mean_total_tokens": 14750,
-      "mean_total_cost": {
-        "amount": 19200,
-        "currency": "fake_microcredit"
-      },
-      "mean_wall_time_ms": 295000,
-      "mean_quality_score": 0.796667,
-      "mean_held_out_pass_rate": 0.833333,
-      "mean_breadth_score": 0.783333,
-      "mean_anti_shortcut_score": 0.7,
-      "mean_inter_grader_disagreement": 0.083333,
-      "mean_churn": {
-        "commit_count": 5.333333,
-        "revision_rounds": 2.333333,
-        "changed_files": 6,
-        "lines_added": 158.333333,
-        "lines_deleted": 64.333333,
-        "diff_lines": 222.666667,
-        "net_loc": 94
-      },
-      "conflict_totals": {
-        "claim_conflicts": 3,
-        "merge_conflicts": 1,
-        "review_rework_cycles": 6
-      },
-      "per_role_means": [
-        {
-          "role": "supervisor",
-          "total_tokens": 1580,
-          "cost": {
-            "amount": 2060,
-            "currency": "fake_microcredit"
-          }
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4348,
+            "output_tokens": 1434,
+            "total_tokens": 5782
+          },
+          "cost_usd": 0.05297066,
+          "observation": "process_observed"
         },
-        {
-          "role": "child_orchestrator",
-          "total_tokens": 2850,
-          "cost": {
-            "amount": 3700,
-            "currency": "fake_microcredit"
-          }
+        "child_orchestrator": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4220,
+            "output_tokens": 2458,
+            "total_tokens": 6678
+          },
+          "cost_usd": 0.06871594,
+          "observation": "process_observed"
         },
-        {
-          "role": "worker",
-          "total_tokens": 8400,
-          "cost": {
-            "amount": 11000,
-            "currency": "fake_microcredit"
-          }
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 5177,
+            "output_tokens": 1332,
+            "total_tokens": 6509
+          },
+          "cost_usd": 0.056977269999999997,
+          "observation": "process_observed"
         },
-        {
-          "role": "review_auditor",
-          "total_tokens": 1920,
-          "cost": {
-            "amount": 2440,
-            "currency": "fake_microcredit"
-          }
+        "auditor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4031,
+            "output_tokens": 2136,
+            "total_tokens": 6167
+          },
+          "cost_usd": 0.062199010000000006,
+          "observation": "process_observed"
         }
-      ],
-      "outcome_counts": {
-        "accepted": 0,
-        "accepted_with_modifications": 2,
-        "rejected": 1
-      }
+      },
+      "aggregate_usage": {
+        "input_tokens": 17776,
+        "output_tokens": 7360,
+        "total_tokens": 25136
+      },
+      "aggregate_cost_usd": 0.24086288000000003,
+      "mean_cost_usd": 0.08028762666666668,
+      "mean_wall_time_ms": 7329,
+      "mean_churn_count": 5,
+      "mean_conflict_count": 3,
+      "mean_loc_added": 419,
+      "mean_loc_deleted": 142,
+      "mean_diff_bytes": 21213,
+      "mean_quality": {
+        "held_out_basis_points": 7757,
+        "breadth_basis_points": 7500,
+        "anti_shortcut_basis_points": 5000,
+        "overall_basis_points": 7003
+      },
+      "pareto_optimal": false
     }
   ],
-  "review_summary": {
-    "rubric_id": "implementation-quality-rubric-v1",
-    "blinded": true,
-    "breadth_findings": [
-      {
-        "profile_id": "frontier-all-v1",
-        "severity": "info",
-        "message": "All required comparison surfaces were covered in every repetition."
-      },
-      {
-        "profile_id": "hybrid-frontier-economy-v1",
-        "severity": "info",
-        "message": "All required comparison surfaces were covered in every repetition."
-      },
-      {
-        "profile_id": "balanced-all-v1",
-        "severity": "warning",
-        "message": "Provider-boundary and default-decision rationale needed modifications across repetitions."
-      },
-      {
-        "profile_id": "economy-all-v1",
-        "severity": "warning",
-        "message": "Held-out coverage and phase-B detail remained incomplete."
-      }
-    ],
-    "anti_shortcut_findings": [
-      {
-        "profile_id": "frontier-all-v1",
-        "severity": "info",
-        "message": "Held-out validation and explicit rubric evidence prevented LOC-only or test-only scoring."
-      },
-      {
-        "profile_id": "hybrid-frontier-economy-v1",
-        "severity": "info",
-        "message": "Held-out validation and explicit rubric evidence prevented LOC-only or test-only scoring."
-      },
-      {
-        "profile_id": "balanced-all-v1",
-        "severity": "warning",
-        "message": "One malformed call and one held-out failure remained visible rather than being discarded."
-      },
-      {
-        "profile_id": "economy-all-v1",
-        "severity": "error",
-        "message": "One malformed call lacked a successful correction; low cost did not override the blocking finding."
-      }
-    ],
-    "negative_example_totals": {
-      "malformed_tool_calls": 2,
-      "typed_environment_failures": [
-        {
-          "kind": "sandbox_denied",
-          "count": 1
-        }
-      ],
-      "all_retained": true,
-      "filtered_out": false
+  "pareto_frontier": [
+    {
+      "profile_id": "frontier-all-v1",
+      "mean_cost_usd": 0.03665678666666667,
+      "quality_basis_points": 8529,
+      "held_out_basis_points": 8726,
+      "breadth_basis_points": 10000,
+      "anti_shortcut_basis_points": 6666
     },
-    "outcome_label_provenance": {
-      "label_schema_version": 1,
-      "actor_kind": "fixture_labeler",
-      "inferred_from_git_history": false
+    {
+      "profile_id": "balanced-all-v1",
+      "mean_cost_usd": 0.07476411999999999,
+      "quality_basis_points": 8553,
+      "held_out_basis_points": 8565,
+      "breadth_basis_points": 8750,
+      "anti_shortcut_basis_points": 8333
     }
-  },
-  "pareto": {
-    "cost_axis": {
-      "field": "mean_total_cost.amount",
-      "direction": "minimize",
-      "currency": "fake_microcredit"
-    },
-    "quality_axis": {
-      "field": "mean_quality_score",
-      "direction": "maximize",
-      "components": [
-        "held_out_pass_rate",
-        "breadth_score",
-        "anti_shortcut_score"
-      ]
-    },
-    "frontier_profile_ids": [
-      "hybrid-frontier-economy-v1",
-      "economy-all-v1"
-    ],
-    "dominated_profiles": [
-      {
-        "profile_id": "frontier-all-v1",
-        "dominated_by": "hybrid-frontier-economy-v1",
-        "reason": "The hybrid profile has the same mean quality score at lower fake cost."
-      },
-      {
-        "profile_id": "balanced-all-v1",
-        "dominated_by": "hybrid-frontier-economy-v1",
-        "reason": "The hybrid profile has higher mean quality and lower fake cost."
-      }
-    ],
-    "provisional_fixture_candidate": {
-      "profile_id": "hybrid-frontier-economy-v1",
-      "decision_status": "fixture_only_not_default_authority",
-      "reason": "It is the only Pareto profile with three accepted repetitions and a mean quality score of 0.95.",
-      "may_set_production_default": false
-    }
-  },
-  "real_provider_boundary": {
-    "provider_execution_performed": false,
-    "strictly_opt_in": true,
-    "fixture_values_are_real_pricing": false,
-    "fixture_values_are_production_evidence": false
-  },
-  "phase_b_requirement": {
-    "status": "remaining",
-    "required_capability": "one_command_goal_to_integration_rerun",
-    "requirement": "Rerun all profiles and repetitions from fresh equivalent isolated state through one command, then emit schema-compatible run and Pareto outputs without overwriting phase-A fixtures."
-  }
+  ]
 }

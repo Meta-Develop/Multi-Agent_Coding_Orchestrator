@@ -1,1996 +1,1798 @@
 {
-  "schema_version": 1,
-  "artifact_kind": "model_mix_run_fixture_set",
-  "fixture_status": "provisional_fake_only",
-  "production_eligible": false,
-  "manifest": {
-    "path": "tests/fixtures/model_mix_evaluation/manifest-v1.json",
-    "sha256": "73f91a23fd45a4a08ca57dea445cf2b019a5f8a9a8e9bcfd5aab61e037df4bb9",
-    "experiment_id": "issue26-phase-a-readme-v1"
+  "version": 1,
+  "manifest_version": 1,
+  "experiment_id": "issue26-phase-a-readme-v1",
+  "fake_seed": 26,
+  "evidence": {
+    "kind": "provisional_deterministic_fake_only",
+    "real_provider_executed": false,
+    "eligible_for_production_economics": false,
+    "eligible_to_justify_named_default": false,
+    "notice": "deterministic fake-provider evidence only; not eligible to justify production model economics or a named default"
   },
-  "comparison_basis": {
-    "goal_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
-    "base_commit": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
-    "base_tree": "f4261a4b81e8e39cb0772829ecbe166aaa7ab15b",
-    "plan_digest": "sha256:97287ddff8f50f671fc95e2930277e4279580eeba7ac9cb4a86e7043fbe6eb9b",
-    "limits_digest": "sha256:f17fa384395dda77e20efda0016f61475463efa9c8f3f1c12f2a445fd1e0b829",
-    "isolated_state_fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-    "held_out_suite_digest": "sha256:dcdc2019fd377cf537cdba5d7831596b68c1988fe53954f76b8419b4aa21dbab",
-    "grader_config_digest": "sha256:b0a5d6344a6b43e9a5e330fbb0ff51f50ac5059e0e9de078e82de79c7575cb35"
+  "comparability": {
+    "target": {
+      "spec_or_goal_id": "readme-model-mix-note-v1",
+      "spec_or_goal_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
+      "hand_authored_plan_digest": "sha256:97287ddff8f50f671fc95e2930277e4279580eeba7ac9cb4a86e7043fbe6eb9b"
+    },
+    "repository_base_snapshot": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+    "limits": {
+      "wall_time_seconds": 900,
+      "max_dispatches": 4
+    },
+    "held_out_validation": [
+      {
+        "id": "readme-contract",
+        "command": [
+          "cargo",
+          "test",
+          "evaluation::tests::committed_fixtures_match_the_deterministic_harness"
+        ]
+      },
+      {
+        "id": "provider-boundary",
+        "command": [
+          "cargo",
+          "test",
+          "evaluation::tests::real_provider_execution_has_opt_in_and_phase_a_refusal_gates"
+        ]
+      }
+    ],
+    "profiles": [
+      {
+        "id": "frontier-all-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      },
+      {
+        "id": "hybrid-frontier-economy-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      },
+      {
+        "id": "balanced-all-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      },
+      {
+        "id": "economy-all-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      }
+    ]
   },
+  "comparability_digest": "fnv1a64:e61ad897c605b51a",
   "runs": [
     {
-      "run_id": "frontier-all-v1-r01",
       "profile_id": "frontier-all-v1",
-      "repetition": 1,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 420000
+      "repetition": 0,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-0",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
       },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1000,
-          "output_tokens": 400,
-          "total_tokens": 1400,
-          "cost": {
-            "amount": 8800,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1800,
-          "output_tokens": 700,
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 15600,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-frontier-v1",
-          "input_tokens": 4800,
-          "output_tokens": 2000,
-          "total_tokens": 6800,
-          "cost": {
-            "amount": 43200,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1200,
-          "output_tokens": 400,
-          "total_tokens": 1600,
-          "cost": {
-            "amount": 9600,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
       "metrics": {
-        "total_tokens": 12300,
-        "total_cost": {
-          "amount": 77200,
-          "currency": "fake_microcredit"
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 742,
+              "output_tokens": 623,
+              "total_tokens": 1365
+            },
+            "cost_usd": 0.00595763,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1568,
+              "output_tokens": 847,
+              "total_tokens": 2415
+            },
+            "cost_usd": 0.011533269999999998,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 881,
+              "output_tokens": 309,
+              "total_tokens": 1190
+            },
+            "cost_usd": 0.00610459,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1256,
+              "output_tokens": 656,
+              "total_tokens": 1912
+            },
+            "cost_usd": 0.009187840000000001,
+            "observation": "process_observed"
+          }
         },
-        "wall_time_ms": 420000,
-        "churn": {
-          "commit_count": 3,
-          "revision_rounds": 1,
-          "changed_files": 4,
-          "lines_added": 120,
-          "lines_deleted": 30,
-          "diff_lines": 150,
-          "net_loc": 90
+        "total_usage": {
+          "input_tokens": 4447,
+          "output_tokens": 2435,
+          "total_tokens": 6882
         },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 0
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 12,
-        "tests_failed": 0,
-        "pass_rate": 1.0
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
+        "total_cost_usd": 0.03278333,
+        "wall_time_ms": 1920,
+        "churn_count": 10,
+        "conflict_count": 3,
+        "loc_added": 129,
+        "loc_deleted": 140,
+        "diff_bytes": 10219,
+        "held_out_validation": [
           {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.9,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "required_surfaces_covered",
-                "message": "The candidate covers fixture status, comparability, and the phase-B boundary."
-              }
-            ]
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 4,
+            "passed": false
           },
           {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.8,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "no_metric_shortcut",
-                "message": "The result uses held-out evidence and rubric findings rather than LOC or test-pass alone."
-              }
-            ]
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 5,
+            "passed": false
           }
         ],
-        "breadth_score": 0.9,
-        "anti_shortcut_score": 0.8,
-        "inter_grader_disagreement": 0.1,
-        "aggregate_quality_score": 0.94,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted",
-        "reason": "All held-out checks passed and both blinded rubric axes found no blocking shortcut.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "frontier-all-v1-r02",
-      "profile_id": "frontier-all-v1",
-      "repetition": 2,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 410000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1020,
-          "output_tokens": 410,
-          "total_tokens": 1430,
-          "cost": {
-            "amount": 9000,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1780,
-          "output_tokens": 720,
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 15760,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-frontier-v1",
-          "input_tokens": 4700,
-          "output_tokens": 1950,
-          "total_tokens": 6650,
-          "cost": {
-            "amount": 42200,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1250,
-          "output_tokens": 420,
-          "total_tokens": 1670,
-          "cost": {
-            "amount": 10040,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 12250,
-        "total_cost": {
-          "amount": 77000,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 410000,
-        "churn": {
-          "commit_count": 3,
-          "revision_rounds": 1,
-          "changed_files": 4,
-          "lines_added": 118,
-          "lines_deleted": 28,
-          "diff_lines": 146,
-          "net_loc": 90
-        },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 0
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 12,
-        "tests_failed": 0,
-        "pass_rate": 1.0
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.95,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "cross_run_evidence_covered",
-                "message": "The candidate preserves all comparison bindings and reports every required metric."
-              }
-            ]
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
           },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.85,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "failure_evidence_retained",
-                "message": "The result keeps the negative-example fields even when their counts are zero."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.95,
-        "anti_shortcut_score": 0.85,
-        "inter_grader_disagreement": 0.1,
-        "aggregate_quality_score": 0.96,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted",
-        "reason": "The bound candidate passed the complete held-out suite and both versioned rubric graders.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "frontier-all-v1-r03",
-      "profile_id": "frontier-all-v1",
-      "repetition": 3,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 430000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 980,
-          "output_tokens": 390,
-          "total_tokens": 1370,
-          "cost": {
-            "amount": 8600,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1820,
-          "output_tokens": 680,
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 15440,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-frontier-v1",
-          "input_tokens": 4900,
-          "output_tokens": 2050,
-          "total_tokens": 6950,
-          "cost": {
-            "amount": 44200,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1180,
-          "output_tokens": 410,
-          "total_tokens": 1590,
-          "cost": {
-            "amount": 9640,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 12410,
-        "total_cost": {
-          "amount": 77880,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 430000,
-        "churn": {
-          "commit_count": 3,
-          "revision_rounds": 1,
-          "changed_files": 4,
-          "lines_added": 124,
-          "lines_deleted": 32,
-          "diff_lines": 156,
-          "net_loc": 92
-        },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 0
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 12,
-        "tests_failed": 0,
-        "pass_rate": 1.0
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.9,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "role_metrics_complete",
-                "message": "Every configured role has separate token and fake-cost attribution."
-              }
-            ]
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 4
           },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.85,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "quality_is_multiaxis",
-                "message": "Quality combines held-out validation, breadth, and anti-shortcut review."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.9,
-        "anti_shortcut_score": 0.85,
-        "inter_grader_disagreement": 0.05,
-        "aggregate_quality_score": 0.95,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted",
-        "reason": "All deterministic checks and both independent rubric axes met the acceptance policy.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "hybrid-frontier-economy-v1-r01",
-      "profile_id": "hybrid-frontier-economy-v1",
-      "repetition": 1,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 350000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1000,
-          "output_tokens": 400,
-          "total_tokens": 1400,
-          "cost": {
-            "amount": 8800,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1800,
-          "output_tokens": 700,
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 7800,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-economy-v1",
-          "input_tokens": 4800,
-          "output_tokens": 2000,
-          "total_tokens": 6800,
-          "cost": {
-            "amount": 8800,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1200,
-          "output_tokens": 400,
-          "total_tokens": 1600,
-          "cost": {
-            "amount": 4800,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 12300,
-        "total_cost": {
-          "amount": 30200,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 350000,
-        "churn": {
-          "commit_count": 3,
-          "revision_rounds": 1,
-          "changed_files": 4,
-          "lines_added": 116,
-          "lines_deleted": 29,
-          "diff_lines": 145,
-          "net_loc": 87
-        },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 0
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 12,
-        "tests_failed": 0,
-        "pass_rate": 1.0
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.9,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "required_surfaces_covered",
-                "message": "The candidate covers all manifest, run, summary, and documentation boundaries."
-              }
-            ]
-          },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.8,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "held_out_not_leaked",
-                "message": "The held-out suite identity is bound but its contents are absent from the agent prompt."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.9,
-        "anti_shortcut_score": 0.8,
-        "inter_grader_disagreement": 0.1,
-        "aggregate_quality_score": 0.94,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted",
-        "reason": "The hybrid candidate passed held-out checks with complete breadth and anti-shortcut evidence.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "hybrid-frontier-economy-v1-r02",
-      "profile_id": "hybrid-frontier-economy-v1",
-      "repetition": 2,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 360000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 1020,
-          "output_tokens": 410,
-          "total_tokens": 1430,
-          "cost": {
-            "amount": 9000,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1780,
-          "output_tokens": 720,
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 7880,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-economy-v1",
-          "input_tokens": 4700,
-          "output_tokens": 1950,
-          "total_tokens": 6650,
-          "cost": {
-            "amount": 8600,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1250,
-          "output_tokens": 420,
-          "total_tokens": 1670,
-          "cost": {
-            "amount": 5020,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 12250,
-        "total_cost": {
-          "amount": 30500,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 360000,
-        "churn": {
-          "commit_count": 3,
-          "revision_rounds": 1,
-          "changed_files": 4,
-          "lines_added": 119,
-          "lines_deleted": 30,
-          "diff_lines": 149,
-          "net_loc": 89
-        },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 0
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 12,
-        "tests_failed": 0,
-        "pass_rate": 1.0
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.9,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "comparison_evidence_complete",
-                "message": "The result binds limits, state, grading, role attribution, and outcome labels."
-              }
-            ]
-          },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.85,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "no_gold_patch_dependency",
-                "message": "The grader permits multiple valid implementations and does not compare against a gold diff."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.9,
-        "anti_shortcut_score": 0.85,
-        "inter_grader_disagreement": 0.05,
-        "aggregate_quality_score": 0.95,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted",
-        "reason": "Held-out validation and both blinded rubric axes accepted the implementation.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "hybrid-frontier-economy-v1-r03",
-      "profile_id": "hybrid-frontier-economy-v1",
-      "repetition": 3,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 355000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-frontier-v1",
-          "input_tokens": 980,
-          "output_tokens": 390,
-          "total_tokens": 1370,
-          "cost": {
-            "amount": 8600,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1820,
-          "output_tokens": 680,
-          "total_tokens": 2500,
-          "cost": {
-            "amount": 7720,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-economy-v1",
-          "input_tokens": 4900,
-          "output_tokens": 2050,
-          "total_tokens": 6950,
-          "cost": {
-            "amount": 9000,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1180,
-          "output_tokens": 410,
-          "total_tokens": 1590,
-          "cost": {
-            "amount": 4820,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 12410,
-        "total_cost": {
-          "amount": 30140,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 355000,
-        "churn": {
-          "commit_count": 3,
-          "revision_rounds": 1,
-          "changed_files": 4,
-          "lines_added": 121,
-          "lines_deleted": 31,
-          "diff_lines": 152,
-          "net_loc": 90
-        },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 0
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 12,
-        "tests_failed": 0,
-        "pass_rate": 1.0
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.95,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "phase_boundaries_explicit",
-                "message": "The candidate distinguishes fake fixture evidence, opt-in provider work, and phase-B reruns."
-              }
-            ]
-          },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.85,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "findings_remain_visible",
-                "message": "Review findings remain explicit inputs to quality instead of collapsing into one pass bit."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.95,
-        "anti_shortcut_score": 0.85,
-        "inter_grader_disagreement": 0.1,
-        "aggregate_quality_score": 0.96,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted",
-        "reason": "The repeated hybrid result passed held-out validation with complete multi-axis review evidence.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "balanced-all-v1-r01",
-      "profile_id": "balanced-all-v1",
-      "repetition": 1,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 330000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1050,
-          "output_tokens": 430,
-          "total_tokens": 1480,
-          "cost": {
-            "amount": 4680,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1900,
-          "output_tokens": 760,
-          "total_tokens": 2660,
-          "cost": {
-            "amount": 8360,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-balanced-v1",
-          "input_tokens": 5200,
-          "output_tokens": 2200,
-          "total_tokens": 7400,
-          "cost": {
-            "amount": 23600,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1300,
-          "output_tokens": 450,
-          "total_tokens": 1750,
-          "cost": {
-            "amount": 5300,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 13290,
-        "total_cost": {
-          "amount": 41940,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 330000,
-        "churn": {
-          "commit_count": 4,
-          "revision_rounds": 2,
-          "changed_files": 5,
-          "lines_added": 137,
-          "lines_deleted": 42,
-          "diff_lines": 179,
-          "net_loc": 95
-        },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 1
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 11,
-        "tests_failed": 1,
-        "pass_rate": 0.9166666667
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.85,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "one_boundary_underexplained",
-                "message": "The provider opt-in boundary needs one explicit operator-approval sentence."
-              }
-            ]
-          },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.8,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "malformed_call_preserved",
-                "message": "One malformed tool-call attempt was retained and requires a bounded correction."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.85,
-        "anti_shortcut_score": 0.8,
-        "inter_grader_disagreement": 0.05,
-        "aggregate_quality_score": 0.88,
-        "negative_examples": {
-          "malformed_tool_calls": 1,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted_with_modifications",
-        "reason": "The result is usable after correcting the failed held-out check and documenting the retained malformed call.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "balanced-all-v1-r02",
-      "profile_id": "balanced-all-v1",
-      "repetition": 2,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 335000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1080,
-          "output_tokens": 440,
-          "total_tokens": 1520,
-          "cost": {
-            "amount": 4800,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1880,
-          "output_tokens": 780,
-          "total_tokens": 2660,
-          "cost": {
-            "amount": 8440,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-balanced-v1",
-          "input_tokens": 5100,
-          "output_tokens": 2250,
-          "total_tokens": 7350,
-          "cost": {
-            "amount": 23700,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1320,
-          "output_tokens": 460,
-          "total_tokens": 1780,
-          "cost": {
-            "amount": 5400,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 13310,
-        "total_cost": {
-          "amount": 42340,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 335000,
-        "churn": {
-          "commit_count": 4,
-          "revision_rounds": 2,
-          "changed_files": 5,
-          "lines_added": 140,
-          "lines_deleted": 43,
-          "diff_lines": 183,
-          "net_loc": 97
-        },
-        "conflicts": {
-          "claim_conflicts": 1,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 1
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 11,
-        "tests_failed": 1,
-        "pass_rate": 0.9166666667
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.9,
-            "findings": [
-              {
-                "severity": "info",
-                "code": "metrics_complete",
-                "message": "The result reports role usage, conflicts, churn, grading, and explicit outcome provenance."
-              }
-            ]
-          },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.8,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "held_out_failure_visible",
-                "message": "The single held-out failure remains visible and prevents an unqualified acceptance label."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.9,
-        "anti_shortcut_score": 0.8,
-        "inter_grader_disagreement": 0.1,
-        "aggregate_quality_score": 0.89,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted_with_modifications",
-        "reason": "One held-out failure requires correction; the comparison record remains usable and complete.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "balanced-all-v1-r03",
-      "profile_id": "balanced-all-v1",
-      "repetition": 3,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 340000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1030,
-          "output_tokens": 420,
-          "total_tokens": 1450,
-          "cost": {
-            "amount": 4580,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1920,
-          "output_tokens": 740,
-          "total_tokens": 2660,
-          "cost": {
-            "amount": 8280,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-balanced-v1",
-          "input_tokens": 5300,
-          "output_tokens": 2150,
-          "total_tokens": 7450,
-          "cost": {
-            "amount": 23500,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-balanced-v1",
-          "input_tokens": 1280,
-          "output_tokens": 440,
-          "total_tokens": 1720,
-          "cost": {
-            "amount": 5200,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 13280,
-        "total_cost": {
-          "amount": 41560,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 340000,
-        "churn": {
-          "commit_count": 3,
-          "revision_rounds": 1,
-          "changed_files": 4,
-          "lines_added": 128,
-          "lines_deleted": 35,
-          "diff_lines": 163,
-          "net_loc": 93
-        },
-        "conflicts": {
-          "claim_conflicts": 0,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 0
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 12,
-        "tests_failed": 0,
-        "pass_rate": 1.0
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.75,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "summary_context_thin",
-                "message": "The result is correct but gives limited rationale for revising a named default."
-              }
-            ]
-          },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.75,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "quality_context_thin",
-                "message": "Passing tests are not enough; the summary should retain the rubric caveats beside the score."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.75,
-        "anti_shortcut_score": 0.75,
-        "inter_grader_disagreement": 0.0,
-        "aggregate_quality_score": 0.9,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted_with_modifications",
-        "reason": "All held-out checks passed, but both rubric graders require fuller decision rationale.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
-        }
-      }
-    },
-    {
-      "run_id": "economy-all-v1-r01",
-      "profile_id": "economy-all-v1",
-      "repetition": 1,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 295000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-economy-v1",
-          "input_tokens": 1100,
-          "output_tokens": 480,
-          "total_tokens": 1580,
-          "cost": {
-            "amount": 2060,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-economy-v1",
-          "input_tokens": 2000,
-          "output_tokens": 850,
-          "total_tokens": 2850,
-          "cost": {
-            "amount": 3700,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-economy-v1",
-          "input_tokens": 5800,
-          "output_tokens": 2600,
-          "total_tokens": 8400,
-          "cost": {
-            "amount": 11000,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-economy-v1",
-          "input_tokens": 1400,
-          "output_tokens": 520,
-          "total_tokens": 1920,
-          "cost": {
-            "amount": 2440,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 14750,
-        "total_cost": {
-          "amount": 19200,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 295000,
-        "churn": {
-          "commit_count": 5,
-          "revision_rounds": 2,
-          "changed_files": 6,
-          "lines_added": 155,
-          "lines_deleted": 61,
-          "diff_lines": 216,
-          "net_loc": 94
-        },
-        "conflicts": {
-          "claim_conflicts": 1,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 2
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 10,
-        "tests_failed": 2,
-        "pass_rate": 0.8333333333
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.75,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "held_out_coverage_gap",
-                "message": "Two held-out cases expose incomplete explanation of comparability exclusions."
-              }
-            ]
-          },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.65,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "sandbox_failure_retained",
-                "message": "A sandbox-denied action is retained as a typed negative example and requires a safe alternative."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.75,
-        "anti_shortcut_score": 0.65,
-        "inter_grader_disagreement": 0.1,
-        "aggregate_quality_score": 0.78,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [
+          "findings": [
             {
-              "kind": "sandbox_denied",
-              "count": 1
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 2 of 6 checks",
+              "paths": []
             }
-          ],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted_with_modifications",
-        "reason": "The candidate requires held-out fixes and a safe replacement for the retained sandbox-denied action.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8181,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 6666,
+          "overall_basis_points": 8257
         }
       }
     },
     {
-      "run_id": "economy-all-v1-r02",
+      "profile_id": "frontier-all-v1",
+      "repetition": 1,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-1",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1037,
+              "output_tokens": 513,
+              "total_tokens": 1550
+            },
+            "cost_usd": 0.007521429999999999,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 928,
+              "output_tokens": 515,
+              "total_tokens": 1443
+            },
+            "cost_usd": 0.0068566700000000005,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1627,
+              "output_tokens": 348,
+              "total_tokens": 1975
+            },
+            "cost_usd": 0.01077278,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1897,
+              "output_tokens": 934,
+              "total_tokens": 2831
+            },
+            "cost_usd": 0.01374908,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 5489,
+          "output_tokens": 2310,
+          "total_tokens": 7799
+        },
+        "total_cost_usd": 0.03889996,
+        "wall_time_ms": 6977,
+        "churn_count": 6,
+        "conflict_count": 3,
+        "loc_added": 58,
+        "loc_deleted": 173,
+        "diff_bytes": 8867,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 8,
+            "assertions_passed": 8,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 4
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 2 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 9333,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 6666,
+          "overall_basis_points": 8833
+        }
+      }
+    },
+    {
+      "profile_id": "frontier-all-v1",
+      "repetition": 2,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-2",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 745,
+              "output_tokens": 288,
+              "total_tokens": 1033
+            },
+            "cost_usd": 0.0052223,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1373,
+              "output_tokens": 797,
+              "total_tokens": 2170
+            },
+            "cost_usd": 0.01022347,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1996,
+              "output_tokens": 921,
+              "total_tokens": 2917
+            },
+            "cost_usd": 0.014327689999999999,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1074,
+              "output_tokens": 853,
+              "total_tokens": 1927
+            },
+            "cost_usd": 0.008513610000000001,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 5188,
+          "output_tokens": 2859,
+          "total_tokens": 8047
+        },
+        "total_cost_usd": 0.038287070000000006,
+        "wall_time_ms": 3034,
+        "churn_count": 2,
+        "conflict_count": 3,
+        "loc_added": 448,
+        "loc_deleted": 25,
+        "diff_bytes": 17875,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 7,
+            "assertions_passed": 7,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 8,
+            "assertions_passed": 6,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 4
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 2 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8666,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 6666,
+          "overall_basis_points": 8499
+        }
+      }
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 0,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-0",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1547,
+              "output_tokens": 684,
+              "total_tokens": 2231
+            },
+            "cost_usd": 0.01103758,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 845,
+              "output_tokens": 538,
+              "total_tokens": 1383
+            },
+            "cost_usd": 0.01400979,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 820,
+              "output_tokens": 986,
+              "total_tokens": 1806
+            },
+            "cost_usd": 0.021603380000000002,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 916,
+              "output_tokens": 759,
+              "total_tokens": 1675
+            },
+            "cost_usd": 0.018453220000000003,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4128,
+          "output_tokens": 2967,
+          "total_tokens": 7095
+        },
+        "total_cost_usd": 0.06510397000000001,
+        "wall_time_ms": 1494,
+        "churn_count": 3,
+        "conflict_count": 2,
+        "loc_added": 109,
+        "loc_deleted": 5,
+        "diff_bytes": 4700,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 8,
+            "assertions_passed": 8,
+            "passed": true
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 9333,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 8416
+        }
+      }
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 1,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-1",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 730,
+              "output_tokens": 966,
+              "total_tokens": 1696
+            },
+            "cost_usd": 0.0066557,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1178,
+              "output_tokens": 421,
+              "total_tokens": 1599
+            },
+            "cost_usd": 0.01341768,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1261,
+              "output_tokens": 374,
+              "total_tokens": 1635
+            },
+            "cost_usd": 0.01468265,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1150,
+              "output_tokens": 392,
+              "total_tokens": 1542
+            },
+            "cost_usd": 0.012745860000000001,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4319,
+          "output_tokens": 2153,
+          "total_tokens": 6472
+        },
+        "total_cost_usd": 0.047501890000000005,
+        "wall_time_ms": 6552,
+        "churn_count": 11,
+        "conflict_count": 2,
+        "loc_added": 499,
+        "loc_deleted": 39,
+        "diff_bytes": 20442,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 6,
+            "assertions_passed": 5,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 5,
+            "assertions_passed": 3,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7272,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 7386
+        }
+      }
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 2,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-2",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 998,
+              "output_tokens": 465,
+              "total_tokens": 1463
+            },
+            "cost_usd": 0.007173969999999999,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1415,
+              "output_tokens": 644,
+              "total_tokens": 2059
+            },
+            "cost_usd": 0.01868677,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1450,
+              "output_tokens": 593,
+              "total_tokens": 2043
+            },
+            "cost_usd": 0.01952789,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1132,
+              "output_tokens": 547,
+              "total_tokens": 1679
+            },
+            "cost_usd": 0.015540259999999998,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4995,
+          "output_tokens": 2249,
+          "total_tokens": 7244
+        },
+        "total_cost_usd": 0.06092889,
+        "wall_time_ms": 9381,
+        "churn_count": 11,
+        "conflict_count": 2,
+        "loc_added": 251,
+        "loc_deleted": 120,
+        "diff_bytes": 14101,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 4,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 4,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7272,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 7386
+        }
+      }
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetition": 0,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-0",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 900,
+              "output_tokens": 536,
+              "total_tokens": 1436
+            },
+            "cost_usd": 0.014233879999999999,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1467,
+              "output_tokens": 721,
+              "total_tokens": 2188
+            },
+            "cost_usd": 0.02036443,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 765,
+              "output_tokens": 734,
+              "total_tokens": 1499
+            },
+            "cost_usd": 0.01727147,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1262,
+              "output_tokens": 917,
+              "total_tokens": 2179
+            },
+            "cost_usd": 0.023032359999999998,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4394,
+          "output_tokens": 2908,
+          "total_tokens": 7302
+        },
+        "total_cost_usd": 0.07490214,
+        "wall_time_ms": 8052,
+        "churn_count": 4,
+        "conflict_count": 3,
+        "loc_added": 205,
+        "loc_deleted": 150,
+        "diff_bytes": 14112,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 8,
+            "assertions_passed": 8,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 7
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 5
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 1 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 1 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 9333,
+          "breadth_basis_points": 8750,
+          "anti_shortcut_basis_points": 8333,
+          "overall_basis_points": 8937
+        }
+      }
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetition": 1,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-1",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1075,
+              "output_tokens": 921,
+              "total_tokens": 1996
+            },
+            "cost_usd": 0.022218429999999997,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1711,
+              "output_tokens": 387,
+              "total_tokens": 2098
+            },
+            "cost_usd": 0.015317709999999998,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1713,
+              "output_tokens": 524,
+              "total_tokens": 2237
+            },
+            "cost_usd": 0.017872669999999997,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1859,
+              "output_tokens": 254,
+              "total_tokens": 2113
+            },
+            "cost_usd": 0.01354957,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 6358,
+          "output_tokens": 2086,
+          "total_tokens": 8444
+        },
+        "total_cost_usd": 0.06895837999999999,
+        "wall_time_ms": 2994,
+        "churn_count": 8,
+        "conflict_count": 3,
+        "loc_added": 276,
+        "loc_deleted": 117,
+        "diff_bytes": 15464,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 3,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 6,
+            "passed": true
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 7
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 5
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 1 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 1 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8181,
+          "breadth_basis_points": 8750,
+          "anti_shortcut_basis_points": 8333,
+          "overall_basis_points": 8361
+        }
+      }
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetition": 2,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-2",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1927,
+              "output_tokens": 981,
+              "total_tokens": 2908
+            },
+            "cost_usd": 0.02738023,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1774,
+              "output_tokens": 285,
+              "total_tokens": 2059
+            },
+            "cost_usd": 0.0137218,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 784,
+              "output_tokens": 642,
+              "total_tokens": 1426
+            },
+            "cost_usd": 0.015652359999999997,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1699,
+              "output_tokens": 840,
+              "total_tokens": 2539
+            },
+            "cost_usd": 0.023677449999999996,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 6184,
+          "output_tokens": 2748,
+          "total_tokens": 8932
+        },
+        "total_cost_usd": 0.08043183999999999,
+        "wall_time_ms": 9166,
+        "churn_count": 8,
+        "conflict_count": 3,
+        "loc_added": 63,
+        "loc_deleted": 36,
+        "diff_bytes": 3751,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 6,
+            "assertions_passed": 6,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 5,
+            "assertions_passed": 3,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 7
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 5
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 1 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 1 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8181,
+          "breadth_basis_points": 8750,
+          "anti_shortcut_basis_points": 8333,
+          "overall_basis_points": 8361
+        }
+      }
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetition": 0,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-0",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1638,
+              "output_tokens": 491,
+              "total_tokens": 2129
+            },
+            "cost_usd": 0.019156470000000002,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1657,
+              "output_tokens": 742,
+              "total_tokens": 2399
+            },
+            "cost_usd": 0.02335997,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1578,
+              "output_tokens": 425,
+              "total_tokens": 2003
+            },
+            "cost_usd": 0.01767549,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 731,
+              "output_tokens": 742,
+              "total_tokens": 1473
+            },
+            "cost_usd": 0.01703539,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 5604,
+          "output_tokens": 2400,
+          "total_tokens": 8004
+        },
+        "total_cost_usd": 0.07722732,
+        "wall_time_ms": 8272,
+        "churn_count": 1,
+        "conflict_count": 3,
+        "loc_added": 490,
+        "loc_deleted": 109,
+        "diff_bytes": 22553,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 4,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 4,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 6
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 2 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7272,
+          "breadth_basis_points": 7500,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 6761
+        }
+      }
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetition": 1,
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-1",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1610,
+              "output_tokens": 649,
+              "total_tokens": 2259
+            },
+            "cost_usd": 0.02152957,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1413,
+              "output_tokens": 759,
+              "total_tokens": 2172
+            },
+            "cost_usd": 0.02196936,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1606,
+              "output_tokens": 605,
+              "total_tokens": 2211
+            },
+            "cost_usd": 0.02078813,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1489,
+              "output_tokens": 978,
+              "total_tokens": 2467
+            },
+            "cost_usd": 0.026042810000000003,
+            "observation": "process_observed"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 6118,
+          "output_tokens": 2991,
+          "total_tokens": 9109
+        },
+        "total_cost_usd": 0.09032987,
+        "wall_time_ms": 4329,
+        "churn_count": 9,
+        "conflict_count": 3,
+        "loc_added": 419,
+        "loc_deleted": 142,
+        "diff_bytes": 21201,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 8,
+            "assertions_passed": 6,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 7,
+            "assertions_passed": 5,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 6
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 2 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7333,
+          "breadth_basis_points": 7500,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 6791
+        }
+      }
+    },
+    {
       "profile_id": "economy-all-v1",
       "repetition": 2,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 300000
+      "comparability_digest": "fnv1a64:e61ad897c605b51a",
+      "isolated_state": {
+        "isolation_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-2",
+        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
       },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-economy-v1",
-          "input_tokens": 1120,
-          "output_tokens": 500,
-          "total_tokens": 1620,
-          "cost": {
-            "amount": 2120,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-economy-v1",
-          "input_tokens": 1980,
-          "output_tokens": 880,
-          "total_tokens": 2860,
-          "cost": {
-            "amount": 3740,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-economy-v1",
-          "input_tokens": 5700,
-          "output_tokens": 2650,
-          "total_tokens": 8350,
-          "cost": {
-            "amount": 11000,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-economy-v1",
-          "input_tokens": 1420,
-          "output_tokens": 540,
-          "total_tokens": 1960,
-          "cost": {
-            "amount": 2500,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
       "metrics": {
-        "total_tokens": 14790,
-        "total_cost": {
-          "amount": 19360,
-          "currency": "fake_microcredit"
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1100,
+              "output_tokens": 294,
+              "total_tokens": 1394
+            },
+            "cost_usd": 0.01228462,
+            "observation": "process_observed"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1150,
+              "output_tokens": 957,
+              "total_tokens": 2107
+            },
+            "cost_usd": 0.023386610000000002,
+            "observation": "process_observed"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1993,
+              "output_tokens": 302,
+              "total_tokens": 2295
+            },
+            "cost_usd": 0.018513650000000003,
+            "observation": "process_observed"
+          },
+          "auditor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1811,
+              "output_tokens": 416,
+              "total_tokens": 2227
+            },
+            "cost_usd": 0.019120810000000002,
+            "observation": "process_observed"
+          }
         },
-        "wall_time_ms": 300000,
-        "churn": {
-          "commit_count": 6,
-          "revision_rounds": 3,
-          "changed_files": 6,
-          "lines_added": 162,
-          "lines_deleted": 68,
-          "diff_lines": 230,
-          "net_loc": 94
+        "total_usage": {
+          "input_tokens": 6054,
+          "output_tokens": 1969,
+          "total_tokens": 8023
         },
-        "conflicts": {
-          "claim_conflicts": 1,
-          "merge_conflicts": 1,
-          "review_rework_cycles": 2
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 10,
-        "tests_failed": 2,
-        "pass_rate": 0.8333333333
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
+        "total_cost_usd": 0.07330569,
+        "wall_time_ms": 9386,
+        "churn_count": 5,
+        "conflict_count": 3,
+        "loc_added": 348,
+        "loc_deleted": 176,
+        "diff_bytes": 19886,
+        "held_out_validation": [
           {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.8,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "phase_b_detail_missing",
-                "message": "The candidate names phase B but omits one-command output-shape compatibility."
-              }
-            ]
+            "id": "readme-contract",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
           },
           {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.75,
-            "findings": [
-              {
-                "severity": "error",
-                "code": "malformed_call_not_recovered",
-                "message": "A malformed tool call was retained but the candidate did not show a successful correction."
-              }
-            ]
+            "id": "provider-boundary",
+            "assertions_run": 8,
+            "assertions_passed": 7,
+            "passed": false
           }
         ],
-        "breadth_score": 0.8,
-        "anti_shortcut_score": 0.75,
-        "inter_grader_disagreement": 0.05,
-        "aggregate_quality_score": 0.81,
-        "negative_examples": {
-          "malformed_tool_calls": 1,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
-        }
-      },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "rejected",
-        "reason": "The retained malformed tool call had no successful correction and one rubric finding is blocking.",
-        "actor_kind": "fixture_labeler"
-      },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 6
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 2 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8666,
+          "breadth_basis_points": 7500,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 7458
         }
       }
+    }
+  ],
+  "profile_summaries": [
+    {
+      "profile_id": "frontier-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 2524,
+            "output_tokens": 1424,
+            "total_tokens": 3948
+          },
+          "cost_usd": 0.01870136,
+          "observation": "process_observed"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3869,
+            "output_tokens": 2159,
+            "total_tokens": 6028
+          },
+          "cost_usd": 0.02861341,
+          "observation": "process_observed"
+        },
+        "worker": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4504,
+            "output_tokens": 1578,
+            "total_tokens": 6082
+          },
+          "cost_usd": 0.03120506,
+          "observation": "process_observed"
+        },
+        "auditor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4227,
+            "output_tokens": 2443,
+            "total_tokens": 6670
+          },
+          "cost_usd": 0.031450530000000004,
+          "observation": "process_observed"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 15124,
+        "output_tokens": 7604,
+        "total_tokens": 22728
+      },
+      "aggregate_cost_usd": 0.10997036,
+      "mean_cost_usd": 0.03665678666666667,
+      "mean_wall_time_ms": 3977,
+      "mean_churn_count": 6,
+      "mean_conflict_count": 3,
+      "mean_loc_added": 211,
+      "mean_loc_deleted": 112,
+      "mean_diff_bytes": 12320,
+      "mean_quality": {
+        "held_out_basis_points": 8726,
+        "breadth_basis_points": 10000,
+        "anti_shortcut_basis_points": 6666,
+        "overall_basis_points": 8529
+      },
+      "pareto_optimal": true
     },
     {
-      "run_id": "economy-all-v1-r03",
-      "profile_id": "economy-all-v1",
-      "repetition": 3,
-      "execution": {
-        "mode": "deterministic_fake",
-        "provider_execution_performed": false,
-        "observed_dispatches": 4,
-        "wall_time_ms": 290000
-      },
-      "start_state": {
-        "fingerprint": "sha256:4358cd5c905b281d1a6524bad7ba6abde88e92e80636d64b3cb39f1037cba5c0",
-        "checks": {
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "index_clean": true,
-          "worktree_clean": true,
-          "untracked_paths_empty": true,
-          "runtime_artifacts_absent": true,
-          "provider_credentials_absent": true
-        }
-      },
-      "role_usage": [
-        {
-          "role": "supervisor",
-          "model": "fake-economy-v1",
-          "input_tokens": 1080,
-          "output_tokens": 460,
-          "total_tokens": 1540,
-          "cost": {
-            "amount": 2000,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "child_orchestrator",
-          "model": "fake-economy-v1",
-          "input_tokens": 2020,
-          "output_tokens": 820,
-          "total_tokens": 2840,
-          "cost": {
-            "amount": 3660,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "worker",
-          "model": "fake-economy-v1",
-          "input_tokens": 5900,
-          "output_tokens": 2550,
-          "total_tokens": 8450,
-          "cost": {
-            "amount": 11000,
-            "currency": "fake_microcredit"
-          }
-        },
-        {
-          "role": "review_auditor",
-          "model": "fake-economy-v1",
-          "input_tokens": 1380,
-          "output_tokens": 500,
-          "total_tokens": 1880,
-          "cost": {
-            "amount": 2380,
-            "currency": "fake_microcredit"
-          }
-        }
-      ],
-      "metrics": {
-        "total_tokens": 14710,
-        "total_cost": {
-          "amount": 19040,
-          "currency": "fake_microcredit"
-        },
-        "wall_time_ms": 290000,
-        "churn": {
-          "commit_count": 5,
-          "revision_rounds": 2,
-          "changed_files": 6,
-          "lines_added": 158,
-          "lines_deleted": 64,
-          "diff_lines": 222,
-          "net_loc": 94
-        },
-        "conflicts": {
-          "claim_conflicts": 1,
-          "merge_conflicts": 0,
-          "review_rework_cycles": 2
-        }
-      },
-      "held_out_validation": {
-        "suite_id": "readme-model-mix-held-out-v1",
-        "tests_total": 12,
-        "tests_passed": 10,
-        "tests_failed": 2,
-        "pass_rate": 0.8333333333
-      },
-      "review_evaluation": {
-        "rubric_id": "implementation-quality-rubric-v1",
-        "blinded": true,
-        "graders": [
-          {
-            "grader_id": "breadth",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.8,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "coverage_gaps_visible",
-                "message": "The result keeps two held-out coverage gaps visible in the final evidence."
-              }
-            ]
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3275,
+            "output_tokens": 2115,
+            "total_tokens": 5390
           },
-          {
-            "grader_id": "anti_shortcut",
-            "model": "fake-grader-v1",
-            "prompt_version": 1,
-            "policy_version": 1,
-            "score": 0.7,
-            "findings": [
-              {
-                "severity": "warning",
-                "code": "cost_not_quality",
-                "message": "Low cost is reported separately and does not erase breadth or held-out quality gaps."
-              }
-            ]
-          }
-        ],
-        "breadth_score": 0.8,
-        "anti_shortcut_score": 0.7,
-        "inter_grader_disagreement": 0.1,
-        "aggregate_quality_score": 0.8,
-        "negative_examples": {
-          "malformed_tool_calls": 0,
-          "typed_environment_failures": [],
-          "retained": true,
-          "filtered_out": false
+          "cost_usd": 0.024867249999999997,
+          "observation": "process_observed"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3438,
+            "output_tokens": 1603,
+            "total_tokens": 5041
+          },
+          "cost_usd": 0.04611424,
+          "observation": "process_observed"
+        },
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 3531,
+            "output_tokens": 1953,
+            "total_tokens": 5484
+          },
+          "cost_usd": 0.05581392,
+          "observation": "process_observed"
+        },
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3198,
+            "output_tokens": 1698,
+            "total_tokens": 4896
+          },
+          "cost_usd": 0.046739340000000004,
+          "observation": "process_observed"
         }
       },
-      "experiment_outcome": {
-        "label_schema_version": 1,
-        "label": "accepted_with_modifications",
-        "reason": "The cheap profile remains comparable but needs both held-out fixes before acceptance.",
-        "actor_kind": "fixture_labeler"
+      "aggregate_usage": {
+        "input_tokens": 13442,
+        "output_tokens": 7369,
+        "total_tokens": 20811
       },
-      "comparability": {
-        "verdict": "comparable",
-        "checks": {
-          "manifest_digest_matches": true,
-          "goal_digest_matches": true,
-          "base_commit_matches": true,
-          "base_tree_matches": true,
-          "plan_digest_matches": true,
-          "limits_digest_matches": true,
-          "isolated_state_fingerprint_matches": true,
-          "held_out_suite_digest_matches": true,
-          "grader_config_digest_matches": true,
-          "time_limit_respected": true,
-          "dispatch_limit_respected": true
+      "aggregate_cost_usd": 0.17353475000000002,
+      "mean_cost_usd": 0.05784491666666667,
+      "mean_wall_time_ms": 5809,
+      "mean_churn_count": 8,
+      "mean_conflict_count": 2,
+      "mean_loc_added": 286,
+      "mean_loc_deleted": 54,
+      "mean_diff_bytes": 13081,
+      "mean_quality": {
+        "held_out_basis_points": 7959,
+        "breadth_basis_points": 10000,
+        "anti_shortcut_basis_points": 5000,
+        "overall_basis_points": 7729
+      },
+      "pareto_optimal": false
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3902,
+            "output_tokens": 2438,
+            "total_tokens": 6340
+          },
+          "cost_usd": 0.06383254,
+          "observation": "process_observed"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4952,
+            "output_tokens": 1393,
+            "total_tokens": 6345
+          },
+          "cost_usd": 0.04940394,
+          "observation": "process_observed"
+        },
+        "worker": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3262,
+            "output_tokens": 1900,
+            "total_tokens": 5162
+          },
+          "cost_usd": 0.050796499999999994,
+          "observation": "process_observed"
+        },
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4820,
+            "output_tokens": 2011,
+            "total_tokens": 6831
+          },
+          "cost_usd": 0.060259379999999994,
+          "observation": "process_observed"
         }
-      }
+      },
+      "aggregate_usage": {
+        "input_tokens": 16936,
+        "output_tokens": 7742,
+        "total_tokens": 24678
+      },
+      "aggregate_cost_usd": 0.22429235999999997,
+      "mean_cost_usd": 0.07476411999999999,
+      "mean_wall_time_ms": 6737,
+      "mean_churn_count": 6,
+      "mean_conflict_count": 3,
+      "mean_loc_added": 181,
+      "mean_loc_deleted": 101,
+      "mean_diff_bytes": 11109,
+      "mean_quality": {
+        "held_out_basis_points": 8565,
+        "breadth_basis_points": 8750,
+        "anti_shortcut_basis_points": 8333,
+        "overall_basis_points": 8553
+      },
+      "pareto_optimal": true
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4348,
+            "output_tokens": 1434,
+            "total_tokens": 5782
+          },
+          "cost_usd": 0.05297066,
+          "observation": "process_observed"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4220,
+            "output_tokens": 2458,
+            "total_tokens": 6678
+          },
+          "cost_usd": 0.06871594,
+          "observation": "process_observed"
+        },
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 5177,
+            "output_tokens": 1332,
+            "total_tokens": 6509
+          },
+          "cost_usd": 0.056977269999999997,
+          "observation": "process_observed"
+        },
+        "auditor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4031,
+            "output_tokens": 2136,
+            "total_tokens": 6167
+          },
+          "cost_usd": 0.062199010000000006,
+          "observation": "process_observed"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 17776,
+        "output_tokens": 7360,
+        "total_tokens": 25136
+      },
+      "aggregate_cost_usd": 0.24086288000000003,
+      "mean_cost_usd": 0.08028762666666668,
+      "mean_wall_time_ms": 7329,
+      "mean_churn_count": 5,
+      "mean_conflict_count": 3,
+      "mean_loc_added": 419,
+      "mean_loc_deleted": 142,
+      "mean_diff_bytes": 21213,
+      "mean_quality": {
+        "held_out_basis_points": 7757,
+        "breadth_basis_points": 7500,
+        "anti_shortcut_basis_points": 5000,
+        "overall_basis_points": 7003
+      },
+      "pareto_optimal": false
+    }
+  ],
+  "pareto_frontier": [
+    {
+      "profile_id": "frontier-all-v1",
+      "mean_cost_usd": 0.03665678666666667,
+      "quality_basis_points": 8529,
+      "held_out_basis_points": 8726,
+      "breadth_basis_points": 10000,
+      "anti_shortcut_basis_points": 6666
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "mean_cost_usd": 0.07476411999999999,
+      "quality_basis_points": 8553,
+      "held_out_basis_points": 8565,
+      "breadth_basis_points": 8750,
+      "anti_shortcut_basis_points": 8333
     }
   ]
 }
