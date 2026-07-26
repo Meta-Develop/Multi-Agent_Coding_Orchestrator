@@ -784,14 +784,13 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
-            supervise::validate_max_concurrent_children(args.max_concurrent_children)?;
             let resolved = resolve_run_id_for_run(
                 &args.repo,
                 RunArtifactFamily::Supervise,
                 args.run_id.as_deref(),
                 args.json,
             )?;
-            let report = supervise::run_supervisor_plan_file_with_max_concurrent_children(
+            let report = supervise::run_supervisor_plan_file_with_concurrency_policy(
                 SupervisorRunOptions {
                     repo: resolved.repo,
                     plan_file: args.supervisor_plan,
@@ -877,9 +876,9 @@ struct RunSuperviseArgs {
     /// Allow supervise to run when the primary worktree is dirty.
     #[arg(long)]
     allow_dirty_primary: bool,
-    /// Maximum number of child assignments to run concurrently.
-    #[arg(long, default_value_t = 1)]
-    max_concurrent_children: usize,
+    /// Maximum concurrent child assignments: `auto` uses measured host capacity.
+    #[arg(long, default_value_t = supervise::SupervisorConcurrencyPolicy::Auto)]
+    max_concurrent_children: supervise::SupervisorConcurrencyPolicy,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
