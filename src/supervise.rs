@@ -5,7 +5,7 @@ use crate::{
     },
     external_agent::{
         codex_usage_from_jsonl, run_external_agent_cancellable, ExternalAgentCommand,
-        ExternalAgentRun, ExternalProgramTrust,
+        ExternalAgentRun, ExternalProgramTrust, SandboxDenialEvidence,
     },
     llm::provider::{ModelPricing, Usage},
     merge::{
@@ -43,6 +43,11 @@ use git2::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::fs::{MetadataExt, OpenOptionsExt},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -86,6 +91,21 @@ const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".agents/temp",
     b".agents/storage",
     b".agents/live",
+];
+const MANDATORY_WORKTREE_DIRECTORY_CONTROLS: &[&str] =
+    &[".maco", ".maco-cache", ".codex", ".agents"];
+const PERMANENT_WORKTREE_CONTROL_ROOTS: &[&str] = &[".git", ".maco", ".maco-cache", ".codex"];
+const POLICY_WORKTREE_CONTROL_FILES: &[&str] = &[
+    ".gitignore",
+    ".gitattributes",
+    ".ignore",
+    ".rgignore",
+    ".dockerignore",
+    ".cursorignore",
+    ".cursorindexingignore",
+    ".codexignore",
+    "AGENTS.md",
+    "CLAUDE.md",
 ];
 
 type CancellableExternalRunner<'a> =
@@ -557,6 +577,8 @@ pub struct SupervisorFinalReport {
     pub usage_complete: bool,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub files_changed: Vec<PathBuf>,
     #[serde(default)]
@@ -632,6 +654,8 @@ pub struct CommandRunRecord {
     pub stdout: String,
     #[serde(default)]
     pub stderr: String,
+    #[serde(default)]
+    pub sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1510,6 +1534,7 @@ pub fn collect_supervisor_run(
         total_cost_usd: None,
         usage_complete: false,
         commands_run: Vec::new(),
+        sandbox_denials: Vec::new(),
         files_changed: Vec::new(),
         validation_results: Vec::new(),
         findings: vec![Finding {
@@ -1830,6 +1855,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         timed_out: false,
         stdout: String::new(),
         stderr: String::new(),
+        sandbox_denials: Vec::new(),
         error: None,
     };
     let worker = WorkerReport {
@@ -1917,6 +1943,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         total_cost_usd: None,
         usage_complete: true,
         commands_run: vec![command],
+        sandbox_denials: Vec::new(),
         files_changed,
         validation_results: vec![validation],
         findings: Vec::new(),
@@ -2514,6 +2541,293 @@ fn apply_role_model_selection(
 ) -> ExternalAgentCommand {
     let (model, reasoning_effort) = role_model_selection(plan, role);
     command.with_model_selection(model, reasoning_effort)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorktreeControlIdentity {
+    device: u64,
+    inode: u64,
+    file_type: u32,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct HeldWorktreeDirectoryControl {
+    relative: &'static str,
+    directory: fs::File,
+    identity: WorktreeControlIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct MandatoryWorktreeControls {
+    workspace_path: PathBuf,
+    workspace: fs::File,
+    workspace_identity: WorktreeControlIdentity,
+    git_identity: WorktreeControlIdentity,
+    directories: Vec<HeldWorktreeDirectoryControl>,
+}
+
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct MandatoryWorktreeControls;
+
+#[cfg(unix)]
+impl MandatoryWorktreeControls {
+    fn revalidate(&self) -> Result<()> {
+        let path_metadata = fs::symlink_metadata(&self.workspace_path)
+            .context("failed to revalidate managed worktree root")?;
+        let path_identity = worktree_control_identity_from_metadata(&path_metadata);
+        let held_identity = worktree_control_identity_from_metadata(&self.workspace.metadata()?);
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.is_dir()
+            || path_identity != self.workspace_identity
+            || held_identity != self.workspace_identity
+        {
+            bail!("managed worktree root identity changed during control bootstrap");
+        }
+
+        let git_identity = direct_worktree_control_identity(&self.workspace, ".git")?;
+        if git_identity != self.git_identity {
+            bail!("linked worktree .git marker identity changed during control bootstrap");
+        }
+        for control in &self.directories {
+            let path_identity =
+                direct_worktree_control_identity(&self.workspace, control.relative)?;
+            let held_identity =
+                worktree_control_identity_from_metadata(&control.directory.metadata()?);
+            if path_identity != control.identity || held_identity != control.identity {
+                bail!(
+                    "mandatory worktree control identity changed: {}",
+                    control.relative
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+impl MandatoryWorktreeControls {
+    fn revalidate(&self) -> Result<()> {
+        bail!("mandatory worktree control provisioning is unsupported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn worktree_control_identity_from_metadata(metadata: &fs::Metadata) -> WorktreeControlIdentity {
+    WorktreeControlIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        file_type: metadata.mode() & libc::S_IFMT,
+    }
+}
+
+#[cfg(unix)]
+fn direct_worktree_control_identity(
+    workspace: &fs::File,
+    relative: &str,
+) -> Result<WorktreeControlIdentity> {
+    let name = std::ffi::CString::new(relative)
+        .with_context(|| format!("mandatory worktree control name is invalid: {relative}"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `workspace` is a held directory descriptor, `name` is NUL-terminated, and `stat`
+    // points to writable storage. `AT_SYMLINK_NOFOLLOW` ensures a direct-child symlink is observed
+    // as a symlink rather than followed.
+    if unsafe {
+        libc::fstatat(
+            workspace.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to inspect mandatory worktree control {relative}"));
+    }
+    // SAFETY: `fstatat` succeeded and initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok(WorktreeControlIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        file_type: stat.st_mode & libc::S_IFMT,
+    })
+}
+
+#[cfg(unix)]
+fn open_direct_worktree_directory(
+    workspace: &fs::File,
+    relative: &'static str,
+) -> Result<fs::File> {
+    let name = std::ffi::CString::new(relative)
+        .with_context(|| format!("mandatory worktree control name is invalid: {relative}"))?;
+    let open = || {
+        // SAFETY: `workspace` is a held directory descriptor and `name` is NUL-terminated.
+        let descriptor = unsafe {
+            libc::openat(
+                workspace.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `openat` returned a new owned descriptor.
+            Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+        }
+    };
+    match open() {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // SAFETY: `workspace` is a held directory descriptor and `name` is NUL-terminated.
+            let result = unsafe { libc::mkdirat(workspace.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0 {
+                let mkdir_error = std::io::Error::last_os_error();
+                if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(mkdir_error).with_context(|| {
+                        format!("failed to provision mandatory worktree control {relative}")
+                    });
+                }
+            }
+            open().with_context(|| {
+                format!("mandatory worktree control is not a non-symlink directory: {relative}")
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!("mandatory worktree control is not a non-symlink directory: {relative}")
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn provision_mandatory_worktree_controls(
+    workspace_path: &Path,
+) -> Result<MandatoryWorktreeControls> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let workspace = options
+        .open(workspace_path)
+        .context("failed to bind managed worktree root for control bootstrap")?;
+    let path_metadata = fs::symlink_metadata(workspace_path)
+        .context("failed to inspect managed worktree root for control bootstrap")?;
+    let workspace_identity = worktree_control_identity_from_metadata(&workspace.metadata()?);
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_dir()
+        || worktree_control_identity_from_metadata(&path_metadata) != workspace_identity
+    {
+        bail!("managed worktree root is not an identity-stable non-symlink directory");
+    }
+
+    let git_identity = direct_worktree_control_identity(&workspace, ".git")
+        .context("linked worktree .git marker must already exist")?;
+    if !matches!(git_identity.file_type, libc::S_IFREG | libc::S_IFDIR) {
+        bail!("linked worktree .git marker must be a regular file or directory");
+    }
+
+    let mut directories = Vec::with_capacity(MANDATORY_WORKTREE_DIRECTORY_CONTROLS.len());
+    for &relative in MANDATORY_WORKTREE_DIRECTORY_CONTROLS {
+        let directory = open_direct_worktree_directory(&workspace, relative)?;
+        let identity = worktree_control_identity_from_metadata(&directory.metadata()?);
+        if identity.file_type != libc::S_IFDIR {
+            bail!("mandatory worktree control is not a directory: {relative}");
+        }
+        if direct_worktree_control_identity(&workspace, relative)? != identity {
+            bail!("mandatory worktree control identity changed while provisioning: {relative}");
+        }
+        directories.push(HeldWorktreeDirectoryControl {
+            relative,
+            directory,
+            identity,
+        });
+    }
+    let controls = MandatoryWorktreeControls {
+        workspace_path: workspace_path.to_path_buf(),
+        workspace,
+        workspace_identity,
+        git_identity,
+        directories,
+    };
+    controls.revalidate()?;
+    Ok(controls)
+}
+
+#[cfg(not(unix))]
+fn provision_mandatory_worktree_controls(
+    _workspace_path: &Path,
+) -> Result<MandatoryWorktreeControls> {
+    bail!("mandatory worktree control provisioning is unsupported on this platform")
+}
+
+fn assignment_worktree_control_exceptions(assigned_paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut exceptions = BTreeSet::new();
+    for assigned in assigned_paths {
+        let normalized = normalize_repo_relative_path(assigned).with_context(|| {
+            format!(
+                "assigned path cannot be used for a worktree control exception: {}",
+                assigned.display()
+            )
+        })?;
+        if normalized != *assigned {
+            bail!(
+                "assigned path must already be normalized before control exception derivation: {}",
+                assigned.display()
+            );
+        }
+        if PERMANENT_WORKTREE_CONTROL_ROOTS
+            .iter()
+            .any(|root| normalized.starts_with(root))
+        {
+            bail!(
+                "assigned path targets a permanently read-only worktree control: {}",
+                normalized.display()
+            );
+        }
+        if normalized == Path::new(".agents") {
+            bail!("the .agents policy root cannot be assigned as a writable exception");
+        }
+        if normalized.starts_with(".agents")
+            || POLICY_WORKTREE_CONTROL_FILES
+                .iter()
+                .any(|policy| normalized == Path::new(policy))
+        {
+            exceptions.insert(normalized);
+        }
+    }
+    Ok(exceptions.into_iter().collect())
+}
+
+fn configure_writable_child_command(
+    mut command: ExternalAgentCommand,
+    assigned_paths: &[PathBuf],
+) -> Result<ExternalAgentCommand> {
+    if command.workspace_access != WorkspaceAccess::ReadWrite {
+        bail!("child orchestrator command must use read-write workspace access");
+    }
+    if !command.worktree_control_exceptions.is_empty() {
+        bail!("child orchestrator command already contains undeclared control exceptions");
+    }
+    for exception in assignment_worktree_control_exceptions(assigned_paths)? {
+        command = command.with_worktree_control_exception(exception);
+    }
+    Ok(command)
+}
+
+fn configure_read_only_auditor_command(
+    command: ExternalAgentCommand,
+) -> Result<ExternalAgentCommand> {
+    if !command.worktree_control_exceptions.is_empty() {
+        bail!("read-only auditor command may not contain worktree control exceptions");
+    }
+    Ok(command.with_workspace_access(WorkspaceAccess::ReadOnly))
 }
 
 #[derive(Debug, Clone)]
@@ -3364,6 +3678,27 @@ fn execute_supervisor_assignment_inner(
             return Ok(());
         }
     }
+    let mandatory_worktree_controls = match provision_mandatory_worktree_controls(&worktree.path) {
+        Ok(controls) => controls,
+        Err(error) => {
+            record_isolated_assignment_failure(
+                outcome,
+                assignment,
+                "mandatory worktree control bootstrap",
+                &error,
+            );
+            return Ok(());
+        }
+    };
+    if let Err(error) = assignment_worktree_control_exceptions(&assignment.assigned_paths) {
+        record_isolated_assignment_failure(
+            outcome,
+            assignment,
+            "worktree control exception derivation",
+            &error,
+        );
+        return Ok(());
+    }
     let child_base_head = match current_head_oid(&worktree.path).with_context(|| {
         format!(
             "failed to capture base HEAD for child worktree '{}' at {}",
@@ -3503,6 +3838,15 @@ fn execute_supervisor_assignment_inner(
     let mut attempt_history = Vec::new();
     let max_attempts = usize::from(plan.max_child_retries).saturating_add(1);
     for attempt in 1..=max_attempts {
+        if let Err(error) = mandatory_worktree_controls.revalidate() {
+            record_isolated_assignment_failure(
+                outcome,
+                assignment,
+                "mandatory worktree control revalidation",
+                &error,
+            );
+            return Ok(());
+        }
         let (incoming_name, capture_name) =
             invocation_scratch_names(*index, attempt, false, *concurrent_mode);
         let incoming_path = run_dir.join(&incoming_name);
@@ -3611,6 +3955,7 @@ fn execute_supervisor_assignment_inner(
             options.run_id.as_str(),
             &assignment.id,
         );
+        command = configure_writable_child_command(command, &assignment.assigned_paths)?;
 
         record_shared_orchestration_event(
             artifacts,
@@ -3869,6 +4214,15 @@ fn execute_supervisor_assignment_inner(
 
     let mut assignment_containment_verified = child_containment_verified;
     if child_containment_verified && parent_auditor_required(assignment, &child_report) {
+        if let Err(error) = mandatory_worktree_controls.revalidate() {
+            record_isolated_assignment_failure(
+                outcome,
+                assignment,
+                "mandatory worktree control revalidation before auditor",
+                &error,
+            );
+            return Ok(());
+        }
         let auditor_id = parent_auditor_id(assignment);
         let auditor_prompt_path = dirs.assignments.join(format!("{auditor_id}.prompt.md"));
         let (auditor_incoming_name, auditor_capture_name) =
@@ -3993,8 +4347,7 @@ fn execute_supervisor_assignment_inner(
         );
         auditor_command = apply_role_model_selection(auditor_command, plan, AgentRole::Auditor);
         auditor_command.output_schema = Some(auditor_schema_path);
-        auditor_command = auditor_command
-            .with_workspace_access(WorkspaceAccess::ReadOnly)
+        auditor_command = configure_read_only_auditor_command(auditor_command)?
             .with_hidden_root(repo)
             .with_agent_lifecycle(
                 repo,
@@ -5065,6 +5418,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     );
     let mut coverage_gaps = plan_metadata.coverage_gaps.clone();
     coverage_gaps.extend(runtime_coverage_gaps);
+    let sandbox_denials = aggregate_sandbox_denials(&command_records);
     let final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -5116,6 +5470,7 @@ fn run_supervisor_plan_with_runner_and_creation(
         total_cost_usd,
         usage_complete,
         commands_run: command_records,
+        sandbox_denials,
         files_changed: orchestrator_reports
             .iter()
             .flat_map(|report| report.files_changed.iter().cloned())
@@ -9370,8 +9725,35 @@ fn command_record_from_external(
         timed_out: run.timed_out,
         stdout: run.stdout.text.clone(),
         stderr: run.stderr.text.clone(),
+        sandbox_denials: sandbox_denials_for_report(run.sandbox_denials()),
         error: run.error.clone(),
     }
+}
+
+fn sandbox_denials_for_report(denials: &[SandboxDenialEvidence]) -> Vec<SandboxDenialEvidence> {
+    denials
+        .iter()
+        .cloned()
+        .map(|mut denial| {
+            if let Some(path) = denial.path.take() {
+                denial.path = normalize_repo_relative_path(&path)
+                    .ok()
+                    .filter(|normalized| normalized == &path);
+            }
+            denial
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn aggregate_sandbox_denials(command_records: &[CommandRunRecord]) -> Vec<SandboxDenialEvidence> {
+    command_records
+        .iter()
+        .flat_map(|record| record.sandbox_denials.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn serializable_external_command(
@@ -9908,7 +10290,30 @@ fn command_run_record_schema_value() -> serde_json::Value {
             "timed_out": {"type": "boolean"},
             "stdout": {"type": "string"},
             "stderr": {"type": "string"},
+            "sandbox_denials": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": sandbox_denial_evidence_schema_value()
+            },
             "error": {"type": ["string", "null"]}
+        }
+    })
+}
+
+fn sandbox_denial_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["boundary", "policy_id", "operation", "retryability"],
+        "properties": {
+            "boundary": {"type": "string", "enum": ["outer_systemd", "inner_codex"]},
+            "policy_id": {"type": "string", "minLength": 1},
+            "operation": {"type": "string", "enum": ["establish_boundary", "write"]},
+            "path": {"type": "string", "minLength": 1},
+            "retryability": {
+                "type": "string",
+                "enum": ["requires_declared_exception", "not_retryable"]
+            }
         }
     })
 }
@@ -10353,7 +10758,10 @@ pub fn generated_run_id() -> Result<RunId> {
 mod tests {
     use super::*;
     use crate::{
-        external_agent::{CapturedOutput, CodexPermissionEvidence},
+        external_agent::{
+            CapturedOutput, CodexPermissionEvidence, SandboxDenialBoundary,
+            SandboxDenialRetryability, SandboxDeniedOperation,
+        },
         orchestration_event::{
             set_orchestration_event_append_fault, OrchestrationEvent, ORCHESTRATION_EVENT_PATH,
         },
@@ -10365,6 +10773,310 @@ mod tests {
         Arc, Condvar,
     };
     use std::time::Instant;
+
+    #[cfg(unix)]
+    fn mandatory_control_test_workspace() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary mandatory-control workspace");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).expect("create mandatory-control workspace");
+        fs::write(
+            workspace.join(".git"),
+            b"gitdir: /held/common/worktrees/test\n",
+        )
+        .expect("write linked-worktree marker fixture");
+        (temp, workspace)
+    }
+
+    fn control_test_command(workspace: &Path, artifact_root: &Path) -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            "/run/current-system/sw/bin/codex",
+            workspace,
+            workspace.join("prompt.md"),
+            artifact_root.join("events.jsonl"),
+            artifact_root.join("report.json"),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn denial_fixture(
+        boundary: SandboxDenialBoundary,
+        policy_id: &str,
+        path: Option<&str>,
+        retryability: SandboxDenialRetryability,
+    ) -> SandboxDenialEvidence {
+        SandboxDenialEvidence {
+            boundary,
+            policy_id: policy_id.to_string(),
+            operation: SandboxDeniedOperation::Write,
+            path: path.map(PathBuf::from),
+            retryability,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue32_mandatory_worktree_controls_are_provisioned_without_touching_policy_contents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, workspace) = mandatory_control_test_workspace();
+        fs::create_dir(workspace.join(".agents")).expect("create existing policy root");
+        let policy = workspace.join(".agents/AGENTS.md");
+        fs::write(&policy, b"immutable policy fixture\n").expect("write policy fixture");
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o444))
+            .expect("make policy fixture read-only");
+        let git_before = fs::read(workspace.join(".git")).expect("read .git marker before");
+        let policy_before = fs::symlink_metadata(&policy).expect("inspect policy before");
+
+        let controls = provision_mandatory_worktree_controls(&workspace)
+            .expect("provision mandatory controls");
+        controls.revalidate().expect("revalidate held controls");
+
+        for relative in MANDATORY_WORKTREE_DIRECTORY_CONTROLS {
+            let metadata = fs::symlink_metadata(workspace.join(relative))
+                .expect("inspect provisioned control");
+            assert!(
+                metadata.is_dir(),
+                "{relative} was not provisioned as a directory"
+            );
+            assert!(!metadata.file_type().is_symlink());
+        }
+        assert_eq!(
+            fs::read(workspace.join(".git")).expect("read .git marker after"),
+            git_before
+        );
+        let policy_after = fs::symlink_metadata(&policy).expect("inspect policy after");
+        assert_eq!(
+            fs::read(&policy).expect("read policy after"),
+            b"immutable policy fixture\n"
+        );
+        assert_eq!(policy_after.mode(), policy_before.mode());
+        assert_eq!(policy_after.ino(), policy_before.ino());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue32_mandatory_control_bootstrap_rejects_symlinks_and_identity_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, workspace) = mandatory_control_test_workspace();
+        let target = workspace.join("alias-target");
+        fs::create_dir(&target).expect("create symlink target");
+        symlink(&target, workspace.join(".codex")).expect("create control symlink");
+        let error = provision_mandatory_worktree_controls(&workspace)
+            .expect_err("symlink control must fail closed");
+        assert!(error.to_string().contains("non-symlink directory"));
+
+        fs::remove_file(workspace.join(".codex")).expect("remove symlink fixture");
+        let controls = provision_mandatory_worktree_controls(&workspace)
+            .expect("provision mandatory controls");
+        fs::rename(workspace.join(".agents"), workspace.join(".agents-held"))
+            .expect("move held policy root");
+        symlink(&target, workspace.join(".agents")).expect("replace policy root with symlink");
+        let error = controls
+            .revalidate()
+            .expect_err("replaced control identity must fail closed");
+        assert!(error
+            .to_string()
+            .contains("mandatory worktree control identity changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue32_child_command_exceptions_are_exactly_assignment_derived_policy_paths() {
+        let (temp, workspace) = mandatory_control_test_workspace();
+        let artifact_root = temp.path().join("incoming");
+        fs::create_dir(&artifact_root).expect("create incoming root");
+        provision_mandatory_worktree_controls(&workspace).expect("provision controls");
+        fs::create_dir_all(workspace.join(".agents/skills/demo"))
+            .expect("create nested policy path");
+        fs::write(workspace.join(".agents/skills/demo/SKILL.md"), b"policy\n")
+            .expect("write nested policy");
+        fs::write(workspace.join("AGENTS.md"), b"root policy\n").expect("write root policy");
+
+        let ordinary = configure_writable_child_command(
+            control_test_command(&workspace, &artifact_root),
+            &[PathBuf::from("src/lib.rs")],
+        )
+        .expect("configure ordinary assignment");
+        assert_eq!(ordinary.workspace_access, WorkspaceAccess::ReadWrite);
+        assert!(ordinary.worktree_control_exceptions.is_empty());
+
+        let policy = configure_writable_child_command(
+            control_test_command(&workspace, &artifact_root),
+            &[
+                PathBuf::from("AGENTS.md"),
+                PathBuf::from(".agents/skills/demo/SKILL.md"),
+            ],
+        )
+        .expect("configure exact policy assignment");
+        assert_eq!(
+            policy.worktree_control_exceptions,
+            vec![
+                PathBuf::from(".agents/skills/demo/SKILL.md"),
+                PathBuf::from("AGENTS.md"),
+            ]
+        );
+        assert!(!policy
+            .worktree_control_exceptions
+            .iter()
+            .any(|path| path == Path::new(".agents")));
+    }
+
+    #[test]
+    fn issue32_permanent_controls_and_policy_root_are_never_write_exceptions() {
+        for forbidden in [
+            ".git",
+            ".git/config",
+            ".maco/state.json",
+            ".maco-cache/index",
+            ".codex/config.toml",
+            ".agents",
+        ] {
+            let error = assignment_worktree_control_exceptions(&[PathBuf::from(forbidden)])
+                .expect_err("permanent control assignment must fail closed");
+            assert!(
+                error.to_string().contains("read-only")
+                    || error.to_string().contains("policy root"),
+                "unexpected error for {forbidden}: {error:#}"
+            );
+        }
+        assert!(
+            assignment_worktree_control_exceptions(&[PathBuf::from("src/.agents/config")])
+                .expect("ordinary nested name is not a protected root")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue32_auditor_is_read_only_while_incoming_report_remains_writable() {
+        let (temp, workspace) = mandatory_control_test_workspace();
+        let artifact_root = temp.path().join("incoming");
+        fs::create_dir(&artifact_root).expect("create incoming root");
+        provision_mandatory_worktree_controls(&workspace).expect("provision controls");
+        let report_path = artifact_root.join("report.json");
+        let command =
+            configure_read_only_auditor_command(control_test_command(&workspace, &artifact_root))
+                .expect("configure read-only auditor");
+        assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+        assert!(command.worktree_control_exceptions.is_empty());
+        assert_eq!(command.output_last_message, report_path);
+
+        let argv = crate::external_agent::command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let filesystem = argv
+            .iter()
+            .find(|argument| argument.starts_with("permissions.maco_external_codex.filesystem="))
+            .expect("filesystem permission config");
+        assert!(!filesystem.contains("\":workspace_roots\""));
+        assert!(filesystem.contains(&format!(
+            "{}=\"write\"",
+            serde_json::to_string(
+                artifact_root
+                    .to_str()
+                    .expect("UTF-8 temporary artifact root")
+            )
+            .expect("quote artifact root")
+        )));
+    }
+
+    #[test]
+    fn issue32_denials_propagate_deduplicate_round_trip_and_default() {
+        let temp = tempfile::tempdir().expect("temporary denial fixture");
+        let workspace = temp.path().join("workspace");
+        let artifact_root = temp.path().join("incoming");
+        fs::create_dir_all(&workspace).expect("create denial workspace");
+        fs::create_dir_all(&artifact_root).expect("create denial artifact root");
+        let command = control_test_command(&workspace, &artifact_root);
+        let outer = denial_fixture(
+            SandboxDenialBoundary::OuterSystemd,
+            "outer-policy",
+            None,
+            SandboxDenialRetryability::NotRetryable,
+        );
+        let inner = denial_fixture(
+            SandboxDenialBoundary::InnerCodex,
+            "inner-policy",
+            Some("AGENTS.md"),
+            SandboxDenialRetryability::RequiresDeclaredException,
+        );
+        let mut run_value = serde_json::to_value(deterministic_fake_run(&command, Vec::new()))
+            .expect("serialize external run fixture");
+        run_value
+            .as_object_mut()
+            .expect("external run object")
+            .insert(
+                "sandbox_denials".to_string(),
+                serde_json::to_value(vec![inner.clone(), outer.clone(), inner.clone()])
+                    .expect("serialize denial fixtures"),
+            );
+        let run: ExternalAgentRun =
+            serde_json::from_value(run_value).expect("deserialize external run fixture");
+        let record = command_record_from_external(&run, &command);
+        assert_eq!(
+            record.sandbox_denials,
+            vec![outer.clone(), inner.clone()],
+            "command record denial ordering must be deterministic"
+        );
+
+        let mut report = artifact_test_final_report(
+            &RunId::new("sandbox-denial-round-trip").expect("valid run id"),
+        );
+        report.commands_run = vec![record.clone(), record.clone()];
+        report.sandbox_denials = aggregate_sandbox_denials(&report.commands_run);
+        assert_eq!(report.sandbox_denials, vec![outer, inner]);
+        let value = serde_json::to_value(&report).expect("serialize supervisor report");
+        let decoded: SupervisorFinalReport =
+            serde_json::from_value(value.clone()).expect("stable supervisor report round trip");
+        assert_eq!(decoded, report);
+
+        let mut old_value = value;
+        old_value
+            .as_object_mut()
+            .expect("supervisor report object")
+            .remove("sandbox_denials");
+        for command in old_value["commands_run"]
+            .as_array_mut()
+            .expect("command array")
+        {
+            command
+                .as_object_mut()
+                .expect("command object")
+                .remove("sandbox_denials");
+        }
+        let old: SupervisorFinalReport =
+            serde_json::from_value(old_value).expect("old report JSON remains compatible");
+        assert!(old.sandbox_denials.is_empty());
+        assert!(old
+            .commands_run
+            .iter()
+            .all(|record| record.sandbox_denials.is_empty()));
+        assert!(command_run_record_schema_value()["properties"]
+            .get("sandbox_denials")
+            .is_some());
+        assert!(!command_run_record_schema_value()["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "sandbox_denials"));
+    }
+
+    #[test]
+    fn issue32_unsafe_denial_paths_do_not_serialize_absolute_host_paths() {
+        let unsafe_path = "/home/operator/private/control";
+        let denials = sandbox_denials_for_report(&[denial_fixture(
+            SandboxDenialBoundary::InnerCodex,
+            "inner-policy",
+            Some(unsafe_path),
+            SandboxDenialRetryability::RequiresDeclaredException,
+        )]);
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0].path, None);
+        let serialized = serde_json::to_string(&denials).expect("serialize sanitized denials");
+        assert!(!serialized.contains(unsafe_path));
+    }
 
     #[test]
     fn concurrency_policy_parses_auto_and_positive_limits_with_auto_default() {
@@ -16032,6 +16744,7 @@ mod tests {
             timed_out: false,
             stdout: String::new(),
             stderr: String::new(),
+            sandbox_denials: Vec::new(),
             error: None,
         };
         let value = serde_json::to_value(record).expect("serialize command cwd");
@@ -16358,6 +17071,7 @@ mod tests {
             total_cost_usd: None,
             usage_complete: false,
             commands_run: Vec::new(),
+            sandbox_denials: Vec::new(),
             files_changed: Vec::new(),
             validation_results: Vec::new(),
             findings: Vec::new(),
@@ -16656,6 +17370,7 @@ mod tests {
             timed_out: false,
             stdout: String::new(),
             stderr: String::new(),
+            sandbox_denials: Vec::new(),
             error: None,
         }
     }
