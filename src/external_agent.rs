@@ -1320,39 +1320,45 @@ struct ProtectedWorktreeControl {
     relative: PathBuf,
     retryability: SandboxDenialRetryability,
     #[cfg(unix)]
-    held_materialized_file: Option<HeldMaterializedControlFile>,
+    held_file: Option<HeldWorktreeControlFile>,
 }
 
 #[cfg(unix)]
 #[derive(Clone)]
-struct HeldMaterializedControlFile {
+struct HeldWorktreeControlFile {
     _file: std::sync::Arc<fs::File>,
-    identity: MaterializedControlFileIdentity,
+    identity: WorktreeControlFileIdentity,
+    requires_private_materialization: bool,
 }
 
 #[cfg(unix)]
-impl PartialEq for HeldMaterializedControlFile {
+impl PartialEq for HeldWorktreeControlFile {
     fn eq(&self, other: &Self) -> bool {
         self.identity == other.identity
+            && self.requires_private_materialization == other.requires_private_materialization
     }
 }
 
 #[cfg(unix)]
-impl Eq for HeldMaterializedControlFile {}
+impl Eq for HeldWorktreeControlFile {}
 
 #[cfg(unix)]
-impl std::fmt::Debug for HeldMaterializedControlFile {
+impl std::fmt::Debug for HeldWorktreeControlFile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("HeldMaterializedControlFile")
+            .debug_struct("HeldWorktreeControlFile")
             .field("identity", &self.identity)
+            .field(
+                "requires_private_materialization",
+                &self.requires_private_materialization,
+            )
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MaterializedControlFileIdentity {
+struct WorktreeControlFileIdentity {
     device: u64,
     inode: u64,
     owner: u32,
@@ -1361,9 +1367,17 @@ struct MaterializedControlFileIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlExceptionTarget {
-    Existing,
+enum ControlExceptionKind {
+    ExistingDirectory,
+    ExistingRegularFile,
     AbsentRegularFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlExceptionTarget {
+    kind: ControlExceptionKind,
+    #[cfg(unix)]
+    held_file: Option<HeldWorktreeControlFile>,
 }
 
 impl ProtectedWorktreeControls {
@@ -1507,7 +1521,7 @@ fn collect_protected_control(
         relative: relative.to_path_buf(),
         retryability,
         #[cfg(unix)]
-        held_materialized_file: None,
+        held_file: None,
     };
     if metadata.is_dir() {
         controls.read_only_roots.push(control);
@@ -1536,14 +1550,52 @@ fn validate_artifact_parent_disjoint(
             continue;
         }
         if control.relative == Path::new(".maco")
-            && parent != protected
-            && parent.starts_with(&protected)
+            && matches!(
+                spec.invocation,
+                ExternalAgentInvocation::CodexConsultant
+                    | ExternalAgentInvocation::ClaudeConsultant
+            )
+            && is_designated_maco_incoming_parent(&parent, &protected)
         {
             continue;
         }
         bail!("external-agent output parent overlaps a protected worktree control");
     }
     Ok(parent)
+}
+
+fn is_designated_maco_incoming_parent(parent: &Path, maco_root: &Path) -> bool {
+    let Ok(relative) = parent.strip_prefix(maco_root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (
+        Some(std::path::Component::Normal(consult)),
+        Some(std::path::Component::Normal(runs)),
+        Some(std::path::Component::Normal(run_id)),
+        Some(std::path::Component::Normal(incoming_name)),
+        None,
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return false;
+    };
+    if runs != OsStr::new("runs") {
+        return false;
+    }
+    let Some(run_id) = run_id.to_str() else {
+        return false;
+    };
+    if !crate::orchestrator::RunId::new(run_id).is_ok_and(|validated| validated.as_str() == run_id)
+    {
+        return false;
+    }
+    consult == OsStr::new("consult") && incoming_name == OsStr::new("incoming")
 }
 
 fn normalized_absolute_path(path: &Path, label: &str) -> Result<PathBuf> {
@@ -1661,7 +1713,11 @@ fn validate_control_exception_target(
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_final => {
-                return Ok(ControlExceptionTarget::AbsentRegularFile);
+                return Ok(ControlExceptionTarget {
+                    kind: ControlExceptionKind::AbsentRegularFile,
+                    #[cfg(unix)]
+                    held_file: None,
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 bail!(
@@ -1696,8 +1752,36 @@ fn validate_control_exception_target(
                 relative.display()
             );
         }
+        if is_final && metadata.is_file() {
+            #[cfg(unix)]
+            let held_file = Some(
+                hold_existing_control_exception_file(workspace, relative, &metadata).with_context(
+                    || {
+                        format!(
+                            "failed to hold exact worktree control exception: {}",
+                            relative.display()
+                        )
+                    },
+                )?,
+            );
+            return Ok(ControlExceptionTarget {
+                kind: ControlExceptionKind::ExistingRegularFile,
+                #[cfg(unix)]
+                held_file,
+            });
+        }
+        if is_final {
+            return Ok(ControlExceptionTarget {
+                kind: ControlExceptionKind::ExistingDirectory,
+                #[cfg(unix)]
+                held_file: None,
+            });
+        }
     }
-    Ok(ControlExceptionTarget::Existing)
+    bail!(
+        "worktree control exception did not resolve to a target: {}",
+        relative.display()
+    )
 }
 
 fn collect_control_exception(
@@ -1708,20 +1792,20 @@ fn collect_control_exception(
 ) -> Result<()> {
     let absolute = workspace.join(relative);
     #[cfg(unix)]
-    let held_materialized_file = if target == ControlExceptionTarget::AbsentRegularFile {
-        Some(
+    let held_file = match target.kind {
+        ControlExceptionKind::AbsentRegularFile => Some(
             materialize_control_exception_file(workspace, relative).with_context(|| {
                 format!(
                     "failed to materialize exact worktree control exception: {}",
                     relative.display()
                 )
             })?,
-        )
-    } else {
-        None
+        ),
+        ControlExceptionKind::ExistingRegularFile => target.held_file,
+        ControlExceptionKind::ExistingDirectory => None,
     };
     #[cfg(not(unix))]
-    if target == ControlExceptionTarget::AbsentRegularFile {
+    if target.kind == ControlExceptionKind::AbsentRegularFile {
         materialize_control_exception_file(workspace, relative).with_context(|| {
             format!(
                 "failed to materialize exact worktree control exception: {}",
@@ -1741,18 +1825,33 @@ fn collect_control_exception(
             relative.display()
         );
     }
-    if target == ControlExceptionTarget::AbsentRegularFile && !metadata.is_file() {
+    let expected_type_matches = match target.kind {
+        ControlExceptionKind::ExistingDirectory => metadata.is_dir(),
+        ControlExceptionKind::ExistingRegularFile | ControlExceptionKind::AbsentRegularFile => {
+            metadata.is_file()
+        }
+    };
+    if !expected_type_matches {
         bail!(
-            "new worktree control exception must materialize as a regular file: {}",
+            "worktree control exception type changed during classification: {}",
             relative.display()
         );
+    }
+    #[cfg(unix)]
+    if let Some(held) = &held_file {
+        held.verify_path(workspace, relative).with_context(|| {
+            format!(
+                "held worktree control changed during classification: {}",
+                relative.display()
+            )
+        })?;
     }
     let control = ProtectedWorktreeControl {
         absolute,
         relative: relative.to_path_buf(),
         retryability: SandboxDenialRetryability::NotRetryable,
         #[cfg(unix)]
-        held_materialized_file,
+        held_file,
     };
     if metadata.is_dir() {
         controls.read_write_roots.push(control);
@@ -1768,16 +1867,19 @@ fn collect_control_exception(
 }
 
 #[cfg(unix)]
-impl HeldMaterializedControlFile {
+impl HeldWorktreeControlFile {
     fn verify_path(&self, workspace: &Path, relative: &Path) -> std::io::Result<()> {
         use std::os::fd::{AsRawFd, FromRawFd};
 
-        let held_identity = materialized_control_file_identity(&self._file)?;
+        let held_identity = worktree_control_file_identity(&self._file)?;
         if held_identity != self.identity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "held materialized worktree control identity changed",
+                "held worktree control identity changed",
             ));
+        }
+        if self.requires_private_materialization {
+            validate_materialized_control_file_identity(held_identity)?;
         }
         let (parent, name) = open_control_exception_parent_nofollow(workspace, relative)?;
         let observed_fd = unsafe {
@@ -1792,11 +1894,14 @@ impl HeldMaterializedControlFile {
         }
         // SAFETY: `openat` returned a new owned descriptor.
         let observed = unsafe { fs::File::from_raw_fd(observed_fd) };
-        let observed_identity = materialized_control_file_identity(&observed)?;
+        let observed_identity = worktree_control_file_identity(&observed)?;
+        if self.requires_private_materialization {
+            validate_materialized_control_file_identity(observed_identity)?;
+        }
         if observed_identity != self.identity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "materialized worktree control path no longer names the held file",
+                "worktree control path no longer names the held file",
             ));
         }
         Ok(())
@@ -1804,31 +1909,67 @@ impl HeldMaterializedControlFile {
 }
 
 #[cfg(unix)]
-fn materialized_control_file_identity(
-    file: &fs::File,
-) -> std::io::Result<MaterializedControlFileIdentity> {
+fn worktree_control_file_identity(file: &fs::File) -> std::io::Result<WorktreeControlFileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
-    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
-    let effective_uid = unsafe { libc::geteuid() };
-    let identity = MaterializedControlFileIdentity {
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "held worktree control is not a regular file",
+        ));
+    }
+    Ok(WorktreeControlFileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
         owner: metadata.uid(),
         mode: metadata.mode() & 0o7777,
         links: metadata.nlink(),
-    };
-    if !metadata.is_file()
-        || identity.owner != effective_uid
-        || identity.mode != 0o600
-        || identity.links != 1
-    {
+    })
+}
+
+#[cfg(unix)]
+fn worktree_control_file_identity_from_metadata(
+    metadata: &fs::Metadata,
+) -> std::io::Result<WorktreeControlFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worktree control metadata is not a regular file",
+        ));
+    }
+    Ok(WorktreeControlFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+        links: metadata.nlink(),
+    })
+}
+
+#[cfg(unix)]
+fn validate_materialized_control_file_identity(
+    identity: WorktreeControlFileIdentity,
+) -> std::io::Result<()> {
+    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    if identity.owner != effective_uid || identity.mode != 0o600 || identity.links != 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "materialized worktree control must be current-user-owned, mode 0600, and single-link",
         ));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn materialized_control_file_identity(
+    file: &fs::File,
+) -> std::io::Result<WorktreeControlFileIdentity> {
+    let identity = worktree_control_file_identity(file)?;
+    validate_materialized_control_file_identity(identity)?;
     Ok(identity)
 }
 
@@ -1896,10 +2037,48 @@ fn open_control_exception_parent_nofollow(
 }
 
 #[cfg(unix)]
+fn hold_existing_control_exception_file(
+    workspace: &Path,
+    relative: &Path,
+    classified_metadata: &fs::Metadata,
+) -> std::io::Result<HeldWorktreeControlFile> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let classified_identity = worktree_control_file_identity_from_metadata(classified_metadata)?;
+    let (parent, name) = open_control_exception_parent_nofollow(workspace, relative)?;
+    let file_fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if file_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    let file = unsafe { fs::File::from_raw_fd(file_fd) };
+    let held_identity = worktree_control_file_identity(&file)?;
+    if held_identity != classified_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worktree control changed while its held capability was acquired",
+        ));
+    }
+    let held = HeldWorktreeControlFile {
+        _file: std::sync::Arc::new(file),
+        identity: held_identity,
+        requires_private_materialization: false,
+    };
+    held.verify_path(workspace, relative)?;
+    Ok(held)
+}
+
+#[cfg(unix)]
 fn materialize_control_exception_file(
     workspace: &Path,
     relative: &Path,
-) -> std::io::Result<HeldMaterializedControlFile> {
+) -> std::io::Result<HeldWorktreeControlFile> {
     materialize_control_exception_file_with(workspace, relative, || Ok(()))
 }
 
@@ -1908,7 +2087,7 @@ fn materialize_control_exception_file_with_hook(
     workspace: &Path,
     relative: &Path,
     after_create: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<HeldMaterializedControlFile> {
+) -> std::io::Result<HeldWorktreeControlFile> {
     materialize_control_exception_file_with(workspace, relative, after_create)
 }
 
@@ -1917,7 +2096,7 @@ fn materialize_control_exception_file_with(
     workspace: &Path,
     relative: &Path,
     after_create: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<HeldMaterializedControlFile> {
+) -> std::io::Result<HeldWorktreeControlFile> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
     let (parent, name) = open_control_exception_parent_nofollow(workspace, relative)?;
@@ -1964,9 +2143,10 @@ fn materialize_control_exception_file_with(
         ));
     }
 
-    Ok(HeldMaterializedControlFile {
+    Ok(HeldWorktreeControlFile {
         _file: std::sync::Arc::new(file),
         identity,
+        requires_private_materialization: true,
     })
 }
 
@@ -2017,11 +2197,11 @@ fn external_side_effect_profile(
             }
             for control in &protected_controls.read_write_files {
                 #[cfg(target_os = "linux")]
-                if let Some(held) = &control.held_materialized_file {
+                if let Some(held) = &control.held_file {
                     held.verify_path(&spec.cwd, &control.relative)
                         .with_context(|| {
                             format!(
-                                "materialized worktree control changed before sandbox admission: {}",
+                                "held worktree control changed before sandbox admission: {}",
                                 control.relative.display()
                             )
                         })?;
@@ -2032,18 +2212,18 @@ fn external_side_effect_profile(
                         )
                         .with_context(|| {
                             format!(
-                                "materialized worktree control capability is invalid: {}",
+                                "held worktree control capability is invalid: {}",
                                 control.relative.display()
                             )
                         })?;
                     continue;
                 }
                 #[cfg(all(unix, not(target_os = "linux")))]
-                if let Some(held) = &control.held_materialized_file {
+                if let Some(held) = &control.held_file {
                     held.verify_path(&spec.cwd, &control.relative)
                         .with_context(|| {
                             format!(
-                                "materialized worktree control changed before sandbox admission: {}",
+                                "held worktree control changed before sandbox admission: {}",
                                 control.relative.display()
                             )
                         })?;
@@ -3197,7 +3377,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_parent_rejects_protected_overlap_and_allows_incoming() -> Result<()> {
+    fn artifact_parent_allows_only_designated_maco_incoming_layouts() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
         create_mandatory_control_roots(&workspace)?;
@@ -3209,6 +3389,21 @@ mod tests {
             workspace.join(".git/report.json"),
             workspace.join(".git/nested/report.json"),
             workspace.join(".maco/report.json"),
+            workspace.join(".maco/state/report.json"),
+            workspace.join(".maco/control/report.json"),
+            workspace.join(".maco/consult/report.json"),
+            workspace.join(".maco/consult/runs/report.json"),
+            workspace.join(".maco/consult/runs/test/report.json"),
+            workspace.join(".maco/consult/runs/test/capture/report.json"),
+            workspace.join(".maco/consult/runs/test/incoming-extra/report.json"),
+            workspace.join(".maco/consult/runs/test/incoming/nested/report.json"),
+            workspace.join(".maco/consult/runs/invalid run/incoming/report.json"),
+            workspace.join(".maco/o2/runs/test/incoming/report.json"),
+            workspace.join(".maco/o2/runs/test/capture/report.json"),
+            workspace.join(".maco/o2/runs/test/incoming-assignment-1-attempt-01/report.json"),
+            workspace.join(".maco/o2/runs/test/incoming-assignment-0001-attempt-1/report.json"),
+            workspace.join(".maco/o2/runs/test/incoming-assignment-0001-worker/report.json"),
+            workspace.join(".maco/autopilot/runs/test/incoming/report.json"),
             workspace.join(".maco-cache/report.json"),
             workspace.join(".maco-cache/nested/report.json"),
             workspace.join(".codex/report.json"),
@@ -3218,7 +3413,7 @@ mod tests {
             workspace.join(".cursorignore/report.json"),
             workspace.join("report.json"),
         ] {
-            let command = ExternalAgentCommand::codex(
+            let command = ExternalAgentCommand::codex_read_only_consultant(
                 "codex",
                 &workspace,
                 workspace.join("prompt.md"),
@@ -3238,7 +3433,22 @@ mod tests {
 
         let maco_incoming = workspace.join(".maco/consult/runs/test/incoming");
         fs::create_dir_all(&maco_incoming)?;
-        let command = ExternalAgentCommand::codex(
+        let supervisor_command = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join("events.jsonl"),
+            maco_incoming.join("report.json"),
+            Duration::from_secs(1),
+        );
+        let error = protected_worktree_controls(&supervisor_command)
+            .expect_err("supervisor invocation must not receive the consult carve-out");
+        assert_eq!(
+            error.to_string(),
+            "external-agent output parent overlaps a protected worktree control"
+        );
+
+        let command = ExternalAgentCommand::codex_read_only_consultant(
             "codex",
             &workspace,
             workspace.join("prompt.md"),
@@ -3423,7 +3633,7 @@ mod tests {
         assert!(controls
             .read_write_files
             .iter()
-            .all(|control| control.held_materialized_file.is_some()));
+            .all(|control| control.held_file.is_some()));
 
         let repeated = protected_worktree_controls_for(&workspace, &exceptions)?;
         assert_eq!(
@@ -3438,7 +3648,7 @@ mod tests {
         assert!(repeated
             .read_write_files
             .iter()
-            .all(|control| control.held_materialized_file.is_none()));
+            .all(|control| control.held_file.is_some()));
         Ok(())
     }
 
@@ -3450,7 +3660,7 @@ mod tests {
         fs::create_dir_all(workspace.join(".agents/docs"))?;
         let relative = PathBuf::from(".agents/docs/raced-policy.md");
         let target = validate_control_exception_target(&workspace, &relative)?;
-        assert_eq!(target, ControlExceptionTarget::AbsentRegularFile);
+        assert_eq!(target.kind, ControlExceptionKind::AbsentRegularFile);
         fs::write(workspace.join(&relative), "raced file\n")?;
 
         let mut controls = ProtectedWorktreeControls::default();
@@ -3461,6 +3671,53 @@ mod tests {
             .contains("failed to materialize exact worktree control exception"));
         assert!(controls.read_write_files.is_empty());
         assert!(controls.read_write_roots.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_policy_file_capability_rejects_replacement_after_classification() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        create_mandatory_control_roots(&workspace)?;
+        fs::create_dir_all(workspace.join(".agents/docs"))?;
+        let incoming = workspace.join("incoming");
+        fs::create_dir(&incoming)?;
+        let relative = PathBuf::from(".agents/docs/existing-policy.md");
+        let exception = workspace.join(&relative);
+        fs::write(&exception, "original policy\n")?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        )
+        .with_worktree_control_exception(&relative);
+
+        let controls = protected_worktree_controls(&command)?;
+        assert!(controls
+            .read_write_files
+            .iter()
+            .all(|control| control.held_file.is_some()));
+
+        fs::rename(&exception, workspace.join("classified-policy.md"))?;
+        fs::write(&exception, "replacement policy\n")?;
+
+        let error = external_side_effect_profile(
+            &command,
+            &workspace.join("codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )
+        .expect_err("replacement must not inherit the held writable capability");
+        assert!(
+            error
+                .to_string()
+                .contains("held worktree control changed before sandbox admission"),
+            "unexpected replacement rejection: {error:#}"
+        );
         Ok(())
     }
 
@@ -3549,7 +3806,7 @@ mod tests {
         .expect_err("replacement must fail before exact outer exception admission");
         assert!(error
             .to_string()
-            .contains("materialized worktree control changed before sandbox admission"));
+            .contains("held worktree control changed before sandbox admission"));
         Ok(())
     }
 
