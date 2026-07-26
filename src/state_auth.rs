@@ -3,9 +3,12 @@
 //! The key bytes never leave this module. Consumers receive only repository
 //! binding evidence and domain-separated sign/verify operations.
 
-use crate::safe_state::{
-    identity_for_path, AtomicStateWriter, BoundedRegularReader, ExistingExclusiveLock,
-    FileIdentity, KernelStateLock, SafeRoot,
+use crate::{
+    field_guide::FIELD_GUIDE_STATE_NAMESPACE,
+    safe_state::{
+        identity_for_path, AtomicStateWriter, BoundedRegularReader, ExistingExclusiveLock,
+        FileIdentity, KernelStateLock, SafeRoot,
+    },
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -44,6 +47,10 @@ const AUTHENTICATED_STATE_CONSUMERS: &[(&str, &str)] = &[
     (
         "authenticated-semantic-state-v1",
         "authenticated semantic coordination state",
+    ),
+    (
+        FIELD_GUIDE_STATE_NAMESPACE,
+        "authenticated field guide state",
     ),
     (
         "authenticated-managed-worktrees-v1",
@@ -1010,6 +1017,23 @@ mod tests {
             .err()
             .expect("must refuse rekey");
         assert!(error.to_string().contains("authenticated effect WALs"));
+        assert!(!state.path().join(AUTH_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn authenticated_field_guide_refuses_first_key() {
+        let (_temp, common_dir) = repository();
+        let state = SafeRoot::open_or_create(common_dir.join("maco/state")).expect("state root");
+        SafeRoot::open_or_create(state.path().join(FIELD_GUIDE_STATE_NAMESPACE))
+            .expect("field guide consumer root");
+
+        let error = RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .err()
+            .expect("must refuse replacement epoch");
+
+        assert!(error
+            .to_string()
+            .contains("authenticated field guide state"));
         assert!(!state.path().join(AUTH_KEY_FILE).exists());
     }
 

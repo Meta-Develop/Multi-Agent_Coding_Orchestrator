@@ -34,6 +34,22 @@ pub enum OrchestrationEventKind {
     Claim,
 }
 
+/// Field-guide provenance actions carried by a [`OrchestrationEventKind::Journal`]
+/// event's private JSON payload.
+///
+/// This subordinate vocabulary keeps the top-level event-kind schema backward
+/// compatible while allowing callers to distinguish append mutations,
+/// deterministic curation, and prompt-injection evidence. Callers must journal
+/// only redacted metadata summaries for these actions, never field-guide
+/// finding or context text, secrets, or local paths.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldGuideEventKind {
+    AppendMutation,
+    DeterministicCuration,
+    PromptInjectionEvidence,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct OrchestrationEvent {
     pub ts: String,
@@ -43,6 +59,8 @@ pub struct OrchestrationEvent {
     pub parent: Option<String>,
     pub role: OrchestrationRole,
     pub kind: OrchestrationEventKind,
+    /// Arbitrary private JSON evidence. Field-guide callers must include only
+    /// redacted metadata summaries as described by [`FieldGuideEventKind`].
     pub payload: Value,
 }
 
@@ -291,6 +309,11 @@ mod tests {
                 serde_json::to_value(role).expect("serialize role"),
                 expected
             );
+            assert_eq!(
+                serde_json::from_value::<OrchestrationRole>(json!(expected))
+                    .expect("deserialize role"),
+                role
+            );
         }
 
         let kinds = [
@@ -308,6 +331,76 @@ mod tests {
                 serde_json::to_value(kind).expect("serialize event kind"),
                 expected
             );
+            assert_eq!(
+                serde_json::from_value::<OrchestrationEventKind>(json!(expected))
+                    .expect("deserialize event kind"),
+                kind
+            );
+        }
+
+        let field_guide_kinds = [
+            (FieldGuideEventKind::AppendMutation, "append_mutation"),
+            (
+                FieldGuideEventKind::DeterministicCuration,
+                "deterministic_curation",
+            ),
+            (
+                FieldGuideEventKind::PromptInjectionEvidence,
+                "prompt_injection_evidence",
+            ),
+        ];
+        for (kind, expected) in field_guide_kinds {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize field-guide event kind"),
+                expected
+            );
+            assert_eq!(
+                serde_json::from_value::<FieldGuideEventKind>(json!(expected))
+                    .expect("deserialize field-guide event kind"),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn field_guide_journal_example_uses_only_redacted_metadata() {
+        let journal = OrchestrationEventJournal::new("repo-id", "run-1");
+        let field_guide_kinds = [
+            FieldGuideEventKind::AppendMutation,
+            FieldGuideEventKind::DeterministicCuration,
+            FieldGuideEventKind::PromptInjectionEvidence,
+        ];
+
+        for field_guide_kind in field_guide_kinds {
+            let event = journal
+                .create_event_at(
+                    UNIX_EPOCH,
+                    "orchestrator-1",
+                    Some("run-1"),
+                    OrchestrationRole::Orchestrator,
+                    OrchestrationEventKind::Journal,
+                    json!({
+                        "field_guide_event_kind": field_guide_kind,
+                        "entry_count": 2,
+                        "line_count": 4,
+                        "rendered_bytes": 128,
+                    }),
+                )
+                .expect("create redacted field-guide event");
+
+            let payload = event.payload.as_object().expect("metadata object");
+            assert_eq!(event.kind, OrchestrationEventKind::Journal);
+            assert!(payload.contains_key("field_guide_event_kind"));
+            assert!(payload.keys().all(|key| matches!(
+                key.as_str(),
+                "field_guide_event_kind" | "entry_count" | "line_count" | "rendered_bytes"
+            )));
+            for forbidden in ["finding", "context", "secret", "path", "local_path"] {
+                assert!(
+                    !payload.contains_key(forbidden),
+                    "field-guide journal payload leaked forbidden field {forbidden}"
+                );
+            }
         }
     }
 }
