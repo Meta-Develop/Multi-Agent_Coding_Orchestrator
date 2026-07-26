@@ -482,6 +482,33 @@ fn validate_lowercase_sha256(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// Runs neutral merge arbitration through the crate-owned production boundaries.
+///
+/// External callers cannot substitute an arbitration runner.
+///
+/// ```compile_fail
+/// use multi_agent_coding_orchestrator::merge::arbitrate_merge_with_runner;
+/// ```
+///
+/// External callers cannot substitute an arbitration environment.
+///
+/// ```compile_fail
+/// use multi_agent_coding_orchestrator::merge::arbitrate_merge_with_environment;
+/// ```
+///
+/// External callers also cannot construct trusted runner evidence.
+///
+/// ```compile_fail
+/// use multi_agent_coding_orchestrator::merge::ArbitrationRunnerExecution;
+///
+/// let _execution = ArbitrationRunnerExecution {
+///     kind: "injected".to_string(),
+///     trusted_local_boundary: true,
+///     command: Vec::new(),
+///     exit_code: Some(0),
+///     timed_out: false,
+/// };
+/// ```
 pub fn arbitrate_merge(options: MergeArbitrationOptions) -> Result<MergeArbitrationReport> {
     let runner = ExternalArbitrationRunner {
         codex_bin: options.codex_bin.clone(),
