@@ -44,6 +44,7 @@ const REVIEW_BLOCKING_ATTEMPTS_LIMIT: usize = 64;
 const REVIEW_CHANGED_PATH_LIMIT: usize = 512;
 const REVIEW_FINDING_LIMIT: usize = 128;
 const REVIEW_LENS_LIMIT: usize = 64;
+const REVIEW_LENS_AGGREGATE_LIMIT_BYTES: usize = 256 * 1024;
 const REVIEW_PATH_LIMIT_BYTES: usize = 4 * 1024;
 const REVIEW_TARGET_LIMIT_BYTES: usize = 512;
 const REVIEW_SHORT_TEXT_LIMIT_BYTES: usize = 256;
@@ -60,8 +61,10 @@ const EXTERNAL_REVIEWER_BINDING_DOMAIN: &[u8] = b"MACO\0external-reviewer-bindin
 const EXTERNAL_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0external-review-request\0v1\0";
 const FAKE_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0fake-review-request\0v1\0";
 const REVIEW_LENS_BACKEND_CONFIG_DOMAIN: &[u8] = b"MACO\0review-lens-backend-config\0v1\0";
+const REVIEW_LENS_EVIDENCE_CONTENT_DOMAIN: &[u8] = b"MACO\0review-lens-evidence-content\0v1\0";
 const REVIEW_LENS_REQUEST_DOMAIN: &[u8] = b"MACO\0review-lens-request\0v1\0";
 const SANITIZED_REVIEW_VIEW_DOMAIN: &[u8] = b"MACO\0sanitized-review-view\0v1\0";
+const REVIEW_SHA256_IDENTITY_PREFIX: &str = "sha256:";
 
 pub const DEFAULT_DIFF_REVIEW_LENS_ID: &str = "default-diff-review";
 pub const DEFAULT_OUTPUT_REVIEW_LENS_ID: &str = "default-output-report-review";
@@ -634,13 +637,11 @@ impl From<&ReviewLensConfig> for ReviewLensDescriptor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewLensEvidence {
     pub kind: ReviewLensEvidenceKind,
-    /// Opaque content/provenance identity supplied by the evidence producer.
-    /// This core checks metadata consistency but does not authenticate the
-    /// binding or claim cryptographic provenance.
+    /// Parent-normalized content identity in `sha256:<64 lowercase hex>` form.
+    /// It is a consistency identity, not evidence-producer authentication.
     pub binding: String,
     pub lens: ReviewLensDescriptor,
     pub backend_configuration_id: String,
@@ -648,15 +649,74 @@ pub struct ReviewLensEvidence {
     pub coverage: ReviewLensCoverage,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewLensEvidenceWire {
+    kind: ReviewLensEvidenceKind,
+    binding: String,
+    lens: ReviewLensDescriptor,
+    backend_configuration_id: String,
+    request_binding: String,
+    coverage: ReviewLensCoverage,
+}
+
+#[derive(Serialize)]
+struct ReviewLensEvidenceWireRef<'a> {
+    kind: ReviewLensEvidenceKind,
+    binding: &'a str,
+    lens: &'a ReviewLensDescriptor,
+    backend_configuration_id: &'a str,
+    request_binding: &'a str,
+    coverage: &'a ReviewLensCoverage,
+}
+
+impl Serialize for ReviewLensEvidence {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_review_evidence(self).map_err(serde::ser::Error::custom)?;
+        ReviewLensEvidenceWireRef {
+            kind: self.kind,
+            binding: &self.binding,
+            lens: &self.lens,
+            backend_configuration_id: &self.backend_configuration_id,
+            request_binding: &self.request_binding,
+            coverage: &self.coverage,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewLensEvidence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ReviewLensEvidenceWire::deserialize(deserializer)?;
+        let evidence = Self {
+            kind: wire.kind,
+            binding: wire.binding,
+            lens: wire.lens,
+            backend_configuration_id: wire.backend_configuration_id,
+            request_binding: wire.request_binding,
+            coverage: wire.coverage,
+        };
+        validate_review_evidence(&evidence).map_err(D::Error::custom)?;
+        Ok(evidence)
+    }
+}
+
 impl ReviewLensEvidence {
     pub fn for_lens(
         lens: &ReviewLensConfig,
         kind: ReviewLensEvidenceKind,
-        binding: String,
+        evidence_content: String,
         request_binding: String,
         coverage: ReviewLensCoverage,
     ) -> Result<Self> {
         validate_review_lens_config(lens)?;
+        let binding = review_lens_evidence_content_identity(&evidence_content)?;
         let evidence = Self {
             kind,
             binding,
@@ -796,7 +856,7 @@ pub struct AggregatedReviewLensVerdict {
     pub validation_errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLensAggregate {
     #[serde(deserialize_with = "deserialize_review_schema_version")]
@@ -809,6 +869,45 @@ pub struct ReviewLensAggregate {
     pub procedural_failures: usize,
     pub required_coverage: ReviewCoverageRequirement,
     pub lens_verdicts: Vec<AggregatedReviewLensVerdict>,
+}
+
+#[derive(Serialize)]
+struct ReviewLensAggregateWireRef<'a> {
+    version: u32,
+    policy: &'a ReviewAggregationPolicy,
+    decision: &'a ReviewAggregationDecision,
+    required_accepts: usize,
+    validated_accepts: usize,
+    rejected_lenses: usize,
+    procedural_failures: usize,
+    required_coverage: &'a ReviewCoverageRequirement,
+    lens_verdicts: &'a [AggregatedReviewLensVerdict],
+}
+
+impl ReviewLensAggregate {
+    fn wire(&self) -> ReviewLensAggregateWireRef<'_> {
+        ReviewLensAggregateWireRef {
+            version: self.version,
+            policy: &self.policy,
+            decision: &self.decision,
+            required_accepts: self.required_accepts,
+            validated_accepts: self.validated_accepts,
+            rejected_lenses: self.rejected_lenses,
+            procedural_failures: self.procedural_failures,
+            required_coverage: &self.required_coverage,
+            lens_verdicts: &self.lens_verdicts,
+        }
+    }
+}
+
+impl Serialize for ReviewLensAggregate {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_public_review_lens_aggregate_size(self).map_err(serde::ser::Error::custom)?;
+        self.wire().serialize(serializer)
+    }
 }
 
 pub fn aggregate_review_lenses(
@@ -858,7 +957,7 @@ pub fn aggregate_review_lenses(
 
     let mut lens_verdicts = Vec::with_capacity(lenses.len());
     for lens in lenses {
-        let (reported, verdict, mut validation_errors) =
+        let (reported, mut verdict, mut validation_errors) =
             if let Some(verdict) = verdicts_by_id.remove(&lens.id) {
                 let errors = review_lens_verdict_errors(lens, &required_coverage, &verdict);
                 (true, verdict, errors)
@@ -890,7 +989,7 @@ pub fn aggregate_review_lenses(
             } else {
                 ReviewLensCoverage::default()
             };
-        let evidence = public_safe_review_lens_evidence(lens, &verdict);
+        let evidence = public_safe_review_lens_evidence(lens, &mut verdict);
         lens_verdicts.push(AggregatedReviewLensVerdict {
             lens: ReviewLensDescriptor::from(lens),
             reported,
@@ -936,7 +1035,7 @@ pub fn aggregate_review_lenses(
         }
     };
 
-    Ok(ReviewLensAggregate {
+    let aggregate = ReviewLensAggregate {
         version: REVIEW_SCHEMA_VERSION,
         policy,
         decision,
@@ -946,7 +1045,51 @@ pub fn aggregate_review_lenses(
         procedural_failures,
         required_coverage,
         lens_verdicts,
-    })
+    };
+    validate_public_review_lens_aggregate_size(&aggregate)?;
+    Ok(aggregate)
+}
+
+struct ReviewLensAggregateSizeWriter {
+    bytes_written: usize,
+    exceeded: bool,
+}
+
+impl Write for ReviewLensAggregateSizeWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next_size) = self.bytes_written.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("review lens aggregate size overflow"));
+        };
+        if next_size > REVIEW_LENS_AGGREGATE_LIMIT_BYTES {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "review lens aggregate output limit exceeded",
+            ));
+        }
+        self.bytes_written = next_size;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_public_review_lens_aggregate_size(aggregate: &ReviewLensAggregate) -> Result<()> {
+    let mut writer = ReviewLensAggregateSizeWriter {
+        bytes_written: 0,
+        exceeded: false,
+    };
+    let result = serde_json::to_writer(&mut writer, &aggregate.wire());
+    if writer.exceeded {
+        bail!(
+            "public review lens aggregate exceeds its {} byte serialized JSON limit",
+            REVIEW_LENS_AGGREGATE_LIMIT_BYTES
+        );
+    }
+    result.context("failed to serialize public review lens aggregate")?;
+    Ok(())
 }
 
 fn validate_review_lens_set(lenses: &[ReviewLensConfig]) -> Result<()> {
@@ -1036,6 +1179,36 @@ fn validate_review_digest_identity(value: &str, label: &str) -> Result<()> {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         bail!("{label} must be a lowercase SHA-256 content identity");
+    }
+    Ok(())
+}
+
+fn review_lens_evidence_content_identity(content: &str) -> Result<String> {
+    if content.is_empty() {
+        bail!("review lens evidence content cannot be empty");
+    }
+    if content.len() > REVIEW_LONG_TEXT_LIMIT_BYTES {
+        bail!(
+            "review lens evidence content exceeds its {} byte limit",
+            REVIEW_LONG_TEXT_LIMIT_BYTES
+        );
+    }
+    Ok(format!(
+        "{REVIEW_SHA256_IDENTITY_PREFIX}{}",
+        domain_sha256(REVIEW_LENS_EVIDENCE_CONTENT_DOMAIN, content.as_bytes())
+    ))
+}
+
+fn validate_review_evidence_identity(value: &str) -> Result<()> {
+    let digest = value
+        .strip_prefix(REVIEW_SHA256_IDENTITY_PREFIX)
+        .context("review lens evidence binding must use 'sha256:<64 lowercase hex>' form")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("review lens evidence binding must use 'sha256:<64 lowercase hex>' form");
     }
     Ok(())
 }
@@ -1241,16 +1414,15 @@ fn review_lens_verdict_errors(
 
 fn public_safe_review_lens_evidence(
     lens: &ReviewLensConfig,
-    verdict: &ReviewLensVerdict,
+    verdict: &mut ReviewLensVerdict,
 ) -> Vec<ReviewLensEvidence> {
     let expected_lens = ReviewLensDescriptor::from(lens);
     let Ok(expected_backend_configuration_id) = review_lens_backend_configuration_id(&lens.backend)
     else {
         return Vec::new();
     };
-    verdict
-        .evidence
-        .iter()
+    std::mem::take(&mut verdict.evidence)
+        .into_iter()
         .take(REVIEW_FINDING_LIMIT)
         .filter(|evidence| {
             validate_review_evidence(evidence).is_ok()
@@ -1259,27 +1431,11 @@ fn public_safe_review_lens_evidence(
                 && evidence.request_binding == verdict.request_binding
                 && evidence.coverage == verdict.coverage
         })
-        .cloned()
         .collect()
 }
 
 fn validate_review_evidence(evidence: &ReviewLensEvidence) -> Result<()> {
-    validate_bounded_scalar(
-        &evidence.binding,
-        "review lens evidence binding",
-        REVIEW_LONG_TEXT_LIMIT_BYTES,
-        false,
-    )?;
-    if contains_private_key_material(&evidence.binding)
-        || Redactor::new()
-            .redact(&evidence.binding)
-            .summary
-            .total_replacements
-            > 0
-        || contains_external_absolute_path(&evidence.binding)
-    {
-        bail!("review lens evidence binding contains unsafe private or external evidence");
-    }
+    validate_review_evidence_identity(&evidence.binding)?;
     validate_review_lens_descriptor(&evidence.lens, "review lens evidence")?;
     validate_review_digest_identity(
         &evidence.backend_configuration_id,
@@ -5457,7 +5613,7 @@ mod tests {
             coverage.clone(),
             vec![(
                 ReviewLensEvidenceKind::ModelReview,
-                "constructor-evidence".to_string(),
+                "ordinary confidential transcript sentence".to_string(),
             )],
         )?;
         assert_eq!(verdict.lens, descriptor);
@@ -5465,6 +5621,75 @@ mod tests {
         assert_eq!(verdict.evidence[0].lens, verdict.lens);
         assert_eq!(verdict.evidence[0].coverage, coverage);
         assert_eq!(verdict.evidence[0].request_binding, verdict.request_binding);
+        assert_eq!(
+            verdict.evidence[0].binding,
+            review_lens_evidence_content_identity("ordinary confidential transcript sentence")?
+        );
+        assert!(verdict.evidence[0].binding.starts_with("sha256:"));
+        assert_eq!(verdict.evidence[0].binding.len(), 71);
+        assert!(
+            !serde_json::to_string(&verdict)?.contains("ordinary confidential transcript sentence")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_malformed_evidence_digest_identities_fail_closed() -> Result<()> {
+        let lens = model_review_lens(
+            "malformed-evidence-lens",
+            "malformed-evidence-backend",
+            "malformed-evidence-model",
+            ReviewInformationScope::DiffOnly,
+        );
+        let required = ReviewCoverageRequirement {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("src/review.rs")],
+        };
+        let base = bound_lens_verdict(
+            &lens,
+            ReviewLensVerdictStatus::Accept,
+            "valid-evidence-content",
+        );
+        let valid_evidence_wire = serde_json::to_value(&base.evidence[0])?;
+        let malformed = [
+            "0".repeat(64),
+            format!("sha256:{}", "0".repeat(63)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("SHA256:{}", "0".repeat(64)),
+        ];
+
+        for binding in malformed {
+            let mut verdict = base.clone();
+            verdict.evidence[0].binding = binding;
+            let serialization_error = serde_json::to_string(&verdict.evidence[0])
+                .expect_err("malformed public evidence must not serialize");
+            assert!(serialization_error
+                .to_string()
+                .contains("sha256:<64 lowercase hex>"));
+            let mut malformed_wire = valid_evidence_wire.clone();
+            malformed_wire["binding"] =
+                serde_json::Value::String(verdict.evidence[0].binding.clone());
+            assert!(serde_json::from_value::<ReviewLensEvidence>(malformed_wire)
+                .expect_err("malformed public evidence wire must not deserialize")
+                .to_string()
+                .contains("sha256:<64 lowercase hex>"));
+
+            let aggregate = aggregate_review_lenses(
+                std::slice::from_ref(&lens),
+                ReviewAggregationPolicy::AllMustAccept,
+                required.clone(),
+                vec![verdict],
+            )?;
+            assert_eq!(
+                aggregate.decision,
+                ReviewAggregationDecision::ProceduralFailure
+            );
+            assert!(aggregate.lens_verdicts[0].evidence.is_empty());
+            assert!(aggregate.lens_verdicts[0]
+                .validation_errors
+                .join("\n")
+                .contains("sha256:<64 lowercase hex>"));
+        }
         Ok(())
     }
 
@@ -5738,6 +5963,98 @@ mod tests {
     }
 
     #[test]
+    fn review_lens_aggregate_retains_all_verdicts_within_public_output_bound() -> Result<()> {
+        let lenses = (0..REVIEW_LENS_LIMIT)
+            .map(|index| {
+                model_review_lens(
+                    &format!("bounded-lens-{index}"),
+                    &format!("bounded-backend-{index}"),
+                    &format!("bounded-model-{index}"),
+                    ReviewInformationScope::DiffOnly,
+                )
+            })
+            .collect::<Vec<_>>();
+        let verdicts = lenses
+            .iter()
+            .enumerate()
+            .map(|(index, lens)| {
+                ReviewLensVerdict::for_lens(
+                    lens,
+                    sha256_hex(format!("bounded-request-{index}").as_bytes()),
+                    ReviewLensVerdictStatus::Accept,
+                    ReviewLensCoverage::default(),
+                    vec![(
+                        ReviewLensEvidenceKind::ModelReview,
+                        format!("bounded-evidence-{index}"),
+                    )],
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let aggregate = aggregate_review_lenses(
+            &lenses,
+            ReviewAggregationPolicy::AllMustAccept,
+            ReviewCoverageRequirement::default(),
+            verdicts,
+        )?;
+        assert_eq!(aggregate.lens_verdicts.len(), REVIEW_LENS_LIMIT);
+        assert!(aggregate
+            .lens_verdicts
+            .iter()
+            .all(|verdict| verdict.reported));
+        assert_eq!(aggregate.validated_accepts, aggregate.lens_verdicts.len());
+        assert!(serde_json::to_vec(&aggregate)?.len() <= REVIEW_LENS_AGGREGATE_LIMIT_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_maximal_evidence_aggregate_exceeding_public_bound_is_rejected() -> Result<()> {
+        let lenses = (0..REVIEW_LENS_LIMIT)
+            .map(|index| {
+                model_review_lens(
+                    &format!("maximal-lens-{index}"),
+                    &format!("maximal-backend-{index}"),
+                    &format!("maximal-model-{index}"),
+                    ReviewInformationScope::OutputReportOnly,
+                )
+            })
+            .collect::<Vec<_>>();
+        let verdicts = lenses
+            .iter()
+            .enumerate()
+            .map(|(lens_index, lens)| {
+                let evidence = (0..REVIEW_FINDING_LIMIT)
+                    .map(|evidence_index| {
+                        (
+                            ReviewLensEvidenceKind::ModelReview,
+                            format!("maximal-evidence-{lens_index}-{evidence_index}"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                ReviewLensVerdict::for_lens(
+                    lens,
+                    sha256_hex(format!("maximal-request-{lens_index}").as_bytes()),
+                    ReviewLensVerdictStatus::Accept,
+                    ReviewLensCoverage::default(),
+                    evidence,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let error = aggregate_review_lenses(
+            &lenses,
+            ReviewAggregationPolicy::AllMustAccept,
+            ReviewCoverageRequirement::default(),
+            verdicts,
+        )
+        .expect_err("maximal aggregate must exceed the public output bound");
+        assert!(error
+            .to_string()
+            .contains("exceeds its 262144 byte serialized JSON limit"));
+        Ok(())
+    }
+
+    #[test]
     fn review_lens_procedural_aggregate_omits_rejected_unsafe_metadata() -> Result<()> {
         let lens = model_review_lens(
             "sanitized-aggregate-lens",
@@ -5761,7 +6078,9 @@ mod tests {
         secret_evidence.coverage = verdict.coverage.clone();
         let mut absolute_evidence = secret_evidence.clone();
         absolute_evidence.binding = "/private/ABSOLUTE_EVIDENCE_MARKER".to_string();
-        verdict.evidence = vec![secret_evidence, absolute_evidence];
+        let mut ordinary_evidence = secret_evidence.clone();
+        ordinary_evidence.binding = "ORDINARY CONFIDENTIAL TRANSCRIPT EVIDENCE MARKER".to_string();
+        verdict.evidence = vec![secret_evidence, absolute_evidence, ordinary_evidence];
 
         let aggregate = aggregate_review_lenses(
             std::slice::from_ref(&lens),
@@ -5789,6 +6108,7 @@ mod tests {
             "ABSOLUTE_COVERAGE_MARKER",
             "PRIVATE_SECRET_EVIDENCE_MARKER",
             "ABSOLUTE_EVIDENCE_MARKER",
+            "ORDINARY CONFIDENTIAL TRANSCRIPT EVIDENCE MARKER",
         ] {
             assert!(
                 !serialized.contains(marker),
