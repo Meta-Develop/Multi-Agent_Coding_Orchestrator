@@ -10417,6 +10417,15 @@ mod tests {
     }
 
     #[test]
+    fn concurrency_policy_auto_uses_globally_pinned_test_capacity() {
+        assert_eq!(
+            SupervisorConcurrencyPolicy::Auto.resolve(HostProcessCapacity::measured()),
+            3,
+            "test auto admission must share the three-lane containment capacity"
+        );
+    }
+
+    #[test]
     fn external_containment_gate_accepts_only_verified_empty_evidence() {
         assert!(
             ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
