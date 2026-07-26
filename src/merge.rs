@@ -182,7 +182,7 @@ pub struct ArbitrationNeutralWorktree {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ArbitrationSideEvidence {
+struct ArbitrationSideEvidence {
     pub participant: ArbitrationSide,
     pub head_oid: String,
     pub tree_oid: String,
@@ -196,7 +196,7 @@ pub struct ArbitrationSideEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ArbitrationInput {
+struct ArbitrationInput {
     pub version: u32,
     pub arbiter_id: String,
     pub reviewed_base_oid: String,
@@ -208,7 +208,7 @@ pub struct ArbitrationInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct PreparedMergeArbitration {
+struct PreparedMergeArbitration {
     pub input: ArbitrationInput,
     pub input_json: Vec<u8>,
     pub input_sha256: String,
@@ -219,7 +219,7 @@ pub struct PreparedMergeArbitration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ArbitrationProposalDisposition {
+enum ArbitrationProposalDisposition {
     Proposed,
     Rejected,
     Escalated,
@@ -227,7 +227,7 @@ pub enum ArbitrationProposalDisposition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ArbitrationProposal {
+struct ArbitrationProposal {
     pub version: u32,
     pub input_sha256: String,
     pub disposition: ArbitrationProposalDisposition,
@@ -236,50 +236,51 @@ pub struct ArbitrationProposal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ArbitrationRunnerExecution {
-    pub kind: String,
-    pub trusted_local_boundary: bool,
-    pub command: Vec<String>,
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
+pub(crate) struct ArbitrationRunnerExecution {
+    pub(crate) kind: String,
+    trusted_local_boundary: bool,
+    pub(crate) command: Vec<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) timed_out: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArbitrationRunnerResult {
-    pub proposal: ArbitrationProposal,
-    pub execution: ArbitrationRunnerExecution,
+struct ArbitrationRunnerResult {
+    proposal: ArbitrationProposal,
+    execution: ArbitrationRunnerExecution,
 }
 
 #[derive(Debug, Clone)]
-pub struct ArbitrationRunnerRequest {
-    pub input_sha256: String,
-    pub prompt_path: PathBuf,
-    pub output_schema_path: PathBuf,
-    pub output_last_message_path: PathBuf,
-    pub json_log_path: PathBuf,
-    pub neutral_worktree_path: PathBuf,
-    pub hidden_primary_root: PathBuf,
-    pub run_id: String,
-    pub arbiter_id: String,
+struct ArbitrationRunnerRequest {
+    prompt_path: PathBuf,
+    output_schema_path: PathBuf,
+    output_last_message_path: PathBuf,
+    json_log_path: PathBuf,
+    neutral_worktree_path: PathBuf,
+    hidden_primary_root: PathBuf,
+    run_id: String,
+    arbiter_id: String,
 }
 
-pub trait ArbitrationRunner {
+trait ArbitrationRunner {
     fn run(&self, request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult>;
 }
 
 #[derive(Debug, Clone)]
-pub struct ExternalArbitrationRunner {
-    pub codex_bin: PathBuf,
-    pub timeout: Duration,
+struct ExternalArbitrationRunner {
+    codex_bin: PathBuf,
+    timeout: Duration,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct StaticArbitrationRunner {
+struct StaticArbitrationRunner {
     output: Vec<u8>,
 }
 
+#[cfg(test)]
 impl StaticArbitrationRunner {
-    pub fn from_bytes(output: impl Into<Vec<u8>>) -> Result<Self> {
+    fn from_bytes(output: impl Into<Vec<u8>>) -> Result<Self> {
         let output = output.into();
         parse_arbitration_proposal(&output)?;
         Ok(Self { output })
@@ -322,11 +323,11 @@ pub struct MergeArbitrationReport {
     pub validation_commands: Vec<String>,
     pub validations: Vec<ValidationReport>,
     pub semantic_classification: SemanticConflictClassification,
-    pub runner: ArbitrationRunnerExecution,
+    pub(crate) runner: ArbitrationRunnerExecution,
     pub reason: String,
 }
 
-pub trait ArbitrationEnvironment {
+trait ArbitrationEnvironment {
     fn prepare(&self, options: &MergeArbitrationOptions) -> Result<PreparedMergeArbitration>;
 
     fn materialize_candidate(
@@ -345,7 +346,7 @@ pub trait ArbitrationEnvironment {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ProductionArbitrationEnvironment;
+struct ProductionArbitrationEnvironment;
 
 impl ArbitrationRunner for ExternalArbitrationRunner {
     fn run(&self, request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
@@ -394,6 +395,7 @@ impl ArbitrationRunner for ExternalArbitrationRunner {
     }
 }
 
+#[cfg(test)]
 impl ArbitrationRunner for StaticArbitrationRunner {
     fn run(&self, _request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
         Ok(ArbitrationRunnerResult {
@@ -409,7 +411,7 @@ impl ArbitrationRunner for StaticArbitrationRunner {
     }
 }
 
-pub fn parse_arbitration_proposal(bytes: &[u8]) -> Result<ArbitrationProposal> {
+fn parse_arbitration_proposal(bytes: &[u8]) -> Result<ArbitrationProposal> {
     if bytes.len() > MAX_ARBITRATION_PROPOSAL_BYTES {
         bail!("arbiter output exceeds its {MAX_ARBITRATION_PROPOSAL_BYTES}-byte limit");
     }
@@ -488,14 +490,14 @@ pub fn arbitrate_merge(options: MergeArbitrationOptions) -> Result<MergeArbitrat
     arbitrate_merge_with_runner(options, &runner)
 }
 
-pub fn arbitrate_merge_with_runner(
+fn arbitrate_merge_with_runner(
     options: MergeArbitrationOptions,
     runner: &dyn ArbitrationRunner,
 ) -> Result<MergeArbitrationReport> {
     arbitrate_merge_with_environment(options, runner, &ProductionArbitrationEnvironment)
 }
 
-pub fn arbitrate_merge_with_environment(
+fn arbitrate_merge_with_environment(
     options: MergeArbitrationOptions,
     runner: &dyn ArbitrationRunner,
     environment: &dyn ArbitrationEnvironment,
@@ -536,7 +538,6 @@ pub fn arbitrate_merge_with_environment(
 
     let incoming = writer.create_scratch_dir(ARBITRATION_INCOMING_DIR)?;
     let runner_request = ArbitrationRunnerRequest {
-        input_sha256: prepared.input_sha256.clone(),
         prompt_path: writer.run_dir().join(ARBITRATION_PROMPT_PATH),
         output_schema_path: writer.run_dir().join(ARBITRATION_SCHEMA_PATH),
         output_last_message_path: incoming.path().join("proposal.json"),
@@ -8501,7 +8502,6 @@ mod tests {
         let runner = StaticArbitrationRunner::from_bytes(bytes).expect("static runner");
         let result = runner
             .run(&ArbitrationRunnerRequest {
-                input_sha256: "1".repeat(64),
                 prompt_path: PathBuf::from("prompt"),
                 output_schema_path: PathBuf::from("schema"),
                 output_last_message_path: PathBuf::from("output"),
