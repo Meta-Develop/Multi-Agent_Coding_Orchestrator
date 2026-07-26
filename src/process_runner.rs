@@ -613,6 +613,8 @@ struct WorkspaceSandboxConfig {
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: Vec<PathBuf>,
     visible_read_only_files: Vec<PathBuf>,
+    visible_read_write_roots: Vec<PathBuf>,
+    visible_read_write_files: Vec<PathBuf>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -626,6 +628,8 @@ impl WorkspaceSandboxConfig {
             workspace_access,
             visible_read_only_roots: Vec::new(),
             visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             isolated_host_view: false,
@@ -645,6 +649,16 @@ impl WorkspaceSandboxConfig {
 
     fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.visible_read_only_files.push(file.into());
+        self
+    }
+
+    fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.visible_read_write_roots.push(root.into());
+        self
+    }
+
+    fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.visible_read_write_files.push(file.into());
         self
     }
 
@@ -821,6 +835,16 @@ impl ExternalCodexProfile {
 
     pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_file(file);
         self
     }
 
@@ -2069,6 +2093,8 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
     for (label, paths) in [
         ("visible read-only roots", &config.visible_read_only_roots),
         ("visible read-only files", &config.visible_read_only_files),
+        ("visible read-write roots", &config.visible_read_write_roots),
+        ("visible read-write files", &config.visible_read_write_files),
         ("writable artifact roots", &config.writable_artifact_roots),
         ("hidden roots", &config.hidden_roots),
     ] {
@@ -2085,6 +2111,8 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
     let total = 1usize
         .checked_add(config.visible_read_only_roots.len())
         .and_then(|total| total.checked_add(config.visible_read_only_files.len()))
+        .and_then(|total| total.checked_add(config.visible_read_write_roots.len()))
+        .and_then(|total| total.checked_add(config.visible_read_write_files.len()))
         .and_then(|total| total.checked_add(config.writable_artifact_roots.len()))
         .and_then(|total| total.checked_add(config.hidden_roots.len()))
         .ok_or_else(|| {
@@ -4085,6 +4113,8 @@ struct ResolvedSystemdSandbox {
     workspace_access: WorkspaceAccess,
     visible_read_only_roots: Vec<PathBuf>,
     visible_read_only_files: Vec<PathBuf>,
+    visible_read_write_roots: Vec<PathBuf>,
+    visible_read_write_files: Vec<PathBuf>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -4243,6 +4273,12 @@ impl ResolvedSystemdSandbox {
             self.workspace_access == WorkspaceAccess::ReadWrite,
         )];
         roots.extend(
+            self.visible_read_write_roots
+                .iter()
+                .cloned()
+                .map(|root| (root, true)),
+        );
+        roots.extend(
             self.writable_artifact_roots
                 .iter()
                 .cloned()
@@ -4283,6 +4319,53 @@ impl ResolvedSystemdSandbox {
                         path.display()
                     ),
                 ));
+            }
+        }
+        self.verify_narrow_writable_hardlink_scope()
+    }
+
+    fn verify_narrow_writable_hardlink_scope(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        for file in &self.visible_read_write_files {
+            let metadata = fs::symlink_metadata(file)?;
+            if metadata.nlink() != 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "writable sandbox exception file must not have hard-link aliases: {}",
+                        file.display()
+                    ),
+                ));
+            }
+        }
+
+        let mut roots = self.visible_read_write_roots.clone();
+        roots.sort();
+        roots.dedup();
+        let mut minimal_roots: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            if !minimal_roots
+                .iter()
+                .any(|ancestor| root.starts_with(ancestor))
+            {
+                minimal_roots.push(root);
+            }
+        }
+        let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+        for root in minimal_roots {
+            let mut writable_links = BTreeMap::new();
+            scan_sandbox_tree(&root, true, &mut remaining, &mut writable_links)?;
+            for (_, (expected, observed, path)) in writable_links {
+                if observed < expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "writable sandbox exception has a hard-link alias outside its exact root: {} ({observed}/{expected} links observed)",
+                            path.display()
+                        ),
+                    ));
+                }
             }
         }
         Ok(())
@@ -4456,6 +4539,29 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
             "strict workspace confinement refuses '/' as a writable artifact root",
         ));
     }
+    let mut visible_read_write_roots = config
+        .visible_read_write_roots
+        .iter()
+        .map(|root| canonical_sandbox_directory(root, "visible read-write root"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    visible_read_write_roots.sort();
+    visible_read_write_roots.dedup();
+    if visible_read_write_roots
+        .iter()
+        .any(|root| root == Path::new("/"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "strict workspace confinement refuses '/' as a visible read-write root",
+        ));
+    }
+    let mut visible_read_write_files = config
+        .visible_read_write_files
+        .iter()
+        .map(|file| canonical_sandbox_file(file, "visible read-write file"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    visible_read_write_files.sort();
+    visible_read_write_files.dedup();
 
     let mut hidden_roots = config
         .hidden_roots
@@ -4494,6 +4600,8 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
                 .chain(std::iter::once(&current_dir))
                 .chain(visible_read_only_roots.iter())
                 .chain(visible_read_only_files.iter())
+                .chain(visible_read_write_roots.iter())
+                .chain(visible_read_write_files.iter())
                 .chain(writable_artifact_roots.iter())
             {
                 if visible.starts_with(hidden) || hidden.starts_with(visible) {
@@ -4508,6 +4616,8 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     let mut identity_paths = vec![workspace_root.clone(), current_dir.clone()];
     identity_paths.extend(visible_read_only_roots.iter().cloned());
     identity_paths.extend(visible_read_only_files.iter().cloned());
+    identity_paths.extend(visible_read_write_roots.iter().cloned());
+    identity_paths.extend(visible_read_write_files.iter().cloned());
     identity_paths.extend(writable_artifact_roots.iter().cloned());
     identity_paths.extend(hidden_roots.iter().cloned());
     identity_paths.sort();
@@ -4516,15 +4626,17 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .iter()
         .map(|path| capture_sandbox_path_identity(path))
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mount_checks = build_sandbox_mount_checks(
-        &workspace_root,
-        config.workspace_access,
-        &visible_read_only_roots,
-        &visible_read_only_files,
-        &writable_artifact_roots,
-        &hidden_roots,
-        config.isolated_host_view,
-    )?;
+    let mount_checks = build_sandbox_mount_checks(SandboxMountPaths {
+        workspace_root: &workspace_root,
+        workspace_access: config.workspace_access,
+        visible_read_only_roots: &visible_read_only_roots,
+        visible_read_only_files: &visible_read_only_files,
+        visible_read_write_roots: &visible_read_write_roots,
+        visible_read_write_files: &visible_read_write_files,
+        writable_artifact_roots: &writable_artifact_roots,
+        hidden_roots: &hidden_roots,
+        isolated_host_view: config.isolated_host_view,
+    })?;
     if mount_checks.len() > MAX_SANDBOX_MOUNT_CHECKS {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -4539,6 +4651,8 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         workspace_access: config.workspace_access,
         visible_read_only_roots,
         visible_read_only_files,
+        visible_read_write_roots,
+        visible_read_write_files,
         writable_artifact_roots,
         hidden_roots,
         isolated_host_view: config.isolated_host_view,
@@ -4672,14 +4786,21 @@ fn capture_sandbox_path_identity(path: &Path) -> std::io::Result<SandboxPathIden
 }
 
 #[cfg(target_os = "linux")]
-fn build_sandbox_mount_checks(
-    workspace_root: &Path,
+struct SandboxMountPaths<'a> {
+    workspace_root: &'a Path,
     workspace_access: WorkspaceAccess,
-    visible_read_only_roots: &[PathBuf],
-    visible_read_only_files: &[PathBuf],
-    writable_artifact_roots: &[PathBuf],
-    hidden_roots: &[PathBuf],
+    visible_read_only_roots: &'a [PathBuf],
+    visible_read_only_files: &'a [PathBuf],
+    visible_read_write_roots: &'a [PathBuf],
+    visible_read_write_files: &'a [PathBuf],
+    writable_artifact_roots: &'a [PathBuf],
+    hidden_roots: &'a [PathBuf],
     isolated_host_view: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn build_sandbox_mount_checks(
+    paths: SandboxMountPaths<'_>,
 ) -> std::io::Result<Vec<SandboxMountCheck>> {
     use std::os::unix::fs::MetadataExt;
 
@@ -4689,20 +4810,21 @@ fn build_sandbox_mount_checks(
     // trusting only the configured property.
     requested.insert(
         PathBuf::from("/"),
-        if isolated_host_view {
+        if paths.isolated_host_view {
             SandboxMountAccess::IsolatedRoot
         } else {
             SandboxMountAccess::ReadOnly
         },
     );
-    let workspace_mount_access = match workspace_access {
+    let workspace_mount_access = match paths.workspace_access {
         WorkspaceAccess::ReadOnly => SandboxMountAccess::ReadOnly,
         WorkspaceAccess::ReadWrite => SandboxMountAccess::ReadWrite,
     };
-    requested.insert(workspace_root.to_path_buf(), workspace_mount_access);
-    for path in visible_read_only_roots
+    requested.insert(paths.workspace_root.to_path_buf(), workspace_mount_access);
+    for path in paths
+        .visible_read_only_roots
         .iter()
-        .chain(visible_read_only_files)
+        .chain(paths.visible_read_only_files)
     {
         if requested
             .insert(path.clone(), SandboxMountAccess::ReadOnly)
@@ -4717,7 +4839,12 @@ fn build_sandbox_mount_checks(
             ));
         }
     }
-    for path in writable_artifact_roots {
+    for path in paths
+        .visible_read_write_roots
+        .iter()
+        .chain(paths.visible_read_write_files)
+        .chain(paths.writable_artifact_roots)
+    {
         if requested
             .insert(path.clone(), SandboxMountAccess::ReadWrite)
             .is_some_and(|existing| existing != SandboxMountAccess::ReadWrite)
@@ -4759,7 +4886,7 @@ fn build_sandbox_mount_checks(
         .into_iter()
         .map(|path| (path, true))
         .collect::<BTreeMap<_, _>>();
-    for path in hidden_roots {
+    for path in paths.hidden_roots {
         inaccessible.insert(path.clone(), false);
     }
     for (path, optional) in inaccessible {
@@ -4846,6 +4973,16 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         command
             .arg(systemd_path_property("BindReadOnlyPaths=", file, false))
             .arg(systemd_path_property("ReadOnlyPaths=", file, false));
+    }
+    for root in &sandbox.visible_read_write_roots {
+        command
+            .arg(systemd_path_property("BindPaths=", root, false))
+            .arg(systemd_path_property("ReadWritePaths=", root, false));
+    }
+    for file in &sandbox.visible_read_write_files {
+        command
+            .arg(systemd_path_property("BindPaths=", file, false))
+            .arg(systemd_path_property("ReadWritePaths=", file, false));
     }
 
     match sandbox.workspace_access {
@@ -5034,6 +5171,22 @@ fn verify_systemd_sandbox_properties(
             file,
         )?;
     }
+    for root in &sandbox.visible_read_write_roots {
+        require_property_path("BindPaths", property_value(properties, "BindPaths")?, root)?;
+        require_property_path(
+            "ReadWritePaths",
+            property_value(properties, "ReadWritePaths")?,
+            root,
+        )?;
+    }
+    for file in &sandbox.visible_read_write_files {
+        require_property_path("BindPaths", property_value(properties, "BindPaths")?, file)?;
+        require_property_path(
+            "ReadWritePaths",
+            property_value(properties, "ReadWritePaths")?,
+            file,
+        )?;
+    }
     for root in &sandbox.writable_artifact_roots {
         require_property_path("BindPaths", property_value(properties, "BindPaths")?, root)?;
         require_property_path(
@@ -5085,13 +5238,17 @@ fn verify_exact_systemd_path_properties(
         .map(|path| (path.clone(), path.clone()))
         .collect::<BTreeSet<_>>();
     let mut read_write = sandbox
-        .writable_artifact_roots
+        .visible_read_write_roots
         .iter()
+        .chain(&sandbox.visible_read_write_files)
+        .chain(&sandbox.writable_artifact_roots)
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut read_write_bindings = sandbox
-        .writable_artifact_roots
+        .visible_read_write_roots
         .iter()
+        .chain(&sandbox.visible_read_write_files)
+        .chain(&sandbox.writable_artifact_roots)
         .map(|path| (path.clone(), path.clone()))
         .collect::<BTreeSet<_>>();
     match sandbox.workspace_access {
@@ -8566,16 +8723,25 @@ mod tests {
         let workspace = temp.path().join("worktree");
         let control_root = workspace.join(".maco");
         let control_file = workspace.join(".git");
+        let policy_root = workspace.join(".agents");
+        let exception_root = policy_root.join("docs");
+        let exception_file = workspace.join("AGENTS.md");
         let runtime = temp.path().join("runtime");
         fs::create_dir(&workspace).expect("workspace");
         fs::create_dir(&control_root).expect("control root");
+        fs::create_dir(&policy_root).expect("policy root");
+        fs::create_dir(&exception_root).expect("exception root");
         fs::write(&control_file, "gitdir: ../primary/.git/worktrees/child\n")
             .expect("linked-worktree marker");
+        fs::write(&exception_file, "policy\n").expect("exception file");
         fs::create_dir(&runtime).expect("runtime");
 
         let profile = ExternalCodexProfile::read_write(&workspace)
             .with_visible_read_only_root(&control_root)
-            .with_visible_read_only_file(&control_file);
+            .with_visible_read_only_root(&policy_root)
+            .with_visible_read_only_file(&control_file)
+            .with_visible_read_write_root(&exception_root)
+            .with_visible_read_write_file(&exception_file);
         let spec = ProcessSpec::direct(
             "external Codex protected controls",
             PathBuf::from("/bin/true"),
@@ -8597,12 +8763,26 @@ mod tests {
         );
         assert_eq!(sandbox.workspace_access, WorkspaceAccess::ReadWrite);
         assert_eq!(sandbox.workspace_root, workspace);
-        assert_eq!(sandbox.visible_read_only_roots, vec![control_root.clone()]);
+        assert_eq!(
+            sandbox.visible_read_only_roots,
+            vec![policy_root.clone(), control_root.clone()]
+        );
         assert_eq!(sandbox.visible_read_only_files, vec![control_file.clone()]);
+        assert_eq!(
+            sandbox.visible_read_write_roots,
+            vec![exception_root.clone()]
+        );
+        assert_eq!(
+            sandbox.visible_read_write_files,
+            vec![exception_file.clone()]
+        );
         for (path, access) in [
             (&workspace, SandboxMountAccess::ReadWrite),
             (&control_root, SandboxMountAccess::ReadOnly),
+            (&policy_root, SandboxMountAccess::ReadOnly),
             (&control_file, SandboxMountAccess::ReadOnly),
+            (&exception_root, SandboxMountAccess::ReadWrite),
+            (&exception_file, SandboxMountAccess::ReadWrite),
             (&runtime, SandboxMountAccess::PrivateRuntime),
         ] {
             assert!(
@@ -8629,8 +8809,14 @@ mod tests {
             format!("--property=ReadWritePaths={}", workspace.display()),
             format!("--property=BindReadOnlyPaths={}", control_root.display()),
             format!("--property=ReadOnlyPaths={}", control_root.display()),
+            format!("--property=BindReadOnlyPaths={}", policy_root.display()),
+            format!("--property=ReadOnlyPaths={}", policy_root.display()),
             format!("--property=BindReadOnlyPaths={}", control_file.display()),
             format!("--property=ReadOnlyPaths={}", control_file.display()),
+            format!("--property=BindPaths={}", exception_root.display()),
+            format!("--property=ReadWritePaths={}", exception_root.display()),
+            format!("--property=BindPaths={}", exception_file.display()),
+            format!("--property=ReadWritePaths={}", exception_file.display()),
             format!("--property=BindPaths={}", runtime.display()),
             format!("--property=ReadWritePaths={}", runtime.display()),
         ] {
@@ -8643,6 +8829,39 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn external_codex_exact_writable_root_rejects_hardlink_alias_outside_exception() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("worktree");
+        let policy_root = workspace.join(".agents");
+        let exception_root = policy_root.join("docs");
+        let exception_file = exception_root.join("policy.md");
+        let outside_alias = workspace.join("AGENTS.md");
+        fs::create_dir(&workspace).expect("workspace");
+        fs::create_dir(&policy_root).expect("policy root");
+        fs::create_dir(&exception_root).expect("exception root");
+        fs::write(&exception_file, "policy\n").expect("exception file");
+        fs::hard_link(&exception_file, &outside_alias).expect("outside hard-link alias");
+
+        let profile = ExternalCodexProfile::read_write(&workspace)
+            .with_visible_read_only_root(&policy_root)
+            .with_visible_read_write_root(&exception_root);
+        let spec = ProcessSpec::direct(
+            "external Codex hard-link scope",
+            PathBuf::from("/bin/true"),
+            Vec::<OsString>::new(),
+            &workspace,
+            128,
+        )
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+        let error = match resolve_systemd_sandbox(&spec) {
+            Err(error) => error,
+            Ok(_) => panic!("hard-link alias outside exact writable root must fail closed"),
+        };
+        assert!(error.to_string().contains("hard-link alias outside"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn ordinary_external_codex_exact_path_properties_reject_drift() {
         let sandbox = ResolvedSystemdSandbox {
             kind: SideEffectConfinementProfileKind::ExternalCodex,
@@ -8651,6 +8870,8 @@ mod tests {
             workspace_access: WorkspaceAccess::ReadWrite,
             visible_read_only_roots: vec![PathBuf::from("/worktree/.maco")],
             visible_read_only_files: vec![PathBuf::from("/worktree/.git")],
+            visible_read_write_roots: vec![PathBuf::from("/worktree/.agents/docs")],
+            visible_read_write_files: vec![PathBuf::from("/worktree/AGENTS.md")],
             writable_artifact_roots: Vec::new(),
             hidden_roots: vec![PathBuf::from("/primary")],
             isolated_host_view: false,
@@ -8676,11 +8897,13 @@ mod tests {
             ),
             (
                 "ReadWritePaths".to_string(),
-                "/worktree /run/user/1000/maco-process".to_string(),
+                "/worktree /worktree/.agents/docs /worktree/AGENTS.md /run/user/1000/maco-process"
+                    .to_string(),
             ),
             (
                 "BindPaths".to_string(),
-                "/run/user/1000/maco-process /worktree".to_string(),
+                "/run/user/1000/maco-process /worktree /worktree/.agents/docs /worktree/AGENTS.md"
+                    .to_string(),
             ),
         ]);
         verify_exact_systemd_path_properties(&sandbox, &exact, runtime)
@@ -8860,6 +9083,8 @@ mod tests {
             workspace_access: WorkspaceAccess::ReadOnly,
             visible_read_only_roots: vec![PathBuf::from("/nix/store")],
             visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: vec![PathBuf::from("/source")],
             isolated_host_view: true,
@@ -9100,6 +9325,8 @@ mod tests {
             workspace_access: WorkspaceAccess::ReadWrite,
             visible_read_only_roots: Vec::new(),
             visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             isolated_host_view: false,

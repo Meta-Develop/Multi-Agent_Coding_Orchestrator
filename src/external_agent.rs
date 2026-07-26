@@ -27,30 +27,19 @@ const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
-const INNER_CODEX_POLICY_ID: &str = "maco_external_codex";
-const MACO_CONTROL_ROOTS: &[&str] = &[".maco", ".maco-cache"];
-const IGNORE_POLICY_FILES: &[&str] = &[
-    ".gitignore",
-    ".ignore",
-    ".rgignore",
-    ".dockerignore",
-    ".cursorignore",
-    ".cursorindexingignore",
-    ".codexignore",
-];
-const AGENT_POLICY_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+const INNER_CODEX_POLICY_ID: &str = "maco_external_codex_inner_v1";
+const PERMANENT_CONTROL_ROOTS: &[&str] = &[".maco", ".codex"];
+const POLICY_CONTROL_ROOTS: &[&str] = &[".agents"];
+const POLICY_CONTROL_FILES: &[&str] = &[".gitignore", ".gitattributes", "AGENTS.md", "CLAUDE.md"];
+const MAX_WORKTREE_CONTROL_EXCEPTIONS: usize = 128;
+const MAX_CODEX_JSONL_EVENT_BYTES: usize = 256 * 1024;
+const MAX_CODEX_EVENT_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalExecutionRuntime {
     Verified,
     #[cfg(test)]
     NonpublishableSimulation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExternalWorktreeControlCapability {
-    EditIgnorePolicy,
-    EditAgentPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,9 +63,9 @@ pub struct ExternalAgentCommand {
     /// supervisor repository whose `.maco/agents` state operators inspect, which can differ from
     /// `cwd` when the provider runs inside a linked assignment worktree.
     pub agent_lifecycle: Option<ExternalAgentLifecycleIdentity>,
-    /// Explicit exceptions to the default read-only worktree-policy controls. Runtime state and
-    /// linked-worktree Git controls never have a writable capability.
-    pub worktree_control_capabilities: BTreeSet<ExternalWorktreeControlCapability>,
+    /// Exact normalized workspace-relative exceptions to the default read-only policy controls.
+    /// Linked-worktree Git metadata and MACO/Codex runtime roots are never writable exceptions.
+    pub worktree_control_exceptions: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,30 +101,28 @@ pub struct CodexPermissionEvidence {
     pub executable_identity: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxDenialBoundary {
     OuterSystemd,
     InnerCodex,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxDeniedOperation {
     EstablishBoundary,
     Write,
-    NetworkAccess,
-    Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxDenialRetryability {
-    RequiresDeclaredCapability,
+    RequiresDeclaredException,
     NotRetryable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct SandboxDenialEvidence {
     pub boundary: SandboxDenialBoundary,
     pub policy_id: String,
@@ -170,7 +157,7 @@ impl ExternalAgentCommand {
             model: None,
             reasoning_effort: None,
             agent_lifecycle: None,
-            worktree_control_capabilities: BTreeSet::new(),
+            worktree_control_exceptions: Vec::new(),
         }
     }
 
@@ -196,7 +183,7 @@ impl ExternalAgentCommand {
             model: None,
             reasoning_effort: None,
             agent_lifecycle: None,
-            worktree_control_capabilities: BTreeSet::new(),
+            worktree_control_exceptions: Vec::new(),
         }
     }
 
@@ -222,7 +209,7 @@ impl ExternalAgentCommand {
             model: None,
             reasoning_effort: None,
             agent_lifecycle: None,
-            worktree_control_capabilities: BTreeSet::new(),
+            worktree_control_exceptions: Vec::new(),
         }
     }
 
@@ -262,16 +249,13 @@ impl ExternalAgentCommand {
         self
     }
 
-    pub fn with_worktree_control_capability(
-        mut self,
-        capability: ExternalWorktreeControlCapability,
-    ) -> Self {
-        self.worktree_control_capabilities.insert(capability);
+    pub fn with_worktree_control_exception(mut self, relative: impl Into<PathBuf>) -> Self {
+        self.worktree_control_exceptions.push(relative.into());
         self
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExternalAgentRun {
     pub command: Vec<String>,
     pub cwd: PathBuf,
@@ -280,20 +264,16 @@ pub struct ExternalAgentRun {
     pub duration_ms: u64,
     pub timed_out: bool,
     /// Present only after the shared runner starts and closes the owned execution boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_tree: Option<ProcessTreeEvidence>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side_effects: Option<SideEffectConfinementEvidence>,
     pub publishable: bool,
     pub program_trust: ExternalProgramTrust,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_permissions: Option<CodexPermissionEvidence>,
     pub stdout: CapturedOutput,
     pub stderr: CapturedOutput,
     pub error: Option<String>,
     /// Descriptor-captured final output. This is deliberately excluded from the public report
     /// surface so callers cannot confuse a tainted pathname with the held capability.
-    #[serde(skip, default)]
     pub(crate) output_last_message: Option<Vec<u8>>,
 }
 
@@ -316,6 +296,7 @@ impl std::fmt::Debug for ExternalAgentRun {
             .field("publishable", &self.publishable)
             .field("program_trust", &self.program_trust)
             .field("codex_permissions", &self.codex_permissions)
+            .field("sandbox_denials", &self.sandbox_denials())
             .field("stdout", &self.stdout)
             .field("stderr", &self.stderr)
             .field("error", &self.error)
@@ -333,34 +314,8 @@ impl std::fmt::Debug for RedactedByteCount {
 }
 
 impl ExternalAgentRun {
-    pub fn sandbox_denials(&self) -> Vec<SandboxDenialEvidence> {
-        let stdout = if self.stdout.bytes.is_empty() {
-            std::borrow::Cow::Borrowed(self.stdout.text.as_str())
-        } else {
-            String::from_utf8_lossy(&self.stdout.bytes)
-        };
-        let stderr = if self.stderr.bytes.is_empty() {
-            std::borrow::Cow::Borrowed(self.stderr.text.as_str())
-        } else {
-            String::from_utf8_lossy(&self.stderr.bytes)
-        };
-        let mut denials = sandbox_denials_from_output_path(&self.cwd, &stdout, &stderr);
-        if denials.is_empty()
-            && self.error.as_deref().is_some_and(|error| {
-                error.contains("required process containment is unavailable")
-                    || (error.contains("failed to spawn external agent")
-                        && error.to_ascii_lowercase().contains("permission denied"))
-            })
-        {
-            denials.push(SandboxDenialEvidence {
-                boundary: SandboxDenialBoundary::OuterSystemd,
-                policy_id: OUTER_SYSTEMD_POLICY_ID.to_string(),
-                operation: SandboxDeniedOperation::EstablishBoundary,
-                path: None,
-                retryability: SandboxDenialRetryability::NotRetryable,
-            });
-        }
-        denials
+    pub fn sandbox_denials(&self) -> &[SandboxDenialEvidence] {
+        &self.stdout.run_metadata.sandbox_denials
     }
 
     pub fn safely_executed(&self) -> bool {
@@ -406,7 +361,7 @@ impl ExternalAgentRun {
 }
 
 #[derive(Serialize)]
-struct ExternalAgentRunWire<'a> {
+struct ExternalAgentRunWireRef<'a> {
     command: &'a [String],
     cwd: &'a Path,
     timeout_seconds: u64,
@@ -422,10 +377,33 @@ struct ExternalAgentRunWire<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_permissions: &'a Option<CodexPermissionEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    sandbox_denials: Vec<SandboxDenialEvidence>,
+    sandbox_denials: &'a Vec<SandboxDenialEvidence>,
     stdout: &'a CapturedOutput,
     stderr: &'a CapturedOutput,
     error: &'a Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExternalAgentRunWireOwned {
+    command: Vec<String>,
+    cwd: PathBuf,
+    timeout_seconds: u64,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    timed_out: bool,
+    #[serde(default)]
+    process_tree: Option<ProcessTreeEvidence>,
+    #[serde(default)]
+    side_effects: Option<SideEffectConfinementEvidence>,
+    publishable: bool,
+    program_trust: ExternalProgramTrust,
+    #[serde(default)]
+    codex_permissions: Option<CodexPermissionEvidence>,
+    #[serde(default)]
+    sandbox_denials: Vec<SandboxDenialEvidence>,
+    stdout: CapturedOutput,
+    stderr: CapturedOutput,
+    error: Option<String>,
 }
 
 impl Serialize for ExternalAgentRun {
@@ -433,7 +411,7 @@ impl Serialize for ExternalAgentRun {
     where
         S: serde::Serializer,
     {
-        ExternalAgentRunWire {
+        ExternalAgentRunWireRef {
             command: &self.command,
             cwd: &self.cwd,
             timeout_seconds: self.timeout_seconds,
@@ -445,13 +423,46 @@ impl Serialize for ExternalAgentRun {
             publishable: self.publishable,
             program_trust: self.program_trust,
             codex_permissions: &self.codex_permissions,
-            sandbox_denials: self.sandbox_denials(),
+            sandbox_denials: &self.stdout.run_metadata.sandbox_denials,
             stdout: &self.stdout,
             stderr: &self.stderr,
             error: &self.error,
         }
         .serialize(serializer)
     }
+}
+
+impl<'de> Deserialize<'de> for ExternalAgentRun {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ExternalAgentRunWireOwned::deserialize(deserializer)?;
+        let mut stdout = wire.stdout;
+        stdout.run_metadata.sandbox_denials = wire.sandbox_denials;
+        Ok(Self {
+            command: wire.command,
+            cwd: wire.cwd,
+            timeout_seconds: wire.timeout_seconds,
+            exit_code: wire.exit_code,
+            duration_ms: wire.duration_ms,
+            timed_out: wire.timed_out,
+            process_tree: wire.process_tree,
+            side_effects: wire.side_effects,
+            publishable: wire.publishable,
+            program_trust: wire.program_trust,
+            codex_permissions: wire.codex_permissions,
+            stdout,
+            stderr: wire.stderr,
+            error: wire.error,
+            output_last_message: None,
+        })
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ExternalAgentRunMetadata {
+    sandbox_denials: Vec<SandboxDenialEvidence>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -466,6 +477,10 @@ pub struct CapturedOutput {
         default = "default_target_launch_attempted"
     )]
     target_launch_attempted: bool,
+    /// Private held metadata for the enclosing run. It is serialized only by
+    /// `ExternalAgentRun` as the top-level `sandbox_denials` wire field.
+    #[serde(skip, default)]
+    run_metadata: ExternalAgentRunMetadata,
 }
 
 impl std::fmt::Debug for CapturedOutput {
@@ -557,7 +572,30 @@ fn run_external_agent_runtime(
             );
         }
     };
-    let argv = command_argv(spec);
+    if spec.workspace_access == WorkspaceAccess::ReadOnly
+        && !spec.worktree_control_exceptions.is_empty()
+    {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&resolved_program, &[]),
+            false,
+            "read-only external agents may not declare writable control exceptions".to_string(),
+        );
+    }
+    let protected_controls = match protected_worktree_controls(spec) {
+        Ok(controls) => controls,
+        Err(error) => {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&resolved_program, &[]),
+                false,
+                format!("failed to validate protected worktree controls: {error}"),
+            );
+        }
+    };
+    let argv = command_argv_with_controls(spec, &protected_controls);
     let argv_digest = match argv_digest(&argv) {
         Ok(digest) => digest,
         Err(error) => {
@@ -709,7 +747,12 @@ fn run_external_agent_runtime(
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::TrustedSystemCodex
     {
-        match external_side_effect_profile(spec, &resolved_program, program_trust) {
+        match external_side_effect_profile(
+            spec,
+            &resolved_program,
+            program_trust,
+            &protected_controls,
+        ) {
             Ok(profile) => Some(profile),
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -812,19 +855,30 @@ fn run_external_agent_runtime(
                 runtime,
                 codex_version,
                 spec,
+                protected_controls: &protected_controls,
                 argv_digest: &argv_digest,
                 program_identity: &program_identity,
             },
         ),
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
+            let mut sandbox_denials = Vec::new();
+            if let Some(denial) = sandbox_denial_from_process_error(&error) {
+                sandbox_denials.push(denial);
+            }
             if let Some(evidence) = error.cancellation_evidence() {
+                sandbox_denials.extend(sandbox_denials_from_codex_jsonl(
+                    &protected_controls,
+                    evidence.stdout.as_bytes(),
+                ));
                 report.process_tree = Some(evidence.process_tree);
                 report.side_effects = Some(evidence.side_effects);
                 report.stdout = summarize_output(&evidence.stdout);
                 report.stdout.target_launch_attempted = true;
                 report.stderr = summarize_output(&evidence.stderr);
             }
+            deduplicate_sandbox_denials(&mut sandbox_denials);
+            report.stdout.run_metadata.sandbox_denials = sandbox_denials;
             report.error = Some(error.to_string());
         }
     }
@@ -836,6 +890,7 @@ struct CompletedTargetContext<'a> {
     runtime: ExternalExecutionRuntime,
     codex_version: Option<(u64, u64, u64)>,
     spec: &'a ExternalAgentCommand,
+    protected_controls: &'a ProtectedWorktreeControls,
     argv_digest: &'a str,
     program_identity: &'a ExternalProgramIdentity,
 }
@@ -847,6 +902,9 @@ fn record_completed_target(
     context: CompletedTargetContext<'_>,
 ) {
     let safety_verified = output.safety_evidence_verified();
+    let mut sandbox_denials =
+        sandbox_denials_from_codex_jsonl(context.protected_controls, output.stdout.as_bytes());
+    deduplicate_sandbox_denials(&mut sandbox_denials);
     report.exit_code = output.status.and_then(|status| status.code());
     report.timed_out = output.timed_out;
     report.process_tree = Some(output.process_tree);
@@ -868,6 +926,7 @@ fn record_completed_target(
     }
     report.stdout = summarize_output(&output.stdout);
     report.stdout.target_launch_attempted = true;
+    report.stdout.run_metadata.sandbox_denials = sandbox_denials;
     report.stderr = summarize_output(&output.stderr);
     report.error = append_external_error(output.stdin_error, output.process_error);
     if output.timed_out {
@@ -903,6 +962,11 @@ fn record_completed_target(
         && report.exit_code == Some(0)
         && !report.timed_out
         && report.error.is_none();
+}
+
+fn deduplicate_sandbox_denials(evidence: &mut Vec<SandboxDenialEvidence>) {
+    evidence.sort();
+    evidence.dedup();
 }
 
 fn failed_external_run(
@@ -1232,8 +1296,10 @@ fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProtectedWorktreeControls {
-    roots: Vec<ProtectedWorktreeControl>,
-    files: Vec<ProtectedWorktreeControl>,
+    read_only_roots: Vec<ProtectedWorktreeControl>,
+    read_only_files: Vec<ProtectedWorktreeControl>,
+    read_write_roots: Vec<ProtectedWorktreeControl>,
+    read_write_files: Vec<ProtectedWorktreeControl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1245,18 +1311,27 @@ struct ProtectedWorktreeControl {
 
 impl ProtectedWorktreeControls {
     fn iter(&self) -> impl Iterator<Item = &ProtectedWorktreeControl> {
-        self.roots.iter().chain(&self.files)
+        self.read_only_roots
+            .iter()
+            .chain(&self.read_only_files)
+            .chain(&self.read_write_roots)
+            .chain(&self.read_write_files)
     }
 }
 
 fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedWorktreeControls> {
-    protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_capabilities)
+    protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)
 }
 
 fn protected_worktree_controls_for(
     workspace: &Path,
-    capabilities: &BTreeSet<ExternalWorktreeControlCapability>,
+    declared_exceptions: &[PathBuf],
 ) -> Result<ProtectedWorktreeControls> {
+    if declared_exceptions.len() > MAX_WORKTREE_CONTROL_EXCEPTIONS {
+        bail!(
+            "worktree control exception count exceeds the fail-closed limit of {MAX_WORKTREE_CONTROL_EXCEPTIONS}"
+        );
+    }
     let mut controls = ProtectedWorktreeControls::default();
     collect_protected_control(
         workspace,
@@ -1264,7 +1339,7 @@ fn protected_worktree_controls_for(
         SandboxDenialRetryability::NotRetryable,
         &mut controls,
     )?;
-    for relative in MACO_CONTROL_ROOTS {
+    for relative in PERMANENT_CONTROL_ROOTS {
         collect_protected_control(
             workspace,
             Path::new(relative),
@@ -1272,39 +1347,60 @@ fn protected_worktree_controls_for(
             &mut controls,
         )?;
     }
-    if !capabilities.contains(&ExternalWorktreeControlCapability::EditIgnorePolicy) {
-        for relative in IGNORE_POLICY_FILES {
-            collect_protected_control(
-                workspace,
-                Path::new(relative),
-                SandboxDenialRetryability::RequiresDeclaredCapability,
-                &mut controls,
-            )?;
-        }
-    }
-    if !capabilities.contains(&ExternalWorktreeControlCapability::EditAgentPolicy) {
+    for relative in POLICY_CONTROL_ROOTS {
         collect_protected_control(
             workspace,
-            Path::new(".agents"),
-            SandboxDenialRetryability::RequiresDeclaredCapability,
+            Path::new(relative),
+            SandboxDenialRetryability::RequiresDeclaredException,
             &mut controls,
         )?;
-        for relative in AGENT_POLICY_FILES {
-            collect_protected_control(
-                workspace,
-                Path::new(relative),
-                SandboxDenialRetryability::RequiresDeclaredCapability,
-                &mut controls,
-            )?;
-        }
     }
-    controls
-        .roots
-        .sort_by(|left, right| left.absolute.cmp(&right.absolute));
-    controls
-        .files
-        .sort_by(|left, right| left.absolute.cmp(&right.absolute));
+    for relative in POLICY_CONTROL_FILES {
+        collect_protected_control(
+            workspace,
+            Path::new(relative),
+            SandboxDenialRetryability::RequiresDeclaredException,
+            &mut controls,
+        )?;
+    }
+
+    let mut normalized_exceptions = Vec::with_capacity(declared_exceptions.len());
+    for declared in declared_exceptions {
+        let relative = normalize_control_exception(declared)?;
+        validate_control_exception_target(workspace, &relative)?;
+        if normalized_exceptions.iter().any(|existing: &PathBuf| {
+            existing == &relative
+                || existing.starts_with(&relative)
+                || relative.starts_with(existing)
+        }) {
+            bail!(
+                "worktree control exceptions may not duplicate or overlap: {}",
+                relative.display()
+            );
+        }
+        normalized_exceptions.push(relative);
+    }
+    for relative in normalized_exceptions {
+        controls
+            .read_only_roots
+            .retain(|control| control.relative != relative);
+        controls
+            .read_only_files
+            .retain(|control| control.relative != relative);
+        collect_control_exception(workspace, &relative, &mut controls)?;
+    }
+    controls.read_only_roots.sort_by(control_path_order);
+    controls.read_only_files.sort_by(control_path_order);
+    controls.read_write_roots.sort_by(control_path_order);
+    controls.read_write_files.sort_by(control_path_order);
     Ok(controls)
+}
+
+fn control_path_order(
+    left: &ProtectedWorktreeControl,
+    right: &ProtectedWorktreeControl,
+) -> std::cmp::Ordering {
+    left.absolute.cmp(&right.absolute)
 }
 
 fn collect_protected_control(
@@ -1334,9 +1430,9 @@ fn collect_protected_control(
         retryability,
     };
     if metadata.is_dir() {
-        controls.roots.push(control);
+        controls.read_only_roots.push(control);
     } else if metadata.is_file() {
-        controls.files.push(control);
+        controls.read_only_files.push(control);
     } else {
         bail!(
             "protected worktree control is not a regular file or directory: {}",
@@ -1346,10 +1442,127 @@ fn collect_protected_control(
     Ok(())
 }
 
+fn normalize_control_exception(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        bail!(
+            "worktree control exception must be a non-empty workspace-relative path: {}",
+            path.display()
+        );
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::CurDir => {
+                bail!(
+                    "worktree control exception must already be normalized: {}",
+                    path.display()
+                );
+            }
+            std::path::Component::ParentDir => {
+                bail!(
+                    "worktree control exception may not contain '..': {}",
+                    path.display()
+                );
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!(
+                    "worktree control exception must be workspace-relative: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() || normalized == Path::new(".") {
+        bail!("worktree control exception may not be empty or '.'");
+    }
+    if normalized.to_str().is_none() {
+        bail!("worktree control exception must be valid UTF-8 for Codex permissions");
+    }
+    Ok(normalized)
+}
+
+fn validate_control_exception_target(workspace: &Path, relative: &Path) -> Result<()> {
+    if relative.starts_with(".git")
+        || PERMANENT_CONTROL_ROOTS
+            .iter()
+            .any(|root| relative.starts_with(root))
+    {
+        bail!(
+            "worktree control is permanently read-only and cannot be excepted: {}",
+            relative.display()
+        );
+    }
+    let protected_policy_path = POLICY_CONTROL_ROOTS
+        .iter()
+        .any(|root| relative.starts_with(root))
+        || POLICY_CONTROL_FILES
+            .iter()
+            .any(|file| relative == Path::new(file));
+    if !protected_policy_path {
+        bail!(
+            "worktree control exception is outside the protected policy set: {}",
+            relative.display()
+        );
+    }
+
+    let mut current = workspace.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            bail!(
+                "worktree control exception is not normalized: {}",
+                relative.display()
+            );
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).with_context(|| {
+            format!(
+                "worktree control exception must name an existing path: {}",
+                relative.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "worktree control exception may not traverse or name a symlink: {}",
+                relative.display()
+            );
+        }
+    }
+    let metadata = fs::symlink_metadata(&current)?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        bail!(
+            "worktree control exception must name a regular file or directory: {}",
+            relative.display()
+        );
+    }
+    Ok(())
+}
+
+fn collect_control_exception(
+    workspace: &Path,
+    relative: &Path,
+    controls: &mut ProtectedWorktreeControls,
+) -> Result<()> {
+    let absolute = workspace.join(relative);
+    let metadata = fs::symlink_metadata(&absolute)?;
+    let control = ProtectedWorktreeControl {
+        absolute,
+        relative: relative.to_path_buf(),
+        retryability: SandboxDenialRetryability::NotRetryable,
+    };
+    if metadata.is_dir() {
+        controls.read_write_roots.push(control);
+    } else {
+        controls.read_write_files.push(control);
+    }
+    Ok(())
+}
+
 fn external_side_effect_profile(
     spec: &ExternalAgentCommand,
     program: &Path,
     program_trust: ExternalProgramTrust,
+    protected_controls: &ProtectedWorktreeControls,
 ) -> Result<SideEffectConfinementProfile> {
     if program_trust != ExternalProgramTrust::TrustedSystemCodex {
         bail!("provider-network confinement is reserved for the trusted system Codex executable");
@@ -1366,12 +1579,17 @@ fn external_side_effect_profile(
                 WorkspaceAccess::ReadOnly => ExternalCodexProfile::read_only(&spec.cwd),
                 WorkspaceAccess::ReadWrite => ExternalCodexProfile::read_write(&spec.cwd),
             };
-            let protected_controls = protected_worktree_controls(spec)?;
-            for control in protected_controls.roots {
-                profile = profile.with_visible_read_only_root(control.absolute);
+            for control in &protected_controls.read_only_roots {
+                profile = profile.with_visible_read_only_root(&control.absolute);
             }
-            for control in protected_controls.files {
-                profile = profile.with_visible_read_only_file(control.absolute);
+            for control in &protected_controls.read_only_files {
+                profile = profile.with_visible_read_only_file(&control.absolute);
+            }
+            for control in &protected_controls.read_write_roots {
+                profile = profile.with_visible_read_write_root(&control.absolute);
+            }
+            for control in &protected_controls.read_write_files {
+                profile = profile.with_visible_read_write_file(&control.absolute);
             }
             let canonical_workspace = fs::canonicalize(&spec.cwd)?;
             if !program.starts_with(&canonical_workspace) {
@@ -1394,82 +1612,45 @@ fn external_side_effect_profile(
     }
 }
 
-#[cfg(test)]
-fn sandbox_denials_from_output(
-    spec: &ExternalAgentCommand,
-    stdout: &str,
-    stderr: &str,
-) -> Vec<SandboxDenialEvidence> {
-    let controls = protected_worktree_controls(spec).unwrap_or_default();
-    sandbox_denials_from_output_with_controls(&controls, stdout, stderr)
-}
-
-fn sandbox_denials_from_output_path(
-    workspace: &Path,
-    stdout: &str,
-    stderr: &str,
-) -> Vec<SandboxDenialEvidence> {
-    let mut controls = ProtectedWorktreeControls::default();
-    controls.files.push(ProtectedWorktreeControl {
-        absolute: workspace.join(".git"),
-        relative: PathBuf::from(".git"),
-        retryability: SandboxDenialRetryability::NotRetryable,
-    });
-    for relative in MACO_CONTROL_ROOTS {
-        controls.roots.push(ProtectedWorktreeControl {
-            absolute: workspace.join(*relative),
-            relative: PathBuf::from(*relative),
-            retryability: SandboxDenialRetryability::NotRetryable,
-        });
-    }
-    controls.roots.push(ProtectedWorktreeControl {
-        absolute: workspace.join(".agents"),
-        relative: PathBuf::from(".agents"),
-        retryability: SandboxDenialRetryability::RequiresDeclaredCapability,
-    });
-    for relative in IGNORE_POLICY_FILES.iter().chain(AGENT_POLICY_FILES.iter()) {
-        controls.files.push(ProtectedWorktreeControl {
-            absolute: workspace.join(*relative),
-            relative: PathBuf::from(*relative),
-            retryability: SandboxDenialRetryability::RequiresDeclaredCapability,
-        });
-    }
-    sandbox_denials_from_output_with_controls(&controls, stdout, stderr)
-}
-
-fn sandbox_denials_from_output_with_controls(
+fn sandbox_denials_from_codex_jsonl(
     controls: &ProtectedWorktreeControls,
-    stdout: &str,
-    stderr: &str,
+    jsonl: &[u8],
 ) -> Vec<SandboxDenialEvidence> {
-    let combined = format!("{stdout}\n{stderr}");
-    if !contains_sandbox_denial_marker(&combined) {
-        return Vec::new();
-    }
-
-    let mut controls = controls.iter().collect::<Vec<_>>();
-    controls.sort_by(|left, right| {
-        right
-            .absolute
-            .as_os_str()
-            .len()
-            .cmp(&left.absolute.as_os_str().len())
-    });
-    let mut observed = BTreeSet::new();
-    let mut denials = Vec::new();
-    for line in combined
-        .lines()
-        .filter(|line| contains_sandbox_denial_marker(line))
-    {
-        for control in &controls {
-            let absolute = control.absolute.to_string_lossy();
-            let relative = control.relative.to_string_lossy();
-            if (line.contains(absolute.as_ref()) || line.contains(relative.as_ref()))
-                && observed.insert(control.relative.clone())
-            {
-                denials.push(SandboxDenialEvidence {
-                    boundary: SandboxDenialBoundary::OuterSystemd,
-                    policy_id: OUTER_SYSTEMD_POLICY_ID.to_string(),
+    let mut evidence = BTreeSet::new();
+    for line in jsonl.split(|byte| *byte == b'\n') {
+        if line.is_empty() || line.len() > MAX_CODEX_JSONL_EVENT_BYTES {
+            continue;
+        }
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some((command, output)) = failed_command_event_fields(&event) else {
+            continue;
+        };
+        if !contains_sandbox_denial_marker(output) {
+            continue;
+        }
+        let mut known = controls.iter().collect::<Vec<_>>();
+        known.sort_by(|left, right| {
+            right
+                .relative
+                .as_os_str()
+                .len()
+                .cmp(&left.relative.as_os_str().len())
+        });
+        for control in known {
+            let Some(relative) = control.relative.to_str() else {
+                continue;
+            };
+            let Some(absolute) = control.absolute.to_str() else {
+                continue;
+            };
+            if [command, output].iter().any(|text| {
+                contains_exact_path(text, relative) || contains_exact_path(text, absolute)
+            }) {
+                evidence.insert(SandboxDenialEvidence {
+                    boundary: SandboxDenialBoundary::InnerCodex,
+                    policy_id: INNER_CODEX_POLICY_ID.to_string(),
                     operation: SandboxDeniedOperation::Write,
                     path: Some(control.relative.clone()),
                     retryability: control.retryability,
@@ -1478,34 +1659,54 @@ fn sandbox_denials_from_output_with_controls(
             }
         }
     }
-    if !denials.is_empty() {
-        return denials;
-    }
+    evidence.into_iter().collect()
+}
 
-    let lower = combined.to_ascii_lowercase();
-    if lower.contains("sandbox")
-        || lower.contains("maco_external_codex")
-        || lower.contains("denied by policy")
-    {
-        let operation = if lower.contains("network") {
-            SandboxDeniedOperation::NetworkAccess
-        } else if ["write", "create", "remove", "rename", "mkdir", "touch"]
-            .iter()
-            .any(|operation| lower.contains(operation))
-        {
-            SandboxDeniedOperation::Write
-        } else {
-            SandboxDeniedOperation::Unknown
-        };
-        return vec![SandboxDenialEvidence {
-            boundary: SandboxDenialBoundary::InnerCodex,
-            policy_id: INNER_CODEX_POLICY_ID.to_string(),
-            operation,
-            path: None,
-            retryability: SandboxDenialRetryability::NotRetryable,
-        }];
+fn failed_command_event_fields(event: &serde_json::Value) -> Option<(&str, &str)> {
+    if event.get("type")?.as_str()? != "item.completed" {
+        return None;
     }
-    Vec::new()
+    let item = event.get("item")?.as_object()?;
+    if item.get("id")?.as_str()?.is_empty()
+        || item.get("type")?.as_str()? != "command_execution"
+        || item.get("status")?.as_str()? != "failed"
+        || item.get("exit_code")?.as_i64()? == 0
+    {
+        return None;
+    }
+    let command = item.get("command")?.as_str()?;
+    let output = item.get("aggregated_output")?.as_str()?;
+    (command.len() <= MAX_CODEX_EVENT_TEXT_BYTES && output.len() <= MAX_CODEX_EVENT_TEXT_BYTES)
+        .then_some((command, output))
+}
+
+fn contains_exact_path(text: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    text.match_indices(path).any(|(offset, matched)| {
+        let before = text[..offset].chars().next_back();
+        let after = text[offset + matched.len()..].chars().next();
+        !before.is_some_and(is_path_character) && !after.is_some_and(is_path_character)
+    })
+}
+
+fn is_path_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | '\\')
+}
+
+fn sandbox_denial_from_process_error(error: &ProcessRunError) -> Option<SandboxDenialEvidence> {
+    matches!(
+        error,
+        ProcessRunError::ContainmentUnavailable { .. } | ProcessRunError::ProcessOwnership { .. }
+    )
+    .then(|| SandboxDenialEvidence {
+        boundary: SandboxDenialBoundary::OuterSystemd,
+        policy_id: OUTER_SYSTEMD_POLICY_ID.to_string(),
+        operation: SandboxDeniedOperation::EstablishBoundary,
+        path: None,
+        retryability: SandboxDenialRetryability::NotRetryable,
+    })
 }
 
 fn contains_sandbox_denial_marker(message: &str) -> bool {
@@ -1684,16 +1885,28 @@ fn append_external_error(existing: Option<String>, next: Option<String>) -> Opti
     }
 }
 
+#[cfg(test)]
 pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+    let controls = protected_worktree_controls(spec).unwrap_or_default();
+    command_argv_with_controls(spec, &controls)
+}
+
+fn command_argv_with_controls(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Vec<OsString> {
     match spec.invocation {
-        ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec),
-        ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec),
+        ExternalAgentInvocation::CodexSupervisor => codex_supervisor_argv(spec, controls),
+        ExternalAgentInvocation::CodexConsultant => codex_consultant_argv(spec, controls),
         ExternalAgentInvocation::ClaudeConsultant => claude_consultant_argv(),
     }
 }
 
-fn codex_supervisor_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
-    let mut argv = codex_hardened_argv(spec);
+fn codex_supervisor_argv(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Vec<OsString> {
+    let mut argv = codex_hardened_argv(spec, controls);
     argv.extend([
         OsString::from("--enable"),
         OsString::from("goals"),
@@ -1711,8 +1924,11 @@ fn codex_supervisor_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     argv
 }
 
-fn codex_consultant_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
-    let mut argv = codex_hardened_argv(spec);
+fn codex_consultant_argv(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Vec<OsString> {
+    let mut argv = codex_hardened_argv(spec, controls);
     argv.extend([
         OsString::from("--output-last-message"),
         spec.output_last_message.as_os_str().to_os_string(),
@@ -1721,15 +1937,11 @@ fn codex_consultant_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     argv
 }
 
-fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
-    let filesystem_permissions = match spec.workspace_access {
-        WorkspaceAccess::ReadOnly => {
-            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\"}"
-        }
-        WorkspaceAccess::ReadWrite => {
-            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"}}"
-        }
-    };
+fn codex_hardened_argv(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Vec<OsString> {
+    let filesystem_permissions = codex_filesystem_permissions(spec, controls);
     let mut argv = vec![
         OsString::from("-a"),
         OsString::from("never"),
@@ -1781,6 +1993,57 @@ fn codex_hardened_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
         )));
     }
     argv
+}
+
+fn codex_filesystem_permissions(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> String {
+    let mut path_permissions = BTreeMap::<String, &'static str>::new();
+    for control in controls
+        .read_only_roots
+        .iter()
+        .chain(&controls.read_only_files)
+    {
+        if let Some(relative) = control.relative.to_str() {
+            path_permissions.insert(relative.to_string(), "read");
+        }
+    }
+    for control in controls
+        .read_write_roots
+        .iter()
+        .chain(&controls.read_write_files)
+    {
+        if let Some(relative) = control.relative.to_str() {
+            path_permissions.insert(relative.to_string(), "write");
+        }
+    }
+    if let Some(parent) = spec
+        .output_last_message
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let permission_path = parent
+            .strip_prefix(&spec.cwd)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .unwrap_or(parent);
+        if let Some(path) = permission_path.to_str() {
+            path_permissions.insert(path.to_string(), "write");
+        }
+    }
+
+    let mut entries = vec!["\":minimal\"=\"read\"".to_string()];
+    if spec.workspace_access == WorkspaceAccess::ReadWrite {
+        entries.push("\":workspace_roots\"={\".\"=\"write\"}".to_string());
+    }
+    entries.extend(path_permissions.into_iter().map(|(path, access)| {
+        format!("{}={}", toml_basic_string(&path), toml_basic_string(access))
+    }));
+    format!(
+        "permissions.maco_external_codex.filesystem={{{}}}",
+        entries.join(",")
+    )
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -1987,6 +2250,7 @@ fn summarize_output(output: &CapturedBytes) -> CapturedOutput {
         truncated: summary.truncated,
         bytes: output.as_bytes().to_vec(),
         target_launch_attempted: false,
+        run_metadata: ExternalAgentRunMetadata::default(),
     }
 }
 
@@ -2035,7 +2299,7 @@ mod tests {
             "-c",
             "permissions.maco_external_codex.network={enabled=false}",
             "-c",
-            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"}}",
+            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"},\"/run\"=\"write\"}",
             "-c",
             "shell_environment_policy.inherit=\"none\"",
             "-c",
@@ -2330,6 +2594,7 @@ mod tests {
             process_error: None,
             stdin_error: None,
         };
+        let protected_controls = protected_worktree_controls(&command)?;
 
         record_completed_target(
             &mut report,
@@ -2339,6 +2604,7 @@ mod tests {
                 runtime: ExternalExecutionRuntime::Verified,
                 codex_version: Some((0, 142, 3)),
                 spec: &command,
+                protected_controls: &protected_controls,
                 argv_digest: "verified-argv-digest",
                 program_identity: &program_identity,
             },
@@ -2427,14 +2693,14 @@ mod tests {
             &spec,
             Path::new("/tmp/custom-codex"),
             ExternalProgramTrust::ExplicitCustom,
+            &ProtectedWorktreeControls::default(),
         )
         .expect_err("custom program must not receive provider-network authority");
         assert!(error.to_string().contains("trusted system Codex"));
     }
 
     #[test]
-    fn protected_worktree_controls_are_read_only_by_default_with_narrow_policy_capabilities(
-    ) -> Result<()> {
+    fn protected_worktree_controls_use_exact_descendant_exceptions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace)?;
@@ -2442,10 +2708,12 @@ mod tests {
             workspace.join(".git"),
             "gitdir: ../primary/.git/worktrees/child\n",
         )?;
-        for root in [".maco", ".maco-cache", ".agents"] {
+        for root in [".maco", ".codex", ".agents"] {
             fs::create_dir(workspace.join(root))?;
         }
-        for file in [".gitignore", ".ignore", "AGENTS.md"] {
+        fs::create_dir(workspace.join(".agents/docs"))?;
+        fs::write(workspace.join(".agents/docs/worker.md"), "worker policy\n")?;
+        for file in [".gitignore", ".gitattributes", "AGENTS.md", "CLAUDE.md"] {
             fs::write(workspace.join(file), "protected\n")?;
         }
         let command = ExternalAgentCommand::codex(
@@ -2455,16 +2723,17 @@ mod tests {
             workspace.join("events.jsonl"),
             workspace.join("incoming/report.json"),
             Duration::from_secs(1),
-        );
+        )
+        .with_worktree_control_exception(".agents/docs/worker.md");
 
         let controls = protected_worktree_controls(&command)?;
         let roots = controls
-            .roots
+            .read_only_roots
             .iter()
             .map(|control| control.relative.as_path())
             .collect::<BTreeSet<_>>();
         let files = controls
-            .files
+            .read_only_files
             .iter()
             .map(|control| control.relative.as_path())
             .collect::<BTreeSet<_>>();
@@ -2472,53 +2741,75 @@ mod tests {
             roots,
             BTreeSet::from([
                 Path::new(".agents"),
+                Path::new(".codex"),
                 Path::new(".maco"),
-                Path::new(".maco-cache"),
             ])
         );
         assert_eq!(
             files,
             BTreeSet::from([
                 Path::new(".git"),
+                Path::new(".gitattributes"),
                 Path::new(".gitignore"),
-                Path::new(".ignore"),
                 Path::new("AGENTS.md"),
+                Path::new("CLAUDE.md"),
             ])
         );
-
-        let policy_edit = command
-            .clone()
-            .with_worktree_control_capability(ExternalWorktreeControlCapability::EditIgnorePolicy)
-            .with_worktree_control_capability(ExternalWorktreeControlCapability::EditAgentPolicy);
-        let controls = protected_worktree_controls(&policy_edit)?;
         assert_eq!(
             controls
-                .roots
+                .read_write_files
                 .iter()
                 .map(|control| control.relative.as_path())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([Path::new(".maco"), Path::new(".maco-cache")])
-        );
-        assert_eq!(
-            controls
-                .files
-                .iter()
-                .map(|control| control.relative.as_path())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([Path::new(".git")])
+            BTreeSet::from([Path::new(".agents/docs/worker.md")])
         );
         Ok(())
     }
 
     #[test]
-    fn sandbox_denials_are_typed_redacted_and_classified_by_boundary() -> Result<()> {
+    fn control_exceptions_reject_invalid_permanent_symlink_and_ambiguous_paths() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace)?;
-        fs::write(
-            workspace.join(".git"),
-            "gitdir: ../primary/.git/worktrees/child\n",
+        for root in [".git", ".maco", ".codex", ".agents"] {
+            fs::create_dir(workspace.join(root))?;
+        }
+        fs::create_dir(workspace.join(".agents/docs"))?;
+        fs::write(workspace.join(".agents/docs/policy.md"), "policy\n")?;
+        fs::write(workspace.join(".gitignore"), "target\n")?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            workspace.join(".agents/docs"),
+            workspace.join(".agents/link"),
         )?;
+
+        for paths in [
+            vec![PathBuf::from("/absolute")],
+            vec![PathBuf::from("../AGENTS.md")],
+            vec![PathBuf::from(".")],
+            vec![PathBuf::from("src")],
+            vec![PathBuf::from(".git")],
+            vec![PathBuf::from(".maco")],
+            vec![PathBuf::from(".codex")],
+            vec![PathBuf::from(".agents/link")],
+            vec![
+                PathBuf::from(".agents/docs"),
+                PathBuf::from(".agents/docs/policy.md"),
+            ],
+        ] {
+            assert!(
+                protected_worktree_controls_for(&workspace, &paths).is_err(),
+                "invalid exception set was accepted: {paths:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structured_failed_command_denials_are_typed_deduplicated_and_redacted() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace)?;
         fs::write(workspace.join("AGENTS.md"), "policy\n")?;
         let command = ExternalAgentCommand::codex(
             "codex",
@@ -2528,33 +2819,100 @@ mod tests {
             workspace.join("incoming/report.json"),
             Duration::from_secs(1),
         );
-
-        let denials = sandbox_denials_from_output(
-            &command,
-            "",
-            &format!(
-                "cannot write {}: Read-only file system",
-                workspace.join("AGENTS.md").display()
-            ),
-        );
+        let controls = protected_worktree_controls(&command)?;
+        let absolute = workspace.join("AGENTS.md");
+        let event = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item-1",
+                "type": "command_execution",
+                "command": format!("touch '{}'", absolute.display()),
+                "aggregated_output": format!("touch: cannot touch '{}': Read-only file system", absolute.display()),
+                "exit_code": 1,
+                "status": "failed"
+            }
+        });
+        let jsonl = format!("{event}\n{event}\n");
+        let denials = sandbox_denials_from_codex_jsonl(&controls, jsonl.as_bytes());
         assert_eq!(
             denials,
             vec![SandboxDenialEvidence {
-                boundary: SandboxDenialBoundary::OuterSystemd,
-                policy_id: OUTER_SYSTEMD_POLICY_ID.to_string(),
+                boundary: SandboxDenialBoundary::InnerCodex,
+                policy_id: INNER_CODEX_POLICY_ID.to_string(),
                 operation: SandboxDeniedOperation::Write,
                 path: Some(PathBuf::from("AGENTS.md")),
-                retryability: SandboxDenialRetryability::RequiresDeclaredCapability,
+                retryability: SandboxDenialRetryability::RequiresDeclaredException,
             }]
         );
-        let serialized = serde_json::to_value(&denials[0])?;
-        assert_eq!(serialized["path"], "AGENTS.md");
-        assert!(!serialized
-            .to_string()
-            .contains(&workspace.display().to_string()));
-        let denial_message = format!(
-            "cannot write {}: Read-only file system",
-            workspace.join("AGENTS.md").display()
+        let serialized = serde_json::to_string(&denials)?;
+        assert!(!serialized.contains(&workspace.display().to_string()));
+
+        for noise in [
+            br#"{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"AGENTS.md: permission denied"}}"#.as_slice(),
+            br#"{"type":"item.completed","item":{"id":"item-1","type":"command_execution","command":"touch AGENTS.md","aggregated_output":"permission denied","exit_code":0,"status":"completed"}}"#.as_slice(),
+            br#"arbitrary agent prose says AGENTS.md permission denied"#.as_slice(),
+            br#"{"type":"item.completed","item":{"id":"item-1","type":"command_execution","command":"touch AGENTS.md.bak","aggregated_output":"permission denied","exit_code":1,"status":"failed"}}"#.as_slice(),
+        ] {
+            assert!(sandbox_denials_from_codex_jsonl(&controls, noise).is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_inner_permissions_keep_exact_reads_writes_and_toml_escaping() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&workspace)?;
+        fs::create_dir(&incoming)?;
+        fs::write(
+            workspace.join(".git"),
+            "gitdir: ../primary/.git/worktrees/child\n",
+        )?;
+        for root in [".maco", ".codex", ".agents"] {
+            fs::create_dir(workspace.join(root))?;
+        }
+        let exception = PathBuf::from(".agents/policy\"quoted.md");
+        fs::write(workspace.join(&exception), "policy\n")?;
+        fs::write(workspace.join(".gitattributes"), "* text=auto\n")?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        )
+        .with_worktree_control_exception(&exception);
+        let controls = protected_worktree_controls(&command)?;
+        let permissions = codex_filesystem_permissions(&command, &controls);
+
+        assert!(permissions.contains("\":minimal\"=\"read\""));
+        assert!(permissions.contains("\":workspace_roots\"={\".\"=\"write\"}"));
+        for path in [".git", ".maco", ".codex", ".agents", ".gitattributes"] {
+            assert!(
+                permissions.contains(&format!("{}=\"read\"", toml_basic_string(path))),
+                "missing exact read entry for {path}: {permissions}"
+            );
+        }
+        assert!(permissions.contains("\".agents/policy\\\"quoted.md\"=\"write\""));
+        assert!(!permissions.contains("\".agents\"=\"write\""));
+        assert!(permissions.contains(&format!(
+            "{}=\"write\"",
+            toml_basic_string(incoming.to_str().context("UTF-8 incoming path")?)
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn stored_denial_evidence_round_trips_and_old_json_defaults_empty() -> Result<()> {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
         );
         let mut report = failed_external_run(
             &command,
@@ -2563,34 +2921,56 @@ mod tests {
             false,
             "external agent exited with status 1".to_string(),
         );
-        report.stderr.text = denial_message.clone();
-        report.stderr.bytes = denial_message.into_bytes();
-        let report_value = serde_json::to_value(&report)?;
-        assert_eq!(
-            report_value["sandbox_denials"][0]["boundary"],
-            "outer_systemd"
-        );
-        assert_eq!(report_value["sandbox_denials"][0]["path"], "AGENTS.md");
-        assert!(!report_value["sandbox_denials"]
-            .to_string()
-            .contains(&workspace.display().to_string()));
+        report.stdout.run_metadata.sandbox_denials = vec![SandboxDenialEvidence {
+            boundary: SandboxDenialBoundary::InnerCodex,
+            policy_id: INNER_CODEX_POLICY_ID.to_string(),
+            operation: SandboxDeniedOperation::Write,
+            path: Some(PathBuf::from("AGENTS.md")),
+            retryability: SandboxDenialRetryability::RequiresDeclaredException,
+        }];
+        let value = serde_json::to_value(&report)?;
+        let decoded: ExternalAgentRun = serde_json::from_value(value.clone())?;
+        assert_eq!(decoded.sandbox_denials(), report.sandbox_denials());
 
-        let inner = sandbox_denials_from_output(
-            &command,
-            r#"{"error":"network access denied by sandbox policy"}"#,
-            "",
-        );
+        let mut old = value;
+        old.as_object_mut()
+            .context("run serialization must be an object")?
+            .remove("sandbox_denials");
+        let old_decoded: ExternalAgentRun = serde_json::from_value(old)?;
+        assert!(old_decoded.sandbox_denials().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn outer_denial_evidence_uses_only_typed_process_errors() {
+        let typed = ProcessRunError::ContainmentUnavailable {
+            label: "external agent".to_string(),
+            command: "codex exec".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "systemd refused boundary",
+            ),
+        };
         assert_eq!(
-            inner,
-            vec![SandboxDenialEvidence {
-                boundary: SandboxDenialBoundary::InnerCodex,
-                policy_id: INNER_CODEX_POLICY_ID.to_string(),
-                operation: SandboxDeniedOperation::NetworkAccess,
+            sandbox_denial_from_process_error(&typed),
+            Some(SandboxDenialEvidence {
+                boundary: SandboxDenialBoundary::OuterSystemd,
+                policy_id: OUTER_SYSTEMD_POLICY_ID.to_string(),
+                operation: SandboxDeniedOperation::EstablishBoundary,
                 path: None,
                 retryability: SandboxDenialRetryability::NotRetryable,
-            }]
+            })
         );
-        Ok(())
+        let prose_only = ProcessRunError::Spawn {
+            label: "external agent".to_string(),
+            command: "codex exec".to_string(),
+            current_dir: PathBuf::from("/workspace"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "required process containment is unavailable",
+            ),
+        };
+        assert_eq!(sandbox_denial_from_process_error(&prose_only), None);
     }
 
     #[test]
@@ -2613,6 +2993,7 @@ mod tests {
             &spec,
             &workspace.join("codex"),
             ExternalProgramTrust::TrustedSystemCodex,
+            &protected_worktree_controls(&spec)?,
         )?;
         let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
             bail!("expected external Codex profile");
