@@ -17,9 +17,9 @@ use crate::{
     planning,
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
-        EnvironmentMode, ProcessCancellation, ProcessSpec, ProcessTreeEvidence,
-        SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode,
-        StrictOfflineWorkspaceProfile, WorkspaceAccess,
+        EnvironmentMode, HostProcessCapacity, ProcessCancellation, ProcessSpec,
+        ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
+        StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
     safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
@@ -46,8 +46,10 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs,
+    fmt, fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{mpsc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -105,6 +107,53 @@ pub enum SupervisorRuntime {
     #[default]
     Codex,
     Fake,
+}
+
+/// Admission policy for concurrently runnable supervisor children.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SupervisorConcurrencyPolicy {
+    /// Use the same measured, cgroup-aware process capacity as strict systemd containment.
+    ///
+    /// The issue #24 swarm-health circuit breaker remains the admission safety backstop: higher
+    /// default fan-out never bypasses its pre-dispatch check or active-child drain behavior.
+    #[default]
+    Auto,
+    /// Run at most this explicit positive number of children.
+    Fixed(NonZeroUsize),
+}
+
+impl SupervisorConcurrencyPolicy {
+    pub(crate) const fn resolve(self, capacity: HostProcessCapacity) -> usize {
+        match self {
+            Self::Auto => capacity.supervisor_children(),
+            Self::Fixed(limit) => limit.get(),
+        }
+    }
+}
+
+impl fmt::Display for SupervisorConcurrencyPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str("auto"),
+            Self::Fixed(limit) => write!(formatter, "{limit}"),
+        }
+    }
+}
+
+impl FromStr for SupervisorConcurrencyPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value == "auto" {
+            return Ok(Self::Auto);
+        }
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| "--max-concurrent-children must be at least 1 or 'auto'".to_string())?;
+        NonZeroUsize::new(parsed)
+            .map(Self::Fixed)
+            .ok_or_else(|| "--max-concurrent-children must be at least 1 or 'auto'".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1336,7 +1385,18 @@ fn supervisor_plan_value(
 }
 
 pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<SupervisorFinalReport> {
-    run_supervisor_plan_file_with_max_concurrent_children(options, 1)
+    run_supervisor_plan_file_with_concurrency_policy(
+        options,
+        SupervisorConcurrencyPolicy::default(),
+    )
+}
+
+pub fn run_supervisor_plan_file_with_concurrency_policy(
+    options: SupervisorRunOptions,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+) -> Result<SupervisorFinalReport> {
+    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
+    run_supervisor_plan_file_with_max_concurrent_children(options, max_concurrent_children)
 }
 
 pub fn run_supervisor_plan_file_with_max_concurrent_children(
@@ -10307,6 +10367,56 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn concurrency_policy_parses_auto_and_positive_limits_with_auto_default() {
+        assert_eq!(
+            "auto".parse::<SupervisorConcurrencyPolicy>(),
+            Ok(SupervisorConcurrencyPolicy::Auto)
+        );
+        assert_eq!(
+            "1".parse::<SupervisorConcurrencyPolicy>(),
+            Ok(SupervisorConcurrencyPolicy::Fixed(
+                NonZeroUsize::new(1).expect("one is non-zero")
+            ))
+        );
+        assert_eq!(
+            "17".parse::<SupervisorConcurrencyPolicy>(),
+            Ok(SupervisorConcurrencyPolicy::Fixed(
+                NonZeroUsize::new(17).expect("seventeen is non-zero")
+            ))
+        );
+        assert_eq!(
+            SupervisorConcurrencyPolicy::default(),
+            SupervisorConcurrencyPolicy::Auto
+        );
+        for invalid in ["0", "Auto", "-1", "many"] {
+            assert!(
+                invalid.parse::<SupervisorConcurrencyPolicy>().is_err(),
+                "unexpected valid policy: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_policy_resolves_auto_from_pinned_host_capacity() {
+        let capacity = HostProcessCapacity::from_parallelism(
+            NonZeroUsize::new(13).expect("test capacity is non-zero"),
+        );
+        assert_eq!(
+            SupervisorConcurrencyPolicy::Auto.resolve(capacity),
+            13,
+            "auto must preserve the measured capacity without a fixed ceiling"
+        );
+        assert_eq!(
+            SupervisorConcurrencyPolicy::Fixed(
+                NonZeroUsize::new(1).expect("serial limit is non-zero")
+            )
+            .resolve(capacity),
+            1,
+            "explicit one must remain the exact serial opt-out"
+        );
+    }
+
+    #[test]
     fn external_containment_gate_accepts_only_verified_empty_evidence() {
         assert!(
             ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
@@ -12842,7 +12952,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_scheduler_serializes_overlap_without_head_of_line_blocking() {
+    fn auto_policy_serializes_overlap_without_head_of_line_blocking() {
         #[derive(Default)]
         struct ScheduleState {
             events: Vec<String>,
@@ -12898,11 +13008,16 @@ mod tests {
             }
         };
 
+        let auto_bound =
+            SupervisorConcurrencyPolicy::Auto.resolve(HostProcessCapacity::from_parallelism(
+                NonZeroUsize::new(2).expect("test capacity is non-zero"),
+            ));
+        assert_eq!(auto_bound, 2);
         let report = run_supervisor_plan_with_concurrent_runner(
             plan,
             SupervisorConsultantPlan::default(),
             options,
-            2,
+            auto_bound,
             &runner,
         )
         .expect("run overlap-aware scheduler");
@@ -13003,11 +13118,18 @@ mod tests {
             }
         };
 
+        let serial_bound = SupervisorConcurrencyPolicy::Fixed(
+            NonZeroUsize::new(1).expect("serial limit is non-zero"),
+        )
+        .resolve(HostProcessCapacity::from_parallelism(
+            NonZeroUsize::new(8).expect("test capacity is non-zero"),
+        ));
+        assert_eq!(serial_bound, 1);
         let report = run_supervisor_plan_with_concurrent_runner(
             plan,
             SupervisorConsultantPlan::default(),
             options,
-            1,
+            serial_bound,
             &runner,
         )
         .expect("run serial overlapping assignments");

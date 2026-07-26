@@ -675,6 +675,19 @@ fn supervise_plan_still_rejects_overlapping_worker_siblings() -> Result<()> {
 }
 
 #[test]
+fn supervise_run_help_documents_auto_concurrency_default() -> Result<()> {
+    let output = Command::new(BIN)
+        .args(["supervise", "run", "--help"])
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).context("UTF-8 supervise run help")?;
+    assert!(stdout.contains("--max-concurrent-children <MAX_CONCURRENT_CHILDREN>"));
+    assert!(stdout.contains("auto` uses measured host capacity"));
+    assert!(stdout.contains("[default: auto]"));
+    Ok(())
+}
+
+#[test]
 fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -749,6 +762,23 @@ fn supervise_run_accepts_concurrent_bound_before_fake_runtime_safety_refusal() -
     ])?;
     assert!(stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
     assert!(!repo_path.join(".maco/o2/runs/bounded-two").exists());
+
+    let auto_stderr = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "bounded-auto",
+        "--runtime",
+        "fake",
+        "--max-concurrent-children",
+        "auto",
+        "--json",
+    ])?;
+    assert!(auto_stderr.contains(SUPERVISE_RUN_UNSUPPORTED));
+    assert!(!repo_path.join(".maco/o2/runs/bounded-auto").exists());
     Ok(())
 }
 

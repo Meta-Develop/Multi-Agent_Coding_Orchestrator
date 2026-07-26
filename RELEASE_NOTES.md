@@ -20,16 +20,18 @@ the Multi-Agent Coding Orchestrator.
 - Supervise evidence handling now includes worker-evidence cross-checks,
   canonical child-report artifacts, per-assignment task override, and stable
   child-diff baselines for auditable child results.
-- `maco supervise run --max-concurrent-children N` adds bounded child
-  scheduling while retaining legacy behavior at the default `N = 1`. Disjoint
-  path sets can run concurrently; overlapping assignments serialize with
-  scan-ahead scheduling under the sync claim overlap rules. Retries and parent
-  audits retain their assignment slot, ordinary failures remain isolated,
-  fatal aborts stop new starts and join active calls, plan-indexed outcomes
-  preserve deterministic report order, journal appends are synchronized, and
-  concurrent invocations use unique scratch roots. Zero is rejected before
-  artifacts are reserved. `max_child_assignments` remains the plan fan-out
-  budget rather than the concurrency bound.
+- `maco supervise run` now defaults `--max-concurrent-children` to `auto`,
+  deriving a resource-bounded child-execution limit from measured host
+  capacity. A positive numeric value remains available as an explicit override,
+  with `--max-concurrent-children 1` selecting serial execution. Disjoint path
+  sets can run concurrently; overlapping assignments serialize with scan-ahead
+  scheduling under the sync claim overlap rules. Retries and parent audits
+  retain their assignment slot, ordinary failures remain isolated, fatal
+  aborts stop new starts and join active calls, plan-indexed outcomes preserve
+  deterministic report order, journal appends are synchronized, and concurrent
+  invocations use unique scratch roots. Zero is rejected before artifacts are
+  reserved. `max_child_assignments` remains the plan fan-out budget rather than
+  the concurrency bound.
 - New terminal cross-runtime CONSULTANT role with `maco consult ask` and
   `maco consult artifacts list/latest/prune`. Consultation is fake-first by
   default, supports explicit read-only Codex and Claude CLI adapters, and can
