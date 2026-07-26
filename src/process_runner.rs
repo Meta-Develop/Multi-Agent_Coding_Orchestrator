@@ -50,6 +50,12 @@ const MAX_PRIVATE_RUNTIME_FILE_BYTES: usize = 1024 * 1024;
 const MAX_PRIVATE_RUNTIME_FILES: usize = 32;
 #[cfg(target_os = "linux")]
 const MAX_SANDBOX_ENTRY_SCAN: usize = 200_000;
+#[cfg(target_os = "linux")]
+const MAX_SANDBOX_MOUNTINFO_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_SANDBOX_MOUNTINFO_ENTRIES: usize = 65_536;
+#[cfg(target_os = "linux")]
+const MAX_SANDBOX_MOUNTINFO_LINE_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THREAD_JOIN_GRACE: Duration = Duration::from_millis(500);
 const IO_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -4146,7 +4152,7 @@ struct SandboxPathIdentity {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SandboxMountAccess {
     ReadOnly,
     ReadWrite,
@@ -4162,6 +4168,26 @@ struct SandboxMountCheck {
     inode: u64,
     access: SandboxMountAccess,
     optional: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxMountInfo {
+    mount_id: u64,
+    device_major: u64,
+    device_minor: u64,
+    root: PathBuf,
+    mount_point: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxMountRegion {
+    visible_path: PathBuf,
+    device_major: u64,
+    device_minor: u64,
+    backing_path: PathBuf,
+    access: SandboxMountAccess,
 }
 
 #[cfg(target_os = "linux")]
@@ -4283,6 +4309,7 @@ impl ResolvedSystemdSandbox {
     }
 
     fn verify_no_special_entries(&self) -> std::io::Result<()> {
+        self.verify_mount_alias_conflicts()?;
         let mut roots = vec![(
             self.workspace_root.clone(),
             self.workspace_access == WorkspaceAccess::ReadWrite,
@@ -4336,7 +4363,8 @@ impl ResolvedSystemdSandbox {
                 ));
             }
         }
-        self.verify_narrow_writable_hardlink_scope()
+        self.verify_narrow_writable_hardlink_scope()?;
+        self.verify_protected_read_only_hardlink_scope()
     }
 
     fn verify_narrow_writable_hardlink_scope(&self) -> std::io::Result<()> {
@@ -4385,6 +4413,213 @@ impl ResolvedSystemdSandbox {
         }
         Ok(())
     }
+
+    fn effective_path_access(&self, path: &Path) -> std::io::Result<Option<SandboxMountAccess>> {
+        let mut selected: Option<(usize, SandboxMountAccess)> = None;
+        let mut consider =
+            |boundary: &Path, exact: bool, access: SandboxMountAccess| -> std::io::Result<()> {
+                if (exact && path != boundary) || (!exact && !path.starts_with(boundary)) {
+                    return Ok(());
+                }
+                let specificity = boundary.components().count();
+                match selected {
+                    Some((existing_specificity, existing_access))
+                        if existing_specificity == specificity && existing_access != access =>
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "sandbox path has conflicting effective access: {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    Some((existing_specificity, _)) if existing_specificity > specificity => {}
+                    _ => selected = Some((specificity, access)),
+                }
+                Ok(())
+            };
+
+        consider(
+            &self.workspace_root,
+            false,
+            match self.workspace_access {
+                WorkspaceAccess::ReadOnly => SandboxMountAccess::ReadOnly,
+                WorkspaceAccess::ReadWrite => SandboxMountAccess::ReadWrite,
+            },
+        )?;
+        for root in &self.visible_read_only_roots {
+            consider(root, false, SandboxMountAccess::ReadOnly)?;
+        }
+        for file in &self.visible_read_only_files {
+            consider(file, true, SandboxMountAccess::ReadOnly)?;
+        }
+        for root in self
+            .visible_read_write_roots
+            .iter()
+            .chain(&self.writable_artifact_roots)
+        {
+            consider(root, false, SandboxMountAccess::ReadWrite)?;
+        }
+        for file in &self.visible_read_write_files {
+            consider(file, true, SandboxMountAccess::ReadWrite)?;
+        }
+        Ok(selected.map(|(_, access)| access))
+    }
+
+    fn verify_protected_read_only_hardlink_scope(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut protected_roots = self.visible_read_only_roots.clone();
+        if self.workspace_access == WorkspaceAccess::ReadOnly {
+            protected_roots.push(self.workspace_root.clone());
+        }
+        minimize_sandbox_roots(&mut protected_roots);
+
+        let mut writable_roots = self.visible_read_write_roots.clone();
+        writable_roots.extend(self.writable_artifact_roots.iter().cloned());
+        if self.workspace_access == WorkspaceAccess::ReadWrite {
+            writable_roots.push(self.workspace_root.clone());
+        }
+        minimize_sandbox_roots(&mut writable_roots);
+
+        let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+        let mut protected_inodes: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+        for root in protected_roots {
+            scan_sandbox_regular_files(&root, &mut remaining, |path, metadata| {
+                if self.effective_path_access(path)? == Some(SandboxMountAccess::ReadOnly) {
+                    protected_inodes
+                        .entry((metadata.dev(), metadata.ino()))
+                        .or_insert_with(|| path.to_path_buf());
+                }
+                Ok(())
+            })?;
+        }
+        for file in &self.visible_read_only_files {
+            let metadata = fs::symlink_metadata(file)?;
+            if self.effective_path_access(file)? == Some(SandboxMountAccess::ReadOnly) {
+                protected_inodes
+                    .entry((metadata.dev(), metadata.ino()))
+                    .or_insert_with(|| file.clone());
+            }
+        }
+
+        let reject_writable_alias = |path: &Path,
+                                     metadata: &fs::Metadata,
+                                     protected_inodes: &BTreeMap<(u64, u64), PathBuf>|
+         -> std::io::Result<()> {
+            if self.effective_path_access(path)? != Some(SandboxMountAccess::ReadWrite) {
+                return Ok(());
+            }
+            if protected_inodes.contains_key(&(metadata.dev(), metadata.ino())) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "protected read-only sandbox file has a writable hard-link alias: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        for root in writable_roots {
+            scan_sandbox_regular_files(&root, &mut remaining, |path, metadata| {
+                reject_writable_alias(path, metadata, &protected_inodes)
+            })?;
+        }
+        for file in &self.visible_read_write_files {
+            let metadata = fs::symlink_metadata(file)?;
+            reject_writable_alias(file, &metadata, &protected_inodes)?;
+        }
+        Ok(())
+    }
+
+    fn verify_mount_alias_conflicts(&self) -> std::io::Result<()> {
+        let mountinfo = read_sandbox_mountinfo()?;
+        verify_sandbox_mount_alias_conflicts(self, &mountinfo)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn minimize_sandbox_roots(roots: &mut Vec<PathBuf>) {
+    roots.sort();
+    roots.dedup();
+    let mut minimal: Vec<PathBuf> = Vec::new();
+    for root in roots.drain(..) {
+        if !minimal.iter().any(|ancestor| root.starts_with(ancestor)) {
+            minimal.push(root);
+        }
+    }
+    *roots = minimal;
+}
+
+#[cfg(target_os = "linux")]
+fn scan_sandbox_regular_files(
+    root: &Path,
+    remaining: &mut usize,
+    mut visit: impl FnMut(&Path, &fs::Metadata) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_device = fs::symlink_metadata(root)?.dev();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if *remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sandbox protected-file scan exceeded the fail-closed {MAX_SANDBOX_ENTRY_SCAN} entry limit"
+                ),
+            ));
+        }
+        *remaining -= 1;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect sandbox entry {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if metadata.dev() != root_device {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "sandbox tree crosses a filesystem or mount boundary: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            for entry in fs::read_dir(&path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to enumerate sandbox directory {}: {error}",
+                        path.display()
+                    ),
+                )
+            })? {
+                pending.push(entry?.path());
+            }
+        } else if file_type.is_file() {
+            visit(&path, &metadata)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "sandbox contains a socket, FIFO, or device node: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -4489,6 +4724,353 @@ fn scan_sandbox_tree(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_sandbox_mountinfo() -> std::io::Result<Vec<SandboxMountInfo>> {
+    let file = File::open("/proc/self/mountinfo")?;
+    let mut bytes = Vec::new();
+    file.take((MAX_SANDBOX_MOUNTINFO_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SANDBOX_MOUNTINFO_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mountinfo exceeds the fail-closed {MAX_SANDBOX_MOUNTINFO_BYTES} byte limit"),
+        ));
+    }
+    parse_sandbox_mountinfo(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_sandbox_mountinfo(bytes: &[u8]) -> std::io::Result<Vec<SandboxMountInfo>> {
+    let mut entries = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > MAX_SANDBOX_MOUNTINFO_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "mountinfo line exceeds the fail-closed {MAX_SANDBOX_MOUNTINFO_LINE_BYTES} byte limit"
+                ),
+            ));
+        }
+        if entries.len() >= MAX_SANDBOX_MOUNTINFO_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "mountinfo exceeds the fail-closed {MAX_SANDBOX_MOUNTINFO_ENTRIES} entry limit"
+                ),
+            ));
+        }
+        let fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let separator = fields
+            .iter()
+            .position(|field| *field == b"-")
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mountinfo entry omitted the filesystem separator",
+                )
+            })?;
+        if separator < 6 || separator + 3 >= fields.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mountinfo entry has an invalid field count",
+            ));
+        }
+        let mount_id = parse_mountinfo_u64(fields[0], "mount id")?;
+        let _parent_mount_id = parse_mountinfo_u64(fields[1], "parent mount id")?;
+        let device = std::str::from_utf8(fields[2]).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mountinfo device identity is not ASCII",
+            )
+        })?;
+        let (device_major, device_minor) = device.split_once(':').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mountinfo device identity omitted ':'",
+            )
+        })?;
+        let device_major = device_major.parse::<u64>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid mountinfo device major: {error}"),
+            )
+        })?;
+        let device_minor = device_minor.parse::<u64>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid mountinfo device minor: {error}"),
+            )
+        })?;
+        let root = decode_mountinfo_path(fields[3], "mount root")?;
+        let mount_point = decode_mountinfo_path(fields[4], "mount point")?;
+        entries.push(SandboxMountInfo {
+            mount_id,
+            device_major,
+            device_minor,
+            root,
+            mount_point,
+        });
+    }
+    let mut mount_ids = BTreeSet::new();
+    if entries
+        .iter()
+        .any(|entry| !mount_ids.insert(entry.mount_id))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mountinfo contains duplicate mount ids",
+        ));
+    }
+    if entries.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mountinfo contained no entries",
+        ));
+    }
+    Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mountinfo_u64(field: &[u8], label: &str) -> std::io::Result<u64> {
+    let text = std::str::from_utf8(field).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mountinfo {label} is not ASCII"),
+        )
+    })?;
+    text.parse::<u64>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid mountinfo {label}: {error}"),
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(field: &[u8], label: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while index < field.len() {
+        if field[index] != b'\\' {
+            decoded.push(field[index]);
+            index += 1;
+            continue;
+        }
+        if index + 3 >= field.len()
+            || !field[index + 1..=index + 3]
+                .iter()
+                .all(|byte| matches!(*byte, b'0'..=b'7'))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("mountinfo {label} contains an invalid escape"),
+            ));
+        }
+        let value = (field[index + 1] - b'0') * 64
+            + (field[index + 2] - b'0') * 8
+            + (field[index + 3] - b'0');
+        if !matches!(value, b' ' | b'\t' | b'\n' | b'\\') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("mountinfo {label} contains an unsupported escape"),
+            ));
+        }
+        decoded.push(value);
+        index += 4;
+    }
+    let path = PathBuf::from(OsString::from_vec(decoded));
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mountinfo {label} is not a normalized absolute path"),
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_mount_backing_region(
+    path: &Path,
+    mountinfo: &[SandboxMountInfo],
+) -> std::io::Result<(u64, u64, PathBuf)> {
+    let max_specificity = mountinfo
+        .iter()
+        .filter(|entry| path.starts_with(&entry.mount_point))
+        .map(|entry| entry.mount_point.components().count())
+        .max()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "mountinfo did not contain an authoritative mount for sandbox path {}",
+                    path.display()
+                ),
+            )
+        })?;
+    let mut identities = mountinfo
+        .iter()
+        .filter(|entry| {
+            entry.mount_point.components().count() == max_specificity
+                && path.starts_with(&entry.mount_point)
+        })
+        .map(|entry| {
+            let relative = path.strip_prefix(&entry.mount_point).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to derive mount-relative sandbox path: {error}"),
+                )
+            })?;
+            Ok((
+                entry.device_major,
+                entry.device_minor,
+                entry.root.join(relative),
+                entry.mount_id,
+            ))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    identities.sort();
+    identities.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+    if identities.len() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "mountinfo contains ambiguous authoritative mounts for sandbox path {}",
+                path.display()
+            ),
+        ));
+    }
+    let (major, minor, backing, _) = identities.remove(0);
+    Ok((major, minor, backing))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_sandbox_mount_alias_conflicts(
+    sandbox: &ResolvedSystemdSandbox,
+    mountinfo: &[SandboxMountInfo],
+) -> std::io::Result<()> {
+    let mut boundaries = vec![(
+        sandbox.workspace_root.clone(),
+        match sandbox.workspace_access {
+            WorkspaceAccess::ReadOnly => SandboxMountAccess::ReadOnly,
+            WorkspaceAccess::ReadWrite => SandboxMountAccess::ReadWrite,
+        },
+    )];
+    boundaries.extend(
+        sandbox
+            .visible_read_only_roots
+            .iter()
+            .chain(&sandbox.visible_read_only_files)
+            .cloned()
+            .map(|path| (path, SandboxMountAccess::ReadOnly)),
+    );
+    boundaries.extend(
+        sandbox
+            .visible_read_write_roots
+            .iter()
+            .chain(&sandbox.visible_read_write_files)
+            .chain(&sandbox.writable_artifact_roots)
+            .cloned()
+            .map(|path| (path, SandboxMountAccess::ReadWrite)),
+    );
+    for entry in mountinfo {
+        if sandbox.effective_path_access(&entry.mount_point)?.is_some() {
+            boundaries.push((
+                entry.mount_point.clone(),
+                sandbox
+                    .effective_path_access(&entry.mount_point)?
+                    .ok_or_else(|| std::io::Error::other("sandbox mount access disappeared"))?,
+            ));
+        }
+    }
+    boundaries.sort();
+    boundaries.dedup();
+    if boundaries.len() > MAX_SANDBOX_MOUNT_CHECKS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sandbox mount-region vector exceeds its safety bound",
+        ));
+    }
+
+    let mut regions = boundaries
+        .into_iter()
+        .map(|(visible_path, access)| {
+            let (device_major, device_minor, backing_path) =
+                sandbox_mount_backing_region(&visible_path, mountinfo)?;
+            Ok(SandboxMountRegion {
+                visible_path,
+                device_major,
+                device_minor,
+                backing_path,
+                access,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    regions.sort_by(|left, right| {
+        left.visible_path
+            .cmp(&right.visible_path)
+            .then(left.access.cmp(&right.access))
+            .then(left.device_major.cmp(&right.device_major))
+            .then(left.device_minor.cmp(&right.device_minor))
+            .then(left.backing_path.cmp(&right.backing_path))
+    });
+    regions.dedup();
+
+    for (index, left) in regions.iter().enumerate() {
+        for right in regions.iter().skip(index + 1) {
+            if left.access == right.access {
+                continue;
+            }
+            if sandbox_mount_regions_conflict(left, right) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "sandbox read-only and writable paths have a mount identity conflict: {} and {}",
+                        left.visible_path.display(),
+                        right.visible_path.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sandbox_mount_regions_conflict(left: &SandboxMountRegion, right: &SandboxMountRegion) -> bool {
+    if left.visible_path == right.visible_path {
+        return true;
+    }
+    if let Ok(relative) = left.visible_path.strip_prefix(&right.visible_path) {
+        return left.device_major != right.device_major
+            || left.device_minor != right.device_minor
+            || left.backing_path != right.backing_path.join(relative);
+    }
+    if let Ok(relative) = right.visible_path.strip_prefix(&left.visible_path) {
+        return left.device_major != right.device_major
+            || left.device_minor != right.device_minor
+            || right.backing_path != left.backing_path.join(relative);
+    }
+    left.device_major == right.device_major
+        && left.device_minor == right.device_minor
+        && (left.backing_path.starts_with(&right.backing_path)
+            || right.backing_path.starts_with(&left.backing_path))
 }
 
 #[cfg(target_os = "linux")]
@@ -8893,6 +9475,178 @@ mod tests {
             Ok(_) => panic!("hard-link alias outside exact writable root must fail closed"),
         };
         assert!(error.to_string().contains("hard-link alias outside"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_codex_rejects_writable_aliases_to_every_protected_file_class() {
+        for protected_class in ["linked-git", "policy-root", "permanent-root"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("worktree");
+            let git_marker = workspace.join(".git");
+            let policy_root = workspace.join(".agents");
+            let policy_file = policy_root.join("policy.md");
+            let permanent_root = workspace.join(".maco");
+            let permanent_file = permanent_root.join("state");
+            let incoming = temp.path().join("incoming");
+            fs::create_dir(&workspace).expect("workspace");
+            fs::create_dir(&policy_root).expect("policy root");
+            fs::create_dir(&permanent_root).expect("permanent root");
+            fs::create_dir(&incoming).expect("incoming root");
+            fs::write(&git_marker, "gitdir: ../primary/.git/worktrees/child\n")
+                .expect("linked-worktree marker");
+            fs::write(&policy_file, "policy\n").expect("policy file");
+            fs::write(&permanent_file, "state\n").expect("permanent state");
+
+            let (protected, alias) = match protected_class {
+                "linked-git" => (&git_marker, workspace.join("git-alias")),
+                "policy-root" => (&policy_file, workspace.join("policy-alias")),
+                "permanent-root" => (&permanent_file, incoming.join("state-alias")),
+                _ => unreachable!("bounded protected class"),
+            };
+            fs::hard_link(protected, &alias).expect("writable hard-link alias");
+
+            let profile = ExternalCodexProfile::read_write(&workspace)
+                .with_visible_read_only_root(&policy_root)
+                .with_visible_read_only_root(&permanent_root)
+                .with_visible_read_only_file(&git_marker)
+                .with_writable_artifact_root(&incoming);
+            let spec = ProcessSpec::direct(
+                "external Codex protected inode aliases",
+                PathBuf::from("/bin/true"),
+                Vec::<OsString>::new(),
+                &workspace,
+                128,
+            )
+            .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+            let error = match resolve_systemd_sandbox(&spec) {
+                Err(error) => error,
+                Ok(_) => panic!("{protected_class} writable alias must fail closed"),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("protected read-only sandbox file has a writable hard-link alias"),
+                "unexpected {protected_class} rejection: {error}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_codex_legitimate_exact_file_exception_is_not_protected_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("worktree");
+        let policy_root = workspace.join(".agents");
+        let exception = policy_root.join("docs/worker.md");
+        fs::create_dir_all(exception.parent().expect("exception parent")).expect("policy tree");
+        fs::write(&exception, "worker policy\n").expect("writable exception");
+
+        let profile = ExternalCodexProfile::read_write(&workspace)
+            .with_visible_read_only_root(&policy_root)
+            .with_visible_read_write_file(&exception);
+        let spec = ProcessSpec::direct(
+            "external Codex exact exception",
+            PathBuf::from("/bin/true"),
+            Vec::<OsString>::new(),
+            &workspace,
+            128,
+        )
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+        let sandbox = resolve_systemd_sandbox(&spec)
+            .expect("legitimate exact exception")
+            .expect("resolved sandbox");
+        assert_eq!(
+            sandbox
+                .effective_path_access(&exception)
+                .expect("effective exception access"),
+            Some(SandboxMountAccess::ReadWrite)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_parser_decodes_paths_and_rejects_malformed_or_oversized_input() {
+        let parsed = parse_sandbox_mountinfo(
+            b"10 1 8:1 / / rw,relatime - ext4 /dev/root rw\n\
+              11 10 8:1 /repo/policy /repo/work\\040tree/policy rw - ext4 /dev/root rw\n",
+        )
+        .expect("synthetic mountinfo");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].root, PathBuf::from("/repo/policy"));
+        assert_eq!(
+            parsed[1].mount_point,
+            PathBuf::from("/repo/work tree/policy")
+        );
+        assert!(parse_sandbox_mountinfo(b"10 1 8:1 / /\n").is_err());
+        assert!(
+            parse_sandbox_mountinfo(b"10 1 8:1 /bad\\escape /point rw - ext4 /dev/root rw\n")
+                .is_err()
+        );
+        let oversized = vec![b'x'; MAX_SANDBOX_MOUNTINFO_LINE_BYTES + 1];
+        assert!(parse_sandbox_mountinfo(&oversized).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
+        let workspace = PathBuf::from("/repo/worktree");
+        let policy_root = workspace.join(".agents");
+        let protected_file = workspace.join(".git");
+        let exception = policy_root.join("docs/worker.md");
+        let incoming = PathBuf::from("/run/maco/incoming");
+        let sandbox = ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::ExternalCodex,
+            workspace_root: workspace.clone(),
+            current_dir: workspace.clone(),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            visible_read_only_roots: vec![policy_root.clone()],
+            visible_read_only_files: vec![protected_file.clone()],
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: vec![exception.clone()],
+            writable_artifact_roots: vec![incoming.clone()],
+            hidden_roots: Vec::new(),
+            isolated_host_view: false,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        };
+        let base = b"10 1 8:1 / / rw,relatime - ext4 /dev/root rw\n";
+
+        let mut alias = base.to_vec();
+        alias.extend_from_slice(
+            b"11 10 8:1 /repo/worktree/.git /repo/worktree/alias rw - ext4 /dev/root rw\n",
+        );
+        let alias_mountinfo = parse_sandbox_mountinfo(&alias).expect("alias mountinfo");
+        let error = verify_sandbox_mount_alias_conflicts(&sandbox, &alias_mountinfo)
+            .expect_err("same-filesystem writable alias");
+        assert!(error.to_string().contains("mount identity conflict"));
+
+        let mut artifact_alias = base.to_vec();
+        artifact_alias.extend_from_slice(
+            b"12 10 8:1 /repo/worktree/.agents /run/maco/incoming rw - ext4 /dev/root rw\n",
+        );
+        let artifact_mountinfo =
+            parse_sandbox_mountinfo(&artifact_alias).expect("artifact alias mountinfo");
+        assert!(
+            verify_sandbox_mount_alias_conflicts(&sandbox, &artifact_mountinfo).is_err(),
+            "incoming artifact alias to protected policy root must fail closed"
+        );
+
+        let mut nested_exception = base.to_vec();
+        nested_exception.extend_from_slice(
+            b"13 10 8:1 /repo/worktree/.git /repo/worktree/.agents/docs/worker.md rw - ext4 /dev/root rw\n",
+        );
+        let nested_mountinfo =
+            parse_sandbox_mountinfo(&nested_exception).expect("nested mountinfo");
+        assert!(
+            verify_sandbox_mount_alias_conflicts(&sandbox, &nested_mountinfo).is_err(),
+            "writable exception mounted over protected content must fail closed"
+        );
+
+        let ordinary_mountinfo = parse_sandbox_mountinfo(base).expect("ordinary mountinfo");
+        verify_sandbox_mount_alias_conflicts(&sandbox, &ordinary_mountinfo)
+            .expect("ordinary direct RO/RW nesting");
     }
 
     #[cfg(target_os = "linux")]
