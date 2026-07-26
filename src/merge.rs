@@ -6,21 +6,31 @@ pub use crate::merge_semantic::{
     SemanticConflictSymbol,
 };
 use crate::{
+    artifacts::{
+        state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
+    },
+    external_agent::{run_external_agent, ExternalAgentCommand},
     llm::Redactor,
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
-    merge_semantic::classify_semantic_conflicts,
+    merge_semantic::{classify_semantic_candidate_pair, classify_semantic_conflicts},
+    orchestration_event::{
+        ArbitrationOutcome, ArbitrationOutcomeDetails, ArbitrationSide, OrchestrationEventJournal,
+        OrchestrationRole,
+    },
     orchestrator::RunId,
     process_runner::{
         run_process, ContainmentEvidence, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
         SideEffectConfinementEvidence, SideEffectConfinementProfile,
         SideEffectConfinementProfileKind, StdinMode, StrictOfflineWorkspaceProfile,
-        TrustedFixedNetworkProfile,
+        TrustedFixedNetworkProfile, WorkspaceAccess,
     },
+    semantic_coord::{SemanticIntent, SemanticIntentStore},
     supervise::{verified_megafile_decomposition_evidence, VerifiedMegafileDecompositionEvidence},
-    sync::normalize_repo_relative_path,
+    sync::{normalize_repo_relative_path, PathClaim},
+    sync_store::SyncStore,
     worktree::{
-        normalize_agent_id, ManagedWorktreeReadLease, ManagedWorktreeWriteLease, WorktreeManager,
-        WorktreeRecord,
+        normalize_agent_id, ManagedWorktreeReadLease, ManagedWorktreeWriteLease,
+        NeutralWorktreeCreateOptions, WorktreeManager, WorktreeRecord,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -41,7 +51,24 @@ use std::{
 
 pub const DEFAULT_DIFF_SUMMARY_CHAR_LIMIT: usize = 32 * 1024;
 pub const VALIDATION_BINDING_VERSION: u32 = 1;
+pub const ARBITRATION_INPUT_VERSION: u32 = 1;
+pub const ARBITRATION_PROPOSAL_VERSION: u32 = 1;
+pub const ARBITRATION_REPORT_VERSION: u32 = 1;
 const CANDIDATE_CAPTURE_ATTEMPTS: usize = 3;
+const MAX_ARBITRATION_INPUT_BYTES: usize = 768 * 1024;
+const MAX_ARBITRATION_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_ARBITRATION_PROPOSAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ARBITRATION_PATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ARBITRATION_RATIONALE_BYTES: usize = 64 * 1024;
+const MAX_ARBITRATION_VALIDATION_COMMANDS: usize = 128;
+const MAX_ARBITRATION_CHANGED_PATHS: usize = 8 * 1024;
+const ARBITRATION_INPUT_PATH: &str = "trusted/arbitration-input.json";
+const ARBITRATION_PROMPT_PATH: &str = "trusted/arbitration-prompt.md";
+const ARBITRATION_SCHEMA_PATH: &str = "trusted/arbitration-output.schema.json";
+const ARBITRATION_RATIONALE_PATH: &str = "reports/arbitration-rationale.json";
+const ARBITRATION_CANDIDATE_PATH: &str = "reports/arbitration-candidate.patch";
+const ARBITRATION_FINAL_REPORT_PATH: &str = "reports/supervisor-final.json";
+const ARBITRATION_INCOMING_DIR: &str = "arbiter-incoming";
 const LOCK_RECORD_VERSION: u32 = 3;
 const REPOSITORY_MUTATION_LOCK_FILE: &str = "repository-mutation.lock";
 const MAX_LOCK_RECORD_BYTES: u64 = 4 * 1024;
@@ -102,6 +129,1310 @@ pub struct MegafileMergePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateValidationCommand {
     pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeArbitrationOptions {
+    pub repo: PathBuf,
+    pub run_id: RunId,
+    pub arbiter_agent_id: String,
+    pub sides: [ArbitrationSideSpec; 2],
+    pub validation_commands: Vec<CandidateValidationCommand>,
+    pub approve: bool,
+    pub codex_bin: PathBuf,
+    pub timeout: Duration,
+    pub worktree_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArbitrationSideSpec {
+    Agent {
+        agent_id: String,
+        claimed_paths: Vec<PathBuf>,
+    },
+    Primary,
+}
+
+impl ArbitrationSideSpec {
+    fn journal_side(&self) -> ArbitrationSide {
+        match self {
+            Self::Agent { agent_id, .. } => ArbitrationSide::Agent {
+                id: agent_id.clone(),
+            },
+            Self::Primary => ArbitrationSide::Primary,
+        }
+    }
+
+    fn source_identity(&self) -> String {
+        match self {
+            Self::Agent { agent_id, .. } => agent_id.clone(),
+            Self::Primary => "primary".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArbitrationNeutralWorktree {
+    pub agent_id: String,
+    #[serde(serialize_with = "serialize_path")]
+    pub path: PathBuf,
+    pub branch: String,
+    pub exact_base_oid: String,
+    pub inherited_claim: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArbitrationSideEvidence {
+    pub participant: ArbitrationSide,
+    pub head_oid: String,
+    pub tree_oid: String,
+    pub base_oid: String,
+    pub diff_sha256: String,
+    pub diff_bytes: usize,
+    pub diff: String,
+    #[serde(serialize_with = "serialize_paths")]
+    pub changed_paths: Vec<PathBuf>,
+    pub candidate_binding: Option<CandidateValidationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ArbitrationInput {
+    pub version: u32,
+    pub arbiter_id: String,
+    pub reviewed_base_oid: String,
+    pub neutral_worktree: ArbitrationNeutralWorktree,
+    pub sides: [ArbitrationSideEvidence; 2],
+    pub relevant_path_claims: Vec<PathClaim>,
+    pub relevant_semantic_intents: Vec<SemanticIntent>,
+    pub semantic_classification: SemanticConflictClassification,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedMergeArbitration {
+    pub input: ArbitrationInput,
+    pub input_json: Vec<u8>,
+    pub input_sha256: String,
+    pub primary_repo_root: PathBuf,
+    pub primary_state_sha256: String,
+    pub source_diffs: [Vec<u8>; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArbitrationProposalDisposition {
+    Proposed,
+    Rejected,
+    Escalated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArbitrationProposal {
+    pub version: u32,
+    pub input_sha256: String,
+    pub disposition: ArbitrationProposalDisposition,
+    pub rationale: String,
+    pub candidate_patch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArbitrationRunnerExecution {
+    pub kind: String,
+    pub trusted_local_boundary: bool,
+    pub command: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArbitrationRunnerResult {
+    pub proposal: ArbitrationProposal,
+    pub execution: ArbitrationRunnerExecution,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbitrationRunnerRequest {
+    pub input_sha256: String,
+    pub prompt_path: PathBuf,
+    pub output_schema_path: PathBuf,
+    pub output_last_message_path: PathBuf,
+    pub json_log_path: PathBuf,
+    pub neutral_worktree_path: PathBuf,
+    pub hidden_primary_root: PathBuf,
+    pub run_id: String,
+    pub arbiter_id: String,
+}
+
+pub trait ArbitrationRunner {
+    fn run(&self, request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalArbitrationRunner {
+    pub codex_bin: PathBuf,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticArbitrationRunner {
+    output: Vec<u8>,
+}
+
+impl StaticArbitrationRunner {
+    pub fn from_bytes(output: impl Into<Vec<u8>>) -> Result<Self> {
+        let output = output.into();
+        parse_arbitration_proposal(&output)?;
+        Ok(Self { output })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArbitrationPreservationProof {
+    pub side: ArbitrationSide,
+    pub preserved: bool,
+    pub required_additions: usize,
+    pub preserved_additions: usize,
+    pub required_deletions: usize,
+    pub preserved_deletions: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MergeArbitrationReport {
+    pub version: u32,
+    pub run_id: String,
+    pub arbiter_id: String,
+    pub outcome: ArbitrationOutcome,
+    pub approved: bool,
+    pub primary_mutated: bool,
+    pub later_ordinary_merge_apply_required: bool,
+    pub reviewed_base_oid: String,
+    pub sides: [ArbitrationSide; 2],
+    pub neutral_worktree: ArbitrationNeutralWorktree,
+    pub input_artifact: String,
+    pub input_sha256: String,
+    pub rationale_artifact: String,
+    pub rationale_sha256: String,
+    pub candidate_artifact: Option<String>,
+    pub candidate_sha256: Option<String>,
+    pub candidate_binding: Option<CandidateValidationBinding>,
+    pub candidate_status: ValidationStatus,
+    pub preservation: Vec<ArbitrationPreservationProof>,
+    pub validation_commands: Vec<String>,
+    pub validations: Vec<ValidationReport>,
+    pub semantic_classification: SemanticConflictClassification,
+    pub runner: ArbitrationRunnerExecution,
+    pub reason: String,
+}
+
+pub trait ArbitrationEnvironment {
+    fn prepare(&self, options: &MergeArbitrationOptions) -> Result<PreparedMergeArbitration>;
+
+    fn materialize_candidate(
+        &self,
+        prepared: &PreparedMergeArbitration,
+        proposal: &ArbitrationProposal,
+    ) -> Result<MergeApplyPreview>;
+
+    fn validate_candidate(
+        &self,
+        preview: &MergeApplyPreview,
+        commands: &[CandidateValidationCommand],
+    ) -> Result<Vec<ValidationReport>>;
+
+    fn current_primary_state_sha256(&self, prepared: &PreparedMergeArbitration) -> Result<String>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProductionArbitrationEnvironment;
+
+impl ArbitrationRunner for ExternalArbitrationRunner {
+    fn run(&self, request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
+        let mut command = ExternalAgentCommand::codex(
+            &self.codex_bin,
+            &request.neutral_worktree_path,
+            &request.prompt_path,
+            &request.json_log_path,
+            &request.output_last_message_path,
+            self.timeout,
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_hidden_root(&request.hidden_primary_root)
+        .with_agent_lifecycle(
+            &request.hidden_primary_root,
+            "arbiter",
+            &request.run_id,
+            &request.arbiter_id,
+        );
+        command.output_schema = Some(request.output_schema_path.clone());
+        let run = run_external_agent(&command);
+        let execution = ArbitrationRunnerExecution {
+            kind: "external_local_agent".to_string(),
+            trusted_local_boundary: run.succeeded(),
+            command: run.command.clone(),
+            exit_code: run.exit_code,
+            timed_out: run.timed_out,
+        };
+        if !run.succeeded() {
+            bail!(
+                "neutral arbiter did not complete through the trusted local execution boundary: {}",
+                run.error
+                    .as_deref()
+                    .or_else(|| (!run.stderr.text.is_empty()).then_some(run.stderr.text.as_str()))
+                    .unwrap_or("trusted execution evidence was incomplete")
+            );
+        }
+        let output = run
+            .output_last_message()
+            .context("neutral arbiter produced no held final-message output")?;
+        let proposal = parse_arbitration_proposal(output)?;
+        Ok(ArbitrationRunnerResult {
+            proposal,
+            execution,
+        })
+    }
+}
+
+impl ArbitrationRunner for StaticArbitrationRunner {
+    fn run(&self, _request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
+        Ok(ArbitrationRunnerResult {
+            proposal: parse_arbitration_proposal(&self.output)?,
+            execution: ArbitrationRunnerExecution {
+                kind: "static_fake".to_string(),
+                trusted_local_boundary: false,
+                command: Vec::new(),
+                exit_code: Some(0),
+                timed_out: false,
+            },
+        })
+    }
+}
+
+pub fn parse_arbitration_proposal(bytes: &[u8]) -> Result<ArbitrationProposal> {
+    if bytes.len() > MAX_ARBITRATION_PROPOSAL_BYTES {
+        bail!("arbiter output exceeds its {MAX_ARBITRATION_PROPOSAL_BYTES}-byte limit");
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).context("arbiter output is not strict proposal JSON")?;
+    let object = value
+        .as_object()
+        .context("arbiter output must be one strict JSON object")?;
+    for field in [
+        "version",
+        "input_sha256",
+        "disposition",
+        "rationale",
+        "candidate_patch",
+    ] {
+        if !object.contains_key(field) {
+            bail!("arbiter output is missing required field '{field}'");
+        }
+    }
+    let proposal: ArbitrationProposal =
+        serde_json::from_value(value).context("arbiter output is not strict proposal JSON")?;
+    validate_arbitration_proposal_shape(&proposal)?;
+    Ok(proposal)
+}
+
+fn validate_arbitration_proposal_shape(proposal: &ArbitrationProposal) -> Result<()> {
+    if proposal.version != ARBITRATION_PROPOSAL_VERSION {
+        bail!(
+            "unsupported arbitration proposal version {}; expected {}",
+            proposal.version,
+            ARBITRATION_PROPOSAL_VERSION
+        );
+    }
+    validate_lowercase_sha256(&proposal.input_sha256, "arbitration input digest")?;
+    if proposal.rationale.trim().is_empty()
+        || proposal.rationale.trim() != proposal.rationale
+        || proposal.rationale.len() > MAX_ARBITRATION_RATIONALE_BYTES
+        || proposal.rationale.contains('\0')
+    {
+        bail!("arbiter rationale is empty, non-canonical, or exceeds its bounded text contract");
+    }
+    if proposal
+        .candidate_patch
+        .as_ref()
+        .is_some_and(|patch| patch.len() > MAX_ARBITRATION_PATCH_BYTES)
+    {
+        bail!("arbiter candidate patch exceeds its {MAX_ARBITRATION_PATCH_BYTES}-byte limit");
+    }
+    match proposal.disposition {
+        ArbitrationProposalDisposition::Proposed if proposal.candidate_patch.is_none() => {
+            bail!("a proposed arbitration resolution must include candidate_patch")
+        }
+        ArbitrationProposalDisposition::Escalated if proposal.candidate_patch.is_some() => {
+            bail!("an escalated arbitration result must not include candidate_patch")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_lowercase_sha256(value: &str, field: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{field} must be canonical lowercase SHA-256");
+    }
+    Ok(())
+}
+
+pub fn arbitrate_merge(options: MergeArbitrationOptions) -> Result<MergeArbitrationReport> {
+    let runner = ExternalArbitrationRunner {
+        codex_bin: options.codex_bin.clone(),
+        timeout: options.timeout,
+    };
+    arbitrate_merge_with_runner(options, &runner)
+}
+
+pub fn arbitrate_merge_with_runner(
+    options: MergeArbitrationOptions,
+    runner: &dyn ArbitrationRunner,
+) -> Result<MergeArbitrationReport> {
+    arbitrate_merge_with_environment(options, runner, &ProductionArbitrationEnvironment)
+}
+
+pub fn arbitrate_merge_with_environment(
+    options: MergeArbitrationOptions,
+    runner: &dyn ArbitrationRunner,
+    environment: &dyn ArbitrationEnvironment,
+) -> Result<MergeArbitrationReport> {
+    let options = canonicalize_arbitration_options(options)?;
+    let repo_root = discover_primary_repo_root(&options.repo)?;
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_root,
+        RunArtifactFamily::Supervise,
+        options.run_id.clone(),
+        "merge-arbitration",
+    )
+    .context("failed to reserve private arbitration artifacts")?;
+    let prepared = environment
+        .prepare(&options)
+        .context("failed to prepare exact neutral arbitration input")?;
+    writer.write_bytes(
+        ARBITRATION_INPUT_PATH,
+        &prepared.input_json,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    let prompt = arbitration_prompt(&prepared);
+    if prompt.len() > MAX_ARBITRATION_PROMPT_BYTES {
+        bail!(
+            "arbitration prompt exceeds the trusted external runner's {MAX_ARBITRATION_PROMPT_BYTES}-byte limit"
+        );
+    }
+    writer.write_bytes(
+        ARBITRATION_PROMPT_PATH,
+        prompt.as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    writer.write_bytes(
+        ARBITRATION_SCHEMA_PATH,
+        arbitration_output_schema().as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+
+    let incoming = writer.create_scratch_dir(ARBITRATION_INCOMING_DIR)?;
+    let runner_request = ArbitrationRunnerRequest {
+        input_sha256: prepared.input_sha256.clone(),
+        prompt_path: writer.run_dir().join(ARBITRATION_PROMPT_PATH),
+        output_schema_path: writer.run_dir().join(ARBITRATION_SCHEMA_PATH),
+        output_last_message_path: incoming.path().join("proposal.json"),
+        json_log_path: incoming.path().join("arbiter.jsonl"),
+        neutral_worktree_path: prepared.input.neutral_worktree.path.clone(),
+        hidden_primary_root: repo_root.clone(),
+        run_id: options.run_id.as_str().to_string(),
+        arbiter_id: options.arbiter_agent_id.clone(),
+    };
+    let runner_result = runner.run(&runner_request);
+    if runner_result.is_err() {
+        writer
+            .discard_scratch(&incoming)
+            .context("failed to discard failed arbiter invocation scratch")?;
+    }
+    let runner_result = runner_result?;
+    writer
+        .discard_scratch(&incoming)
+        .context("failed to discard completed arbiter invocation scratch")?;
+    validate_arbitration_proposal_shape(&runner_result.proposal)?;
+    if runner_result.proposal.input_sha256 != prepared.input_sha256 {
+        bail!("arbiter proposal input digest does not match the exact reviewed arbitration input");
+    }
+
+    let rationale_value = serde_json::json!({
+        "version": ARBITRATION_REPORT_VERSION,
+        "input_sha256": prepared.input_sha256,
+        "disposition": runner_result.proposal.disposition,
+        "rationale": runner_result.proposal.rationale,
+    });
+    let rationale_record = writer.write_json(
+        ARBITRATION_RATIONALE_PATH,
+        &rationale_value,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+
+    let mut candidate_artifact = None;
+    let mut candidate_sha256 = None;
+    let mut candidate_binding = None;
+    let mut candidate_status = ValidationStatus::NotRun;
+    let mut preservation = Vec::new();
+    let mut validations = Vec::new();
+    let mut reason = runner_result.proposal.rationale.clone();
+    let outcome = match runner_result.proposal.disposition {
+        ArbitrationProposalDisposition::Escalated => ArbitrationOutcome::Escalated,
+        ArbitrationProposalDisposition::Rejected | ArbitrationProposalDisposition::Proposed => {
+            let mut materialized_proposal = runner_result.proposal.clone();
+            if materialized_proposal.candidate_patch.is_none() {
+                materialized_proposal.candidate_patch = Some(String::new());
+            }
+            let preview = environment
+                .materialize_candidate(&prepared, &materialized_proposal)
+                .context("failed to materialize and canonically recapture arbiter candidate")?;
+            let candidate_record = writer.write_bytes(
+                ARBITRATION_CANDIDATE_PATH,
+                &preview.candidate.raw_diff,
+                ArtifactFileDisposition::PrivateEvidence,
+            )?;
+            candidate_artifact = Some(ARBITRATION_CANDIDATE_PATH.to_string());
+            candidate_sha256 = Some(candidate_record.sha256);
+            candidate_binding = Some(
+                preview
+                    .candidate
+                    .validation_binding
+                    .clone()
+                    .canonicalized()
+                    .context("recaptured arbiter candidate binding is not canonical")?,
+            );
+            if candidate_binding
+                .as_ref()
+                .is_some_and(|binding| binding.agent_id != options.arbiter_agent_id)
+            {
+                bail!("recaptured candidate is not bound to the neutral arbiter identity");
+            }
+            match runner_result.proposal.disposition {
+                ArbitrationProposalDisposition::Rejected => {
+                    candidate_status = ValidationStatus::Skipped;
+                    ArbitrationOutcome::Rejected
+                }
+                ArbitrationProposalDisposition::Proposed => {
+                    preservation = prove_both_sides_preserved(
+                        &prepared.input.sides,
+                        &prepared.source_diffs,
+                        &preview.candidate.raw_diff,
+                    )?;
+                    if preservation.iter().any(|proof| !proof.preserved) {
+                        candidate_status = ValidationStatus::Failed;
+                        reason =
+                            "arbiter candidate discarded or could not prove one side contribution"
+                                .to_string();
+                        ArbitrationOutcome::Rejected
+                    } else {
+                        validations = environment
+                            .validate_candidate(&preview, &options.validation_commands)
+                            .context(
+                                "failed to run candidate-bound arbitration validation commands",
+                            )?;
+                        if validations.is_empty()
+                            || validations
+                                .iter()
+                                .any(|report| report.status != ValidationStatus::Passed)
+                        {
+                            candidate_status = ValidationStatus::Failed;
+                            reason =
+                                "arbiter candidate failed candidate-bound validation".to_string();
+                            ArbitrationOutcome::Rejected
+                        } else if options.approve && runner_result.execution.trusted_local_boundary
+                        {
+                            candidate_status = ValidationStatus::Passed;
+                            ArbitrationOutcome::Accepted
+                        } else {
+                            candidate_status = ValidationStatus::Skipped;
+                            reason = if options.approve {
+                                "candidate is preserved and validated, but the injected static runner is non-authoritative; trusted local arbitration and a later ordinary merge apply are still required".to_string()
+                            } else {
+                                "candidate is preserved and validated but awaits explicit arbitration approval; a later ordinary merge apply is still required".to_string()
+                            };
+                            ArbitrationOutcome::Escalated
+                        }
+                    }
+                }
+                ArbitrationProposalDisposition::Escalated => {
+                    bail!("escalated proposal unexpectedly reached candidate materialization")
+                }
+            }
+        }
+    };
+
+    let current_primary_sha256 = environment.current_primary_state_sha256(&prepared)?;
+    if current_primary_sha256 != prepared.primary_state_sha256 {
+        bail!(
+            "primary repository changed during arbitration; refusing to record a successful neutral outcome"
+        );
+    }
+
+    let sides = [
+        options.sides[0].journal_side(),
+        options.sides[1].journal_side(),
+    ];
+    let report = MergeArbitrationReport {
+        version: ARBITRATION_REPORT_VERSION,
+        run_id: options.run_id.as_str().to_string(),
+        arbiter_id: options.arbiter_agent_id.clone(),
+        outcome,
+        approved: outcome == ArbitrationOutcome::Accepted
+            && options.approve
+            && runner_result.execution.trusted_local_boundary,
+        primary_mutated: false,
+        later_ordinary_merge_apply_required: true,
+        reviewed_base_oid: prepared.input.reviewed_base_oid.clone(),
+        sides: sides.clone(),
+        neutral_worktree: prepared.input.neutral_worktree.clone(),
+        input_artifact: ARBITRATION_INPUT_PATH.to_string(),
+        input_sha256: prepared.input_sha256.clone(),
+        rationale_artifact: ARBITRATION_RATIONALE_PATH.to_string(),
+        rationale_sha256: rationale_record.sha256.clone(),
+        candidate_artifact,
+        candidate_sha256,
+        candidate_binding: candidate_binding.clone(),
+        candidate_status,
+        preservation,
+        validation_commands: options
+            .validation_commands
+            .iter()
+            .map(|command| command.command.clone())
+            .collect(),
+        validations,
+        semantic_classification: prepared.input.semantic_classification.clone(),
+        runner: runner_result.execution,
+        reason: reason.clone(),
+    };
+    writer.write_json(
+        ARBITRATION_FINAL_REPORT_PATH,
+        &report,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    let mut journal = OrchestrationEventJournal::new(".", options.run_id.as_str());
+    let journal_reason = arbitration_journal_reason(outcome);
+    journal
+        .append_arbitration_outcome(
+            &mut writer,
+            None,
+            OrchestrationRole::Orchestrator,
+            ArbitrationOutcomeDetails {
+                outcome,
+                arbiter_id: options.arbiter_agent_id,
+                sides,
+                candidate_binding,
+                candidate_status,
+                rationale_report: Some(ARBITRATION_RATIONALE_PATH.to_string()),
+                rationale_sha256: Some(rationale_record.sha256),
+                reason: journal_reason.to_string(),
+            },
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "arbitration outcome journal append failed or may have completed durably; inspect the private event journal before retrying: {error}"
+            )
+        })?;
+    writer
+        .finalize(ARBITRATION_FINAL_REPORT_PATH, false)
+        .context("failed to finalize tamper-evident private arbitration artifacts")?;
+    Ok(report)
+}
+
+fn canonicalize_arbitration_options(
+    mut options: MergeArbitrationOptions,
+) -> Result<MergeArbitrationOptions> {
+    options.arbiter_agent_id = normalize_agent_id(&options.arbiter_agent_id)
+        .context("neutral arbiter identity is invalid")?;
+    if options.timeout.is_zero() {
+        bail!("neutral arbiter timeout must be positive");
+    }
+    if options.validation_commands.is_empty() {
+        bail!("arbitration requires at least one candidate validation command");
+    }
+    if options.validation_commands.len() > MAX_ARBITRATION_VALIDATION_COMMANDS {
+        bail!(
+            "arbitration exceeds its {MAX_ARBITRATION_VALIDATION_COMMANDS}-command validation limit"
+        );
+    }
+    for command in &mut options.validation_commands {
+        command.command = command.command.trim().to_string();
+        if command.command.is_empty()
+            || command.command.len() > 1024 * 1024
+            || command.command.contains('\0')
+        {
+            bail!("arbitration validation command is empty or exceeds its bounded contract");
+        }
+    }
+    let mut primary_count = 0usize;
+    let mut participants = BTreeSet::new();
+    for side in &mut options.sides {
+        match side {
+            ArbitrationSideSpec::Agent {
+                agent_id,
+                claimed_paths,
+            } => {
+                *agent_id =
+                    normalize_agent_id(agent_id).context("arbitration side agent id is invalid")?;
+                if agent_id == "primary" {
+                    bail!("agent id 'primary' is reserved by the arbitration side contract");
+                }
+                if agent_id == &options.arbiter_agent_id {
+                    bail!("neutral arbiter identity must differ from both arbitration sides");
+                }
+                if !participants.insert(agent_id.clone()) {
+                    bail!("arbitration sides must be distinct");
+                }
+                *claimed_paths = normalize_claim_paths(std::mem::take(claimed_paths))?;
+            }
+            ArbitrationSideSpec::Primary => {
+                primary_count += 1;
+                if primary_count > 1 || !participants.insert("primary".to_string()) {
+                    bail!("arbitration sides must be distinct");
+                }
+            }
+        }
+    }
+    if primary_count == 0
+        && options
+            .sides
+            .iter()
+            .all(|side| !matches!(side, ArbitrationSideSpec::Agent { .. }))
+    {
+        bail!("arbitration requires at least one agent side");
+    }
+    Ok(options)
+}
+
+impl ArbitrationEnvironment for ProductionArbitrationEnvironment {
+    fn prepare(&self, options: &MergeArbitrationOptions) -> Result<PreparedMergeArbitration> {
+        let repo_root = discover_primary_repo_root(&options.repo)?;
+        let manager = WorktreeManager::new(&repo_root);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .context("neutral arbitration requires a clean exact primary repository")?;
+        let primary_state_sha256 = primary_state_sha256(&repo_root)?;
+
+        let mut candidates = BTreeMap::new();
+        for side in &options.sides {
+            if let ArbitrationSideSpec::Agent {
+                agent_id,
+                claimed_paths,
+            } = side
+            {
+                let candidate = collect_agent_result(MergeCollectOptions {
+                    repo: repo_root.clone(),
+                    agent_id: agent_id.clone(),
+                    claimed_paths: claimed_paths.clone(),
+                    include_full_diff: false,
+                    diff_summary_char_limit: DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                    validations: Vec::new(),
+                })
+                .with_context(|| {
+                    format!("failed to capture exact arbitration side '{agent_id}'")
+                })?;
+                candidates.insert(agent_id.clone(), candidate);
+            }
+        }
+        if candidates.is_empty() {
+            bail!("neutral arbitration requires at least one captured agent side");
+        }
+
+        let reviewed_base = reviewed_arbitration_base(&candidates)?;
+        let primary_repo = Repository::open(&repo_root).with_context(|| {
+            format!("failed to open primary repository {}", repo_root.display())
+        })?;
+        primary_repo.find_commit(reviewed_base).with_context(|| {
+            format!("reviewed arbitration base {reviewed_base} is not a commit")
+        })?;
+
+        let source_ids = [
+            options.sides[0].source_identity(),
+            options.sides[1].source_identity(),
+        ];
+        let neutral_record = manager
+            .create_neutral_with_repository_cleanliness(
+                NeutralWorktreeCreateOptions {
+                    arbiter_agent_id: options.arbiter_agent_id.clone(),
+                    source_agent_ids: source_ids,
+                    base_oid: reviewed_base,
+                    worktree_root: options.worktree_root.clone(),
+                },
+                &cleanliness,
+            )
+            .context("failed to create structurally neutral arbitration worktree")?;
+        let neutral_worktree = ArbitrationNeutralWorktree {
+            agent_id: neutral_record.name.clone(),
+            path: neutral_record.path.clone(),
+            branch: neutral_record.branch.clone(),
+            exact_base_oid: reviewed_base.to_string(),
+            inherited_claim: false,
+        };
+
+        let mut source_diffs = Vec::with_capacity(2);
+        let mut side_evidence = Vec::with_capacity(2);
+        for side in &options.sides {
+            let (evidence, raw_diff) = arbitration_side_evidence(
+                side,
+                &candidates,
+                &primary_repo,
+                &repo_root,
+                reviewed_base,
+            )?;
+            side_evidence.push(evidence);
+            source_diffs.push(raw_diff);
+        }
+        let side_evidence: [ArbitrationSideEvidence; 2] = side_evidence
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("arbitration side evidence count changed"))?;
+        let source_diffs: [Vec<u8>; 2] = source_diffs
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("arbitration side diff count changed"))?;
+        let collision_paths = arbitration_collision_paths(&side_evidence[0], &side_evidence[1])?;
+        let semantic_classification = match (&options.sides[0], &options.sides[1]) {
+            (
+                ArbitrationSideSpec::Agent {
+                    agent_id: first, ..
+                },
+                ArbitrationSideSpec::Agent {
+                    agent_id: second, ..
+                },
+            ) => classify_semantic_candidate_pair(
+                candidates
+                    .get(first)
+                    .context("first arbitration candidate disappeared")?,
+                candidates
+                    .get(second)
+                    .context("second arbitration candidate disappeared")?,
+                &collision_paths,
+            ),
+            (ArbitrationSideSpec::Agent { agent_id, .. }, ArbitrationSideSpec::Primary)
+            | (ArbitrationSideSpec::Primary, ArbitrationSideSpec::Agent { agent_id, .. }) => {
+                classify_semantic_conflicts(
+                    candidates
+                        .get(agent_id)
+                        .context("agent arbitration candidate disappeared")?,
+                    &SafetyCheck {
+                        status: SafetyCheckStatus::Failed,
+                        message: Some(
+                            "cross-worktree arbitration collision requires neutral review"
+                                .to_string(),
+                        ),
+                        paths: collision_paths.clone(),
+                    },
+                )
+            }
+            _ => bail!("arbitration sides are not a supported participant pair"),
+        };
+
+        let side_agent_ids = options
+            .sides
+            .iter()
+            .filter_map(|side| match side {
+                ArbitrationSideSpec::Agent { agent_id, .. } => Some(agent_id.as_str()),
+                ArbitrationSideSpec::Primary => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let relevant_path_claims = SyncStore::open(&repo_root)?
+            .snapshot()?
+            .into_iter()
+            .filter(|claim| {
+                side_agent_ids.contains(claim.agent_id.as_str())
+                    || claim.paths.iter().any(|claimed| {
+                        collision_paths
+                            .iter()
+                            .any(|path| arbitration_paths_overlap(claimed, path))
+                    })
+            })
+            .collect::<Vec<_>>();
+        let relevant_semantic_intents =
+            SemanticIntentStore::open(&repo_root)?
+                .snapshot()?
+                .into_iter()
+                .filter(|intent| {
+                    side_agent_ids.contains(intent.agent_id.as_str())
+                        || intent.paths.iter().chain(intent.impacted_files.iter()).any(
+                            |intent_path| {
+                                collision_paths
+                                    .iter()
+                                    .any(|path| arbitration_paths_overlap(intent_path, path))
+                            },
+                        )
+                })
+                .collect::<Vec<_>>();
+
+        let input = ArbitrationInput {
+            version: ARBITRATION_INPUT_VERSION,
+            arbiter_id: options.arbiter_agent_id.clone(),
+            reviewed_base_oid: reviewed_base.to_string(),
+            neutral_worktree,
+            sides: side_evidence,
+            relevant_path_claims,
+            relevant_semantic_intents,
+            semantic_classification,
+        };
+        let mut input_json =
+            serde_json::to_vec_pretty(&input).context("failed to encode arbitration input")?;
+        input_json.push(b'\n');
+        if input_json.len() > MAX_ARBITRATION_INPUT_BYTES {
+            bail!("arbitration input exceeds its {MAX_ARBITRATION_INPUT_BYTES}-byte limit");
+        }
+        let input_sha256 = sha256_hex(&input_json);
+        Ok(PreparedMergeArbitration {
+            input,
+            input_json,
+            input_sha256,
+            primary_repo_root: repo_root,
+            primary_state_sha256,
+            source_diffs,
+        })
+    }
+
+    fn materialize_candidate(
+        &self,
+        prepared: &PreparedMergeArbitration,
+        proposal: &ArbitrationProposal,
+    ) -> Result<MergeApplyPreview> {
+        let patch = proposal
+            .candidate_patch
+            .as_deref()
+            .context("candidate materialization requires a proposal patch")?;
+        let claimed_paths = arbitration_candidate_scope(&prepared.input.sides)?;
+        let collect_options = MergeCollectOptions {
+            repo: prepared.primary_repo_root.clone(),
+            agent_id: prepared.input.arbiter_id.clone(),
+            claimed_paths: claimed_paths.clone(),
+            include_full_diff: true,
+            diff_summary_char_limit: DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+            validations: Vec::new(),
+        };
+        let manager = WorktreeManager::new(&prepared.primary_repo_root);
+        let write_lease = manager
+            .acquire_write_execution_lease(&prepared.input.arbiter_id)
+            .context("failed to acquire the neutral arbitration worktree write lease")?;
+        let initial = collect_agent_result_with_evidence_and_write_lease(
+            collect_options.clone(),
+            ValidationEvidenceBundle::default(),
+            &write_lease,
+        )
+        .context("failed to capture pristine neutral arbitration worktree")?;
+        if !initial.raw_diff.is_empty() {
+            bail!("neutral arbitration worktree changed before candidate materialization");
+        }
+        if !patch.is_empty() {
+            let output = run_git_with_input(
+                &prepared.input.neutral_worktree.path,
+                &["apply", "--binary"],
+                patch.as_bytes(),
+            )
+            .context("failed to apply arbiter proposal inside the neutral worktree")?;
+            if !output.success {
+                bail!(
+                    "arbiter proposal patch did not apply to the exact reviewed base: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        let candidate = collect_agent_result_with_evidence_and_write_lease(
+            collect_options,
+            ValidationEvidenceBundle::default(),
+            &write_lease,
+        )
+        .context("failed to canonically recapture materialized neutral candidate")?;
+        if proposal.disposition == ArbitrationProposalDisposition::Proposed
+            && candidate.raw_diff.is_empty()
+        {
+            bail!("proposed arbitration candidate is empty");
+        }
+        if !candidate.unclaimed_changed_paths.is_empty() {
+            bail!(
+                "arbiter candidate changed paths outside the bounded collision scope: {}",
+                format_arbitration_paths(&candidate.unclaimed_changed_paths)
+            );
+        }
+        if candidate.metadata.merge_base.as_deref()
+            != Some(prepared.input.reviewed_base_oid.as_str())
+        {
+            bail!("arbiter candidate no longer uses the exact reviewed arbitration base");
+        }
+        build_merge_apply_preview(
+            candidate,
+            MergeForceOptions {
+                allow_dirty_primary: false,
+                allow_stale_base: true,
+                allow_unclaimed_edits: false,
+                allow_validation_failures: false,
+                allow_apply_conflicts: true,
+            },
+            false,
+        )
+    }
+
+    fn validate_candidate(
+        &self,
+        preview: &MergeApplyPreview,
+        commands: &[CandidateValidationCommand],
+    ) -> Result<Vec<ValidationReport>> {
+        run_candidate_validation_commands(preview, commands)
+    }
+
+    fn current_primary_state_sha256(&self, prepared: &PreparedMergeArbitration) -> Result<String> {
+        primary_state_sha256(primary_repo_path_for_verification(prepared))
+    }
+}
+
+fn primary_repo_path_for_verification(prepared: &PreparedMergeArbitration) -> &Path {
+    &prepared.primary_repo_root
+}
+
+fn reviewed_arbitration_base(candidates: &BTreeMap<String, MergeCandidate>) -> Result<Oid> {
+    let mut bases = candidates
+        .values()
+        .map(|candidate| {
+            let base = candidate
+                .metadata
+                .merge_base
+                .as_deref()
+                .context("arbitration side has no reviewed merge base")?;
+            Oid::from_str(base).context("arbitration side merge base is invalid")
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if bases.len() != 1 {
+        bail!("arbitration sides do not share one exact reviewed base");
+    }
+    bases
+        .pop_first()
+        .context("arbitration reviewed base disappeared")
+}
+
+fn arbitration_side_evidence(
+    side: &ArbitrationSideSpec,
+    candidates: &BTreeMap<String, MergeCandidate>,
+    primary_repo: &Repository,
+    repo_root: &Path,
+    reviewed_base: Oid,
+) -> Result<(ArbitrationSideEvidence, Vec<u8>)> {
+    let (participant, head_oid, tree_oid, changed_paths, raw_diff, candidate_binding) = match side {
+        ArbitrationSideSpec::Agent { agent_id, .. } => {
+            let candidate = candidates
+                .get(agent_id)
+                .with_context(|| format!("captured arbitration side '{agent_id}' disappeared"))?;
+            let head_oid = candidate
+                .metadata
+                .agent_head
+                .clone()
+                .context("arbitration agent side has no HEAD commit")?;
+            (
+                side.journal_side(),
+                head_oid,
+                candidate.snapshot_tree.to_string(),
+                candidate.changed_paths.clone(),
+                candidate.raw_diff.clone(),
+                Some(candidate.validation_binding.clone().canonicalized()?),
+            )
+        }
+        ArbitrationSideSpec::Primary => {
+            let head =
+                head_oid(primary_repo)?.context("primary arbitration side has no HEAD commit")?;
+            let tree = primary_repo
+                .find_commit(head)
+                .context("failed to open primary arbitration HEAD")?
+                .tree_id();
+            let (changed_paths, raw_diff) =
+                capture_worktree_diff_from_commit(primary_repo, repo_root, reviewed_base)?;
+            (
+                ArbitrationSide::Primary,
+                head.to_string(),
+                tree.to_string(),
+                changed_paths,
+                raw_diff,
+                None,
+            )
+        }
+    };
+    if changed_paths.len() > MAX_ARBITRATION_CHANGED_PATHS {
+        bail!("arbitration side exceeds its {MAX_ARBITRATION_CHANGED_PATHS}-path limit");
+    }
+    if raw_diff.len() > MAX_ARBITRATION_PATCH_BYTES {
+        bail!("arbitration side diff exceeds its bounded input limit");
+    }
+    let diff = patch_text_for_json(&raw_diff);
+    Ok((
+        ArbitrationSideEvidence {
+            participant,
+            head_oid,
+            tree_oid,
+            base_oid: reviewed_base.to_string(),
+            diff_sha256: sha256_hex(&raw_diff),
+            diff_bytes: raw_diff.len(),
+            diff,
+            changed_paths,
+            candidate_binding,
+        },
+        raw_diff,
+    ))
+}
+
+fn arbitration_collision_paths(
+    first: &ArbitrationSideEvidence,
+    second: &ArbitrationSideEvidence,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for first_path in &first.changed_paths {
+        for second_path in &second.changed_paths {
+            if arbitration_paths_overlap(first_path, second_path) {
+                paths.insert(first_path.clone());
+                paths.insert(second_path.clone());
+            }
+        }
+    }
+    if paths.is_empty() {
+        bail!("arbitration sides do not have a cross-worktree path collision");
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn arbitration_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn arbitration_candidate_scope(sides: &[ArbitrationSideEvidence; 2]) -> Result<Vec<PathBuf>> {
+    normalize_claim_paths(
+        sides
+            .iter()
+            .flat_map(|side| side.changed_paths.iter().cloned())
+            .collect(),
+    )
+}
+
+fn primary_state_sha256(repo_path: &Path) -> Result<String> {
+    let repo_root = discover_primary_repo_root(repo_path)?;
+    let state = PrimaryRepositoryState::capture(&repo_root)?;
+    let bytes = format!(
+        "head={}\nindex={}\nworktree={}\n",
+        state
+            .head
+            .map(|oid| oid.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        state
+            .index_digest
+            .map(|oid| oid.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        state.worktree_digest
+    );
+    Ok(sha256_hex(bytes.as_bytes()))
+}
+
+fn arbitration_prompt(prepared: &PreparedMergeArbitration) -> String {
+    format!(
+        "You are a terminal neutral merge arbiter. Do not delegate, spawn workers, or invoke another agent. Review the exact typed input at the end of this prompt. Return only strict JSON matching the supplied schema. Do not mutate the worktree. A proposed candidate_patch must be a bounded Git binary patch against reviewed_base_oid and must preserve the exact additions and deletions contributed by both sides. Echo input_sha256 exactly. Primary mutation is forbidden; even an approved result only prepares the neutral candidate for a later ordinary human-invoked merge preview/apply.\n\ninput_sha256: {}\n\n{}",
+        prepared.input_sha256,
+        String::from_utf8_lossy(&prepared.input_json)
+    )
+}
+
+fn arbitration_journal_reason(outcome: ArbitrationOutcome) -> &'static str {
+    match outcome {
+        ArbitrationOutcome::Accepted => {
+            "neutral arbitration candidate accepted after both-side preservation and candidate-bound validation"
+        }
+        ArbitrationOutcome::Rejected => {
+            "neutral arbitration candidate rejected by the proposal, preservation, or validation gate"
+        }
+        ArbitrationOutcome::Escalated => {
+            "neutral arbitration requires trusted execution, explicit approval, or human resolution"
+        }
+    }
+}
+
+fn arbitration_output_schema() -> &'static str {
+    r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "input_sha256", "disposition", "rationale", "candidate_patch"],
+  "properties": {
+    "version": {"const": 1},
+    "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "disposition": {"enum": ["proposed", "rejected", "escalated"]},
+    "rationale": {"type": "string", "minLength": 1, "maxLength": 65536},
+    "candidate_patch": {"type": ["string", "null"], "maxLength": 4194304}
+  }
+}"#
+}
+
+#[derive(Debug, Default)]
+struct PatchContributions {
+    additions: BTreeMap<PathBuf, BTreeMap<String, usize>>,
+    deletions: BTreeMap<PathBuf, BTreeMap<String, usize>>,
+    changed_paths: BTreeSet<PathBuf>,
+    binary_paths: BTreeSet<PathBuf>,
+}
+
+fn prove_both_sides_preserved(
+    sides: &[ArbitrationSideEvidence; 2],
+    source_diffs: &[Vec<u8>; 2],
+    candidate_diff: &[u8],
+) -> Result<Vec<ArbitrationPreservationProof>> {
+    let candidate = collect_patch_contributions(candidate_diff)?;
+    let mut proofs = Vec::with_capacity(2);
+    for (index, side) in sides.iter().enumerate() {
+        let source = collect_patch_contributions(&source_diffs[index])?;
+        let required_additions = contribution_count(&source.additions);
+        let required_deletions = contribution_count(&source.deletions);
+        let preserved_additions =
+            count_preserved_contributions(&source.additions, &candidate.additions);
+        let preserved_deletions =
+            count_preserved_contributions(&source.deletions, &candidate.deletions);
+        let mut problems = Vec::new();
+        if !source.binary_paths.is_empty() {
+            problems.push(format!(
+                "binary contribution preservation cannot be proven for {}",
+                format_arbitration_paths(&source.binary_paths.iter().cloned().collect::<Vec<_>>())
+            ));
+        }
+        if required_additions == 0 && required_deletions == 0 {
+            problems.push("side diff exposed no exact text contribution tokens".to_string());
+        }
+        if preserved_additions != required_additions {
+            problems.push(format!(
+                "candidate preserved {preserved_additions}/{required_additions} exact added-line contributions"
+            ));
+        }
+        if preserved_deletions != required_deletions {
+            problems.push(format!(
+                "candidate preserved {preserved_deletions}/{required_deletions} exact deleted-line contributions"
+            ));
+        }
+        if !source
+            .changed_paths
+            .iter()
+            .all(|path| candidate.changed_paths.contains(path))
+        {
+            problems.push("candidate omitted one or more side-changed paths".to_string());
+        }
+        proofs.push(ArbitrationPreservationProof {
+            side: side.participant.clone(),
+            preserved: problems.is_empty(),
+            required_additions,
+            preserved_additions,
+            required_deletions,
+            preserved_deletions,
+            problems,
+        });
+    }
+    Ok(proofs)
+}
+
+fn collect_patch_contributions(diff_bytes: &[u8]) -> Result<PatchContributions> {
+    if diff_bytes.len() > MAX_ARBITRATION_PATCH_BYTES {
+        bail!("patch contribution proof input exceeds its bounded patch limit");
+    }
+    if diff_bytes.is_empty() {
+        return Ok(PatchContributions::default());
+    }
+    let diff = git2::Diff::from_buffer(diff_bytes)
+        .context("candidate preservation proof received an invalid Git patch")?;
+    let mut contributions = PatchContributions::default();
+    for delta in diff.deltas() {
+        for path in arbitration_delta_paths(&delta) {
+            contributions.changed_paths.insert(path.clone());
+            if delta.old_file().is_binary() || delta.new_file().is_binary() {
+                contributions.binary_paths.insert(path);
+            }
+        }
+    }
+    diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        let origin = line.origin();
+        if !matches!(origin, '+' | '-') {
+            return true;
+        }
+        let Some(path) = arbitration_diff_line_path(&delta, origin) else {
+            return true;
+        };
+        let digest = sha256_hex(line.content());
+        let target = if origin == '+' {
+            &mut contributions.additions
+        } else {
+            &mut contributions.deletions
+        };
+        let count = target
+            .entry(path.to_path_buf())
+            .or_default()
+            .entry(digest)
+            .or_insert(0usize);
+        *count = count.saturating_add(1);
+        true
+    })
+    .context("failed to inspect candidate preservation patch")?;
+    Ok(contributions)
+}
+
+fn count_preserved_contributions(
+    required: &BTreeMap<PathBuf, BTreeMap<String, usize>>,
+    candidate: &BTreeMap<PathBuf, BTreeMap<String, usize>>,
+) -> usize {
+    required
+        .iter()
+        .map(|(path, digests)| {
+            candidate
+                .get(path)
+                .map(|observed| {
+                    digests
+                        .iter()
+                        .map(|(digest, required_count)| {
+                            observed
+                                .get(digest)
+                                .copied()
+                                .unwrap_or(0)
+                                .min(*required_count)
+                        })
+                        .sum::<usize>()
+                })
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn contribution_count(contributions: &BTreeMap<PathBuf, BTreeMap<String, usize>>) -> usize {
+    contributions
+        .values()
+        .flat_map(|digests| digests.values())
+        .copied()
+        .sum()
+}
+
+fn arbitration_delta_paths(delta: &git2::DiffDelta<'_>) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    if let Some(path) = delta.old_file().path() {
+        paths.insert(path.to_path_buf());
+    }
+    if let Some(path) = delta.new_file().path() {
+        paths.insert(path.to_path_buf());
+    }
+    paths.into_iter().collect()
+}
+
+fn arbitration_diff_line_path<'a>(
+    delta: &'a git2::DiffDelta<'_>,
+    origin: char,
+) -> Option<&'a Path> {
+    if origin == '-' {
+        delta.old_file().path().or_else(|| delta.new_file().path())
+    } else {
+        delta.new_file().path().or_else(|| delta.old_file().path())
+    }
+}
+
+fn format_arbitration_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -6937,6 +8268,475 @@ mod tests {
     use std::sync::{mpsc, Mutex};
 
     static VALIDATION_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    const ARBITRATION_PATCH_A: &[u8] = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..2222222 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,2 @@\n base\n+side-a\n";
+    const ARBITRATION_PATCH_B: &[u8] = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..3333333 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,2 @@\n base\n+side-b\n";
+    const ARBITRATION_PATCH_BOTH: &[u8] = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..4444444 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,3 @@\n base\n+side-a\n+side-b\n";
+    const ARBITRATION_BASE: &str = "1111111111111111111111111111111111111111";
+
+    #[derive(Clone)]
+    struct FakeArbitrationEnvironment {
+        prepared: PreparedMergeArbitration,
+        candidate_diff: Vec<u8>,
+        validation_status: ValidationStatus,
+    }
+
+    impl ArbitrationEnvironment for FakeArbitrationEnvironment {
+        fn prepare(&self, _options: &MergeArbitrationOptions) -> Result<PreparedMergeArbitration> {
+            Ok(self.prepared.clone())
+        }
+
+        fn materialize_candidate(
+            &self,
+            prepared: &PreparedMergeArbitration,
+            _proposal: &ArbitrationProposal,
+        ) -> Result<MergeApplyPreview> {
+            Ok(fake_arbitration_preview(
+                prepared,
+                self.candidate_diff.clone(),
+            ))
+        }
+
+        fn validate_candidate(
+            &self,
+            _preview: &MergeApplyPreview,
+            _commands: &[CandidateValidationCommand],
+        ) -> Result<Vec<ValidationReport>> {
+            Ok(vec![ValidationReport {
+                name: "fake candidate validation".to_string(),
+                status: self.validation_status,
+                message: None,
+                paths: vec![PathBuf::from("shared.txt")],
+            }])
+        }
+
+        fn current_primary_state_sha256(
+            &self,
+            prepared: &PreparedMergeArbitration,
+        ) -> Result<String> {
+            Ok(prepared.primary_state_sha256.clone())
+        }
+    }
+
+    struct TrustedStaticArbitrationRunner {
+        proposal: ArbitrationProposal,
+    }
+
+    impl ArbitrationRunner for TrustedStaticArbitrationRunner {
+        fn run(&self, _request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
+            Ok(ArbitrationRunnerResult {
+                proposal: self.proposal.clone(),
+                execution: ArbitrationRunnerExecution {
+                    kind: "trusted_fake_test".to_string(),
+                    trusted_local_boundary: true,
+                    command: Vec::new(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                },
+            })
+        }
+    }
+
+    fn fake_arbitration_prepared(
+        repo: &Path,
+        sides: [ArbitrationSide; 2],
+        source_diffs: [Vec<u8>; 2],
+    ) -> PreparedMergeArbitration {
+        let side_evidence = std::array::from_fn(|index| ArbitrationSideEvidence {
+            participant: sides[index].clone(),
+            head_oid: if index == 0 {
+                "2222222222222222222222222222222222222222".to_string()
+            } else {
+                "3333333333333333333333333333333333333333".to_string()
+            },
+            tree_oid: if index == 0 {
+                "4444444444444444444444444444444444444444".to_string()
+            } else {
+                "5555555555555555555555555555555555555555".to_string()
+            },
+            base_oid: ARBITRATION_BASE.to_string(),
+            diff_sha256: sha256_hex(&source_diffs[index]),
+            diff_bytes: source_diffs[index].len(),
+            diff: String::from_utf8_lossy(&source_diffs[index]).into_owned(),
+            changed_paths: vec![PathBuf::from("shared.txt")],
+            candidate_binding: None,
+        });
+        let input = ArbitrationInput {
+            version: ARBITRATION_INPUT_VERSION,
+            arbiter_id: "neutral-arbiter".to_string(),
+            reviewed_base_oid: ARBITRATION_BASE.to_string(),
+            neutral_worktree: ArbitrationNeutralWorktree {
+                agent_id: "neutral-arbiter".to_string(),
+                path: repo.join("neutral-worktree"),
+                branch: "maco/neutral-arbiter".to_string(),
+                exact_base_oid: ARBITRATION_BASE.to_string(),
+                inherited_claim: false,
+            },
+            sides: side_evidence,
+            relevant_path_claims: Vec::new(),
+            relevant_semantic_intents: Vec::new(),
+            semantic_classification: SemanticConflictClassification::no_conflict(),
+        };
+        let mut input_json = serde_json::to_vec_pretty(&input).expect("serialize fake input");
+        input_json.push(b'\n');
+        PreparedMergeArbitration {
+            input,
+            input_sha256: sha256_hex(&input_json),
+            input_json,
+            primary_repo_root: repo.to_path_buf(),
+            primary_state_sha256: sha256_hex(b"stable primary"),
+            source_diffs,
+        }
+    }
+
+    fn fake_arbitration_preview(
+        prepared: &PreparedMergeArbitration,
+        raw_diff: Vec<u8>,
+    ) -> MergeApplyPreview {
+        let metadata = WorktreeMergeMetadata {
+            agent_id: prepared.input.arbiter_id.clone(),
+            worktree_path: prepared.input.neutral_worktree.path.clone(),
+            branch: prepared.input.neutral_worktree.branch.clone(),
+            primary_repo_root: prepared.primary_repo_root.clone(),
+            primary_head: Some(ARBITRATION_BASE.to_string()),
+            agent_head: Some(ARBITRATION_BASE.to_string()),
+            merge_base: Some(ARBITRATION_BASE.to_string()),
+            base_matches_primary: Some(true),
+        };
+        let binding =
+            candidate_validation_binding(&metadata, &raw_diff).expect("fake candidate binding");
+        let candidate = MergeCandidate {
+            metadata,
+            claimed_paths: vec![PathBuf::from("shared.txt")],
+            changed_paths: vec![PathBuf::from("shared.txt")],
+            changes: vec![ChangedPath {
+                path: PathBuf::from("shared.txt"),
+                kind: ChangeKind::Modified,
+            }],
+            unclaimed_changed_paths: Vec::new(),
+            diff: DiffOutput {
+                summary: summarize_text(
+                    &String::from_utf8_lossy(&raw_diff),
+                    DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                ),
+                full: Some(String::from_utf8_lossy(&raw_diff).into_owned()),
+            },
+            validations: Vec::new(),
+            validation_binding: binding,
+            validation_evidence: ValidationEvidenceBundle::default(),
+            raw_diff,
+            snapshot_tree: Oid::from_str(ARBITRATION_BASE).expect("fake tree"),
+        };
+        MergeApplyPreview {
+            candidate,
+            safety: MergeApplySafety {
+                primary_state_unchanged: passed_safety_check(),
+                dirty_primary: passed_safety_check(),
+                stale_base: passed_safety_check(),
+                apply_check: passed_safety_check(),
+                unclaimed_edits: passed_safety_check(),
+                validation: passed_safety_check(),
+                validation_evidence: ValidationEvidenceCheck {
+                    status: SafetyCheckStatus::Passed,
+                    binding_status: ValidationBindingStatus::NotRequired,
+                    message: None,
+                    paths: Vec::new(),
+                },
+                megafile: passed_safety_check(),
+                megafile_warnings: Vec::new(),
+                megafile_decomposition_target: None,
+                megafile_decomposition_evidence: None,
+                megafile_blocking: false,
+                validation_required: false,
+                candidate_validation_commands: Vec::new(),
+                force_options: MergeForceOptions::default(),
+                apply_mode: ApplyMode::Direct,
+                semantic_conflicts: SemanticConflictClassification::no_conflict(),
+                readiness: ApplyReadiness {
+                    status: ApplyReadinessStatus::Safe,
+                    blockers: Vec::new(),
+                    forced: Vec::new(),
+                    details: Vec::new(),
+                },
+            },
+        }
+    }
+
+    fn fake_arbitration_options(repo: &Path, run_id: &str) -> MergeArbitrationOptions {
+        MergeArbitrationOptions {
+            repo: repo.to_path_buf(),
+            run_id: RunId::new(run_id).expect("fake run id"),
+            arbiter_agent_id: "neutral-arbiter".to_string(),
+            sides: [
+                ArbitrationSideSpec::Agent {
+                    agent_id: "agent-a".to_string(),
+                    claimed_paths: vec![PathBuf::from("shared.txt")],
+                },
+                ArbitrationSideSpec::Agent {
+                    agent_id: "agent-b".to_string(),
+                    claimed_paths: vec![PathBuf::from("shared.txt")],
+                },
+            ],
+            validation_commands: vec![CandidateValidationCommand {
+                command: "fake validation".to_string(),
+            }],
+            approve: true,
+            codex_bin: PathBuf::from("unused"),
+            timeout: Duration::from_secs(1),
+            worktree_root: None,
+        }
+    }
+
+    #[test]
+    fn arbitration_strict_parser_and_static_runner_are_bounded_and_non_authoritative() {
+        let digest = "1".repeat(64);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "input_sha256": digest,
+            "disposition": "escalated",
+            "rationale": "human review required",
+            "candidate_patch": null,
+        }))
+        .expect("proposal JSON");
+        let runner = StaticArbitrationRunner::from_bytes(bytes).expect("static runner");
+        let result = runner
+            .run(&ArbitrationRunnerRequest {
+                input_sha256: "1".repeat(64),
+                prompt_path: PathBuf::from("prompt"),
+                output_schema_path: PathBuf::from("schema"),
+                output_last_message_path: PathBuf::from("output"),
+                json_log_path: PathBuf::from("log"),
+                neutral_worktree_path: PathBuf::from("neutral"),
+                hidden_primary_root: PathBuf::from("primary"),
+                run_id: "run".to_string(),
+                arbiter_id: "neutral-arbiter".to_string(),
+            })
+            .expect("static result");
+        assert!(!result.execution.trusted_local_boundary);
+
+        let missing = br#"{"version":1,"input_sha256":"1111111111111111111111111111111111111111111111111111111111111111","disposition":"escalated","rationale":"review"}"#;
+        assert!(parse_arbitration_proposal(missing)
+            .expect_err("missing candidate field")
+            .to_string()
+            .contains("candidate_patch"));
+        assert!(
+            parse_arbitration_proposal(&vec![b'x'; MAX_ARBITRATION_PROPOSAL_BYTES + 1])
+                .expect_err("oversized proposal")
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn arbitration_prompt_cap_fits_existing_external_runner_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut prepared = fake_arbitration_prepared(
+            temp.path(),
+            [
+                ArbitrationSide::Agent {
+                    id: "agent-a".to_string(),
+                },
+                ArbitrationSide::Primary,
+            ],
+            [ARBITRATION_PATCH_A.to_vec(), ARBITRATION_PATCH_B.to_vec()],
+        );
+        prepared.input_json = vec![b'x'; MAX_ARBITRATION_INPUT_BYTES];
+        assert!(arbitration_prompt(&prepared).len() <= MAX_ARBITRATION_PROMPT_BYTES);
+    }
+
+    #[test]
+    fn arbitration_preservation_counts_duplicate_occurrences() {
+        let duplicate = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..2222222 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,3 @@\n base\n+repeat\n+repeat\n";
+        let one_duplicate = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..2222222 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,2 @@\n base\n+repeat\n";
+        let sides = [
+            ArbitrationSideEvidence {
+                participant: ArbitrationSide::Agent {
+                    id: "agent-a".to_string(),
+                },
+                head_oid: "2".repeat(40),
+                tree_oid: "3".repeat(40),
+                base_oid: ARBITRATION_BASE.to_string(),
+                diff_sha256: sha256_hex(duplicate),
+                diff_bytes: duplicate.len(),
+                diff: String::from_utf8_lossy(duplicate).into_owned(),
+                changed_paths: vec![PathBuf::from("shared.txt")],
+                candidate_binding: None,
+            },
+            ArbitrationSideEvidence {
+                participant: ArbitrationSide::Agent {
+                    id: "agent-b".to_string(),
+                },
+                head_oid: "4".repeat(40),
+                tree_oid: "5".repeat(40),
+                base_oid: ARBITRATION_BASE.to_string(),
+                diff_sha256: sha256_hex(ARBITRATION_PATCH_B),
+                diff_bytes: ARBITRATION_PATCH_B.len(),
+                diff: String::from_utf8_lossy(ARBITRATION_PATCH_B).into_owned(),
+                changed_paths: vec![PathBuf::from("shared.txt")],
+                candidate_binding: None,
+            },
+        ];
+        let proofs = prove_both_sides_preserved(
+            &sides,
+            &[duplicate.to_vec(), ARBITRATION_PATCH_B.to_vec()],
+            one_duplicate,
+        )
+        .expect("preservation proof");
+        assert!(!proofs[0].preserved);
+        assert_eq!(proofs[0].required_additions, 2);
+        assert_eq!(proofs[0].preserved_additions, 1);
+    }
+
+    #[test]
+    fn fake_arbitration_exercises_accepted_rejected_and_escalated_journals_without_primary_apply() {
+        let cases = [
+            (
+                "fake-arbitration-accepted",
+                ARBITRATION_PATCH_BOTH.to_vec(),
+                ValidationStatus::Passed,
+                true,
+                ArbitrationOutcome::Accepted,
+            ),
+            (
+                "fake-arbitration-discarded",
+                ARBITRATION_PATCH_A.to_vec(),
+                ValidationStatus::Passed,
+                true,
+                ArbitrationOutcome::Rejected,
+            ),
+            (
+                "fake-arbitration-validation",
+                ARBITRATION_PATCH_BOTH.to_vec(),
+                ValidationStatus::Failed,
+                true,
+                ArbitrationOutcome::Rejected,
+            ),
+            (
+                "fake-arbitration-unapproved",
+                ARBITRATION_PATCH_BOTH.to_vec(),
+                ValidationStatus::Passed,
+                false,
+                ArbitrationOutcome::Escalated,
+            ),
+        ];
+        for (run_id, candidate_diff, validation_status, approve, expected) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            WorktreeManager::init_repository(temp.path(), "main").expect("init fake repo");
+            let prepared = fake_arbitration_prepared(
+                temp.path(),
+                [
+                    ArbitrationSide::Agent {
+                        id: "agent-a".to_string(),
+                    },
+                    ArbitrationSide::Agent {
+                        id: "agent-b".to_string(),
+                    },
+                ],
+                [ARBITRATION_PATCH_A.to_vec(), ARBITRATION_PATCH_B.to_vec()],
+            );
+            let environment = FakeArbitrationEnvironment {
+                prepared: prepared.clone(),
+                candidate_diff,
+                validation_status,
+            };
+            let runner = TrustedStaticArbitrationRunner {
+                proposal: ArbitrationProposal {
+                    version: ARBITRATION_PROPOSAL_VERSION,
+                    input_sha256: prepared.input_sha256.clone(),
+                    disposition: ArbitrationProposalDisposition::Proposed,
+                    rationale: "bounded fake rationale".to_string(),
+                    candidate_patch: Some(
+                        "fake patch bytes are materialized by the fake environment".to_string(),
+                    ),
+                },
+            };
+            let mut options = fake_arbitration_options(temp.path(), run_id);
+            options.approve = approve;
+            let report =
+                arbitrate_merge_with_environment(options, &runner, &environment).expect("report");
+            assert_eq!(report.outcome, expected);
+            assert!(!report.primary_mutated);
+            assert!(report.later_ordinary_merge_apply_required);
+            assert_eq!(primary_repo_path_for_verification(&prepared), temp.path());
+        }
+    }
+
+    #[test]
+    fn static_fake_cannot_claim_accepted_arbitration_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        WorktreeManager::init_repository(temp.path(), "main").expect("init fake repo");
+        let prepared = fake_arbitration_prepared(
+            temp.path(),
+            [
+                ArbitrationSide::Agent {
+                    id: "agent-a".to_string(),
+                },
+                ArbitrationSide::Primary,
+            ],
+            [ARBITRATION_PATCH_A.to_vec(), ARBITRATION_PATCH_B.to_vec()],
+        );
+        let environment = FakeArbitrationEnvironment {
+            prepared: prepared.clone(),
+            candidate_diff: ARBITRATION_PATCH_BOTH.to_vec(),
+            validation_status: ValidationStatus::Passed,
+        };
+        let output = serde_json::to_vec(&ArbitrationProposal {
+            version: ARBITRATION_PROPOSAL_VERSION,
+            input_sha256: prepared.input_sha256,
+            disposition: ArbitrationProposalDisposition::Proposed,
+            rationale: "static fake proposal".to_string(),
+            candidate_patch: Some("fake patch".to_string()),
+        })
+        .expect("static output");
+        let runner = StaticArbitrationRunner::from_bytes(output).expect("static runner");
+        let mut options = fake_arbitration_options(temp.path(), "static-fake-nonauthoritative");
+        options.sides[1] = ArbitrationSideSpec::Primary;
+        let report = arbitrate_merge_with_environment(options, &runner, &environment)
+            .expect("static report");
+        assert_eq!(report.outcome, ArbitrationOutcome::Escalated);
+        assert!(!report.approved);
+        assert!(!report.runner.trusted_local_boundary);
+        assert!(matches!(report.sides[1], ArbitrationSide::Primary));
+    }
+
+    #[test]
+    fn arbitration_tampered_input_digest_is_rejected_before_candidate_evaluation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        WorktreeManager::init_repository(temp.path(), "main").expect("init fake repo");
+        let prepared = fake_arbitration_prepared(
+            temp.path(),
+            [
+                ArbitrationSide::Agent {
+                    id: "agent-a".to_string(),
+                },
+                ArbitrationSide::Agent {
+                    id: "agent-b".to_string(),
+                },
+            ],
+            [ARBITRATION_PATCH_A.to_vec(), ARBITRATION_PATCH_B.to_vec()],
+        );
+        let environment = FakeArbitrationEnvironment {
+            prepared,
+            candidate_diff: ARBITRATION_PATCH_BOTH.to_vec(),
+            validation_status: ValidationStatus::Passed,
+        };
+        let runner = TrustedStaticArbitrationRunner {
+            proposal: ArbitrationProposal {
+                version: ARBITRATION_PROPOSAL_VERSION,
+                input_sha256: "f".repeat(64),
+                disposition: ArbitrationProposalDisposition::Proposed,
+                rationale: "tampered input binding".to_string(),
+                candidate_patch: Some("fake patch".to_string()),
+            },
+        };
+        let error = arbitrate_merge_with_environment(
+            fake_arbitration_options(temp.path(), "tampered-input"),
+            &runner,
+            &environment,
+        )
+        .expect_err("tampered digest");
+        assert!(error.to_string().contains("does not match"));
+    }
 
     fn exact_test_validation_binding() -> CandidateValidationBinding {
         CandidateValidationBinding {

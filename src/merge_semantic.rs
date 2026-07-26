@@ -294,6 +294,103 @@ pub(crate) fn classify_semantic_conflicts(
     let candidate_risk = candidate_map
         .as_ref()
         .map(|map| repo_semantic::risk_report_for_paths(map, &conflict_paths));
+    classify_semantic_pair(
+        conflict_paths,
+        primary_map.as_ref(),
+        candidate_map.as_ref(),
+        &primary_changes,
+        &candidate_changes,
+        primary_risk.as_ref(),
+        candidate_risk.as_ref(),
+        notes,
+        "primary",
+        "candidate",
+    )
+}
+
+pub(crate) fn classify_semantic_candidate_pair(
+    first: &MergeCandidate,
+    second: &MergeCandidate,
+    conflict_paths: &[PathBuf],
+) -> SemanticConflictClassification {
+    let mut notes = Vec::new();
+    let mut conflict_paths = conflict_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if conflict_paths.len() > SEMANTIC_CONFLICT_MAX_PATHS {
+        notes.push(format!(
+            "semantic conflict classification truncated conflict paths to {SEMANTIC_CONFLICT_MAX_PATHS}"
+        ));
+        conflict_paths.truncate(SEMANTIC_CONFLICT_MAX_PATHS);
+    }
+    if conflict_paths.is_empty() {
+        return degraded_without_paths(
+            "candidate-pair arbitration had no reported collision path; semantic overlap could not be located",
+        );
+    }
+
+    let first_map = scan_semantic_map(&first.metadata.worktree_path, "first candidate", &mut notes);
+    let second_map = scan_semantic_map(
+        &second.metadata.worktree_path,
+        "second candidate",
+        &mut notes,
+    );
+    let first_changes = match collect_candidate_changes(first, &conflict_paths) {
+        Ok(changes) => changes,
+        Err(error) => {
+            notes.push(format!(
+                "first candidate conflict diff could not be parsed; classification is degraded: {error:#}"
+            ));
+            PatchChangeSet::default()
+        }
+    };
+    let second_changes = match collect_candidate_changes(second, &conflict_paths) {
+        Ok(changes) => changes,
+        Err(error) => {
+            notes.push(format!(
+                "second candidate conflict diff could not be parsed; classification is degraded: {error:#}"
+            ));
+            PatchChangeSet::default()
+        }
+    };
+    notes.extend(first_changes.notes.iter().cloned());
+    notes.extend(second_changes.notes.iter().cloned());
+    let first_risk = first_map
+        .as_ref()
+        .map(|map| repo_semantic::risk_report_for_paths(map, &conflict_paths));
+    let second_risk = second_map
+        .as_ref()
+        .map(|map| repo_semantic::risk_report_for_paths(map, &conflict_paths));
+    classify_semantic_pair(
+        conflict_paths,
+        first_map.as_ref(),
+        second_map.as_ref(),
+        &first_changes,
+        &second_changes,
+        first_risk.as_ref(),
+        second_risk.as_ref(),
+        notes,
+        "first candidate",
+        "second candidate",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_semantic_pair(
+    conflict_paths: Vec<PathBuf>,
+    primary_map: Option<&repo_semantic::SemanticRepoMap>,
+    candidate_map: Option<&repo_semantic::SemanticRepoMap>,
+    primary_changes: &PatchChangeSet,
+    candidate_changes: &PatchChangeSet,
+    primary_risk: Option<&SemanticRiskReport>,
+    candidate_risk: Option<&SemanticRiskReport>,
+    notes: Vec<String>,
+    primary_label: &str,
+    candidate_label: &str,
+) -> SemanticConflictClassification {
     let mut overlaps = Vec::new();
 
     for path in &conflict_paths {
@@ -304,9 +401,9 @@ pub(crate) fn classify_semantic_conflicts(
             .cloned()
             .unwrap_or_default();
         let (primary, mut overlap_notes) =
-            classify_side(primary_map.as_ref(), path, &primary_file, "primary");
+            classify_side(primary_map, path, &primary_file, primary_label);
         let (candidate_side, candidate_notes) =
-            classify_side(candidate_map.as_ref(), path, &candidate_file, "candidate");
+            classify_side(candidate_map, path, &candidate_file, candidate_label);
         overlap_notes.extend(candidate_notes);
 
         let common_symbols =
@@ -328,7 +425,7 @@ pub(crate) fn classify_semantic_conflicts(
         );
         let risk = overlap_risk(kind);
         let (impacted_files, dependency_impacts) =
-            dependency_impacts_for_path(primary_risk.as_ref(), candidate_risk.as_ref(), path);
+            dependency_impacts_for_path(primary_risk, candidate_risk, path);
         let impacted_files = truncate_items(impacted_files, "impacted files", &mut overlap_notes);
         let dependency_impacts =
             truncate_items(dependency_impacts, "dependency impacts", &mut overlap_notes);
