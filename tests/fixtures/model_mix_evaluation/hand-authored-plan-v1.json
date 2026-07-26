@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "task": "Improve the README model-mix fixture note without changing Rust code.",
+  "max_depth": 2,
+  "max_child_assignments": 1,
+  "max_child_retries": 0,
+  "child_timeout_seconds": 600,
+  "assignments": [
+    {
+      "id": "docs-child",
+      "assigned_paths": [
+        "README.md"
+      ],
+      "worker_assignments": [
+        {
+          "id": "docs-worker",
+          "assigned_paths": [
+            "README.md"
+          ]
+        }
+      ]
+    }
+  ]
+}

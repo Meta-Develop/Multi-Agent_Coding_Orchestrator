@@ -813,6 +813,57 @@ case so a complete local run stays modest.
   instrumentation; state amplification; published concurrency limits; or CI
   regression thresholds.
 
+### Provisional model-mix evaluation fixtures
+
+`tests/fixtures/model_mix_evaluation` is the phase-A contract for the Issue #26
+model-mix evaluation harness. It is explicitly `provisional_fake_only`: the
+records are deterministic, hand-authored fake evidence, no provider or
+supervisor was executed to produce them, fake microcredits are not prices, and
+the fixture's provisional Pareto candidate cannot authorize a production
+default.
+
+The version-1 fixture set contains:
+
+- `hand-authored-plan-v1.json`, the current pre-Issue-#22 input boundary;
+- `manifest-v1.json`, which binds the goal, exact base commit and tree, plan
+  digest, wall-time and dispatch limits, three repetitions per profile, role
+  models, held-out suite, blinded grader versions, isolated-start fingerprint,
+  required metrics, comparability policy, and Pareto definition;
+- `runs-v1.json`, with 12 fake runs covering four profiles. Every run repeats
+  the equivalent isolated-state checks and comparability verdict and reports
+  per-role tokens/cost, wall time, churn, conflicts, changed files, added and
+  deleted lines, total diff lines, net LOC, held-out results, versioned
+  breadth/anti-shortcut grader findings, inter-grader disagreement, typed
+  negative examples, and an explicit `accepted`, `rejected`, or
+  `accepted_with_modifications` label with a reason; and
+- `summary-v1.json`, which preserves comparison exclusions, profile aggregates,
+  rubric findings, negative-example counts, and the machine-readable
+  cost-versus-quality Pareto frontier. Quality combines held-out validation,
+  breadth, and anti-shortcut review; test-pass, LOC, or low cost alone cannot
+  stand in for quality.
+
+Parse-check the committed JSON without running Rust, a supervisor, or a
+provider:
+
+```bash
+find tests/fixtures/model_mix_evaluation -name '*.json' -print0 |
+  xargs -0 -n1 jq -e .
+```
+
+Real-provider experiments are a strict future opt-in boundary. A future runner
+must require an explicit operator choice of provider and models, obtain
+credentials outside committed fixtures, start every repetition from a freshly
+verified equivalent isolated state, retain failures rather than filtering them,
+and write new evidence without replacing phase-A fixtures. Merely having
+credentials or real-looking model labels must never opt in.
+
+Phase B remains required: once the Issue #22 path is available, one command
+must rerun every profile and repetition from the bound goal and base through
+goal-to-integration, enforce the same limits and held-out grading contract, and
+emit schema-compatible run and Pareto results. The phase-A fixtures do not
+claim that command exists. Gate-policy/classifier corpus experiments remain
+separate and depend on the Issue #28 production broker path.
+
 ### Platform boundary
 
 Linux is the fully supported security-sensitive runtime path. macOS and Windows
