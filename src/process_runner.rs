@@ -4633,11 +4633,14 @@ impl ResolvedSystemdSandbox {
             writable_roots.push(self.workspace_root.clone());
         }
         minimize_sandbox_roots(&mut writable_roots);
+        if writable_roots.is_empty() && self.visible_read_write_files.is_empty() {
+            return Ok(());
+        }
 
         let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
         let mut protected_inodes: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
         for root in protected_roots {
-            scan_sandbox_regular_files(&root, &mut remaining, |path, metadata| {
+            scan_sandbox_regular_files(&root, false, &mut remaining, |path, metadata| {
                 if self.effective_path_access(path)? == Some(SandboxMountAccess::ReadOnly) {
                     protected_inodes
                         .entry((metadata.dev(), metadata.ino()))
@@ -4674,7 +4677,7 @@ impl ResolvedSystemdSandbox {
             Ok(())
         };
         for root in writable_roots {
-            scan_sandbox_regular_files(&root, &mut remaining, |path, metadata| {
+            scan_sandbox_regular_files(&root, true, &mut remaining, |path, metadata| {
                 reject_writable_alias(path, metadata, &protected_inodes)
             })?;
         }
@@ -4707,6 +4710,7 @@ fn minimize_sandbox_roots(roots: &mut Vec<PathBuf>) {
 #[cfg(target_os = "linux")]
 fn scan_sandbox_regular_files(
     root: &Path,
+    reject_special_entries: bool,
     remaining: &mut usize,
     mut visit: impl FnMut(&Path, &fs::Metadata) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -4760,7 +4764,7 @@ fn scan_sandbox_regular_files(
             }
         } else if file_type.is_file() {
             visit(&path, &metadata)?;
-        } else {
+        } else if reject_special_entries {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
@@ -9699,6 +9703,92 @@ mod tests {
                 "unexpected {protected_class} rejection: {error}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protected_alias_scan_skips_read_only_roots_without_a_writable_surface() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("read-only-workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        // This absent root is a fail-if-traversed sentinel for an irrelevant large read-only tree.
+        let irrelevant_read_only_root = temp.path().join("irrelevant-large-read-only-root");
+        let sandbox = ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            workspace_root: workspace.clone(),
+            current_dir: workspace,
+            workspace_access: WorkspaceAccess::ReadOnly,
+            visible_read_only_roots: vec![irrelevant_read_only_root],
+            visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            isolated_host_view: false,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        };
+
+        sandbox
+            .verify_protected_read_only_hardlink_scope()
+            .expect("no writable boundary means no protected alias traversal");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let protected_root = temp.path().join("protected");
+        let writable_root = temp.path().join("writable");
+        fs::create_dir(&protected_root).expect("protected root");
+        fs::create_dir(&writable_root).expect("writable root");
+        let socket_path = protected_root.join("socket");
+        let _socket = UnixListener::bind(&socket_path).expect("protected socket");
+        let protected_file = protected_root.join("policy.md");
+        fs::write(&protected_file, "policy\n").expect("protected file");
+        let sandbox = ResolvedSystemdSandbox {
+            kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            workspace_root: writable_root.clone(),
+            current_dir: writable_root.clone(),
+            workspace_access: WorkspaceAccess::ReadWrite,
+            visible_read_only_roots: vec![protected_root.clone()],
+            visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            isolated_host_view: false,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: Vec::new(),
+        };
+
+        sandbox
+            .verify_protected_read_only_hardlink_scope()
+            .expect("read-only socket is irrelevant to regular-file alias identity");
+
+        let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+        let mut writable_links = BTreeMap::new();
+        let error = scan_sandbox_tree(&protected_root, true, &mut remaining, &mut writable_links)
+            .expect_err("the same socket on a writable surface must remain forbidden");
+        assert!(error.to_string().contains("socket, FIFO, or device node"));
+
+        fs::hard_link(&protected_file, writable_root.join("policy-alias.md"))
+            .expect("writable hard-link alias");
+        let error = sandbox
+            .verify_protected_read_only_hardlink_scope()
+            .expect_err("protected regular-file alias must remain forbidden");
+        assert!(
+            error
+                .to_string()
+                .contains("protected read-only sandbox file has a writable hard-link alias"),
+            "unexpected hard-link rejection: {error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
