@@ -11,10 +11,11 @@ use crate::{
         RoleUsageReport,
     },
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    path::PathBuf,
 };
 use thiserror::Error;
 
@@ -63,6 +64,7 @@ pub struct HeldOutValidation {
 #[serde(deny_unknown_fields)]
 pub struct EvaluationProfile {
     pub id: String,
+    #[serde(deserialize_with = "deserialize_role_models")]
     pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
 }
 
@@ -133,6 +135,7 @@ impl EvaluationManifest {
             repository_base_snapshot: self.repository_base_snapshot.clone(),
             limits: self.limits,
             held_out_validation: self.held_out_validation.clone(),
+            profiles: self.profiles.clone(),
         }
     }
 }
@@ -214,6 +217,7 @@ pub struct ComparabilityBinding {
     pub repository_base_snapshot: String,
     pub limits: EvaluationLimits,
     pub held_out_validation: Vec<HeldOutValidation>,
+    pub profiles: Vec<EvaluationProfile>,
 }
 
 /// Isolation evidence for one synthetic repetition.
@@ -249,6 +253,7 @@ pub struct ReviewDimension {
 pub struct ReviewQuality {
     pub breadth: ReviewDimension,
     pub anti_shortcut: ReviewDimension,
+    #[serde(deserialize_with = "deserialize_findings")]
     pub findings: Vec<Finding>,
 }
 
@@ -265,7 +270,9 @@ pub struct QualityScore {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationMetrics {
+    #[serde(deserialize_with = "deserialize_role_usage")]
     pub role_usage: BTreeMap<AgentRole, RoleUsageReport>,
+    #[serde(deserialize_with = "deserialize_usage")]
     pub total_usage: Usage,
     pub total_cost_usd: f64,
     pub wall_time_ms: u64,
@@ -297,7 +304,9 @@ pub struct EvaluationRepetitionResult {
 pub struct ProfileSummary {
     pub profile_id: String,
     pub repetitions: u32,
+    #[serde(deserialize_with = "deserialize_role_usage")]
     pub aggregate_role_usage: BTreeMap<AgentRole, RoleUsageReport>,
+    #[serde(deserialize_with = "deserialize_usage")]
     pub aggregate_usage: Usage,
     pub aggregate_cost_usd: f64,
     pub mean_cost_usd: f64,
@@ -344,6 +353,134 @@ impl EvaluationResults {
     pub fn validate_against(&self, manifest: &EvaluationManifest) -> Result<(), EvaluationError> {
         validate_run_comparability(manifest, self)
     }
+}
+
+// Shared supervision/accounting types intentionally remain backward-compatible and permissive.
+// Evaluation documents use strict local wire boundaries so their nested schemas still fail closed
+// without changing those shared APIs.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRoleModelSelection {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+}
+
+impl From<StrictRoleModelSelection> for RoleModelSelection {
+    fn from(selection: StrictRoleModelSelection) -> Self {
+        Self {
+            model: selection.model,
+            reasoning_effort: selection.reasoning_effort,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictUsage {
+    input_tokens: usize,
+    output_tokens: usize,
+    total_tokens: usize,
+}
+
+impl From<StrictUsage> for Usage {
+    fn from(usage: StrictUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictRoleUsageReport {
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    usage: Option<StrictUsage>,
+    #[serde(default)]
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    observation: RoleUsageObservation,
+    #[serde(default)]
+    unavailable_reason: Option<String>,
+}
+
+impl From<StrictRoleUsageReport> for RoleUsageReport {
+    fn from(report: StrictRoleUsageReport) -> Self {
+        Self {
+            models: report.models,
+            usage: report.usage.map(Usage::from),
+            cost_usd: report.cost_usd,
+            observation: report.observation,
+            unavailable_reason: report.unavailable_reason,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictFinding {
+    severity: FindingSeverity,
+    message: String,
+    #[serde(default)]
+    paths: Vec<PathBuf>,
+}
+
+impl From<StrictFinding> for Finding {
+    fn from(finding: StrictFinding) -> Self {
+        Self {
+            severity: finding.severity,
+            message: finding.message,
+            paths: finding.paths,
+        }
+    }
+}
+
+fn deserialize_role_models<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<AgentRole, RoleModelSelection>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    BTreeMap::<AgentRole, StrictRoleModelSelection>::deserialize(deserializer).map(|selections| {
+        selections
+            .into_iter()
+            .map(|(role, selection)| (role, selection.into()))
+            .collect()
+    })
+}
+
+fn deserialize_usage<'de, D>(deserializer: D) -> Result<Usage, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    StrictUsage::deserialize(deserializer).map(Usage::from)
+}
+
+fn deserialize_role_usage<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<AgentRole, RoleUsageReport>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    BTreeMap::<AgentRole, StrictRoleUsageReport>::deserialize(deserializer).map(|reports| {
+        reports
+            .into_iter()
+            .map(|(role, report)| (role, report.into()))
+            .collect()
+    })
+}
+
+fn deserialize_findings<'de, D>(deserializer: D) -> Result<Vec<Finding>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<StrictFinding>::deserialize(deserializer)
+        .map(|findings| findings.into_iter().map(Finding::from).collect())
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -483,7 +620,8 @@ pub fn validate_run_comparability(
     if results.comparability != expected_binding {
         return Err(invalid_results(
             "comparability",
-            "target, base snapshot, limits, or held-out validation differ from the manifest",
+            "target, base snapshot, limits, held-out validation, or full role/model profile set \
+             differ from the manifest",
         ));
     }
     let expected_digest = digest_serializable(&expected_binding)?;
@@ -1672,6 +1810,46 @@ mod tests {
         let error = serde_json::from_value::<EvaluationManifest>(invalid_manifest)
             .expect_err("unknown manifest fields fail closed");
         assert!(error.to_string().contains("unknown field"));
+
+        let mut invalid_selection = serde_json::to_value(&manifest).expect("serialize manifest");
+        invalid_selection["profiles"][0]["role_models"]["worker"]["unexpected_selection_field"] =
+            json!(true);
+        let error = serde_json::from_value::<EvaluationManifest>(invalid_selection)
+            .expect_err("unknown RoleModelSelection fields fail closed");
+        assert!(error.to_string().contains("unknown field"));
+
+        let results = run_deterministic_fake(&manifest, 7).expect("fake results");
+        let mut invalid_total_usage = serde_json::to_value(&results).expect("serialize results");
+        invalid_total_usage["runs"][0]["metrics"]["total_usage"]["unexpected_usage_field"] =
+            json!(true);
+        let error = serde_json::from_value::<EvaluationResults>(invalid_total_usage)
+            .expect_err("unknown Usage fields fail closed");
+        assert!(error.to_string().contains("unknown field"));
+
+        let mut invalid_role_report = serde_json::to_value(&results).expect("serialize results");
+        invalid_role_report["runs"][0]["metrics"]["role_usage"]["worker"]
+            ["unexpected_role_usage_field"] = json!(true);
+        let error = serde_json::from_value::<EvaluationResults>(invalid_role_report)
+            .expect_err("unknown RoleUsageReport fields fail closed");
+        assert!(error.to_string().contains("unknown field"));
+
+        let mut invalid_nested_usage = serde_json::to_value(&results).expect("serialize results");
+        invalid_nested_usage["profile_summaries"][0]["aggregate_role_usage"]["worker"]["usage"]
+            ["unexpected_nested_usage_field"] = json!(true);
+        let error = serde_json::from_value::<EvaluationResults>(invalid_nested_usage)
+            .expect_err("nested unknown Usage fields in summaries fail closed");
+        assert!(error.to_string().contains("unknown field"));
+
+        let mut invalid_finding = serde_json::to_value(&results).expect("serialize results");
+        invalid_finding["runs"][0]["metrics"]["review"]["findings"] = json!([{
+            "severity": "warning",
+            "message": "representative review finding",
+            "paths": [],
+            "unexpected_finding_field": true
+        }]);
+        let error = serde_json::from_value::<EvaluationResults>(invalid_finding)
+            .expect_err("unknown Finding fields fail closed");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -1784,7 +1962,24 @@ mod tests {
             .expect_err("changed dispatch limits break comparability");
         assert!(error
             .to_string()
-            .contains("target, base snapshot, limits, or held-out validation differ"));
+            .contains("full role/model profile set differ"));
+
+        let results = run_deterministic_fake(&manifest, 11).expect("fake results");
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.profiles[0]
+            .role_models
+            .get_mut(&AgentRole::Worker)
+            .expect("worker selection")
+            .reasoning_effort = Some("low".to_string());
+        changed_manifest
+            .validate()
+            .expect("reasoning-effort variant remains a valid manifest");
+        let error = results
+            .validate_against(&changed_manifest)
+            .expect_err("reasoning-effort drift changes the full profile binding");
+        assert!(error
+            .to_string()
+            .contains("full role/model profile set differ"));
     }
 
     #[test]
