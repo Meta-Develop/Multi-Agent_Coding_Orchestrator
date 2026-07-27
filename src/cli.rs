@@ -2544,47 +2544,9 @@ impl MergeCommand {
                 )?;
                 print_merge_preview(&preview, args.json)
             }
-            MergeSubcommand::Apply(args) => {
-                let megafile_policy = args.megafile_policy()?;
-                let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
-                let validation_evidence =
-                    load_validation_evidence(&args.validation_report, &args.agent_id)?;
-                let candidate_validation_commands = args
-                    .validation_command
-                    .into_iter()
-                    .map(|command| CandidateValidationCommand { command })
-                    .collect::<Vec<_>>();
-                let preview_options = MergePreviewOptions {
-                    collect: collect_options_from_claims(
-                        &args.repo,
-                        &args.agent_id,
-                        claims,
-                        true,
-                        Vec::new(),
-                    ),
-                    forces: args.forces.into_force_options(),
-                    require_validation: args.require_validation,
-                };
-                let report = merge::merge_apply_report_with_megafile_policy(
-                    MergeApplyOptions {
-                        preview: preview_options,
-                        candidate_validation_commands,
-                    },
-                    validation_evidence,
-                    megafile_policy,
-                )?;
-                if report.status == merge::MergeApplyReportStatus::Blocked {
-                    if args.json {
-                        print_merge_apply_report(&report, true)?;
-                    }
-                    let message = report
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "merge apply refused".to_string());
-                    bail!("{message}");
-                }
-                print_merge_apply_report(&report, args.json)
-            }
+            MergeSubcommand::Apply(args) => run_merge_apply_controller(args, |report, json| {
+                print_merge_apply_report(report, json)
+            }),
             MergeSubcommand::Arbitrate(args) => {
                 let first_side =
                     arbitration_side_from_cli(args.first_side, args.first_claim, "first")?;
@@ -2609,6 +2571,44 @@ impl MergeCommand {
             }
         }
     }
+}
+
+fn run_merge_apply_controller(
+    args: MergeApplyArgs,
+    mut deliver_report: impl FnMut(&MergeApplyReport, bool) -> Result<()>,
+) -> Result<()> {
+    let megafile_policy = args.megafile_policy()?;
+    let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
+    let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
+    let candidate_validation_commands = args
+        .validation_command
+        .into_iter()
+        .map(|command| CandidateValidationCommand { command })
+        .collect::<Vec<_>>();
+    let preview_options = MergePreviewOptions {
+        collect: collect_options_from_claims(&args.repo, &args.agent_id, claims, true, Vec::new()),
+        forces: args.forces.into_force_options(),
+        require_validation: args.require_validation,
+    };
+    let report = merge::merge_apply_report_with_megafile_policy(
+        MergeApplyOptions {
+            preview: preview_options,
+            candidate_validation_commands,
+        },
+        validation_evidence,
+        megafile_policy,
+    )?;
+    if report.status == merge::MergeApplyReportStatus::Blocked {
+        if args.json {
+            deliver_report(&report, true)?;
+        }
+        let message = report
+            .error
+            .clone()
+            .unwrap_or_else(|| "merge apply refused".to_string());
+        bail!("{message}");
+    }
+    deliver_report(&report, args.json)
 }
 
 #[derive(Debug, Subcommand)]
@@ -4244,6 +4244,10 @@ fn print_owner_report(report: &OwnerReport, json: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use git2::Signature;
+
     use super::*;
 
     #[test]
@@ -4361,6 +4365,118 @@ mod tests {
                 command: MergeSubcommand::Apply(_)
             })
         ));
+    }
+
+    #[test]
+    fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repository");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(repo_path.join("README.md"), "# Smoke\n").expect("write README");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub fn ok() -> bool { true }\n",
+        )
+        .expect("write lib");
+        let repo = Repository::open(&repo_path).expect("open repository");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .expect("stage fixture");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("commit fixture");
+        drop(tree);
+        drop(repo);
+
+        let worktree = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create test worktree");
+        fs::write(
+            worktree.path.join("README.md"),
+            "# Smoke\n\nclaimed change\n",
+        )
+        .expect("edit claimed path");
+        fs::write(
+            worktree.path.join("src/lib.rs"),
+            "pub fn ok() -> bool { false }\n",
+        )
+        .expect("edit unclaimed path");
+
+        let args = MergeApplyArgs {
+            agent_id: "agent-a".to_string(),
+            repo: repo_path,
+            claim: vec![PathBuf::from("README.md")],
+            validation_report: Vec::new(),
+            require_validation: false,
+            validation_command: Vec::new(),
+            block_megafiles: false,
+            decomposition_target: None,
+            decomposition_run_id: None,
+            megafile_thresholds: MegafileThresholdArgs::default(),
+            forces: MergeForceArgs {
+                force_dirty_primary: false,
+                force_stale_base: false,
+                force_unclaimed_edits: false,
+                force_validation_failures: false,
+                force_apply_conflicts: false,
+            },
+            json: true,
+        };
+        let mut delivered = None;
+        let error = run_merge_apply_controller(args, |report, json| {
+            assert!(json);
+            delivered = Some(report.clone());
+            Ok(())
+        })
+        .expect_err("unclaimed merge edit must remain blocked");
+
+        assert!(error.to_string().contains("unclaimed_edits"));
+        let report = delivered.expect("integration controller must receive the blocked report");
+        assert_eq!(report.status, merge::MergeApplyReportStatus::Blocked);
+        assert!(!report.applied);
+        let denial = report
+            .gate_denials
+            .iter()
+            .find(|denial| {
+                matches!(
+                    denial.reason,
+                    crate::gate_denial::GateDenialReason::MergeRemediation {
+                        blocker: merge::ApplyBlocker::UnclaimedEdits
+                    }
+                )
+            })
+            .expect("delivered unclaimed-edits merge denial");
+        assert_eq!(
+            denial.route,
+            crate::gate_denial::GateDenialRoute::IntegrationController
+        );
+        assert_eq!(denial.context.owner, "agent-a");
+        assert_eq!(
+            denial.context.source,
+            crate::gate_denial::GateCheckSource::MergeScope
+        );
+        assert_eq!(denial.context.paths, vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(
+            denial.next_safe_operation,
+            crate::gate_denial::NextSafeOperation::RemediateUnclaimedMergeEdits
+        );
+        let correlation_id = denial.correction_correlation_id.as_str();
+        assert!(!correlation_id.is_empty());
+        assert!(correlation_id.len() <= 128);
+        assert!(correlation_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        }));
     }
 
     #[test]
