@@ -12,6 +12,7 @@ pub mod decision_claim;
 pub(crate) mod effect_wal;
 pub mod external_agent;
 pub mod field_guide;
+pub mod gate_denial;
 pub mod inbox;
 pub mod live_claim;
 pub mod llm;

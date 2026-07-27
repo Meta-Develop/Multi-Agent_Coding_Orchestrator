@@ -1169,6 +1169,7 @@ fn supervisor_plan_for_attempt(
         max_depth: 2,
         max_child_assignments: 1,
         max_child_retries: 0,
+        max_gate_corrections: 0,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
