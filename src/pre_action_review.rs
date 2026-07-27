@@ -643,9 +643,9 @@ impl ReviewOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LatencyBudget {
-    pub p50_ms: u64,
-    pub p95_ms: u64,
-    pub timeout_ms: u64,
+    p50_ms: u64,
+    p95_ms: u64,
+    timeout_ms: u64,
 }
 
 impl LatencyBudget {
@@ -666,6 +666,18 @@ impl LatencyBudget {
             p95_ms: DEFAULT_CLASSIFIER_P95_BUDGET_MS,
             timeout_ms: DEFAULT_CLASSIFIER_TIMEOUT_MS,
         }
+    }
+
+    pub fn p50_ms(self) -> u64 {
+        self.p50_ms
+    }
+
+    pub fn p95_ms(self) -> u64 {
+        self.p95_ms
+    }
+
+    pub fn timeout_ms(self) -> u64 {
+        self.timeout_ms
     }
 
     fn timeout(self) -> Duration {
@@ -1741,6 +1753,9 @@ mod tests {
         assert_eq!(metrics.classifier_latency.measured_p95_ms, Some(20));
         assert_eq!(metrics.classifier_latency.p50_within_budget, Some(true));
         assert_eq!(metrics.classifier_latency.p95_within_budget, Some(true));
+        assert_eq!(metrics.classifier_latency.budget.p50_ms(), 15);
+        assert_eq!(metrics.classifier_latency.budget.p95_ms(), 25);
+        assert_eq!(metrics.classifier_latency.budget.timeout_ms(), 100);
     }
 
     #[test]
