@@ -4414,6 +4414,10 @@ fn execute_supervisor_assignment_inner(
         .parent_assignment_id
         .as_deref()
         .unwrap_or_else(|| options.run_id.as_str());
+    let semantic_block_turn = match (semantic_block_gate, semantic_block_order) {
+        (Some(gate), Some(order)) => Some(gate.wait_for_turn(*order)?),
+        _ => None,
+    };
     let mut effective_assignment = (*assignment).clone();
     let claim = loop {
         match sync_store.claim_paths(
@@ -4518,10 +4522,6 @@ fn execute_supervisor_assignment_inner(
     };
     outcome.claim_tokens.push(claim.token);
     let assignment = &effective_assignment;
-    let semantic_block_turn = match (semantic_block_gate, semantic_block_order) {
-        (Some(gate), Some(order)) => Some(gate.wait_for_turn(*order)?),
-        _ => None,
-    };
     let current_primary_head = current_head_oid(repo)?;
     if !reused {
         let create_options = WorktreeCreateOptions {
