@@ -1384,7 +1384,7 @@ mod tests {
         )
         .is_err());
         assert!(
-            ReviewContext::new("run", "worker-a", &"x".repeat(MAX_INTENT_BYTES + 1), [], [])
+            ReviewContext::new("run", "worker-a", "x".repeat(MAX_INTENT_BYTES + 1), [], [])
                 .is_err()
         );
         assert!(CommandInvocation::new("tool", vec!["x"; MAX_ARGUMENTS + 1]).is_err());

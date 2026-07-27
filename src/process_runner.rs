@@ -1604,7 +1604,7 @@ where
 fn run_process_cancellable_with_interaction(
     mut spec: ProcessSpec,
     cancellation: &ProcessCancellation,
-    mut interaction: Option<&mut dyn FnMut(&mut ContainedProcessSession<'_>)>,
+    interaction: Option<&mut dyn FnMut(&mut ContainedProcessSession<'_>)>,
 ) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
     if interaction.is_some() != matches!(spec.stdin, StdinMode::Interactive) {
@@ -1896,7 +1896,7 @@ fn run_process_cancellable_with_interaction(
         }
     };
     let (stdout_tee, stderr_tee) = prepared_tees.commit();
-    let (mut input_writer, mut output_drainers) = match interaction.as_deref_mut() {
+    let (mut input_writer, mut output_drainers) = match interaction {
         Some(handler) => {
             let mut session = prepared_io
                 .start_interactive(
