@@ -29,7 +29,6 @@ pub const GATE_DENIAL_VERSION: u32 = 1;
 
 const STABLE_ID_DOMAIN: &[u8] = b"maco-gate-denial-v1\0";
 const MAX_CORRELATION_ID_BYTES: usize = 128;
-const MAX_CHECK_ID_BYTES: usize = 64;
 const MAX_POLICY_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_PATHS: usize = 256;
@@ -170,6 +169,28 @@ pub enum ExternalSideEffectState {
     Completed,
 }
 
+/// Trusted source check that produced a denial.
+///
+/// These variants replace caller-supplied check labels. Consumers can route
+/// distinct checks without parsing messages, diagnostics, or commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateCheckSource {
+    ClaimAcquisition,
+    Auditor,
+    Validation,
+    PrimaryDrift,
+    GitApplyCheck,
+    MergeScope,
+    ValidationBinding,
+    ValidationState,
+    SandboxPolicy,
+    Containment,
+    PrimaryIntegrity,
+    ExternalSideEffect,
+    FutureApprovalReview,
+}
+
 /// Typed family explaining why a gate denied progress.
 ///
 /// The sandbox variant embeds the existing [`SandboxDenialEvidence`] contract;
@@ -177,7 +198,7 @@ pub enum ExternalSideEffectState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GateDenialReason {
-    ClaimConflict { blocker: GateApplyBlocker },
+    ClaimConflict,
     AuditorRepair,
     ValidationRepair { blocker: GateApplyBlocker },
     MergeRemediation { blocker: GateApplyBlocker },
@@ -210,17 +231,17 @@ pub enum GateDenialRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextSafeOperation {
-    ReplanClaimOwnership,
+    NarrowOrReplanClaimOwnership,
     RepairAuditorFindings,
     RepairValidation,
     RestoreCleanPrimary,
     RefreshCandidateBase,
     RepairMergeConflict,
+    RemediateUnclaimedMergeEdits,
     RemediateExcludedReference,
     RestoreContainment,
     RestorePrimaryIntegrity,
     ReconcileExternalSideEffect,
-    RequestSandboxException,
     EscalateSandboxPolicy,
 }
 
@@ -229,20 +250,20 @@ pub enum NextSafeOperation {
 #[serde(deny_unknown_fields)]
 pub struct VerifiedGateContext {
     pub owner: String,
-    pub check: String,
+    pub source: GateCheckSource,
     pub paths: Vec<PathBuf>,
 }
 
 impl VerifiedGateContext {
-    /// Canonicalizes the owner/check identities and every repository-relative path.
-    pub fn new<I, P>(owner: impl AsRef<str>, check: impl AsRef<str>, paths: I) -> Result<Self>
+    /// Canonicalizes the owner and every repository-relative path.
+    pub fn new<I, P>(owner: impl AsRef<str>, source: GateCheckSource, paths: I) -> Result<Self>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
         canonical_context(Self {
             owner: owner.as_ref().to_string(),
-            check: check.as_ref().to_string(),
+            source,
             paths: paths
                 .into_iter()
                 .map(|path| path.as_ref().to_path_buf())
@@ -311,6 +332,7 @@ impl GateDenial {
         let correction_correlation_id = CorrectionCorrelationId::new(correction_correlation_id)?;
         let reason = canonical_reason(reason)?;
         let context = canonical_context(context)?;
+        validate_context_source(&reason, context.source)?;
         let retryability = retryability_for(&reason);
         let route = route_for(&reason);
         let next_safe_operation = next_safe_operation_for(&reason);
@@ -329,11 +351,32 @@ impl GateDenial {
         Ok(denial)
     }
 
+    /// Constructs a real pre-launch claim-acquisition conflict.
+    ///
+    /// Merge-phase [`ApplyBlocker::UnclaimedEdits`] is intentionally handled by
+    /// the merge adapter and never enters this reason family.
+    pub fn from_claim_conflict<I, P>(
+        correction_correlation_id: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        paths: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let context = VerifiedGateContext::new(owner, GateCheckSource::ClaimAcquisition, paths)?;
+        Self::new(
+            correction_correlation_id,
+            GateDenialReason::ClaimConflict,
+            context,
+        )
+    }
+
     /// Adapts a structured merge blocker before any fields are flattened to prose.
     pub fn from_apply_blocker<I, P>(
         correction_correlation_id: impl AsRef<str>,
         owner: impl AsRef<str>,
-        check: impl AsRef<str>,
+        source: GateCheckSource,
         blocker: ApplyBlocker,
         paths: I,
     ) -> Result<Self>
@@ -343,7 +386,7 @@ impl GateDenial {
     {
         let blocker = GateApplyBlocker::from(blocker);
         let reason = reason_for_apply_blocker(blocker);
-        let context = VerifiedGateContext::new(owner, check, paths)?;
+        let context = VerifiedGateContext::new(owner, source, paths)?;
         Self::new(correction_correlation_id, reason, context)
     }
 
@@ -354,7 +397,7 @@ impl GateDenial {
     pub fn from_apply_blocker_detail(
         correction_correlation_id: impl AsRef<str>,
         owner: impl AsRef<str>,
-        check: impl AsRef<str>,
+        source: GateCheckSource,
         detail: &ApplyBlockerDetail,
     ) -> Result<Self> {
         if detail.disposition != ApplyBlockerDisposition::Blocked {
@@ -366,7 +409,7 @@ impl GateDenial {
         Self::from_apply_blocker(
             correction_correlation_id,
             owner,
-            check,
+            source,
             detail.kind,
             &detail.paths,
         )
@@ -376,10 +419,13 @@ impl GateDenial {
     pub fn from_sandbox_denial(
         correction_correlation_id: impl AsRef<str>,
         owner: impl AsRef<str>,
-        check: impl AsRef<str>,
         evidence: SandboxDenialEvidence,
     ) -> Result<Self> {
-        let context = VerifiedGateContext::new(owner, check, std::iter::empty::<&Path>())?;
+        let context = VerifiedGateContext::new(
+            owner,
+            GateCheckSource::SandboxPolicy,
+            std::iter::empty::<&Path>(),
+        )?;
         Self::new(
             correction_correlation_id,
             GateDenialReason::Sandbox { evidence },
@@ -405,6 +451,7 @@ impl GateDenial {
         if canonical_context != self.context {
             return invalid("verified context is not canonical");
         }
+        validate_context_source(&self.reason, self.context.source)?;
 
         let expected_retryability = retryability_for(&self.reason);
         if self.retryability != expected_retryability {
@@ -470,8 +517,8 @@ impl GateDenial {
         prompt.push_str("Verified owner: ");
         prompt.push_str(&self.context.owner);
         prompt.push('\n');
-        prompt.push_str("Verified check: ");
-        prompt.push_str(&self.context.check);
+        prompt.push_str("Verified check source: ");
+        prompt.push_str(check_source_label(self.context.source));
         prompt.push('\n');
 
         let paths = prompt_paths(&self.reason, &self.context);
@@ -502,23 +549,16 @@ impl GateDenial {
 fn canonical_context(context: VerifiedGateContext) -> Result<VerifiedGateContext> {
     let owner = normalize_agent_id(&context.owner)
         .map_err(|error| GateDenialError::Invalid(format!("owner is invalid: {error:#}")))?;
-    let check = canonical_check_id(&context.check)?;
     let paths = canonical_paths(context.paths)?;
     Ok(VerifiedGateContext {
         owner,
-        check,
+        source: context.source,
         paths,
     })
 }
 
 fn canonical_reason(reason: GateDenialReason) -> Result<GateDenialReason> {
     match reason {
-        GateDenialReason::ClaimConflict { blocker } => {
-            if blocker != GateApplyBlocker::UnclaimedEdits {
-                return invalid("claim-conflict reason requires unclaimed_edits blocker");
-            }
-            Ok(GateDenialReason::ClaimConflict { blocker })
-        }
         GateDenialReason::ValidationRepair { blocker } => {
             if !matches!(
                 blocker,
@@ -538,6 +578,7 @@ fn canonical_reason(reason: GateDenialReason) -> Result<GateDenialReason> {
                     | GateApplyBlocker::StaleBase
                     | GateApplyBlocker::ApplyCheckFailed
                     | GateApplyBlocker::ExcludedReference
+                    | GateApplyBlocker::UnclaimedEdits
             ) {
                 return invalid("merge-remediation reason requires a merge blocker");
             }
@@ -615,14 +656,8 @@ fn canonical_identifier(value: &str, field: &str, max_bytes: usize) -> Result<St
     Ok(trimmed.to_string())
 }
 
-fn canonical_check_id(value: &str) -> Result<String> {
-    let canonical = canonical_identifier(value, "check id", MAX_CHECK_ID_BYTES)?;
-    Ok(canonical.to_ascii_lowercase())
-}
-
 fn reason_for_apply_blocker(blocker: GateApplyBlocker) -> GateDenialReason {
     match blocker {
-        GateApplyBlocker::UnclaimedEdits => GateDenialReason::ClaimConflict { blocker },
         GateApplyBlocker::ValidationMissing
         | GateApplyBlocker::ValidationNotRun
         | GateApplyBlocker::ValidationSkipped
@@ -630,15 +665,74 @@ fn reason_for_apply_blocker(blocker: GateApplyBlocker) -> GateDenialReason {
         GateApplyBlocker::DirtyPrimary
         | GateApplyBlocker::StaleBase
         | GateApplyBlocker::ApplyCheckFailed
-        | GateApplyBlocker::ExcludedReference => GateDenialReason::MergeRemediation { blocker },
+        | GateApplyBlocker::ExcludedReference
+        | GateApplyBlocker::UnclaimedEdits => GateDenialReason::MergeRemediation { blocker },
     }
 }
 
+fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -> Result<()> {
+    let valid = match reason {
+        GateDenialReason::ClaimConflict => source == GateCheckSource::ClaimAcquisition,
+        GateDenialReason::AuditorRepair => {
+            matches!(
+                source,
+                GateCheckSource::Auditor | GateCheckSource::FutureApprovalReview
+            )
+        }
+        GateDenialReason::ValidationRepair { blocker } => match blocker {
+            GateApplyBlocker::ValidationMissing => matches!(
+                source,
+                GateCheckSource::Validation
+                    | GateCheckSource::ValidationBinding
+                    | GateCheckSource::ValidationState
+            ),
+            GateApplyBlocker::ValidationNotRun
+            | GateApplyBlocker::ValidationSkipped
+            | GateApplyBlocker::ValidationFailed => matches!(
+                source,
+                GateCheckSource::Validation | GateCheckSource::ValidationState
+            ),
+            _ => false,
+        },
+        GateDenialReason::MergeRemediation { blocker } => match blocker {
+            GateApplyBlocker::DirtyPrimary => source == GateCheckSource::PrimaryDrift,
+            GateApplyBlocker::StaleBase => {
+                matches!(
+                    source,
+                    GateCheckSource::PrimaryDrift | GateCheckSource::MergeScope
+                )
+            }
+            GateApplyBlocker::ApplyCheckFailed => {
+                matches!(
+                    source,
+                    GateCheckSource::PrimaryDrift | GateCheckSource::GitApplyCheck
+                )
+            }
+            GateApplyBlocker::ExcludedReference | GateApplyBlocker::UnclaimedEdits => {
+                source == GateCheckSource::MergeScope
+            }
+            _ => false,
+        },
+        GateDenialReason::ContainmentFailure => source == GateCheckSource::Containment,
+        GateDenialReason::PrimaryIntegrityFailure => source == GateCheckSource::PrimaryIntegrity,
+        GateDenialReason::ExternalSideEffect { .. } => {
+            source == GateCheckSource::ExternalSideEffect
+        }
+        GateDenialReason::Sandbox { .. } => source == GateCheckSource::SandboxPolicy,
+    };
+    if !valid {
+        return invalid("verified check source does not match the typed reason");
+    }
+    Ok(())
+}
+
 fn retryability_for(reason: &GateDenialReason) -> GateRetryability {
-    if is_non_retryable_safety_class(reason) {
-        GateRetryability::NotRetryable
-    } else {
-        GateRetryability::RetryAfterCorrection
+    match reason {
+        GateDenialReason::ContainmentFailure
+        | GateDenialReason::PrimaryIntegrityFailure
+        | GateDenialReason::ExternalSideEffect { .. }
+        | GateDenialReason::Sandbox { .. } => GateRetryability::NotRetryable,
+        _ => GateRetryability::RetryAfterCorrection,
     }
 }
 
@@ -648,18 +742,13 @@ fn is_non_retryable_safety_class(reason: &GateDenialReason) -> bool {
         GateDenialReason::ContainmentFailure
             | GateDenialReason::PrimaryIntegrityFailure
             | GateDenialReason::ExternalSideEffect { .. }
-            | GateDenialReason::Sandbox {
-                evidence: SandboxDenialEvidence {
-                    retryability: SandboxDenialRetryability::NotRetryable,
-                    ..
-                }
-            }
+            | GateDenialReason::Sandbox { .. }
     )
 }
 
 fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
     match reason {
-        GateDenialReason::ClaimConflict { .. } => GateDenialRoute::PlannerParent,
+        GateDenialReason::ClaimConflict => GateDenialRoute::PlannerParent,
         GateDenialReason::AuditorRepair
         | GateDenialReason::ValidationRepair { .. }
         | GateDenialReason::ContainmentFailure
@@ -672,7 +761,7 @@ fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
 
 fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
     match reason {
-        GateDenialReason::ClaimConflict { .. } => NextSafeOperation::ReplanClaimOwnership,
+        GateDenialReason::ClaimConflict => NextSafeOperation::NarrowOrReplanClaimOwnership,
         GateDenialReason::AuditorRepair => NextSafeOperation::RepairAuditorFindings,
         GateDenialReason::ValidationRepair { .. } => NextSafeOperation::RepairValidation,
         GateDenialReason::MergeRemediation { blocker } => match blocker {
@@ -680,6 +769,7 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
             GateApplyBlocker::StaleBase => NextSafeOperation::RefreshCandidateBase,
             GateApplyBlocker::ApplyCheckFailed => NextSafeOperation::RepairMergeConflict,
             GateApplyBlocker::ExcludedReference => NextSafeOperation::RemediateExcludedReference,
+            GateApplyBlocker::UnclaimedEdits => NextSafeOperation::RemediateUnclaimedMergeEdits,
             _ => unreachable!("merge blocker family is validated"),
         },
         GateDenialReason::ContainmentFailure => NextSafeOperation::RestoreContainment,
@@ -687,12 +777,7 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
         GateDenialReason::ExternalSideEffect { .. } => {
             NextSafeOperation::ReconcileExternalSideEffect
         }
-        GateDenialReason::Sandbox { evidence } => match evidence.retryability {
-            SandboxDenialRetryability::RequiresDeclaredException => {
-                NextSafeOperation::RequestSandboxException
-            }
-            SandboxDenialRetryability::NotRetryable => NextSafeOperation::EscalateSandboxPolicy,
-        },
+        GateDenialReason::Sandbox { .. } => NextSafeOperation::EscalateSandboxPolicy,
     }
 }
 
@@ -741,7 +826,7 @@ fn prompt_paths<'a>(
 
 fn reason_label(reason: &GateDenialReason) -> &'static str {
     match reason {
-        GateDenialReason::ClaimConflict { .. } => "claim conflict",
+        GateDenialReason::ClaimConflict => "pre-launch claim conflict",
         GateDenialReason::AuditorRepair => "auditor repair",
         GateDenialReason::ValidationRepair { blocker } => match blocker {
             GateApplyBlocker::ValidationMissing => "validation evidence missing",
@@ -789,10 +874,28 @@ fn route_label(value: GateDenialRoute) -> &'static str {
     }
 }
 
+fn check_source_label(value: GateCheckSource) -> &'static str {
+    match value {
+        GateCheckSource::ClaimAcquisition => "claim acquisition",
+        GateCheckSource::Auditor => "auditor",
+        GateCheckSource::Validation => "validation",
+        GateCheckSource::PrimaryDrift => "primary drift",
+        GateCheckSource::GitApplyCheck => "Git apply check",
+        GateCheckSource::MergeScope => "merge scope",
+        GateCheckSource::ValidationBinding => "validation binding",
+        GateCheckSource::ValidationState => "validation state",
+        GateCheckSource::SandboxPolicy => "sandbox policy",
+        GateCheckSource::Containment => "containment",
+        GateCheckSource::PrimaryIntegrity => "primary integrity",
+        GateCheckSource::ExternalSideEffect => "external side effect",
+        GateCheckSource::FutureApprovalReview => "future approval review",
+    }
+}
+
 fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
     match value {
-        NextSafeOperation::ReplanClaimOwnership => {
-            "return the conflict to the planner or parent for claim replanning."
+        NextSafeOperation::NarrowOrReplanClaimOwnership => {
+            "return the conflict to the planner or parent to narrow the scope or replan claim ownership."
         }
         NextSafeOperation::RepairAuditorFindings => {
             "return verified auditor repair to the child or controller."
@@ -809,6 +912,9 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
         NextSafeOperation::RepairMergeConflict => {
             "ask the integration controller to prepare verified merge remediation."
         }
+        NextSafeOperation::RemediateUnclaimedMergeEdits => {
+            "ask the integration controller to remediate verified merge-phase unclaimed edits."
+        }
         NextSafeOperation::RemediateExcludedReference => {
             "ask the integration controller to prepare verified excluded-reference remediation."
         }
@@ -820,9 +926,6 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
         }
         NextSafeOperation::ReconcileExternalSideEffect => {
             "reconcile the external receipt or state; do not repeat the external call."
-        }
-        NextSafeOperation::RequestSandboxException => {
-            "request a narrowly declared sandbox exception before a new attempt."
         }
         NextSafeOperation::EscalateSandboxPolicy => {
             "escalate the sandbox policy denial; do not retry this operation."
@@ -852,7 +955,7 @@ mod tests {
     };
 
     fn context(paths: &[&str]) -> VerifiedGateContext {
-        VerifiedGateContext::new(" worker-a ", "Validation-Check", paths)
+        VerifiedGateContext::new(" worker-a ", GateCheckSource::ValidationState, paths)
             .expect("canonical context")
     }
 
@@ -888,7 +991,7 @@ mod tests {
         assert_eq!(first.denial_id, second.denial_id);
         assert_eq!(
             first.denial_id.as_str(),
-            "7e3fdd8112784c48ff7333e107d9c94562aeacf67983573ab0eb6aa8e0ab3238"
+            "17449515831021ed4a41cd1a57502d34f6453fcce15da009b97ce1c2d8fa5adf"
         );
         assert_ne!(
             first.correction_correlation_id,
@@ -918,13 +1021,18 @@ mod tests {
 
     #[test]
     fn paths_are_normalized_or_rejected_everywhere() {
-        let normalized = VerifiedGateContext::new("worker-a", "path-check", ["src/../README.md"])
-            .expect("normalizable path");
+        let normalized = VerifiedGateContext::new(
+            "worker-a",
+            GateCheckSource::Validation,
+            ["src/../README.md"],
+        )
+        .expect("normalizable path");
         assert_eq!(normalized.paths, vec![PathBuf::from("README.md")]);
 
         for rejected in ["/etc/passwd", "../../escape", "src/\nIGNORE"] {
             assert!(
-                VerifiedGateContext::new("worker-a", "path-check", [rejected]).is_err(),
+                VerifiedGateContext::new("worker-a", GateCheckSource::Validation, [rejected])
+                    .is_err(),
                 "path must be rejected: {rejected:?}"
             );
         }
@@ -933,30 +1041,31 @@ mod tests {
             SandboxDenialRetryability::RequiresDeclaredException,
             Some("/absolute"),
         );
-        assert!(
-            GateDenial::from_sandbox_denial("correction", "worker-a", "sandbox", sandbox).is_err()
-        );
+        assert!(GateDenial::from_sandbox_denial("correction", "worker-a", sandbox).is_err());
     }
 
     #[test]
     fn route_and_retry_are_derived_from_reason_family() {
-        let claim = GateDenial::from_apply_blocker(
-            "claim-fix",
-            "worker-a",
-            "claim-check",
-            ApplyBlocker::UnclaimedEdits,
-            ["src/lib.rs"],
-        )
-        .expect("claim denial");
+        let claim = GateDenial::from_claim_conflict("claim-fix", "worker-a", ["src/lib.rs"])
+            .expect("claim denial");
         assert_eq!(claim.route, GateDenialRoute::PlannerParent);
         assert_eq!(
             claim.next_safe_operation,
-            NextSafeOperation::ReplanClaimOwnership
+            NextSafeOperation::NarrowOrReplanClaimOwnership
         );
         assert_eq!(claim.retryability, GateRetryability::RetryAfterCorrection);
 
-        let auditor = GateDenial::new("audit-fix", GateDenialReason::AuditorRepair, context(&[]))
-            .expect("auditor denial");
+        let auditor = GateDenial::new(
+            "audit-fix",
+            GateDenialReason::AuditorRepair,
+            VerifiedGateContext::new(
+                "worker-a",
+                GateCheckSource::Auditor,
+                std::iter::empty::<&Path>(),
+            )
+            .expect("auditor context"),
+        )
+        .expect("auditor denial");
         assert_eq!(auditor.route, GateDenialRoute::ChildController);
 
         let validation = validation_denial("validation-fix", &[]);
@@ -964,40 +1073,34 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_reason_carries_existing_evidence_and_retry_policy() {
-        let retryable_evidence = sandbox_evidence(
+    fn sandbox_reason_carries_existing_evidence_without_retry_authority() {
+        let carry_only_evidence = sandbox_evidence(
             SandboxDenialRetryability::RequiresDeclaredException,
             Some("AGENTS.md"),
         );
-        let retryable = GateDenial::from_sandbox_denial(
-            "sandbox-fix",
-            "worker-a",
-            "sandbox-policy",
-            retryable_evidence.clone(),
-        )
-        .expect("retryable sandbox denial");
+        let denial =
+            GateDenial::from_sandbox_denial("sandbox-fix", "worker-a", carry_only_evidence.clone())
+                .expect("carry-only sandbox denial");
         assert_eq!(
-            retryable.reason,
+            denial.reason,
             GateDenialReason::Sandbox {
-                evidence: retryable_evidence
+                evidence: carry_only_evidence
             }
         );
+        assert_eq!(denial.retryability, GateRetryability::NotRetryable);
         assert_eq!(
-            retryable.retryability,
-            GateRetryability::RetryAfterCorrection
+            denial.next_safe_operation,
+            NextSafeOperation::EscalateSandboxPolicy
         );
-        assert_eq!(
-            retryable.next_safe_operation,
-            NextSafeOperation::RequestSandboxException
-        );
-        let json = retryable.to_json().expect("sandbox JSON");
+        let json = denial.to_json().expect("sandbox JSON");
         assert!(json.contains("\"boundary\":\"inner_codex\""));
         assert!(json.contains("\"policy_id\":\"maco_external_codex_inner_v1\""));
+        assert_eq!(json.matches("\"boundary\"").count(), 1);
+        assert_eq!(json.matches("\"policy_id\"").count(), 1);
 
         let not_retryable = GateDenial::from_sandbox_denial(
             "sandbox-stop",
             "worker-a",
-            "sandbox-policy",
             sandbox_evidence(SandboxDenialRetryability::NotRetryable, Some(".git")),
         )
         .expect("non-retryable sandbox denial");
@@ -1009,60 +1112,104 @@ mod tests {
     }
 
     #[test]
-    fn apply_blockers_map_to_claim_validation_or_merge_routes() {
+    fn prelaunch_claim_and_merge_unclaimed_edits_have_distinct_routes() {
+        let claim = GateDenial::from_claim_conflict("claim-fix", "worker-a", ["src/lib.rs"])
+            .expect("claim conflict");
+        let merge_unclaimed = GateDenial::from_apply_blocker(
+            "merge-fix",
+            "worker-a",
+            GateCheckSource::MergeScope,
+            ApplyBlocker::UnclaimedEdits,
+            ["src/lib.rs"],
+        )
+        .expect("merge unclaimed edits");
+
+        assert_eq!(claim.reason, GateDenialReason::ClaimConflict);
+        assert_eq!(claim.route, GateDenialRoute::PlannerParent);
+        assert_eq!(
+            claim.next_safe_operation,
+            NextSafeOperation::NarrowOrReplanClaimOwnership
+        );
+        assert_eq!(
+            merge_unclaimed.reason,
+            GateDenialReason::MergeRemediation {
+                blocker: GateApplyBlocker::UnclaimedEdits
+            }
+        );
+        assert_eq!(
+            merge_unclaimed.route,
+            GateDenialRoute::IntegrationController
+        );
+        assert_eq!(
+            merge_unclaimed.next_safe_operation,
+            NextSafeOperation::RemediateUnclaimedMergeEdits
+        );
+    }
+
+    #[test]
+    fn apply_blockers_map_to_validation_or_merge_routes() {
         let cases = [
             (
                 ApplyBlocker::UnclaimedEdits,
-                GateDenialRoute::PlannerParent,
-                NextSafeOperation::ReplanClaimOwnership,
+                GateCheckSource::MergeScope,
+                GateDenialRoute::IntegrationController,
+                NextSafeOperation::RemediateUnclaimedMergeEdits,
             ),
             (
                 ApplyBlocker::ValidationMissing,
+                GateCheckSource::ValidationBinding,
                 GateDenialRoute::ChildController,
                 NextSafeOperation::RepairValidation,
             ),
             (
                 ApplyBlocker::ValidationNotRun,
+                GateCheckSource::ValidationState,
                 GateDenialRoute::ChildController,
                 NextSafeOperation::RepairValidation,
             ),
             (
                 ApplyBlocker::ValidationSkipped,
+                GateCheckSource::ValidationState,
                 GateDenialRoute::ChildController,
                 NextSafeOperation::RepairValidation,
             ),
             (
                 ApplyBlocker::ValidationFailed,
+                GateCheckSource::Validation,
                 GateDenialRoute::ChildController,
                 NextSafeOperation::RepairValidation,
             ),
             (
                 ApplyBlocker::DirtyPrimary,
+                GateCheckSource::PrimaryDrift,
                 GateDenialRoute::IntegrationController,
                 NextSafeOperation::RestoreCleanPrimary,
             ),
             (
                 ApplyBlocker::StaleBase,
+                GateCheckSource::MergeScope,
                 GateDenialRoute::IntegrationController,
                 NextSafeOperation::RefreshCandidateBase,
             ),
             (
                 ApplyBlocker::ApplyCheckFailed,
+                GateCheckSource::GitApplyCheck,
                 GateDenialRoute::IntegrationController,
                 NextSafeOperation::RepairMergeConflict,
             ),
             (
                 ApplyBlocker::ExcludedReference,
+                GateCheckSource::MergeScope,
                 GateDenialRoute::IntegrationController,
                 NextSafeOperation::RemediateExcludedReference,
             ),
         ];
 
-        for (blocker, route, operation) in cases {
+        for (blocker, source, route, operation) in cases {
             let denial = GateDenial::from_apply_blocker(
                 "merge-fix",
                 "worker-a",
-                "merge-readiness",
+                source,
                 blocker,
                 ["src/lib.rs"],
             )
@@ -1073,27 +1220,106 @@ mod tests {
     }
 
     #[test]
+    fn typed_check_source_preserves_check_identity_without_prose() {
+        let primary_drift = GateDenial::from_apply_blocker(
+            "drift-fix",
+            "worker-a",
+            GateCheckSource::PrimaryDrift,
+            ApplyBlocker::ApplyCheckFailed,
+            ["src/lib.rs"],
+        )
+        .expect("primary drift denial");
+        let git_apply = GateDenial::from_apply_blocker(
+            "apply-fix",
+            "worker-a",
+            GateCheckSource::GitApplyCheck,
+            ApplyBlocker::ApplyCheckFailed,
+            ["src/lib.rs"],
+        )
+        .expect("git apply denial");
+
+        assert_eq!(primary_drift.context.source, GateCheckSource::PrimaryDrift);
+        assert_eq!(git_apply.context.source, GateCheckSource::GitApplyCheck);
+        assert_ne!(primary_drift.denial_id, git_apply.denial_id);
+
+        let all_sources = [
+            GateCheckSource::ClaimAcquisition,
+            GateCheckSource::Auditor,
+            GateCheckSource::Validation,
+            GateCheckSource::PrimaryDrift,
+            GateCheckSource::GitApplyCheck,
+            GateCheckSource::MergeScope,
+            GateCheckSource::ValidationBinding,
+            GateCheckSource::ValidationState,
+            GateCheckSource::SandboxPolicy,
+            GateCheckSource::Containment,
+            GateCheckSource::PrimaryIntegrity,
+            GateCheckSource::ExternalSideEffect,
+            GateCheckSource::FutureApprovalReview,
+        ];
+        assert_eq!(
+            serde_json::to_value(all_sources).expect("serialize sources"),
+            serde_json::json!([
+                "claim_acquisition",
+                "auditor",
+                "validation",
+                "primary_drift",
+                "git_apply_check",
+                "merge_scope",
+                "validation_binding",
+                "validation_state",
+                "sandbox_policy",
+                "containment",
+                "primary_integrity",
+                "external_side_effect",
+                "future_approval_review"
+            ])
+        );
+
+        let mut invalid = serde_json::to_value(git_apply).expect("denial value");
+        invalid["context"]["source"] = serde_json::json!("auditor");
+        assert!(serde_json::from_value::<GateDenial>(invalid).is_err());
+    }
+
+    #[test]
     fn unsafe_safety_classes_can_never_authorize_retry() {
-        let reasons = [
-            GateDenialReason::ContainmentFailure,
-            GateDenialReason::PrimaryIntegrityFailure,
-            GateDenialReason::ExternalSideEffect {
-                state: ExternalSideEffectState::Ambiguous,
-            },
-            GateDenialReason::ExternalSideEffect {
-                state: ExternalSideEffectState::Completed,
-            },
-            GateDenialReason::Sandbox {
-                evidence: sandbox_evidence(SandboxDenialRetryability::NotRetryable, Some(".git")),
-            },
+        let cases = [
+            (
+                GateDenialReason::ContainmentFailure,
+                GateCheckSource::Containment,
+            ),
+            (
+                GateDenialReason::PrimaryIntegrityFailure,
+                GateCheckSource::PrimaryIntegrity,
+            ),
+            (
+                GateDenialReason::ExternalSideEffect {
+                    state: ExternalSideEffectState::Ambiguous,
+                },
+                GateCheckSource::ExternalSideEffect,
+            ),
+            (
+                GateDenialReason::ExternalSideEffect {
+                    state: ExternalSideEffectState::Completed,
+                },
+                GateCheckSource::ExternalSideEffect,
+            ),
+            (
+                GateDenialReason::Sandbox {
+                    evidence: sandbox_evidence(
+                        SandboxDenialRetryability::RequiresDeclaredException,
+                        Some(".git"),
+                    ),
+                },
+                GateCheckSource::SandboxPolicy,
+            ),
         ];
 
-        for (index, reason) in reasons.into_iter().enumerate() {
+        for (index, (reason, source)) in cases.into_iter().enumerate() {
             let denial = GateDenial::new(
                 format!("unsafe-{index}"),
                 reason,
-                VerifiedGateContext::new("worker-a", "safety-check", ["src/lib.rs"])
-                    .expect("context"),
+                VerifiedGateContext::new("worker-a", source, ["src/lib.rs"]).expect("context"),
             )
             .expect("unsafe denial");
             assert_eq!(denial.retryability, GateRetryability::NotRetryable);
@@ -1128,7 +1354,7 @@ mod tests {
         let denial = GateDenial::from_apply_blocker_detail(
             "prompt-fix",
             "worker-a",
-            "validation-check",
+            GateCheckSource::ValidationState,
             &detail,
         )
         .expect("detail denial");
@@ -1156,7 +1382,7 @@ mod tests {
         assert!(GateDenial::from_apply_blocker_detail(
             "merge-fix",
             "worker-a",
-            "merge-check",
+            GateCheckSource::PrimaryDrift,
             &detail
         )
         .is_err());
@@ -1166,7 +1392,7 @@ mod tests {
         assert!(GateDenial::from_apply_blocker_detail(
             "merge-fix",
             "worker-a",
-            "merge-check",
+            GateCheckSource::PrimaryDrift,
             &detail
         )
         .is_err());

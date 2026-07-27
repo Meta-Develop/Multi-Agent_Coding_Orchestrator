@@ -1095,40 +1095,55 @@ turns a blocked merge into an apply.
 
 `gate_denial::GateDenial` is the versioned public envelope for passing a gate
 denial to correction consumers. It carries a typed reason family, derived
-retryability, canonical verified owner/check/path context, a responsible route,
-and a typed non-executable next-safe operation. Its constructors and validated
-deserializer fail closed: containment failure, primary-integrity failure,
-ambiguous or completed external side effects, and
-`SandboxDenialEvidence` with `retryability: not_retryable` can never authorize a
-retry.
+retryability, canonical verified owner/path context, a typed `GateCheckSource`,
+a responsible route, and a typed non-executable next-safe operation. The public
+source discriminator distinguishes claim acquisition, auditor and future
+approval review, validation, primary drift, Git apply check, merge scope,
+validation binding and state, sandbox policy, containment, primary integrity,
+and external side effects without parsing prose. Reason/source mismatches are
+rejected by both constructors and validated deserialization.
 
 Sandbox denials carry the existing `SandboxDenialEvidence` type without a second
-schema. Merge callers should adapt `ApplyBlockerDetail` or `ApplyBlocker` before
-flattening anything to prose. The adapter uses only blocker kind, blocked
-disposition, failed check status, and canonical paths. Reviewer messages,
-validation diagnostics, validation commands, and the legacy free-text
-`next_safe_operation` are never inputs to corrective-prompt rendering.
+schema. Its evidence-level retryability is reporting data, not execution
+authority: `GateDenial::from_sandbox_denial` always fails closed as
+`not_retryable` and escalates sandbox policy. A future retry would require a
+separate trusted supervisor-created execution context that this module does not
+provide. Containment failure, primary-integrity failure, and ambiguous or
+completed external effects are also unconditionally non-retryable.
+
+Merge callers should adapt `ApplyBlockerDetail` or `ApplyBlocker` before
+flattening anything to prose and must supply the trusted typed source check. The
+adapter uses only blocker kind, blocked disposition, failed check status,
+source, and canonical paths. Reviewer messages, validation diagnostics,
+validation commands, and the legacy free-text `next_safe_operation` are never
+inputs to corrective-prompt rendering.
 
 Routing is explicit and fixed:
 
 | Denial family | Responsible route |
 | --- | --- |
-| Claim conflict | Planner or parent |
+| Pre-launch claim-acquisition conflict | Planner or parent |
 | Auditor or validation repair | Child or controller |
-| Merge remediation | Integration controller |
+| Merge remediation, including `unclaimed_edits` | Integration controller |
 
-Containment and retryable sandbox repair also route to the child/controller.
+The dedicated `from_claim_conflict` constructor creates the pre-launch
+claim-conflict family with its typed narrow-or-replan operation. Merge-phase
+`ApplyBlocker::UnclaimedEdits` is merge remediation and never routes to the
+planner/parent.
+
+Containment and sandbox escalation also route to the child/controller.
 Primary-integrity and external-side-effect reconciliation route to the
 integration controller. Corrective prompts contain only fixed policy vocabulary
 plus validated canonical identities and JSON-quoted repository-relative paths.
 
 The stable denial ID is a deterministic SHA-256 identity of envelope version,
-typed reason, and canonical verified context. It deliberately excludes the
-correction-correlation ID. Issue 28 lifecycle consumers should therefore dedupe
-the same denied condition by stable denial ID while using the separately
-validated correction-correlation ID to associate events with one correction
-attempt. Starting a new correction lifecycle changes the correlation ID, not the
-stable denial ID; changing the reason or verified context changes the stable ID.
+typed reason, typed source check, and canonical verified context. It deliberately
+excludes the correction-correlation ID. Issue 28 lifecycle consumers should
+therefore dedupe the same denied condition by stable denial ID while using the
+separately validated correction-correlation ID to associate events with one
+correction attempt. Starting a new correction lifecycle changes the correlation
+ID, not the stable denial ID; changing the reason, source check, or verified
+context changes the stable ID.
 
 `--decomposition-target` never self-authorizes decomposition work. It must be
 paired with `--decomposition-run-id` naming a verified finalized supervise
