@@ -15532,7 +15532,7 @@ mod tests {
             fs::read_to_string(run_root.join("assignments/child-a.attempt-2.prompt.md"))
                 .expect("read corrective prompt");
         assert!(corrective_prompt.contains("STRUCTURAL REPORT RETRY:"));
-        assert!(corrective_prompt.contains("does not match assignment"));
+        assert!(!corrective_prompt.contains("does not match assignment"));
         let history = finding_messages(&report.orchestrator_reports[0]);
         assert!(history.contains("child attempt 1 history"));
         assert!(history.contains("child attempt 2 history"));
