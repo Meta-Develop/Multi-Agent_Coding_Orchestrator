@@ -3638,6 +3638,13 @@ impl GateCorrectionTracker {
         self.active.as_ref().map(|active| &active.denial.reason)
     }
 
+    fn correlation_id_for_observation(&self, entity_id: &str) -> String {
+        self.active
+            .as_ref()
+            .map(|active| active.denial.correction_correlation_id.as_str().to_string())
+            .unwrap_or_else(|| gate_correlation_id(entity_id, self.denials.len().saturating_add(1)))
+    }
+
     fn authorize(
         &mut self,
         denial: GateDenial,
@@ -3645,7 +3652,7 @@ impl GateCorrectionTracker {
         entity_id: &str,
         parent_id: &str,
         health_signals: &mut Vec<SwarmHealthSignal>,
-    ) -> Result<bool> {
+    ) -> Result<Option<GateDenial>> {
         self.begin(denial, artifacts, entity_id, parent_id)?;
         let active = self
             .active
@@ -3658,7 +3665,7 @@ impl GateCorrectionTracker {
                 entity_id,
                 parent_id,
             )?;
-            return Ok(false);
+            return Ok(None);
         }
         if self.used >= self.budget {
             self.finish(
@@ -3667,7 +3674,7 @@ impl GateCorrectionTracker {
                 entity_id,
                 parent_id,
             )?;
-            return Ok(false);
+            return Ok(None);
         }
 
         self.used = self.used.saturating_add(1);
@@ -3687,7 +3694,7 @@ impl GateCorrectionTracker {
             "correction_attempt",
             Some(active.correction_attempts),
         )?;
-        Ok(true)
+        Ok(Some(active.denial.clone()))
     }
 
     fn escalate(
@@ -3778,7 +3785,7 @@ impl GateCorrectionTracker {
     ) -> Result<()> {
         let active = self
             .active
-            .take()
+            .as_ref()
             .context("gate correction terminal disposition has no active denial")?;
         let terminal_state = match terminal_class {
             GateCorrectionTerminalClass::SelfCorrected => "self_corrected",
@@ -3793,6 +3800,10 @@ impl GateCorrectionTracker {
             terminal_state,
             Some(active.correction_attempts),
         )?;
+        let active = self
+            .active
+            .take()
+            .context("gate correction tracker lost its terminalized denial")?;
         self.outcomes.push(GateCorrectionOutcomeRecord {
             denial_id: active.denial.denial_id.as_str().to_string(),
             correction_correlation_id: active.denial.correction_correlation_id.as_str().to_string(),
@@ -4291,6 +4302,25 @@ fn execute_supervisor_assignment(
             ));
         }
     }
+    let journal_parent_id = context
+        .assignment_schedule
+        .get(context.index)
+        .and_then(|entry| entry.parent_assignment_id.as_deref())
+        .unwrap_or_else(|| context.options.run_id.as_str());
+    if let Some(tracker) = outcome.gate_tracker.as_mut() {
+        if let Err(error) =
+            tracker.escalate_active(context.artifacts, &context.assignment.id, journal_parent_id)
+        {
+            let terminalization_error = format!(
+                "failed to terminalize gate correction for supervisor assignment '{}': {error:#}",
+                context.assignment.id
+            );
+            outcome.fatal_error = Some(match outcome.fatal_error.take() {
+                Some(error) => format!("{error}; {terminalization_error}"),
+                None => terminalization_error,
+            });
+        }
+    }
     if let Some(tracker) = outcome.gate_tracker.take() {
         tracker.move_into_outcome(&mut outcome);
     }
@@ -4393,15 +4423,13 @@ fn execute_supervisor_assignment_inner(
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect::<Vec<_>>();
-                let denial_ordinal = outcome
+                let correction_correlation_id = outcome
                     .gate_tracker
                     .as_ref()
                     .context("gate correction tracker was not initialized")?
-                    .denials
-                    .len()
-                    .saturating_add(1);
+                    .correlation_id_for_observation(&effective_assignment.id);
                 let denial = GateDenial::from_claim_conflict(
-                    gate_correlation_id(&effective_assignment.id, denial_ordinal),
+                    correction_correlation_id,
                     &effective_assignment.id,
                     &conflicted_paths,
                 )
@@ -4427,7 +4455,7 @@ fn execute_supervisor_assignment_inner(
                     outcome.assignment_failed = true;
                     return Ok(());
                 };
-                let authorized = outcome
+                let authorized_denial = outcome
                     .gate_tracker
                     .as_mut()
                     .context("gate correction tracker was not initialized")?
@@ -4438,7 +4466,7 @@ fn execute_supervisor_assignment_inner(
                         journal_parent_id,
                         &mut outcome.health_signals,
                     )?;
-                if !authorized {
+                if authorized_denial.is_none() {
                     outcome.findings.push(claim_failure_finding(
                         sync_store,
                         &effective_assignment,
@@ -5125,15 +5153,13 @@ fn execute_supervisor_assignment_inner(
             if report_shape_problems.is_empty() {
                 if let Some(blocker) = validation_blocker.filter(|_| report_failed(&attempt_report))
                 {
-                    let denial_ordinal = outcome
+                    let correction_correlation_id = outcome
                         .gate_tracker
                         .as_ref()
                         .context("gate correction tracker was not initialized")?
-                        .denials
-                        .len()
-                        .saturating_add(1);
+                        .correlation_id_for_observation(&assignment.id);
                     let denial = GateDenial::new(
-                        gate_correlation_id(&assignment.id, denial_ordinal),
+                        correction_correlation_id,
                         GateDenialReason::ValidationRepair { blocker },
                         VerifiedGateContext::new(
                             &assignment.id,
@@ -5142,19 +5168,19 @@ fn execute_supervisor_assignment_inner(
                         )?,
                     )
                     .context("failed to construct validation gate denial")?;
-                    let authorized = outcome
+                    let authorized_denial = outcome
                         .gate_tracker
                         .as_mut()
                         .context("gate correction tracker was not initialized")?
                         .authorize(
-                            denial.clone(),
+                            denial,
                             artifacts,
                             &assignment.id,
                             journal_parent_id,
                             &mut outcome.health_signals,
                         )?;
-                    if authorized {
-                        retry_feedback = Some(ChildAttemptCorrection::Gate(denial));
+                    if let Some(authorized_denial) = authorized_denial {
+                        retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
                         continue;
                     }
                 } else if matches!(
@@ -5604,15 +5630,13 @@ fn execute_supervisor_assignment_inner(
             && !auditor_primary_integrity_failed
             && !auditor_sandbox_denied
         {
-            let denial_ordinal = outcome
+            let correction_correlation_id = outcome
                 .gate_tracker
                 .as_ref()
                 .context("gate correction tracker was not initialized")?
-                .denials
-                .len()
-                .saturating_add(1);
+                .correlation_id_for_observation(&assignment.id);
             let denial = GateDenial::new(
-                gate_correlation_id(&assignment.id, denial_ordinal),
+                correction_correlation_id,
                 GateDenialReason::AuditorRepair,
                 VerifiedGateContext::new(
                     &assignment.id,
@@ -5621,19 +5645,19 @@ fn execute_supervisor_assignment_inner(
                 )?,
             )
             .context("failed to construct parent-auditor gate denial")?;
-            let authorized = outcome
+            let authorized_denial = outcome
                 .gate_tracker
                 .as_mut()
                 .context("gate correction tracker was not initialized")?
                 .authorize(
-                    denial.clone(),
+                    denial,
                     artifacts,
                     &assignment.id,
                     journal_parent_id,
                     &mut outcome.health_signals,
                 )?;
-            if authorized {
-                retry_feedback = Some(ChildAttemptCorrection::Gate(denial));
+            if let Some(authorized_denial) = authorized_denial {
+                retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
                 continue 'gate_controller;
             }
         } else if matches!(
@@ -19434,6 +19458,73 @@ mod tests {
     }
 
     #[test]
+    fn repeated_validation_denial_uses_one_correlation_across_prompts_and_journal() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(false);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.max_gate_corrections = 2;
+        let run_id = RunId::new("repeated-validation-gate-correlation")
+            .expect("valid repeated validation run id");
+        let options = SupervisorRunOptions {
+            repo: repo_path.clone(),
+            plan_file: temp
+                .path()
+                .join("repeated-validation-gate-correlation.json"),
+            run_id: run_id.clone(),
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: true,
+        };
+        let mut invocations = 0usize;
+        let mut correction_prompts = Vec::new();
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            if invocations > 1 {
+                correction_prompts.push(
+                    fs::read_to_string(&command.prompt)
+                        .expect("read repeated validation correction prompt"),
+                );
+            }
+            let mut child = injected_child_report(&assignment);
+            if invocations <= 2 {
+                child.status = ReviewStatus::Failed;
+                child.accepted = false;
+                child.rejected = true;
+                child.validation_results[0].status = ReviewStatus::Failed;
+            }
+            write_injected_json(&command.output_last_message, &child);
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run repeated validation correction");
+
+        assert!(report.success, "unexpected corrected report: {report:#?}");
+        assert_eq!(invocations, 3);
+        assert_eq!(correction_prompts.len(), 2);
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open repeated validation artifacts");
+        assert_single_gate_lifecycle_correlation(
+            &report,
+            &correction_prompts,
+            &reader,
+            &[
+                "blocked",
+                "correction_attempt",
+                "correction_attempt",
+                "self_corrected",
+            ],
+        );
+        assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 2);
+    }
+
+    #[test]
     fn primary_integrity_failure_dominates_validation_retry() {
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(true);
@@ -19589,6 +19680,155 @@ mod tests {
             report.gate_correction_outcomes[0].terminal_class,
             GateCorrectionTerminalClass::SelfCorrected
         );
+    }
+
+    #[test]
+    fn repeated_auditor_denial_uses_one_correlation_across_prompts_and_journal() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.max_gate_corrections = 2;
+        let run_id =
+            RunId::new("repeated-auditor-gate-correlation").expect("valid repeated auditor run id");
+        let options =
+            injected_options(&repo_path, temp.path(), "repeated-auditor-gate-correlation");
+        let mut child_invocations = 0usize;
+        let mut auditor_invocations = 0usize;
+        let mut correction_prompts = Vec::new();
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if name.contains("review-auditor") {
+                auditor_invocations = auditor_invocations.saturating_add(1);
+                let child = injected_child_report(&assignment);
+                let mut auditor = injected_auditor_report(&assignment, &child);
+                if auditor_invocations <= 2 {
+                    auditor.status = ReviewStatus::Rejected;
+                    auditor.accepted = false;
+                    auditor.rejected = true;
+                    auditor.findings.push(Finding {
+                        severity: FindingSeverity::Error,
+                        message: "bounded repeated auditor rejection".to_string(),
+                        paths: vec![PathBuf::from("README.md")],
+                    });
+                }
+                write_injected_json(&command.output_last_message, &auditor);
+            } else {
+                child_invocations = child_invocations.saturating_add(1);
+                if child_invocations > 1 {
+                    correction_prompts.push(
+                        fs::read_to_string(&command.prompt)
+                            .expect("read repeated auditor correction prompt"),
+                    );
+                }
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_child_report(&assignment),
+                );
+            }
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run repeated auditor correction");
+
+        assert!(
+            report.success,
+            "unexpected repeated auditor repair report: {report:#?}"
+        );
+        assert_eq!(child_invocations, 3);
+        assert_eq!(auditor_invocations, 3);
+        assert_eq!(correction_prompts.len(), 2);
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open repeated auditor artifacts");
+        assert_single_gate_lifecycle_correlation(
+            &report,
+            &correction_prompts,
+            &reader,
+            &[
+                "blocked",
+                "correction_attempt",
+                "correction_attempt",
+                "self_corrected",
+            ],
+        );
+        assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 2);
+    }
+
+    #[test]
+    fn active_gate_is_escalated_when_corrective_child_operation_panics() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(false);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.max_gate_corrections = 2;
+        let run_id = RunId::new("active-gate-corrective-operation-panic")
+            .expect("valid active gate panic run id");
+        let options = SupervisorRunOptions {
+            repo: repo_path.clone(),
+            plan_file: temp
+                .path()
+                .join("active-gate-corrective-operation-panic.json"),
+            run_id: run_id.clone(),
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: true,
+        };
+        let mut invocations = 0usize;
+        let mut correction_prompts = Vec::new();
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            if invocations == 2 {
+                correction_prompts.push(
+                    fs::read_to_string(&command.prompt)
+                        .expect("read correction prompt before injected panic"),
+                );
+                panic!("injected trusted corrective child operation failure");
+            }
+            let mut child = injected_child_report(&assignment);
+            child.status = ReviewStatus::Failed;
+            child.accepted = false;
+            child.rejected = true;
+            child.validation_results[0].status = ReviewStatus::Failed;
+            write_injected_json(&command.output_last_message, &child);
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("finalize supervisor report after corrective operation panic");
+
+        assert!(!report.success);
+        assert_eq!(invocations, 2);
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("supervisor assignment 'child-a' panicked")));
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open corrective operation panic artifacts");
+        assert_single_gate_lifecycle_correlation(
+            &report,
+            &correction_prompts,
+            &reader,
+            &["blocked", "correction_attempt", "escalated"],
+        );
+        assert_eq!(
+            report.gate_correction_outcomes[0].terminal_class,
+            GateCorrectionTerminalClass::Escalated
+        );
+        assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 1);
     }
 
     #[test]
@@ -19787,6 +20027,91 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("schema-conforming event record"))
             .collect()
+    }
+
+    fn correction_correlation_id_from_prompt(prompt: &str) -> &str {
+        prompt
+            .lines()
+            .find_map(|line| line.strip_prefix("Correction correlation id: "))
+            .expect("correction prompt must carry a correlation id")
+    }
+
+    fn assert_single_gate_lifecycle_correlation(
+        report: &SupervisorFinalReport,
+        correction_prompts: &[String],
+        reader: &ArtifactRunReader,
+        expected_states: &[&str],
+    ) {
+        assert_eq!(report.gate_denials.len(), 1);
+        assert_eq!(report.gate_correction_outcomes.len(), 1);
+        let denial = &report.gate_denials[0];
+        let expected_correlation = denial.correction_correlation_id.as_str();
+        let outcome = &report.gate_correction_outcomes[0];
+        assert_eq!(outcome.denial_id, denial.denial_id.as_str());
+        assert_eq!(outcome.correction_correlation_id, expected_correlation);
+        if !report.orchestrator_reports.is_empty() {
+            assert_eq!(
+                report
+                    .orchestrator_reports
+                    .iter()
+                    .map(|child| child.gate_denials.len())
+                    .sum::<usize>(),
+                1
+            );
+            assert_eq!(
+                report
+                    .orchestrator_reports
+                    .iter()
+                    .map(|child| child.gate_correction_outcomes.len())
+                    .sum::<usize>(),
+                1
+            );
+        }
+        for recorded_denial in report.gate_denials.iter().chain(
+            report
+                .orchestrator_reports
+                .iter()
+                .flat_map(|child| child.gate_denials.iter()),
+        ) {
+            assert_eq!(recorded_denial.denial_id, denial.denial_id);
+            assert_eq!(
+                recorded_denial.correction_correlation_id,
+                denial.correction_correlation_id
+            );
+        }
+        for recorded_outcome in report.gate_correction_outcomes.iter().chain(
+            report
+                .orchestrator_reports
+                .iter()
+                .flat_map(|child| child.gate_correction_outcomes.iter()),
+        ) {
+            assert_eq!(recorded_outcome.denial_id, denial.denial_id.as_str());
+            assert_eq!(
+                recorded_outcome.correction_correlation_id,
+                expected_correlation
+            );
+        }
+        for prompt in correction_prompts {
+            assert_eq!(
+                correction_correlation_id_from_prompt(prompt),
+                expected_correlation
+            );
+        }
+
+        let gate_events = read_finalized_orchestration_events(reader)
+            .into_iter()
+            .filter(|event| event.kind == OrchestrationEventKind::Gate)
+            .filter(|event| event.payload.get("state").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(gate_events.len(), expected_states.len());
+        for (event, expected_state) in gate_events.iter().zip(expected_states) {
+            assert_eq!(event.payload["state"], *expected_state);
+            assert_eq!(event.payload["denial_id"], denial.denial_id.as_str());
+            assert_eq!(
+                event.payload["correction_correlation_id"],
+                expected_correlation
+            );
+        }
     }
 
     fn assert_final_decision_event<T: ReportStatus>(
