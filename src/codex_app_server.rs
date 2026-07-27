@@ -798,6 +798,7 @@ where
     let mut active_reviews = BTreeMap::<String, ActiveReview>::new();
     let mut completed_reviews = BTreeSet::<String>::new();
     let mut auto_reviews = Vec::new();
+    let mut approval_request_items = BTreeSet::<String>::new();
     let mut refused_ceiling_expansions = 0usize;
     let mut thread_started_seen = false;
     let mut turn_started_seen = false;
@@ -913,6 +914,12 @@ where
                 }
                 let item_id =
                     required_text(&message, &["params", "itemId"], "approval", "item id")?;
+                if !approval_request_items.insert(item_id.to_string()) {
+                    return Err(AppServerError::Duplicate {
+                        phase: "approval",
+                        message: "active item requested approval more than once".to_string(),
+                    });
+                }
                 let expected_type = if method == "item/commandExecution/requestApproval" {
                     "commandExecution"
                 } else {
@@ -1158,7 +1165,17 @@ where
                 let duplex_fallback_required = auto_reviews.is_empty()
                     || auto_reviews
                         .iter()
-                        .any(|review| !review.structured_policy_decision);
+                        .any(|review| !review.structured_policy_decision)
+                    || {
+                        let adequate_review_targets = auto_reviews
+                            .iter()
+                            .filter(|review| review.structured_policy_decision)
+                            .filter_map(|review| review.target_item_id.as_deref())
+                            .collect::<BTreeSet<_>>();
+                        !approval_request_items
+                            .iter()
+                            .all(|item_id| adequate_review_targets.contains(item_id.as_str()))
+                    };
                 return Ok(AppServerOutcome {
                     thread_id: thread_id.to_string(),
                     turn_id: turn_id.to_string(),
@@ -1737,6 +1754,128 @@ mod tests {
         .expect("auto review transcript")
     }
 
+    fn auto_review_lifecycle(review_id: &str, target_item_id: &str, at_ms: u64) -> Vec<Value> {
+        vec![
+            json!({
+                "method": "item/autoApprovalReview/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "reviewId": review_id,
+                    "targetItemId": target_item_id,
+                    "startedAtMs": at_ms,
+                    "action": {"type": "command", "command": "cargo test"},
+                    "review": {"status": "inProgress"}
+                }
+            }),
+            json!({
+                "method": "item/autoApprovalReview/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "reviewId": review_id,
+                    "targetItemId": target_item_id,
+                    "startedAtMs": at_ms,
+                    "completedAtMs": at_ms.saturating_add(1),
+                    "action": {"type": "command", "command": "cargo test"},
+                    "decisionSource": "agent",
+                    "review": {
+                        "status": "approved",
+                        "rationale": "bounded command",
+                        "riskLevel": "low",
+                        "userAuthorization": "low"
+                    }
+                }
+            }),
+        ]
+    }
+
+    fn run_two_approval_item_transcript(review_second_item: bool) -> AppServerOutcome {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "item-one", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 61,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-one",
+                    "startedAtMs": 1,
+                    "command": "cargo test one"
+                }
+            }),
+        ]);
+        messages.extend(auto_review_lifecycle("review-one", "item-one", 2));
+        messages.extend([
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 4,
+                    "item": {"id": "item-one", "type": "commandExecution", "status": "completed"}
+                }
+            }),
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "item-two", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 62,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-two",
+                    "startedAtMs": 5,
+                    "command": "cargo test two"
+                }
+            }),
+        ]);
+        if review_second_item {
+            messages.extend(auto_review_lifecycle("review-two", "item-two", 6));
+        }
+        messages.extend([
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 8,
+                    "item": {"id": "item-two", "type": "commandExecution", "status": "completed"}
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            Arc::new(|_: ApprovalRequest| ApprovalDecision::Accept),
+            || false,
+        )
+        .expect("two approval item transcript")
+    }
+
     #[test]
     fn command_execution_approval_is_correlated_and_exact() {
         let mut messages = base_messages();
@@ -2216,6 +2355,73 @@ mod tests {
     fn mismatched_auto_review_lifecycle_target_requires_fallback() {
         let outcome = run_auto_review_transcript(Some("item-reviewed"), Some("item-other"));
         assert!(outcome.duplex_fallback_required);
+    }
+
+    #[test]
+    fn every_approval_item_requires_adequate_review_coverage() {
+        let outcome = run_two_approval_item_transcript(false);
+        assert_eq!(outcome.completed_items, 2);
+        assert!(outcome.duplex_fallback_required);
+    }
+
+    #[test]
+    fn complete_approval_item_review_coverage_can_avoid_fallback() {
+        let outcome = run_two_approval_item_transcript(true);
+        assert_eq!(outcome.completed_items, 2);
+        assert!(!outcome.duplex_fallback_required);
+    }
+
+    #[test]
+    fn active_item_cannot_request_approval_twice() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "item-duplicate", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 71,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-duplicate",
+                    "startedAtMs": 1,
+                    "command": "cargo test"
+                }
+            }),
+            json!({
+                "id": 72,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-duplicate",
+                    "startedAtMs": 2,
+                    "command": "cargo test"
+                }
+            }),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            Arc::new(move |_: ApprovalRequest| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                ApprovalDecision::Accept
+            }),
+            || false,
+        )
+        .expect_err("duplicate approval item");
+        assert!(matches!(error, AppServerError::Duplicate { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
