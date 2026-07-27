@@ -4659,6 +4659,7 @@ fn execute_supervisor_assignment_inner(
     let (child_report, completed_candidate_inspection, completed_assignment_containment) = 'gate_controller: loop {
         let mut child_report = None;
         let mut child_containment_verified = false;
+        let mut child_gate_terminal = false;
         let first_attempt = next_attempt;
         for attempt in first_attempt..=max_attempts {
             next_attempt = attempt.saturating_add(1);
@@ -4963,7 +4964,8 @@ fn execute_supervisor_assignment_inner(
                     child_base_head: &child_base_head,
                     worker_journals: &worker_journal_evidence,
                 });
-            if !primary_changes.is_empty() {
+            let primary_integrity_failed = !primary_changes.is_empty();
+            if primary_integrity_failed {
                 mark_primary_integrity_violation(assignment, &primary_changes, &mut attempt_report);
                 let tracker = outcome
                     .gate_tracker
@@ -5051,6 +5053,18 @@ fn execute_supervisor_assignment_inner(
                     structural_problems: report_shape_problems,
                     corrective_retry_used,
                 });
+                child_report = Some(attempt_report);
+                break;
+            }
+            if primary_integrity_failed {
+                attempt_history.push(ChildAttemptHistory {
+                    attempt,
+                    report_path: attempt_artifacts.raw_report_relative.clone(),
+                    structural_problems: report_shape_problems,
+                    corrective_retry_used,
+                });
+                child_containment_verified = true;
+                child_gate_terminal = true;
                 child_report = Some(attempt_report);
                 break;
             }
@@ -5218,7 +5232,10 @@ fn execute_supervisor_assignment_inner(
         let mut assignment_containment_verified = child_containment_verified;
         let mut auditor_primary_integrity_failed = false;
         let mut auditor_sandbox_denied = false;
-        if child_containment_verified && parent_auditor_required(assignment, &child_report) {
+        if child_containment_verified
+            && !child_gate_terminal
+            && parent_auditor_required(assignment, &child_report)
+        {
             auditor_attempt = auditor_attempt.saturating_add(1);
             if let Err(error) = mandatory_worktree_controls.revalidate() {
                 record_isolated_assignment_failure(
@@ -19414,6 +19431,95 @@ mod tests {
             states,
             vec!["blocked", "correction_attempt", "self_corrected"]
         );
+    }
+
+    #[test]
+    fn primary_integrity_failure_dominates_validation_retry() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.max_gate_corrections = MAX_GATE_CORRECTIONS_LIMIT;
+        let run_id = RunId::new("primary-integrity-dominates-validation")
+            .expect("valid primary-integrity run id");
+        let options = SupervisorRunOptions {
+            repo: repo_path.clone(),
+            plan_file: temp
+                .path()
+                .join("primary-integrity-dominates-validation.json"),
+            run_id: run_id.clone(),
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: true,
+        };
+        let primary = repo_path.clone();
+        let mut child_invocations = 0usize;
+        let mut auditor_invocations = 0usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if name.contains("review-auditor") {
+                auditor_invocations = auditor_invocations.saturating_add(1);
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+            } else {
+                child_invocations = child_invocations.saturating_add(1);
+                let mut child = injected_child_report(&assignment);
+                if child_invocations == 1 {
+                    child.status = ReviewStatus::Failed;
+                    child.accepted = false;
+                    child.rejected = true;
+                    child.validation_results[0].status = ReviewStatus::Failed;
+                    fs::write(primary.join("README.md"), "primary drift\n")
+                        .expect("mutate tracked primary during child attempt");
+                }
+                write_injected_json(&command.output_last_message, &child);
+            }
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run mixed primary-integrity and validation failure");
+
+        assert!(!report.success);
+        assert_eq!(child_invocations, 1);
+        assert_eq!(auditor_invocations, 0);
+        assert_eq!(report.gate_denials.len(), 1);
+        assert_eq!(
+            report.gate_denials[0].reason,
+            GateDenialReason::PrimaryIntegrityFailure
+        );
+        assert_eq!(report.gate_correction_outcomes.len(), 1);
+        assert_eq!(
+            report.gate_correction_outcomes[0].terminal_class,
+            GateCorrectionTerminalClass::Escalated
+        );
+        assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 0);
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open primary-integrity correction artifacts");
+        let states = read_finalized_orchestration_events(&reader)
+            .into_iter()
+            .filter(|event| event.kind == OrchestrationEventKind::Gate)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(states, vec!["blocked", "escalated"]);
     }
 
     #[test]
