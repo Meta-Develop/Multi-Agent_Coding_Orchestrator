@@ -1091,6 +1091,45 @@ the authenticated durable megafile store before a blocked merge decision is
 returned. An authenticity or persistence failure aborts the decision and never
 turns a blocked merge into an apply.
 
+### Public gate-denial contract
+
+`gate_denial::GateDenial` is the versioned public envelope for passing a gate
+denial to correction consumers. It carries a typed reason family, derived
+retryability, canonical verified owner/check/path context, a responsible route,
+and a typed non-executable next-safe operation. Its constructors and validated
+deserializer fail closed: containment failure, primary-integrity failure,
+ambiguous or completed external side effects, and
+`SandboxDenialEvidence` with `retryability: not_retryable` can never authorize a
+retry.
+
+Sandbox denials carry the existing `SandboxDenialEvidence` type without a second
+schema. Merge callers should adapt `ApplyBlockerDetail` or `ApplyBlocker` before
+flattening anything to prose. The adapter uses only blocker kind, blocked
+disposition, failed check status, and canonical paths. Reviewer messages,
+validation diagnostics, validation commands, and the legacy free-text
+`next_safe_operation` are never inputs to corrective-prompt rendering.
+
+Routing is explicit and fixed:
+
+| Denial family | Responsible route |
+| --- | --- |
+| Claim conflict | Planner or parent |
+| Auditor or validation repair | Child or controller |
+| Merge remediation | Integration controller |
+
+Containment and retryable sandbox repair also route to the child/controller.
+Primary-integrity and external-side-effect reconciliation route to the
+integration controller. Corrective prompts contain only fixed policy vocabulary
+plus validated canonical identities and JSON-quoted repository-relative paths.
+
+The stable denial ID is a deterministic SHA-256 identity of envelope version,
+typed reason, and canonical verified context. It deliberately excludes the
+correction-correlation ID. Issue 28 lifecycle consumers should therefore dedupe
+the same denied condition by stable denial ID while using the separately
+validated correction-correlation ID to associate events with one correction
+attempt. Starting a new correction lifecycle changes the correlation ID, not the
+stable denial ID; changing the reason or verified context changes the stable ID.
+
 `--decomposition-target` never self-authorizes decomposition work. It must be
 paired with `--decomposition-run-id` naming a verified finalized supervise
 artifact. That run must be real/publishable and accepted successful, and its
