@@ -5018,6 +5018,7 @@ fn execute_supervisor_assignment_inner(
             let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
             let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
             let sandbox_denials = external_run.sandbox_denials().to_vec();
+            let external_side_effect_state = external_run.external_side_effect_state();
             let (mut attempt_report, report_shape_problems) =
                 collect_child_report(ChildReportCollectionContext {
                     assignment,
@@ -5122,6 +5123,53 @@ fn execute_supervisor_assignment_inner(
                 break;
             }
             if primary_integrity_failed {
+                attempt_history.push(ChildAttemptHistory {
+                    attempt,
+                    report_path: attempt_artifacts.raw_report_relative.clone(),
+                    structural_problems: report_shape_problems,
+                    corrective_retry_used,
+                });
+                child_containment_verified = true;
+                child_gate_terminal = true;
+                child_report = Some(attempt_report);
+                break;
+            }
+            if let Some(external_side_effect_state) = external_side_effect_state {
+                let correction_correlation_id = outcome
+                    .gate_tracker
+                    .as_ref()
+                    .context("gate correction tracker was not initialized")?
+                    .correlation_id_for_observation(&assignment.id);
+                let denial = external_side_effect_gate_denial(
+                    &correction_correlation_id,
+                    &assignment.id,
+                    external_side_effect_state,
+                    &assignment.assigned_paths,
+                )
+                .context("failed to construct external-side-effect gate denial")?;
+                let authorized_denial = outcome
+                    .gate_tracker
+                    .as_mut()
+                    .context("gate correction tracker was not initialized")?
+                    .authorize(
+                        denial,
+                        artifacts,
+                        &assignment.id,
+                        journal_parent_id,
+                        &mut outcome.health_signals,
+                    )?;
+                if authorized_denial.is_some() {
+                    bail!("external side effect unexpectedly authorized a correction");
+                }
+                attempt_report.status = ReviewStatus::Failed;
+                attempt_report.accepted = false;
+                attempt_report.rejected = true;
+                attempt_report.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: "observed external side effect requires integration-controller reconciliation and cannot authorize another child launch"
+                        .to_string(),
+                    paths: assignment.assigned_paths.clone(),
+                });
                 attempt_history.push(ChildAttemptHistory {
                     attempt,
                     report_path: attempt_artifacts.raw_report_relative.clone(),
@@ -20061,6 +20109,99 @@ mod tests {
             report.gate_denials[0].retryability,
             GateRetryability::NotRetryable
         );
+    }
+
+    #[test]
+    fn completed_external_side_effect_escalates_through_gate_controller_without_second_launch() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(false);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.max_gate_corrections = MAX_GATE_CORRECTIONS_LIMIT;
+        let run_id = RunId::new("completed-external-side-effect-no-retry")
+            .expect("valid completed external-side-effect run id");
+        let options = SupervisorRunOptions {
+            repo: repo_path.clone(),
+            plan_file: temp
+                .path()
+                .join("completed-external-side-effect-no-retry.json"),
+            run_id: run_id.clone(),
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: true,
+        };
+        let mut child_invocations = 0usize;
+        let mut auditor_invocations = 0usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if name.contains("review-auditor") {
+                auditor_invocations = auditor_invocations.saturating_add(1);
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+                injected_verified_run(command)
+            } else {
+                child_invocations = child_invocations.saturating_add(1);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_child_report(&assignment),
+                );
+                injected_verified_run(command)
+                    .with_external_side_effect_state(ExternalSideEffectState::Completed)
+            }
+        };
+
+        let report = run_supervisor_plan_with_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("run completed external-side-effect denial");
+
+        assert!(!report.success);
+        assert_eq!(child_invocations, 1);
+        assert_eq!(auditor_invocations, 0);
+        assert_eq!(report.commands_run.len(), 1);
+        assert_eq!(report.gate_denials.len(), 1);
+        assert_eq!(
+            report.gate_denials[0].reason,
+            GateDenialReason::ExternalSideEffect {
+                state: ExternalSideEffectState::Completed
+            }
+        );
+        assert_eq!(
+            report.gate_denials[0].retryability,
+            GateRetryability::NotRetryable
+        );
+        assert_eq!(
+            report.gate_denials[0].route,
+            GateDenialRoute::IntegrationController
+        );
+        assert_eq!(report.gate_correction_outcomes.len(), 1);
+        assert_eq!(
+            report.gate_correction_outcomes[0].terminal_class,
+            GateCorrectionTerminalClass::Escalated
+        );
+        assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 0);
+        assert_eq!(
+            report.gate_correction_outcomes[0].correction_correlation_id,
+            report.gate_denials[0].correction_correlation_id.as_str()
+        );
+        assert!(report.breaker_trip.is_none());
+        assert!(report
+            .orchestrator_reports
+            .iter()
+            .all(|child| child.audit_reports.is_empty()));
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open completed external-side-effect artifacts");
+        assert_single_gate_lifecycle_correlation(&report, &[], &reader, &["blocked", "escalated"]);
     }
 
     #[test]

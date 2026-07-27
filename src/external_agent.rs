@@ -1,4 +1,5 @@
 use crate::agent_lifecycle::AgentLaunchMetadata;
+use crate::gate_denial::ExternalSideEffectState;
 use crate::llm::provider::Usage;
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, CapturedBytes, EnvironmentMode,
@@ -329,6 +330,28 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.sandbox_denials
     }
 
+    /// Returns a typed external-effect observation attached by the trusted host runner.
+    ///
+    /// This held metadata is not decoded from child output and is deliberately excluded from the
+    /// serialized run wire format.
+    pub(crate) fn external_side_effect_state(&self) -> Option<ExternalSideEffectState> {
+        self.stdout.run_metadata.external_side_effect_state
+    }
+
+    /// Attaches a host-observed external-effect state before the parent controller consumes the
+    /// run. Child reports and serialized run values cannot set or preserve this held metadata.
+    ///
+    /// This crate-private seam is available to trusted host integrations; the current external
+    /// runner leaves it empty unless such an integration supplies an observation.
+    #[allow(dead_code)]
+    pub(crate) fn with_external_side_effect_state(
+        mut self,
+        state: ExternalSideEffectState,
+    ) -> Self {
+        self.stdout.run_metadata.external_side_effect_state = Some(state);
+        self
+    }
+
     pub fn safely_executed(&self) -> bool {
         self.exit_code == Some(0)
             && !self.timed_out
@@ -474,6 +497,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ExternalAgentRunMetadata {
     sandbox_denials: Vec<SandboxDenialEvidence>,
+    external_side_effect_state: Option<ExternalSideEffectState>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -4086,9 +4110,21 @@ mod tests {
             path: Some(PathBuf::from("AGENTS.md")),
             retryability: SandboxDenialRetryability::RequiresDeclaredException,
         }];
+        report = report.with_external_side_effect_state(ExternalSideEffectState::Completed);
+        assert_eq!(
+            report.external_side_effect_state(),
+            Some(ExternalSideEffectState::Completed)
+        );
         let value = serde_json::to_value(&report)?;
+        assert!(value.get("external_side_effect_state").is_none());
         let decoded: ExternalAgentRun = serde_json::from_value(value.clone())?;
         assert_eq!(decoded.sandbox_denials(), report.sandbox_denials());
+        assert_eq!(decoded.external_side_effect_state(), None);
+
+        let mut forged = value.clone();
+        forged["external_side_effect_state"] = serde_json::json!("completed");
+        let forged_decoded: ExternalAgentRun = serde_json::from_value(forged)?;
+        assert_eq!(forged_decoded.external_side_effect_state(), None);
 
         let mut old = value;
         old.as_object_mut()
