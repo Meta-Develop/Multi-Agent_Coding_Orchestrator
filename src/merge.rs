@@ -10,6 +10,7 @@ use crate::{
         state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
     },
     external_agent::{run_external_agent, ExternalAgentCommand},
+    gate_denial::{GateCheckSource, GateDenial},
     llm::Redactor,
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     merge_semantic::{classify_semantic_candidate_pair, classify_semantic_conflicts},
@@ -1823,7 +1824,7 @@ pub enum ApplyReadinessStatus {
     Blocked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyBlocker {
     DirtyPrimary,
@@ -1881,6 +1882,7 @@ pub struct MergeApplyReport {
     pub preview: MergeApplyPreview,
     pub status: MergeApplyReportStatus,
     pub applied: bool,
+    pub gate_denials: Vec<GateDenial>,
     pub stdout: OutputSummary,
     pub stderr: OutputSummary,
     pub error: Option<String>,
@@ -2714,7 +2716,7 @@ pub fn merge_apply_report_with_megafile_policy(
     let recorded_collision_paths =
         record_merge_collision_decision(&preview, &megafile_policy.thresholds)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
-        let mut report = blocked_merge_apply_report(preview);
+        let mut report = blocked_merge_apply_report(preview)?;
         report.recorded_collision_paths = recorded_collision_paths;
         return Ok(report);
     }
@@ -2789,7 +2791,7 @@ fn record_merge_collision_decision(
     Ok(paths)
 }
 
-pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> MergeApplyReport {
+pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> Result<MergeApplyReport> {
     let error = if preview.safety.readiness.blockers.is_empty() {
         None
     } else {
@@ -2798,16 +2800,58 @@ pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> MergeApplyRepor
             format_blockers(&preview.safety.readiness.blockers)
         ))
     };
+    let gate_denials = merge_apply_gate_denials(&preview)?;
 
-    MergeApplyReport {
+    Ok(MergeApplyReport {
         preview,
         status: MergeApplyReportStatus::Blocked,
         applied: false,
+        gate_denials,
         stdout: OutputSummary::default(),
         stderr: OutputSummary::default(),
         error,
         recorded_collision_paths: Vec::new(),
         accepted_decomposition: None,
+    })
+}
+
+fn merge_apply_gate_denials(preview: &MergeApplyPreview) -> Result<Vec<GateDenial>> {
+    let owner = &preview.candidate.metadata.agent_id;
+    let mut gate_denials = Vec::new();
+    for detail in preview
+        .safety
+        .readiness
+        .details
+        .iter()
+        .filter(|detail| detail.disposition == ApplyBlockerDisposition::Blocked)
+    {
+        let ordinal = gate_denials.len().saturating_add(1);
+        let correlation_id = format!("merge-apply-{owner}-{ordinal}");
+        let denial = GateDenial::from_apply_blocker_detail(
+            correlation_id,
+            owner,
+            gate_check_source_for_apply_blocker(detail.kind),
+            detail,
+        )
+        .context("failed to deliver structured merge blocker to the integration controller")?;
+        gate_denials.push(denial);
+    }
+    Ok(gate_denials)
+}
+
+fn gate_check_source_for_apply_blocker(blocker: ApplyBlocker) -> GateCheckSource {
+    match blocker {
+        ApplyBlocker::DirtyPrimary => GateCheckSource::PrimaryDrift,
+        ApplyBlocker::StaleBase => GateCheckSource::MergeScope,
+        ApplyBlocker::ApplyCheckFailed => GateCheckSource::GitApplyCheck,
+        ApplyBlocker::ExcludedReference | ApplyBlocker::UnclaimedEdits => {
+            GateCheckSource::MergeScope
+        }
+        ApplyBlocker::ValidationMissing => GateCheckSource::ValidationBinding,
+        ApplyBlocker::ValidationNotRun | ApplyBlocker::ValidationSkipped => {
+            GateCheckSource::ValidationState
+        }
+        ApplyBlocker::ValidationFailed => GateCheckSource::Validation,
     }
 }
 
@@ -2850,6 +2894,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             preview,
             status: MergeApplyReportStatus::NothingToApply,
             applied: false,
+            gate_denials: Vec::new(),
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
             error: None,
@@ -2898,7 +2943,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
         };
         preview.safety.readiness = classify_apply_safety(checks, &preview.safety.force_options);
         if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
-            return Ok(blocked_merge_apply_report(preview));
+            return blocked_merge_apply_report(preview);
         }
     } else if require_validation_after_candidate {
         preview.safety.validation_required = true;
@@ -2925,13 +2970,13 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
         };
         preview.safety.readiness = classify_apply_safety(checks, &preview.safety.force_options);
         if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
-            return Ok(blocked_merge_apply_report(preview));
+            return blocked_merge_apply_report(preview);
         }
     }
 
     refresh_apply_safety(&mut preview, expected_primary_state)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
-        return Ok(blocked_merge_apply_report(preview));
+        return blocked_merge_apply_report(preview);
     }
 
     let args = match preview.safety.apply_mode {
@@ -2944,6 +2989,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             preview,
             status: MergeApplyReportStatus::NothingToApply,
             applied: false,
+            gate_denials: Vec::new(),
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
             error: None,
@@ -2965,6 +3011,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
         preview,
         status: MergeApplyReportStatus::Applied,
         applied: true,
+        gate_denials: Vec::new(),
         stdout: summarize_text(
             &String::from_utf8_lossy(&output.stdout),
             DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
