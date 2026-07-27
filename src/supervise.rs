@@ -3382,6 +3382,36 @@ fn record_field_guide_event_strict(
     Ok(())
 }
 
+fn record_gate_correction_event_strict(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    node: &str,
+    parent: Option<&str>,
+    role: OrchestrationRole,
+    payload: Value,
+) -> Result<()> {
+    let active_journal = journal
+        .as_mut()
+        .context("strict gate correction lifecycle requires an orchestration event journal")?;
+    if !active_journal.is_enabled() {
+        bail!("strict gate correction lifecycle journal is disabled");
+    }
+    active_journal
+        .append(
+            writer,
+            node,
+            parent,
+            role,
+            OrchestrationEventKind::Gate,
+            payload,
+        )
+        .context("failed to append strict gate correction lifecycle event")?;
+    if !active_journal.is_enabled() {
+        bail!("strict gate correction lifecycle journal became disabled");
+    }
+    Ok(())
+}
+
 fn field_guide_injection_payload(
     prompt_role: SupervisePromptRole,
     prompt: &SupervisorFieldGuidePrompt,
@@ -3677,24 +3707,29 @@ impl GateCorrectionTracker {
             return Ok(None);
         }
 
-        self.used = self.used.saturating_add(1);
         let active = self
             .active
-            .as_mut()
+            .as_ref()
             .context("gate correction tracker lost its active denial")?;
-        active.correction_attempts = active.correction_attempts.saturating_add(1);
-        health_signals.push(SwarmHealthSignal::AssignmentOutcome(
-            AssignmentHealthOutcome::Retried,
-        ));
+        let correction_attempt = active.correction_attempts.saturating_add(1);
+        let authorized_denial = active.denial.clone();
         record_gate_correction_event(
             artifacts,
             entity_id,
             parent_id,
-            &active.denial,
+            &authorized_denial,
             "correction_attempt",
-            Some(active.correction_attempts),
+            Some(correction_attempt),
         )?;
-        Ok(Some(active.denial.clone()))
+        self.used = self.used.saturating_add(1);
+        self.active
+            .as_mut()
+            .context("gate correction tracker lost its active denial")?
+            .correction_attempts = correction_attempt;
+        health_signals.push(SwarmHealthSignal::AssignmentOutcome(
+            AssignmentHealthOutcome::Retried,
+        ));
+        Ok(Some(authorized_denial))
     }
 
     fn escalate(
@@ -3828,20 +3863,22 @@ fn record_gate_correction_event(
     state: &str,
     correction_attempt: Option<u8>,
 ) -> Result<()> {
-    record_shared_orchestration_event(
-        artifacts,
-        entity_id,
-        Some(parent_id),
-        OrchestrationRole::Orchestrator,
-        OrchestrationEventKind::Gate,
-        json!({
-            "state": state,
-            "denial_id": denial.denial_id.as_str(),
-            "correction_correlation_id": denial.correction_correlation_id.as_str(),
-            "route": denial.route,
-            "correction_attempt": correction_attempt,
-        }),
-    )
+    with_supervisor_artifacts(artifacts, |writer, journal| {
+        record_gate_correction_event_strict(
+            journal,
+            writer,
+            entity_id,
+            Some(parent_id),
+            OrchestrationRole::Orchestrator,
+            json!({
+                "state": state,
+                "denial_id": denial.denial_id.as_str(),
+                "correction_correlation_id": denial.correction_correlation_id.as_str(),
+                "route": denial.route,
+                "correction_attempt": correction_attempt,
+            }),
+        )
+    })
 }
 
 fn gate_correlation_id(assignment_id: &str, ordinal: usize) -> String {
@@ -19308,6 +19345,111 @@ mod tests {
         assert!(error
             .to_string()
             .contains("max_gate_corrections must be at most"));
+    }
+
+    #[test]
+    fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
+        let (_temp, repo_path) = injected_repository();
+        let run_id = RunId::new("gate-terminal-append-failure").expect("valid strict gate run id");
+        let mut journal = Some(OrchestrationEventJournal::new(
+            "strict-gate-test-repository",
+            run_id.as_str(),
+        ));
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "strict-gate-journal-test",
+        )
+        .expect("reserve strict gate artifact run");
+        let denial = GateDenial::new(
+            "strict-gate-lifecycle-correlation",
+            GateDenialReason::ValidationRepair {
+                blocker: GateApplyBlocker::ValidationFailed,
+            },
+            VerifiedGateContext::new(
+                "child-a",
+                GateCheckSource::Validation,
+                [PathBuf::from("README.md")],
+            )
+            .expect("construct strict gate context"),
+        )
+        .expect("construct canonical strict gate denial");
+        let mut tracker = GateCorrectionTracker::new(1);
+        let mut health_signals = Vec::new();
+
+        {
+            let artifacts = Mutex::new(SharedSupervisorArtifacts {
+                writer: &mut writer,
+                journal: &mut journal,
+            });
+            let authorized = tracker
+                .authorize(
+                    denial.clone(),
+                    &artifacts,
+                    "child-a",
+                    run_id.as_str(),
+                    &mut health_signals,
+                )
+                .expect("persist blocked and correction attempt")
+                .expect("authorize the bounded correction");
+            assert_eq!(authorized, denial);
+
+            set_orchestration_event_append_fault();
+            let error = tracker
+                .self_corrected(&artifacts, "child-a", run_id.as_str())
+                .expect_err("terminal append failure must reject terminalization");
+            assert!(format!("{error:#}")
+                .contains("failed to append strict gate correction lifecycle event"));
+
+            let disabled_error = tracker
+                .escalate_active(&artifacts, "child-a", run_id.as_str())
+                .expect_err("disabled journal must reject the terminalization safety net");
+            assert!(format!("{disabled_error:#}")
+                .contains("strict gate correction lifecycle journal is disabled"));
+        }
+
+        let active = tracker
+            .active
+            .as_ref()
+            .expect("failed terminal persistence must retain the active denial");
+        assert_eq!(active.denial, denial);
+        assert_eq!(active.correction_attempts, 1);
+        assert_eq!(tracker.used, 1);
+        assert_eq!(tracker.denials, vec![denial]);
+        assert!(tracker.outcomes.is_empty());
+        assert_eq!(
+            health_signals,
+            vec![SwarmHealthSignal::AssignmentOutcome(
+                AssignmentHealthOutcome::Retried
+            )]
+        );
+        assert!(journal
+            .as_ref()
+            .is_some_and(|active_journal| !active_journal.is_enabled()));
+
+        let final_report = artifact_test_final_report(&run_id);
+        write_final_report(&mut writer, &final_report).expect("write strict gate final report");
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize strict gate artifacts");
+        let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+            .expect("open finalized strict gate artifacts");
+        let gate_states = read_finalized_orchestration_events(&reader)
+            .into_iter()
+            .filter(|event| event.kind == OrchestrationEventKind::Gate)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gate_states, vec!["blocked", "correction_attempt"]);
     }
 
     #[test]
