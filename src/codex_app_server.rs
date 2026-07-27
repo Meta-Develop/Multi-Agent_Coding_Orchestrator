@@ -1,11 +1,15 @@
 #![allow(dead_code)]
 
+use crate::{
+    gate_denial::GateDenial,
+    process_runner::{ContainedProcessSession, InteractiveProcessRead},
+};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     io::{BufRead, BufReader, Read, Write},
-    sync::{mpsc, Arc},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +19,7 @@ const HARD_MAX_LINE_BYTES: usize = 1024 * 1024;
 const HARD_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_MESSAGES: usize = 16_384;
 const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const OUTPUT_AGENT_MESSAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 
@@ -34,6 +39,42 @@ pub(crate) trait JsonLineTransport {
     ) -> Result<TransportRead, String>;
 
     fn send(&mut self, line: &[u8]) -> Result<(), String>;
+}
+
+/// App-server JSONL over the process runner's borrowed, already-contained session.
+///
+/// This adapter owns no child and no raw stdio handles. Its two lifetimes prevent the transport
+/// from outliving either the handler call or the underlying contained process.
+pub(crate) struct ContainedJsonLineTransport<'session, 'process> {
+    session: &'session mut ContainedProcessSession<'process>,
+}
+
+impl<'session, 'process> ContainedJsonLineTransport<'session, 'process> {
+    pub(crate) fn new(session: &'session mut ContainedProcessSession<'process>) -> Self {
+        Self { session }
+    }
+}
+
+impl JsonLineTransport for ContainedJsonLineTransport<'_, '_> {
+    fn receive(
+        &mut self,
+        wait: Duration,
+        max_line_bytes: usize,
+        destination: &mut Vec<u8>,
+    ) -> Result<TransportRead, String> {
+        match self
+            .session
+            .receive_line(wait, max_line_bytes, destination)?
+        {
+            InteractiveProcessRead::Line => Ok(TransportRead::Line),
+            InteractiveProcessRead::Timeout => Ok(TransportRead::Timeout),
+            InteractiveProcessRead::Eof => Ok(TransportRead::Eof),
+        }
+    }
+
+    fn send(&mut self, line: &[u8]) -> Result<(), String> {
+        self.session.send_line(line)
+    }
 }
 
 enum ReaderEvent {
@@ -248,6 +289,7 @@ impl AppServerTurn {
 pub(crate) enum ApprovalKind {
     CommandExecution,
     FileChange,
+    PermissionExpansion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,20 +318,63 @@ pub(crate) struct ApprovalRequest {
     pub(crate) command: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) reason: Option<String>,
+    pub(crate) ceiling_expansion_requested: bool,
     pub(crate) item: Value,
     pub(crate) raw_params: Value,
 }
 
-pub(crate) trait ApprovalReviewer: Send + Sync + 'static {
-    fn review(&self, request: ApprovalRequest) -> ApprovalDecision;
+pub(crate) trait ApprovalReviewer {
+    fn review(&mut self, request: ApprovalRequest) -> Result<ApprovalReview, String>;
 }
 
 impl<F> ApprovalReviewer for F
 where
-    F: Fn(ApprovalRequest) -> ApprovalDecision + Send + Sync + 'static,
+    F: FnMut(ApprovalRequest) -> Result<ApprovalReview, String>,
 {
-    fn review(&self, request: ApprovalRequest) -> ApprovalDecision {
+    fn review(&mut self, request: ApprovalRequest) -> Result<ApprovalReview, String> {
         self(request)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalReview {
+    pub(crate) decision: ApprovalDecision,
+    pub(crate) denial: Option<GateDenial>,
+}
+
+impl ApprovalReview {
+    pub(crate) fn accept() -> Self {
+        Self {
+            decision: ApprovalDecision::Accept,
+            denial: None,
+        }
+    }
+
+    pub(crate) fn decline(denial: GateDenial) -> Self {
+        Self {
+            decision: ApprovalDecision::Decline,
+            denial: Some(denial),
+        }
+    }
+
+    pub(crate) fn cancel(denial: Option<GateDenial>) -> Self {
+        Self {
+            decision: ApprovalDecision::Cancel,
+            denial,
+        }
+    }
+
+    fn validate(self) -> Result<Self, AppServerError> {
+        let valid = match self.decision {
+            ApprovalDecision::Accept => self.denial.is_none(),
+            ApprovalDecision::Decline => self.denial.is_some(),
+            ApprovalDecision::Cancel => true,
+        };
+        if valid {
+            Ok(self)
+        } else {
+            Err(AppServerError::ApprovalReviewerLost)
+        }
     }
 }
 
@@ -306,14 +391,16 @@ pub(crate) struct AutoReviewEvidence {
     pub(crate) structured_policy_decision: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TurnTerminalStatus {
     Completed,
     Interrupted,
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ItemOutcome {
     pub(crate) item_id: String,
     pub(crate) item_type: String,
@@ -328,6 +415,8 @@ pub(crate) struct AppServerOutcome {
     pub(crate) completed_items: usize,
     pub(crate) item_outcomes: Vec<ItemOutcome>,
     pub(crate) refused_ceiling_expansions: usize,
+    pub(crate) gate_denials: Vec<GateDenial>,
+    pub(crate) final_message: Option<String>,
     pub(crate) auto_reviews: Vec<AutoReviewEvidence>,
     pub(crate) duplex_fallback_required: bool,
     pub(crate) messages_received: usize,
@@ -553,7 +642,7 @@ pub(crate) fn run_app_server_turn<T, C>(
     transport: &mut T,
     turn: &AppServerTurn,
     limits: AppServerLimits,
-    reviewer: Arc<dyn ApprovalReviewer>,
+    reviewer: &mut dyn ApprovalReviewer,
     cancelled: C,
 ) -> Result<AppServerOutcome, AppServerError>
 where
@@ -596,7 +685,10 @@ where
     let mut thread_params = Map::from_iter([
         ("cwd".to_string(), Value::from(turn.cwd.clone())),
         ("approvalPolicy".to_string(), Value::from("on-request")),
-        ("approvalsReviewer".to_string(), Value::from("auto_review")),
+        // Production routes every surfaced request through the client-owned MACO callback.
+        // Upstream auto_review remains experiment-only evidence because it does not review
+        // actions already allowed inside the active sandbox.
+        ("approvalsReviewer".to_string(), Value::from("user")),
         (
             "permissions".to_string(),
             Value::from(turn.permission_profile.clone()),
@@ -633,7 +725,7 @@ where
     require_exact_text(
         &thread_response,
         &["result", "approvalsReviewer"],
-        "auto_review",
+        "user",
         "thread/start",
     )?;
     require_exact_text(
@@ -666,7 +758,7 @@ where
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": turn.prompt, "text_elements": []}],
                 "approvalPolicy": "on-request",
-                "approvalsReviewer": "auto_review",
+                "approvalsReviewer": "user",
                 "permissions": turn.permission_profile,
                 "environments": []
             }
@@ -772,7 +864,7 @@ fn drive_turn<T, C>(
     transport: &mut T,
     thread_id: &str,
     turn_id: &str,
-    reviewer: Arc<dyn ApprovalReviewer>,
+    reviewer: &mut dyn ApprovalReviewer,
     cancelled: &C,
 ) -> Result<AppServerOutcome, AppServerError>
 where
@@ -795,10 +887,13 @@ where
     let mut active_items = BTreeMap::<String, ActiveItem>::new();
     let mut completed_items = BTreeSet::<String>::new();
     let mut item_outcomes = Vec::new();
+    let mut final_message = None;
     let mut active_reviews = BTreeMap::<String, ActiveReview>::new();
     let mut completed_reviews = BTreeSet::<String>::new();
     let mut auto_reviews = Vec::new();
+    let mut gate_denials = Vec::new();
     let mut approval_request_items = BTreeSet::<String>::new();
+    let mut pending_correction_responses = BTreeMap::<RequestId, String>::new();
     let mut refused_ceiling_expansions = 0usize;
     let mut thread_started_seen = false;
     let mut turn_started_seen = false;
@@ -819,11 +914,20 @@ where
                     message: "response has no id".to_string(),
                 })
                 .and_then(|value| RequestId::parse(value, "turn"))?;
-            if !state.response_ids.insert(id) {
+            if !state.response_ids.insert(id.clone()) {
                 return Err(AppServerError::Duplicate {
                     phase: "turn",
                     message: "response id was already completed".to_string(),
                 });
+            }
+            if pending_correction_responses.remove(&id).is_some() {
+                if object.contains_key("error") {
+                    return Err(AppServerError::Remote {
+                        phase: "gate denial feedback",
+                        message: "app-server rejected typed gate-denial feedback".to_string(),
+                    });
+                }
+                continue;
             }
             return Err(AppServerError::Unexpected {
                 phase: "turn",
@@ -939,45 +1043,82 @@ where
                             .to_string(),
                     });
                 }
-                let expansion = approval_requests_ceiling_expansion(params);
-                let decision = if expansion {
-                    refused_ceiling_expansions = refused_ceiling_expansions.saturating_add(1);
-                    ApprovalDecision::Decline
-                } else {
-                    let request = parse_approval_request(method, params, active_item.raw.clone())?;
-                    match bounded_review(
-                        Arc::clone(&reviewer),
-                        request,
-                        state.deadline,
-                        state.limits.approval_timeout,
-                        cancelled,
-                    ) {
-                        Ok(decision) => decision,
-                        Err(error @ AppServerError::ApprovalTimeout)
-                        | Err(error @ AppServerError::ApprovalReviewerLost)
-                        | Err(error @ AppServerError::Cancelled { .. }) => {
-                            state.send(
-                                transport,
-                                &json!({
-                                    "id": request_id.to_value(),
-                                    "result": {
-                                        "decision": ApprovalDecision::Cancel.protocol_value()
-                                    }
-                                }),
-                            )?;
-                            return Err(error);
-                        }
-                        Err(error) => return Err(error),
+                let request = parse_approval_request(method, params, active_item.raw.clone())?;
+                let expansion = request.ceiling_expansion_requested;
+                let review = match bounded_review(
+                    reviewer,
+                    request,
+                    state.deadline,
+                    state.limits.approval_timeout,
+                    cancelled,
+                ) {
+                    Ok(review) => review,
+                    Err(error @ AppServerError::ApprovalTimeout)
+                    | Err(error @ AppServerError::ApprovalReviewerLost)
+                    | Err(error @ AppServerError::Cancelled { .. }) => {
+                        state.send(
+                            transport,
+                            &json!({
+                                "id": request_id.to_value(),
+                                "result": {
+                                    "decision": ApprovalDecision::Cancel.protocol_value()
+                                }
+                            }),
+                        )?;
+                        return Err(error);
                     }
+                    Err(error) => return Err(error),
                 };
+                if expansion {
+                    refused_ceiling_expansions = refused_ceiling_expansions.saturating_add(1);
+                    if review.decision == ApprovalDecision::Accept {
+                        state.send(
+                            transport,
+                            &json!({
+                                "id": request_id.to_value(),
+                                "result": {
+                                    "decision": ApprovalDecision::Cancel.protocol_value()
+                                }
+                            }),
+                        )?;
+                        return Err(AppServerError::ApprovalReviewerLost);
+                    }
+                }
+                if let Some(denial) = review.denial.clone() {
+                    let feedback_id = state.allocate_request_id()?;
+                    let payload = serde_json::to_string(&denial).map_err(|error| {
+                        AppServerError::Malformed {
+                            phase: "gate denial feedback",
+                            message: format!("failed to encode typed gate denial: {error}"),
+                        }
+                    })?;
+                    state.send(
+                        transport,
+                        &json!({
+                            "id": feedback_id.to_value(),
+                            "method": "turn/steer",
+                            "params": {
+                                "threadId": thread_id,
+                                "expectedTurnId": turn_id,
+                                "input": [{
+                                    "type": "text",
+                                    "text": format!("MACO_GATE_DENIAL_V1\n{payload}"),
+                                    "text_elements": []
+                                }]
+                            }
+                        }),
+                    )?;
+                    pending_correction_responses.insert(feedback_id, item_id.to_string());
+                    gate_denials.push(denial);
+                }
                 state.send(
                     transport,
                     &json!({
                         "id": request_id.to_value(),
-                        "result": {"decision": decision.protocol_value()}
+                        "result": {"decision": review.decision.protocol_value()}
                     }),
                 )?;
-                if decision == ApprovalDecision::Cancel {
+                if review.decision == ApprovalDecision::Cancel {
                     return Err(AppServerError::Cancelled { phase: "approval" });
                 }
             }
@@ -996,7 +1137,104 @@ where
                         message: "permission request id was reused".to_string(),
                     });
                 }
+                let item_id = required_text(
+                    &message,
+                    &["params", "itemId"],
+                    "permission approval",
+                    "item id",
+                )?;
+                if !approval_request_items.insert(item_id.to_string()) {
+                    return Err(AppServerError::Duplicate {
+                        phase: "permission approval",
+                        message: "active item requested approval more than once".to_string(),
+                    });
+                }
+                let active_item =
+                    active_items
+                        .get(item_id)
+                        .ok_or_else(|| AppServerError::Unexpected {
+                            phase: "permission approval",
+                            message: "permission approval item has no active lifecycle".to_string(),
+                        })?;
+                let request = ApprovalRequest {
+                    kind: ApprovalKind::PermissionExpansion,
+                    thread_id: required_map_text(params, "threadId", "permission approval")?
+                        .to_string(),
+                    turn_id: required_map_text(params, "turnId", "permission approval")?
+                        .to_string(),
+                    item_id: item_id.to_string(),
+                    command: None,
+                    cwd: optional_bounded_text(params.get("cwd"), "cwd", 16 * 1024)?,
+                    reason: optional_bounded_text(params.get("reason"), "reason", 64 * 1024)?,
+                    ceiling_expansion_requested: true,
+                    item: active_item.raw.clone(),
+                    raw_params: Value::Object(params.clone()),
+                };
                 refused_ceiling_expansions = refused_ceiling_expansions.saturating_add(1);
+                let review = match bounded_review(
+                    reviewer,
+                    request,
+                    state.deadline,
+                    state.limits.approval_timeout,
+                    cancelled,
+                ) {
+                    Ok(review) => review,
+                    Err(error) => {
+                        state.send(
+                            transport,
+                            &json!({
+                                "id": request_id.to_value(),
+                                "result": {
+                                    "permissions": {},
+                                    "scope": "turn",
+                                    "strictAutoReview": true
+                                }
+                            }),
+                        )?;
+                        return Err(error);
+                    }
+                };
+                if review.decision == ApprovalDecision::Accept {
+                    state.send(
+                        transport,
+                        &json!({
+                            "id": request_id.to_value(),
+                            "result": {
+                                "permissions": {},
+                                "scope": "turn",
+                                "strictAutoReview": true
+                            }
+                        }),
+                    )?;
+                    return Err(AppServerError::ApprovalReviewerLost);
+                }
+                if let Some(denial) = review.denial {
+                    let feedback_id = state.allocate_request_id()?;
+                    let payload = serde_json::to_string(&denial).map_err(|error| {
+                        AppServerError::Malformed {
+                            phase: "gate denial feedback",
+                            message: format!("failed to encode typed gate denial: {error}"),
+                        }
+                    })?;
+                    state.send(
+                        transport,
+                        &json!({
+                            "id": feedback_id.to_value(),
+                            "method": "turn/steer",
+                            "params": {
+                                "threadId": thread_id,
+                                "expectedTurnId": turn_id,
+                                "input": [{
+                                    "type": "text",
+                                    "text": format!("MACO_GATE_DENIAL_V1\n{payload}"),
+                                    "text_elements": []
+                                }]
+                            }
+                        }),
+                    )?;
+                    pending_correction_responses.insert(feedback_id, item_id.to_string());
+                    gate_denials.push(denial);
+                }
                 state.send(
                     transport,
                     &json!({
@@ -1008,6 +1246,11 @@ where
                         }
                     }),
                 )?;
+                if review.decision == ApprovalDecision::Cancel {
+                    return Err(AppServerError::Cancelled {
+                        phase: "permission approval",
+                    });
+                }
             }
             "item/autoApprovalReview/started" => {
                 validate_turn_correlation(params, thread_id, turn_id, "auto approval review")?;
@@ -1084,6 +1327,17 @@ where
                     "item/completed",
                     "item id",
                 )?;
+                if pending_correction_responses
+                    .values()
+                    .any(|pending_item_id| pending_item_id == item_id)
+                {
+                    return Err(AppServerError::Unexpected {
+                        phase: "item/completed",
+                        message:
+                            "denied item terminalized before typed gate-denial feedback was acknowledged"
+                                .to_string(),
+                    });
+                }
                 let item_type = required_text(
                     &message,
                     &["params", "item", "type"],
@@ -1131,6 +1385,13 @@ where
                         .unwrap_or("completed")
                         .to_string()
                 };
+                if item_type == "agentMessage" {
+                    final_message = optional_bounded_text(
+                        message.pointer("/params/item/text"),
+                        "completed agent message",
+                        OUTPUT_AGENT_MESSAGE_MAX_BYTES,
+                    )?;
+                }
                 item_outcomes.push(ItemOutcome {
                     item_id: item_id.to_string(),
                     item_type: item_type.to_string(),
@@ -1139,6 +1400,14 @@ where
             }
             "turn/completed" => {
                 validate_turn_correlation(params, thread_id, turn_id, "turn/completed")?;
+                if !pending_correction_responses.is_empty() {
+                    return Err(AppServerError::Unexpected {
+                        phase: "turn/completed",
+                        message:
+                            "turn terminalized before all typed gate-denial feedback was acknowledged"
+                                .to_string(),
+                    });
+                }
                 if !active_items.is_empty() || !active_reviews.is_empty() {
                     return Err(AppServerError::Unexpected {
                         phase: "turn/completed",
@@ -1183,6 +1452,8 @@ where
                     completed_items: completed_items.len(),
                     item_outcomes,
                     refused_ceiling_expansions,
+                    gate_denials,
+                    final_message,
                     auto_reviews,
                     duplex_fallback_required,
                     messages_received: state.messages_received,
@@ -1234,6 +1505,7 @@ fn parse_approval_request(
         command: optional_bounded_text(params.get("command"), "command", 256 * 1024)?,
         cwd: optional_bounded_text(params.get("cwd"), "cwd", 16 * 1024)?,
         reason: optional_bounded_text(params.get("reason"), "reason", 64 * 1024)?,
+        ceiling_expansion_requested: approval_requests_ceiling_expansion(params),
         item,
         raw_params: Value::Object(params.clone()),
     })
@@ -1263,41 +1535,48 @@ fn non_empty_array_or_value(value: &Value) -> bool {
 }
 
 fn bounded_review(
-    reviewer: Arc<dyn ApprovalReviewer>,
+    reviewer: &mut dyn ApprovalReviewer,
     request: ApprovalRequest,
     turn_deadline: Instant,
     approval_timeout: Duration,
     cancelled: &impl Fn() -> bool,
-) -> Result<ApprovalDecision, AppServerError> {
+) -> Result<ApprovalReview, AppServerError> {
     let approval_deadline = Instant::now()
         .checked_add(approval_timeout)
         .map_or(turn_deadline, |deadline| deadline.min(turn_deadline));
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("maco-codex-approval-review".to_string())
-        .spawn(move || {
-            let decision = reviewer.review(request);
-            let _ = sender.send(decision);
-        })
-        .map_err(|_| AppServerError::ApprovalReviewerLost)?;
-    loop {
-        if cancelled() {
-            return Err(AppServerError::Cancelled { phase: "approval" });
-        }
-        let now = Instant::now();
-        if now >= approval_deadline {
-            return Err(AppServerError::ApprovalTimeout);
-        }
-        let wait = approval_deadline
-            .saturating_duration_since(now)
-            .min(CANCELLATION_POLL_INTERVAL);
-        match receiver.recv_timeout(wait) {
-            Ok(decision) => return Ok(decision),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(AppServerError::ApprovalReviewerLost);
-            }
-        }
+    if cancelled() {
+        return Err(AppServerError::Cancelled { phase: "approval" });
+    }
+    if Instant::now() >= approval_deadline {
+        return Err(AppServerError::ApprovalTimeout);
+    }
+    // The callback is deliberately synchronous: a timed-out classifier or journal append must
+    // not continue as a detached effect after the child has been cancelled. Trusted reviewers
+    // receive the same deadline and are required to bound their own read-only classifier call.
+    let review = reviewer
+        .review(request)
+        .map_err(|_| AppServerError::ApprovalReviewerLost)?
+        .validate()?;
+    if cancelled() {
+        return Err(AppServerError::Cancelled { phase: "approval" });
+    }
+    if Instant::now() >= approval_deadline {
+        return Err(AppServerError::ApprovalTimeout);
+    }
+    Ok(review)
+}
+
+#[cfg(test)]
+fn reviewer_decline_for_test(label: &str) -> ApprovalReview {
+    let denial = GateDenial::from_approval_review(
+        format!("test-{label}"),
+        "test-reviewer",
+        crate::gate_denial::ApprovalReviewDenial::ClassifierDenied,
+        std::iter::empty::<&str>(),
+    );
+    match denial {
+        Ok(denial) => ApprovalReview::decline(denial),
+        Err(_) => ApprovalReview::cancel(None),
     }
 }
 
@@ -1556,7 +1835,10 @@ fn bounded_json_summary(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[derive(Default)]
     struct FakeTransport {
@@ -1625,7 +1907,7 @@ mod tests {
                 "result": {
                     "thread": {"id": "thread-1"},
                     "approvalPolicy": "on-request",
-                    "approvalsReviewer": "auto_review",
+                    "approvalsReviewer": "user",
                     "activePermissionProfile": {"id": "maco_external_codex"},
                     "cwd": "/workspace"
                 }
@@ -1748,7 +2030,7 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("auto-review")),
             || false,
         )
         .expect("auto review transcript")
@@ -1870,7 +2152,7 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Accept),
+            &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
             || false,
         )
         .expect("two approval item transcript")
@@ -1926,17 +2208,17 @@ mod tests {
             }),
         ]);
         let mut transport = FakeTransport::from_values(messages);
-        let reviewer = Arc::new(|request: ApprovalRequest| {
+        let mut reviewer = |request: ApprovalRequest| {
             assert_eq!(request.item_id, "item-1");
             assert_eq!(request.kind, ApprovalKind::CommandExecution);
-            ApprovalDecision::Accept
-        });
+            Ok(ApprovalReview::accept())
+        };
 
         let outcome = run_app_server_turn(
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            reviewer,
+            &mut reviewer,
             || false,
         )
         .expect("command approval transcript");
@@ -1974,6 +2256,7 @@ mod tests {
                     "reason": "update source"
                 }
             }),
+            json!({"id": 4, "result": {}}),
             json!({
                 "method": "item/completed",
                 "params": {
@@ -1996,10 +2279,10 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|request: ApprovalRequest| {
+            &mut |request: ApprovalRequest| {
                 assert_eq!(request.kind, ApprovalKind::FileChange);
-                ApprovalDecision::Decline
-            }),
+                Ok(reviewer_decline_for_test("file-change"))
+            },
             || false,
         )
         .expect("file approval transcript");
@@ -2007,6 +2290,143 @@ mod tests {
             approval_response(&transport, 44).and_then(|value| value.pointer("/result/decision")),
             Some(&json!("decline"))
         );
+        let steer_index = transport
+            .sent
+            .iter()
+            .position(|message| message.get("method") == Some(&json!("turn/steer")))
+            .expect("typed denial steer");
+        let decline_index = transport
+            .sent
+            .iter()
+            .position(|message| message.get("id") == Some(&json!(44)))
+            .expect("decline response");
+        assert!(steer_index < decline_index);
+        assert_eq!(
+            transport.sent[steer_index].pointer("/params/threadId"),
+            Some(&json!("thread-1"))
+        );
+        assert_eq!(
+            transport.sent[steer_index].pointer("/params/expectedTurnId"),
+            Some(&json!("turn-1"))
+        );
+        assert!(
+            transport.sent[steer_index]
+                .pointer("/params/turnId")
+                .is_none(),
+            "TurnSteerParams must use expectedTurnId, not turnId"
+        );
+    }
+
+    #[test]
+    fn denied_item_cannot_terminalize_before_same_turn_feedback_ack() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "denied-item", "type": "fileChange", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 91,
+                "method": "item/fileChange/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "denied-item",
+                    "startedAtMs": 1,
+                    "reason": "unsafe write"
+                }
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 2,
+                    "item": {"id": "denied-item", "type": "fileChange", "status": "declined"}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("item-before-ack")),
+            || false,
+        )
+        .expect_err("terminal item before feedback ack");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "item/completed",
+                ..
+            }
+        ));
+        let steer = transport
+            .sent
+            .iter()
+            .find(|message| message.get("method") == Some(&json!("turn/steer")))
+            .expect("same-turn steer");
+        assert_eq!(steer.pointer("/params/threadId"), Some(&json!("thread-1")));
+        assert_eq!(
+            steer.pointer("/params/expectedTurnId"),
+            Some(&json!("turn-1"))
+        );
+    }
+
+    #[test]
+    fn turn_cannot_terminalize_with_unacknowledged_gate_feedback() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "denied-item", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 92,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "denied-item",
+                    "startedAtMs": 1,
+                    "command": "unsafe command"
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("turn-before-ack")),
+            || false,
+        )
+        .expect_err("terminal turn before feedback ack");
+
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected {
+                phase: "turn/completed",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2043,14 +2463,15 @@ mod tests {
             &mut transport,
             &test_turn(),
             limits,
-            Arc::new(|_: ApprovalRequest| {
-                thread::sleep(Duration::from_secs(5));
-                ApprovalDecision::Accept
-            }),
+            &mut |_: ApprovalRequest| {
+                thread::sleep(Duration::from_millis(20));
+                Ok(ApprovalReview::accept())
+            },
             || false,
         )
         .expect_err("approval timeout");
         assert_eq!(error, AppServerError::ApprovalTimeout);
+        assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(
             approval_response(&transport, 45).and_then(|value| value.pointer("/result/decision")),
@@ -2093,14 +2514,15 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| {
-                thread::sleep(Duration::from_secs(5));
-                ApprovalDecision::Accept
-            }),
+            &mut |_: ApprovalRequest| {
+                thread::sleep(Duration::from_millis(20));
+                Ok(ApprovalReview::accept())
+            },
             move || cancellation_started.elapsed() >= Duration::from_millis(10),
         )
         .expect_err("approval cancellation");
         assert_eq!(error, AppServerError::Cancelled { phase: "approval" });
+        assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(
             approval_response(&transport, 47).and_then(|value| value.pointer("/result/decision")),
@@ -2124,7 +2546,7 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("malformed")),
             || false,
         )
         .expect_err("malformed response");
@@ -2143,7 +2565,7 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("protocol-loss")),
             || false,
         )
         .expect_err("protocol loss");
@@ -2156,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_expansion_is_refused_without_calling_policy() {
+    fn permission_expansion_is_refused_by_policy() {
         let mut messages = base_messages();
         messages.extend([
             json!({
@@ -2183,6 +2605,7 @@ mod tests {
                     }
                 }
             }),
+            json!({"id": 4, "result": {}}),
             json!({
                 "method": "item/completed",
                 "params": {
@@ -2203,18 +2626,19 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = Arc::clone(&calls);
         let mut transport = FakeTransport::from_values(messages);
+        let mut reviewer = move |_: ApprovalRequest| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(reviewer_decline_for_test("permission-expansion"))
+        };
         let outcome = run_app_server_turn(
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(move |_: ApprovalRequest| {
-                callback_calls.fetch_add(1, Ordering::SeqCst);
-                ApprovalDecision::Accept
-            }),
+            &mut reviewer,
             || false,
         )
         .expect("expansion refusal transcript");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(outcome.refused_ceiling_expansions, 1);
         assert_eq!(
             approval_response(&transport, 46).and_then(|value| value.pointer("/result/decision")),
@@ -2239,7 +2663,7 @@ mod tests {
             &mut transport,
             &test_turn(),
             limits,
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("protocol-timeout")),
             || false,
         )
         .expect_err("protocol timeout");
@@ -2262,7 +2686,7 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("turn-cancel")),
             move || cancellation_reads.load(Ordering::SeqCst) >= 3,
         )
         .expect_err("turn cancellation");
@@ -2303,7 +2727,7 @@ mod tests {
             &mut transport,
             &turn,
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("profile")),
             || false,
         )
         .expect_err("broader permission profile");
@@ -2326,7 +2750,7 @@ mod tests {
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            &mut |_: ApprovalRequest| Ok(reviewer_decline_for_test("duplicate-start")),
             || false,
         )
         .expect_err("duplicate turn start");
@@ -2409,14 +2833,15 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = Arc::clone(&calls);
         let mut transport = FakeTransport::from_values(messages);
+        let mut reviewer = move |_: ApprovalRequest| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ApprovalReview::accept())
+        };
         let error = run_app_server_turn(
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
-            Arc::new(move |_: ApprovalRequest| {
-                callback_calls.fetch_add(1, Ordering::SeqCst);
-                ApprovalDecision::Accept
-            }),
+            &mut reviewer,
             || false,
         )
         .expect_err("duplicate approval item");

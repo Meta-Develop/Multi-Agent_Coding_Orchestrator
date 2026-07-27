@@ -338,8 +338,23 @@ impl ActionDescriptor {
     where
         I: IntoIterator<Item = PathAccess>,
     {
+        Self::file_change_with_manifest(accesses, destructive, true)
+    }
+
+    /// Describes a file-change request whose path manifest may be incomplete.
+    ///
+    /// App-server approval requests can omit the full change list. Such requests remain valid
+    /// inputs to the fail-closed reviewer, but can never use the deterministic allow path.
+    pub fn file_change_with_manifest<I>(
+        accesses: I,
+        destructive: bool,
+        access_manifest_complete: bool,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = PathAccess>,
+    {
         let accesses = canonical_accesses(accesses)?;
-        if accesses.is_empty() {
+        if access_manifest_complete && accesses.is_empty() {
             return invalid("file-change action must include at least one path");
         }
         if accesses
@@ -348,10 +363,10 @@ impl ActionDescriptor {
         {
             return invalid("file-change action may contain only writes or deletes");
         }
-        let blast_radius = if accesses.len() == 1 {
-            BlastRadius::SingleClaimedPath
-        } else {
-            BlastRadius::MultipleClaimedPaths
+        let blast_radius = match accesses.len() {
+            0 => BlastRadius::WorkspaceWide,
+            1 => BlastRadius::SingleClaimedPath,
+            _ => BlastRadius::MultipleClaimedPaths,
         };
         Ok(Self {
             kind: ActionKind::FileChange,
@@ -363,7 +378,7 @@ impl ActionDescriptor {
             },
             blast_radius,
             accesses,
-            access_manifest_complete: true,
+            access_manifest_complete,
         })
     }
 
@@ -641,7 +656,7 @@ impl ReviewOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LatencyBudget {
     p50_ms: u64,
     p95_ms: u64,
@@ -685,7 +700,7 @@ impl LatencyBudget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LatencyReport {
     pub sample_count: u64,
     pub measured_p50_ms: Option<u64>,
@@ -732,13 +747,13 @@ impl LatencySeries {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RatioMetric {
     pub numerator: u64,
     pub denominator: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ReviewMetricSnapshot {
     pub reviewed_action_denials: RatioMetric,
     pub eligible_run_human_interruptions: RatioMetric,
@@ -1035,7 +1050,8 @@ fn deterministic_decision(
         return deny(ApprovalReviewDenial::SensitiveRead, sensitive_reads);
     }
     match action.kind {
-        ActionKind::FileChange => PolicyDisposition::Allow,
+        ActionKind::FileChange if action.access_manifest_complete => PolicyDisposition::Allow,
+        ActionKind::FileChange => PolicyDisposition::Ambiguous,
         ActionKind::CommandExecution => match action.command_class {
             CommandClass::ReadOnly | CommandClass::Validation
                 if action.access_manifest_complete =>
@@ -1409,6 +1425,54 @@ mod tests {
             .expect("review")
             .is_allowed());
         assert_eq!(classifier.calls, 0);
+    }
+
+    #[test]
+    fn incomplete_file_manifest_never_receives_a_deterministic_allow() {
+        let context = context("run-incomplete-file-manifest");
+        let action = ActionDescriptor::file_change_with_manifest(
+            [PathAccess::write("src/review/policy.rs").expect("write")],
+            false,
+            false,
+        )
+        .expect("incomplete file action");
+        let request = ApprovalReviewRequest::new(
+            "request-incomplete-file",
+            "incomplete-file",
+            action,
+            PermissionRequest::within_ceiling(),
+        )
+        .expect("incomplete file request");
+        let mut classifier = FakeClassifier::new([response("allow", 1)]);
+        let mut reviewer = PreActionReviewer::default();
+
+        let outcome = reviewer
+            .review(&context, &request, Some(&mut classifier))
+            .expect("classifier-reviewed file request");
+        assert_eq!(
+            outcome,
+            ReviewOutcome::Allowed {
+                source: DecisionSource::Classifier
+            }
+        );
+        assert_eq!(classifier.calls, 1);
+
+        let no_manifest = ActionDescriptor::file_change_with_manifest([], false, false)
+            .expect("missing file manifest remains reviewable");
+        let no_manifest_request = ApprovalReviewRequest::new(
+            "request-missing-file",
+            "missing-file",
+            no_manifest,
+            PermissionRequest::within_ceiling(),
+        )
+        .expect("missing file request");
+        let outcome = reviewer
+            .review(&context, &no_manifest_request, None)
+            .expect("fail-closed missing file review");
+        assert_eq!(
+            denial_kind(&outcome),
+            ApprovalReviewDenial::ClassifierProtocolError
+        );
     }
 
     #[test]
