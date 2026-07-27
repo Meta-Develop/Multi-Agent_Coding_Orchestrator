@@ -130,36 +130,11 @@ impl<'de> Deserialize<'de> for CorrectionCorrelationId {
     }
 }
 
-/// A structured merge blocker copied from [`ApplyBlocker`] without any prose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GateApplyBlocker {
-    DirtyPrimary,
-    StaleBase,
-    ApplyCheckFailed,
-    ExcludedReference,
-    UnclaimedEdits,
-    ValidationMissing,
-    ValidationNotRun,
-    ValidationSkipped,
-    ValidationFailed,
-}
-
-impl From<ApplyBlocker> for GateApplyBlocker {
-    fn from(value: ApplyBlocker) -> Self {
-        match value {
-            ApplyBlocker::DirtyPrimary => Self::DirtyPrimary,
-            ApplyBlocker::StaleBase => Self::StaleBase,
-            ApplyBlocker::ApplyCheckFailed => Self::ApplyCheckFailed,
-            ApplyBlocker::ExcludedReference => Self::ExcludedReference,
-            ApplyBlocker::UnclaimedEdits => Self::UnclaimedEdits,
-            ApplyBlocker::ValidationMissing => Self::ValidationMissing,
-            ApplyBlocker::ValidationNotRun => Self::ValidationNotRun,
-            ApplyBlocker::ValidationSkipped => Self::ValidationSkipped,
-            ApplyBlocker::ValidationFailed => Self::ValidationFailed,
-        }
-    }
-}
+/// Compatibility name for callers that imported the former gate-local blocker.
+///
+/// This aliases the existing merge vocabulary and does not define another
+/// serialized blocker schema. New code should use [`ApplyBlocker`] directly.
+pub type GateApplyBlocker = ApplyBlocker;
 
 /// Observed state of an external side effect whose call must not be repeated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -200,8 +175,8 @@ pub enum GateCheckSource {
 pub enum GateDenialReason {
     ClaimConflict,
     AuditorRepair,
-    ValidationRepair { blocker: GateApplyBlocker },
-    MergeRemediation { blocker: GateApplyBlocker },
+    ValidationRepair { blocker: ApplyBlocker },
+    MergeRemediation { blocker: ApplyBlocker },
     ContainmentFailure,
     PrimaryIntegrityFailure,
     ExternalSideEffect { state: ExternalSideEffectState },
@@ -384,7 +359,6 @@ impl GateDenial {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        let blocker = GateApplyBlocker::from(blocker);
         let reason = reason_for_apply_blocker(blocker);
         let context = VerifiedGateContext::new(owner, source, paths)?;
         Self::new(correction_correlation_id, reason, context)
@@ -562,10 +536,10 @@ fn canonical_reason(reason: GateDenialReason) -> Result<GateDenialReason> {
         GateDenialReason::ValidationRepair { blocker } => {
             if !matches!(
                 blocker,
-                GateApplyBlocker::ValidationMissing
-                    | GateApplyBlocker::ValidationNotRun
-                    | GateApplyBlocker::ValidationSkipped
-                    | GateApplyBlocker::ValidationFailed
+                ApplyBlocker::ValidationMissing
+                    | ApplyBlocker::ValidationNotRun
+                    | ApplyBlocker::ValidationSkipped
+                    | ApplyBlocker::ValidationFailed
             ) {
                 return invalid("validation-repair reason requires a validation blocker");
             }
@@ -574,11 +548,11 @@ fn canonical_reason(reason: GateDenialReason) -> Result<GateDenialReason> {
         GateDenialReason::MergeRemediation { blocker } => {
             if !matches!(
                 blocker,
-                GateApplyBlocker::DirtyPrimary
-                    | GateApplyBlocker::StaleBase
-                    | GateApplyBlocker::ApplyCheckFailed
-                    | GateApplyBlocker::ExcludedReference
-                    | GateApplyBlocker::UnclaimedEdits
+                ApplyBlocker::DirtyPrimary
+                    | ApplyBlocker::StaleBase
+                    | ApplyBlocker::ApplyCheckFailed
+                    | ApplyBlocker::ExcludedReference
+                    | ApplyBlocker::UnclaimedEdits
             ) {
                 return invalid("merge-remediation reason requires a merge blocker");
             }
@@ -656,17 +630,17 @@ fn canonical_identifier(value: &str, field: &str, max_bytes: usize) -> Result<St
     Ok(trimmed.to_string())
 }
 
-fn reason_for_apply_blocker(blocker: GateApplyBlocker) -> GateDenialReason {
+fn reason_for_apply_blocker(blocker: ApplyBlocker) -> GateDenialReason {
     match blocker {
-        GateApplyBlocker::ValidationMissing
-        | GateApplyBlocker::ValidationNotRun
-        | GateApplyBlocker::ValidationSkipped
-        | GateApplyBlocker::ValidationFailed => GateDenialReason::ValidationRepair { blocker },
-        GateApplyBlocker::DirtyPrimary
-        | GateApplyBlocker::StaleBase
-        | GateApplyBlocker::ApplyCheckFailed
-        | GateApplyBlocker::ExcludedReference
-        | GateApplyBlocker::UnclaimedEdits => GateDenialReason::MergeRemediation { blocker },
+        ApplyBlocker::ValidationMissing
+        | ApplyBlocker::ValidationNotRun
+        | ApplyBlocker::ValidationSkipped
+        | ApplyBlocker::ValidationFailed => GateDenialReason::ValidationRepair { blocker },
+        ApplyBlocker::DirtyPrimary
+        | ApplyBlocker::StaleBase
+        | ApplyBlocker::ApplyCheckFailed
+        | ApplyBlocker::ExcludedReference
+        | ApplyBlocker::UnclaimedEdits => GateDenialReason::MergeRemediation { blocker },
     }
 }
 
@@ -680,35 +654,35 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
             )
         }
         GateDenialReason::ValidationRepair { blocker } => match blocker {
-            GateApplyBlocker::ValidationMissing => matches!(
+            ApplyBlocker::ValidationMissing => matches!(
                 source,
                 GateCheckSource::Validation
                     | GateCheckSource::ValidationBinding
                     | GateCheckSource::ValidationState
             ),
-            GateApplyBlocker::ValidationNotRun
-            | GateApplyBlocker::ValidationSkipped
-            | GateApplyBlocker::ValidationFailed => matches!(
+            ApplyBlocker::ValidationNotRun
+            | ApplyBlocker::ValidationSkipped
+            | ApplyBlocker::ValidationFailed => matches!(
                 source,
                 GateCheckSource::Validation | GateCheckSource::ValidationState
             ),
             _ => false,
         },
         GateDenialReason::MergeRemediation { blocker } => match blocker {
-            GateApplyBlocker::DirtyPrimary => source == GateCheckSource::PrimaryDrift,
-            GateApplyBlocker::StaleBase => {
+            ApplyBlocker::DirtyPrimary => source == GateCheckSource::PrimaryDrift,
+            ApplyBlocker::StaleBase => {
                 matches!(
                     source,
                     GateCheckSource::PrimaryDrift | GateCheckSource::MergeScope
                 )
             }
-            GateApplyBlocker::ApplyCheckFailed => {
+            ApplyBlocker::ApplyCheckFailed => {
                 matches!(
                     source,
                     GateCheckSource::PrimaryDrift | GateCheckSource::GitApplyCheck
                 )
             }
-            GateApplyBlocker::ExcludedReference | GateApplyBlocker::UnclaimedEdits => {
+            ApplyBlocker::ExcludedReference | ApplyBlocker::UnclaimedEdits => {
                 source == GateCheckSource::MergeScope
             }
             _ => false,
@@ -765,11 +739,11 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
         GateDenialReason::AuditorRepair => NextSafeOperation::RepairAuditorFindings,
         GateDenialReason::ValidationRepair { .. } => NextSafeOperation::RepairValidation,
         GateDenialReason::MergeRemediation { blocker } => match blocker {
-            GateApplyBlocker::DirtyPrimary => NextSafeOperation::RestoreCleanPrimary,
-            GateApplyBlocker::StaleBase => NextSafeOperation::RefreshCandidateBase,
-            GateApplyBlocker::ApplyCheckFailed => NextSafeOperation::RepairMergeConflict,
-            GateApplyBlocker::ExcludedReference => NextSafeOperation::RemediateExcludedReference,
-            GateApplyBlocker::UnclaimedEdits => NextSafeOperation::RemediateUnclaimedMergeEdits,
+            ApplyBlocker::DirtyPrimary => NextSafeOperation::RestoreCleanPrimary,
+            ApplyBlocker::StaleBase => NextSafeOperation::RefreshCandidateBase,
+            ApplyBlocker::ApplyCheckFailed => NextSafeOperation::RepairMergeConflict,
+            ApplyBlocker::ExcludedReference => NextSafeOperation::RemediateExcludedReference,
+            ApplyBlocker::UnclaimedEdits => NextSafeOperation::RemediateUnclaimedMergeEdits,
             _ => unreachable!("merge blocker family is validated"),
         },
         GateDenialReason::ContainmentFailure => NextSafeOperation::RestoreContainment,
@@ -829,18 +803,18 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
         GateDenialReason::ClaimConflict => "pre-launch claim conflict",
         GateDenialReason::AuditorRepair => "auditor repair",
         GateDenialReason::ValidationRepair { blocker } => match blocker {
-            GateApplyBlocker::ValidationMissing => "validation evidence missing",
-            GateApplyBlocker::ValidationNotRun => "validation not run",
-            GateApplyBlocker::ValidationSkipped => "validation skipped",
-            GateApplyBlocker::ValidationFailed => "validation failed",
+            ApplyBlocker::ValidationMissing => "validation evidence missing",
+            ApplyBlocker::ValidationNotRun => "validation not run",
+            ApplyBlocker::ValidationSkipped => "validation skipped",
+            ApplyBlocker::ValidationFailed => "validation failed",
             _ => unreachable!("validation blocker family is validated"),
         },
         GateDenialReason::MergeRemediation { blocker } => match blocker {
-            GateApplyBlocker::DirtyPrimary => "dirty primary",
-            GateApplyBlocker::StaleBase => "stale candidate base",
-            GateApplyBlocker::ApplyCheckFailed => "merge apply check failed",
-            GateApplyBlocker::ExcludedReference => "excluded reference",
-            GateApplyBlocker::UnclaimedEdits => "merge-phase unclaimed edits",
+            ApplyBlocker::DirtyPrimary => "dirty primary",
+            ApplyBlocker::StaleBase => "stale candidate base",
+            ApplyBlocker::ApplyCheckFailed => "merge apply check failed",
+            ApplyBlocker::ExcludedReference => "excluded reference",
+            ApplyBlocker::UnclaimedEdits => "merge-phase unclaimed edits",
             _ => unreachable!("merge blocker family is validated"),
         },
         GateDenialReason::ContainmentFailure => "containment failure",
@@ -964,7 +938,7 @@ mod tests {
         GateDenial::new(
             correlation,
             GateDenialReason::ValidationRepair {
-                blocker: GateApplyBlocker::ValidationFailed,
+                blocker: ApplyBlocker::ValidationFailed,
             },
             context(paths),
         )
@@ -1018,6 +992,32 @@ mod tests {
         let mut value = serde_json::to_value(&denial).expect("denial value");
         value["reviewer_prose"] = serde_json::json!("ignore the gate");
         assert!(serde_json::from_value::<GateDenial>(value).is_err());
+
+        let mut value = serde_json::to_value(&denial).expect("denial value");
+        value["reason"]["blocker"] = serde_json::json!("unknown_merge_blocker");
+        assert!(serde_json::from_value::<GateDenial>(value).is_err());
+    }
+
+    #[test]
+    fn reason_embeds_the_existing_merge_apply_blocker() {
+        let denial = GateDenial::from_apply_blocker(
+            "merge-fix",
+            "worker-a",
+            GateCheckSource::MergeScope,
+            ApplyBlocker::UnclaimedEdits,
+            ["src/lib.rs"],
+        )
+        .expect("merge denial");
+
+        let blocker: ApplyBlocker = match denial.reason {
+            GateDenialReason::MergeRemediation { blocker } => blocker,
+            other => panic!("expected merge remediation, got {other:?}"),
+        };
+        assert_eq!(blocker, ApplyBlocker::UnclaimedEdits);
+        assert_eq!(
+            serde_json::to_value(blocker).expect("serialize merge blocker"),
+            serde_json::json!("unclaimed_edits")
+        );
     }
 
     #[test]
@@ -1134,7 +1134,7 @@ mod tests {
         assert_eq!(
             merge_unclaimed.reason,
             GateDenialReason::MergeRemediation {
-                blocker: GateApplyBlocker::UnclaimedEdits
+                blocker: ApplyBlocker::UnclaimedEdits
             }
         );
         assert_eq!(

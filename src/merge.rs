@@ -1823,7 +1823,7 @@ pub enum ApplyReadinessStatus {
     Blocked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyBlocker {
     DirtyPrimary,
