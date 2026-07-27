@@ -16,6 +16,7 @@ const HARD_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_MESSAGES: usize = 16_384;
 const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportRead {
@@ -216,6 +217,13 @@ pub(crate) struct AppServerTurn {
 impl AppServerTurn {
     fn validate(&self) -> Result<(), AppServerError> {
         validate_identifier(&self.permission_profile, "permission profile", 128)?;
+        if self.permission_profile != EXTERNAL_CODEX_PERMISSION_PROFILE {
+            return Err(AppServerError::InvalidConfiguration {
+                message:
+                    "app-server permission profile differs from the fixed external Codex ceiling"
+                        .to_string(),
+            });
+        }
         if self.cwd.is_empty()
             || self.cwd.len() > 16 * 1024
             || self.cwd.contains(['\0', '\n', '\r'])
@@ -691,7 +699,8 @@ where
         Ok(outcome) => Ok(outcome),
         Err(error @ AppServerError::Timeout { .. })
         | Err(error @ AppServerError::Cancelled { .. })
-        | Err(error @ AppServerError::ApprovalTimeout) => {
+        | Err(error @ AppServerError::ApprovalTimeout)
+        | Err(error @ AppServerError::ApprovalReviewerLost) => {
             state.interrupt(transport, &thread_id, &turn_id);
             Err(error)
         }
@@ -776,13 +785,22 @@ where
         raw: Value,
     }
 
+    #[derive(Debug)]
+    struct ActiveReview {
+        target_item_id: Option<String>,
+        action_type: String,
+        target_correlated: bool,
+    }
+
     let mut active_items = BTreeMap::<String, ActiveItem>::new();
     let mut completed_items = BTreeSet::<String>::new();
     let mut item_outcomes = Vec::new();
-    let mut active_reviews = BTreeSet::<String>::new();
+    let mut active_reviews = BTreeMap::<String, ActiveReview>::new();
     let mut completed_reviews = BTreeSet::<String>::new();
     let mut auto_reviews = Vec::new();
     let mut refused_ceiling_expansions = 0usize;
+    let mut thread_started_seen = false;
+    let mut turn_started_seen = false;
 
     loop {
         let message = state.receive(transport, "turn", cancelled)?;
@@ -816,9 +834,22 @@ where
 
         match method {
             "thread/started" => {
+                if thread_started_seen {
+                    return Err(AppServerError::Duplicate {
+                        phase: "thread/started",
+                        message: "thread lifecycle started more than once".to_string(),
+                    });
+                }
                 require_exact_text(&message, &["params", "thread", "id"], thread_id, "turn")?;
+                thread_started_seen = true;
             }
             "turn/started" => {
+                if turn_started_seen {
+                    return Err(AppServerError::Duplicate {
+                        phase: "turn/started",
+                        message: "turn lifecycle started more than once".to_string(),
+                    });
+                }
                 validate_turn_correlation(params, thread_id, turn_id, "turn/started")?;
                 require_exact_text(
                     &message,
@@ -826,6 +857,7 @@ where
                     "inProgress",
                     "turn/started",
                 )?;
+                turn_started_seen = true;
             }
             "item/started" => {
                 validate_turn_correlation(params, thread_id, turn_id, "item/started")?;
@@ -900,7 +932,7 @@ where
                             .to_string(),
                     });
                 }
-                let expansion = approval_requests_ceiling_expansion(method, params);
+                let expansion = approval_requests_ceiling_expansion(params);
                 let decision = if expansion {
                     refused_ceiling_expansions = refused_ceiling_expansions.saturating_add(1);
                     ApprovalDecision::Decline
@@ -911,10 +943,12 @@ where
                         request,
                         state.deadline,
                         state.limits.approval_timeout,
+                        cancelled,
                     ) {
                         Ok(decision) => decision,
                         Err(error @ AppServerError::ApprovalTimeout)
-                        | Err(error @ AppServerError::ApprovalReviewerLost) => {
+                        | Err(error @ AppServerError::ApprovalReviewerLost)
+                        | Err(error @ AppServerError::Cancelled { .. }) => {
                             state.send(
                                 transport,
                                 &json!({
@@ -977,8 +1011,35 @@ where
                     "review id",
                 )?;
                 validate_identifier(review_id, "review id", 256)?;
+                let action_type = required_text(
+                    &message,
+                    &["params", "action", "type"],
+                    "auto approval review",
+                    "review action type",
+                )?
+                .to_string();
+                let target_item_id = optional_bounded_text(
+                    message.pointer("/params/targetItemId"),
+                    "review target item id",
+                    256,
+                )?;
+                let target_correlated = target_item_id
+                    .as_deref()
+                    .and_then(|item_id| active_items.get(item_id))
+                    .is_some_and(|item| {
+                        auto_review_action_matches_item_type(&action_type, &item.item_type)
+                    });
                 if completed_reviews.contains(review_id)
-                    || !active_reviews.insert(review_id.to_string())
+                    || active_reviews
+                        .insert(
+                            review_id.to_string(),
+                            ActiveReview {
+                                target_item_id,
+                                action_type,
+                                target_correlated,
+                            },
+                        )
+                        .is_some()
                 {
                     return Err(AppServerError::Duplicate {
                         phase: "auto approval review",
@@ -988,16 +1049,24 @@ where
             }
             "item/autoApprovalReview/completed" => {
                 validate_turn_correlation(params, thread_id, turn_id, "auto approval review")?;
-                let evidence = parse_auto_review(&message)?;
-                if !active_reviews.remove(&evidence.review_id)
-                    || !completed_reviews.insert(evidence.review_id.clone())
-                {
-                    return Err(AppServerError::Unexpected {
+                let mut evidence = parse_auto_review(&message)?;
+                let active_review =
+                    active_reviews.remove(&evidence.review_id).ok_or_else(|| {
+                        AppServerError::Unexpected {
+                            phase: "auto approval review",
+                            message: "review completed without one matching active lifecycle"
+                                .to_string(),
+                        }
+                    })?;
+                if !completed_reviews.insert(evidence.review_id.clone()) {
+                    return Err(AppServerError::Duplicate {
                         phase: "auto approval review",
-                        message: "review completed without one matching active lifecycle"
-                            .to_string(),
+                        message: "review lifecycle completed more than once".to_string(),
                     });
                 }
+                evidence.structured_policy_decision &= active_review.target_correlated
+                    && evidence.target_item_id == active_review.target_item_id
+                    && evidence.action_type == active_review.action_type;
                 auto_reviews.push(evidence);
             }
             "item/completed" => {
@@ -1153,13 +1222,11 @@ fn parse_approval_request(
     })
 }
 
-fn approval_requests_ceiling_expansion(method: &str, params: &Map<String, Value>) -> bool {
-    if method == "item/fileChange/requestApproval" {
-        return params.get("grantRoot").is_some_and(non_null_value);
-    }
-    params
-        .get("additionalPermissions")
-        .is_some_and(non_null_value)
+fn approval_requests_ceiling_expansion(params: &Map<String, Value>) -> bool {
+    params.get("grantRoot").is_some_and(non_null_value)
+        || params
+            .get("additionalPermissions")
+            .is_some_and(non_null_value)
         || params
             .get("networkApprovalContext")
             .is_some_and(non_null_value)
@@ -1183,14 +1250,11 @@ fn bounded_review(
     request: ApprovalRequest,
     turn_deadline: Instant,
     approval_timeout: Duration,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<ApprovalDecision, AppServerError> {
-    let now = Instant::now();
-    if now >= turn_deadline {
-        return Err(AppServerError::ApprovalTimeout);
-    }
-    let wait = turn_deadline
-        .saturating_duration_since(now)
-        .min(approval_timeout);
+    let approval_deadline = Instant::now()
+        .checked_add(approval_timeout)
+        .map_or(turn_deadline, |deadline| deadline.min(turn_deadline));
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("maco-codex-approval-review".to_string())
@@ -1199,10 +1263,24 @@ fn bounded_review(
             let _ = sender.send(decision);
         })
         .map_err(|_| AppServerError::ApprovalReviewerLost)?;
-    match receiver.recv_timeout(wait) {
-        Ok(decision) => Ok(decision),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(AppServerError::ApprovalTimeout),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(AppServerError::ApprovalReviewerLost),
+    loop {
+        if cancelled() {
+            return Err(AppServerError::Cancelled { phase: "approval" });
+        }
+        let now = Instant::now();
+        if now >= approval_deadline {
+            return Err(AppServerError::ApprovalTimeout);
+        }
+        let wait = approval_deadline
+            .saturating_duration_since(now)
+            .min(CANCELLATION_POLL_INTERVAL);
+        match receiver.recv_timeout(wait) {
+            Ok(decision) => return Ok(decision),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(AppServerError::ApprovalReviewerLost);
+            }
+        }
     }
 }
 
@@ -1255,7 +1333,8 @@ fn parse_auto_review(message: &Value) -> Result<AutoReviewEvidence, AppServerErr
         "review target item id",
         256,
     )?;
-    let structured_policy_decision = matches!(status.as_str(), "approved" | "denied")
+    let structured_policy_decision = target_item_id.is_some()
+        && matches!(status.as_str(), "approved" | "denied")
         && decision_source == "agent"
         && matches!(
             action_type.as_str(),
@@ -1286,6 +1365,15 @@ fn parse_auto_review(message: &Value) -> Result<AutoReviewEvidence, AppServerErr
         user_authorization,
         structured_policy_decision,
     })
+}
+
+fn auto_review_action_matches_item_type(action_type: &str, item_type: &str) -> bool {
+    matches!(
+        (action_type, item_type),
+        ("command" | "execve", "commandExecution")
+            | ("applyPatch", "fileChange")
+            | ("mcpToolCall", "mcpToolCall")
+    )
 }
 
 fn validate_turn_correlation(
@@ -1555,6 +1643,100 @@ mod tests {
         })
     }
 
+    fn auto_review_messages(
+        started_target: Option<&str>,
+        completed_target: Option<&str>,
+    ) -> Vec<Value> {
+        let mut started = json!({
+            "method": "item/autoApprovalReview/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "reviewId": "review-1",
+                "startedAtMs": 2,
+                "action": {"type": "command", "command": "cargo test"},
+                "review": {"status": "inProgress"}
+            }
+        });
+        if let Some(target) = started_target {
+            started["params"]["targetItemId"] = Value::from(target);
+        }
+        let mut completed = json!({
+            "method": "item/autoApprovalReview/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "reviewId": "review-1",
+                "startedAtMs": 2,
+                "completedAtMs": 3,
+                "action": {"type": "command", "command": "cargo test"},
+                "decisionSource": "agent",
+                "review": {
+                    "status": "approved",
+                    "rationale": "bounded command",
+                    "riskLevel": "low",
+                    "userAuthorization": "low"
+                }
+            }
+        });
+        if let Some(target) = completed_target {
+            completed["params"]["targetItemId"] = Value::from(target);
+        }
+        vec![
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "item-reviewed",
+                        "type": "commandExecution",
+                        "status": "inProgress"
+                    }
+                }
+            }),
+            started,
+            completed,
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 4,
+                    "item": {
+                        "id": "item-reviewed",
+                        "type": "commandExecution",
+                        "status": "completed"
+                    }
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed", "items": []}
+                }
+            }),
+        ]
+    }
+
+    fn run_auto_review_transcript(
+        started_target: Option<&str>,
+        completed_target: Option<&str>,
+    ) -> AppServerOutcome {
+        let mut messages = base_messages();
+        messages.extend(auto_review_messages(started_target, completed_target));
+        let mut transport = FakeTransport::from_values(messages);
+        run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            || false,
+        )
+        .expect("auto review transcript")
+    }
+
     #[test]
     fn command_execution_approval_is_correlated_and_exact() {
         let mut messages = base_messages();
@@ -1742,6 +1924,56 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_is_polled_while_approval_callback_is_running() {
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "item-cancel", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 47,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-cancel",
+                    "startedAtMs": 1,
+                    "command": "sleep forever"
+                }
+            }),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let started = Instant::now();
+        let cancellation_started = started;
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            Arc::new(|_: ApprovalRequest| {
+                thread::sleep(Duration::from_secs(5));
+                ApprovalDecision::Accept
+            }),
+            move || cancellation_started.elapsed() >= Duration::from_millis(10),
+        )
+        .expect_err("approval cancellation");
+        assert_eq!(error, AppServerError::Cancelled { phase: "approval" });
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            approval_response(&transport, 47).and_then(|value| value.pointer("/result/decision")),
+            Some(&json!("cancel"))
+        );
+        assert!(transport
+            .sent
+            .iter()
+            .any(|message| message.get("method") == Some(&json!("turn/interrupt"))));
+    }
+
+    #[test]
     fn malformed_response_fails_closed() {
         let mut transport = FakeTransport {
             incoming: vec![ReaderEvent::Line(b"{malformed".to_vec())],
@@ -1903,12 +2135,87 @@ mod tests {
     }
 
     #[test]
-    fn grant_root_is_always_a_ceiling_expansion() {
-        let params = Map::from_iter([("grantRoot".to_string(), Value::from("/outside/workspace"))]);
-        assert!(approval_requests_ceiling_expansion(
-            "item/fileChange/requestApproval",
-            &params
-        ));
+    fn approval_expansion_fields_are_rejected_across_method_shapes() {
+        for params in [
+            Map::from_iter([("grantRoot".to_string(), Value::from("/outside/workspace"))]),
+            Map::from_iter([(
+                "additionalPermissions".to_string(),
+                json!({"network": {"enabled": true}}),
+            )]),
+            Map::from_iter([(
+                "networkApprovalContext".to_string(),
+                json!({"host": "example.invalid", "protocol": "https"}),
+            )]),
+            Map::from_iter([(
+                "proposedNetworkPolicyAmendments".to_string(),
+                json!([{"host": "example.invalid", "action": "allow"}]),
+            )]),
+        ] {
+            assert!(approval_requests_ceiling_expansion(&params));
+        }
+    }
+
+    #[test]
+    fn fixed_permission_profile_cannot_be_replaced_by_a_caller() {
+        let mut transport = FakeTransport::default();
+        let mut turn = test_turn();
+        turn.permission_profile = "broader_profile".to_string();
+        let error = run_app_server_turn(
+            &mut transport,
+            &turn,
+            AppServerLimits::default(),
+            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            || false,
+        )
+        .expect_err("broader permission profile");
+        assert!(matches!(error, AppServerError::InvalidConfiguration { .. }));
+        assert!(transport.sent.is_empty());
+    }
+
+    #[test]
+    fn duplicate_turn_started_notification_is_rejected() {
+        let mut messages = base_messages();
+        messages.push(json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "inProgress"}
+            }
+        }));
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            Arc::new(|_: ApprovalRequest| ApprovalDecision::Decline),
+            || false,
+        )
+        .expect_err("duplicate turn start");
+        assert!(matches!(error, AppServerError::Duplicate { .. }));
+    }
+
+    #[test]
+    fn exact_item_correlated_auto_review_can_avoid_fallback() {
+        let outcome = run_auto_review_transcript(Some("item-reviewed"), Some("item-reviewed"));
+        assert!(!outcome.duplex_fallback_required);
+    }
+
+    #[test]
+    fn missing_auto_review_target_requires_fallback() {
+        let outcome = run_auto_review_transcript(None, None);
+        assert!(outcome.duplex_fallback_required);
+    }
+
+    #[test]
+    fn wrong_auto_review_target_requires_fallback() {
+        let outcome = run_auto_review_transcript(Some("item-other"), Some("item-other"));
+        assert!(outcome.duplex_fallback_required);
+    }
+
+    #[test]
+    fn mismatched_auto_review_lifecycle_target_requires_fallback() {
+        let outcome = run_auto_review_transcript(Some("item-reviewed"), Some("item-other"));
+        assert!(outcome.duplex_fallback_required);
     }
 
     #[test]
