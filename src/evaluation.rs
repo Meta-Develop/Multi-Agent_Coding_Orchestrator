@@ -13,6 +13,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -25,8 +26,10 @@ pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EVALUATION_REPETITIONS: u32 = 100;
 pub const MAX_EXECUTION_ERROR_EVIDENCE_BYTES: usize = 256;
 pub const COMMITTED_FIXTURE_FAKE_SEED: u64 = 26;
-pub const PROVISIONAL_FAKE_EVIDENCE_NOTICE: &str = "deterministic fake-provider evidence only; \
-     not eligible to justify production model economics or a named default";
+pub const PROVISIONAL_FAKE_EVIDENCE_NOTICE: &str = "provisional deterministic fake evidence over \
+     a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 \
+     comparability is not established and is deferred to Phase B; ineligible for production or \
+     default decisions";
 
 const BASIS_POINTS: u32 = 10_000;
 const HELD_OUT_WEIGHT_PERCENT: u32 = 50;
@@ -45,7 +48,7 @@ pub struct EvaluationTarget {
     pub hand_authored_plan_digest: String,
 }
 
-/// Limits which must remain identical for runs to be comparable.
+/// Declared limits used consistently by every synthetic run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationLimits {
@@ -77,6 +80,7 @@ pub struct EvaluationProfile {
 pub struct EvaluationManifest {
     pub version: u32,
     pub experiment_id: String,
+    pub evidence: EvaluationEvidence,
     pub target: EvaluationTarget,
     /// A full Git object id (SHA-1 or SHA-256) for the common repository base.
     pub repository_base_snapshot: String,
@@ -87,7 +91,7 @@ pub struct EvaluationManifest {
 }
 
 impl EvaluationManifest {
-    /// Validate all invariants that make phase-A repetitions comparable.
+    /// Validate the declared Phase-A fake-fixture inputs.
     pub fn validate(&self) -> Result<(), EvaluationError> {
         if self.version != EVALUATION_MANIFEST_SCHEMA_VERSION {
             return Err(EvaluationError::UnsupportedManifestVersion {
@@ -96,6 +100,13 @@ impl EvaluationManifest {
             });
         }
         require_nonempty("experiment_id", &self.experiment_id)?;
+        if self.evidence != EvaluationEvidence::provisional_fake_only() {
+            return Err(invalid_manifest(
+                "evidence",
+                "manifest must carry the exact provisional fake-only, hand-authored-plan, \
+                 Phase-B-deferred declaration",
+            ));
+        }
         require_nonempty("target.spec_or_goal_id", &self.target.spec_or_goal_id)?;
         require_digest(
             "target.spec_or_goal_digest",
@@ -132,24 +143,52 @@ impl EvaluationManifest {
         Ok(())
     }
 
-    /// Verify that plan bytes are exactly the plan bound by this manifest.
-    pub fn validate_hand_authored_plan(&self, plan: &[u8]) -> Result<(), EvaluationError> {
+    /// Verify that supplied bytes are a labelled hand-authored plan exactly bound by this
+    /// manifest.
+    fn validate_hand_authored_plan(&self, plan: &[u8]) -> Result<(), EvaluationError> {
         let observed = format!("sha256:{}", sha256_hex(plan));
         if self.target.hand_authored_plan_digest != observed {
-            return Err(invalid_manifest(
-                "target.hand_authored_plan_digest",
-                format!(
-                    "does not bind the supplied hand-authored plan; expected '{}', observed \
-                     '{observed}'",
-                    self.target.hand_authored_plan_digest
-                ),
-            ));
+            return Err(EvaluationError::HandAuthoredPlanBindingMismatch {
+                expected: self.target.hand_authored_plan_digest.clone(),
+                observed,
+            });
+        }
+
+        let document = serde_json::from_slice::<Value>(plan).map_err(|error| {
+            EvaluationError::InvalidHandAuthoredPlan {
+                message: format!("must be valid JSON: {error}"),
+            }
+        })?;
+        let object =
+            document
+                .as_object()
+                .ok_or_else(|| EvaluationError::InvalidHandAuthoredPlan {
+                    message: "must be a JSON object".to_string(),
+                })?;
+        let evidence =
+            object
+                .get("evidence")
+                .ok_or_else(|| EvaluationError::InvalidHandAuthoredPlan {
+                    message: "must contain an evidence declaration".to_string(),
+                })?;
+        let evidence =
+            serde_json::from_value::<EvaluationEvidence>(evidence.clone()).map_err(|error| {
+                EvaluationError::InvalidHandAuthoredPlan {
+                    message: format!("contains an invalid evidence declaration: {error}"),
+                }
+            })?;
+        if evidence != EvaluationEvidence::provisional_fake_only() {
+            return Err(EvaluationError::InvalidHandAuthoredPlan {
+                message: "must carry the exact provisional fake-only, hand-authored-plan, \
+                          Phase-B-deferred declaration"
+                    .to_string(),
+            });
         }
         Ok(())
     }
 
-    fn comparability_binding(&self) -> ComparabilityBinding {
-        ComparabilityBinding {
+    fn declared_inputs_binding(&self) -> DeclaredInputsBinding {
+        DeclaredInputsBinding {
             target: self.target.clone(),
             repository_base_snapshot: self.repository_base_snapshot.clone(),
             limits: self.limits,
@@ -195,13 +234,29 @@ pub enum EvaluationEvidenceKind {
     ProvisionalDeterministicFakeOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationPlanBasis {
+    HandAuthored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementFourComparability {
+    NotEstablishedDeferredToPhaseB,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationEvidence {
     pub kind: EvaluationEvidenceKind,
+    pub plan_basis: EvaluationPlanBasis,
     pub real_provider_executed: bool,
+    pub observed_isolated_repository_state: bool,
+    pub requirement_four_comparability: RequirementFourComparability,
     pub eligible_for_production_economics: bool,
     pub eligible_to_justify_named_default: bool,
+    pub eligible_for_production_or_default_decisions: bool,
     pub notice: String,
 }
 
@@ -209,9 +264,14 @@ impl EvaluationEvidence {
     fn provisional_fake_only() -> Self {
         Self {
             kind: EvaluationEvidenceKind::ProvisionalDeterministicFakeOnly,
+            plan_basis: EvaluationPlanBasis::HandAuthored,
             real_provider_executed: false,
+            observed_isolated_repository_state: false,
+            requirement_four_comparability:
+                RequirementFourComparability::NotEstablishedDeferredToPhaseB,
             eligible_for_production_economics: false,
             eligible_to_justify_named_default: false,
+            eligible_for_production_or_default_decisions: false,
             notice: PROVISIONAL_FAKE_EVIDENCE_NOTICE.to_string(),
         }
     }
@@ -221,17 +281,21 @@ impl EvaluationEvidence {
         if self != &expected {
             return Err(invalid_results(
                 "evidence",
-                "phase-A results must carry the exact provisional fake-only evidence declaration",
+                "phase-A results must carry the exact provisional fake-only, hand-authored-plan, \
+                 Phase-B-deferred evidence declaration",
             ));
         }
         Ok(())
     }
 }
 
-/// Fields which must be identical across every repetition and profile.
+/// Declared inputs which must remain internally consistent across the synthetic fixture.
+///
+/// This is not an observed repository-state fingerprint and does not establish Issue #26
+/// requirement-4 comparability.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ComparabilityBinding {
+pub struct DeclaredInputsBinding {
     pub target: EvaluationTarget,
     pub repository_base_snapshot: String,
     pub limits: EvaluationLimits,
@@ -239,14 +303,15 @@ pub struct ComparabilityBinding {
     pub profiles: Vec<EvaluationProfile>,
 }
 
-/// Isolation evidence for one synthetic repetition.
+/// A unique identity for one synthetic repetition.
+///
+/// This identity does not claim that a repository or isolated workspace existed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct IsolatedRunState {
-    /// Unique workspace identity. Reusing one identity across repetitions fails validation.
-    pub isolation_id: String,
-    /// Equivalent starting-state fingerprint shared by every run.
-    pub starting_state_fingerprint: String,
+pub struct SyntheticRunIdentity {
+    /// Unique deterministic fixture identity. Reusing one identity across repetitions fails
+    /// validation.
+    pub fake_run_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -370,14 +435,14 @@ pub struct EvaluationMetrics {
     pub quality: QualityScore,
 }
 
-/// One independently isolated fake repetition.
+/// One synthetic fixture repetition with no repository-isolation claim.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationRepetitionResult {
     pub profile_id: String,
     pub repetition: u32,
-    pub comparability_digest: String,
-    pub isolated_state: IsolatedRunState,
+    pub declared_inputs_digest: String,
+    pub synthetic_run_identity: SyntheticRunIdentity,
     pub execution: RepetitionExecution,
     pub metrics: EvaluationMetrics,
 }
@@ -427,18 +492,18 @@ pub struct EvaluationResults {
     /// Stable seed used by the deterministic fake harness.
     pub fake_seed: u64,
     pub evidence: EvaluationEvidence,
-    pub comparability: ComparabilityBinding,
-    pub comparability_digest: String,
+    pub declared_inputs: DeclaredInputsBinding,
+    pub declared_inputs_digest: String,
     pub runs: Vec<EvaluationRepetitionResult>,
     pub profile_summaries: Vec<ProfileSummary>,
     pub pareto_frontier: Vec<ParetoPoint>,
 }
 
 impl EvaluationResults {
-    /// Revalidate isolation, run bindings, observations, aggregates, and the Pareto projection
-    /// against the manifest.
+    /// Revalidate declared-input consistency, synthetic observations, aggregates, and the Pareto
+    /// projection against the manifest.
     pub fn validate_against(&self, manifest: &EvaluationManifest) -> Result<(), EvaluationError> {
-        validate_run_comparability(manifest, self)
+        validate_results_against_manifest(manifest, self)
     }
 
     /// Build the strict aggregate projection stored beside committed run fixtures.
@@ -449,7 +514,7 @@ impl EvaluationResults {
             experiment_id: self.experiment_id.clone(),
             fake_seed: self.fake_seed,
             evidence: self.evidence.clone(),
-            comparability_digest: self.comparability_digest.clone(),
+            declared_inputs_digest: self.declared_inputs_digest.clone(),
             profile_summaries: self.profile_summaries.clone(),
             pareto_frontier: self.pareto_frontier.clone(),
         }
@@ -465,7 +530,7 @@ pub struct EvaluationSummary {
     pub experiment_id: String,
     pub fake_seed: u64,
     pub evidence: EvaluationEvidence,
-    pub comparability_digest: String,
+    pub declared_inputs_digest: String,
     pub profile_summaries: Vec<ProfileSummary>,
     pub pareto_frontier: Vec<ParetoPoint>,
 }
@@ -628,6 +693,12 @@ pub enum EvaluationError {
     #[error("invalid evaluation results field '{field}': {message}")]
     InvalidResults { field: String, message: String },
     #[error(
+        "supplied hand-authored plan bytes do not match the manifest binding; expected {expected}, observed {observed}"
+    )]
+    HandAuthoredPlanBindingMismatch { expected: String, observed: String },
+    #[error("invalid supplied hand-authored plan: {message}")]
+    InvalidHandAuthoredPlan { message: String },
+    #[error(
         "real-provider evaluation requires explicit allow_real_provider=true; no provider was run"
     )]
     RealProviderOptInRequired,
@@ -637,16 +708,22 @@ pub enum EvaluationError {
     RealProviderUnavailableInPhaseA,
     #[error("evaluation arithmetic overflow while aggregating {context}")]
     ArithmeticOverflow { context: String },
-    #[error("failed to serialize the comparability binding: {message}")]
-    ComparabilitySerialization { message: String },
+    #[error("failed to serialize the declared-input binding: {message}")]
+    DeclaredInputsSerialization { message: String },
 }
 
-/// Run a validated evaluation request. Phase A only permits deterministic fake execution.
+/// Run a manifest-bound evaluation request.
+///
+/// The supplied plan bytes are parsed, checked for the exact provisional declaration, and matched
+/// to the manifest digest before either fake or future real-provider dispatch can be selected.
+/// Phase A only permits deterministic fake execution.
 pub fn run_evaluation(
     manifest: &EvaluationManifest,
+    hand_authored_plan: &[u8],
     request: EvaluationRunRequest,
 ) -> Result<EvaluationResults, EvaluationError> {
     manifest.validate()?;
+    manifest.validate_hand_authored_plan(hand_authored_plan)?;
     match request.execution {
         EvaluationExecution::DeterministicFake => {
             run_deterministic_fake(manifest, request.fake_seed)
@@ -658,18 +735,14 @@ pub fn run_evaluation(
     }
 }
 
-/// Execute deterministic fake repetitions. This function never invokes a provider or a command.
-pub fn run_deterministic_fake(
+/// Execute deterministic fake repetitions after the public runner has bound the supplied plan.
+/// This function never invokes a provider or a command.
+fn run_deterministic_fake(
     manifest: &EvaluationManifest,
     seed: u64,
 ) -> Result<EvaluationResults, EvaluationError> {
-    manifest.validate()?;
-    let comparability = manifest.comparability_binding();
-    let comparability_digest = digest_serializable(&comparability)?;
-    let starting_state_fingerprint = stable_digest(&format!(
-        "phase-a-starting-state:{}:{comparability_digest}",
-        manifest.repository_base_snapshot
-    ));
+    let declared_inputs = manifest.declared_inputs_binding();
+    let declared_inputs_digest = digest_serializable(&declared_inputs)?;
     let mut runs = Vec::with_capacity(
         manifest
             .profiles
@@ -686,16 +759,15 @@ pub fn run_deterministic_fake(
             runs.push(EvaluationRepetitionResult {
                 profile_id: profile.id.clone(),
                 repetition,
-                comparability_digest: comparability_digest.clone(),
-                isolated_state: IsolatedRunState {
-                    isolation_id: format!(
+                declared_inputs_digest: declared_inputs_digest.clone(),
+                synthetic_run_identity: SyntheticRunIdentity {
+                    fake_run_id: format!(
                         "fake-{}-{}-{:016x}-{}",
                         sanitize_identifier(&manifest.experiment_id),
                         sanitize_identifier(&profile.id),
                         stable_hash(0x8ebc_6af0_9c88_c6e3, profile.id.as_bytes()),
                         repetition
                     ),
-                    starting_state_fingerprint: starting_state_fingerprint.clone(),
                 },
                 execution,
                 metrics,
@@ -710,19 +782,22 @@ pub fn run_deterministic_fake(
         experiment_id: manifest.experiment_id.clone(),
         fake_seed: seed,
         evidence: EvaluationEvidence::provisional_fake_only(),
-        comparability,
-        comparability_digest,
+        declared_inputs,
+        declared_inputs_digest,
         runs,
         profile_summaries,
         pareto_frontier,
     };
-    validate_run_comparability(manifest, &results)?;
+    validate_results_against_manifest(manifest, &results)?;
     Ok(results)
 }
 
-/// Check that every result starts from equivalent isolated state and is bound to the same target,
-/// snapshot, limits, and held-out validations.
-pub fn validate_run_comparability(
+/// Check that every synthetic result is internally consistent with the manifest's declared target,
+/// snapshot string, limits, and held-out validations.
+///
+/// This validates declared inputs only. It does not observe repository state or establish Issue
+/// #26 requirement-4 comparability, which remains deferred to Phase B.
+pub fn validate_results_against_manifest(
     manifest: &EvaluationManifest,
     results: &EvaluationResults,
 ) -> Result<(), EvaluationError> {
@@ -753,21 +828,21 @@ pub fn validate_run_comparability(
     }
     results.evidence.validate()?;
 
-    let expected_binding = manifest.comparability_binding();
-    if results.comparability != expected_binding {
+    let expected_binding = manifest.declared_inputs_binding();
+    if results.declared_inputs != expected_binding {
         return Err(invalid_results(
-            "comparability",
+            "declared_inputs",
             "target, base snapshot, limits, held-out validation, or full role/model profile set \
              differ from the manifest",
         ));
     }
     let expected_digest = digest_serializable(&expected_binding)?;
-    if results.comparability_digest != expected_digest {
+    if results.declared_inputs_digest != expected_digest {
         return Err(invalid_results(
-            "comparability_digest",
+            "declared_inputs_digest",
             format!(
-                "expected manifest binding digest '{expected_digest}', got '{}'",
-                results.comparability_digest
+                "expected declared-input digest '{expected_digest}', got '{}'",
+                results.declared_inputs_digest
             ),
         ));
     }
@@ -793,11 +868,7 @@ pub fn validate_run_comparability(
         .map(|profile| (profile.id.as_str(), profile))
         .collect::<BTreeMap<_, _>>();
     let mut seen_repetitions = BTreeSet::new();
-    let mut seen_isolation_ids = BTreeSet::new();
-    let expected_starting_state_fingerprint = stable_digest(&format!(
-        "phase-a-starting-state:{}:{expected_digest}",
-        manifest.repository_base_snapshot
-    ));
+    let mut seen_fake_run_ids = BTreeSet::new();
     for (run_index, run) in results.runs.iter().enumerate() {
         let field = |suffix: &str| format!("runs[{run_index}].{suffix}");
         let profile = profiles.get(run.profile_id.as_str()).ok_or_else(|| {
@@ -824,36 +895,23 @@ pub fn validate_run_comparability(
                 ),
             ));
         }
-        if run.comparability_digest != expected_digest {
+        if run.declared_inputs_digest != expected_digest {
             return Err(invalid_results(
-                field("comparability_digest"),
-                "run is not bound to the manifest target and constraints",
+                field("declared_inputs_digest"),
+                "synthetic run is not bound to the manifest's declared inputs",
             ));
         }
         require_result_nonempty(
-            &field("isolated_state.isolation_id"),
-            &run.isolated_state.isolation_id,
+            &field("synthetic_run_identity.fake_run_id"),
+            &run.synthetic_run_identity.fake_run_id,
         )?;
-        if !seen_isolation_ids.insert(run.isolated_state.isolation_id.as_str()) {
+        if !seen_fake_run_ids.insert(run.synthetic_run_identity.fake_run_id.as_str()) {
             return Err(invalid_results(
-                field("isolated_state.isolation_id"),
+                field("synthetic_run_identity.fake_run_id"),
                 format!(
-                    "isolation identity '{}' was reused; repetitions must use independent state",
-                    run.isolated_state.isolation_id
-                ),
-            ));
-        }
-        require_result_nonempty(
-            &field("isolated_state.starting_state_fingerprint"),
-            &run.isolated_state.starting_state_fingerprint,
-        )?;
-        if run.isolated_state.starting_state_fingerprint != expected_starting_state_fingerprint {
-            return Err(invalid_results(
-                field("isolated_state.starting_state_fingerprint"),
-                format!(
-                    "starting state is not equivalent to the bound repository snapshot; expected \
-                     '{expected_starting_state_fingerprint}', got '{}'",
-                    run.isolated_state.starting_state_fingerprint
+                    "synthetic run identity '{}' was reused; repetitions need distinct fixture \
+                     identities",
+                    run.synthetic_run_identity.fake_run_id
                 ),
             ));
         }
@@ -1160,7 +1218,7 @@ fn fake_metrics(
                 models: vec![model.to_string()],
                 usage: Some(usage),
                 cost_usd: Some(cost_usd),
-                observation: RoleUsageObservation::ProcessObserved,
+                observation: RoleUsageObservation::SyntheticFake,
                 unavailable_reason: None,
             },
         );
@@ -1289,10 +1347,10 @@ fn validate_metrics(
                 ),
             ));
         }
-        if report.observation != RoleUsageObservation::ProcessObserved {
+        if report.observation != RoleUsageObservation::SyntheticFake {
             return Err(invalid_results(
                 field(&format!("role_usage.{}.observation", role_name(*role))),
-                "fake fixture must contain an explicit per-role observation",
+                "fake fixture usage must be explicitly classified as synthetic_fake",
             ));
         }
         if report.unavailable_reason.is_some() {
@@ -1544,7 +1602,7 @@ fn summarize_profiles(
                     models: vec![selection.model.clone().unwrap_or_default()],
                     usage: Some(usage),
                     cost_usd: Some(cost_usd),
-                    observation: RoleUsageObservation::ProcessObserved,
+                    observation: RoleUsageObservation::SyntheticFake,
                     unavailable_reason: None,
                 },
             );
@@ -1705,7 +1763,7 @@ fn evaluation_summaries_equivalent(left: &EvaluationSummary, right: &EvaluationS
         && left.experiment_id == right.experiment_id
         && left.fake_seed == right.fake_seed
         && left.evidence == right.evidence
-        && left.comparability_digest == right.comparability_digest
+        && left.declared_inputs_digest == right.declared_inputs_digest
         && profile_summaries_equivalent(&left.profile_summaries, &right.profile_summaries)
         && pareto_frontiers_equivalent(&left.pareto_frontier, &right.pareto_frontier)
 }
@@ -1881,10 +1939,11 @@ fn profile_fingerprint(profile: &EvaluationProfile) -> String {
 }
 
 fn digest_serializable(value: &impl Serialize) -> Result<String, EvaluationError> {
-    let bytes =
-        serde_json::to_vec(value).map_err(|error| EvaluationError::ComparabilitySerialization {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        EvaluationError::DeclaredInputsSerialization {
             message: error.to_string(),
-        })?;
+        }
+    })?;
     Ok(stable_digest_bytes(&bytes))
 }
 
@@ -1999,18 +2058,28 @@ mod tests {
         }
     }
 
+    fn labelled_test_plan() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "evidence": EvaluationEvidence::provisional_fake_only(),
+            "task": "deterministic fake evaluation test plan",
+            "assignments": []
+        }))
+        .expect("serialize labelled test plan")
+    }
+
     fn manifest() -> EvaluationManifest {
+        let plan = labelled_test_plan();
         EvaluationManifest {
             version: EVALUATION_MANIFEST_SCHEMA_VERSION,
             experiment_id: "issue-26-phase-a".to_string(),
+            evidence: EvaluationEvidence::provisional_fake_only(),
             target: EvaluationTarget {
                 spec_or_goal_id: "issue-26".to_string(),
                 spec_or_goal_digest:
                     "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e1bca75d84e1400c421b321"
                         .to_string(),
-                hand_authored_plan_digest:
-                    "sha256:908a9d30f280908a3d153f21b3e401797f22cfb43a27c2a08fc2e76d715a8084"
-                        .to_string(),
+                hand_authored_plan_digest: format!("sha256:{}", sha256_hex(&plan)),
             },
             repository_base_snapshot: "a".repeat(40),
             limits: EvaluationLimits {
@@ -2041,6 +2110,20 @@ mod tests {
                 profile("all-frontier", "frontier-v1", "frontier-v1"),
             ],
         }
+    }
+
+    fn run_fake(
+        manifest: &EvaluationManifest,
+        seed: u64,
+    ) -> Result<EvaluationResults, EvaluationError> {
+        run_evaluation(
+            manifest,
+            &labelled_test_plan(),
+            EvaluationRunRequest {
+                fake_seed: seed,
+                ..EvaluationRunRequest::default()
+            },
+        )
     }
 
     fn committed_manifest() -> EvaluationManifest {
@@ -2089,8 +2172,15 @@ mod tests {
         results
             .validate_against(&manifest)
             .expect("committed results validate against their manifest");
-        let reproduced = run_deterministic_fake(&manifest, COMMITTED_FIXTURE_FAKE_SEED)
-            .expect("reproduce committed deterministic results");
+        let reproduced = run_evaluation(
+            &manifest,
+            FIXTURE_PLAN,
+            EvaluationRunRequest {
+                fake_seed: COMMITTED_FIXTURE_FAKE_SEED,
+                ..EvaluationRunRequest::default()
+            },
+        )
+        .expect("reproduce committed deterministic results");
         assert_eq!(
             FIXTURE_RESULTS,
             format!(
@@ -2115,12 +2205,12 @@ mod tests {
     }
 
     #[test]
-    fn committed_fixtures_repeat_from_unique_equivalent_isolated_state() {
+    fn committed_fixtures_use_unique_synthetic_ids_without_comparability_claims() {
         let manifest = committed_manifest();
         let results = committed_results();
         results
             .validate_against(&manifest)
-            .expect("fixture comparability validation");
+            .expect("fixture declared-input consistency validation");
 
         let expected_runs = manifest.profiles.len() * manifest.repetitions as usize;
         assert_eq!(results.runs.len(), expected_runs);
@@ -2137,22 +2227,21 @@ mod tests {
             );
         }
 
-        let isolation_ids = results
+        let fake_run_ids = results
             .runs
             .iter()
-            .map(|run| run.isolated_state.isolation_id.as_str())
+            .map(|run| run.synthetic_run_identity.fake_run_id.as_str())
             .collect::<BTreeSet<_>>();
-        let starting_states = results
-            .runs
-            .iter()
-            .map(|run| run.isolated_state.starting_state_fingerprint.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(isolation_ids.len(), expected_runs);
-        assert_eq!(starting_states.len(), 1);
+        assert_eq!(fake_run_ids.len(), expected_runs);
+        assert!(!results.evidence.observed_isolated_repository_state);
+        assert_eq!(
+            results.evidence.requirement_four_comparability,
+            RequirementFourComparability::NotEstablishedDeferredToPhaseB
+        );
         assert!(results
             .runs
             .iter()
-            .all(|run| run.comparability_digest == results.comparability_digest));
+            .all(|run| run.declared_inputs_digest == results.declared_inputs_digest));
     }
 
     #[test]
@@ -2170,11 +2259,11 @@ mod tests {
                 .find(|profile| profile.id == run.profile_id)
                 .expect("run profile is manifest-bound");
             assert_eq!(run.metrics.role_usage.len(), profile.role_models.len());
-            assert!(run
-                .metrics
-                .role_usage
-                .values()
-                .all(|report| report.usage.is_some() && report.cost_usd.is_some()));
+            assert!(run.metrics.role_usage.values().all(|report| {
+                report.usage.is_some()
+                    && report.cost_usd.is_some()
+                    && report.observation == RoleUsageObservation::SyntheticFake
+            }));
             assert_eq!(
                 run.metrics.held_out_validation.len(),
                 manifest.held_out_validation.len()
@@ -2187,6 +2276,12 @@ mod tests {
         }
 
         assert!(!results.pareto_frontier.is_empty());
+        assert!(results.profile_summaries.iter().all(|summary| {
+            summary
+                .aggregate_role_usage
+                .values()
+                .all(|report| report.observation == RoleUsageObservation::SyntheticFake)
+        }));
         assert!(results.pareto_frontier.iter().all(|point| {
             point.quality_basis_points.total > 0
                 && point.held_out_basis_points.total > 0
@@ -2211,16 +2306,32 @@ mod tests {
 
     #[test]
     fn committed_fixtures_are_schema_labeled_provisional_fake_only() {
+        let manifest = committed_manifest();
         let results = committed_results();
         let summary = committed_summary();
-        for evidence in [&results.evidence, &summary.evidence] {
+        let plan: Value = serde_json::from_slice(FIXTURE_PLAN).expect("parse committed plan");
+        let plan_evidence: EvaluationEvidence =
+            serde_json::from_value(plan["evidence"].clone()).expect("parse plan evidence");
+        for evidence in [
+            &manifest.evidence,
+            &plan_evidence,
+            &results.evidence,
+            &summary.evidence,
+        ] {
             assert_eq!(
                 evidence.kind,
                 EvaluationEvidenceKind::ProvisionalDeterministicFakeOnly
             );
+            assert_eq!(evidence.plan_basis, EvaluationPlanBasis::HandAuthored);
             assert!(!evidence.real_provider_executed);
+            assert!(!evidence.observed_isolated_repository_state);
+            assert_eq!(
+                evidence.requirement_four_comparability,
+                RequirementFourComparability::NotEstablishedDeferredToPhaseB
+            );
             assert!(!evidence.eligible_for_production_economics);
             assert!(!evidence.eligible_to_justify_named_default);
+            assert!(!evidence.eligible_for_production_or_default_decisions);
             assert_eq!(evidence.notice, PROVISIONAL_FAKE_EVIDENCE_NOTICE);
         }
     }
@@ -2233,8 +2344,15 @@ mod tests {
         manifest
             .validate_hand_authored_plan(FIXTURE_PLAN)
             .expect("manifest binds committed plan");
-        let results = run_deterministic_fake(&manifest, COMMITTED_FIXTURE_FAKE_SEED)
-            .expect("generate deterministic fixture results");
+        let results = run_evaluation(
+            &manifest,
+            FIXTURE_PLAN,
+            EvaluationRunRequest {
+                fake_seed: COMMITTED_FIXTURE_FAKE_SEED,
+                ..EvaluationRunRequest::default()
+            },
+        )
+        .expect("generate deterministic fixture results");
         let summary = results.summary();
         let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/model_mix_evaluation");
@@ -2264,8 +2382,11 @@ mod tests {
             fake_seed: 42,
             ..EvaluationRunRequest::default()
         };
-        let first = run_evaluation(&manifest, request).expect("first deterministic fake run");
-        let second = run_evaluation(&manifest, request).expect("second deterministic fake run");
+        let plan = labelled_test_plan();
+        let first =
+            run_evaluation(&manifest, &plan, request).expect("first deterministic fake run");
+        let second =
+            run_evaluation(&manifest, &plan, request).expect("second deterministic fake run");
 
         assert_eq!(first, second);
         assert_eq!(
@@ -2273,24 +2394,19 @@ mod tests {
             EvaluationEvidenceKind::ProvisionalDeterministicFakeOnly
         );
         assert!(!first.evidence.real_provider_executed);
+        assert!(!first.evidence.observed_isolated_repository_state);
         assert!(!first.evidence.eligible_for_production_economics);
         assert!(!first.evidence.eligible_to_justify_named_default);
         assert_eq!(first.runs.len(), 6);
         assert_eq!(first.profile_summaries.len(), 2);
         assert!(!first.pareto_frontier.is_empty());
 
-        let isolation_ids = first
+        let fake_run_ids = first
             .runs
             .iter()
-            .map(|run| run.isolated_state.isolation_id.as_str())
+            .map(|run| run.synthetic_run_identity.fake_run_id.as_str())
             .collect::<BTreeSet<_>>();
-        let state_fingerprints = first
-            .runs
-            .iter()
-            .map(|run| run.isolated_state.starting_state_fingerprint.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(isolation_ids.len(), first.runs.len());
-        assert_eq!(state_fingerprints.len(), 1);
+        assert_eq!(fake_run_ids.len(), first.runs.len());
         for run in &first.runs {
             assert_eq!(run.metrics.role_usage.len(), 2);
             assert!(run
@@ -2304,7 +2420,7 @@ mod tests {
         }
         first
             .validate_against(&manifest)
-            .expect("generated results remain comparable");
+            .expect("generated results remain consistent with declared inputs");
     }
 
     #[test]
@@ -2314,7 +2430,7 @@ mod tests {
             wall_time_seconds: 1,
             max_dispatches: 1,
         };
-        let results = run_deterministic_fake(&manifest, 31).expect("bounded fake results");
+        let results = run_fake(&manifest, 31).expect("bounded fake results");
 
         assert_eq!(
             results.runs.len(),
@@ -2373,7 +2489,7 @@ mod tests {
     fn execution_validation_enforces_limits_and_bounded_outcome_evidence() {
         let manifest = manifest();
 
-        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let mut results = run_fake(&manifest, 37).expect("fake results");
         results.runs[0].execution.observed_dispatch_count = manifest.limits.max_dispatches + 1;
         let error = results
             .validate_against(&manifest)
@@ -2381,7 +2497,7 @@ mod tests {
         assert!(error.to_string().contains("exceeds manifest limit"));
         assert!(error.to_string().contains("observed_dispatch_count"));
 
-        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let mut results = run_fake(&manifest, 37).expect("fake results");
         results.runs[0].metrics.wall_time_ms = manifest.limits.wall_time_seconds * 1_000 + 1;
         let error = results
             .validate_against(&manifest)
@@ -2389,7 +2505,7 @@ mod tests {
         assert!(error.to_string().contains("exceeds manifest limit"));
         assert!(error.to_string().contains("wall_time_ms"));
 
-        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let mut results = run_fake(&manifest, 37).expect("fake results");
         let failed = results
             .runs
             .iter_mut()
@@ -2403,7 +2519,7 @@ mod tests {
             .to_string()
             .contains("required when outcome is failure"));
 
-        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let mut results = run_fake(&manifest, 37).expect("fake results");
         let successful = results
             .runs
             .iter_mut()
@@ -2418,7 +2534,7 @@ mod tests {
             .expect_err("success cannot carry error evidence");
         assert!(error.to_string().contains("must be absent"));
 
-        let mut results = run_deterministic_fake(&manifest, 37).expect("fake results");
+        let mut results = run_fake(&manifest, 37).expect("fake results");
         let timed_out = results
             .runs
             .iter_mut()
@@ -2441,7 +2557,7 @@ mod tests {
     #[test]
     fn precise_profile_means_retain_non_divisible_totals() {
         let manifest = manifest();
-        let mut results = run_deterministic_fake(&manifest, 41).expect("fake results");
+        let mut results = run_fake(&manifest, 41).expect("fake results");
         let profile_id = manifest.profiles[0].id.as_str();
         for (index, run) in results
             .runs
@@ -2496,7 +2612,7 @@ mod tests {
             manifest
         );
 
-        let results = run_deterministic_fake(&manifest, 7).expect("fake results");
+        let results = run_fake(&manifest, 7).expect("fake results");
         let results_json = serde_json::to_value(&results).expect("serialize results");
         assert_eq!(
             results_json["version"],
@@ -2518,6 +2634,13 @@ mod tests {
             .expect_err("unknown manifest fields fail closed");
         assert!(error.to_string().contains("unknown field"));
 
+        let mut invalid_manifest_evidence =
+            serde_json::to_value(&manifest).expect("serialize manifest");
+        invalid_manifest_evidence["evidence"]["unversioned_extension"] = json!(true);
+        let error = serde_json::from_value::<EvaluationManifest>(invalid_manifest_evidence)
+            .expect_err("unknown manifest evidence fields fail closed");
+        assert!(error.to_string().contains("unknown field"));
+
         let mut invalid_selection = serde_json::to_value(&manifest).expect("serialize manifest");
         invalid_selection["profiles"][0]["role_models"]["worker"]["unexpected_selection_field"] =
             json!(true);
@@ -2525,7 +2648,7 @@ mod tests {
             .expect_err("unknown RoleModelSelection fields fail closed");
         assert!(error.to_string().contains("unknown field"));
 
-        let results = run_deterministic_fake(&manifest, 7).expect("fake results");
+        let results = run_fake(&manifest, 7).expect("fake results");
         let mut invalid_total_usage = serde_json::to_value(&results).expect("serialize results");
         invalid_total_usage["runs"][0]["metrics"]["total_usage"]["unexpected_usage_field"] =
             json!(true);
@@ -2560,10 +2683,62 @@ mod tests {
     }
 
     #[test]
+    fn public_runner_binds_and_validates_supplied_plan_bytes_before_dispatch() {
+        let manifest = manifest();
+        for request in [
+            EvaluationRunRequest::default(),
+            EvaluationRunRequest {
+                execution: EvaluationExecution::RealProvider,
+                allow_real_provider: true,
+                fake_seed: 0,
+            },
+        ] {
+            let mismatch = run_evaluation(&manifest, br#"{"evidence":{}}"#, request)
+                .expect_err("mismatched bytes must fail before execution selection");
+            assert!(matches!(
+                mismatch,
+                EvaluationError::HandAuthoredPlanBindingMismatch { .. }
+            ));
+        }
+
+        let invalid_json = b"not-json";
+        let mut invalid_manifest = manifest.clone();
+        invalid_manifest.target.hand_authored_plan_digest =
+            format!("sha256:{}", sha256_hex(invalid_json));
+        let invalid = run_evaluation(
+            &invalid_manifest,
+            invalid_json,
+            EvaluationRunRequest::default(),
+        )
+        .expect_err("digest-matched invalid JSON must fail before fake execution");
+        assert!(matches!(
+            invalid,
+            EvaluationError::InvalidHandAuthoredPlan { .. }
+        ));
+
+        let unlabelled = br#"{"version":1,"task":"unlabelled"}"#;
+        let mut unlabelled_manifest = manifest;
+        unlabelled_manifest.target.hand_authored_plan_digest =
+            format!("sha256:{}", sha256_hex(unlabelled));
+        let unlabelled_error = run_evaluation(
+            &unlabelled_manifest,
+            unlabelled,
+            EvaluationRunRequest::default(),
+        )
+        .expect_err("digest-matched unlabelled JSON must fail before fake execution");
+        assert!(matches!(
+            unlabelled_error,
+            EvaluationError::InvalidHandAuthoredPlan { .. }
+        ));
+    }
+
+    #[test]
     fn real_provider_execution_has_opt_in_and_phase_a_refusal_gates() {
         let manifest = manifest();
+        let plan = labelled_test_plan();
         let without_opt_in = run_evaluation(
             &manifest,
+            &plan,
             EvaluationRunRequest {
                 execution: EvaluationExecution::RealProvider,
                 allow_real_provider: false,
@@ -2577,6 +2752,7 @@ mod tests {
 
         let explicitly_opted_in = run_evaluation(
             &manifest,
+            &plan,
             EvaluationRunRequest {
                 execution: EvaluationExecution::RealProvider,
                 allow_real_provider: true,
@@ -2590,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_hidden_or_noncomparable_profile_inputs() {
+    fn manifest_rejects_hidden_or_inconsistent_profile_inputs() {
         let mut candidate = manifest();
         candidate.repository_base_snapshot = "main".to_string();
         let error = candidate
@@ -2631,47 +2807,26 @@ mod tests {
     }
 
     #[test]
-    fn comparability_validation_rejects_reused_or_changed_state() {
+    fn declared_input_validation_rejects_reused_ids_or_changed_bindings() {
         let manifest = manifest();
-        let mut results = run_deterministic_fake(&manifest, 11).expect("fake results");
-        results.runs[1].isolated_state.isolation_id =
-            results.runs[0].isolated_state.isolation_id.clone();
+        let mut results = run_fake(&manifest, 11).expect("fake results");
+        results.runs[1].synthetic_run_identity.fake_run_id =
+            results.runs[0].synthetic_run_identity.fake_run_id.clone();
         let error = results
             .validate_against(&manifest)
-            .expect_err("an isolation identity cannot be reused");
+            .expect_err("a synthetic run identity cannot be reused");
         assert!(error.to_string().contains("was reused"));
 
-        let mut results = run_deterministic_fake(&manifest, 11).expect("fake results");
-        results.runs[1]
-            .isolated_state
-            .starting_state_fingerprint
-            .push_str("-different");
+        let mut results = run_fake(&manifest, 11).expect("fake results");
+        results.declared_inputs.limits.max_dispatches += 1;
         let error = results
             .validate_against(&manifest)
-            .expect_err("starting state must be equivalent");
-        assert!(error
-            .to_string()
-            .contains("starting state is not equivalent"));
-
-        let mut results = run_deterministic_fake(&manifest, 11).expect("fake results");
-        for run in &mut results.runs {
-            run.isolated_state.starting_state_fingerprint = "same-but-unbound".to_string();
-        }
-        let error = results
-            .validate_against(&manifest)
-            .expect_err("uniform but unbound state is not equivalent to the base snapshot");
-        assert!(error.to_string().contains("bound repository snapshot"));
-
-        let mut results = run_deterministic_fake(&manifest, 11).expect("fake results");
-        results.comparability.limits.max_dispatches += 1;
-        let error = results
-            .validate_against(&manifest)
-            .expect_err("changed dispatch limits break comparability");
+            .expect_err("changed dispatch limits break declared-input consistency");
         assert!(error
             .to_string()
             .contains("full role/model profile set differ"));
 
-        let results = run_deterministic_fake(&manifest, 11).expect("fake results");
+        let results = run_fake(&manifest, 11).expect("fake results");
         let mut changed_manifest = manifest.clone();
         changed_manifest.profiles[0]
             .role_models
@@ -2692,7 +2847,7 @@ mod tests {
     #[test]
     fn metric_validation_requires_complete_accounting_and_quality_evidence() {
         let manifest = manifest();
-        let mut results = run_deterministic_fake(&manifest, 19).expect("fake results");
+        let mut results = run_fake(&manifest, 19).expect("fake results");
         results.runs[0]
             .metrics
             .role_usage
@@ -2704,14 +2859,26 @@ mod tests {
             .expect_err("per-role cost is required");
         assert!(error.to_string().contains("per-role cost is required"));
 
-        let mut results = run_deterministic_fake(&manifest, 19).expect("fake results");
+        let mut results = run_fake(&manifest, 19).expect("fake results");
+        results.runs[0]
+            .metrics
+            .role_usage
+            .get_mut(&AgentRole::Worker)
+            .expect("worker usage")
+            .observation = RoleUsageObservation::ProcessObserved;
+        let error = results
+            .validate_against(&manifest)
+            .expect_err("synthetic usage cannot be labelled process-observed");
+        assert!(error.to_string().contains("synthetic_fake"));
+
+        let mut results = run_fake(&manifest, 19).expect("fake results");
         results.runs[0].metrics.review.anti_shortcut.checks_run = 0;
         let error = results
             .validate_against(&manifest)
             .expect_err("anti-shortcut evidence cannot be omitted");
         assert!(error.to_string().contains("must be greater than zero"));
 
-        let mut results = run_deterministic_fake(&manifest, 19).expect("fake results");
+        let mut results = run_fake(&manifest, 19).expect("fake results");
         results.runs[0].metrics.total_usage.total_tokens += 1;
         let error = results
             .validate_against(&manifest)
@@ -2755,7 +2922,7 @@ mod tests {
         assert_eq!(full_quality.overall_basis_points, BASIS_POINTS);
         assert_eq!(shortcut_quality.overall_basis_points, 7_500);
 
-        let results = run_deterministic_fake(&manifest(), 23).expect("fake results");
+        let results = run_fake(&manifest(), 23).expect("fake results");
         let mut high_quality = results.profile_summaries[0].clone();
         high_quality.mean_cost_usd = 1.0;
         high_quality.mean_loc_added = PreciseMean {

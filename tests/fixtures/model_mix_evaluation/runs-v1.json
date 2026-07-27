@@ -5,16 +5,20 @@
   "fake_seed": 26,
   "evidence": {
     "kind": "provisional_deterministic_fake_only",
+    "plan_basis": "hand_authored",
     "real_provider_executed": false,
+    "observed_isolated_repository_state": false,
+    "requirement_four_comparability": "not_established_deferred_to_phase_b",
     "eligible_for_production_economics": false,
     "eligible_to_justify_named_default": false,
-    "notice": "deterministic fake-provider evidence only; not eligible to justify production model economics or a named default"
+    "eligible_for_production_or_default_decisions": false,
+    "notice": "provisional deterministic fake evidence over a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 comparability is not established and is deferred to Phase B; ineligible for production or default decisions"
   },
-  "comparability": {
+  "declared_inputs": {
     "target": {
       "spec_or_goal_id": "readme-model-mix-note-v1",
       "spec_or_goal_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
-      "hand_authored_plan_digest": "sha256:97287ddff8f50f671fc95e2930277e4279580eeba7ac9cb4a86e7043fbe6eb9b"
+      "hand_authored_plan_digest": "sha256:33aa49c0f72bd7e8b8be5ee706bdac3840e9807c9d789821033f7d23a47378ce"
     },
     "repository_base_snapshot": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
     "limits": {
@@ -126,15 +130,14 @@
       }
     ]
   },
-  "comparability_digest": "fnv1a64:e61ad897c605b51a",
+  "declared_inputs_digest": "fnv1a64:e7da008318253760",
   "runs": [
     {
       "profile_id": "frontier-all-v1",
       "repetition": 0,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-0",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-0"
       },
       "execution": {
         "observed_dispatch_count": 1,
@@ -153,7 +156,7 @@
               "total_tokens": 1365
             },
             "cost_usd": 0.00595763,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -165,7 +168,7 @@
               "total_tokens": 2415
             },
             "cost_usd": 0.011533269999999998,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -177,7 +180,7 @@
               "total_tokens": 1190
             },
             "cost_usd": 0.00610459,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -189,7 +192,7 @@
               "total_tokens": 1912
             },
             "cost_usd": 0.009187840000000001,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -246,10 +249,9 @@
     {
       "profile_id": "frontier-all-v1",
       "repetition": 1,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-1",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-1"
       },
       "execution": {
         "observed_dispatch_count": 1,
@@ -271,7 +273,7 @@
               "total_tokens": 1550
             },
             "cost_usd": 0.007521429999999999,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -283,7 +285,7 @@
               "total_tokens": 1443
             },
             "cost_usd": 0.0068566700000000005,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -295,7 +297,7 @@
               "total_tokens": 1975
             },
             "cost_usd": 0.01077278,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -307,7 +309,7 @@
               "total_tokens": 2831
             },
             "cost_usd": 0.01374908,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -364,10 +366,9 @@
     {
       "profile_id": "frontier-all-v1",
       "repetition": 2,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-2",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-2"
       },
       "execution": {
         "observed_dispatch_count": 2,
@@ -389,7 +390,7 @@
               "total_tokens": 1033
             },
             "cost_usd": 0.0052223,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -401,7 +402,7 @@
               "total_tokens": 2170
             },
             "cost_usd": 0.01022347,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -413,7 +414,7 @@
               "total_tokens": 2917
             },
             "cost_usd": 0.014327689999999999,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -425,7 +426,7 @@
               "total_tokens": 1927
             },
             "cost_usd": 0.008513610000000001,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -482,10 +483,9 @@
     {
       "profile_id": "hybrid-frontier-economy-v1",
       "repetition": 0,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-0",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-0"
       },
       "execution": {
         "observed_dispatch_count": 1,
@@ -504,7 +504,7 @@
               "total_tokens": 2231
             },
             "cost_usd": 0.01103758,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -516,7 +516,7 @@
               "total_tokens": 1383
             },
             "cost_usd": 0.01400979,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -528,7 +528,7 @@
               "total_tokens": 1806
             },
             "cost_usd": 0.021603380000000002,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -540,7 +540,7 @@
               "total_tokens": 1675
             },
             "cost_usd": 0.018453220000000003,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -597,10 +597,9 @@
     {
       "profile_id": "hybrid-frontier-economy-v1",
       "repetition": 1,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-1",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-1"
       },
       "execution": {
         "observed_dispatch_count": 1,
@@ -622,7 +621,7 @@
               "total_tokens": 1696
             },
             "cost_usd": 0.0066557,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -634,7 +633,7 @@
               "total_tokens": 1599
             },
             "cost_usd": 0.01341768,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -646,7 +645,7 @@
               "total_tokens": 1635
             },
             "cost_usd": 0.01468265,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -658,7 +657,7 @@
               "total_tokens": 1542
             },
             "cost_usd": 0.012745860000000001,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -715,10 +714,9 @@
     {
       "profile_id": "hybrid-frontier-economy-v1",
       "repetition": 2,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-2",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-2"
       },
       "execution": {
         "observed_dispatch_count": 4,
@@ -740,7 +738,7 @@
               "total_tokens": 1463
             },
             "cost_usd": 0.007173969999999999,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -752,7 +750,7 @@
               "total_tokens": 2059
             },
             "cost_usd": 0.01868677,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -764,7 +762,7 @@
               "total_tokens": 2043
             },
             "cost_usd": 0.01952789,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -776,7 +774,7 @@
               "total_tokens": 1679
             },
             "cost_usd": 0.015540259999999998,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -833,10 +831,9 @@
     {
       "profile_id": "balanced-all-v1",
       "repetition": 0,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-0",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-0"
       },
       "execution": {
         "observed_dispatch_count": 2,
@@ -855,7 +852,7 @@
               "total_tokens": 1436
             },
             "cost_usd": 0.014233879999999999,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -867,7 +864,7 @@
               "total_tokens": 2188
             },
             "cost_usd": 0.02036443,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -879,7 +876,7 @@
               "total_tokens": 1499
             },
             "cost_usd": 0.01727147,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -891,7 +888,7 @@
               "total_tokens": 2179
             },
             "cost_usd": 0.023032359999999998,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -953,10 +950,9 @@
     {
       "profile_id": "balanced-all-v1",
       "repetition": 1,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-1",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-1"
       },
       "execution": {
         "observed_dispatch_count": 1,
@@ -978,7 +974,7 @@
               "total_tokens": 1996
             },
             "cost_usd": 0.022218429999999997,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -990,7 +986,7 @@
               "total_tokens": 2098
             },
             "cost_usd": 0.015317709999999998,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -1002,7 +998,7 @@
               "total_tokens": 2237
             },
             "cost_usd": 0.017872669999999997,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -1014,7 +1010,7 @@
               "total_tokens": 2113
             },
             "cost_usd": 0.01354957,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -1076,10 +1072,9 @@
     {
       "profile_id": "balanced-all-v1",
       "repetition": 2,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-2",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-2"
       },
       "execution": {
         "observed_dispatch_count": 3,
@@ -1101,7 +1096,7 @@
               "total_tokens": 2908
             },
             "cost_usd": 0.02738023,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -1113,7 +1108,7 @@
               "total_tokens": 2059
             },
             "cost_usd": 0.0137218,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -1125,7 +1120,7 @@
               "total_tokens": 1426
             },
             "cost_usd": 0.015652359999999997,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -1137,7 +1132,7 @@
               "total_tokens": 2539
             },
             "cost_usd": 0.023677449999999996,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -1199,10 +1194,9 @@
     {
       "profile_id": "economy-all-v1",
       "repetition": 0,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-0",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-0"
       },
       "execution": {
         "observed_dispatch_count": 2,
@@ -1221,7 +1215,7 @@
               "total_tokens": 2129
             },
             "cost_usd": 0.019156470000000002,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -1233,7 +1227,7 @@
               "total_tokens": 2399
             },
             "cost_usd": 0.02335997,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -1245,7 +1239,7 @@
               "total_tokens": 2003
             },
             "cost_usd": 0.01767549,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -1257,7 +1251,7 @@
               "total_tokens": 1473
             },
             "cost_usd": 0.01703539,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -1319,10 +1313,9 @@
     {
       "profile_id": "economy-all-v1",
       "repetition": 1,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-1",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-1"
       },
       "execution": {
         "observed_dispatch_count": 2,
@@ -1344,7 +1337,7 @@
               "total_tokens": 2259
             },
             "cost_usd": 0.02152957,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -1356,7 +1349,7 @@
               "total_tokens": 2172
             },
             "cost_usd": 0.02196936,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -1368,7 +1361,7 @@
               "total_tokens": 2211
             },
             "cost_usd": 0.02078813,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -1380,7 +1373,7 @@
               "total_tokens": 2467
             },
             "cost_usd": 0.026042810000000003,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -1442,10 +1435,9 @@
     {
       "profile_id": "economy-all-v1",
       "repetition": 2,
-      "comparability_digest": "fnv1a64:e61ad897c605b51a",
-      "isolated_state": {
-        "isolation_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-2",
-        "starting_state_fingerprint": "fnv1a64:0e6b58a9243ae57f"
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-2"
       },
       "execution": {
         "observed_dispatch_count": 3,
@@ -1467,7 +1459,7 @@
               "total_tokens": 1394
             },
             "cost_usd": 0.01228462,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "child_orchestrator": {
             "models": [
@@ -1479,7 +1471,7 @@
               "total_tokens": 2107
             },
             "cost_usd": 0.023386610000000002,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "worker": {
             "models": [
@@ -1491,7 +1483,7 @@
               "total_tokens": 2295
             },
             "cost_usd": 0.018513650000000003,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           },
           "auditor": {
             "models": [
@@ -1503,7 +1495,7 @@
               "total_tokens": 2227
             },
             "cost_usd": 0.019120810000000002,
-            "observation": "process_observed"
+            "observation": "synthetic_fake"
           }
         },
         "total_usage": {
@@ -1578,7 +1570,7 @@
             "total_tokens": 3948
           },
           "cost_usd": 0.01870136,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -1590,7 +1582,7 @@
             "total_tokens": 6028
           },
           "cost_usd": 0.02861341,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -1602,7 +1594,7 @@
             "total_tokens": 6082
           },
           "cost_usd": 0.03120506,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -1614,7 +1606,7 @@
             "total_tokens": 6670
           },
           "cost_usd": 0.031450530000000004,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {
@@ -1682,7 +1674,7 @@
             "total_tokens": 5390
           },
           "cost_usd": 0.024867249999999997,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -1694,7 +1686,7 @@
             "total_tokens": 5041
           },
           "cost_usd": 0.04611424,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -1706,7 +1698,7 @@
             "total_tokens": 5484
           },
           "cost_usd": 0.05581392,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -1718,7 +1710,7 @@
             "total_tokens": 4896
           },
           "cost_usd": 0.046739340000000004,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {
@@ -1786,7 +1778,7 @@
             "total_tokens": 6340
           },
           "cost_usd": 0.06383254,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -1798,7 +1790,7 @@
             "total_tokens": 6345
           },
           "cost_usd": 0.04940394,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -1810,7 +1802,7 @@
             "total_tokens": 5162
           },
           "cost_usd": 0.050796499999999994,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -1822,7 +1814,7 @@
             "total_tokens": 6831
           },
           "cost_usd": 0.060259379999999994,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {
@@ -1890,7 +1882,7 @@
             "total_tokens": 5782
           },
           "cost_usd": 0.05297066,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -1902,7 +1894,7 @@
             "total_tokens": 6678
           },
           "cost_usd": 0.06871594,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -1914,7 +1906,7 @@
             "total_tokens": 6509
           },
           "cost_usd": 0.056977269999999997,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -1926,7 +1918,7 @@
             "total_tokens": 6167
           },
           "cost_usd": 0.062199010000000006,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {

@@ -5,12 +5,16 @@
   "fake_seed": 26,
   "evidence": {
     "kind": "provisional_deterministic_fake_only",
+    "plan_basis": "hand_authored",
     "real_provider_executed": false,
+    "observed_isolated_repository_state": false,
+    "requirement_four_comparability": "not_established_deferred_to_phase_b",
     "eligible_for_production_economics": false,
     "eligible_to_justify_named_default": false,
-    "notice": "deterministic fake-provider evidence only; not eligible to justify production model economics or a named default"
+    "eligible_for_production_or_default_decisions": false,
+    "notice": "provisional deterministic fake evidence over a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 comparability is not established and is deferred to Phase B; ineligible for production or default decisions"
   },
-  "comparability_digest": "fnv1a64:e61ad897c605b51a",
+  "declared_inputs_digest": "fnv1a64:e7da008318253760",
   "profile_summaries": [
     {
       "profile_id": "frontier-all-v1",
@@ -26,7 +30,7 @@
             "total_tokens": 3948
           },
           "cost_usd": 0.01870136,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -38,7 +42,7 @@
             "total_tokens": 6028
           },
           "cost_usd": 0.02861341,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -50,7 +54,7 @@
             "total_tokens": 6082
           },
           "cost_usd": 0.03120506,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -62,7 +66,7 @@
             "total_tokens": 6670
           },
           "cost_usd": 0.031450530000000004,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {
@@ -130,7 +134,7 @@
             "total_tokens": 5390
           },
           "cost_usd": 0.024867249999999997,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -142,7 +146,7 @@
             "total_tokens": 5041
           },
           "cost_usd": 0.04611424,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -154,7 +158,7 @@
             "total_tokens": 5484
           },
           "cost_usd": 0.05581392,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -166,7 +170,7 @@
             "total_tokens": 4896
           },
           "cost_usd": 0.046739340000000004,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {
@@ -234,7 +238,7 @@
             "total_tokens": 6340
           },
           "cost_usd": 0.06383254,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -246,7 +250,7 @@
             "total_tokens": 6345
           },
           "cost_usd": 0.04940394,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -258,7 +262,7 @@
             "total_tokens": 5162
           },
           "cost_usd": 0.050796499999999994,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -270,7 +274,7 @@
             "total_tokens": 6831
           },
           "cost_usd": 0.060259379999999994,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {
@@ -338,7 +342,7 @@
             "total_tokens": 5782
           },
           "cost_usd": 0.05297066,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "child_orchestrator": {
           "models": [
@@ -350,7 +354,7 @@
             "total_tokens": 6678
           },
           "cost_usd": 0.06871594,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "worker": {
           "models": [
@@ -362,7 +366,7 @@
             "total_tokens": 6509
           },
           "cost_usd": 0.056977269999999997,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         },
         "auditor": {
           "models": [
@@ -374,7 +378,7 @@
             "total_tokens": 6167
           },
           "cost_usd": 0.062199010000000006,
-          "observation": "process_observed"
+          "observation": "synthetic_fake"
         }
       },
       "aggregate_usage": {
