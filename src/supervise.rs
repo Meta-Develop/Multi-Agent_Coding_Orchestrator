@@ -4,8 +4,9 @@ use crate::{
         ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory, RunArtifactFamily,
     },
     external_agent::{
-        codex_usage_from_jsonl, run_external_agent_cancellable, ExternalAgentCommand,
-        ExternalAgentRun, ExternalProgramTrust, SandboxDenialEvidence,
+        codex_usage_from_jsonl, run_external_agent_cancellable_reviewed, ExternalAgentCommand,
+        ExternalAgentRun, ExternalPreActionReviewRuntime, ExternalProgramTrust,
+        PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -25,6 +26,7 @@ use crate::{
     },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
+    pre_action_review::{RepoPathRule, ReviewContext, ReviewMetricSnapshot},
     process_runner::{
         read_bounded_regular_file_nofollow, run_process, trusted_system_executable,
         EnvironmentMode, HostProcessCapacity, ProcessCancellation, ProcessSpec,
@@ -133,8 +135,14 @@ const POLICY_WORKTREE_CONTROL_FILES: &[&str] = &[
     "CLAUDE.md",
 ];
 
-type CancellableExternalRunner<'a> =
-    dyn Fn(&ExternalAgentCommand, &ProcessCancellation) -> ExternalAgentRun + Send + Sync + 'a;
+type CancellableExternalRunner<'a> = dyn for<'review> Fn(
+        &ExternalAgentCommand,
+        &ProcessCancellation,
+        Option<ExternalPreActionReviewRuntime<'review>>,
+    ) -> ExternalAgentRun
+    + Send
+    + Sync
+    + 'a;
 
 #[derive(Debug, Clone)]
 pub struct SupervisorRunOptions {
@@ -625,6 +633,8 @@ pub struct SupervisorFinalReport {
     pub sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_denials: Vec<GateDenial>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_action_review_metrics: Vec<ReviewMetricSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_correction_outcomes: Vec<GateCorrectionOutcomeRecord>,
     #[serde(default, serialize_with = "serialize_paths")]
@@ -1495,7 +1505,7 @@ pub fn run_supervisor_plan_file_with_max_concurrent_children(
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
 ) -> Result<SupervisorFinalReport> {
-    let external_runner = run_external_agent_cancellable;
+    let external_runner = run_external_agent_cancellable_reviewed;
     run_supervisor_plan_file_with_runner_and_max_concurrent_children(
         options,
         max_concurrent_children,
@@ -1512,7 +1522,7 @@ fn run_supervisor_plan_file_with_runner(
     run_supervisor_plan_file_with_runner_and_max_concurrent_children(
         options,
         1,
-        &|command, _cancellation| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -1604,6 +1614,7 @@ pub fn collect_supervisor_run(
         commands_run: Vec::new(),
         sandbox_denials: Vec::new(),
         gate_denials: Vec::new(),
+        pre_action_review_metrics: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         files_changed: Vec::new(),
         validation_results: Vec::new(),
@@ -2019,6 +2030,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         commands_run: vec![command],
         sandbox_denials: Vec::new(),
         gate_denials: Vec::new(),
+        pre_action_review_metrics: Vec::new(),
         gate_correction_outcomes: Vec::new(),
         files_changed,
         validation_results: vec![validation],
@@ -3158,6 +3170,38 @@ fn configure_writable_child_command(
     Ok(command)
 }
 
+fn pre_action_review_context(
+    options: &SupervisorRunOptions,
+    assignment: &OrchestratorAssignment,
+    worktree: &Path,
+) -> Result<ReviewContext> {
+    let claims = assignment
+        .assigned_paths
+        .iter()
+        .map(|path| {
+            if worktree.join(path).is_dir() {
+                RepoPathRule::subtree(path)
+            } else {
+                RepoPathRule::exact(path)
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to bind pre-action review claims")?;
+    let intent = assignment
+        .task
+        .as_deref()
+        .or(assignment.notes.as_deref())
+        .unwrap_or(&assignment.id);
+    ReviewContext::new(
+        options.run_id.as_str(),
+        &assignment.id,
+        intent,
+        claims,
+        std::iter::empty::<RepoPathRule>(),
+    )
+    .context("failed to construct pre-action review context")
+}
+
 fn configure_read_only_auditor_command(
     command: ExternalAgentCommand,
 ) -> Result<ExternalAgentCommand> {
@@ -3414,6 +3458,35 @@ fn record_gate_correction_event_strict(
     Ok(())
 }
 
+fn record_pre_action_event_strict(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    node: &str,
+    parent: Option<&str>,
+    record: &PreActionJournalRecord,
+) -> Result<()> {
+    let active_journal = journal
+        .as_mut()
+        .context("strict pre-action review requires an orchestration event journal")?;
+    if !active_journal.is_enabled() {
+        bail!("strict pre-action review journal is disabled");
+    }
+    active_journal
+        .append(
+            writer,
+            node,
+            parent,
+            OrchestrationRole::Orchestrator,
+            OrchestrationEventKind::Gate,
+            json!({"pre_action_review": record}),
+        )
+        .context("failed to append strict pre-action review event")?;
+    if !active_journal.is_enabled() {
+        bail!("strict pre-action review journal became disabled");
+    }
+    Ok(())
+}
+
 fn field_guide_injection_payload(
     prompt_role: SupervisePromptRole,
     prompt: &SupervisorFieldGuidePrompt,
@@ -3592,6 +3665,20 @@ struct SharedSupervisorArtifacts<'a> {
     journal: &'a mut Option<OrchestrationEventJournal>,
 }
 
+struct SupervisorPreActionJournalSink<'artifacts, 'writer> {
+    artifacts: &'artifacts Mutex<SharedSupervisorArtifacts<'writer>>,
+    node: &'artifacts str,
+    parent: Option<&'artifacts str>,
+}
+
+impl PreActionJournalSink for SupervisorPreActionJournalSink<'_, '_> {
+    fn append(&mut self, record: &PreActionJournalRecord) -> Result<()> {
+        with_supervisor_artifacts(self.artifacts, |writer, journal| {
+            record_pre_action_event_strict(journal, writer, self.node, self.parent, record)
+        })
+    }
+}
+
 fn with_supervisor_artifacts<T>(
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     operation: impl FnOnce(&mut ArtifactRunWriter, &mut Option<OrchestrationEventJournal>) -> Result<T>,
@@ -3633,6 +3720,7 @@ struct AssignmentExecutionOutcome {
     semantic_release_errors: Vec<String>,
     health_signals: Vec<SwarmHealthSignal>,
     gate_tracker: Option<GateCorrectionTracker>,
+    pre_action_review_metrics: Vec<ReviewMetricSnapshot>,
     gate_denials: Vec<GateDenial>,
     gate_correction_outcomes: Vec<GateCorrectionOutcomeRecord>,
     assignment_failed: bool,
@@ -4909,8 +4997,22 @@ fn execute_supervisor_assignment_inner(
             // independently contained external process runs.
             let external_run_result = match options.runtime {
                 SupervisorRuntime::Codex => {
+                    let review_context =
+                        pre_action_review_context(options, assignment, &worktree.path)?;
+                    let mut review_journal = SupervisorPreActionJournalSink {
+                        artifacts,
+                        node: &assignment.id,
+                        parent: Some(journal_parent_id),
+                    };
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        external_runner(&command, cancellation)
+                        external_runner(
+                            &command,
+                            cancellation,
+                            Some(ExternalPreActionReviewRuntime {
+                                context: &review_context,
+                                journal: &mut review_journal,
+                            }),
+                        )
                     })) {
                         Ok(run) => Ok(run),
                         Err(payload) => {
@@ -5020,6 +5122,12 @@ fn execute_supervisor_assignment_inner(
             let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
             let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
             let sandbox_denials = external_run.sandbox_denials().to_vec();
+            outcome
+                .gate_denials
+                .extend(external_run.gate_denials().iter().cloned());
+            if let Some(metrics) = external_run.pre_action_review_metrics() {
+                outcome.pre_action_review_metrics.push(metrics.clone());
+            }
             let external_side_effect_state = external_run.external_side_effect_state();
             let (mut attempt_report, report_shape_problems) =
                 collect_child_report(ChildReportCollectionContext {
@@ -5530,7 +5638,7 @@ fn execute_supervisor_assignment_inner(
             let auditor_run_result = match options.runtime {
                 SupervisorRuntime::Codex => {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        external_runner(&auditor_command, cancellation)
+                        external_runner(&auditor_command, cancellation, None)
                     })) {
                         Ok(run) => Ok(run),
                         Err(payload) => {
@@ -6031,7 +6139,7 @@ fn run_supervisor_plan_with_runner(
         1,
         execution_runtime,
         SupervisorWorktreeCreation::TestOnly,
-        &|command, _cancellation| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -6057,7 +6165,7 @@ fn run_supervisor_plan_with_concurrent_runner(
         max_concurrent_children,
         SupervisorExecutionRuntime::NonpublishableSimulation,
         SupervisorWorktreeCreation::TestOnly,
-        &|command, _cancellation| external_runner(command),
+        &|command, _cancellation, _review_runtime| external_runner(command),
     )
 }
 
@@ -6142,6 +6250,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let mut usage_incomplete = false;
     let mut orchestrator_reports = Vec::new();
     let mut gate_denials = Vec::new();
+    let mut pre_action_review_metrics = Vec::new();
     let mut gate_correction_outcomes = Vec::new();
     let mut candidate_inspections = BTreeMap::new();
     let mut findings = Vec::new();
@@ -6546,6 +6655,7 @@ fn run_supervisor_plan_with_runner_and_creation(
             usage_incomplete |= outcome.usage_incomplete;
             findings.extend(outcome.findings);
             gate_denials.extend(outcome.gate_denials);
+            pre_action_review_metrics.extend(outcome.pre_action_review_metrics);
             gate_correction_outcomes.extend(outcome.gate_correction_outcomes);
             assignment_execution_failed |= outcome.assignment_failed;
             external_containment_failed |= outcome.external_containment_failed;
@@ -6789,6 +6899,7 @@ fn run_supervisor_plan_with_runner_and_creation(
         commands_run: command_records,
         sandbox_denials,
         gate_denials,
+        pre_action_review_metrics,
         gate_correction_outcomes,
         files_changed: orchestrator_reports
             .iter()
@@ -16618,7 +16729,9 @@ mod tests {
         let runner = {
             let assignments = assignments.clone();
             let state = Arc::clone(&state);
-            move |command: &ExternalAgentCommand, cancellation: &ProcessCancellation| {
+            move |command: &ExternalAgentCommand,
+                  cancellation: &ProcessCancellation,
+                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
                 let id = injected_command_assignment_id(command);
                 let (lock, condvar) = &*state;
                 let mut breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -16981,7 +17094,9 @@ mod tests {
         let runner = {
             let state = Arc::clone(&state);
             let assignments = assignments.clone();
-            move |command: &ExternalAgentCommand, cancellation: &ProcessCancellation| {
+            move |command: &ExternalAgentCommand,
+                  cancellation: &ProcessCancellation,
+                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
                 let id = injected_command_assignment_id(command);
                 let (lock, condvar) = &*state;
                 if id == "child-b" {
@@ -20614,6 +20729,7 @@ mod tests {
             commands_run: Vec::new(),
             sandbox_denials: Vec::new(),
             gate_denials: Vec::new(),
+            pre_action_review_metrics: Vec::new(),
             gate_correction_outcomes: Vec::new(),
             files_changed: Vec::new(),
             validation_results: Vec::new(),

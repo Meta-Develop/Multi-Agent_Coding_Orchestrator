@@ -24,6 +24,7 @@ pub mod orchestration_event;
 pub mod orchestrator;
 pub(crate) mod pinned_exec;
 pub mod planning;
+pub mod pre_action_review;
 pub mod process_runner;
 pub mod publication;
 pub mod repo_map;

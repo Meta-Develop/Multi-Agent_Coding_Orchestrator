@@ -500,6 +500,12 @@ pub enum StdinMode {
     Inherit,
     Null,
     Bytes(Vec<u8>),
+    /// Reserve a bounded pipe for [`run_process_interactive`].
+    ///
+    /// Ordinary batch execution rejects this mode so a caller cannot accidentally leave an
+    /// unowned stdin pipe open. The interactive runner keeps the raw handle private and exposes
+    /// only a borrowed, deadline-aware line session to its crate-internal handler.
+    Interactive,
 }
 
 /// Selects the ownership guarantee that must be established before a command executes.
@@ -1392,6 +1398,24 @@ pub struct ProcessOutput {
     pub stdin_error: Option<String>,
 }
 
+/// Result of one bounded interaction with a contained process.
+///
+/// Process ownership and confinement evidence are identical to [`ProcessOutput`]. The protocol
+/// result is separate so a malformed or lost protocol cannot erase proof that the owned process
+/// tree was cleaned up.
+#[derive(Debug)]
+pub(crate) struct InteractiveProcessOutput<T> {
+    pub(crate) process: ProcessOutput,
+    pub(crate) interaction: Result<T, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteractiveProcessRead {
+    Line,
+    Timeout,
+    Eof,
+}
+
 #[derive(Debug)]
 pub struct ProcessFailureEvidence {
     pub stdout: CapturedBytes,
@@ -1532,10 +1556,67 @@ pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> 
 }
 
 pub fn run_process_cancellable(
-    mut spec: ProcessSpec,
+    spec: ProcessSpec,
     cancellation: &ProcessCancellation,
 ) -> Result<ProcessOutput, ProcessRunError> {
+    run_process_cancellable_with_interaction(spec, cancellation, None)
+}
+
+/// Runs one bounded interactive protocol inside the normal contained process lifecycle.
+///
+/// The handler is invoked synchronously after the exact same preflight, containment attachment,
+/// lifecycle registration, tee validation, and start gate as [`run_process_cancellable`]. It can
+/// neither obtain nor retain the child or its stdio handles. Returning from the handler closes
+/// stdin and the normal runner loop then reaps the process, verifies the owned tree is empty, and
+/// returns the ordinary confinement evidence.
+pub(crate) fn run_process_interactive<T, F>(
+    mut spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    mut handler: F,
+) -> Result<InteractiveProcessOutput<T>, ProcessRunError>
+where
+    F: FnMut(&mut ContainedProcessSession<'_>) -> Result<T, String>,
+{
+    spec.stdin = StdinMode::Interactive;
+    let mut interaction = None;
+    let mut adapter = |session: &mut ContainedProcessSession<'_>| {
+        interaction = Some(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(session)))
+                .unwrap_or_else(|_| {
+                    Err("contained interactive handler panicked; details redacted".to_string())
+                }),
+        );
+    };
+    let process = run_process_cancellable_with_interaction(spec, cancellation, Some(&mut adapter))?;
+    let interaction = interaction.ok_or_else(|| ProcessRunError::IoSetup {
+        label: "interactive process".to_string(),
+        command: "<redacted>".to_string(),
+        source: std::io::Error::other(
+            "contained interactive handler was not invoked after successful setup",
+        ),
+    })?;
+    Ok(InteractiveProcessOutput {
+        process,
+        interaction,
+    })
+}
+
+fn run_process_cancellable_with_interaction(
+    mut spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    interaction: Option<&mut dyn FnMut(&mut ContainedProcessSession<'_>)>,
+) -> Result<ProcessOutput, ProcessRunError> {
     let started = Instant::now();
+    if interaction.is_some() != matches!(spec.stdin, StdinMode::Interactive) {
+        return Err(ProcessRunError::IoSetup {
+            label: spec.label.clone(),
+            command: spec.command_display(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "interactive stdin requires the bounded interactive runner",
+            ),
+        });
+    }
     if let Some(metadata) = &spec.agent_lifecycle {
         stamp_agent_lifecycle_environment(&mut spec.environment, metadata);
     }
@@ -1815,14 +1896,42 @@ pub fn run_process_cancellable(
         }
     };
     let (stdout_tee, stderr_tee) = prepared_tees.commit();
-    let (mut input_writer, mut output_drainers) = prepared_io.start(
-        &spec.label,
-        spec.stdin,
-        spec.stdout.max_bytes,
-        spec.stderr.max_bytes,
-        stdout_tee,
-        stderr_tee,
-    );
+    let (mut input_writer, mut output_drainers) = match interaction {
+        Some(handler) => {
+            let mut session = prepared_io
+                .start_interactive(
+                    &spec.label,
+                    cancellation,
+                    operation_deadline,
+                    spec.max_stdin_bytes,
+                    spec.stdout.max_bytes,
+                    spec.stderr.max_bytes,
+                    stdout_tee,
+                    stderr_tee,
+                )
+                .map_err(|source| ProcessRunError::IoSetup {
+                    label: spec.label.clone(),
+                    command: command_display.clone(),
+                    source,
+                })?;
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&mut session)))
+                .is_err()
+            {
+                let _ = session.fail_io::<()>(
+                    "contained interactive protocol adapter panicked; details redacted",
+                );
+            }
+            session.into_runner_io()
+        }
+        None => prepared_io.start(
+            &spec.label,
+            spec.stdin,
+            spec.stdout.max_bytes,
+            spec.stderr.max_bytes,
+            stdout_tee,
+            stderr_tee,
+        ),
+    };
     let mut status = None;
     let mut timed_out = false;
     let mut process_error = None;
@@ -3741,7 +3850,7 @@ fn configure_stdin(command: &mut Command, stdin: &StdinMode) {
         StdinMode::Null => {
             command.stdin(Stdio::null());
         }
-        StdinMode::Bytes(_) => {
+        StdinMode::Bytes(_) | StdinMode::Interactive => {
             command.stdin(Stdio::piped());
         }
     }
@@ -8647,7 +8756,7 @@ impl PreparedChildIo {
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("failed to open child stderr pipe"))?;
-        let stdin = if matches!(stdin_mode, StdinMode::Bytes(_)) {
+        let stdin = if matches!(stdin_mode, StdinMode::Bytes(_) | StdinMode::Interactive) {
             Some(
                 child
                     .stdin
@@ -8690,6 +8799,222 @@ impl PreparedChildIo {
             stderr_tee,
         );
         (input_writer, output_drainers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_interactive<'a>(
+        self,
+        label: &str,
+        cancellation: &'a ProcessCancellation,
+        operation_deadline: Option<Instant>,
+        max_stdin_bytes: usize,
+        stdout_limit: usize,
+        stderr_limit: usize,
+        stdout_tee: Option<TeeWriter>,
+        stderr_tee: Option<TeeWriter>,
+    ) -> std::io::Result<ContainedProcessSession<'a>> {
+        let stdin = self.stdin.ok_or_else(|| {
+            std::io::Error::other("failed to open contained interactive stdin pipe")
+        })?;
+        Ok(ContainedProcessSession {
+            label: label.to_string(),
+            cancellation,
+            operation_deadline,
+            stdin: Some(stdin),
+            stdin_bytes_written: 0,
+            max_stdin_bytes,
+            pending_stdout: Vec::new(),
+            stdout_eof: false,
+            io_error: None,
+            output_drainers: OutputDrainers::start(
+                self.stdout,
+                self.stderr,
+                label,
+                stdout_limit,
+                stderr_limit,
+                stdout_tee,
+                stderr_tee,
+            ),
+        })
+    }
+}
+
+/// Borrowed line-oriented access to one contained child.
+///
+/// All fields are private and the value is constructed only after containment attachment and the
+/// start gate. The callback receives `&mut ContainedProcessSession`, so neither this value nor any
+/// stdio handle can be retained after [`run_process_interactive`] returns.
+pub(crate) struct ContainedProcessSession<'a> {
+    label: String,
+    cancellation: &'a ProcessCancellation,
+    operation_deadline: Option<Instant>,
+    stdin: Option<ChildStdin>,
+    stdin_bytes_written: usize,
+    max_stdin_bytes: usize,
+    pending_stdout: Vec<u8>,
+    stdout_eof: bool,
+    io_error: Option<String>,
+    output_drainers: OutputDrainers,
+}
+
+impl ContainedProcessSession<'_> {
+    pub(crate) fn receive_line(
+        &mut self,
+        wait: Duration,
+        max_line_bytes: usize,
+        destination: &mut Vec<u8>,
+    ) -> Result<InteractiveProcessRead, String> {
+        destination.clear();
+        if max_line_bytes == 0 || max_line_bytes > MAX_REQUIRED_STREAM_BYTES {
+            return self.fail_io("interactive line bound is zero or exceeds the hard ceiling");
+        }
+        if let Some(line) = self.take_pending_line(max_line_bytes)? {
+            destination.extend_from_slice(&line);
+            return Ok(InteractiveProcessRead::Line);
+        }
+        if self.stdout_eof {
+            return Ok(InteractiveProcessRead::Eof);
+        }
+
+        let requested_deadline = Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(Instant::now);
+        let deadline = self
+            .operation_deadline
+            .map_or(requested_deadline, |operation| {
+                operation.min(requested_deadline)
+            });
+        loop {
+            self.ensure_interactive_live()?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(InteractiveProcessRead::Timeout);
+            }
+            self.output_drainers.stderr.drain_ready(&self.label);
+            let remaining = deadline.saturating_duration_since(now);
+            match self
+                .output_drainers
+                .stdout
+                .receive_interactive(remaining, &self.label)?
+            {
+                InteractivePipeRead::Chunk(chunk) => {
+                    self.pending_stdout.extend_from_slice(&chunk);
+                    if let Some(line) = self.take_pending_line(max_line_bytes)? {
+                        destination.extend_from_slice(&line);
+                        return Ok(InteractiveProcessRead::Line);
+                    }
+                }
+                InteractivePipeRead::Timeout => return Ok(InteractiveProcessRead::Timeout),
+                InteractivePipeRead::Eof => {
+                    self.stdout_eof = true;
+                    if self.pending_stdout.is_empty() {
+                        return Ok(InteractiveProcessRead::Eof);
+                    }
+                    if self.pending_stdout.len() > max_line_bytes {
+                        return self.fail_io(
+                            "contained interactive message exceeded its configured line bound",
+                        );
+                    }
+                    destination.extend_from_slice(&self.pending_stdout);
+                    self.pending_stdout.clear();
+                    return Ok(InteractiveProcessRead::Line);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn send_line(&mut self, line: &[u8]) -> Result<(), String> {
+        if line.contains(&b'\n') || line.contains(&b'\r') {
+            return self.fail_io("contained interactive line contains a raw newline");
+        }
+        let framed_len = line.len().checked_add(1).ok_or_else(|| {
+            "contained interactive stdin byte count overflowed its bound".to_string()
+        })?;
+        let next_total = self
+            .stdin_bytes_written
+            .checked_add(framed_len)
+            .ok_or_else(|| {
+                "contained interactive stdin byte count overflowed its bound".to_string()
+            })?;
+        if next_total > self.max_stdin_bytes {
+            return self
+                .fail_io("contained interactive stdin exceeded its configured aggregate bound");
+        }
+        let mut framed = Vec::with_capacity(framed_len);
+        framed.extend_from_slice(line);
+        framed.push(b'\n');
+        let mut written = 0usize;
+        while written < framed.len() {
+            self.ensure_interactive_live()?;
+            self.output_drainers.stderr.drain_ready(&self.label);
+            let Some(stdin) = self.stdin.as_mut() else {
+                return self.fail_io("contained interactive stdin was already closed");
+            };
+            match stdin.write(&framed[written..]) {
+                Ok(0) => {
+                    return self
+                        .fail_io("contained interactive stdin returned a zero-length write");
+                }
+                Ok(count) => written = written.saturating_add(count),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(IO_CANCEL_POLL_INTERVAL);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return self.fail_io(format!(
+                        "failed to write contained interactive stdin: {error}"
+                    ));
+                }
+            }
+        }
+        self.stdin_bytes_written = next_total;
+        Ok(())
+    }
+
+    fn take_pending_line(&mut self, max_line_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+        let Some(newline) = self.pending_stdout.iter().position(|byte| *byte == b'\n') else {
+            if self.pending_stdout.len() > max_line_bytes {
+                return self
+                    .fail_io("contained interactive message exceeded its configured line bound");
+            }
+            return Ok(None);
+        };
+        if newline > max_line_bytes {
+            return self
+                .fail_io("contained interactive message exceeded its configured line bound");
+        }
+        let mut line = self.pending_stdout.drain(..=newline).collect::<Vec<_>>();
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Ok(Some(line))
+    }
+
+    fn ensure_interactive_live(&mut self) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            return self.fail_io("contained interactive session was cancelled");
+        }
+        if self
+            .operation_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return self.fail_io("contained interactive session reached its operation deadline");
+        }
+        Ok(())
+    }
+
+    fn fail_io<T>(&mut self, message: impl Into<String>) -> Result<T, String> {
+        let message = message.into();
+        if self.io_error.is_none() {
+            self.io_error = Some(message.clone());
+        }
+        Err(message)
+    }
+
+    fn into_runner_io(mut self) -> (InputWriter, OutputDrainers) {
+        drop(self.stdin.take());
+        (InputWriter::completed(self.io_error), self.output_drainers)
     }
 }
 
@@ -8825,6 +9150,12 @@ enum InputWriterState {
 }
 
 impl InputWriter {
+    fn completed(error: Option<String>) -> Self {
+        Self {
+            state: InputWriterState::Complete { error },
+        }
+    }
+
     fn start(child_stdin: Option<ChildStdin>, label: &str, stdin: StdinMode) -> Self {
         let StdinMode::Bytes(input) = stdin else {
             return Self {
@@ -9054,7 +9385,72 @@ struct PipeReader {
     error: Option<String>,
 }
 
+enum InteractivePipeRead {
+    Chunk(Vec<u8>),
+    Timeout,
+    Eof,
+}
+
 impl PipeReader {
+    fn receive_interactive(
+        &mut self,
+        wait: Duration,
+        label: &str,
+    ) -> Result<InteractivePipeRead, String> {
+        if self.complete {
+            return match &self.error {
+                Some(error) => Err(error.clone()),
+                None => Ok(InteractivePipeRead::Eof),
+            };
+        }
+        let deadline = Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(Instant::now);
+        loop {
+            let Some(receiver) = &self.receiver else {
+                let message = format!("{label} {} receiver is unavailable", self.stream);
+                self.error = Some(message.clone());
+                self.complete = true;
+                return Err(message);
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = match receiver.recv_timeout(remaining) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Ok(InteractivePipeRead::Timeout);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let message =
+                        format!("{label} {} reader thread stopped unexpectedly", self.stream);
+                    self.error = Some(message.clone());
+                    self.complete = true;
+                    return Err(message);
+                }
+            };
+            match event {
+                PipeReadEvent::Chunk(chunk) => {
+                    self.capture.push(&chunk);
+                    return Ok(InteractivePipeRead::Chunk(chunk));
+                }
+                PipeReadEvent::Finished => {
+                    self.complete = true;
+                    return Ok(InteractivePipeRead::Eof);
+                }
+                PipeReadEvent::Error(error) => {
+                    self.error = Some(error.clone());
+                    self.complete = true;
+                    return Err(error);
+                }
+                PipeReadEvent::TeeLimitExceeded(error) => {
+                    self.error = append_error(self.error.take(), Some(error));
+                    if Instant::now() >= deadline {
+                        return Ok(InteractivePipeRead::Timeout);
+                    }
+                }
+            }
+        }
+    }
+
     fn cancel_incomplete(&mut self, label: &str) -> Option<String> {
         if self.complete {
             return None;
@@ -9317,6 +9713,140 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn nonpublishable_trusted_compatibility_interactive_session_round_trips() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ProcessSpec::direct(
+            "interactive JSONL child",
+            PathBuf::from("/bin/sh"),
+            [
+                OsString::from("-c"),
+                OsString::from(
+                    "IFS= read -r request && test \"$request\" = '{\"request\":1}' && printf '%s\\n' '{\"response\":1}'",
+                ),
+            ],
+            temp.path(),
+            1024,
+        )
+        .with_stdin_limit(1024)
+        .with_timeout(Some(Duration::from_secs(5)))
+        .with_containment(ContainmentPolicy::TrustedBestEffort);
+        let result = run_process_interactive(spec, &ProcessCancellation::new(), |session| {
+            session.send_line(br#"{"request":1}"#)?;
+            let mut response = Vec::new();
+            let read = session.receive_line(Duration::from_secs(1), 1024, &mut response)?;
+            Ok((read, response))
+        })
+        .expect("run contained interactive child");
+
+        let (read, response) = result.interaction.expect("interactive exchange");
+        assert_eq!(read, InteractiveProcessRead::Line);
+        assert_eq!(response, br#"{"response":1}"#);
+        assert!(result.process.status.is_some_and(|status| status.success()));
+        assert!(matches!(
+            result.process.process_tree,
+            ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonpublishable_trusted_compatibility_interactive_rejects_unframed_input() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ProcessSpec::direct(
+            "interactive malformed input child",
+            PathBuf::from("/bin/sh"),
+            [OsString::from("-c"), OsString::from("read -r _ || true")],
+            temp.path(),
+            1024,
+        )
+        .with_stdin_limit(1024)
+        .with_timeout(Some(Duration::from_secs(5)))
+        .with_containment(ContainmentPolicy::TrustedBestEffort);
+        let result = run_process_interactive(spec, &ProcessCancellation::new(), |session| {
+            session.send_line(b"two\nframes")
+        })
+        .expect("run contained interactive child");
+
+        assert!(result
+            .interaction
+            .is_err_and(|message| message.contains("raw newline")));
+        assert!(matches!(
+            result.process.process_tree,
+            ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        ));
+        assert!(result.process.stdin_error.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonpublishable_trusted_compatibility_interactive_panic_is_redacted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ProcessSpec::direct(
+            "interactive panicking handler child",
+            PathBuf::from("/bin/sh"),
+            [OsString::from("-c"), OsString::from("read -r _ || true")],
+            temp.path(),
+            1024,
+        )
+        .with_stdin_limit(1024)
+        .with_timeout(Some(Duration::from_secs(5)))
+        .with_containment(ContainmentPolicy::TrustedBestEffort);
+        let result =
+            run_process_interactive::<(), _>(spec, &ProcessCancellation::new(), |_session| {
+                panic!("sensitive panic details")
+            })
+            .expect("runner must preserve process evidence after handler panic");
+
+        assert!(result.interaction.is_err_and(|message| {
+            message.contains("handler panicked") && !message.contains("sensitive panic details")
+        }));
+        assert!(matches!(
+            result.process.process_tree,
+            ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        ));
+        assert!(result.process.status.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_contained_interactive_session_proves_tree_and_side_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ProcessSpec::direct(
+            "verified interactive JSONL child",
+            PathBuf::from("/bin/sh"),
+            [
+                OsString::from("-c"),
+                OsString::from(
+                    "IFS= read -r request && test \"$request\" = '{\"request\":1}' && printf '%s\\n' '{\"response\":1}'",
+                ),
+            ],
+            temp.path(),
+            1024,
+        )
+        .with_stdin_limit(1024)
+        .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT));
+        let result = match run_process_interactive(spec, &ProcessCancellation::new(), |session| {
+            session.send_line(br#"{"request":1}"#)?;
+            let mut response = Vec::new();
+            let read = session.receive_line(Duration::from_secs(1), 1024, &mut response)?;
+            Ok((read, response))
+        }) {
+            Ok(result) => result,
+            Err(ProcessRunError::ContainmentUnavailable { .. }) => return,
+            Err(error) => panic!("verified interactive runner failed: {error:?}"),
+        };
+
+        let (read, response) = result.interaction.expect("interactive exchange");
+        assert_eq!(read, InteractiveProcessRead::Line);
+        assert_eq!(response, br#"{"response":1}"#);
+        assert!(result.process.status.is_some_and(|status| status.success()));
+        assert!(result.process.process_tree.is_verified_empty());
+        assert!(result.process.side_effects.is_verified());
+        assert!(result.process.safety_evidence_verified());
+    }
 
     #[test]
     fn failed_host_capacity_measurement_falls_back_to_one_lane() {
