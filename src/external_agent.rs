@@ -21,6 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "codex_app_server.rs"]
+pub(crate) mod codex_app_server;
+
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const OUTPUT_TEE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -2662,6 +2665,72 @@ fn codex_hardened_argv(
     argv
 }
 
+/// Experimental app-server launch arguments. The existing one-shot launch path deliberately does
+/// not call this until the approval policy core is integrated.
+#[allow(dead_code)]
+fn codex_app_server_argv(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Vec<OsString> {
+    let filesystem_permissions = codex_filesystem_permissions(spec, controls);
+    let mut argv = vec![
+        OsString::from("app-server"),
+        OsString::from("--stdio"),
+        OsString::from("--strict-config"),
+        OsString::from("-c"),
+        OsString::from("approval_policy=\"on-request\""),
+        OsString::from("-c"),
+        OsString::from("approvals_reviewer=\"auto_review\""),
+        OsString::from("-c"),
+        OsString::from("default_permissions=\"maco_external_codex\""),
+        OsString::from("-c"),
+        OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+        OsString::from("-c"),
+        OsString::from(filesystem_permissions),
+        OsString::from("-c"),
+        OsString::from("shell_environment_policy.inherit=\"none\""),
+        OsString::from("-c"),
+        OsString::from(
+            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
+        ),
+        OsString::from("-c"),
+        OsString::from("web_search=\"disabled\""),
+        // app-server has no --ignore-rules flag. A private CODEX_HOME prevents ambient user config,
+        // while a zero project-doc budget prevents workspace rule discovery.
+        OsString::from("-c"),
+        OsString::from("project_doc_max_bytes=0"),
+    ];
+    for feature in [
+        "apps",
+        "plugins",
+        "hooks",
+        "in_app_browser",
+        "browser_use",
+        "browser_use_full_cdp_access",
+        "browser_use_external",
+        "computer_use",
+        "image_generation",
+    ] {
+        argv.push(OsString::from("--disable"));
+        argv.push(OsString::from(feature));
+    }
+    if let Some(model) = &spec.model {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model={}",
+            toml_basic_string(model)
+        )));
+    }
+    if let Some(reasoning_effort) = &spec.reasoning_effort {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model_reasoning_effort={}",
+            toml_basic_string(reasoning_effort)
+        )));
+    }
+    argv
+}
+
 fn codex_filesystem_permissions(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
@@ -3040,6 +3109,84 @@ mod tests {
         assert!(!actual
             .iter()
             .any(|argument| argument == "web_search=\"live\""));
+    }
+
+    #[test]
+    fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        );
+        let controls =
+            protected_worktree_controls(&command).unwrap_or_else(|_| ProtectedWorktreeControls {
+                writable_artifact_root: Some(PathBuf::from("/run")),
+                ..ProtectedWorktreeControls::default()
+            });
+        let actual = codex_app_server_argv(&command, &controls)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual
+                .get(0..3)
+                .map(|arguments| arguments.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["app-server", "--stdio", "--strict-config"])
+        );
+        for required in [
+            "approval_policy=\"on-request\"",
+            "approvals_reviewer=\"auto_review\"",
+            "default_permissions=\"maco_external_codex\"",
+            "permissions.maco_external_codex.network={enabled=false}",
+            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"},\"/run\"=\"write\"}",
+            "shell_environment_policy.inherit=\"none\"",
+            "web_search=\"disabled\"",
+            "project_doc_max_bytes=0",
+        ] {
+            assert!(
+                actual.iter().any(|argument| argument == required),
+                "missing bounded app-server argument {required}"
+            );
+        }
+        assert!(!actual.iter().any(|argument| {
+            argument.contains("enabled=true")
+                || argument.contains("danger-full-access")
+                || argument == "--add-dir"
+        }));
+    }
+
+    #[test]
+    fn app_server_capability_uses_the_existing_external_codex_profile() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        create_mandatory_control_roots(&workspace)?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir_all(&incoming)?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join(".maco/events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        );
+        let controls = protected_worktree_controls(&command)?;
+        let profile = external_side_effect_profile(
+            &command,
+            Path::new("/run/current-system/sw/bin/codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+
+        assert_eq!(
+            profile.kind(),
+            SideEffectConfinementProfileKind::ExternalCodex
+        );
+        Ok(())
     }
 
     #[test]
