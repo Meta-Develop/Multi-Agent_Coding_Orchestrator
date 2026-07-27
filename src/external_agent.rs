@@ -1,11 +1,18 @@
 use crate::agent_lifecycle::AgentLaunchMetadata;
-use crate::gate_denial::ExternalSideEffectState;
+use crate::artifacts::state_auth::sha256_hex;
+use crate::gate_denial::{ExternalSideEffectState, GateDenial};
 use crate::llm::provider::Usage;
+use crate::pre_action_review::{
+    ActionDescriptor, ApprovalReviewRequest, BlastRadius, CommandClass, CommandInvocation,
+    DecisionSource, PathAccess, PathAccessMode, PermissionRequest, PreActionReviewer,
+    RedactedClassifierRequest, ReviewContext, ReviewMetricSnapshot, ReviewOutcome,
+};
 use crate::process_runner::{
-    read_bounded_regular_file_nofollow, run_process_cancellable, CapturedBytes, EnvironmentMode,
-    ExternalCodexProfile, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
-    ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode,
-    StreamCapture, StrictOfflineWorkspaceProfile, WorkspaceAccess,
+    read_bounded_regular_file_nofollow, run_process_cancellable, run_process_interactive,
+    CapturedBytes, EnvironmentMode, ExternalCodexProfile, InteractiveProcessOutput,
+    ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec, ProcessTreeEvidence,
+    SideEffectConfinementEvidence, SideEffectConfinementProfile, StdinMode, StreamCapture,
+    StrictOfflineWorkspaceProfile, WorkspaceAccess,
 };
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
@@ -20,6 +27,9 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+#[path = "codex_app_server.rs"]
+pub(crate) mod codex_app_server;
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
@@ -46,6 +56,58 @@ const POLICY_CONTROL_FILES: &[&str] = &[
 const MAX_WORKTREE_CONTROL_EXCEPTIONS: usize = 128;
 const MAX_CODEX_JSONL_EVENT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_EVENT_TEXT_BYTES: usize = 64 * 1024;
+const PRE_ACTION_JOURNAL_VERSION: u32 = 1;
+
+pub(crate) trait PreActionJournalSink {
+    fn append(&mut self, record: &PreActionJournalRecord) -> Result<()>;
+}
+
+pub(crate) struct ExternalPreActionReviewRuntime<'a> {
+    pub(crate) context: &'a ReviewContext,
+    pub(crate) journal: &'a mut dyn PreActionJournalSink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PreActionJournalPhase {
+    ReviewDecision,
+    TurnTerminal,
+    ProcessTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PreActionJournalRationale {
+    DeterministicPolicyAllow,
+    DeterministicPolicyDeny,
+    ClassifierAllow,
+    ClassifierFailClosed,
+    HumanInterventionRequired,
+    TerminalEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreActionJournalRecord {
+    pub(crate) version: u32,
+    pub(crate) run_id: String,
+    pub(crate) review_session_id: String,
+    pub(crate) phase: PreActionJournalPhase,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) item_id: Option<String>,
+    pub(crate) request: Option<RedactedClassifierRequest>,
+    pub(crate) decision_source: Option<DecisionSource>,
+    pub(crate) decision_latency_ms: Option<u64>,
+    pub(crate) rationale: PreActionJournalRationale,
+    pub(crate) allowed: Option<bool>,
+    pub(crate) denial: Option<GateDenial>,
+    pub(crate) turn_status: Option<codex_app_server::TurnTerminalStatus>,
+    pub(crate) item_outcomes: Vec<codex_app_server::ItemOutcome>,
+    pub(crate) process_exit_code: Option<i32>,
+    pub(crate) process_tree: Option<ProcessTreeEvidence>,
+    pub(crate) side_effects: Option<SideEffectConfinementEvidence>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalExecutionRuntime {
@@ -330,6 +392,14 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.sandbox_denials
     }
 
+    pub fn gate_denials(&self) -> &[GateDenial] {
+        &self.stdout.run_metadata.gate_denials
+    }
+
+    pub fn pre_action_review_metrics(&self) -> Option<&ReviewMetricSnapshot> {
+        self.stdout.run_metadata.pre_action_review_metrics.as_ref()
+    }
+
     /// Returns a typed external-effect observation attached by the trusted host runner.
     ///
     /// This held metadata is not decoded from child output and is deliberately excluded from the
@@ -412,6 +482,10 @@ struct ExternalAgentRunWireRef<'a> {
     codex_permissions: &'a Option<CodexPermissionEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sandbox_denials: &'a Vec<SandboxDenialEvidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    gate_denials: &'a Vec<GateDenial>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_action_review_metrics: &'a Option<ReviewMetricSnapshot>,
     stdout: &'a CapturedOutput,
     stderr: &'a CapturedOutput,
     error: &'a Option<String>,
@@ -435,6 +509,10 @@ struct ExternalAgentRunWireOwned {
     codex_permissions: Option<CodexPermissionEvidence>,
     #[serde(default)]
     sandbox_denials: Vec<SandboxDenialEvidence>,
+    #[serde(default)]
+    gate_denials: Vec<GateDenial>,
+    #[serde(default)]
+    pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     stdout: CapturedOutput,
     stderr: CapturedOutput,
     error: Option<String>,
@@ -458,6 +536,8 @@ impl Serialize for ExternalAgentRun {
             program_trust: self.program_trust,
             codex_permissions: &self.codex_permissions,
             sandbox_denials: &self.stdout.run_metadata.sandbox_denials,
+            gate_denials: &self.stdout.run_metadata.gate_denials,
+            pre_action_review_metrics: &self.stdout.run_metadata.pre_action_review_metrics,
             stdout: &self.stdout,
             stderr: &self.stderr,
             error: &self.error,
@@ -474,6 +554,8 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
         let wire = ExternalAgentRunWireOwned::deserialize(deserializer)?;
         let mut stdout = wire.stdout;
         stdout.run_metadata.sandbox_denials = wire.sandbox_denials;
+        stdout.run_metadata.gate_denials = wire.gate_denials;
+        stdout.run_metadata.pre_action_review_metrics = wire.pre_action_review_metrics;
         Ok(Self {
             command: wire.command,
             cwd: wire.cwd,
@@ -497,6 +579,8 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ExternalAgentRunMetadata {
     sandbox_denials: Vec<SandboxDenialEvidence>,
+    gate_denials: Vec<GateDenial>,
+    pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     external_side_effect_state: Option<ExternalSideEffectState>,
 }
 
@@ -542,7 +626,20 @@ pub fn run_external_agent_cancellable(
     spec: &ExternalAgentCommand,
     cancellation: &ProcessCancellation,
 ) -> ExternalAgentRun {
-    run_external_agent_runtime(spec, ExternalExecutionRuntime::Verified, cancellation)
+    run_external_agent_runtime(spec, ExternalExecutionRuntime::Verified, cancellation, None)
+}
+
+pub(crate) fn run_external_agent_cancellable_reviewed(
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+    review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+) -> ExternalAgentRun {
+    run_external_agent_runtime(
+        spec,
+        ExternalExecutionRuntime::Verified,
+        cancellation,
+        review_runtime,
+    )
 }
 
 #[cfg(test)]
@@ -561,6 +658,7 @@ fn run_external_agent_nonpublishable_simulation_cancellable(
         spec,
         ExternalExecutionRuntime::NonpublishableSimulation,
         cancellation,
+        None,
     )
 }
 
@@ -568,6 +666,7 @@ fn run_external_agent_runtime(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
     cancellation: &ProcessCancellation,
+    mut review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
 ) -> ExternalAgentRun {
     let started = Instant::now();
     if cancellation.is_cancelled() {
@@ -630,7 +729,34 @@ fn run_external_agent_runtime(
             );
         }
     };
-    let argv = command_argv_with_controls(spec, &protected_controls);
+    let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadWrite;
+    if duplex_review_required && review_runtime.is_none() {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&resolved_program, &[]),
+            false,
+            "writable verified Codex requires a duplex MACO pre-action reviewer".to_string(),
+        );
+    }
+    if duplex_review_required {
+        if let Err(error) = validate_universal_pre_action_coverage() {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&resolved_program, &[]),
+                false,
+                error.to_string(),
+            );
+        }
+    }
+    let argv = if duplex_review_required {
+        codex_app_server_argv(spec, &protected_controls)
+    } else {
+        command_argv_with_controls(spec, &protected_controls)
+    };
     let argv_digest = match argv_digest(&argv) {
         Ok(digest) => digest,
         Err(error) => {
@@ -743,7 +869,7 @@ fn run_external_agent_runtime(
         return report;
     }
 
-    let output_reservation = match reserve_external_output(&spec.output_last_message) {
+    let mut output_reservation = match reserve_external_output(&spec.output_last_message) {
         Ok(reservation) => reservation,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
@@ -762,6 +888,19 @@ fn run_external_agent_runtime(
             ));
             return report;
         }
+    };
+    let duplex_prompt = if duplex_review_required {
+        match String::from_utf8(prompt.clone()) {
+            Ok(prompt) => Some(prompt),
+            Err(_) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                report.error =
+                    Some("writable Codex app-server prompt is not valid UTF-8".to_string());
+                return report;
+            }
+        }
+    } else {
+        None
     };
 
     let codex_auth = if runtime == ExternalExecutionRuntime::Verified
@@ -837,7 +976,11 @@ fn run_external_agent_runtime(
         spec.invocation,
         program_trust,
     )))
-    .with_stdin(StdinMode::Bytes(prompt))
+    .with_stdin(if duplex_review_required {
+        StdinMode::Interactive
+    } else {
+        StdinMode::Bytes(prompt)
+    })
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
     .with_stdout(
@@ -881,20 +1024,74 @@ fn run_external_agent_runtime(
     }
 
     report.stdout.target_launch_attempted = true;
-    match run_process_cancellable(process_spec, cancellation) {
-        Ok(output) => record_completed_target(
-            &mut report,
-            output,
-            &output_reservation,
-            CompletedTargetContext {
-                runtime,
-                codex_version,
-                spec,
-                protected_controls: &protected_controls,
-                argv_digest: &argv_digest,
-                program_identity: &program_identity,
-            },
-        ),
+    let completed_context = CompletedTargetContext {
+        runtime,
+        codex_version,
+        spec,
+        protected_controls: &protected_controls,
+        argv_digest: &argv_digest,
+        program_identity: &program_identity,
+    };
+    let mut retained_gate_denials = Vec::new();
+    let mut retained_review_metrics = None;
+    let process_result = if duplex_review_required {
+        let Some(prompt) = duplex_prompt else {
+            report.error = Some("writable Codex duplex prompt was unavailable".to_string());
+            report.duration_ms = duration_millis(started.elapsed());
+            return report;
+        };
+        let Some(review_runtime) = review_runtime.as_mut() else {
+            report.error = Some("writable Codex duplex review runtime was unavailable".to_string());
+            report.duration_ms = duration_millis(started.elapsed());
+            return report;
+        };
+        let attempt =
+            run_duplex_app_server_process(process_spec, cancellation, spec, prompt, review_runtime);
+        retained_gate_denials = attempt.gate_denials;
+        retained_review_metrics = Some(attempt.metrics);
+        match attempt.process {
+            Ok(interactive) => {
+                let protocol = interactive.interaction;
+                let mut final_message_error = None;
+                if let Ok(outcome) = &protocol {
+                    if let Some(final_message) = &outcome.final_message {
+                        if let Err(error) = output_reservation
+                            .write_bytes_atomic(final_message.as_bytes(), OUTPUT_TEE_LIMIT_BYTES)
+                        {
+                            final_message_error = Some(format!(
+                                "failed to persist app-server final message: {error:#}"
+                            ));
+                        }
+                    }
+                }
+                record_completed_target(
+                    &mut report,
+                    interactive.process,
+                    &output_reservation,
+                    completed_context,
+                );
+                if let Some(error) = final_message_error {
+                    report.error = append_external_error(report.error.take(), Some(error));
+                    report.publishable = false;
+                }
+                if let Err(error) = protocol {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!("duplex app-server protocol failed closed: {error}")),
+                    );
+                    report.publishable = false;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        run_process_cancellable(process_spec, cancellation).map(|output| {
+            record_completed_target(&mut report, output, &output_reservation, completed_context);
+        })
+    };
+    match process_result {
+        Ok(()) => {}
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
             let mut sandbox_denials = Vec::new();
@@ -917,8 +1114,392 @@ fn run_external_agent_runtime(
             report.error = Some(error.to_string());
         }
     }
+    report.stdout.run_metadata.gate_denials = retained_gate_denials;
+    report.stdout.run_metadata.pre_action_review_metrics = retained_review_metrics;
     report.duration_ms = duration_millis(started.elapsed());
     report
+}
+
+fn validate_universal_pre_action_coverage() -> Result<()> {
+    // Codex 0.144.4 exposes client callbacks only for actions for which the server chooses to ask
+    // approval. AskForApproval has no force-review-every-action mode, and `approvalsReviewer=user`
+    // does not block reads, writes, or tools already permitted by the active sandbox. The MACO
+    // policy additionally distinguishes safe writes from destructive writes, which a static
+    // filesystem sandbox cannot express. Until the protocol supplies a blocking callback for
+    // every relevant proposed action, a writable production child must not be released.
+    bail!(
+        "writable Codex failed closed before launch: the current app-server protocol does not guarantee a blocking MACO callback for every in-sandbox read, write, destructive operation, and tool action"
+    )
+}
+
+struct DuplexApprovalReviewer<'a> {
+    context: &'a ReviewContext,
+    review_session_id: &'a str,
+    journal: &'a mut dyn PreActionJournalSink,
+    reviewer: PreActionReviewer,
+    observed_denials: Vec<GateDenial>,
+    workspace: &'a Path,
+}
+
+impl codex_app_server::ApprovalReviewer for DuplexApprovalReviewer<'_> {
+    fn review(
+        &mut self,
+        request: codex_app_server::ApprovalRequest,
+    ) -> std::result::Result<codex_app_server::ApprovalReview, String> {
+        let decision_started = Instant::now();
+        let review_request = approval_review_request_from_app_server(&request, self.workspace)
+            .map_err(|error| format!("invalid approval manifest: {error:#}"))?;
+        let redacted = self
+            .reviewer
+            .redacted_classifier_request(self.context, &review_request);
+        // Production deliberately supplies no classifier here. Incomplete command/file manifests
+        // therefore fail closed instead of letting a classifier guess claim or sensitive-path
+        // coverage.
+        let outcome = self
+            .reviewer
+            .review(self.context, &review_request, None)
+            .map_err(|error| format!("pre-action policy failed: {error}"))?;
+        let (source, allowed, denial, rationale, response) = match outcome {
+            ReviewOutcome::Allowed { source } => (
+                source,
+                true,
+                None,
+                if source == DecisionSource::Classifier {
+                    PreActionJournalRationale::ClassifierAllow
+                } else {
+                    PreActionJournalRationale::DeterministicPolicyAllow
+                },
+                codex_app_server::ApprovalReview::accept(),
+            ),
+            ReviewOutcome::Denied { source, denial } => (
+                source,
+                false,
+                Some(denial.clone()),
+                if source == DecisionSource::Classifier {
+                    PreActionJournalRationale::ClassifierFailClosed
+                } else {
+                    PreActionJournalRationale::DeterministicPolicyDeny
+                },
+                codex_app_server::ApprovalReview::decline(denial),
+            ),
+            ReviewOutcome::HumanInterventionRequired { source, denial } => (
+                source,
+                false,
+                Some(denial.clone()),
+                PreActionJournalRationale::HumanInterventionRequired,
+                codex_app_server::ApprovalReview::cancel(Some(denial)),
+            ),
+        };
+        let record = PreActionJournalRecord {
+            version: PRE_ACTION_JOURNAL_VERSION,
+            run_id: self.context.run_id().to_string(),
+            review_session_id: self.review_session_id.to_string(),
+            phase: PreActionJournalPhase::ReviewDecision,
+            thread_id: Some(request.thread_id),
+            turn_id: Some(request.turn_id),
+            item_id: Some(request.item_id),
+            request: Some(redacted),
+            decision_source: Some(source),
+            decision_latency_ms: Some(duration_millis(decision_started.elapsed())),
+            rationale,
+            allowed: Some(allowed),
+            denial,
+            turn_status: None,
+            item_outcomes: Vec::new(),
+            process_exit_code: None,
+            process_tree: None,
+            side_effects: None,
+        };
+        if let Some(denial) = &record.denial {
+            self.observed_denials.push(denial.clone());
+        }
+        self.journal
+            .append(&record)
+            .map_err(|error| format!("strict pre-action journal append failed: {error:#}"))?;
+        Ok(response)
+    }
+}
+
+fn approval_review_request_from_app_server(
+    request: &codex_app_server::ApprovalRequest,
+    workspace: &Path,
+) -> Result<ApprovalReviewRequest> {
+    let action = match request.kind {
+        codex_app_server::ApprovalKind::CommandExecution => {
+            command_action_from_app_server(request, workspace)?
+        }
+        codex_app_server::ApprovalKind::FileChange => {
+            file_action_from_app_server(request, workspace)?
+        }
+        codex_app_server::ApprovalKind::PermissionExpansion => ActionDescriptor::command(
+            CommandInvocation::new("codex-permission-request", std::iter::empty::<&str>())?,
+            CommandClass::ExternalSideEffect,
+            BlastRadius::External,
+            std::iter::empty::<PathAccess>(),
+            false,
+        )?,
+    };
+    let permissions = if request.ceiling_expansion_requested {
+        PermissionRequest::within_ceiling().with_outside_workspace_access()
+    } else {
+        PermissionRequest::within_ceiling()
+    };
+    let mut correlation = Vec::new();
+    correlation.extend_from_slice(request.thread_id.as_bytes());
+    correlation.push(0);
+    correlation.extend_from_slice(request.turn_id.as_bytes());
+    correlation.push(0);
+    correlation.extend_from_slice(request.item_id.as_bytes());
+    let digest = sha256_hex(&correlation);
+    ApprovalReviewRequest::new(
+        format!("request-{digest}"),
+        format!("correction-{digest}"),
+        action,
+        permissions,
+    )
+    .map_err(Into::into)
+}
+
+fn command_action_from_app_server(
+    request: &codex_app_server::ApprovalRequest,
+    workspace: &Path,
+) -> Result<ActionDescriptor> {
+    let invocation = CommandInvocation::new("codex-command", std::iter::empty::<&str>())?;
+    let mut accesses = Vec::new();
+    if let Some(actions) = request
+        .item
+        .get("commandActions")
+        .and_then(serde_json::Value::as_array)
+    {
+        for action in actions {
+            let action_type = action.get("type").and_then(serde_json::Value::as_str);
+            if !matches!(action_type, Some("read" | "listFiles" | "search")) {
+                continue;
+            }
+            let Some(path) = action.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Some(access) = review_path_access(workspace, path, PathAccessMode::Read) {
+                accesses.push(access);
+            }
+        }
+    }
+    // Upstream documents commandActions as best-effort. Even a syntactically complete list is
+    // never authoritative enough for a deterministic allow.
+    ActionDescriptor::command(
+        invocation,
+        CommandClass::Unknown,
+        BlastRadius::WorkspaceWide,
+        accesses,
+        false,
+    )
+    .map_err(Into::into)
+}
+
+fn file_action_from_app_server(
+    request: &codex_app_server::ApprovalRequest,
+    workspace: &Path,
+) -> Result<ActionDescriptor> {
+    let mut accesses = Vec::new();
+    let mut destructive = false;
+    let mut complete = true;
+    let changes = request
+        .item
+        .get("changes")
+        .and_then(serde_json::Value::as_array);
+    let Some(changes) = changes else {
+        return ActionDescriptor::file_change_with_manifest([], false, false).map_err(Into::into);
+    };
+    if changes.is_empty() {
+        complete = false;
+    }
+    for change in changes {
+        let Some(path) = change.get("path").and_then(serde_json::Value::as_str) else {
+            complete = false;
+            continue;
+        };
+        let kind = change
+            .pointer("/kind/type")
+            .and_then(serde_json::Value::as_str);
+        let delete = kind == Some("delete");
+        if !matches!(kind, Some("add" | "delete" | "update")) {
+            complete = false;
+            continue;
+        }
+        destructive |= delete;
+        let mode = if delete {
+            PathAccessMode::Delete
+        } else {
+            PathAccessMode::Write
+        };
+        match review_path_access(workspace, path, mode) {
+            Some(access) => accesses.push(access),
+            None => complete = false,
+        }
+        if let Some(move_path) = change
+            .pointer("/kind/move_path")
+            .and_then(serde_json::Value::as_str)
+        {
+            destructive = true;
+            match review_path_access(workspace, move_path, PathAccessMode::Delete) {
+                Some(access) => accesses.push(access),
+                None => complete = false,
+            }
+        }
+    }
+    ActionDescriptor::file_change_with_manifest(accesses, destructive, complete).map_err(Into::into)
+}
+
+fn review_path_access(workspace: &Path, path: &str, mode: PathAccessMode) -> Option<PathAccess> {
+    let path = Path::new(path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(workspace).ok()?
+    } else {
+        path
+    };
+    PathAccess::new(relative, mode).ok()
+}
+
+struct DuplexProcessAttempt {
+    process: std::result::Result<
+        InteractiveProcessOutput<codex_app_server::AppServerOutcome>,
+        ProcessRunError,
+    >,
+    metrics: ReviewMetricSnapshot,
+    gate_denials: Vec<GateDenial>,
+}
+
+fn run_duplex_app_server_process(
+    process_spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    spec: &ExternalAgentCommand,
+    prompt: String,
+    runtime: &mut ExternalPreActionReviewRuntime<'_>,
+) -> DuplexProcessAttempt {
+    let review_session_id = duplex_review_session_id(runtime.context, spec);
+    let mut reviewer = DuplexApprovalReviewer {
+        context: runtime.context,
+        review_session_id: &review_session_id,
+        journal: runtime.journal,
+        reviewer: PreActionReviewer::default(),
+        observed_denials: Vec::new(),
+        workspace: &spec.cwd,
+    };
+    let turn = codex_app_server::AppServerTurn {
+        cwd: spec.cwd.to_string_lossy().into_owned(),
+        permission_profile: "maco_external_codex".to_string(),
+        prompt,
+        model: spec.model.clone(),
+    };
+    let mut process = run_process_interactive(process_spec, cancellation, |session| {
+        let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
+        let outcome = codex_app_server::run_app_server_turn(
+            &mut transport,
+            &turn,
+            codex_app_server::AppServerLimits {
+                turn_timeout: spec.timeout,
+                ..codex_app_server::AppServerLimits::default()
+            },
+            &mut reviewer,
+            || cancellation.is_cancelled(),
+        )
+        .map_err(|error| error.to_string())?;
+        reviewer
+            .journal
+            .append(&terminal_turn_journal_record(
+                runtime.context.run_id(),
+                &review_session_id,
+                &outcome,
+            ))
+            .map_err(|error| format!("strict turn-terminal journal append failed: {error:#}"))?;
+        Ok(outcome)
+    });
+    if let Ok(result) = &mut process {
+        let terminal_outcome = result.interaction.as_ref().ok();
+        if let Err(error) = reviewer.journal.append(&terminal_process_journal_record(
+            runtime.context.run_id(),
+            &review_session_id,
+            terminal_outcome,
+            &result.process,
+        )) {
+            result.interaction = Err(format!(
+                "strict process-terminal journal append failed: {error:#}"
+            ));
+        }
+    }
+    let metrics = reviewer.reviewer.metrics();
+    DuplexProcessAttempt {
+        process,
+        metrics,
+        gate_denials: reviewer.observed_denials,
+    }
+}
+
+fn duplex_review_session_id(context: &ReviewContext, spec: &ExternalAgentCommand) -> String {
+    let mut material = Vec::new();
+    material.extend_from_slice(context.run_id().as_bytes());
+    material.push(0);
+    material.extend_from_slice(context.owner().as_bytes());
+    material.push(0);
+    material.extend_from_slice(spec.prompt.as_os_str().as_encoded_bytes());
+    format!("review-{}", sha256_hex(&material))
+}
+
+fn terminal_turn_journal_record(
+    run_id: &str,
+    review_session_id: &str,
+    outcome: &codex_app_server::AppServerOutcome,
+) -> PreActionJournalRecord {
+    PreActionJournalRecord {
+        version: PRE_ACTION_JOURNAL_VERSION,
+        run_id: run_id.to_string(),
+        review_session_id: review_session_id.to_string(),
+        phase: PreActionJournalPhase::TurnTerminal,
+        thread_id: Some(outcome.thread_id.clone()),
+        turn_id: Some(outcome.turn_id.clone()),
+        item_id: None,
+        request: None,
+        decision_source: None,
+        decision_latency_ms: None,
+        rationale: PreActionJournalRationale::TerminalEvidence,
+        allowed: None,
+        denial: None,
+        turn_status: Some(outcome.status),
+        item_outcomes: outcome.item_outcomes.clone(),
+        process_exit_code: None,
+        process_tree: None,
+        side_effects: None,
+    }
+}
+
+fn terminal_process_journal_record(
+    run_id: &str,
+    review_session_id: &str,
+    outcome: Option<&codex_app_server::AppServerOutcome>,
+    process: &ProcessOutput,
+) -> PreActionJournalRecord {
+    PreActionJournalRecord {
+        version: PRE_ACTION_JOURNAL_VERSION,
+        run_id: run_id.to_string(),
+        review_session_id: review_session_id.to_string(),
+        phase: PreActionJournalPhase::ProcessTerminal,
+        thread_id: outcome.map(|value| value.thread_id.clone()),
+        turn_id: outcome.map(|value| value.turn_id.clone()),
+        item_id: None,
+        request: None,
+        decision_source: None,
+        decision_latency_ms: None,
+        rationale: PreActionJournalRationale::TerminalEvidence,
+        allowed: None,
+        denial: None,
+        turn_status: outcome.map(|value| value.status),
+        item_outcomes: outcome
+            .map(|value| value.item_outcomes.clone())
+            .unwrap_or_default(),
+        process_exit_code: process.status.and_then(|status| status.code()),
+        process_tree: Some(process.process_tree),
+        side_effects: Some(process.side_effects),
+    }
 }
 
 struct CompletedTargetContext<'a> {
@@ -2662,6 +3243,70 @@ fn codex_hardened_argv(
     argv
 }
 
+/// Production writable-Codex app-server launch arguments.
+fn codex_app_server_argv(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+) -> Vec<OsString> {
+    let filesystem_permissions = codex_filesystem_permissions(spec, controls);
+    let mut argv = vec![
+        OsString::from("app-server"),
+        OsString::from("--stdio"),
+        OsString::from("--strict-config"),
+        OsString::from("-c"),
+        OsString::from("approval_policy=\"on-request\""),
+        OsString::from("-c"),
+        OsString::from("approvals_reviewer=\"user\""),
+        OsString::from("-c"),
+        OsString::from("default_permissions=\"maco_external_codex\""),
+        OsString::from("-c"),
+        OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+        OsString::from("-c"),
+        OsString::from(filesystem_permissions),
+        OsString::from("-c"),
+        OsString::from("shell_environment_policy.inherit=\"none\""),
+        OsString::from("-c"),
+        OsString::from(
+            "shell_environment_policy.set={PATH=\"/run/current-system/sw/bin:/usr/bin:/bin\"}",
+        ),
+        OsString::from("-c"),
+        OsString::from("web_search=\"disabled\""),
+        // app-server has no --ignore-rules flag. A private CODEX_HOME prevents ambient user config,
+        // while a zero project-doc budget prevents workspace rule discovery.
+        OsString::from("-c"),
+        OsString::from("project_doc_max_bytes=0"),
+    ];
+    for feature in [
+        "apps",
+        "plugins",
+        "hooks",
+        "in_app_browser",
+        "browser_use",
+        "browser_use_full_cdp_access",
+        "browser_use_external",
+        "computer_use",
+        "image_generation",
+    ] {
+        argv.push(OsString::from("--disable"));
+        argv.push(OsString::from(feature));
+    }
+    if let Some(model) = &spec.model {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model={}",
+            toml_basic_string(model)
+        )));
+    }
+    if let Some(reasoning_effort) = &spec.reasoning_effort {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model_reasoning_effort={}",
+            toml_basic_string(reasoning_effort)
+        )));
+    }
+    argv
+}
+
 fn codex_filesystem_permissions(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
@@ -2933,6 +3578,599 @@ mod tests {
     use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
     use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
 
+    #[derive(Default)]
+    struct RecordingPreActionJournal {
+        records: Vec<PreActionJournalRecord>,
+        fail: bool,
+    }
+
+    impl PreActionJournalSink for RecordingPreActionJournal {
+        fn append(&mut self, record: &PreActionJournalRecord) -> Result<()> {
+            if self.fail {
+                bail!("injected journal failure");
+            }
+            self.records.push(record.clone());
+            Ok(())
+        }
+    }
+
+    fn test_review_context() -> ReviewContext {
+        ReviewContext::new(
+            "issue28-test",
+            "worker-a",
+            "review bounded changes",
+            [crate::pre_action_review::RepoPathRule::exact("README.md").expect("claim")],
+            std::iter::empty::<crate::pre_action_review::RepoPathRule>(),
+        )
+        .expect("review context")
+    }
+
+    #[test]
+    fn production_adapter_fails_closed_for_incomplete_file_and_command_manifests() {
+        let context = test_review_context();
+        let mut journal = RecordingPreActionJournal::default();
+        let mut reviewer = DuplexApprovalReviewer {
+            context: &context,
+            review_session_id: "review-test",
+            journal: &mut journal,
+            reviewer: PreActionReviewer::default(),
+            observed_denials: Vec::new(),
+            workspace: Path::new("/workspace"),
+        };
+        let file_response = codex_app_server::ApprovalReviewer::review(
+            &mut reviewer,
+            codex_app_server::ApprovalRequest {
+                kind: codex_app_server::ApprovalKind::FileChange,
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "file-1".to_string(),
+                command: None,
+                cwd: Some("/workspace".to_string()),
+                reason: Some("missing changes".to_string()),
+                ceiling_expansion_requested: false,
+                item: serde_json::json!({
+                    "id": "file-1",
+                    "type": "fileChange",
+                    "status": "inProgress"
+                }),
+                raw_params: serde_json::json!({}),
+            },
+        )
+        .expect("file review");
+        assert_eq!(
+            file_response.decision,
+            codex_app_server::ApprovalDecision::Decline
+        );
+
+        let command_response = codex_app_server::ApprovalReviewer::review(
+            &mut reviewer,
+            codex_app_server::ApprovalRequest {
+                kind: codex_app_server::ApprovalKind::CommandExecution,
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "command-1".to_string(),
+                command: Some("sed -n 1p /workspace/README.md".to_string()),
+                cwd: Some("/workspace".to_string()),
+                reason: None,
+                ceiling_expansion_requested: false,
+                item: serde_json::json!({
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "status": "inProgress",
+                    "command": "sed -n 1p /workspace/README.md",
+                    "cwd": "/workspace",
+                    "commandActions": [{
+                        "type": "read",
+                        "command": "sed",
+                        "name": "README.md",
+                        "path": "/workspace/README.md"
+                    }]
+                }),
+                raw_params: serde_json::json!({}),
+            },
+        )
+        .expect("command review");
+        assert_eq!(
+            command_response.decision,
+            codex_app_server::ApprovalDecision::Decline
+        );
+        drop(reviewer);
+
+        assert_eq!(journal.records.len(), 2);
+        for record in &journal.records {
+            let request = record.request.as_ref().expect("redacted request");
+            assert!(!request.action.access_manifest_complete);
+            assert_eq!(record.decision_source, Some(DecisionSource::Classifier));
+            assert_eq!(record.allowed, Some(false));
+        }
+        assert_eq!(
+            journal.records[1]
+                .request
+                .as_ref()
+                .expect("command request")
+                .action
+                .accesses[0]
+                .mode(),
+            PathAccessMode::Read
+        );
+    }
+
+    #[test]
+    fn strict_journal_failure_prevents_an_allow_response() {
+        let context = test_review_context();
+        let mut journal = RecordingPreActionJournal {
+            records: Vec::new(),
+            fail: true,
+        };
+        let mut reviewer = DuplexApprovalReviewer {
+            context: &context,
+            review_session_id: "review-test",
+            journal: &mut journal,
+            reviewer: PreActionReviewer::default(),
+            observed_denials: Vec::new(),
+            workspace: Path::new("/workspace"),
+        };
+        let result = codex_app_server::ApprovalReviewer::review(
+            &mut reviewer,
+            codex_app_server::ApprovalRequest {
+                kind: codex_app_server::ApprovalKind::FileChange,
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "file-allow".to_string(),
+                command: None,
+                cwd: Some("/workspace".to_string()),
+                reason: None,
+                ceiling_expansion_requested: false,
+                item: serde_json::json!({
+                    "id": "file-allow",
+                    "type": "fileChange",
+                    "status": "inProgress",
+                    "changes": [{
+                        "path": "README.md",
+                        "kind": {"type": "update"},
+                        "diff": "bounded"
+                    }]
+                }),
+                raw_params: serde_json::json!({}),
+            },
+        );
+        assert!(result.is_err_and(|message| message.contains("journal append failed")));
+    }
+
+    #[test]
+    fn current_protocol_refuses_writable_production_release() {
+        let error =
+            validate_universal_pre_action_coverage().expect_err("coverage gap must fail closed");
+        assert!(error
+            .to_string()
+            .contains("does not guarantee a blocking MACO callback"));
+    }
+
+    fn contained_fake_app_server(
+        mode: &str,
+        journal: &mut RecordingPreActionJournal,
+        containment: crate::process_runner::ContainmentPolicy,
+    ) -> std::result::Result<
+        (
+            InteractiveProcessOutput<codex_app_server::AppServerOutcome>,
+            ReviewMetricSnapshot,
+            Vec<GateDenial>,
+            PathBuf,
+        ),
+        ProcessRunError,
+    > {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.keep();
+        let marker = workspace.join("post-approval-action");
+        let python = [
+            PathBuf::from("/run/current-system/sw/bin/python3"),
+            PathBuf::from("/usr/bin/python3"),
+            PathBuf::from("/bin/python3"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("trusted python3");
+        let script = r#"
+import json, pathlib, sys
+mode, marker = sys.argv[1], pathlib.Path(sys.argv[2])
+def receive():
+    line = sys.stdin.readline()
+    assert line, "unexpected client EOF"
+    return json.loads(line)
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+initialize = receive()
+assert initialize["method"] == "initialize"
+send({"id": initialize["id"], "result": {}})
+assert receive()["method"] == "initialized"
+thread_start = receive()
+assert thread_start["method"] == "thread/start"
+assert thread_start["params"]["approvalsReviewer"] == "user"
+send({"id": thread_start["id"], "result": {
+    "thread": {"id": "thread-contained"},
+    "approvalPolicy": "on-request",
+    "approvalsReviewer": "user",
+    "activePermissionProfile": {"id": "maco_external_codex"},
+    "cwd": sys.argv[3]
+}})
+turn_start = receive()
+assert turn_start["method"] == "turn/start"
+assert turn_start["params"]["approvalsReviewer"] == "user"
+send({"id": turn_start["id"], "result": {
+    "turn": {"id": "turn-contained", "status": "inProgress"}
+}})
+send({"method": "turn/started", "params": {
+    "threadId": "thread-contained",
+    "turn": {"id": "turn-contained", "status": "inProgress"}
+}})
+item = {"id": "item-contained", "type": "fileChange", "status": "inProgress"}
+if mode == "accept":
+    item["changes"] = [{
+        "path": "README.md",
+        "kind": {"type": "update"},
+        "diff": "bounded"
+    }]
+send({"method": "item/started", "params": {
+    "threadId": "thread-contained",
+    "turnId": "turn-contained",
+    "item": item
+}})
+send({"id": 77, "method": "item/fileChange/requestApproval", "params": {
+    "threadId": "thread-contained",
+    "turnId": "turn-contained",
+    "itemId": "item-contained",
+    "startedAtMs": 1,
+    "reason": "incomplete manifest"
+}})
+first = receive()
+if mode in ("decline", "protocol_loss"):
+    assert first["method"] == "turn/steer"
+    assert first["params"]["threadId"] == "thread-contained"
+    assert first["params"]["expectedTurnId"] == "turn-contained"
+    assert "turnId" not in first["params"]
+    assert first["params"]["input"][0]["text"].startswith("MACO_GATE_DENIAL_V1\n")
+    send({"id": first["id"], "result": {}})
+    decision = receive()
+    assert decision["id"] == 77
+    assert decision["result"]["decision"] == "decline"
+    if decision["result"]["decision"] == "accept":
+        marker.touch()
+    if mode == "protocol_loss":
+        sys.exit(0)
+    send({"method": "item/completed", "params": {
+        "threadId": "thread-contained",
+        "turnId": "turn-contained",
+        "completedAtMs": 2,
+        "item": {"id": "item-contained", "type": "fileChange", "status": "declined"}
+    }})
+    send({"method": "turn/completed", "params": {
+        "threadId": "thread-contained",
+        "turn": {"id": "turn-contained", "status": "completed", "items": []}
+    }})
+elif mode == "accept":
+    assert first["id"] == 77
+    assert first["result"]["decision"] == "accept"
+    marker.touch()
+    send({"method": "item/completed", "params": {
+        "threadId": "thread-contained",
+        "turnId": "turn-contained",
+        "completedAtMs": 2,
+        "item": {"id": "item-contained", "type": "fileChange", "status": "completed"}
+    }})
+    send({"method": "turn/completed", "params": {
+        "threadId": "thread-contained",
+        "turn": {"id": "turn-contained", "status": "completed", "items": []}
+    }})
+else:
+    assert first["id"] == 77
+    assert first["result"]["decision"] == "cancel"
+    if first["result"]["decision"] == "accept":
+        marker.touch()
+"#;
+        let script_path = workspace.join("fake-app-server.py");
+        fs::write(&script_path, script).expect("write contained fake app-server fixture");
+        let process_spec = ProcessSpec::direct(
+            "contained fake app-server",
+            &python,
+            [
+                script_path.as_os_str().to_os_string(),
+                OsString::from(mode),
+                marker.as_os_str().to_os_string(),
+                workspace.as_os_str().to_os_string(),
+            ],
+            &workspace,
+            256 * 1024,
+        )
+        .with_stdin_limit(256 * 1024)
+        .with_timeout(Some(Duration::from_secs(5)))
+        .with_containment(containment);
+        let spec = ExternalAgentCommand::codex(
+            &python,
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join("events.jsonl"),
+            workspace.join("report.json"),
+            Duration::from_secs(5),
+        );
+        let context = test_review_context();
+        let mut runtime = ExternalPreActionReviewRuntime {
+            context: &context,
+            journal,
+        };
+        let attempt = run_duplex_app_server_process(
+            process_spec,
+            &ProcessCancellation::new(),
+            &spec,
+            "bounded task".to_string(),
+            &mut runtime,
+        );
+        Ok((
+            attempt.process?,
+            attempt.metrics,
+            attempt.gate_denials,
+            marker,
+        ))
+    }
+
+    fn nonpublishable_trusted_compatibility_fake_app_server(
+        mode: &str,
+        journal: &mut RecordingPreActionJournal,
+    ) -> (
+        InteractiveProcessOutput<codex_app_server::AppServerOutcome>,
+        ReviewMetricSnapshot,
+        Vec<GateDenial>,
+        PathBuf,
+    ) {
+        contained_fake_app_server(
+            mode,
+            journal,
+            crate::process_runner::ContainmentPolicy::TrustedBestEffort,
+        )
+        .expect("trusted compatibility fake app-server process")
+    }
+
+    #[test]
+    fn nonpublishable_trusted_compatibility_fake_delivers_denial_before_decline() {
+        let mut journal = RecordingPreActionJournal::default();
+        let (result, metrics, gate_denials, marker) =
+            nonpublishable_trusted_compatibility_fake_app_server("decline", &mut journal);
+
+        if let Err(error) = &result.interaction {
+            panic!(
+                "completed duplex outcome: {error}; child stderr: {:?}",
+                result.process.stderr.summarize_chars(2048)
+            );
+        }
+        let outcome = result.interaction.expect("completed duplex outcome");
+        assert_eq!(outcome.thread_id, "thread-contained");
+        assert_eq!(outcome.turn_id, "turn-contained");
+        assert_eq!(outcome.gate_denials.len(), 1);
+        assert_eq!(gate_denials, outcome.gate_denials);
+        assert!(!marker.exists());
+        assert!(result.process.status.is_some_and(|status| status.success()));
+        assert!(matches!(
+            result.process.process_tree,
+            ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        ));
+        assert_eq!(journal.records.len(), 3);
+        assert_eq!(
+            journal
+                .records
+                .iter()
+                .map(|record| record.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                PreActionJournalPhase::ReviewDecision,
+                PreActionJournalPhase::TurnTerminal,
+                PreActionJournalPhase::ProcessTerminal
+            ]
+        );
+        assert!(journal
+            .records
+            .windows(2)
+            .all(|pair| pair[0].run_id == pair[1].run_id
+                && pair[0].review_session_id == pair[1].review_session_id));
+        assert!(journal.records[0].decision_latency_ms.is_some());
+        assert_eq!(
+            journal.records[0].rationale,
+            PreActionJournalRationale::ClassifierFailClosed
+        );
+        assert_eq!(metrics.reviewed_action_denials.denominator, 1);
+        assert_eq!(metrics.reviewed_action_denials.numerator, 1);
+    }
+
+    #[test]
+    fn nonpublishable_trusted_compatibility_fake_journals_before_marker() {
+        let mut journal = RecordingPreActionJournal::default();
+        let (result, metrics, gate_denials, marker) =
+            nonpublishable_trusted_compatibility_fake_app_server("accept", &mut journal);
+
+        let outcome = result.interaction.expect("completed duplex outcome");
+        assert!(outcome.gate_denials.is_empty());
+        assert!(gate_denials.is_empty());
+        assert!(marker.exists());
+        assert!(result.process.status.is_some_and(|status| status.success()));
+        assert!(matches!(
+            result.process.process_tree,
+            ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        ));
+        assert_eq!(journal.records.len(), 3);
+        assert_eq!(
+            journal.records[0].phase,
+            PreActionJournalPhase::ReviewDecision
+        );
+        assert_eq!(journal.records[0].allowed, Some(true));
+        assert_eq!(
+            journal.records[0].rationale,
+            PreActionJournalRationale::DeterministicPolicyAllow
+        );
+        assert!(journal.records[0].decision_latency_ms.is_some());
+        assert_eq!(metrics.reviewed_action_denials.denominator, 1);
+        assert_eq!(metrics.reviewed_action_denials.numerator, 0);
+    }
+
+    #[test]
+    fn nonpublishable_trusted_compatibility_fake_journal_failure_cancels() {
+        let mut journal = RecordingPreActionJournal {
+            records: Vec::new(),
+            fail: true,
+        };
+        let (result, metrics, gate_denials, marker) =
+            nonpublishable_trusted_compatibility_fake_app_server("cancel", &mut journal);
+
+        assert!(result.interaction.is_err());
+        assert!(!marker.exists());
+        assert!(result.process.status.is_some_and(|status| status.success()));
+        assert!(matches!(
+            result.process.process_tree,
+            ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        ));
+        assert!(journal.records.is_empty());
+        assert_eq!(gate_denials.len(), 1);
+        assert_eq!(metrics.reviewed_action_denials.denominator, 1);
+    }
+
+    #[test]
+    fn nonpublishable_trusted_compatibility_protocol_loss_retains_evidence() {
+        let mut journal = RecordingPreActionJournal::default();
+        let (result, metrics, gate_denials, marker) =
+            nonpublishable_trusted_compatibility_fake_app_server("protocol_loss", &mut journal);
+
+        assert!(result.interaction.is_err());
+        assert!(!marker.exists());
+        assert_eq!(gate_denials.len(), 1);
+        assert_eq!(
+            journal
+                .records
+                .iter()
+                .map(|record| record.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                PreActionJournalPhase::ReviewDecision,
+                PreActionJournalPhase::ProcessTerminal
+            ]
+        );
+        assert_eq!(
+            journal.records[0].review_session_id,
+            journal.records[1].review_session_id
+        );
+        assert_eq!(journal.records[0].run_id, journal.records[1].run_id);
+        assert!(journal.records[1].thread_id.is_none());
+        assert!(journal.records[1].turn_id.is_none());
+        assert!(!journal.records[1].review_session_id.is_empty());
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ExternalAgentCommand::codex(
+            "codex",
+            temp.path(),
+            temp.path().join("prompt"),
+            temp.path().join("events"),
+            temp.path().join("report"),
+            Duration::from_secs(1),
+        );
+        let mut report = failed_external_run(
+            &spec,
+            Instant::now(),
+            vec!["codex".to_string()],
+            false,
+            "protocol loss".to_string(),
+        );
+        report.stdout.run_metadata.gate_denials = gate_denials.clone();
+        report.stdout.run_metadata.pre_action_review_metrics = Some(metrics.clone());
+        let serialized = serde_json::to_vec(&report).expect("serialize retained review evidence");
+        let restored: ExternalAgentRun =
+            serde_json::from_slice(&serialized).expect("deserialize retained review evidence");
+        assert_eq!(restored.gate_denials(), gate_denials);
+        assert_eq!(restored.pre_action_review_metrics(), Some(&metrics));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_contained_fake_app_server_proves_duplex_ordering_and_confinement() {
+        let mut allow_journal = RecordingPreActionJournal::default();
+        let (allow, allow_metrics, allow_denials, allow_marker) = match contained_fake_app_server(
+            "accept",
+            &mut allow_journal,
+            crate::process_runner::ContainmentPolicy::Required,
+        ) {
+            Ok(result) => result,
+            Err(ProcessRunError::ContainmentUnavailable { .. }) => return,
+            Err(error) => panic!("verified fake app-server capability probe failed: {error:?}"),
+        };
+        assert!(allow.process.safety_evidence_verified());
+        assert!(allow.process.process_tree.is_verified_empty());
+        assert!(allow.process.side_effects.is_verified());
+        assert!(allow.interaction.is_ok());
+        assert!(allow_marker.exists());
+        assert!(allow_denials.is_empty());
+        assert_eq!(allow_journal.records[0].allowed, Some(true));
+        assert_eq!(allow_metrics.reviewed_action_denials.denominator, 1);
+
+        let mut decline_journal = RecordingPreActionJournal::default();
+        let (decline, decline_metrics, decline_denials, decline_marker) =
+            contained_fake_app_server(
+                "decline",
+                &mut decline_journal,
+                crate::process_runner::ContainmentPolicy::Required,
+            )
+            .expect("verified denial fake app-server");
+        assert!(decline.process.safety_evidence_verified());
+        assert!(decline.process.process_tree.is_verified_empty());
+        assert!(decline.process.side_effects.is_verified());
+        let decline_outcome = decline.interaction.expect("denial protocol outcome");
+        assert_eq!(decline_outcome.gate_denials, decline_denials);
+        assert_eq!(decline_denials.len(), 1);
+        assert!(!decline_marker.exists());
+        assert_eq!(decline_journal.records[0].allowed, Some(false));
+        assert_eq!(decline_metrics.reviewed_action_denials.numerator, 1);
+
+        let mut failed_journal = RecordingPreActionJournal {
+            records: Vec::new(),
+            fail: true,
+        };
+        let (cancel, cancel_metrics, cancel_denials, cancel_marker) = contained_fake_app_server(
+            "cancel",
+            &mut failed_journal,
+            crate::process_runner::ContainmentPolicy::Required,
+        )
+        .expect("verified journal-failure fake app-server");
+        assert!(cancel.process.safety_evidence_verified());
+        assert!(cancel.process.process_tree.is_verified_empty());
+        assert!(cancel.process.side_effects.is_verified());
+        assert!(cancel.interaction.is_err());
+        assert_eq!(cancel_denials.len(), 1);
+        assert!(!cancel_marker.exists());
+        assert!(failed_journal.records.is_empty());
+        assert_eq!(cancel_metrics.reviewed_action_denials.denominator, 1);
+
+        let mut loss_journal = RecordingPreActionJournal::default();
+        let (loss, loss_metrics, loss_denials, loss_marker) = contained_fake_app_server(
+            "protocol_loss",
+            &mut loss_journal,
+            crate::process_runner::ContainmentPolicy::Required,
+        )
+        .expect("verified protocol-loss fake app-server");
+        assert!(loss.process.safety_evidence_verified());
+        assert!(loss.process.process_tree.is_verified_empty());
+        assert!(loss.process.side_effects.is_verified());
+        assert!(loss.interaction.is_err());
+        assert_eq!(loss_denials.len(), 1);
+        assert!(!loss_marker.exists());
+        assert_eq!(loss_metrics.reviewed_action_denials.numerator, 1);
+        assert_eq!(
+            loss_journal
+                .records
+                .iter()
+                .map(|record| record.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                PreActionJournalPhase::ReviewDecision,
+                PreActionJournalPhase::ProcessTerminal
+            ]
+        );
+    }
+
     fn create_mandatory_control_roots(workspace: &Path) -> Result<()> {
         fs::create_dir_all(workspace)?;
         fs::create_dir_all(workspace.join(".git"))?;
@@ -3040,6 +4278,84 @@ mod tests {
         assert!(!actual
             .iter()
             .any(|argument| argument == "web_search=\"live\""));
+    }
+
+    #[test]
+    fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        );
+        let controls =
+            protected_worktree_controls(&command).unwrap_or_else(|_| ProtectedWorktreeControls {
+                writable_artifact_root: Some(PathBuf::from("/run")),
+                ..ProtectedWorktreeControls::default()
+            });
+        let actual = codex_app_server_argv(&command, &controls)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual
+                .get(0..3)
+                .map(|arguments| arguments.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["app-server", "--stdio", "--strict-config"])
+        );
+        for required in [
+            "approval_policy=\"on-request\"",
+            "approvals_reviewer=\"user\"",
+            "default_permissions=\"maco_external_codex\"",
+            "permissions.maco_external_codex.network={enabled=false}",
+            "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"},\"/run\"=\"write\"}",
+            "shell_environment_policy.inherit=\"none\"",
+            "web_search=\"disabled\"",
+            "project_doc_max_bytes=0",
+        ] {
+            assert!(
+                actual.iter().any(|argument| argument == required),
+                "missing bounded app-server argument {required}"
+            );
+        }
+        assert!(!actual.iter().any(|argument| {
+            argument.contains("enabled=true")
+                || argument.contains("danger-full-access")
+                || argument == "--add-dir"
+        }));
+    }
+
+    #[test]
+    fn app_server_capability_uses_the_existing_external_codex_profile() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        create_mandatory_control_roots(&workspace)?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir_all(&incoming)?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join(".maco/events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        );
+        let controls = protected_worktree_controls(&command)?;
+        let profile = external_side_effect_profile(
+            &command,
+            Path::new("/run/current-system/sw/bin/codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+
+        assert_eq!(
+            profile.kind(),
+            SideEffectConfinementProfileKind::ExternalCodex
+        );
+        Ok(())
     }
 
     #[test]
@@ -4356,7 +5672,8 @@ mod tests {
             temp.path().join("events.jsonl"),
             incoming.join("last-message.txt"),
             Duration::ZERO,
-        );
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly);
 
         let report = run_external_agent(&spec);
 

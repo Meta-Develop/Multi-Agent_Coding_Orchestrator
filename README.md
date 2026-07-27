@@ -68,11 +68,13 @@ The current implementation covers a local-first command-line slice:
   task or JSON plan form, while `maco supervise plan --from-goal <file>`
   explicitly decomposes a high-level goal/spec into a validated full supervisor
   plan.
-- `maco supervise run` uses the Codex runtime by default and is supported. It
-  internally acquires the repository-cleanliness capability and creates
-  capability-bound managed child worktrees. The in-process Fake file-entry
-  simulation path returns `Unsupported`. `maco supervise plan/status/collect`
-  remain available. The
+- `maco supervise run` selects the Codex runtime by default, but verified
+  writable child release currently fails closed before launch because the
+  Codex 0.144.4 app-server protocol cannot force a blocking client callback for
+  every in-sandbox action. It still acquires the repository-cleanliness
+  capability and creates capability-bound managed child worktrees before that
+  safety gate. The in-process Fake file-entry simulation path returns
+  `Unsupported`. `maco supervise plan/status/collect` remain available. The
   supervisor scheduler launches opt-in O1 child orchestrators through the
   Codex CLI in isolated child worktrees under an O2 supervisor, with
   automatic resource-bounded fan-out as the default. It measures host capacity
@@ -1799,7 +1801,7 @@ Run an opt-in supervisor-of-orchestrators plan:
 cargo run -- supervise plan --from-goal goal.md --repo . --json
 # Preserve the positional form for either plain-text tasks or authored JSON plans:
 cargo run -- supervise plan supervisor-plan.json --repo . --json
-# Uses the supported default Codex runtime and automatic resource-bounded fan-out:
+# Selects the default Codex runtime; writable child release currently fails closed:
 cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo --codex-bin codex --json
 # Explicit serial opt-out:
 cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-serial --codex-bin codex --max-concurrent-children 1 --json
@@ -1856,13 +1858,16 @@ surface: supervisor plan validation already rejected an empty `assignments`
 array. The run path continues to use that library validation and does not
 reimplement a second empty-plan check.
 
-`maco supervise run` is supported with the default Codex runtime. Its file-entry
-path internally acquires the repository-cleanliness capability used to create
-managed child worktrees, then shells out to the configured Codex-compatible
-executable, claims each assignment's paths, records semantic coordination
+`maco supervise run` has a default Codex runtime, but this release does not
+claim writable production child execution. Its file-entry path internally
+acquires the repository-cleanliness capability used to create managed child
+worktrees, claims each assignment's paths, records semantic coordination
 metadata when the plan requests it, and writes structured logs and reports
-under the run directory. The in-process Fake file-entry simulation path instead
-returns `Unsupported` before repository access or artifact reservation.
+under the run directory. Before releasing a writable Codex child it applies the
+Issue 28 universal-review coverage gate described below; with the current
+protocol that gate refuses launch. The in-process Fake file-entry simulation
+path instead returns `Unsupported` before repository access or artifact
+reservation.
 Child/model final-message bytes are confined to `incoming/`; normalized child
 reports and `supervisor-final.json` are parent-owned under `reports/`. Only the
 incoming root is granted writable to an external child. The parent retains file
@@ -1909,6 +1914,52 @@ the same validated MACO launch path instead of invoking a raw Codex process or
 selecting a broader sandbox mode. The ordinary workspace-write profile is not
 used for these chains because nested Codex state DB access can collide, corrupt,
 or fail under workspace-scoped restrictions.
+
+### Duplex pre-action review boundary
+
+Issue 28 adds a crate-internal, line-oriented app-server transport over the
+ordinary contained process runner. The protocol handler receives only a
+bounded borrowed session after executable validation, containment attachment,
+lifecycle registration, tee setup, and the start gate. It cannot obtain or
+retain `Child`, raw stdio handles, or an uncontained `Command`. The writable
+app-server configuration selects `approvals_reviewer="user"`; the upstream
+`auto_review` mode remains experiment evidence only.
+
+The live Codex 0.144.4 schema exposes client callbacks for approval requests
+that Codex chooses to surface. `AskForApproval` has no mode that forces every
+in-sandbox read, write, destructive operation, or tool action through the
+client. Consequently, approval callbacks alone cannot prove universal
+review-before-action, including for sensitive reads, and a static filesystem
+sandbox cannot distinguish an allowed claimed write from a forbidden delete
+of that same path. MACO therefore refuses verified writable production release
+before starting the child. Removing this gate requires a future protocol
+mechanism that blocks every relevant proposed action; the existing callback
+tests are not evidence that such coverage already exists.
+
+For surfaced requests, the retained duplex implementation derives policy input
+from server lifecycle items, never treats best-effort or missing manifests as a
+deterministic allow, appends a redacted authenticated orchestration-journal
+record before sending `accept`, and sends a typed `GateDenial` to the same
+thread and expected turn before `decline` or `cancel`. The denied item and turn
+cannot terminalize until that steer request is acknowledged. Journal failure,
+malformed protocol, timeout, cancellation, permission expansion, and missing
+manifest all fail closed. Trusted records carry a stable run/review-session
+correlation, structured rationale, measured per-decision latency, terminal
+item/turn/process evidence, and native review metrics with distinct
+action-denial and eligible-run-interruption denominators plus measured p50/p95.
+
+Focused tests run a fake app-server as a real subprocess through the same
+interactive runner. The Linux required-containment variant proves both
+`VerifiedEmpty` process-tree evidence and verified strict-offline-workspace
+side-effect evidence while exercising journal-before-accept ordering, typed
+denial/acknowledgement before decline on the same child, absence of a
+post-approval action marker on denial or journal failure, and protocol-loss
+evidence retention. It skips only when required containment itself is
+unavailable; ownership or protocol failures remain failures. Separate
+trusted-best-effort compatibility tests are explicitly nonpublishable and do
+not claim verified evidence. These tests validate the bounded duplex path; they
+do not claim that current Codex provides universal writable production
+interception.
 
 For worker assignments, child orchestrators should use Codex native
 SubAgent/delegated-worker mechanisms when available only for terminal worker or
