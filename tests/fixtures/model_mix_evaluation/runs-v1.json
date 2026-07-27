@@ -1,0 +1,2018 @@
+{
+  "version": 1,
+  "manifest_version": 1,
+  "experiment_id": "issue26-phase-a-readme-v1",
+  "fake_seed": 26,
+  "evidence": {
+    "kind": "provisional_deterministic_fake_only",
+    "plan_basis": "hand_authored",
+    "real_provider_executed": false,
+    "observed_isolated_repository_state": false,
+    "requirement_four_comparability": "not_established_deferred_to_phase_b",
+    "eligible_for_production_economics": false,
+    "eligible_to_justify_named_default": false,
+    "eligible_for_production_or_default_decisions": false,
+    "notice": "provisional deterministic fake evidence over a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 comparability is not established and is deferred to Phase B; ineligible for production or default decisions"
+  },
+  "declared_inputs": {
+    "target": {
+      "spec_or_goal_id": "readme-model-mix-note-v1",
+      "spec_or_goal_digest": "sha256:2248287b2efaaf7ea6a7af665e432fa29da2678c89823b3ca17fd99306140b24",
+      "hand_authored_plan_digest": "sha256:33aa49c0f72bd7e8b8be5ee706bdac3840e9807c9d789821033f7d23a47378ce"
+    },
+    "repository_base_snapshot": "9f92b3eeba21fa0e13a147a460bf7275a7c411a0",
+    "limits": {
+      "wall_time_seconds": 900,
+      "max_dispatches": 4
+    },
+    "held_out_validation": [
+      {
+        "id": "readme-contract",
+        "command": [
+          "cargo",
+          "test",
+          "evaluation::tests::committed_fixtures_match_the_deterministic_harness"
+        ]
+      },
+      {
+        "id": "provider-boundary",
+        "command": [
+          "cargo",
+          "test",
+          "evaluation::tests::real_provider_execution_has_opt_in_and_phase_a_refusal_gates"
+        ]
+      }
+    ],
+    "profiles": [
+      {
+        "id": "frontier-all-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      },
+      {
+        "id": "hybrid-frontier-economy-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-frontier-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      },
+      {
+        "id": "balanced-all-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-balanced-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      },
+      {
+        "id": "economy-all-v1",
+        "role_models": {
+          "supervisor": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "high"
+          },
+          "child_orchestrator": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "high"
+          },
+          "worker": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "medium"
+          },
+          "auditor": {
+            "model": "fake-economy-v1",
+            "reasoning_effort": "high"
+          }
+        }
+      }
+    ]
+  },
+  "declared_inputs_digest": "fnv1a64:e7da008318253760",
+  "runs": [
+    {
+      "profile_id": "frontier-all-v1",
+      "repetition": 0,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-0"
+      },
+      "execution": {
+        "observed_dispatch_count": 1,
+        "outcome": "success",
+        "error_evidence": null
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 742,
+              "output_tokens": 623,
+              "total_tokens": 1365
+            },
+            "cost_usd": 0.00595763,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1568,
+              "output_tokens": 847,
+              "total_tokens": 2415
+            },
+            "cost_usd": 0.011533269999999998,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 881,
+              "output_tokens": 309,
+              "total_tokens": 1190
+            },
+            "cost_usd": 0.00610459,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1256,
+              "output_tokens": 656,
+              "total_tokens": 1912
+            },
+            "cost_usd": 0.009187840000000001,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4447,
+          "output_tokens": 2435,
+          "total_tokens": 6882
+        },
+        "total_cost_usd": 0.03278333,
+        "wall_time_ms": 52037,
+        "churn_count": 10,
+        "conflict_count": 3,
+        "loc_added": 129,
+        "loc_deleted": 140,
+        "diff_bytes": 10219,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 4,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 5,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 4
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 2 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8181,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 6666,
+          "overall_basis_points": 8257
+        }
+      }
+    },
+    {
+      "profile_id": "frontier-all-v1",
+      "repetition": 1,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-1"
+      },
+      "execution": {
+        "observed_dispatch_count": 1,
+        "outcome": "failure",
+        "error_evidence": {
+          "message": "deterministic fake repetition reported a synthetic failure",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1037,
+              "output_tokens": 513,
+              "total_tokens": 1550
+            },
+            "cost_usd": 0.007521429999999999,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 928,
+              "output_tokens": 515,
+              "total_tokens": 1443
+            },
+            "cost_usd": 0.0068566700000000005,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1627,
+              "output_tokens": 348,
+              "total_tokens": 1975
+            },
+            "cost_usd": 0.01077278,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1897,
+              "output_tokens": 934,
+              "total_tokens": 2831
+            },
+            "cost_usd": 0.01374908,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 5489,
+          "output_tokens": 2310,
+          "total_tokens": 7799
+        },
+        "total_cost_usd": 0.03889996,
+        "wall_time_ms": 490418,
+        "churn_count": 6,
+        "conflict_count": 3,
+        "loc_added": 58,
+        "loc_deleted": 173,
+        "diff_bytes": 8867,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 8,
+            "assertions_passed": 8,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 4
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 2 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 9333,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 6666,
+          "overall_basis_points": 8833
+        }
+      }
+    },
+    {
+      "profile_id": "frontier-all-v1",
+      "repetition": 2,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-2"
+      },
+      "execution": {
+        "observed_dispatch_count": 2,
+        "outcome": "timeout",
+        "error_evidence": {
+          "message": "deterministic fake repetition reached its synthetic timeout",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 745,
+              "output_tokens": 288,
+              "total_tokens": 1033
+            },
+            "cost_usd": 0.0052223,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1373,
+              "output_tokens": 797,
+              "total_tokens": 2170
+            },
+            "cost_usd": 0.01022347,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1996,
+              "output_tokens": 921,
+              "total_tokens": 2917
+            },
+            "cost_usd": 0.014327689999999999,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1074,
+              "output_tokens": 853,
+              "total_tokens": 1927
+            },
+            "cost_usd": 0.008513610000000001,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 5188,
+          "output_tokens": 2859,
+          "total_tokens": 8047
+        },
+        "total_cost_usd": 0.038287070000000006,
+        "wall_time_ms": 900000,
+        "churn_count": 2,
+        "conflict_count": 3,
+        "loc_added": 448,
+        "loc_deleted": 25,
+        "diff_bytes": 17875,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 7,
+            "assertions_passed": 7,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 8,
+            "assertions_passed": 6,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 4
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 2 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8666,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 6666,
+          "overall_basis_points": 8499
+        }
+      }
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 0,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-0"
+      },
+      "execution": {
+        "observed_dispatch_count": 1,
+        "outcome": "success",
+        "error_evidence": null
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 1547,
+              "output_tokens": 684,
+              "total_tokens": 2231
+            },
+            "cost_usd": 0.01103758,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 845,
+              "output_tokens": 538,
+              "total_tokens": 1383
+            },
+            "cost_usd": 0.01400979,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 820,
+              "output_tokens": 986,
+              "total_tokens": 1806
+            },
+            "cost_usd": 0.021603380000000002,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 916,
+              "output_tokens": 759,
+              "total_tokens": 1675
+            },
+            "cost_usd": 0.018453220000000003,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4128,
+          "output_tokens": 2967,
+          "total_tokens": 7095
+        },
+        "total_cost_usd": 0.06510397000000001,
+        "wall_time_ms": 572360,
+        "churn_count": 3,
+        "conflict_count": 2,
+        "loc_added": 109,
+        "loc_deleted": 5,
+        "diff_bytes": 4700,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 8,
+            "assertions_passed": 8,
+            "passed": true
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 9333,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 8416
+        }
+      }
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 1,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-1"
+      },
+      "execution": {
+        "observed_dispatch_count": 1,
+        "outcome": "failure",
+        "error_evidence": {
+          "message": "deterministic fake repetition reported a synthetic failure",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 730,
+              "output_tokens": 966,
+              "total_tokens": 1696
+            },
+            "cost_usd": 0.0066557,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1178,
+              "output_tokens": 421,
+              "total_tokens": 1599
+            },
+            "cost_usd": 0.01341768,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1261,
+              "output_tokens": 374,
+              "total_tokens": 1635
+            },
+            "cost_usd": 0.01468265,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1150,
+              "output_tokens": 392,
+              "total_tokens": 1542
+            },
+            "cost_usd": 0.012745860000000001,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4319,
+          "output_tokens": 2153,
+          "total_tokens": 6472
+        },
+        "total_cost_usd": 0.047501890000000005,
+        "wall_time_ms": 110742,
+        "churn_count": 11,
+        "conflict_count": 2,
+        "loc_added": 499,
+        "loc_deleted": 39,
+        "diff_bytes": 20442,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 6,
+            "assertions_passed": 5,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 5,
+            "assertions_passed": 3,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7272,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 7386
+        }
+      }
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetition": 2,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-2"
+      },
+      "execution": {
+        "observed_dispatch_count": 4,
+        "outcome": "timeout",
+        "error_evidence": {
+          "message": "deterministic fake repetition reached its synthetic timeout",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-frontier-v1"
+            ],
+            "usage": {
+              "input_tokens": 998,
+              "output_tokens": 465,
+              "total_tokens": 1463
+            },
+            "cost_usd": 0.007173969999999999,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1415,
+              "output_tokens": 644,
+              "total_tokens": 2059
+            },
+            "cost_usd": 0.01868677,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1450,
+              "output_tokens": 593,
+              "total_tokens": 2043
+            },
+            "cost_usd": 0.01952789,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1132,
+              "output_tokens": 547,
+              "total_tokens": 1679
+            },
+            "cost_usd": 0.015540259999999998,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4995,
+          "output_tokens": 2249,
+          "total_tokens": 7244
+        },
+        "total_cost_usd": 0.06092889,
+        "wall_time_ms": 900000,
+        "churn_count": 11,
+        "conflict_count": 2,
+        "loc_added": 251,
+        "loc_deleted": 120,
+        "diff_bytes": 14101,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 4,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 4,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 8
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7272,
+          "breadth_basis_points": 10000,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 7386
+        }
+      }
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetition": 0,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-0"
+      },
+      "execution": {
+        "observed_dispatch_count": 2,
+        "outcome": "success",
+        "error_evidence": null
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 900,
+              "output_tokens": 536,
+              "total_tokens": 1436
+            },
+            "cost_usd": 0.014233879999999999,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1467,
+              "output_tokens": 721,
+              "total_tokens": 2188
+            },
+            "cost_usd": 0.02036443,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 765,
+              "output_tokens": 734,
+              "total_tokens": 1499
+            },
+            "cost_usd": 0.01727147,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1262,
+              "output_tokens": 917,
+              "total_tokens": 2179
+            },
+            "cost_usd": 0.023032359999999998,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 4394,
+          "output_tokens": 2908,
+          "total_tokens": 7302
+        },
+        "total_cost_usd": 0.07490214,
+        "wall_time_ms": 526928,
+        "churn_count": 4,
+        "conflict_count": 3,
+        "loc_added": 205,
+        "loc_deleted": 150,
+        "diff_bytes": 14112,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 8,
+            "assertions_passed": 8,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 7
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 5
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 1 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 1 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 9333,
+          "breadth_basis_points": 8750,
+          "anti_shortcut_basis_points": 8333,
+          "overall_basis_points": 8937
+        }
+      }
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetition": 1,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-1"
+      },
+      "execution": {
+        "observed_dispatch_count": 1,
+        "outcome": "failure",
+        "error_evidence": {
+          "message": "deterministic fake repetition reported a synthetic failure",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1075,
+              "output_tokens": 921,
+              "total_tokens": 1996
+            },
+            "cost_usd": 0.022218429999999997,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1711,
+              "output_tokens": 387,
+              "total_tokens": 2098
+            },
+            "cost_usd": 0.015317709999999998,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1713,
+              "output_tokens": 524,
+              "total_tokens": 2237
+            },
+            "cost_usd": 0.017872669999999997,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1859,
+              "output_tokens": 254,
+              "total_tokens": 2113
+            },
+            "cost_usd": 0.01354957,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 6358,
+          "output_tokens": 2086,
+          "total_tokens": 8444
+        },
+        "total_cost_usd": 0.06895837999999999,
+        "wall_time_ms": 88546,
+        "churn_count": 8,
+        "conflict_count": 3,
+        "loc_added": 276,
+        "loc_deleted": 117,
+        "diff_bytes": 15464,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 3,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 6,
+            "passed": true
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 7
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 5
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 1 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 1 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8181,
+          "breadth_basis_points": 8750,
+          "anti_shortcut_basis_points": 8333,
+          "overall_basis_points": 8361
+        }
+      }
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetition": 2,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-2"
+      },
+      "execution": {
+        "observed_dispatch_count": 3,
+        "outcome": "timeout",
+        "error_evidence": {
+          "message": "deterministic fake repetition reached its synthetic timeout",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1927,
+              "output_tokens": 981,
+              "total_tokens": 2908
+            },
+            "cost_usd": 0.02738023,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1774,
+              "output_tokens": 285,
+              "total_tokens": 2059
+            },
+            "cost_usd": 0.0137218,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 784,
+              "output_tokens": 642,
+              "total_tokens": 1426
+            },
+            "cost_usd": 0.015652359999999997,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-balanced-v1"
+            ],
+            "usage": {
+              "input_tokens": 1699,
+              "output_tokens": 840,
+              "total_tokens": 2539
+            },
+            "cost_usd": 0.023677449999999996,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 6184,
+          "output_tokens": 2748,
+          "total_tokens": 8932
+        },
+        "total_cost_usd": 0.08043183999999999,
+        "wall_time_ms": 900000,
+        "churn_count": 8,
+        "conflict_count": 3,
+        "loc_added": 63,
+        "loc_deleted": 36,
+        "diff_bytes": 3751,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 6,
+            "assertions_passed": 6,
+            "passed": true
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 5,
+            "assertions_passed": 3,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 7
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 5
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 1 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 1 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8181,
+          "breadth_basis_points": 8750,
+          "anti_shortcut_basis_points": 8333,
+          "overall_basis_points": 8361
+        }
+      }
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetition": 0,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-0"
+      },
+      "execution": {
+        "observed_dispatch_count": 2,
+        "outcome": "success",
+        "error_evidence": null
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1638,
+              "output_tokens": 491,
+              "total_tokens": 2129
+            },
+            "cost_usd": 0.019156470000000002,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1657,
+              "output_tokens": 742,
+              "total_tokens": 2399
+            },
+            "cost_usd": 0.02335997,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1578,
+              "output_tokens": 425,
+              "total_tokens": 2003
+            },
+            "cost_usd": 0.01767549,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 731,
+              "output_tokens": 742,
+              "total_tokens": 1473
+            },
+            "cost_usd": 0.01703539,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 5604,
+          "output_tokens": 2400,
+          "total_tokens": 8004
+        },
+        "total_cost_usd": 0.07722732,
+        "wall_time_ms": 428466,
+        "churn_count": 1,
+        "conflict_count": 3,
+        "loc_added": 490,
+        "loc_deleted": 109,
+        "diff_bytes": 22553,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 5,
+            "assertions_passed": 4,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 6,
+            "assertions_passed": 4,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 6
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 2 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7272,
+          "breadth_basis_points": 7500,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 6761
+        }
+      }
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetition": 1,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-1"
+      },
+      "execution": {
+        "observed_dispatch_count": 2,
+        "outcome": "failure",
+        "error_evidence": {
+          "message": "deterministic fake repetition reported a synthetic failure",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1610,
+              "output_tokens": 649,
+              "total_tokens": 2259
+            },
+            "cost_usd": 0.02152957,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1413,
+              "output_tokens": 759,
+              "total_tokens": 2172
+            },
+            "cost_usd": 0.02196936,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1606,
+              "output_tokens": 605,
+              "total_tokens": 2211
+            },
+            "cost_usd": 0.02078813,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1489,
+              "output_tokens": 978,
+              "total_tokens": 2467
+            },
+            "cost_usd": 0.026042810000000003,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 6118,
+          "output_tokens": 2991,
+          "total_tokens": 9109
+        },
+        "total_cost_usd": 0.09032987,
+        "wall_time_ms": 866848,
+        "churn_count": 9,
+        "conflict_count": 3,
+        "loc_added": 419,
+        "loc_deleted": 142,
+        "diff_bytes": 21201,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 8,
+            "assertions_passed": 6,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 7,
+            "assertions_passed": 5,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 6
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 2 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 7333,
+          "breadth_basis_points": 7500,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 6791
+        }
+      }
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetition": 2,
+      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "synthetic_run_identity": {
+        "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-2"
+      },
+      "execution": {
+        "observed_dispatch_count": 3,
+        "outcome": "timeout",
+        "error_evidence": {
+          "message": "deterministic fake repetition reached its synthetic timeout",
+          "truncated": false
+        }
+      },
+      "metrics": {
+        "role_usage": {
+          "supervisor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1100,
+              "output_tokens": 294,
+              "total_tokens": 1394
+            },
+            "cost_usd": 0.01228462,
+            "observation": "synthetic_fake"
+          },
+          "child_orchestrator": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1150,
+              "output_tokens": 957,
+              "total_tokens": 2107
+            },
+            "cost_usd": 0.023386610000000002,
+            "observation": "synthetic_fake"
+          },
+          "worker": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1993,
+              "output_tokens": 302,
+              "total_tokens": 2295
+            },
+            "cost_usd": 0.018513650000000003,
+            "observation": "synthetic_fake"
+          },
+          "auditor": {
+            "models": [
+              "fake-economy-v1"
+            ],
+            "usage": {
+              "input_tokens": 1811,
+              "output_tokens": 416,
+              "total_tokens": 2227
+            },
+            "cost_usd": 0.019120810000000002,
+            "observation": "synthetic_fake"
+          }
+        },
+        "total_usage": {
+          "input_tokens": 6054,
+          "output_tokens": 1969,
+          "total_tokens": 8023
+        },
+        "total_cost_usd": 0.07330569,
+        "wall_time_ms": 900000,
+        "churn_count": 5,
+        "conflict_count": 3,
+        "loc_added": 348,
+        "loc_deleted": 176,
+        "diff_bytes": 19886,
+        "held_out_validation": [
+          {
+            "id": "readme-contract",
+            "assertions_run": 7,
+            "assertions_passed": 6,
+            "passed": false
+          },
+          {
+            "id": "provider-boundary",
+            "assertions_run": 8,
+            "assertions_passed": 7,
+            "passed": false
+          }
+        ],
+        "review": {
+          "breadth": {
+            "checks_run": 8,
+            "checks_passed": 6
+          },
+          "anti_shortcut": {
+            "checks_run": 6,
+            "checks_passed": 3
+          },
+          "findings": [
+            {
+              "severity": "warning",
+              "message": "deterministic fake breadth review missed 2 of 8 checks",
+              "paths": []
+            },
+            {
+              "severity": "warning",
+              "message": "deterministic fake anti-shortcut review missed 3 of 6 checks",
+              "paths": []
+            }
+          ]
+        },
+        "quality": {
+          "held_out_basis_points": 8666,
+          "breadth_basis_points": 7500,
+          "anti_shortcut_basis_points": 5000,
+          "overall_basis_points": 7458
+        }
+      }
+    }
+  ],
+  "profile_summaries": [
+    {
+      "profile_id": "frontier-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 2524,
+            "output_tokens": 1424,
+            "total_tokens": 3948
+          },
+          "cost_usd": 0.01870136,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3869,
+            "output_tokens": 2159,
+            "total_tokens": 6028
+          },
+          "cost_usd": 0.02861341,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4504,
+            "output_tokens": 1578,
+            "total_tokens": 6082
+          },
+          "cost_usd": 0.03120506,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 4227,
+            "output_tokens": 2443,
+            "total_tokens": 6670
+          },
+          "cost_usd": 0.031450530000000004,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 15124,
+        "output_tokens": 7604,
+        "total_tokens": 22728
+      },
+      "aggregate_cost_usd": 0.10997036,
+      "mean_cost_usd": 0.03665678666666667,
+      "mean_wall_time_ms": {
+        "total": 1442455,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 18,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 635,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 338,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 36961,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 26180,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 30000,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 19998,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 25589,
+          "count": 3
+        }
+      },
+      "pareto_optimal": true
+    },
+    {
+      "profile_id": "hybrid-frontier-economy-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-frontier-v1"
+          ],
+          "usage": {
+            "input_tokens": 3275,
+            "output_tokens": 2115,
+            "total_tokens": 5390
+          },
+          "cost_usd": 0.024867249999999997,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3438,
+            "output_tokens": 1603,
+            "total_tokens": 5041
+          },
+          "cost_usd": 0.04611424,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 3531,
+            "output_tokens": 1953,
+            "total_tokens": 5484
+          },
+          "cost_usd": 0.05581392,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3198,
+            "output_tokens": 1698,
+            "total_tokens": 4896
+          },
+          "cost_usd": 0.046739340000000004,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 13442,
+        "output_tokens": 7369,
+        "total_tokens": 20811
+      },
+      "aggregate_cost_usd": 0.17353475000000002,
+      "mean_cost_usd": 0.05784491666666667,
+      "mean_wall_time_ms": {
+        "total": 1583102,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 25,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 6,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 859,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 164,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 39243,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 23877,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 30000,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 15000,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 23188,
+          "count": 3
+        }
+      },
+      "pareto_optimal": false
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3902,
+            "output_tokens": 2438,
+            "total_tokens": 6340
+          },
+          "cost_usd": 0.06383254,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4952,
+            "output_tokens": 1393,
+            "total_tokens": 6345
+          },
+          "cost_usd": 0.04940394,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 3262,
+            "output_tokens": 1900,
+            "total_tokens": 5162
+          },
+          "cost_usd": 0.050796499999999994,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-balanced-v1"
+          ],
+          "usage": {
+            "input_tokens": 4820,
+            "output_tokens": 2011,
+            "total_tokens": 6831
+          },
+          "cost_usd": 0.060259379999999994,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 16936,
+        "output_tokens": 7742,
+        "total_tokens": 24678
+      },
+      "aggregate_cost_usd": 0.22429235999999997,
+      "mean_cost_usd": 0.07476411999999999,
+      "mean_wall_time_ms": {
+        "total": 1515474,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 20,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 544,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 303,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 33327,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 25695,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 26250,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 24999,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 25659,
+          "count": 3
+        }
+      },
+      "pareto_optimal": true
+    },
+    {
+      "profile_id": "economy-all-v1",
+      "repetitions": 3,
+      "aggregate_role_usage": {
+        "supervisor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4348,
+            "output_tokens": 1434,
+            "total_tokens": 5782
+          },
+          "cost_usd": 0.05297066,
+          "observation": "synthetic_fake"
+        },
+        "child_orchestrator": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4220,
+            "output_tokens": 2458,
+            "total_tokens": 6678
+          },
+          "cost_usd": 0.06871594,
+          "observation": "synthetic_fake"
+        },
+        "worker": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 5177,
+            "output_tokens": 1332,
+            "total_tokens": 6509
+          },
+          "cost_usd": 0.056977269999999997,
+          "observation": "synthetic_fake"
+        },
+        "auditor": {
+          "models": [
+            "fake-economy-v1"
+          ],
+          "usage": {
+            "input_tokens": 4031,
+            "output_tokens": 2136,
+            "total_tokens": 6167
+          },
+          "cost_usd": 0.062199010000000006,
+          "observation": "synthetic_fake"
+        }
+      },
+      "aggregate_usage": {
+        "input_tokens": 17776,
+        "output_tokens": 7360,
+        "total_tokens": 25136
+      },
+      "aggregate_cost_usd": 0.24086288000000003,
+      "mean_cost_usd": 0.08028762666666668,
+      "mean_wall_time_ms": {
+        "total": 2195314,
+        "count": 3
+      },
+      "mean_churn_count": {
+        "total": 15,
+        "count": 3
+      },
+      "mean_conflict_count": {
+        "total": 9,
+        "count": 3
+      },
+      "mean_loc_added": {
+        "total": 1257,
+        "count": 3
+      },
+      "mean_loc_deleted": {
+        "total": 427,
+        "count": 3
+      },
+      "mean_diff_bytes": {
+        "total": 63640,
+        "count": 3
+      },
+      "mean_quality": {
+        "held_out_basis_points": {
+          "total": 23271,
+          "count": 3
+        },
+        "breadth_basis_points": {
+          "total": 22500,
+          "count": 3
+        },
+        "anti_shortcut_basis_points": {
+          "total": 15000,
+          "count": 3
+        },
+        "overall_basis_points": {
+          "total": 21010,
+          "count": 3
+        }
+      },
+      "pareto_optimal": false
+    }
+  ],
+  "pareto_frontier": [
+    {
+      "profile_id": "frontier-all-v1",
+      "mean_cost_usd": 0.03665678666666667,
+      "quality_basis_points": {
+        "total": 25589,
+        "count": 3
+      },
+      "held_out_basis_points": {
+        "total": 26180,
+        "count": 3
+      },
+      "breadth_basis_points": {
+        "total": 30000,
+        "count": 3
+      },
+      "anti_shortcut_basis_points": {
+        "total": 19998,
+        "count": 3
+      }
+    },
+    {
+      "profile_id": "balanced-all-v1",
+      "mean_cost_usd": 0.07476411999999999,
+      "quality_basis_points": {
+        "total": 25659,
+        "count": 3
+      },
+      "held_out_basis_points": {
+        "total": 25695,
+        "count": 3
+      },
+      "breadth_basis_points": {
+        "total": 26250,
+        "count": 3
+      },
+      "anti_shortcut_basis_points": {
+        "total": 24999,
+        "count": 3
+      }
+    }
+  ]
+}

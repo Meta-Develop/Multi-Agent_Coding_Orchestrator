@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "evidence": {
+    "kind": "provisional_deterministic_fake_only",
+    "plan_basis": "hand_authored",
+    "real_provider_executed": false,
+    "observed_isolated_repository_state": false,
+    "requirement_four_comparability": "not_established_deferred_to_phase_b",
+    "eligible_for_production_economics": false,
+    "eligible_to_justify_named_default": false,
+    "eligible_for_production_or_default_decisions": false,
+    "notice": "provisional deterministic fake evidence over a hand-authored plan; no isolated repository state was observed, so Issue #26 requirement-4 comparability is not established and is deferred to Phase B; ineligible for production or default decisions"
+  },
+  "task": "Improve the README model-mix fixture note without changing Rust code.",
+  "max_depth": 2,
+  "max_child_assignments": 1,
+  "max_child_retries": 0,
+  "child_timeout_seconds": 600,
+  "assignments": [
+    {
+      "id": "docs-child",
+      "assigned_paths": [
+        "README.md"
+      ],
+      "worker_assignments": [
+        {
+          "id": "docs-worker",
+          "assigned_paths": [
+            "README.md"
+          ]
+        }
+      ]
+    }
+  ]
+}
