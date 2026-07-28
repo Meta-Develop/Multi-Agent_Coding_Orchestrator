@@ -63,6 +63,8 @@ use git2::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
+#[cfg(test)]
+use std::cell::Cell;
 #[cfg(unix)]
 use std::os::{
     fd::{AsRawFd, FromRawFd},
@@ -4531,9 +4533,33 @@ struct DispatchBudgetReservation<'a> {
     state: DispatchBudgetReservationState,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static DISPATCH_PRE_RUNNER_FAULT: Cell<Option<AgentRole>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_dispatch_pre_runner_fault(role: AgentRole) {
+    DISPATCH_PRE_RUNNER_FAULT.with(|fault| fault.set(Some(role)));
+}
+
 impl DispatchBudgetReservation<'_> {
-    fn mark_invoked(&mut self) {
+    fn mark_invoked(&mut self) -> Result<()> {
+        if self.state != DispatchBudgetReservationState::Reserved {
+            bail!("budget reservation was invoked outside its reserved state");
+        }
+        #[cfg(test)]
+        if DISPATCH_PRE_RUNNER_FAULT
+            .with(|fault| fault.replace(None))
+            .is_some_and(|role| role == self.reservation.role)
+        {
+            bail!(
+                "injected '{}' pre-runner preparation failure",
+                self.reservation.role.as_str()
+            );
+        }
         self.state = DispatchBudgetReservationState::Invoked;
+        Ok(())
     }
 
     fn settle_not_started(&mut self) -> Result<()> {
@@ -5377,18 +5403,43 @@ fn execute_supervisor_assignment_inner(
                 lifecycle_event_payload("running", Some(attempt), None),
             )?;
 
-            // No scheduler, artifact-writer, or journal lock is held while the
-            // independently contained external process runs.
-            budget_reservation.mark_invoked();
             let external_run_result = match options.runtime {
                 SupervisorRuntime::Codex => {
                     let review_context =
-                        pre_action_review_context(options, assignment, &worktree.path)?;
+                        match pre_action_review_context(options, assignment, &worktree.path) {
+                            Ok(review_context) => review_context,
+                            Err(error) => {
+                                drop(incoming_output_root);
+                                drop(capture_output_root);
+                                with_supervisor_artifacts(artifacts, |writer, _| {
+                                    discard_invocation_scratches(
+                                        writer,
+                                        &incoming_scratch,
+                                        &capture_scratch,
+                                    )
+                                })?;
+                                return Err(error);
+                            }
+                        };
                     let mut review_journal = SupervisorPreActionJournalSink {
                         artifacts,
                         node: &assignment.id,
                         parent: Some(journal_parent_id),
                     };
+                    // All fallible pre-dispatch preparation is complete. Mark
+                    // invocation only at the external-runner call boundary.
+                    if let Err(error) = budget_reservation.mark_invoked() {
+                        drop(incoming_output_root);
+                        drop(capture_output_root);
+                        with_supervisor_artifacts(artifacts, |writer, _| {
+                            discard_invocation_scratches(
+                                writer,
+                                &incoming_scratch,
+                                &capture_scratch,
+                            )
+                        })?;
+                        return Err(error);
+                    }
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         external_runner(
                             &command,
@@ -5414,13 +5465,27 @@ fn execute_supervisor_assignment_inner(
                         }
                     }
                 }
-                SupervisorRuntime::Fake => deterministic_fake_child_run(
-                    &command,
-                    assignment,
-                    assignment_metadata,
-                    claim.token.get(),
-                    semantic_token,
-                ),
+                SupervisorRuntime::Fake => {
+                    if let Err(error) = budget_reservation.mark_invoked() {
+                        drop(incoming_output_root);
+                        drop(capture_output_root);
+                        with_supervisor_artifacts(artifacts, |writer, _| {
+                            discard_invocation_scratches(
+                                writer,
+                                &incoming_scratch,
+                                &capture_scratch,
+                            )
+                        })?;
+                        return Err(error);
+                    }
+                    deterministic_fake_child_run(
+                        &command,
+                        assignment,
+                        assignment_metadata,
+                        claim.token.get(),
+                        semantic_token,
+                    )
+                }
             };
             let external_run = match external_run_result {
                 Ok(run) => run,
@@ -6068,11 +6133,22 @@ fn execute_supervisor_assignment_inner(
                 lifecycle_event_payload("running", Some(auditor_attempt), None),
             )?;
 
-            // The artifact and journal mutex is intentionally released before
-            // entering the potentially long-running auditor process.
-            auditor_budget_reservation.mark_invoked();
             let auditor_run_result = match options.runtime {
                 SupervisorRuntime::Codex => {
+                    // All fallible pre-dispatch preparation is complete. Mark
+                    // invocation only at the external-runner call boundary.
+                    if let Err(error) = auditor_budget_reservation.mark_invoked() {
+                        drop(auditor_incoming_root);
+                        drop(auditor_capture_root);
+                        with_supervisor_artifacts(artifacts, |writer, _| {
+                            discard_invocation_scratches(
+                                writer,
+                                &auditor_incoming_scratch,
+                                &auditor_capture_scratch,
+                            )
+                        })?;
+                        return Err(error);
+                    }
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         external_runner(&auditor_command, cancellation, None)
                     })) {
@@ -6092,6 +6168,18 @@ fn execute_supervisor_assignment_inner(
                     }
                 }
                 SupervisorRuntime::Fake => {
+                    if let Err(error) = auditor_budget_reservation.mark_invoked() {
+                        drop(auditor_incoming_root);
+                        drop(auditor_capture_root);
+                        with_supervisor_artifacts(artifacts, |writer, _| {
+                            discard_invocation_scratches(
+                                writer,
+                                &auditor_incoming_scratch,
+                                &auditor_capture_scratch,
+                            )
+                        })?;
+                        return Err(error);
+                    }
                     deterministic_fake_auditor_run(&auditor_command, assignment, &child_report)
                 }
             };
@@ -7313,14 +7401,6 @@ fn run_supervisor_plan_with_runner_and_creation(
             paths: Vec::new(),
         });
     }
-    if usage_incomplete {
-        findings.push(Finding {
-            severity: FindingSeverity::Warning,
-            message: "process usage is incomplete because at least one external Codex JSONL capture was missing, truncated, or malformed"
-                .to_string(),
-            paths: Vec::new(),
-        });
-    }
     let (run_budget_report, budget_accounting_failed) = match budget_ledger.report() {
         Ok(report) => (Some(report), false),
         Err(error) => {
@@ -7332,6 +7412,18 @@ fn run_supervisor_plan_with_runner_and_creation(
             (None, true)
         }
     };
+    usage_incomplete |= budget_accounting_failed
+        || run_budget_report
+            .as_ref()
+            .is_some_and(|report| !report.usage_complete);
+    if usage_incomplete {
+        findings.push(Finding {
+            severity: FindingSeverity::Warning,
+            message: "process usage is incomplete because at least one external Codex JSONL capture was missing, truncated, malformed, or conservatively reconciled after an invoked dispatch did not return usage"
+                .to_string(),
+            paths: Vec::new(),
+        });
+    }
     if budget_prevented_dispatch {
         findings.push(Finding {
             severity: FindingSeverity::Error,
@@ -22046,6 +22138,66 @@ mod tests {
             .join("; ")
     }
 
+    fn assert_injected_dispatch_cleanup(
+        report: &SupervisorFinalReport,
+        repo: &Path,
+        run_id: &str,
+        started_worktree: &str,
+        unstarted_worktrees: &[&str],
+    ) {
+        assert_eq!(report.released_claims.len(), 1);
+        assert!(report.release_errors.is_empty());
+        assert!(report.released_semantic_intents.is_empty());
+        assert!(report.semantic_release_errors.is_empty());
+        assert!(report.breaker_trip.is_none());
+        assert!(report.gate_denials.is_empty());
+        assert!(report.gate_correction_outcomes.is_empty());
+        assert!(SyncStore::open(repo)
+            .expect("reopen lifecycle sync store")
+            .snapshot()
+            .expect("snapshot lifecycle claims")
+            .is_empty());
+        assert!(SemanticIntentStore::open(repo)
+            .expect("reopen lifecycle semantic store")
+            .snapshot()
+            .expect("snapshot lifecycle semantic intents")
+            .is_empty());
+
+        let run_root = repo
+            .join(RunArtifactFamily::Supervise.run_root())
+            .join(run_id);
+        let scratch_entries = fs::read_dir(&run_root)
+            .expect("read finalized lifecycle artifact root")
+            .map(|entry| {
+                entry
+                    .expect("read lifecycle artifact entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with("incoming") || name.starts_with("capture"))
+            .collect::<Vec<_>>();
+        assert!(
+            scratch_entries.is_empty(),
+            "invocation scratch artifacts leaked: {scratch_entries:?}"
+        );
+        assert!(run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());
+
+        let manager = WorktreeManager::new(repo);
+        let records = manager.list().expect("list lifecycle worktrees");
+        assert!(records.iter().any(|record| record.name == started_worktree));
+        for unstarted in unstarted_worktrees {
+            assert!(
+                records.iter().all(|record| record.name != *unstarted),
+                "pending assignment worktree {unstarted} was unexpectedly created"
+            );
+        }
+        let lease = manager
+            .acquire_write_execution_lease(started_worktree)
+            .expect("started worktree execution lease must be released");
+        drop(lease);
+    }
+
     #[test]
     fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
         let legacy_source = json!({
@@ -22321,6 +22473,243 @@ mod tests {
     }
 
     #[test]
+    fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pending() {
+        let (temp, repo_path) = injected_repository();
+        let mut child_a = injected_named_assignment("child-a", "README.md");
+        child_a.task = Some("x".repeat(8 * 1024 + 1));
+        let child_b = injected_named_assignment("child-b", "src/lib.rs");
+        let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
+        let run_id = "budget-child-pre-runner-release";
+        let options = injected_options(&repo_path, temp.path(), run_id);
+        let mut invocations = 0usize;
+        let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+            invocations = invocations.saturating_add(1);
+            panic!("pre-runner child failure must not invoke an external runner")
+        };
+
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("finalize child pre-runner failure");
+
+        assert!(!report.success);
+        assert_eq!(invocations, 0);
+        assert!(report.usage_complete);
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("failed to construct pre-action review context")));
+        let budget = report.run_budget.as_ref().expect("child lifecycle budget");
+        assert_eq!(budget.consumed.tokens, 0);
+        assert_eq!(budget.reserved.tokens, 0);
+        assert_eq!(budget.active_reservations, 0);
+        assert!(budget.usage_complete);
+        assert!(budget.new_dispatch_allowed);
+        assert_eq!(budget.action, BudgetAction::Continue);
+        assert!(budget.reasons.is_empty());
+        assert_eq!(
+            budget
+                .roles
+                .iter()
+                .find(|role| role.role == AgentRole::ChildOrchestrator)
+                .map(|role| (role.consumed.tokens, role.usage_complete)),
+            Some((0, true))
+        );
+        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+    }
+
+    #[test]
+    fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pending() {
+        let (temp, repo_path) = injected_repository();
+        let child_a = injected_assignment(true);
+        let child_b = injected_named_assignment("child-b", "src/lib.rs");
+        let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
+        let run_id = "budget-auditor-pre-runner-release";
+        let options = injected_options(&repo_path, temp.path(), run_id);
+        let mut invocations = 0usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            assert!(!name.contains("review-auditor"));
+            assert!(name.starts_with("child-a"));
+            write_injected_assignment_report(command, &child_a);
+            write_injected_usage(command, 7, 3);
+            set_dispatch_pre_runner_fault(AgentRole::Auditor);
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("finalize auditor pre-runner failure");
+
+        assert!(!report.success);
+        assert_eq!(invocations, 1);
+        assert!(report.usage_complete);
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("injected 'auditor' pre-runner preparation failure")));
+        let budget = report
+            .run_budget
+            .as_ref()
+            .expect("auditor lifecycle budget");
+        assert_eq!(budget.consumed.tokens, 10);
+        assert_eq!(budget.reserved.tokens, 0);
+        assert_eq!(budget.active_reservations, 0);
+        assert!(budget.usage_complete);
+        assert!(budget.new_dispatch_allowed);
+        assert_eq!(budget.action, BudgetAction::Continue);
+        assert!(budget.reasons.is_empty());
+        assert_eq!(
+            budget
+                .roles
+                .iter()
+                .find(|role| role.role == AgentRole::Auditor)
+                .map(|role| (role.consumed.tokens, role.usage_complete)),
+            Some((0, true))
+        );
+        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+    }
+
+    #[test]
+    fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
+        let (temp, repo_path) = injected_repository();
+        let child_a = injected_named_assignment("child-a", "README.md");
+        let child_b = injected_named_assignment("child-b", "src/lib.rs");
+        let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
+        let run_id = "budget-child-runner-panic";
+        let options = injected_options(&repo_path, temp.path(), run_id);
+        let mut invocations = 0usize;
+        let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+            invocations = invocations.saturating_add(1);
+            panic!("injected child runner panic")
+        };
+
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("finalize child runner panic");
+
+        assert!(!report.success);
+        assert_eq!(invocations, 1);
+        assert!(!report.usage_complete);
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("supervisor assignment 'child-a' panicked")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("conservatively reconciled")));
+        let budget = report.run_budget.as_ref().expect("child panic budget");
+        assert_eq!(budget.consumed.tokens, 50);
+        assert_eq!(budget.reserved.tokens, 0);
+        assert_eq!(budget.active_reservations, 0);
+        assert!(!budget.usage_complete);
+        assert!(!budget.new_dispatch_allowed);
+        assert_eq!(budget.action, BudgetAction::OwnerEscalation);
+        assert!(budget.reasons.contains(&BudgetReason::MissingProviderUsage));
+        assert_eq!(
+            budget
+                .roles
+                .iter()
+                .find(|role| role.role == AgentRole::ChildOrchestrator)
+                .map(|role| (role.consumed.tokens, role.usage_complete)),
+            Some((50, false))
+        );
+        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+    }
+
+    #[test]
+    fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() {
+        let (temp, repo_path) = injected_repository();
+        let child_a = injected_assignment(true);
+        let child_b = injected_named_assignment("child-b", "src/lib.rs");
+        let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
+        let run_id = "budget-auditor-runner-panic";
+        let options = injected_options(&repo_path, temp.path(), run_id);
+        let mut invocations = 0usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if name.contains("review-auditor") {
+                panic!("injected auditor runner panic");
+            }
+            assert!(name.starts_with("child-a"));
+            write_injected_assignment_report(command, &child_a);
+            write_injected_usage(command, 7, 3);
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("finalize auditor runner panic");
+
+        assert!(!report.success);
+        assert_eq!(invocations, 2);
+        assert!(!report.usage_complete);
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("supervisor assignment 'child-a' panicked")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("conservatively reconciled")));
+        let budget = report.run_budget.as_ref().expect("auditor panic budget");
+        assert_eq!(budget.consumed.tokens, 60);
+        assert_eq!(budget.reserved.tokens, 0);
+        assert_eq!(budget.active_reservations, 0);
+        assert!(!budget.usage_complete);
+        assert!(!budget.new_dispatch_allowed);
+        assert_eq!(budget.action, BudgetAction::OwnerEscalation);
+        assert!(budget.reasons.contains(&BudgetReason::MissingProviderUsage));
+        assert_eq!(
+            budget
+                .roles
+                .iter()
+                .find(|role| role.role == AgentRole::Auditor)
+                .map(|role| (role.consumed.tokens, role.usage_complete)),
+            Some((50, false))
+        );
+        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+    }
+
+    #[test]
     fn budget_integration_reservation_is_released_when_codex_process_never_starts() {
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(false);
@@ -22390,7 +22779,9 @@ mod tests {
                 panic!("unexpected budget refusal: {refusal:?}")
             }
         };
-        reservation.mark_invoked();
+        reservation
+            .mark_invoked()
+            .expect("mark uncertain-start dispatch invoked");
         let mut run = injected_target_attempted(injected_verified_run_without_journals(&command));
         run.process_tree = None;
         assert!(!run.scratch_quiescence_verified());
