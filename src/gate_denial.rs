@@ -144,6 +144,26 @@ pub enum ExternalSideEffectState {
     Completed,
 }
 
+/// Typed causes emitted by the pre-action approval reviewer.
+///
+/// These values are fixed policy vocabulary. Classifier prose and protocol
+/// diagnostics never enter the stable denial identity or corrective prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalReviewDenial {
+    PermissionExpansion,
+    OutsideWorkspace,
+    DestructiveWorkspaceOperation,
+    ClaimEscape,
+    SensitiveRead,
+    InconsistentRequest,
+    ClassifierDenied,
+    ClassifierTimeout,
+    ClassifierMalformedResponse,
+    ClassifierProtocolError,
+    HumanReviewRequired,
+}
+
 /// Trusted source check that produced a denial.
 ///
 /// These variants replace caller-supplied check labels. Consumers can route
@@ -181,6 +201,7 @@ pub enum GateDenialReason {
     PrimaryIntegrityFailure,
     ExternalSideEffect { state: ExternalSideEffectState },
     Sandbox { evidence: SandboxDenialEvidence },
+    ApprovalReview { denial: ApprovalReviewDenial },
 }
 
 /// Whether the denied operation may be attempted again after correction.
@@ -218,6 +239,7 @@ pub enum NextSafeOperation {
     RestorePrimaryIntegrity,
     ReconcileExternalSideEffect,
     EscalateSandboxPolicy,
+    NarrowActionOrChooseAnotherTool,
 }
 
 /// Verified canonical context used to identify and route a denial.
@@ -403,6 +425,26 @@ impl GateDenial {
         Self::new(
             correction_correlation_id,
             GateDenialReason::Sandbox { evidence },
+            context,
+        )
+    }
+
+    /// Constructs a pre-action approval-review denial from typed policy data.
+    pub fn from_approval_review<I, P>(
+        correction_correlation_id: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        denial: ApprovalReviewDenial,
+        paths: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let context =
+            VerifiedGateContext::new(owner, GateCheckSource::FutureApprovalReview, paths)?;
+        Self::new(
+            correction_correlation_id,
+            GateDenialReason::ApprovalReview { denial },
             context,
         )
     }
@@ -693,6 +735,7 @@ fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -
             source == GateCheckSource::ExternalSideEffect
         }
         GateDenialReason::Sandbox { .. } => source == GateCheckSource::SandboxPolicy,
+        GateDenialReason::ApprovalReview { .. } => source == GateCheckSource::FutureApprovalReview,
     };
     if !valid {
         return invalid("verified check source does not match the typed reason");
@@ -726,7 +769,8 @@ fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
         GateDenialReason::AuditorRepair
         | GateDenialReason::ValidationRepair { .. }
         | GateDenialReason::ContainmentFailure
-        | GateDenialReason::Sandbox { .. } => GateDenialRoute::ChildController,
+        | GateDenialReason::Sandbox { .. }
+        | GateDenialReason::ApprovalReview { .. } => GateDenialRoute::ChildController,
         GateDenialReason::MergeRemediation { .. }
         | GateDenialReason::PrimaryIntegrityFailure
         | GateDenialReason::ExternalSideEffect { .. } => GateDenialRoute::IntegrationController,
@@ -752,6 +796,9 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
             NextSafeOperation::ReconcileExternalSideEffect
         }
         GateDenialReason::Sandbox { .. } => NextSafeOperation::EscalateSandboxPolicy,
+        GateDenialReason::ApprovalReview { .. } => {
+            NextSafeOperation::NarrowActionOrChooseAnotherTool
+        }
     }
 }
 
@@ -831,6 +878,35 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
             }
             SandboxDenialRetryability::NotRetryable => "non-retryable sandbox denial",
         },
+        GateDenialReason::ApprovalReview { denial } => match denial {
+            ApprovalReviewDenial::PermissionExpansion => {
+                "approval review denied permission expansion"
+            }
+            ApprovalReviewDenial::OutsideWorkspace => {
+                "approval review denied an outside-workspace action"
+            }
+            ApprovalReviewDenial::DestructiveWorkspaceOperation => {
+                "approval review denied a destructive workspace operation"
+            }
+            ApprovalReviewDenial::ClaimEscape => {
+                "approval review denied a write outside verified claims"
+            }
+            ApprovalReviewDenial::SensitiveRead => "approval review denied a sensitive read",
+            ApprovalReviewDenial::InconsistentRequest => {
+                "approval review denied an inconsistent request"
+            }
+            ApprovalReviewDenial::ClassifierDenied => {
+                "approval classifier denied an ambiguous action"
+            }
+            ApprovalReviewDenial::ClassifierTimeout => "approval classifier timed out",
+            ApprovalReviewDenial::ClassifierMalformedResponse => {
+                "approval classifier returned a malformed response"
+            }
+            ApprovalReviewDenial::ClassifierProtocolError => "approval classifier protocol failed",
+            ApprovalReviewDenial::HumanReviewRequired => {
+                "approval classifier required human review"
+            }
+        },
     }
 }
 
@@ -904,6 +980,9 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
         }
         NextSafeOperation::EscalateSandboxPolicy => {
             "escalate the sandbox policy denial; do not retry this operation."
+        }
+        NextSafeOperation::NarrowActionOrChooseAnotherTool => {
+            "narrow the proposed action or choose another tool before requesting review again."
         }
     }
 }
@@ -980,6 +1059,45 @@ mod tests {
             first.denial_id,
             validation_denial("correction-c", &["src/lib.rs"]).denial_id
         );
+    }
+
+    #[test]
+    fn approval_review_denial_has_stable_identity_and_fixed_child_correction() {
+        let first = GateDenial::from_approval_review(
+            "review-correction-a",
+            "worker-a",
+            ApprovalReviewDenial::ClaimEscape,
+            ["src/./policy.rs"],
+        )
+        .expect("approval denial");
+        let second = GateDenial::from_approval_review(
+            "review-correction-b",
+            "worker-a",
+            ApprovalReviewDenial::ClaimEscape,
+            ["src/policy.rs"],
+        )
+        .expect("approval denial");
+
+        assert_eq!(first.denial_id, second.denial_id);
+        assert_ne!(
+            first.correction_correlation_id,
+            second.correction_correlation_id
+        );
+        assert_eq!(first.retryability, GateRetryability::RetryAfterCorrection);
+        assert_eq!(first.route, GateDenialRoute::ChildController);
+        assert_eq!(
+            first.next_safe_operation,
+            NextSafeOperation::NarrowActionOrChooseAnotherTool
+        );
+        let json = first.to_json().expect("serialize approval denial");
+        assert_eq!(
+            GateDenial::from_json(&json).expect("deserialize approval denial"),
+            first
+        );
+
+        let mut tampered = serde_json::to_value(&first).expect("denial value");
+        tampered["next_safe_operation"] = serde_json::json!("repair_validation");
+        assert!(serde_json::from_value::<GateDenial>(tampered).is_err());
     }
 
     #[test]
