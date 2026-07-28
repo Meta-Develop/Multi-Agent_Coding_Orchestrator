@@ -81,6 +81,14 @@ const MAX_GATE_CORRECTIONS_LIMIT: u8 = 4;
 const MIN_SUPERVISOR_DEPTH: u8 = 2;
 const MAX_SUPERVISOR_DEPTH: u8 = 32;
 const SUPERVISOR_SCHEMA_VERSION: u32 = 1;
+pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME: &str = "provisional-phase-a-hybrid-effort-v1";
+pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE: &str =
+    "provisional deterministic fake phase-A evidence";
+pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
+    "selected provisionally from deterministic fake phase-A evidence over a hand-authored plan; \
+     no real-provider or isolated-repository comparison was observed, so this profile is \
+     production-ineligible and must not be represented as evidence-backed production economics";
+const DEFAULT_PROFILE_MODEL: &str = "gpt-5.6-sol";
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
 const PRIMARY_INDEX_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -257,6 +265,63 @@ pub struct RoleModelSelection {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "UnavailableModelFallback::is_fail_closed"
+    )]
+    pub unavailable_model_fallback: UnavailableModelFallback,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableModelFallback {
+    #[default]
+    FailClosed,
+    RuntimeDefault,
+    LocalDeterministicFake,
+}
+
+impl UnavailableModelFallback {
+    const fn is_fail_closed(&self) -> bool {
+        matches!(self, Self::FailClosed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoleEconomicsProfile {
+    pub name: String,
+    pub evidence: String,
+    pub evidence_notice: String,
+    pub production_eligible: bool,
+    #[serde(default)]
+    pub overridden_roles: Vec<AgentRole>,
+    pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
+}
+
+impl RoleModelSelection {
+    pub fn resolve_for_availability(
+        &self,
+        preferred_model_available: bool,
+        runtime: SupervisorRuntime,
+    ) -> Result<Self> {
+        if preferred_model_available || self.model.is_none() {
+            return Ok(self.clone());
+        }
+        match self.unavailable_model_fallback {
+            UnavailableModelFallback::FailClosed => {
+                bail!("configured model is unavailable and the role fallback is fail_closed")
+            }
+            UnavailableModelFallback::RuntimeDefault => Ok(Self::default()),
+            UnavailableModelFallback::LocalDeterministicFake
+                if runtime == SupervisorRuntime::Fake =>
+            {
+                Ok(Self::default())
+            }
+            UnavailableModelFallback::LocalDeterministicFake => {
+                bail!("local_deterministic_fake fallback is valid only for the fake runtime")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -408,6 +473,7 @@ pub enum AgentRole {
     Supervisor,
     ChildOrchestrator,
     Worker,
+    GateClassifier,
     Auditor,
 }
 
@@ -417,6 +483,7 @@ impl AgentRole {
             Self::Supervisor => "supervisor",
             Self::ChildOrchestrator => "child_orchestrator",
             Self::Worker => "worker",
+            Self::GateClassifier => "gate_classifier",
             Self::Auditor => "auditor",
         }
     }
@@ -617,6 +684,8 @@ pub struct SupervisorFinalReport {
     pub claim_tokens: Vec<u64>,
     #[serde(default)]
     pub semantic_intent_tokens: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_economics_profile: Option<RoleEconomicsProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_usage: BTreeMap<AgentRole, RoleUsageReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1607,6 +1676,7 @@ pub fn collect_supervisor_run(
         semantic_modules: Vec::new(),
         claim_tokens: Vec::new(),
         semantic_intent_tokens: Vec::new(),
+        role_economics_profile: None,
         role_usage: BTreeMap::new(),
         total_usage: None,
         total_cost_usd: None,
@@ -2023,6 +2093,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         semantic_modules: Vec::new(),
         claim_tokens: vec![1],
         semantic_intent_tokens: Vec::new(),
+        role_economics_profile: None,
         role_usage: BTreeMap::new(),
         total_usage: None,
         total_cost_usd: None,
@@ -2877,10 +2948,64 @@ fn role_model_selection(
     plan: &SupervisorPlan,
     role: AgentRole,
 ) -> (Option<String>, Option<String>) {
+    let selection = effective_role_model_selection(plan, role);
+    (selection.model, selection.reasoning_effort)
+}
+
+fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
+    let reasoning_effort = match role {
+        AgentRole::Worker => "medium",
+        AgentRole::GateClassifier => "high",
+        AgentRole::Supervisor | AgentRole::ChildOrchestrator | AgentRole::Auditor => "xhigh",
+    };
+    RoleModelSelection {
+        model: Some(DEFAULT_PROFILE_MODEL.to_string()),
+        reasoning_effort: Some(reasoning_effort.to_string()),
+        unavailable_model_fallback: match role {
+            AgentRole::GateClassifier => UnavailableModelFallback::LocalDeterministicFake,
+            AgentRole::Supervisor
+            | AgentRole::ChildOrchestrator
+            | AgentRole::Worker
+            | AgentRole::Auditor => UnavailableModelFallback::RuntimeDefault,
+        },
+    }
+}
+
+fn provisional_default_role_models() -> BTreeMap<AgentRole, RoleModelSelection> {
+    [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ]
+    .into_iter()
+    .map(|role| (role, provisional_default_role_model_selection(role)))
+    .collect()
+}
+
+fn effective_role_model_selection(plan: &SupervisorPlan, role: AgentRole) -> RoleModelSelection {
     plan.role_models
         .get(&role)
-        .map(|selection| (selection.model.clone(), selection.reasoning_effort.clone()))
-        .unwrap_or((None, None))
+        .cloned()
+        .unwrap_or_else(|| provisional_default_role_model_selection(role))
+}
+
+impl SupervisorPlan {
+    pub fn effective_role_economics_profile(&self) -> RoleEconomicsProfile {
+        let mut role_models = provisional_default_role_models();
+        for (role, selection) in &self.role_models {
+            role_models.insert(*role, selection.clone());
+        }
+        RoleEconomicsProfile {
+            name: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME.to_string(),
+            evidence: PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE.to_string(),
+            evidence_notice: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE.to_string(),
+            production_eligible: false,
+            overridden_roles: self.role_models.keys().copied().collect(),
+            role_models,
+        }
+    }
 }
 
 fn apply_role_model_selection(
@@ -6892,6 +7017,7 @@ fn run_supervisor_plan_with_runner_and_creation(
             .iter()
             .map(|intent| intent.token.get())
             .collect(),
+        role_economics_profile: Some(plan.effective_role_economics_profile()),
         role_usage,
         total_usage,
         total_cost_usd,
@@ -11372,7 +11498,7 @@ fn role_usage_report(
     for sample in samples {
         if !matches!(
             sample.role,
-            AgentRole::ChildOrchestrator | AgentRole::Auditor
+            AgentRole::ChildOrchestrator | AgentRole::GateClassifier | AgentRole::Auditor
         ) {
             bail!(
                 "{} usage is not directly process-observable",
@@ -11438,6 +11564,20 @@ fn role_usage_report(
             ),
         },
     );
+    reports
+        .entry(AgentRole::GateClassifier)
+        .or_insert_with(|| RoleUsageReport {
+            models: Vec::new(),
+            usage: None,
+            cost_usd: None,
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: Some(
+                "the current pre-action gate classifier is a deterministic local broker with no \
+                 role-tagged provider invocation; usage and cost remain unavailable until a \
+                 genuine runtime-side gate_classifier sample exists"
+                    .to_string(),
+            ),
+        });
     if !has_observed_samples {
         total_cost_usd = None;
     }
@@ -14195,6 +14335,7 @@ mod tests {
                 RoleModelSelection {
                     model: Some("planner-model".to_string()),
                     reasoning_effort: Some("high".to_string()),
+                    unavailable_model_fallback: UnavailableModelFallback::FailClosed,
                 },
             ),
             (
@@ -14202,6 +14343,7 @@ mod tests {
                 RoleModelSelection {
                     model: Some("worker-model".to_string()),
                     reasoning_effort: Some("low".to_string()),
+                    unavailable_model_fallback: UnavailableModelFallback::FailClosed,
                 },
             ),
             (
@@ -14209,6 +14351,7 @@ mod tests {
                 RoleModelSelection {
                     model: Some("auditor-model".to_string()),
                     reasoning_effort: Some("xhigh".to_string()),
+                    unavailable_model_fallback: UnavailableModelFallback::FailClosed,
                 },
             ),
         ]);
@@ -14249,6 +14392,90 @@ mod tests {
             .iter()
             .any(|argument| argument.contains("worker-model")));
         assert_ne!(child_argv, auditor_argv);
+    }
+
+    #[test]
+    fn no_override_selects_named_provisional_hybrid_profile() {
+        let plan = parse_supervisor_plan_with_consultant(
+            std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+        )
+        .expect("base plan")
+        .plan;
+        let profile = plan.effective_role_economics_profile();
+        assert_eq!(profile.name, PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME);
+        assert_eq!(
+            profile.evidence,
+            PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE
+        );
+        assert!(profile.evidence_notice.contains("production-ineligible"));
+        assert!(!profile.production_eligible);
+        assert!(profile.overridden_roles.is_empty());
+        assert_eq!(profile.role_models.len(), 5);
+        assert_eq!(
+            profile.role_models[&AgentRole::ChildOrchestrator]
+                .reasoning_effort
+                .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            profile.role_models[&AgentRole::Worker]
+                .reasoning_effort
+                .as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            profile.role_models[&AgentRole::GateClassifier].unavailable_model_fallback,
+            UnavailableModelFallback::LocalDeterministicFake
+        );
+        assert_eq!(
+            profile.role_models[&AgentRole::Auditor].unavailable_model_fallback,
+            UnavailableModelFallback::RuntimeDefault
+        );
+    }
+
+    #[test]
+    fn gate_classifier_override_and_unavailable_fallback_are_independent() {
+        let mut plan = parse_supervisor_plan_with_consultant(
+            std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+        )
+        .expect("base plan")
+        .plan;
+        plan.role_models.insert(
+            AgentRole::GateClassifier,
+            RoleModelSelection {
+                model: Some("classifier-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            },
+        );
+        let profile = plan.effective_role_economics_profile();
+        assert_eq!(
+            profile.role_models[&AgentRole::GateClassifier]
+                .model
+                .as_deref(),
+            Some("classifier-model")
+        );
+        assert_eq!(
+            profile.role_models[&AgentRole::Auditor].model.as_deref(),
+            Some(DEFAULT_PROFILE_MODEL)
+        );
+        assert_eq!(profile.overridden_roles, vec![AgentRole::GateClassifier]);
+
+        let fallback = profile.role_models[&AgentRole::GateClassifier]
+            .resolve_for_availability(false, SupervisorRuntime::Codex)
+            .expect("runtime-default fallback");
+        assert_eq!(fallback, RoleModelSelection::default());
+        let local_fake = provisional_default_role_model_selection(AgentRole::GateClassifier)
+            .resolve_for_availability(false, SupervisorRuntime::Fake)
+            .expect("local fake fallback");
+        assert_eq!(local_fake, RoleModelSelection::default());
+        assert!(
+            provisional_default_role_model_selection(AgentRole::GateClassifier)
+                .resolve_for_availability(false, SupervisorRuntime::Codex)
+                .expect_err("local fake cannot replace a Codex model")
+                .to_string()
+                .contains("valid only for the fake runtime")
+        );
     }
 
     #[test]
@@ -14344,6 +14571,15 @@ mod tests {
             .unavailable_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("runtime-side role-tagged usage reporting")));
+        assert_eq!(
+            by_role[&AgentRole::GateClassifier].observation,
+            RoleUsageObservation::NotProcessObservable
+        );
+        assert!(by_role[&AgentRole::GateClassifier].usage.is_none());
+        assert!(by_role[&AgentRole::GateClassifier]
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("deterministic local broker")));
         let serialized_worker =
             serde_json::to_value(&by_role[&AgentRole::Worker]).expect("serialize worker marker");
         assert_eq!(serialized_worker["observation"], "not_process_observable");
@@ -19396,6 +19632,7 @@ mod tests {
             RoleModelSelection {
                 model: Some("worker-model".to_string()),
                 reasoning_effort: Some("low".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
         );
         let prompt = worker_prompt(
@@ -20722,6 +20959,7 @@ mod tests {
             semantic_modules: Vec::new(),
             claim_tokens: Vec::new(),
             semantic_intent_tokens: Vec::new(),
+            role_economics_profile: None,
             role_usage: BTreeMap::new(),
             total_usage: None,
             total_cost_usd: None,
