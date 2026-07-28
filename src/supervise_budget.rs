@@ -5,7 +5,7 @@
 //! as zero cost. This module is kept private to `supervise` so the run lifecycle remains the single
 //! owner of both usage accounting and enforcement.
 
-use super::AgentRole;
+use crate::supervise::AgentRole;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,19 +13,19 @@ use std::{
 };
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Soft ceilings are advisory degradation thresholds: reaching one does not by itself stop new
 /// dispatch. Hard ceilings are admission gates, and reaching one exhausts further dispatch.
-pub(super) struct RunBudgetLimits {
+pub struct RunBudgetLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) soft_tokens: Option<usize>,
+    pub soft_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) hard_tokens: Option<usize>,
+    pub hard_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) soft_cost_usd: Option<f64>,
+    pub soft_cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) hard_cost_usd: Option<f64>,
+    pub hard_cost_usd: Option<f64>,
 }
 
 impl RunBudgetLimits {
@@ -49,15 +49,19 @@ impl RunBudgetLimits {
         Ok(self)
     }
 
-    fn has_cost_ceiling(self) -> bool {
+    pub(super) fn has_cost_ceiling(self) -> bool {
         self.soft_cost_usd.is_some() || self.hard_cost_usd.is_some()
     }
 
-    fn has_any_ceiling(self) -> bool {
+    pub(super) fn has_any_ceiling(self) -> bool {
         self.soft_tokens.is_some()
             || self.hard_tokens.is_some()
             || self.soft_cost_usd.is_some()
             || self.hard_cost_usd.is_some()
+    }
+
+    pub(super) fn is_unconfigured(&self) -> bool {
+        !self.has_any_ceiling()
     }
 }
 
@@ -94,29 +98,29 @@ pub(super) struct BudgetReservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct BudgetAmount {
-    pub(super) tokens: usize,
+pub struct BudgetAmount {
+    pub tokens: usize,
     /// `None` means cost accounting is unavailable or unreliable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) cost_usd: Option<f64>,
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct BudgetRemaining {
+pub struct BudgetRemaining {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) soft_tokens: Option<usize>,
+    pub soft_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) hard_tokens: Option<usize>,
+    pub hard_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) soft_cost_usd: Option<f64>,
+    pub soft_cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) hard_cost_usd: Option<f64>,
+    pub hard_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum BudgetReason {
+pub enum BudgetReason {
     SoftTokenCeilingReached,
     HardTokenCeilingReached,
     SoftCostCeilingReached,
@@ -129,7 +133,7 @@ pub(super) enum BudgetReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum BudgetAction {
+pub enum BudgetAction {
     Continue,
     Degrade,
     OwnerEscalation,
@@ -137,30 +141,30 @@ pub(super) enum BudgetAction {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RoleBudgetReport {
-    pub(super) role: AgentRole,
-    pub(super) consumed: BudgetAmount,
-    pub(super) reserved: BudgetAmount,
-    pub(super) active_reservations: usize,
-    pub(super) usage_complete: bool,
+pub struct RoleBudgetReport {
+    pub role: AgentRole,
+    pub consumed: BudgetAmount,
+    pub reserved: BudgetAmount,
+    pub active_reservations: usize,
+    pub usage_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RunBudgetReport {
-    pub(super) limits: RunBudgetLimits,
-    pub(super) consumed: BudgetAmount,
-    pub(super) reserved: BudgetAmount,
-    pub(super) committed: BudgetAmount,
-    pub(super) remaining: BudgetRemaining,
+pub struct RunBudgetReport {
+    pub limits: RunBudgetLimits,
+    pub consumed: BudgetAmount,
+    pub reserved: BudgetAmount,
+    pub committed: BudgetAmount,
+    pub remaining: BudgetRemaining,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) roles: Vec<RoleBudgetReport>,
-    pub(super) active_reservations: usize,
-    pub(super) usage_complete: bool,
-    pub(super) action: BudgetAction,
-    pub(super) new_dispatch_allowed: bool,
+    pub roles: Vec<RoleBudgetReport>,
+    pub active_reservations: usize,
+    pub usage_complete: bool,
+    pub action: BudgetAction,
+    pub new_dispatch_allowed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(super) reasons: Vec<BudgetReason>,
+    pub reasons: Vec<BudgetReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -193,6 +197,7 @@ pub(super) enum BudgetAdmission {
     },
 }
 
+#[cfg(test)]
 impl BudgetAdmission {
     pub(super) fn reservation(&self) -> Option<&BudgetReservation> {
         match self {
@@ -369,9 +374,14 @@ impl RunBudgetLedger {
             });
         }
         if request.cost_usd.is_none() && self.limits.has_cost_ceiling() {
+            let mut next = state.clone();
+            next.force_stop = true;
+            next.persistent_reasons.insert(BudgetReason::MissingPricing);
+            let report = report_for(self.limits, &next)?;
+            *state = next;
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::MissingCostEstimate,
-                report: current_report,
+                report,
             });
         }
 
@@ -387,13 +397,19 @@ impl RunBudgetLedger {
             .hard_tokens
             .filter(|limit| projected_tokens > *limit)
         {
+            let mut next = state.clone();
+            next.force_stop = true;
+            next.persistent_reasons
+                .insert(BudgetReason::HardTokenCeilingReached);
+            let report = report_for(self.limits, &next)?;
+            *state = next;
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::HardTokenCeiling {
                     limit,
                     committed: committed_tokens,
                     requested: request.tokens,
                 },
-                report: current_report,
+                report,
             });
         }
 
@@ -404,13 +420,19 @@ impl RunBudgetLedger {
         {
             let projected_cost_usd = checked_cost_add(committed_cost_usd, requested_usd)?;
             if projected_cost_usd > limit_usd {
+                let mut next = state.clone();
+                next.force_stop = true;
+                next.persistent_reasons
+                    .insert(BudgetReason::HardCostCeilingReached);
+                let report = report_for(self.limits, &next)?;
+                *state = next;
                 return Ok(BudgetAdmission::Refused {
                     refusal: BudgetAdmissionRefusal::HardCostCeiling {
                         limit_usd,
                         committed_usd: committed_cost_usd,
                         requested_usd,
                     },
-                    report: current_report,
+                    report,
                 });
             }
         }
@@ -868,6 +890,15 @@ mod tests {
         }
     }
 
+    fn cost_limits(soft_cost_usd: f64, hard_cost_usd: f64) -> RunBudgetLimits {
+        RunBudgetLimits {
+            soft_tokens: None,
+            hard_tokens: None,
+            soft_cost_usd: Some(soft_cost_usd),
+            hard_cost_usd: Some(hard_cost_usd),
+        }
+    }
+
     fn request(tokens: usize, cost_usd: Option<f64>) -> BudgetReservationRequest {
         BudgetReservationRequest {
             role: AgentRole::Worker,
@@ -974,6 +1005,110 @@ mod tests {
             1
         );
         assert_eq!(ledger.report().expect("report").reserved.tokens, 60);
+    }
+
+    #[test]
+    fn soft_and_exact_hard_cost_boundaries_degrade_then_stop() {
+        let ledger = RunBudgetLedger::new(cost_limits(0.5, 1.0)).expect("cost ledger");
+        let first = ledger
+            .reserve(request(100, Some(0.5)))
+            .expect("soft-boundary reservation");
+        assert!(first.reservation().is_some());
+        assert_eq!(first.report().action, BudgetAction::Degrade);
+        assert!(first.report().new_dispatch_allowed);
+        assert!(first
+            .report()
+            .reasons
+            .contains(&BudgetReason::SoftCostCeilingReached));
+
+        let exact = ledger
+            .reserve(request(100, Some(0.5)))
+            .expect("exact hard-boundary reservation");
+        assert!(exact.reservation().is_some());
+        assert_eq!(exact.report().committed.cost_usd, Some(1.0));
+        assert_eq!(exact.report().remaining.hard_cost_usd, Some(0.0));
+        assert_eq!(exact.report().action, BudgetAction::OwnerEscalation);
+        assert!(!exact.report().new_dispatch_allowed);
+        assert!(exact
+            .report()
+            .reasons
+            .contains(&BudgetReason::HardCostCeilingReached));
+    }
+
+    #[test]
+    fn over_hard_cost_boundary_is_refused_without_mutating_commitments() {
+        let ledger = RunBudgetLedger::new(cost_limits(0.5, 1.0)).expect("cost ledger");
+        let first = ledger
+            .reserve(request(100, Some(0.6)))
+            .expect("first reservation");
+        assert!(first.reservation().is_some());
+
+        let over = ledger
+            .reserve(request(100, Some(0.400_001)))
+            .expect("over-boundary refusal");
+        assert!(matches!(
+            over,
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::HardCostCeiling { .. },
+                ..
+            }
+        ));
+        let report = ledger.report().expect("stable report");
+        assert_eq!(report.reserved.cost_usd, Some(0.6));
+        assert_eq!(report.active_reservations, 1);
+        assert!(!report.new_dispatch_allowed);
+        assert!(report
+            .reasons
+            .contains(&BudgetReason::HardCostCeilingReached));
+    }
+
+    #[test]
+    fn concurrent_cost_reservations_cannot_oversubscribe_hard_ceiling() {
+        let ledger =
+            Arc::new(RunBudgetLedger::new(cost_limits(0.9, 1.0)).expect("concurrent cost ledger"));
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let ledger = Arc::clone(&ledger);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    ledger.reserve(request(100, Some(0.6)))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reservation thread").expect("ledger"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, BudgetAdmission::Admitted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        BudgetAdmission::Refused {
+                            refusal: BudgetAdmissionRefusal::HardCostCeiling { .. },
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            ledger.report().expect("report").reserved.cost_usd,
+            Some(0.6)
+        );
     }
 
     #[test]
@@ -1153,6 +1288,12 @@ mod tests {
             }
         ));
         assert_eq!(cost_ledger.report().expect("report").reserved.tokens, 0);
+        assert!(
+            !cost_ledger
+                .report()
+                .expect("latched pricing refusal")
+                .new_dispatch_allowed
+        );
 
         let token_ledger = RunBudgetLedger::new(token_limits(500, 1_000)).expect("token ledger");
         let admission = token_ledger
