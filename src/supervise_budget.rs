@@ -42,7 +42,7 @@ impl RunBudgetLimits {
         }
         if matches!(
             (self.soft_cost_usd, self.hard_cost_usd),
-            (Some(soft), Some(hard)) if soft > hard
+            (Some(soft), Some(hard)) if cost_exceeds(soft, hard)
         ) {
             return Err(BudgetError::InvalidLimitOrder { resource: "cost" });
         }
@@ -419,7 +419,7 @@ impl RunBudgetLedger {
             (request.cost_usd, self.limits.hard_cost_usd)
         {
             let projected_cost_usd = checked_cost_add(committed_cost_usd, requested_usd)?;
-            if projected_cost_usd > limit_usd {
+            if cost_exceeds(projected_cost_usd, limit_usd) {
                 let mut next = state.clone();
                 next.force_stop = true;
                 next.persistent_reasons
@@ -762,14 +762,14 @@ fn report_for(limits: RunBudgetLimits, state: &LedgerState) -> Result<RunBudgetR
     let soft_cost_reached = committed_cost_complete
         && limits
             .soft_cost_usd
-            .is_some_and(|limit| committed_cost_usd >= limit);
+            .is_some_and(|limit| cost_reaches(committed_cost_usd, limit));
     if soft_cost_reached {
         reasons.insert(BudgetReason::SoftCostCeilingReached);
     }
     let hard_cost_reached = committed_cost_complete
         && limits
             .hard_cost_usd
-            .is_some_and(|limit| committed_cost_usd >= limit);
+            .is_some_and(|limit| cost_reaches(committed_cost_usd, limit));
     if hard_cost_reached {
         reasons.insert(BudgetReason::HardCostCeilingReached);
     }
@@ -832,15 +832,19 @@ fn report_for(limits: RunBudgetLimits, state: &LedgerState) -> Result<RunBudgetR
                 .then(|| {
                     limits
                         .soft_cost_usd
-                        .map(|limit| (limit - committed_cost_usd).max(0.0))
+                        .map(|limit| cost_remaining(limit, committed_cost_usd))
+                        .transpose()
                 })
+                .transpose()?
                 .flatten(),
             hard_cost_usd: committed_cost_complete
                 .then(|| {
                     limits
                         .hard_cost_usd
-                        .map(|limit| (limit - committed_cost_usd).max(0.0))
+                        .map(|limit| cost_remaining(limit, committed_cost_usd))
+                        .transpose()
                 })
+                .transpose()?
                 .flatten(),
         },
         roles,
@@ -861,13 +865,32 @@ fn checked_cost_add(left: f64, right: f64) -> Result<f64> {
     }
 }
 
+fn cost_tolerance(left: f64, right: f64) -> f64 {
+    f64::EPSILON * left.abs().max(right.abs()) * 8.0
+}
+
+fn cost_exceeds(value: f64, limit: f64) -> bool {
+    value - limit > cost_tolerance(value, limit)
+}
+
+fn cost_reaches(value: f64, limit: f64) -> bool {
+    !cost_exceeds(limit, value)
+}
+
+fn cost_remaining(limit: f64, committed: f64) -> Result<f64> {
+    if cost_reaches(committed, limit) {
+        Ok(0.0)
+    } else {
+        checked_cost_sub(limit, committed)
+    }
+}
+
 fn checked_cost_sub(total: f64, amount: f64) -> Result<f64> {
     let remaining = total - amount;
     if !remaining.is_finite() {
         return Err(BudgetError::CostOverflow);
     }
-    let tolerance = f64::EPSILON * total.abs().max(amount.abs()).max(1.0) * 8.0;
-    if remaining < -tolerance {
+    if remaining < -cost_tolerance(total, amount) {
         return Err(BudgetError::InconsistentState);
     }
     Ok(remaining.max(0.0))
@@ -1033,6 +1056,45 @@ mod tests {
             .report()
             .reasons
             .contains(&BudgetReason::HardCostCeilingReached));
+    }
+
+    #[test]
+    fn decimal_exact_hard_cost_boundary_is_admitted_with_zero_remaining() {
+        let ledger = RunBudgetLedger::new(cost_limits(0.1, 0.3)).expect("decimal cost ledger");
+        admitted_reservation(
+            ledger
+                .reserve(request(100, Some(0.1)))
+                .expect("first decimal reservation"),
+        );
+
+        let exact = ledger
+            .reserve(request(100, Some(0.2)))
+            .expect("decimal exact-boundary reservation");
+        assert!(exact.reservation().is_some());
+        assert_eq!(exact.report().remaining.hard_cost_usd, Some(0.0));
+        assert_eq!(exact.report().action, BudgetAction::OwnerEscalation);
+        assert!(!exact.report().new_dispatch_allowed);
+        assert!(exact
+            .report()
+            .reasons
+            .contains(&BudgetReason::HardCostCeilingReached));
+
+        let over_ledger =
+            RunBudgetLedger::new(cost_limits(0.1, 0.3)).expect("near-over cost ledger");
+        admitted_reservation(
+            over_ledger
+                .reserve(request(100, Some(0.1)))
+                .expect("near-over first reservation"),
+        );
+        assert!(matches!(
+            over_ledger
+                .reserve(request(100, Some(0.200_001)))
+                .expect("near-over boundary refusal"),
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::HardCostCeiling { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
