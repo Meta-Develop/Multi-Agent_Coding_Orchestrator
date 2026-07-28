@@ -87,7 +87,9 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE: &str =
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
     "selected provisionally from deterministic fake phase-A evidence over a hand-authored plan; \
      no real-provider or isolated-repository comparison was observed, so this profile is \
-     production-ineligible and must not be represented as evidence-backed production economics";
+     production-ineligible and must not be represented as evidence-backed production economics; \
+     live role-scoped model availability is not currently observable, so command construction \
+     follows each role's explicit unknown-availability fallback";
 const DEFAULT_PROFILE_MODEL: &str = "gpt-5.6-sol";
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
@@ -287,12 +289,23 @@ impl UnavailableModelFallback {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleModelAvailability {
+    #[default]
+    Unknown,
+    Available,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RoleEconomicsProfile {
     pub name: String,
     pub evidence: String,
     pub evidence_notice: String,
     pub production_eligible: bool,
+    #[serde(default)]
+    pub model_availability: RoleModelAvailability,
     #[serde(default)]
     pub overridden_roles: Vec<AgentRole>,
     pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
@@ -301,17 +314,26 @@ pub struct RoleEconomicsProfile {
 impl RoleModelSelection {
     pub fn resolve_for_availability(
         &self,
-        preferred_model_available: bool,
+        availability: RoleModelAvailability,
         runtime: SupervisorRuntime,
     ) -> Result<Self> {
-        if preferred_model_available || self.model.is_none() {
+        if self.model.is_none() || availability == RoleModelAvailability::Available {
+            return Ok(self.clone());
+        }
+        if availability == RoleModelAvailability::Unknown
+            && self.unavailable_model_fallback == UnavailableModelFallback::FailClosed
+        {
             return Ok(self.clone());
         }
         match self.unavailable_model_fallback {
             UnavailableModelFallback::FailClosed => {
                 bail!("configured model is unavailable and the role fallback is fail_closed")
             }
-            UnavailableModelFallback::RuntimeDefault => Ok(Self::default()),
+            UnavailableModelFallback::RuntimeDefault => Ok(Self {
+                model: None,
+                reasoning_effort: self.reasoning_effort.clone(),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            }),
             UnavailableModelFallback::LocalDeterministicFake
                 if runtime == SupervisorRuntime::Fake =>
             {
@@ -3002,6 +3024,7 @@ impl SupervisorPlan {
             evidence: PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE.to_string(),
             evidence_notice: PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE.to_string(),
             production_eligible: false,
+            model_availability: RoleModelAvailability::Unknown,
             overridden_roles: self.role_models.keys().copied().collect(),
             role_models,
         }
@@ -3012,9 +3035,13 @@ fn apply_role_model_selection(
     command: ExternalAgentCommand,
     plan: &SupervisorPlan,
     role: AgentRole,
-) -> ExternalAgentCommand {
-    let (model, reasoning_effort) = role_model_selection(plan, role);
-    command.with_model_selection(model, reasoning_effort)
+    runtime: SupervisorRuntime,
+) -> Result<ExternalAgentCommand> {
+    // The current runtime boundary does not expose a role-scoped, authenticated model catalog.
+    // Resolve conservatively from Unknown instead of treating a configured slug as observed.
+    let selection = effective_role_model_selection(plan, role)
+        .resolve_for_availability(RoleModelAvailability::Unknown, runtime)?;
+    Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
 }
 
 #[cfg(unix)]
@@ -5088,7 +5115,7 @@ fn execute_supervisor_assignment_inner(
                 &attempt_artifacts.report_path,
                 Duration::from_secs(plan.child_timeout_seconds),
             );
-            command = apply_role_model_selection(command, plan, assignment.role);
+            command = apply_role_model_selection(command, plan, assignment.role, options.runtime)?;
             command.output_schema = Some(schema_path.clone());
             command = command.with_hidden_root(repo).with_agent_lifecycle(
                 repo,
@@ -5731,7 +5758,12 @@ fn execute_supervisor_assignment_inner(
                 &auditor_report_path,
                 Duration::from_secs(plan.child_timeout_seconds),
             );
-            auditor_command = apply_role_model_selection(auditor_command, plan, AgentRole::Auditor);
+            auditor_command = apply_role_model_selection(
+                auditor_command,
+                plan,
+                AgentRole::Auditor,
+                options.runtime,
+            )?;
             auditor_command.output_schema = Some(auditor_schema_path);
             auditor_command = configure_read_only_auditor_command(auditor_command)?
                 .with_hidden_root(repo)
@@ -14365,8 +14397,20 @@ mod tests {
                 Duration::from_secs(1),
             )
         };
-        let child = apply_role_model_selection(base_command(), &plan, AgentRole::ChildOrchestrator);
-        let auditor = apply_role_model_selection(base_command(), &plan, AgentRole::Auditor);
+        let child = apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Codex,
+        )
+        .expect("unknown availability preserves the configured child selection");
+        let auditor = apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::Auditor,
+            SupervisorRuntime::Codex,
+        )
+        .expect("unknown availability preserves the configured auditor selection");
         let child_argv = crate::external_agent::command_argv(&child)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -14409,6 +14453,7 @@ mod tests {
         );
         assert!(profile.evidence_notice.contains("production-ineligible"));
         assert!(!profile.production_eligible);
+        assert_eq!(profile.model_availability, RoleModelAvailability::Unknown);
         assert!(profile.overridden_roles.is_empty());
         assert_eq!(profile.role_models.len(), 5);
         assert_eq!(
@@ -14462,20 +14507,107 @@ mod tests {
         assert_eq!(profile.overridden_roles, vec![AgentRole::GateClassifier]);
 
         let fallback = profile.role_models[&AgentRole::GateClassifier]
-            .resolve_for_availability(false, SupervisorRuntime::Codex)
+            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex)
             .expect("runtime-default fallback");
-        assert_eq!(fallback, RoleModelSelection::default());
+        assert!(fallback.model.is_none());
+        assert_eq!(fallback.reasoning_effort.as_deref(), Some("high"));
         let local_fake = provisional_default_role_model_selection(AgentRole::GateClassifier)
-            .resolve_for_availability(false, SupervisorRuntime::Fake)
+            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Fake)
             .expect("local fake fallback");
         assert_eq!(local_fake, RoleModelSelection::default());
         assert!(
             provisional_default_role_model_selection(AgentRole::GateClassifier)
-                .resolve_for_availability(false, SupervisorRuntime::Codex)
+                .resolve_for_availability(
+                    RoleModelAvailability::Unavailable,
+                    SupervisorRuntime::Codex,
+                )
                 .expect_err("local fake cannot replace a Codex model")
                 .to_string()
                 .contains("valid only for the fake runtime")
         );
+    }
+
+    #[test]
+    fn unavailable_model_fallback_is_a_runtime_aware_command_contract() {
+        let mut plan = parse_supervisor_plan_with_consultant(
+            std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+        )
+        .expect("base plan")
+        .plan;
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("preferred-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            },
+        );
+        let base_command = || {
+            ExternalAgentCommand::codex(
+                "codex",
+                "/workspace",
+                "/run/prompt.md",
+                "/run/events.jsonl",
+                "/run/report.json",
+                Duration::from_secs(1),
+            )
+        };
+
+        let unknown_runtime_default = apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Codex,
+        )
+        .expect("unknown availability uses the configured runtime default");
+        assert_eq!(unknown_runtime_default.model, None);
+        assert_eq!(
+            unknown_runtime_default.reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        let unavailable = plan.role_models[&AgentRole::ChildOrchestrator]
+            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex)
+            .expect("known unavailable model uses the configured runtime default");
+        assert_eq!(unavailable.model, None);
+        assert_eq!(unavailable.reasoning_effort.as_deref(), Some("high"));
+
+        plan.role_models
+            .get_mut(&AgentRole::ChildOrchestrator)
+            .expect("child selection")
+            .unavailable_model_fallback = UnavailableModelFallback::FailClosed;
+        apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Codex,
+        )
+        .expect("fail_closed does not reject unknown availability");
+        let fail_closed_error = plan.role_models[&AgentRole::ChildOrchestrator]
+            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex)
+            .expect_err("fail_closed rejects observed unavailability");
+        assert!(format!("{fail_closed_error:#}").contains("fallback is fail_closed"));
+
+        plan.role_models
+            .get_mut(&AgentRole::ChildOrchestrator)
+            .expect("child selection")
+            .unavailable_model_fallback = UnavailableModelFallback::LocalDeterministicFake;
+        let local_fake = apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Fake,
+        )
+        .expect("the fake runtime may use its deterministic local fallback");
+        assert_eq!(local_fake.model, None);
+        let invalid_runtime_error = apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Codex,
+        )
+        .expect_err("Codex runtime cannot use the deterministic local fallback");
+        assert!(format!("{invalid_runtime_error:#}").contains("valid only for the fake runtime"));
     }
 
     #[test]
