@@ -17,6 +17,8 @@ use crate::process_runner::{
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -32,9 +34,13 @@ use std::{
 pub(crate) mod codex_app_server;
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
-const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const OUTPUT_TEE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const MIN_CREDENTIAL_BYTES: usize = 16;
+const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
+const MAX_CREDENTIAL_REDACTION_PATTERNS: usize = 32;
+const MAX_CREDENTIAL_REDACTION_PATTERN_BYTES: usize = 128 * 1024;
+const CREDENTIAL_REDACTION: &[u8] = b"[REDACTED]";
 const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
@@ -58,6 +64,8 @@ const MAX_CODEX_JSONL_EVENT_BYTES: usize = 256 * 1024;
 const MAX_CODEX_EVENT_TEXT_BYTES: usize = 64 * 1024;
 const MAX_ENVIRONMENT_REQUIREMENTS: usize = 32;
 const PRE_ACTION_JOURNAL_VERSION: u32 = 1;
+#[cfg(target_os = "linux")]
+static OUTPUT_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) trait PreActionJournalSink {
     fn append(&mut self, record: &PreActionJournalRecord) -> Result<()>;
@@ -319,8 +327,13 @@ impl EnvironmentExecutable {
 pub enum EnvironmentCredential {
     CodexAccessToken,
     CodexApiKey,
-    CodexAuthFile,
     OpenAiApiKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentConfiguration {
+    CodexAuthFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -347,6 +360,9 @@ pub enum EnvironmentRequirement {
     Credential {
         credential: EnvironmentCredential,
     },
+    Configuration {
+        configuration: EnvironmentConfiguration,
+    },
     Network {
         access: EnvironmentNetworkAccess,
     },
@@ -368,6 +384,10 @@ impl EnvironmentRequirement {
 
     pub const fn credential(credential: EnvironmentCredential) -> Self {
         Self::Credential { credential }
+    }
+
+    pub const fn configuration(configuration: EnvironmentConfiguration) -> Self {
+        Self::Configuration { configuration }
     }
 
     pub const fn network(access: EnvironmentNetworkAccess) -> Self {
@@ -395,6 +415,9 @@ pub enum EnvironmentPreflightObservation {
     },
     CredentialPresent {
         credential: EnvironmentCredential,
+    },
+    ConfigurationPresent {
+        configuration: EnvironmentConfiguration,
     },
     Network {
         enabled: bool,
@@ -992,11 +1015,13 @@ fn run_external_agent_runtime(
 ) -> ExternalAgentRun {
     let started = Instant::now();
     if cancellation.is_cancelled() {
-        return failed_external_run(
+        return failed_external_environment_run(
             spec,
             started,
             command_display(&spec.program, &[]),
             false,
+            EnvironmentFailureCategory::ProbeFailed,
+            None,
             "external agent was cancelled before executable preflight".to_string(),
         );
     }
@@ -1039,6 +1064,17 @@ fn run_external_agent_runtime(
                         Some(requirement),
                         format!("trusted Codex executable preflight failed: {error}"),
                     ));
+            } else {
+                let summary = format!("explicit executable preflight failed: {error}");
+                report
+                    .stdout
+                    .run_metadata
+                    .environment_failures
+                    .push(environment_failure(
+                        EnvironmentFailureCategory::ProbeFailed,
+                        None,
+                        summary,
+                    ));
             }
             return report;
         }
@@ -1046,11 +1082,13 @@ fn run_external_agent_runtime(
     let program_identity = match external_program_identity(&resolved_program) {
         Ok(identity) => identity,
         Err(error) => {
-            return failed_external_run(
+            return failed_external_environment_run(
                 spec,
                 started,
                 command_display(&resolved_program, &[]),
                 false,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
                 format!("failed to capture external executable identity: {error}"),
             );
         }
@@ -1058,62 +1096,109 @@ fn run_external_agent_runtime(
     if spec.workspace_access == WorkspaceAccess::ReadOnly
         && !spec.worktree_control_exceptions.is_empty()
     {
-        return failed_external_run(
+        return failed_external_environment_run(
             spec,
             started,
             command_display(&resolved_program, &[]),
             false,
+            EnvironmentFailureCategory::ProbeFailed,
+            None,
             "read-only external agents may not declare writable control exceptions".to_string(),
         );
     }
     let protected_controls = match protected_worktree_controls(spec) {
         Ok(controls) => controls,
         Err(error) => {
-            return failed_external_run(
+            return failed_external_environment_run(
                 spec,
                 started,
                 command_display(&resolved_program, &[]),
                 false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
                 format!("failed to validate protected worktree controls: {error}"),
             );
         }
     };
+    let mut output_staging = match ExternalOutputStaging::create(&spec.cwd) {
+        Ok(staging) => staging,
+        Err(error) => {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&resolved_program, &[]),
+                false,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
+                format!("failed to prepare private external-agent output staging: {error}"),
+            );
+        }
+    };
+    let mut target_spec = spec.clone();
+    target_spec.output_last_message = match output_staging.path() {
+        Ok(path) => path.to_path_buf(),
+        Err(error) => {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&resolved_program, &[]),
+                false,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
+                format!("private external-agent output staging became unavailable: {error:#}"),
+            );
+        }
+    };
+    let mut target_controls = protected_controls.clone();
+    target_controls.writable_artifact_root = Some(output_staging.root_path().to_path_buf());
     let duplex_review_required = runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::CodexSupervisor
         && spec.workspace_access == WorkspaceAccess::ReadWrite;
     if duplex_review_required && review_runtime.is_none() {
-        return failed_external_run(
+        return failed_external_environment_run(
             spec,
             started,
             command_display(&resolved_program, &[]),
             false,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(EnvironmentRequirement::sandbox(
+                EnvironmentSandboxCapability::VerifiedExternalCodex,
+            )),
             "writable verified Codex requires a duplex MACO pre-action reviewer".to_string(),
         );
     }
     if duplex_review_required {
         if let Err(error) = validate_universal_pre_action_coverage() {
-            return failed_external_run(
+            return failed_external_environment_run(
                 spec,
                 started,
                 command_display(&resolved_program, &[]),
                 false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
                 error.to_string(),
             );
         }
     }
     let argv = if duplex_review_required {
-        codex_app_server_argv(spec, &protected_controls)
+        codex_app_server_argv(&target_spec, &target_controls)
     } else {
-        command_argv_with_controls(spec, &protected_controls)
+        command_argv_with_controls(&target_spec, &target_controls)
     };
     let argv_digest = match argv_digest(&argv) {
         Ok(digest) => digest,
         Err(error) => {
-            return failed_external_run(
+            return failed_external_environment_run(
                 spec,
                 started,
                 command_display(&resolved_program, &argv),
                 false,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
                 format!("failed to bind external-agent permission evidence to argv: {error}"),
             );
         }
@@ -1138,6 +1223,27 @@ fn run_external_agent_runtime(
     };
 
     let mut codex_version = None;
+    let agent_lifecycle = match &spec.agent_lifecycle {
+        Some(identity) => match AgentLaunchMetadata::new(
+            &identity.registry_repo,
+            &identity.role,
+            &identity.run_id,
+            &identity.task_id,
+        ) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::ProbeFailed,
+                    None,
+                    format!("failed to prepare external-agent lifecycle identity: {error:#}"),
+                );
+                return report;
+            }
+        },
+        None => None,
+    };
 
     if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::ExplicitCustom
@@ -1148,10 +1254,19 @@ fn run_external_agent_runtime(
     {
         let requirement = codex_environment_requirement();
         let remaining = spec.timeout.saturating_sub(started.elapsed());
-        match preflight_custom_codex_version(&resolved_program, &spec.cwd, remaining, cancellation)
-        {
-            Ok(version) => {
-                codex_version = Some((version.major, version.minor, version.patch));
+        match preflight_custom_codex_version(
+            &resolved_program,
+            &spec.cwd,
+            remaining,
+            cancellation,
+            agent_lifecycle.as_ref(),
+        ) {
+            Ok(probe) => {
+                codex_version = Some((
+                    probe.version.major,
+                    probe.version.minor,
+                    probe.version.patch,
+                ));
                 report
                     .stdout
                     .run_metadata
@@ -1161,7 +1276,7 @@ fn run_external_agent_runtime(
                         status: EnvironmentPreflightStatus::Satisfied,
                         observation: Some(EnvironmentPreflightObservation::ExecutableVersion {
                             executable: EnvironmentExecutable::Codex,
-                            version,
+                            version: probe.version,
                         }),
                     });
             }
@@ -1190,13 +1305,23 @@ fn run_external_agent_runtime(
 
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
-        report.error = Some("external agent was cancelled before target setup".to_string());
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::ProbeFailed,
+            None,
+            "external agent was cancelled before target setup".to_string(),
+        );
         return report;
     }
 
     if spec.invocation == ExternalAgentInvocation::ClaudeConsultant {
         report.duration_ms = duration_millis(started.elapsed());
-        report.error = Some(
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(EnvironmentRequirement::sandbox(
+                EnvironmentSandboxCapability::VerifiedExternalCodex,
+            )),
             "external Claude runtime is refused because no enforceable inner read-only permission contract is available"
                 .to_string(),
         );
@@ -1211,31 +1336,17 @@ fn run_external_agent_runtime(
         && program_trust == ExternalProgramTrust::ExplicitCustom
     {
         report.duration_ms = duration_millis(started.elapsed());
-        report.error = Some(
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(EnvironmentRequirement::sandbox(
+                EnvironmentSandboxCapability::VerifiedExternalCodex,
+            )),
             "explicit custom executables are limited to a strict-offline version diagnostic; the external target was not started"
                 .to_string(),
         );
         return report;
     }
-
-    let agent_lifecycle = match &spec.agent_lifecycle {
-        Some(identity) => match AgentLaunchMetadata::new(
-            &identity.registry_repo,
-            &identity.role,
-            &identity.run_id,
-            &identity.task_id,
-        ) {
-            Ok(metadata) => Some(metadata),
-            Err(error) => {
-                report.duration_ms = duration_millis(started.elapsed());
-                report.error = Some(format!(
-                    "failed to prepare external-agent lifecycle identity: {error:#}"
-                ));
-                return report;
-            }
-        },
-        None => None,
-    };
 
     if let Err(error) = ensure_existing_output_parent(&spec.json_log)
         .and_then(|_| ensure_existing_output_parent(&spec.output_last_message))
@@ -1246,7 +1357,12 @@ fn run_external_agent_runtime(
         .and_then(|_| ensure_safe_read_target(&spec.prompt))
     {
         report.duration_ms = duration_millis(started.elapsed());
-        report.error = Some(error.to_string());
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::ProbeFailed,
+            None,
+            error.to_string(),
+        );
         return report;
     }
 
@@ -1254,7 +1370,12 @@ fn run_external_agent_runtime(
         Ok(reservation) => reservation,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
-            report.error = Some(format!("failed to reserve external-agent output: {error}"));
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
+                format!("failed to reserve external-agent output: {error}"),
+            );
             return report;
         }
     };
@@ -1263,10 +1384,15 @@ fn run_external_agent_runtime(
         Ok(prompt) => prompt,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
-            report.error = Some(format!(
-                "failed to read prompt file {}: {error}",
-                spec.prompt.display()
-            ));
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
+                format!(
+                    "failed to read prompt file {}: {error}",
+                    spec.prompt.display()
+                ),
+            );
             return report;
         }
     };
@@ -1275,8 +1401,12 @@ fn run_external_agent_runtime(
             Ok(prompt) => Some(prompt),
             Err(_) => {
                 report.duration_ms = duration_millis(started.elapsed());
-                report.error =
-                    Some("writable Codex app-server prompt is not valid UTF-8".to_string());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::ProbeFailed,
+                    None,
+                    "writable Codex app-server prompt is not valid UTF-8".to_string(),
+                );
                 return report;
             }
         }
@@ -1293,7 +1423,7 @@ fn run_external_agent_runtime(
                 report.duration_ms = duration_millis(started.elapsed());
                 report.error = Some(format!("failed to validate Codex auth source: {error}"));
                 let requirement =
-                    EnvironmentRequirement::credential(EnvironmentCredential::CodexAuthFile);
+                    EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
                 report
                     .stdout
                     .run_metadata
@@ -1323,10 +1453,10 @@ fn run_external_agent_runtime(
         && program_trust == ExternalProgramTrust::TrustedSystemCodex
     {
         match external_side_effect_profile(
-            spec,
+            &target_spec,
             &resolved_program,
             program_trust,
-            &protected_controls,
+            &target_controls,
         ) {
             Ok(profile) => Some(profile),
             Err(error) => {
@@ -1364,6 +1494,22 @@ fn run_external_agent_runtime(
         external_environment.insert(MACO_RUN_ID_ENV.to_string(), metadata.run_id().to_string());
         external_environment.insert(MACO_TASK_ID_ENV.to_string(), metadata.task_id().to_string());
     }
+    let credential_redactor =
+        match CredentialRedactor::from_runtime(&external_environment, codex_auth.as_ref()) {
+            Ok(redactor) => redactor,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::ProbeFailed,
+                    Some(EnvironmentRequirement::configuration(
+                        EnvironmentConfiguration::CodexAuthFile,
+                    )),
+                    format!("failed to prepare bounded credential redaction: {error:#}"),
+                );
+                return report;
+            }
+        };
     if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::TrustedSystemCodex
         && matches!(
@@ -1373,32 +1519,31 @@ fn run_external_agent_runtime(
     {
         let Some(preflight_profile) = side_effect_profile.as_ref() else {
             report.duration_ms = duration_millis(started.elapsed());
-            report.error = Some(
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
                 "verified environment preflight did not receive the target side-effect profile"
                     .to_string(),
             );
-            report
-                .stdout
-                .run_metadata
-                .environment_failures
-                .push(environment_failure(
-                    EnvironmentFailureCategory::SandboxUnavailable,
-                    None,
-                    "verified environment preflight did not receive the target side-effect profile"
-                        .to_string(),
-                ));
             return report;
         };
         let remaining = spec.timeout.saturating_sub(started.elapsed());
-        let preflight = run_environment_preflight(
-            spec,
+        let mut preflight = run_environment_preflight(
+            &target_spec,
             &resolved_program,
             remaining,
             cancellation,
             &external_environment,
             preflight_profile,
             codex_auth.as_ref(),
+            agent_lifecycle.as_ref(),
         );
+        for failure in &mut preflight.failures {
+            failure.summary = credential_redactor.redact_string(&failure.summary);
+        }
         codex_version = preflight
             .codex_version
             .map(|version| (version.major, version.minor, version.patch));
@@ -1423,28 +1568,49 @@ fn run_external_agent_runtime(
             })
     {
         report.duration_ms = duration_millis(started.elapsed());
-        report.error = Some(format!(
-            "external executable changed before target release: {error}"
-        ));
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::ProbeFailed,
+            Some(codex_environment_requirement()),
+            format!("external executable changed before target release: {error}"),
+        );
         return report;
     }
     if let Some(auth) = &codex_auth {
         if let Err(error) = auth.verify_source_unchanged() {
             report.duration_ms = duration_millis(started.elapsed());
-            report.error = Some(format!(
-                "Codex auth source changed before unit setup: {error}"
-            ));
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                Some(EnvironmentRequirement::configuration(
+                    EnvironmentConfiguration::CodexAuthFile,
+                )),
+                format!("Codex auth source changed before unit setup: {error}"),
+            );
             return report;
         }
     }
+    let mut json_log_reservation = match reserve_external_output(&spec.json_log) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
+                format!("failed to reserve external-agent JSON log: {error}"),
+            );
+            return report;
+        }
+    };
 
     let timeout = spec.timeout.saturating_sub(started.elapsed());
     let process_spec = ProcessSpec::direct(
         "external agent",
         &resolved_program,
         argv.clone(),
-        &spec.cwd,
-        OUTPUT_CAPTURE_LIMIT_BYTES,
+        &target_spec.cwd,
+        OUTPUT_TEE_LIMIT_BYTES,
     )
     .with_stdin(if duplex_review_required {
         StdinMode::Interactive
@@ -1453,20 +1619,17 @@ fn run_external_agent_runtime(
     })
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
-    .with_stdout(
-        StreamCapture::bounded(OUTPUT_CAPTURE_LIMIT_BYTES)
-            .tee_to(&spec.json_log)
-            .with_tee_limit(OUTPUT_TEE_LIMIT_BYTES),
-    );
-    let process_spec = match agent_lifecycle {
-        Some(metadata) => process_spec.with_agent_lifecycle(metadata),
-        None => process_spec,
-    };
+    .with_stdout(StreamCapture::bounded(OUTPUT_TEE_LIMIT_BYTES));
     let process_spec = match runtime {
         ExternalExecutionRuntime::Verified => {
             let Some(side_effect_profile) = side_effect_profile else {
                 report.duration_ms = duration_millis(started.elapsed());
-                report.error = Some(
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::SandboxUnavailable,
+                    Some(EnvironmentRequirement::sandbox(
+                        EnvironmentSandboxCapability::VerifiedExternalCodex,
+                    )),
                     "verified external-agent runtime did not prepare a side-effect profile"
                         .to_string(),
                 );
@@ -1477,16 +1640,28 @@ fn run_external_agent_runtime(
                 external_environment,
                 side_effect_profile,
                 codex_auth.as_ref(),
+                agent_lifecycle.as_ref(),
             )
         }
         #[cfg(test)]
-        ExternalExecutionRuntime::NonpublishableSimulation => process_spec
-            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+        ExternalExecutionRuntime::NonpublishableSimulation => {
+            let process_spec = process_spec
+                .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort);
+            match &agent_lifecycle {
+                Some(metadata) => process_spec.with_agent_lifecycle(metadata.clone()),
+                None => process_spec,
+            }
+        }
     };
 
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
-        report.error = Some("external agent was cancelled before target start".to_string());
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::ProbeFailed,
+            None,
+            "external agent was cancelled before target start".to_string(),
+        );
         return report;
     }
 
@@ -1494,8 +1669,8 @@ fn run_external_agent_runtime(
     let completed_context = CompletedTargetContext {
         runtime,
         codex_version,
-        spec,
-        protected_controls: &protected_controls,
+        spec: &target_spec,
+        protected_controls: &target_controls,
         argv_digest: &argv_digest,
         program_identity: &program_identity,
     };
@@ -1503,13 +1678,25 @@ fn run_external_agent_runtime(
     let mut retained_review_metrics = None;
     let process_result = if duplex_review_required {
         let Some(prompt) = duplex_prompt else {
-            report.error = Some("writable Codex duplex prompt was unavailable".to_string());
             report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
+                "writable Codex duplex prompt was unavailable".to_string(),
+            );
             return report;
         };
         let Some(review_runtime) = review_runtime.as_mut() else {
-            report.error = Some("writable Codex duplex review runtime was unavailable".to_string());
             report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
+                "writable Codex duplex review runtime was unavailable".to_string(),
+            );
             return report;
         };
         let attempt =
@@ -1522,21 +1709,38 @@ fn run_external_agent_runtime(
                 let mut final_message_error = None;
                 if let Ok(outcome) = &protocol {
                     if let Some(final_message) = &outcome.final_message {
-                        if let Err(error) = output_reservation
-                            .write_bytes_atomic(final_message.as_bytes(), OUTPUT_TEE_LIMIT_BYTES)
-                        {
+                        let final_message =
+                            credential_redactor.redact_bytes(final_message.as_bytes());
+                        let staged = output_staging.reservation_mut().and_then(|reservation| {
+                            reservation.write_bytes_atomic(&final_message, OUTPUT_TEE_LIMIT_BYTES)
+                        });
+                        if let Err(error) = staged {
                             final_message_error = Some(format!(
-                                "failed to persist app-server final message: {error:#}"
+                                "failed to stage app-server final message: {error:#}"
                             ));
                         }
                     }
                 }
-                record_completed_target(
-                    &mut report,
-                    interactive.process,
-                    &output_reservation,
-                    completed_context,
-                );
+                match output_staging.reservation() {
+                    Ok(staged_output) => record_completed_target(
+                        &mut report,
+                        interactive.process,
+                        staged_output,
+                        &mut output_reservation,
+                        &mut json_log_reservation,
+                        &credential_redactor,
+                        completed_context,
+                    ),
+                    Err(error) => {
+                        report.error = append_external_error(
+                            report.error.take(),
+                            Some(format!(
+                                "private external-agent output staging became unavailable: {error:#}"
+                            )),
+                        );
+                        report.publishable = false;
+                    }
+                }
                 if let Some(error) = final_message_error {
                     report.error = append_external_error(report.error.take(), Some(error));
                     report.publishable = false;
@@ -1544,7 +1748,9 @@ fn run_external_agent_runtime(
                 if let Err(error) = protocol {
                     report.error = append_external_error(
                         report.error.take(),
-                        Some(format!("duplex app-server protocol failed closed: {error}")),
+                        Some(credential_redactor.redact_string(&format!(
+                            "duplex app-server protocol failed closed: {error}"
+                        ))),
                     );
                     report.publishable = false;
                 }
@@ -1554,13 +1760,63 @@ fn run_external_agent_runtime(
         }
     } else {
         run_process_cancellable(process_spec, cancellation).map(|output| {
-            record_completed_target(&mut report, output, &output_reservation, completed_context);
+            match output_staging.reservation() {
+                Ok(staged_output) => record_completed_target(
+                    &mut report,
+                    output,
+                    staged_output,
+                    &mut output_reservation,
+                    &mut json_log_reservation,
+                    &credential_redactor,
+                    completed_context,
+                ),
+                Err(error) => {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!(
+                            "private external-agent output staging became unavailable: {error:#}"
+                        )),
+                    );
+                    report.publishable = false;
+                }
+            }
         })
     };
     match process_result {
         Ok(()) => {}
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
+            let preparation_failure = match &error {
+                ProcessRunError::ContainmentUnavailable { .. }
+                | ProcessRunError::ProcessOwnership { .. } => Some((
+                    EnvironmentFailureCategory::SandboxUnavailable,
+                    Some(EnvironmentRequirement::sandbox(
+                        EnvironmentSandboxCapability::VerifiedExternalCodex,
+                    )),
+                )),
+                ProcessRunError::OpenTee { .. }
+                | ProcessRunError::TeeConflict { .. }
+                | ProcessRunError::Spawn { .. }
+                | ProcessRunError::SetupTimeout { .. }
+                | ProcessRunError::IoSetup { .. }
+                | ProcessRunError::StdinTooLarge { .. }
+                | ProcessRunError::Cancelled { evidence: None, .. } => {
+                    Some((EnvironmentFailureCategory::ProbeFailed, None))
+                }
+                ProcessRunError::Cancelled {
+                    evidence: Some(_), ..
+                }
+                | ProcessRunError::Wait { .. } => None,
+            };
+            if let Some((category, requirement)) = preparation_failure {
+                report.stdout.target_launch_attempted = false;
+                record_environment_failure(
+                    &mut report,
+                    category,
+                    requirement,
+                    credential_redactor.redact_string(&error.to_string()),
+                );
+            }
             let mut sandbox_denials = Vec::new();
             if let Some(denial) = sandbox_denial_from_process_error(&error) {
                 sandbox_denials.push(denial);
@@ -1572,14 +1828,59 @@ fn run_external_agent_runtime(
                 ));
                 report.process_tree = Some(evidence.process_tree);
                 report.side_effects = Some(evidence.side_effects);
-                replace_report_stdout(&mut report, summarize_output(&evidence.stdout));
+                if let Err(log_error) = write_redacted_json_log(
+                    &mut json_log_reservation,
+                    evidence.stdout.as_bytes(),
+                    &credential_redactor,
+                ) {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!(
+                            "failed to persist redacted JSON log: {log_error:#}"
+                        )),
+                    );
+                }
+                replace_report_stdout(
+                    &mut report,
+                    summarize_redacted_output(&evidence.stdout, &credential_redactor),
+                );
                 report.stdout.target_launch_attempted = true;
-                report.stderr = summarize_output(&evidence.stderr);
+                report.stderr = summarize_redacted_output(&evidence.stderr, &credential_redactor);
             }
             deduplicate_sandbox_denials(&mut sandbox_denials);
             report.stdout.run_metadata.sandbox_denials = sandbox_denials;
-            report.error = Some(error.to_string());
+            report.error = append_external_error(
+                report.error.take(),
+                Some(credential_redactor.redact_string(&error.to_string())),
+            );
+            let staged_output = output_staging.reservation().and_then(|staged_output| {
+                capture_redacted_staged_output(
+                    staged_output,
+                    &mut output_reservation,
+                    &credential_redactor,
+                )
+            });
+            match staged_output {
+                Ok(bytes) => report.output_last_message = Some(bytes),
+                Err(output_error) => {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!(
+                            "external-agent output reservation could not be safely captured: {output_error:#}"
+                        )),
+                    );
+                }
+            }
         }
+    }
+    if let Err(error) = output_staging.cleanup() {
+        report.error = append_external_error(
+            report.error.take(),
+            Some(format!(
+                "failed to remove private external-agent output staging: {error:#}"
+            )),
+        );
+        report.publishable = false;
     }
     report.stdout.run_metadata.gate_denials = retained_gate_denials;
     report.stdout.run_metadata.pre_action_review_metrics = retained_review_metrics;
@@ -1981,7 +2282,10 @@ struct CompletedTargetContext<'a> {
 fn record_completed_target(
     report: &mut ExternalAgentRun,
     output: ProcessOutput,
-    output_reservation: &ReservedOutputFile,
+    staged_output: &ReservedOutputFile,
+    output_reservation: &mut ReservedOutputFile,
+    json_log_reservation: &mut ReservedOutputFile,
+    credential_redactor: &CredentialRedactor,
     context: CompletedTargetContext<'_>,
 ) {
     let safety_verified = output.safety_evidence_verified();
@@ -2007,11 +2311,28 @@ fn record_completed_target(
             )
         });
     }
-    replace_report_stdout(report, summarize_output(&output.stdout));
+    if let Err(error) = write_redacted_json_log(
+        json_log_reservation,
+        output.stdout.as_bytes(),
+        credential_redactor,
+    ) {
+        report.error = append_external_error(
+            report.error.take(),
+            Some(format!("failed to persist redacted JSON log: {error:#}")),
+        );
+    }
+    replace_report_stdout(
+        report,
+        summarize_redacted_output(&output.stdout, credential_redactor),
+    );
     report.stdout.target_launch_attempted = true;
     report.stdout.run_metadata.sandbox_denials = sandbox_denials;
-    report.stderr = summarize_output(&output.stderr);
-    report.error = append_external_error(output.stdin_error, output.process_error);
+    report.stderr = summarize_redacted_output(&output.stderr, credential_redactor);
+    report.error = append_external_error(
+        report.error.take(),
+        append_external_error(output.stdin_error, output.process_error)
+            .map(|error| credential_redactor.redact_string(&error)),
+    );
     if output.timed_out {
         report.error = append_external_error(
             report.error.take(),
@@ -2027,7 +2348,7 @@ fn record_completed_target(
         };
         report.error = append_external_error(report.error.take(), Some(status_error));
     }
-    match output_reservation.read_bounded(OUTPUT_TEE_LIMIT_BYTES) {
+    match capture_redacted_staged_output(staged_output, output_reservation, credential_redactor) {
         Ok(bytes) => report.output_last_message = Some(bytes),
         Err(error) => {
             report.error = append_external_error(
@@ -2045,6 +2366,27 @@ fn record_completed_target(
         && report.exit_code == Some(0)
         && !report.timed_out
         && report.error.is_none();
+}
+
+fn capture_redacted_staged_output(
+    staging: &ReservedOutputFile,
+    destination: &mut ReservedOutputFile,
+    credential_redactor: &CredentialRedactor,
+) -> Result<Vec<u8>> {
+    let bytes = match staging.read_bounded(OUTPUT_TEE_LIMIT_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            destination
+                .write_bytes_atomic(CREDENTIAL_REDACTION, OUTPUT_TEE_LIMIT_BYTES)
+                .context("failed to replace unreadable external output with a redaction marker")?;
+            return Err(error);
+        }
+    };
+    let redacted = credential_redactor.redact_bytes(&bytes);
+    destination
+        .write_bytes_atomic(&redacted, OUTPUT_TEE_LIMIT_BYTES)
+        .context("failed to persist redacted external-agent output")?;
+    Ok(redacted)
 }
 
 fn deduplicate_sandbox_denials(evidence: &mut Vec<SandboxDenialEvidence>) {
@@ -2078,6 +2420,20 @@ fn failed_external_run(
     }
 }
 
+fn failed_external_environment_run(
+    spec: &ExternalAgentCommand,
+    started: Instant,
+    command: Vec<String>,
+    timed_out: bool,
+    category: EnvironmentFailureCategory,
+    requirement: Option<EnvironmentRequirement>,
+    error: String,
+) -> ExternalAgentRun {
+    let mut report = failed_external_run(spec, started, command, timed_out, error.clone());
+    record_environment_failure(&mut report, category, requirement, error);
+    report
+}
+
 fn reserve_external_output(path: &Path) -> Result<ReservedOutputFile> {
     let parent = required_parent(path)?;
     let name = path
@@ -2085,6 +2441,122 @@ fn reserve_external_output(path: &Path) -> Result<ReservedOutputFile> {
         .with_context(|| format!("external output must have a file name: {}", path.display()))?;
     let root = SecureOutputRoot::open_or_create(parent)?;
     root.reserve(name)
+}
+
+struct ExternalOutputStaging {
+    root_path: PathBuf,
+    reservation: Option<ReservedOutputFile>,
+}
+
+impl ExternalOutputStaging {
+    fn create(writable_workspace: &Path) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let runtime_root = crate::process_runner::trusted_linux_runtime_root()
+                .context("owner-private runtime root is unavailable for output staging")?;
+            Self::create_under(&runtime_root, writable_workspace)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = writable_workspace;
+            bail!("private external-agent output staging requires the strict Linux runtime")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_under(runtime_root: &Path, writable_workspace: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut root_path = None;
+        for _ in 0..16 {
+            let sequence = OUTPUT_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = runtime_root.join(format!(
+                ".maco-external-output-{}-{sequence}",
+                std::process::id()
+            ));
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => {
+                    root_path = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create private output staging {}",
+                            candidate.display()
+                        )
+                    });
+                }
+            }
+        }
+        let root_path =
+            root_path.context("private output staging name collision limit was exhausted")?;
+        let prepared = (|| -> Result<ReservedOutputFile> {
+            let root = SecureOutputRoot::open_private(&root_path)?;
+            root.reject_inside(writable_workspace)?;
+            root.reserve(OsStr::new("last-message.raw"))
+        })();
+        match prepared {
+            Ok(reservation) => Ok(Self {
+                root_path,
+                reservation: Some(reservation),
+            }),
+            Err(error) => {
+                let _ = fs::remove_dir(&root_path);
+                Err(error)
+            }
+        }
+    }
+
+    fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    fn path(&self) -> Result<&Path> {
+        self.reservation
+            .as_ref()
+            .map(ReservedOutputFile::path)
+            .context("private output staging reservation was already cleaned")
+    }
+
+    fn reservation(&self) -> Result<&ReservedOutputFile> {
+        self.reservation
+            .as_ref()
+            .context("private output staging reservation was already cleaned")
+    }
+
+    fn reservation_mut(&mut self) -> Result<&mut ReservedOutputFile> {
+        self.reservation
+            .as_mut()
+            .context("private output staging reservation was already cleaned")
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        self.cleanup_inner()
+    }
+
+    fn cleanup_inner(&mut self) -> Result<()> {
+        if let Some(reservation) = self.reservation.take() {
+            reservation
+                .remove()
+                .context("failed to remove reserved raw output staging leaf")?;
+        }
+        fs::remove_dir(&self.root_path).with_context(|| {
+            format!(
+                "failed to remove private output staging root {}",
+                self.root_path.display()
+            )
+        })
+    }
+}
+
+impl Drop for ExternalOutputStaging {
+    fn drop(&mut self) {
+        let _ = self.cleanup_inner();
+    }
 }
 
 #[derive(Debug)]
@@ -2105,9 +2577,17 @@ struct EnvironmentPreflightReport {
     results: Vec<EnvironmentPreflightResult>,
     failures: Vec<EnvironmentFailure>,
     codex_version: Option<EnvironmentVersion>,
+    verified_confinement: Option<SideEffectConfinementProfileKind>,
     timed_out: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnvironmentVersionProbe {
+    version: EnvironmentVersion,
+    verified_confinement: SideEffectConfinementProfileKind,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn preflight_codex_version(
     program: &Path,
     cwd: &Path,
@@ -2116,7 +2596,8 @@ fn preflight_codex_version(
     environment: &BTreeMap<String, String>,
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
-) -> std::result::Result<EnvironmentVersion, CodexPreflightFailure> {
+    agent_lifecycle: Option<&AgentLaunchMetadata>,
+) -> std::result::Result<EnvironmentVersionProbe, CodexPreflightFailure> {
     let requirement = codex_environment_requirement();
     let version = run_fixed_version_probe(
         EnvironmentExecutable::Codex,
@@ -2127,6 +2608,7 @@ fn preflight_codex_version(
         environment,
         side_effect_profile,
         codex_auth,
+        agent_lifecycle,
     )
     .map_err(|probe| CodexPreflightFailure {
         timed_out: probe.timed_out,
@@ -2141,14 +2623,17 @@ fn preflight_codex_version(
         CODEX_MINIMUM_VERSION.1,
         CODEX_MINIMUM_VERSION.2,
     ));
-    if !constraint.accepts(version) {
+    if !constraint.accepts(version.version) {
         return Err(CodexPreflightFailure {
             failure: Box::new(environment_failure(
                 EnvironmentFailureCategory::VersionMismatch,
                 Some(requirement),
                 format!(
-                    "Codex {version} is too old; {}.{}.{} or newer custom permissions are required",
-                    CODEX_MINIMUM_VERSION.0, CODEX_MINIMUM_VERSION.1, CODEX_MINIMUM_VERSION.2
+                    "Codex {} is too old; {}.{}.{} or newer custom permissions are required",
+                    version.version,
+                    CODEX_MINIMUM_VERSION.0,
+                    CODEX_MINIMUM_VERSION.1,
+                    CODEX_MINIMUM_VERSION.2
                 ),
             )),
             timed_out: false,
@@ -2162,7 +2647,8 @@ fn preflight_custom_codex_version(
     cwd: &Path,
     timeout: Duration,
     cancellation: &ProcessCancellation,
-) -> std::result::Result<EnvironmentVersion, CodexPreflightFailure> {
+    agent_lifecycle: Option<&AgentLaunchMetadata>,
+) -> std::result::Result<EnvironmentVersionProbe, CodexPreflightFailure> {
     let program_parent = program.parent().ok_or_else(|| CodexPreflightFailure {
         failure: Box::new(environment_failure(
             EnvironmentFailureCategory::ProbeFailed,
@@ -2186,9 +2672,11 @@ fn preflight_custom_codex_version(
         &environment,
         &profile,
         None,
+        agent_lifecycle,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_environment_preflight(
     spec: &ExternalAgentCommand,
     resolved_codex: &Path,
@@ -2197,6 +2685,7 @@ fn run_environment_preflight(
     environment: &BTreeMap<String, String>,
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
+    agent_lifecycle: Option<&AgentLaunchMetadata>,
 ) -> EnvironmentPreflightReport {
     let mut report = EnvironmentPreflightReport::default();
     if let Err(error) = validate_environment_requirements(&spec.environment_requirements) {
@@ -2218,16 +2707,18 @@ fn run_environment_preflight(
         environment,
         side_effect_profile,
         codex_auth,
+        agent_lifecycle,
     );
     match codex_probe {
-        Ok(version) => {
-            report.codex_version = Some(version);
+        Ok(probe) => {
+            report.codex_version = Some(probe.version);
+            report.verified_confinement = Some(probe.verified_confinement);
             report.results.push(EnvironmentPreflightResult {
                 requirement: implicit_codex,
                 status: EnvironmentPreflightStatus::Satisfied,
                 observation: Some(EnvironmentPreflightObservation::ExecutableVersion {
                     executable: EnvironmentExecutable::Codex,
-                    version,
+                    version: probe.version,
                 }),
             });
         }
@@ -2253,6 +2744,8 @@ fn run_environment_preflight(
             side_effect_profile,
             codex_auth,
             report.codex_version,
+            report.verified_confinement,
+            agent_lifecycle,
         );
         report.results.push(result);
         if let Some(failure) = failure {
@@ -2273,6 +2766,8 @@ fn evaluate_environment_requirement(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     observed_codex_version: Option<EnvironmentVersion>,
+    verified_confinement: Option<SideEffectConfinementProfileKind>,
+    agent_lifecycle: Option<&AgentLaunchMetadata>,
 ) -> (EnvironmentPreflightResult, Option<EnvironmentFailure>, bool) {
     match requirement {
         EnvironmentRequirement::Executable {
@@ -2300,7 +2795,9 @@ fn evaluate_environment_requirement(
                         environment,
                         side_effect_profile,
                         codex_auth,
+                        agent_lifecycle,
                     )
+                    .map(|probe| probe.version)
                 })
             };
             match observed {
@@ -2358,7 +2855,7 @@ fn evaluate_environment_requirement(
             }
         }
         EnvironmentRequirement::Credential { credential } => {
-            let present = credential_present(*credential, environment, codex_auth);
+            let present = credential_present(*credential, environment);
             if present {
                 (
                     EnvironmentPreflightResult {
@@ -2390,14 +2887,16 @@ fn evaluate_environment_requirement(
                 )
             }
         }
-        EnvironmentRequirement::Network { access } => {
-            let enabled = false;
-            if *access == EnvironmentNetworkAccess::Disabled {
+        EnvironmentRequirement::Configuration { configuration } => {
+            let present = configuration_present(*configuration, codex_auth);
+            if present {
                 (
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
                         status: EnvironmentPreflightStatus::Satisfied,
-                        observation: Some(EnvironmentPreflightObservation::Network { enabled }),
+                        observation: Some(EnvironmentPreflightObservation::ConfigurationPresent {
+                            configuration: *configuration,
+                        }),
                     },
                     None,
                     false,
@@ -2407,7 +2906,59 @@ fn evaluate_environment_requirement(
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
                         status: EnvironmentPreflightStatus::Blocked,
-                        observation: Some(EnvironmentPreflightObservation::Network { enabled }),
+                        observation: None,
+                    },
+                    Some(environment_failure(
+                        EnvironmentFailureCategory::MissingCredential,
+                        Some(requirement.clone()),
+                        format!(
+                            "required configuration source {} is absent from the sanitized child runtime",
+                            configuration_name(*configuration)
+                        ),
+                    )),
+                    false,
+                )
+            }
+        }
+        EnvironmentRequirement::Network { access } => {
+            let enforced_offline =
+                verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex);
+            if *access == EnvironmentNetworkAccess::Disabled && enforced_offline {
+                (
+                    EnvironmentPreflightResult {
+                        requirement: requirement.clone(),
+                        status: EnvironmentPreflightStatus::Satisfied,
+                        observation: Some(EnvironmentPreflightObservation::Network {
+                            enabled: false,
+                        }),
+                    },
+                    None,
+                    false,
+                )
+            } else if *access == EnvironmentNetworkAccess::Disabled {
+                (
+                    EnvironmentPreflightResult {
+                        requirement: requirement.clone(),
+                        status: EnvironmentPreflightStatus::Blocked,
+                        observation: None,
+                    },
+                    Some(environment_failure(
+                        EnvironmentFailureCategory::SandboxUnavailable,
+                        Some(requirement.clone()),
+                        "the fixed child sandbox did not produce verified offline confinement evidence"
+                            .to_string(),
+                    )),
+                    false,
+                )
+            } else {
+                (
+                    EnvironmentPreflightResult {
+                        requirement: requirement.clone(),
+                        status: EnvironmentPreflightStatus::Blocked,
+                        observation: enforced_offline
+                            .then_some(EnvironmentPreflightObservation::Network {
+                                enabled: false,
+                            }),
                     },
                     Some(environment_failure(
                         EnvironmentFailureCategory::NetworkForbidden,
@@ -2420,16 +2971,16 @@ fn evaluate_environment_requirement(
             }
         }
         EnvironmentRequirement::Sandbox { capability } => {
-            let profile = side_effect_profile.kind();
             let verified = *capability == EnvironmentSandboxCapability::VerifiedExternalCodex
-                && profile == SideEffectConfinementProfileKind::ExternalCodex
-                && observed_codex_version.is_some();
+                && verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex);
             if verified {
                 (
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
                         status: EnvironmentPreflightStatus::Satisfied,
-                        observation: Some(EnvironmentPreflightObservation::Sandbox { profile }),
+                        observation: Some(EnvironmentPreflightObservation::Sandbox {
+                            profile: SideEffectConfinementProfileKind::ExternalCodex,
+                        }),
                     },
                     None,
                     false,
@@ -2439,7 +2990,8 @@ fn evaluate_environment_requirement(
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
                         status: EnvironmentPreflightStatus::Blocked,
-                        observation: Some(EnvironmentPreflightObservation::Sandbox { profile }),
+                        observation: verified_confinement
+                            .map(|profile| EnvironmentPreflightObservation::Sandbox { profile }),
                     },
                     Some(environment_failure(
                         EnvironmentFailureCategory::SandboxUnavailable,
@@ -2454,12 +3006,15 @@ fn evaluate_environment_requirement(
     }
 }
 
-fn validate_environment_requirements(requirements: &[EnvironmentRequirement]) -> Result<()> {
+pub(crate) fn validate_environment_requirements(
+    requirements: &[EnvironmentRequirement],
+) -> Result<()> {
     if requirements.len() > MAX_ENVIRONMENT_REQUIREMENTS {
         bail!("environment requirements exceed the fixed limit of {MAX_ENVIRONMENT_REQUIREMENTS}");
     }
     let mut executables = BTreeSet::new();
     let mut credentials = BTreeSet::new();
+    let mut configurations = BTreeSet::new();
     let mut network = false;
     let mut sandbox = false;
     for requirement in requirements {
@@ -2483,6 +3038,14 @@ fn validate_environment_requirements(requirements: &[EnvironmentRequirement]) ->
                     bail!(
                         "duplicate credential requirement for {}",
                         credential_name(*credential)
+                    );
+                }
+            }
+            EnvironmentRequirement::Configuration { configuration } => {
+                if !configurations.insert(*configuration) {
+                    bail!(
+                        "duplicate configuration requirement for {}",
+                        configuration_name(*configuration)
                     );
                 }
             }
@@ -2578,7 +3141,8 @@ fn run_fixed_version_probe(
     environment: &BTreeMap<String, String>,
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
-) -> std::result::Result<EnvironmentVersion, EnvironmentProbeFailure> {
+    agent_lifecycle: Option<&AgentLaunchMetadata>,
+) -> std::result::Result<EnvironmentVersionProbe, EnvironmentProbeFailure> {
     let label = format!("{} version preflight", executable.program_name());
     let process_spec = ProcessSpec::direct(
         label,
@@ -2594,6 +3158,7 @@ fn run_fixed_version_probe(
         environment.clone(),
         side_effect_profile.clone(),
         codex_auth,
+        agent_lifecycle,
     );
     let output = run_process_cancellable(process_spec, cancellation).map_err(|error| {
         let sandbox_unavailable = matches!(
@@ -2652,15 +3217,29 @@ fn run_fixed_version_probe(
         parse_codex_version(&version_text)
             .map(|(major, minor, patch)| EnvironmentVersion::new(major, minor, patch))
     } else {
-        parse_environment_version(&version_text)
+        parse_environment_version(executable, &version_text)
     };
-    parsed.ok_or_else(|| EnvironmentProbeFailure {
+    let version = parsed.ok_or_else(|| EnvironmentProbeFailure {
         category: EnvironmentFailureCategory::ProbeFailed,
         summary: format!(
             "{} version preflight returned an unknown version",
             executable.program_name()
         ),
         timed_out: false,
+    })?;
+    let SideEffectConfinementEvidence::Verified(verified_confinement) = output.side_effects else {
+        return Err(EnvironmentProbeFailure {
+            category: EnvironmentFailureCategory::SandboxUnavailable,
+            summary: format!(
+                "{} version preflight did not return verified confinement evidence",
+                executable.program_name()
+            ),
+            timed_out: false,
+        });
+    };
+    Ok(EnvironmentVersionProbe {
+        version,
+        verified_confinement,
     })
 }
 
@@ -2669,12 +3248,17 @@ fn with_external_runtime_context(
     environment: BTreeMap<String, String>,
     side_effect_profile: SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
+    agent_lifecycle: Option<&AgentLaunchMetadata>,
 ) -> ProcessSpec {
     let prepared = process_spec
         .with_environment(EnvironmentMode::ClearAndSet(environment))
         .with_private_runtime_home(true)
         .with_private_runtime_codex_home(true)
         .with_side_effect_confinement(side_effect_profile);
+    let prepared = match agent_lifecycle {
+        Some(metadata) => prepared.with_agent_lifecycle(metadata.clone()),
+        None => prepared,
+    };
     #[cfg(target_os = "linux")]
     {
         match codex_auth {
@@ -2692,13 +3276,20 @@ fn with_external_runtime_context(
 fn credential_present(
     credential: EnvironmentCredential,
     environment: &BTreeMap<String, String>,
-    codex_auth: Option<&ValidatedCodexAuth>,
 ) -> bool {
     match credential {
         EnvironmentCredential::OpenAiApiKey => environment.contains_key("OPENAI_API_KEY"),
         EnvironmentCredential::CodexApiKey => environment.contains_key("CODEX_API_KEY"),
         EnvironmentCredential::CodexAccessToken => environment.contains_key("CODEX_ACCESS_TOKEN"),
-        EnvironmentCredential::CodexAuthFile => codex_auth.is_some(),
+    }
+}
+
+fn configuration_present(
+    configuration: EnvironmentConfiguration,
+    codex_auth: Option<&ValidatedCodexAuth>,
+) -> bool {
+    match configuration {
+        EnvironmentConfiguration::CodexAuthFile => codex_auth.is_some(),
     }
 }
 
@@ -2707,7 +3298,12 @@ const fn credential_name(credential: EnvironmentCredential) -> &'static str {
         EnvironmentCredential::OpenAiApiKey => "OPENAI_API_KEY",
         EnvironmentCredential::CodexApiKey => "CODEX_API_KEY",
         EnvironmentCredential::CodexAccessToken => "CODEX_ACCESS_TOKEN",
-        EnvironmentCredential::CodexAuthFile => "Codex auth file",
+    }
+}
+
+const fn configuration_name(configuration: EnvironmentConfiguration) -> &'static str {
+    match configuration {
+        EnvironmentConfiguration::CodexAuthFile => "Codex auth file",
     }
 }
 
@@ -2722,6 +3318,31 @@ fn environment_failure(
         summary,
         remediation: environment_remediation(category),
     }
+}
+
+fn record_environment_failure(
+    report: &mut ExternalAgentRun,
+    category: EnvironmentFailureCategory,
+    requirement: Option<EnvironmentRequirement>,
+    summary: String,
+) {
+    report.error = Some(summary.clone());
+    if let Some(requirement) = requirement.as_ref() {
+        report
+            .stdout
+            .run_metadata
+            .environment_preflight_results
+            .push(EnvironmentPreflightResult {
+                requirement: requirement.clone(),
+                status: EnvironmentPreflightStatus::Blocked,
+                observation: None,
+            });
+    }
+    report
+        .stdout
+        .run_metadata
+        .environment_failures
+        .push(environment_failure(category, requirement, summary));
 }
 
 fn environment_blocked_message(failures: &[EnvironmentFailure]) -> String {
@@ -2750,7 +3371,7 @@ fn environment_remediation(category: EnvironmentFailureCategory) -> Vec<Environm
         ],
         EnvironmentFailureCategory::MissingCredential => vec![EnvironmentRemediation {
             scope: EnvironmentRemediationScope::CredentialConfiguration,
-            guidance: "Configure the named credential source for the supervised runner without committing or copying the secret into the repository."
+            guidance: "Configure the named credential or configuration source for the supervised runner without committing or copying secret material into the repository."
                 .to_string(),
         }],
         EnvironmentFailureCategory::NetworkForbidden => vec![EnvironmentRemediation {
@@ -2771,16 +3392,57 @@ fn environment_remediation(category: EnvironmentFailureCategory) -> Vec<Environm
     }
 }
 
-fn parse_environment_version(text: &str) -> Option<EnvironmentVersion> {
-    parse_version_candidate(text)
+fn parse_environment_version(
+    executable: EnvironmentExecutable,
+    text: &str,
+) -> Option<EnvironmentVersion> {
+    let prefixes: &[&str] = match executable {
+        EnvironmentExecutable::Bash => &["gnu bash, version "],
+        EnvironmentExecutable::Cargo => &["cargo "],
+        EnvironmentExecutable::Cmake => &["cmake version "],
+        EnvironmentExecutable::Git => &["git version "],
+        EnvironmentExecutable::Nix => &["nix (nix) "],
+        EnvironmentExecutable::Python3 => &["python "],
+        EnvironmentExecutable::Rustc => &["rustc "],
+        EnvironmentExecutable::Node | EnvironmentExecutable::Npm => {
+            return unique_version_candidate(text.lines().filter_map(parse_standalone_version));
+        }
+        EnvironmentExecutable::Codex => return None,
+    };
+    unique_version_candidate(
+        text.lines()
+            .filter_map(|line| parse_prefixed_version(line, prefixes)),
+    )
 }
 
 fn parse_codex_version(text: &str) -> Option<(u64, u64, u64)> {
-    if !text.to_ascii_lowercase().contains("codex") {
-        return None;
-    }
-    let version = parse_environment_version(text)?;
+    let version = unique_version_candidate(
+        text.lines()
+            .filter_map(|line| parse_prefixed_version(line, &["codex-cli ", "codex "])),
+    )?;
     Some((version.major, version.minor, version.patch))
+}
+
+fn parse_prefixed_version(line: &str, prefixes: &[&str]) -> Option<EnvironmentVersion> {
+    let line = line.trim();
+    let lower = line.to_ascii_lowercase();
+    let prefix = prefixes.iter().find(|prefix| lower.starts_with(**prefix))?;
+    let version_word = line[prefix.len()..].split_whitespace().next()?;
+    parse_version_candidate(version_word)
+}
+
+fn parse_standalone_version(line: &str) -> Option<EnvironmentVersion> {
+    let line = line.trim();
+    (!line.is_empty() && !line.contains(char::is_whitespace))
+        .then(|| parse_version_candidate(line))
+        .flatten()
+}
+
+fn unique_version_candidate(
+    mut candidates: impl Iterator<Item = EnvironmentVersion>,
+) -> Option<EnvironmentVersion> {
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
 }
 
 fn parse_version_candidate(text: &str) -> Option<EnvironmentVersion> {
@@ -4218,6 +4880,156 @@ impl ValidatedCodexAuth {
     }
 }
 
+#[derive(Clone, Default)]
+struct CredentialRedactor {
+    patterns: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for CredentialRedactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialRedactor")
+            .field("patterns", &RedactedByteCount(self.patterns.len()))
+            .finish()
+    }
+}
+
+impl CredentialRedactor {
+    fn from_runtime(
+        environment: &BTreeMap<String, String>,
+        codex_auth: Option<&ValidatedCodexAuth>,
+    ) -> Result<Self> {
+        let mut patterns = Vec::new();
+        for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            if let Some(value) = environment.get(key) {
+                add_credential_pattern(&mut patterns, value.as_bytes())?;
+                if let Ok(quoted) = serde_json::to_string(value) {
+                    if let Some(escaped) = quoted
+                        .strip_prefix('"')
+                        .and_then(|value| value.strip_suffix('"'))
+                    {
+                        add_credential_pattern(&mut patterns, escaped.as_bytes())?;
+                    }
+                }
+            }
+        }
+        if let Some(auth) = codex_auth {
+            let auth_pattern_start = patterns.len();
+            if auth.bytes.len() <= MAX_CREDENTIAL_BYTES {
+                add_credential_pattern(&mut patterns, &auth.bytes)?;
+            }
+            let value = serde_json::from_slice::<serde_json::Value>(&auth.bytes)
+                .context("Codex auth material is not valid JSON for bounded redaction")?;
+            collect_json_credential_patterns(&value, false, &mut patterns)?;
+            if auth.bytes.len() > MAX_CREDENTIAL_BYTES && patterns.len() == auth_pattern_start {
+                bail!(
+                    "oversized Codex auth material did not expose any bounded redaction patterns"
+                );
+            }
+        }
+        patterns.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        Ok(Self { patterns })
+    }
+
+    fn redact_bytes(&self, bytes: &[u8]) -> Vec<u8> {
+        self.patterns
+            .iter()
+            .fold(bytes.to_vec(), |redacted, pattern| {
+                replace_bounded_bytes(&redacted, pattern, CREDENTIAL_REDACTION)
+            })
+    }
+
+    fn redact_string(&self, value: &str) -> String {
+        String::from_utf8_lossy(&self.redact_bytes(value.as_bytes())).into_owned()
+    }
+}
+
+fn add_credential_pattern(patterns: &mut Vec<Vec<u8>>, value: &[u8]) -> Result<()> {
+    if !(MIN_CREDENTIAL_BYTES..=MAX_CREDENTIAL_BYTES).contains(&value.len())
+        || patterns.iter().any(|existing| existing == value)
+    {
+        return Ok(());
+    }
+    let aggregate_bytes = patterns
+        .iter()
+        .try_fold(0usize, |total, pattern| total.checked_add(pattern.len()))
+        .and_then(|total| total.checked_add(value.len()))
+        .context("credential redaction pattern size overflow")?;
+    if patterns.len() >= MAX_CREDENTIAL_REDACTION_PATTERNS
+        || aggregate_bytes > MAX_CREDENTIAL_REDACTION_PATTERN_BYTES
+    {
+        bail!(
+            "credential redaction patterns exceed the fixed count or aggregate-byte safety bound"
+        );
+    }
+    patterns.push(value.to_vec());
+    Ok(())
+}
+
+fn collect_json_credential_patterns(
+    value: &serde_json::Value,
+    credential_bearing: bool,
+    patterns: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    match value {
+        serde_json::Value::String(value) => {
+            if credential_bearing && !value.is_empty() && value.len() < MIN_CREDENTIAL_BYTES {
+                bail!(
+                    "credential-bearing Codex auth value is shorter than the safe redaction bound"
+                );
+            }
+            if credential_bearing && value.len() > MAX_CREDENTIAL_BYTES {
+                bail!("credential-bearing Codex auth value exceeds the safe redaction byte bound");
+            }
+            add_credential_pattern(patterns, value.as_bytes())?;
+            if let Ok(quoted) = serde_json::to_string(value) {
+                if let Some(escaped) = quoted
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                {
+                    add_credential_pattern(patterns, escaped.as_bytes())?;
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_credential_patterns(value, credential_bearing, patterns)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                let key = key.to_ascii_lowercase();
+                let nested_credential_bearing = credential_bearing
+                    || ["token", "key", "secret", "password", "authorization"]
+                        .iter()
+                        .any(|marker| key.contains(marker));
+                collect_json_credential_patterns(value, nested_credential_bearing, patterns)?;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn replace_bounded_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return haystack.to_vec();
+    }
+    let mut output = Vec::with_capacity(haystack.len());
+    let mut offset = 0;
+    while let Some(relative) = haystack[offset..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let matched = offset + relative;
+        output.extend_from_slice(&haystack[offset..matched]);
+        output.extend_from_slice(replacement);
+        offset = matched + needle.len();
+    }
+    output.extend_from_slice(&haystack[offset..]);
+    output
+}
+
 fn ensure_safe_read_target(path: &Path) -> Result<()> {
     ensure_existing_output_parent(path)?;
     read_bounded_regular_file_nofollow(path, MAX_PROMPT_BYTES)
@@ -4554,7 +5366,9 @@ fn allowed_env(
     {
         for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
             if let Ok(value) = env::var(key) {
-                if !value.is_empty() && !value.contains(['\n', '\r', '\0']) {
+                if (MIN_CREDENTIAL_BYTES..=MAX_CREDENTIAL_BYTES).contains(&value.len())
+                    && !value.contains(['\n', '\r', '\0'])
+                {
                     environment.insert(key.to_string(), value);
                 }
             }
@@ -4658,15 +5472,30 @@ fn ensure_existing_directory_without_symlinks(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn summarize_output(output: &CapturedBytes) -> CapturedOutput {
-    let summary = output.summarize_chars(OUTPUT_CHAR_LIMIT);
+fn summarize_redacted_output(
+    output: &CapturedBytes,
+    credential_redactor: &CredentialRedactor,
+) -> CapturedOutput {
+    let bytes = credential_redactor.redact_bytes(output.as_bytes());
+    let text = String::from_utf8_lossy(&bytes);
+    let mut chars = text.chars();
+    let value = chars.by_ref().take(OUTPUT_CHAR_LIMIT).collect::<String>();
     CapturedOutput {
-        text: summary.text,
-        truncated: summary.truncated,
-        bytes: output.as_bytes().to_vec(),
+        text: value,
+        truncated: output.is_truncated() || chars.next().is_some(),
+        bytes,
         target_launch_attempted: false,
         run_metadata: ExternalAgentRunMetadata::default(),
     }
+}
+
+fn write_redacted_json_log(
+    reservation: &mut ReservedOutputFile,
+    bytes: &[u8],
+    credential_redactor: &CredentialRedactor,
+) -> Result<()> {
+    let redacted = credential_redactor.redact_bytes(bytes);
+    reservation.write_bytes_atomic(&redacted, OUTPUT_TEE_LIMIT_BYTES)
 }
 
 fn replace_report_stdout(report: &mut ExternalAgentRun, mut stdout: CapturedOutput) {
@@ -5344,6 +6173,14 @@ else:
         .expect_err("conflicting network requirements must fail")
         .to_string()
         .contains("one canonical network requirement"));
+        let configuration =
+            EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
+        assert!(
+            validate_environment_requirements(&[configuration.clone(), configuration,])
+                .expect_err("duplicate configuration requirement must fail")
+                .to_string()
+                .contains("duplicate configuration requirement")
+        );
     }
 
     #[test]
@@ -5378,14 +6215,54 @@ else:
     }
 
     #[test]
+    fn typed_preparation_failure_pairs_named_requirement_with_blocked_result() {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt",
+            "events",
+            "report",
+            Duration::from_secs(1),
+        );
+        let requirement =
+            EnvironmentRequirement::sandbox(EnvironmentSandboxCapability::VerifiedExternalCodex);
+        let run = failed_external_environment_run(
+            &command,
+            Instant::now(),
+            vec!["codex".to_string()],
+            false,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(requirement.clone()),
+            "sandbox preparation failed".to_string(),
+        );
+        assert_eq!(run.environment_failures().len(), 1);
+        assert_eq!(run.environment_preflight_results().len(), 1);
+        assert_eq!(
+            run.environment_preflight_results()[0],
+            EnvironmentPreflightResult {
+                requirement,
+                status: EnvironmentPreflightStatus::Blocked,
+                observation: None,
+            }
+        );
+    }
+
+    #[test]
     fn environment_preflight_wire_is_presence_only_and_backward_compatible() -> Result<()> {
         let secret = "DO_NOT_SERIALIZE_environment_secret";
         let environment = BTreeMap::from([("OPENAI_API_KEY".to_string(), secret.to_string())]);
         assert!(credential_present(
             EnvironmentCredential::OpenAiApiKey,
-            &environment,
-            None
+            &environment
         ));
+        let config_requirement =
+            EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
+        let config_wire = serde_json::to_string(&config_requirement)?;
+        assert_eq!(
+            config_wire,
+            r#"{"kind":"configuration","configuration":"codex_auth_file"}"#
+        );
+        assert!(!config_wire.contains(secret));
 
         let command = ExternalAgentCommand::codex(
             "codex",
@@ -5451,17 +6328,212 @@ else:
     }
 
     #[test]
+    fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() -> Result<()> {
+        let environment_secret = r#"environment-secret-"quoted"-31"#;
+        let auth_secret = "materialized-auth-token-secret-31";
+        let environment =
+            BTreeMap::from([("OPENAI_API_KEY".to_string(), environment_secret.to_string())]);
+        let auth_bytes = serde_json::to_vec(&serde_json::json!({
+            "tokens": {"access_token": auth_secret}
+        }))?;
+        let auth = ValidatedCodexAuth {
+            path: PathBuf::from("/private/auth.json"),
+            length: auth_bytes.len() as u64,
+            modified: None,
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 2,
+            bytes: auth_bytes,
+        };
+        let redactor = CredentialRedactor::from_runtime(&environment, Some(&auth))?;
+        let output = format!(
+            "raw={environment_secret} escaped={} auth={auth_secret}",
+            serde_json::to_string(environment_secret)?
+        );
+        let redacted = redactor.redact_string(&output);
+        assert!(!redacted.contains(environment_secret));
+        assert!(!redacted.contains(auth_secret));
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!format!("{redactor:?}").contains(environment_secret));
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("redacted-log");
+        let mut reservation =
+            SecureOutputRoot::open_or_create(&root)?.reserve(OsStr::new("events.jsonl"))?;
+        write_redacted_json_log(&mut reservation, output.as_bytes(), &redactor)?;
+        let persisted = String::from_utf8(reservation.read_bounded(OUTPUT_TEE_LIMIT_BYTES)?)?;
+        assert!(!persisted.contains(environment_secret));
+        assert!(!persisted.contains(auth_secret));
+        assert!(persisted.contains("[REDACTED]"));
+
+        let oversized_values = (0..=MAX_CREDENTIAL_REDACTION_PATTERNS)
+            .map(|index| format!("distinct-credential-pattern-{index:04}-31"))
+            .collect::<Vec<_>>();
+        let oversized_bytes = serde_json::to_vec(&oversized_values)?;
+        let oversized_auth = ValidatedCodexAuth {
+            path: PathBuf::from("/private/oversized-auth.json"),
+            length: oversized_bytes.len() as u64,
+            modified: None,
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 3,
+            bytes: oversized_bytes,
+        };
+        assert!(
+            CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth))
+                .expect_err("oversized redaction pattern set must fail closed")
+                .to_string()
+                .contains("fixed count or aggregate-byte safety bound")
+        );
+        let short_auth_bytes =
+            serde_json::to_vec(&serde_json::json!({"access_token": "too-short"}))?;
+        let short_auth = ValidatedCodexAuth {
+            path: PathBuf::from("/private/short-auth.json"),
+            length: short_auth_bytes.len() as u64,
+            modified: None,
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 4,
+            bytes: short_auth_bytes,
+        };
+        assert!(
+            CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&short_auth))
+                .expect_err("short credential-bearing auth value must fail closed")
+                .to_string()
+                .contains("shorter than the safe redaction bound")
+        );
+        let opaque_bytes = vec![b'x'; MAX_CREDENTIAL_BYTES + 1];
+        let opaque_auth = ValidatedCodexAuth {
+            path: PathBuf::from("/private/opaque-auth.json"),
+            length: opaque_bytes.len() as u64,
+            modified: None,
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 5,
+            bytes: opaque_bytes,
+        };
+        assert!(
+            CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&opaque_auth))
+                .expect_err("opaque oversized auth must fail closed")
+                .to_string()
+                .contains("not valid JSON for bounded redaction")
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_output_staging_redacts_atomic_publication_and_cleans_up() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("workspace");
+        let runtime_root = temp.path().join("private-runtime");
+        let destination_root = temp.path().join("destination");
+        for path in [&workspace, &runtime_root, &destination_root] {
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        let destination_path = destination_root.join("report.json");
+        let mut destination = reserve_external_output(&destination_path)?;
+        let secret = "private-staging-secret-value-31";
+        let redactor = CredentialRedactor::from_runtime(
+            &BTreeMap::from([("OPENAI_API_KEY".to_string(), secret.to_string())]),
+            None,
+        )?;
+
+        let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+        let staging_root = staging.root_path().to_path_buf();
+        let staging_path = staging.path()?.to_path_buf();
+        assert!(staging_root.starts_with(&runtime_root));
+        assert!(!staging_root.starts_with(&workspace));
+        assert_eq!(
+            fs::metadata(&staging_root)?.permissions().mode() & 0o777,
+            0o700
+        );
+        staging
+            .reservation_mut()?
+            .write_bytes_atomic(secret.as_bytes(), OUTPUT_TEE_LIMIT_BYTES)?;
+        assert_eq!(destination.read_bounded(OUTPUT_TEE_LIMIT_BYTES)?, b"");
+
+        let published =
+            capture_redacted_staged_output(staging.reservation()?, &mut destination, &redactor)?;
+        assert_eq!(published, CREDENTIAL_REDACTION);
+        assert_eq!(
+            destination.read_bounded(OUTPUT_TEE_LIMIT_BYTES)?,
+            CREDENTIAL_REDACTION
+        );
+        assert_eq!(
+            staging
+                .reservation()?
+                .read_bounded(OUTPUT_TEE_LIMIT_BYTES)?,
+            secret.as_bytes()
+        );
+
+        staging.cleanup()?;
+        assert!(!staging_path.exists());
+        assert!(!staging_root.exists());
+
+        let dropped_root = {
+            let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+            staging
+                .reservation_mut()?
+                .write_bytes_atomic(secret.as_bytes(), OUTPUT_TEE_LIMIT_BYTES)?;
+            staging.root_path().to_path_buf()
+        };
+        assert!(!dropped_root.exists());
+        Ok(())
+    }
+
+    #[test]
     fn environment_preflight_parses_fixed_tool_versions_without_weakening_codex_marker() {
         assert_eq!(
-            parse_environment_version("GNU bash, version 5.3.9(1)-release"),
+            parse_environment_version(
+                EnvironmentExecutable::Bash,
+                "warning: helper 99.98.97\nGNU bash, version 5.3.9(1)-release"
+            ),
             Some(EnvironmentVersion::new(5, 3, 9))
         );
         assert_eq!(
-            parse_environment_version("git version 2.51.0"),
+            parse_environment_version(
+                EnvironmentExecutable::Git,
+                "warning: helper 99.98.97\ngit version 2.51.0"
+            ),
             Some(EnvironmentVersion::new(2, 51, 0))
+        );
+        assert_eq!(
+            parse_environment_version(
+                EnvironmentExecutable::Node,
+                "warning: helper 99.98.97\nv22.17.0"
+            ),
+            Some(EnvironmentVersion::new(22, 17, 0))
         );
         assert_eq!(parse_codex_version("unrelated-tool 0.142.0"), None);
         assert_eq!(parse_codex_version("codex-cli 0.142.0"), Some((0, 142, 0)));
+        assert_eq!(
+            parse_codex_version("warning: helper 99.98.97\ncodex-cli 0.142.0"),
+            Some((0, 142, 0))
+        );
+        assert_eq!(
+            parse_codex_version("warning 99.98.97 before codex-cli 0.142.0"),
+            None
+        );
+        assert_eq!(
+            parse_environment_version(EnvironmentExecutable::Cargo, "cargo 99.98.97\ncargo 1.89.0"),
+            None
+        );
+        assert_eq!(
+            parse_environment_version(EnvironmentExecutable::Node, "99.98.97\n22.17.0"),
+            None
+        );
+        assert_eq!(
+            parse_codex_version("codex 99.98.97\ncodex-cli 0.142.0"),
+            None
+        );
     }
 
     #[test]
@@ -5473,6 +6545,12 @@ else:
         let profile = SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only(
             "/workspace",
         ));
+        let lifecycle = AgentLaunchMetadata {
+            role: "worker".to_string(),
+            run_id: "run-31".to_string(),
+            task_id: "task-31".to_string(),
+            repo: PathBuf::from("/registry"),
+        };
         let prepared = with_external_runtime_context(
             ProcessSpec::direct(
                 "fixed probe",
@@ -5484,12 +6562,17 @@ else:
             environment.clone(),
             profile.clone(),
             None,
+            Some(&lifecycle),
         );
 
+        let mut expected_environment = environment;
+        expected_environment.insert(MACO_RUN_ID_ENV.to_string(), "run-31".to_string());
+        expected_environment.insert(MACO_TASK_ID_ENV.to_string(), "task-31".to_string());
         assert_eq!(
             prepared.environment,
-            EnvironmentMode::ClearAndSet(environment)
+            EnvironmentMode::ClearAndSet(expected_environment)
         );
+        assert_eq!(prepared.agent_lifecycle, Some(lifecycle));
         assert_eq!(prepared.side_effects, profile);
         assert!(prepared.private_runtime_home);
         assert!(prepared.private_runtime_codex_home);
@@ -5506,11 +6589,13 @@ else:
             (
                 EnvironmentRequirement::credential(EnvironmentCredential::OpenAiApiKey),
                 None,
+                None,
                 EnvironmentFailureCategory::MissingCredential,
             ),
             (
                 EnvironmentRequirement::network(EnvironmentNetworkAccess::Enabled),
                 Some(EnvironmentVersion::new(0, 142, 0)),
+                Some(SideEffectConfinementProfileKind::ExternalCodex),
                 EnvironmentFailureCategory::NetworkForbidden,
             ),
             (
@@ -5518,6 +6603,7 @@ else:
                     EnvironmentSandboxCapability::VerifiedExternalCodex,
                 ),
                 Some(EnvironmentVersion::new(0, 142, 0)),
+                None,
                 EnvironmentFailureCategory::SandboxUnavailable,
             ),
             (
@@ -5528,11 +6614,12 @@ else:
                     )),
                 ),
                 Some(EnvironmentVersion::new(0, 142, 0)),
+                Some(SideEffectConfinementProfileKind::ExternalCodex),
                 EnvironmentFailureCategory::VersionMismatch,
             ),
         ];
 
-        for (requirement, codex_version, expected_category) in cases {
+        for (requirement, codex_version, verified_confinement, expected_category) in cases {
             let (result, failure, timed_out) = evaluate_environment_requirement(
                 &requirement,
                 Path::new("/workspace"),
@@ -5542,6 +6629,8 @@ else:
                 &wrong_profile,
                 None,
                 codex_version,
+                verified_confinement,
+                None,
             );
             assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
             assert_eq!(
@@ -5550,6 +6639,25 @@ else:
             );
             assert!(!timed_out);
         }
+
+        let disabled_network = EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled);
+        let (result, failure, _) = evaluate_environment_requirement(
+            &disabled_network,
+            Path::new("/workspace"),
+            Duration::from_secs(1),
+            &cancellation,
+            &environment,
+            &wrong_profile,
+            None,
+            Some(EnvironmentVersion::new(0, 142, 0)),
+            None,
+            None,
+        );
+        assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
+        assert_eq!(
+            failure.map(|failure| failure.category),
+            Some(EnvironmentFailureCategory::SandboxUnavailable)
+        );
     }
 
     #[test]
@@ -5865,7 +6973,7 @@ else:
             &provider,
             &child_repo,
             &prompt,
-            child_repo.join("events.jsonl"),
+            incoming.join("events.jsonl"),
             incoming.join("last-message.txt"),
             Duration::from_secs(10),
         )
@@ -5940,11 +7048,15 @@ else:
             "codex",
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            incoming.join("events.jsonl"),
             &output_path,
             Duration::from_secs(5),
         );
-        let output_reservation = reserve_external_output(&output_path)?;
+        let staged_output_path = incoming.join("staged-output.raw");
+        let staged_output = reserve_external_output(&staged_output_path)?;
+        let mut output_reservation = reserve_external_output(&output_path)?;
+        let mut json_log_reservation = reserve_external_output(&command.json_log)?;
+        let credential_redactor = CredentialRedactor::default();
         let identity_path = temp.path().join("trusted-codex-identity");
         fs::write(&identity_path, b"identity")?;
         let program_identity = external_program_identity(&identity_path)?;
@@ -5985,7 +7097,10 @@ else:
         record_completed_target(
             &mut report,
             output,
-            &output_reservation,
+            &staged_output,
+            &mut output_reservation,
+            &mut json_log_reservation,
+            &credential_redactor,
             CompletedTargetContext {
                 runtime: ExternalExecutionRuntime::Verified,
                 codex_version: Some((0, 142, 3)),
@@ -7061,11 +8176,12 @@ else:
         fs::write(&prompt, "do not start\n")?;
         let incoming = temp.path().join("incoming");
         fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
         let spec = ExternalAgentCommand::codex(
             agent,
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            incoming.join("events.jsonl"),
             incoming.join("last-message.txt"),
             Duration::ZERO,
         )
@@ -7105,11 +8221,12 @@ else:
         fs::write(&prompt, "never run custom target\n")?;
         let incoming = temp.path().join("incoming");
         fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
         let spec = ExternalAgentCommand::codex(
             agent,
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            incoming.join("events.jsonl"),
             incoming.join("last-message.txt"),
             Duration::from_secs(3),
         );
@@ -7172,7 +8289,7 @@ printf '\n{"type":"done"}\n'
             &agent,
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            output_dir.join("events.jsonl"),
             output_dir.join("last-message.txt"),
             Duration::from_secs(3),
         );
@@ -7192,12 +8309,8 @@ printf '\n{"type":"done"}\n'
         assert!(report.stdout.text.len() >= OUTPUT_CHAR_LIMIT);
         assert!(report.stderr.text.len() >= OUTPUT_CHAR_LIMIT);
         let exact_tee = fs::read(&spec.json_log)?;
-        assert!(exact_tee.len() > OUTPUT_CAPTURE_LIMIT_BYTES);
-        assert_eq!(report.stdout_bytes().len(), OUTPUT_CAPTURE_LIMIT_BYTES);
-        assert_eq!(
-            report.stdout_bytes(),
-            &exact_tee[..OUTPUT_CAPTURE_LIMIT_BYTES]
-        );
+        assert!(exact_tee.len() > OUTPUT_CHAR_LIMIT);
+        assert_eq!(report.stdout_bytes(), exact_tee);
 
         Ok(())
     }
@@ -7227,7 +8340,7 @@ printf 'A\377B\n'
             &agent,
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            output_dir.join("events.jsonl"),
             output_dir.join("last-message.txt"),
             Duration::from_secs(3),
         );
@@ -7281,7 +8394,7 @@ exit 0
             &agent,
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            output_dir.join("events.jsonl"),
             output_dir.join("last-message.txt"),
             Duration::from_secs(1),
         );
@@ -7337,7 +8450,7 @@ exit 0
             &agent,
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            incoming.join("events.jsonl"),
             incoming.join("last-message.txt"),
             Duration::from_secs(5),
         );
@@ -7411,7 +8524,7 @@ ln -s '{}' "$report"
             &agent,
             temp.path(),
             &prompt,
-            temp.path().join("events.jsonl"),
+            incoming.join("events.jsonl"),
             incoming.join("report.json"),
             Duration::from_secs(3),
         );
