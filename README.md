@@ -910,6 +910,44 @@ fixtures do not claim that command exists.
 Gate-policy/classifier corpus experiments remain separate and depend on the
 Issue #28 production broker path.
 
+### Provisional named hybrid default
+
+When a supervisor plan supplies no `role_models` override, MACO selects the
+named `provisional-phase-a-hybrid-effort-v1` profile. The profile assigns
+`gpt-5.6-sol` to every role, with `xhigh` reasoning effort for the supervisor,
+child orchestrator, and auditor, `medium` for workers, and `high` for the
+`gate_classifier`. A per-role `role_models` entry replaces that role's
+selection.
+
+On the production Codex path, the no-override child-orchestrator and auditor
+commands are constructed with the profile's explicit model and role-specific
+reasoning effort. Worker selection remains declarative data in the child
+orchestrator prompt because nested workers are not launched as separately
+process-observable commands; it is not per-worker model or usage evidence. The
+supervisor entry completes the reported role profile rather than claiming that
+the running supervisor launches itself. The `gate_classifier` entry currently
+has only the deterministic-fake evaluation boundary described above; Issue
+#28's writable production gate remains deferred.
+
+The current Codex runtime boundary has no authenticated role-scoped
+model-availability catalog, so availability is `unknown`. Unknown availability
+preserves the configured model and effort in command argv. An unsupported slug
+can therefore fail when Codex launches it; MACO does not silently clear the
+selection, retry with an ambient default, or cycle through model names.
+Fallbacks apply only after unavailability is actually known:
+
+| Configured fallback | Known-unavailable behavior |
+| --- | --- |
+| `runtime_default` | Clear the explicit model while preserving the configured reasoning effort, allowing the runtime to choose its default model. |
+| `fail_closed` | Refuse the selection rather than dispatch with another model. |
+| `local_deterministic_fake` | Use the deterministic local fallback only with the Fake runtime; reject it for Codex. |
+
+This default is operationally selected, but it is not an evidence-backed
+production recommendation. Its source remains provisional deterministic-fake
+Phase A evidence over a hand-authored plan, so the profile is reported as
+`production_eligible=false`. Genuine Issue #26 evidence is required before the
+profile can be qualified for production or revised on empirical grounds.
+
 ### Platform boundary
 
 Linux is the fully supported security-sensitive runtime path. macOS and Windows
