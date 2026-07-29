@@ -22147,7 +22147,12 @@ mod tests {
     ) {
         assert_eq!(report.released_claims.len(), 1);
         assert!(report.release_errors.is_empty());
-        assert!(report.released_semantic_intents.is_empty());
+        assert_eq!(report.released_semantic_intents.len(), 1);
+        assert_eq!(report.released_semantic_intents[0].agent_id, "child-a");
+        assert_eq!(
+            report.released_semantic_intents[0].paths,
+            vec![PathBuf::from("README.md")]
+        );
         assert!(report.semantic_release_errors.is_empty());
         assert!(report.breaker_trip.is_none());
         assert!(report.gate_denials.is_empty());
@@ -22479,6 +22484,7 @@ mod tests {
         child_a.task = Some("x".repeat(8 * 1024 + 1));
         let child_b = injected_named_assignment("child-b", "src/lib.rs");
         let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
         inject_priced_process_roles(&mut plan, "priced-model", 1.0);
         let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
         let run_id = "budget-child-pre-runner-release";
@@ -22530,6 +22536,7 @@ mod tests {
         let child_a = injected_assignment(true);
         let child_b = injected_named_assignment("child-b", "src/lib.rs");
         let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
         inject_priced_process_roles(&mut plan, "priced-model", 1.0);
         let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
         let run_id = "budget-auditor-pre-runner-release";
@@ -22594,6 +22601,7 @@ mod tests {
         let child_a = injected_named_assignment("child-a", "README.md");
         let child_b = injected_named_assignment("child-b", "src/lib.rs");
         let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
         inject_priced_process_roles(&mut plan, "priced-model", 1.0);
         let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
         let run_id = "budget-child-runner-panic";
@@ -22649,6 +22657,7 @@ mod tests {
         let child_a = injected_assignment(true);
         let child_b = injected_named_assignment("child-b", "src/lib.rs");
         let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
         inject_priced_process_roles(&mut plan, "priced-model", 1.0);
         let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
         let run_id = "budget-auditor-runner-panic";
