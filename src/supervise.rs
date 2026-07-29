@@ -2812,6 +2812,7 @@ fn parent_review_auditor_prompt_with_field_guide(
         .map(|worker| (worker.id.clone(), worker.field_guide_entries.len()))
         .collect::<BTreeMap<_, _>>();
     let mut redacted_child_report = child_report.clone();
+    enforce_orchestrator_environment_failure_outcome(&mut redacted_child_report);
     redacted_child_report.field_guide_entries.clear();
     for worker in &mut redacted_child_report.worker_reports {
         worker.field_guide_entries.clear();
@@ -6919,7 +6920,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let mut coverage_gaps = plan_metadata.coverage_gaps.clone();
     coverage_gaps.extend(runtime_coverage_gaps);
     let sandbox_denials = aggregate_sandbox_denials(&command_records);
-    let final_report = SupervisorFinalReport {
+    let mut final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
         role: AgentRole::Supervisor,
@@ -7051,6 +7052,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .to_string()
         },
     };
+    enforce_supervisor_final_environment_failure_outcome(&mut final_report);
     record_orchestration_event(
         &mut orchestration_journal,
         &mut artifact_writer,
@@ -7082,7 +7084,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     write_final_report(&mut artifact_writer, &final_report)?;
     artifact_writer.finalize(
         RunArtifactFamily::Supervise.final_report_relative_path(),
-        publishable,
+        final_report.publishable,
     )?;
     Ok(final_report)
 }
@@ -10531,10 +10533,12 @@ fn write_child_report(
     relative: &Path,
     report: &OrchestratorReviewReport,
 ) -> Result<()> {
+    let mut normalized_report = report.clone();
+    enforce_orchestrator_environment_failure_outcome(&mut normalized_report);
     write_artifact_json(
         writer,
         relative,
-        report,
+        &normalized_report,
         MAX_SUPERVISOR_REPORT_BYTES,
         ArtifactFileDisposition::PrivateEvidence,
     )
@@ -11021,31 +11025,54 @@ fn append_unique_environment_failures(
     }
 }
 
-fn enforce_worker_environment_failure_outcome(report: &mut WorkerReport) {
-    if report.environment_failures.is_empty() {
-        return;
+fn normalize_command_environment_failures(record: &mut CommandRunRecord) {
+    record.environment_failures =
+        sanitized_environment_failures(std::mem::take(&mut record.environment_failures));
+    if !record.environment_failures.is_empty() {
+        record.status = ReviewStatus::Failed;
     }
+}
+
+fn normalize_command_records_environment_failures(
+    records: &mut [CommandRunRecord],
+) -> Vec<EnvironmentFailure> {
+    let mut failures = Vec::new();
+    for record in records {
+        normalize_command_environment_failures(record);
+        append_unique_environment_failures(&mut failures, record.environment_failures.clone());
+    }
+    failures
+}
+
+fn enforce_worker_environment_failure_outcome(report: &mut WorkerReport) {
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
     report.environment_failures =
         sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
-    report.accepted = false;
-    report.rejected = true;
-    report.status = ReviewStatus::Failed;
+    append_unique_environment_failures(&mut report.environment_failures, command_failures);
+    if !report.environment_failures.is_empty() {
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+    }
 }
 
 fn enforce_auditor_environment_failure_outcome(report: &mut AuditorReport) {
-    if report.environment_failures.is_empty() {
-        return;
-    }
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
     report.environment_failures =
         sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
-    report.accepted = false;
-    report.rejected = true;
-    report.status = ReviewStatus::Failed;
+    append_unique_environment_failures(&mut report.environment_failures, command_failures);
+    if !report.environment_failures.is_empty() {
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+    }
 }
 
 fn enforce_orchestrator_environment_failure_outcome(report: &mut OrchestratorReviewReport) {
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
     report.environment_failures =
         sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
+    append_unique_environment_failures(&mut report.environment_failures, command_failures);
     for worker in &mut report.worker_reports {
         enforce_worker_environment_failure_outcome(worker);
     }
@@ -11066,6 +11093,28 @@ fn enforce_orchestrator_environment_failure_outcome(report: &mut OrchestratorRev
         .collect::<Vec<_>>();
     append_unique_environment_failures(&mut report.environment_failures, nested_failures);
     if !report.environment_failures.is_empty() {
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+    }
+}
+
+fn enforce_supervisor_final_environment_failure_outcome(report: &mut SupervisorFinalReport) {
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
+    for child in &mut report.orchestrator_reports {
+        enforce_orchestrator_environment_failure_outcome(child);
+    }
+    let mut failures =
+        sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
+    append_unique_environment_failures(&mut failures, command_failures);
+    append_unique_environment_failures(
+        &mut failures,
+        aggregate_environment_failures(&report.commands_run, &report.orchestrator_reports),
+    );
+    report.environment_failures = failures;
+    if !report.environment_failures.is_empty() {
+        report.publishable = false;
+        report.success = false;
         report.accepted = false;
         report.rejected = true;
         report.status = ReviewStatus::Failed;
@@ -11941,14 +11990,34 @@ fn aggregate_environment_failures(
         .chain(
             reports
                 .iter()
+                .flat_map(|report| report.commands_run.iter())
+                .flat_map(|record| record.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
                 .flat_map(|report| report.worker_reports.iter())
                 .flat_map(|report| report.environment_failures.iter()),
         )
         .chain(
             reports
                 .iter()
+                .flat_map(|report| report.worker_reports.iter())
+                .flat_map(|report| report.commands_run.iter())
+                .flat_map(|record| record.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
                 .flat_map(|report| report.audit_reports.iter())
                 .flat_map(|report| report.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
+                .flat_map(|report| report.audit_reports.iter())
+                .flat_map(|report| report.commands_run.iter())
+                .flat_map(|record| record.environment_failures.iter()),
         )
         .cloned()
         .collect::<Vec<_>>();
@@ -12332,7 +12401,7 @@ fn orchestrator_report_schema_value() -> serde_json::Value {
             "remaining_risk": {"type": "string"},
             "next_safe_action": {"type": "string"}
         },
-        "allOf": [environment_failure_outcome_schema_value()]
+        "allOf": [orchestrator_environment_failure_outcome_schema_value()]
     })
 }
 
@@ -12647,11 +12716,12 @@ fn command_run_record_schema_value() -> serde_json::Value {
                 "items": environment_failure_schema_value()
             },
             "error": {"type": ["string", "null"]}
-        }
+        },
+        "allOf": [command_environment_failure_outcome_schema_value()]
     })
 }
 
-fn environment_failure_outcome_schema_value() -> serde_json::Value {
+fn command_environment_failure_outcome_schema_value() -> serde_json::Value {
     json!({
         "if": {
             "properties": {
@@ -12661,10 +12731,81 @@ fn environment_failure_outcome_schema_value() -> serde_json::Value {
         },
         "then": {
             "properties": {
-                "accepted": {"const": false},
-                "rejected": {"const": true},
-                "status": {"enum": ["failed", "rejected", "missing"]}
+                "status": {"const": "failed"}
             }
+        }
+    })
+}
+
+fn environment_failure_outcome_schema_value() -> serde_json::Value {
+    json!({
+        "if": environment_failure_source_schema_value(),
+        "then": failed_environment_outcome_schema_value()
+    })
+}
+
+fn orchestrator_environment_failure_outcome_schema_value() -> serde_json::Value {
+    json!({
+        "if": {
+            "anyOf": [
+                environment_failure_source_schema_value(),
+                {
+                    "properties": {
+                        "worker_reports": {
+                            "contains": environment_failure_source_schema_value(),
+                            "minContains": 1
+                        }
+                    },
+                    "required": ["worker_reports"]
+                },
+                {
+                    "properties": {
+                        "audit_reports": {
+                            "contains": environment_failure_source_schema_value(),
+                            "minContains": 1
+                        }
+                    },
+                    "required": ["audit_reports"]
+                }
+            ]
+        },
+        "then": failed_environment_outcome_schema_value()
+    })
+}
+
+fn environment_failure_source_schema_value() -> serde_json::Value {
+    json!({
+        "anyOf": [
+            {
+                "properties": {
+                    "environment_failures": {"minItems": 1}
+                },
+                "required": ["environment_failures"]
+            },
+            {
+                "properties": {
+                    "commands_run": {
+                        "contains": {
+                            "properties": {
+                                "environment_failures": {"minItems": 1}
+                            },
+                            "required": ["environment_failures"]
+                        },
+                        "minContains": 1
+                    }
+                },
+                "required": ["commands_run"]
+            }
+        ]
+    })
+}
+
+fn failed_environment_outcome_schema_value() -> serde_json::Value {
+    json!({
+        "properties": {
+            "accepted": {"const": false},
+            "rejected": {"const": true},
+            "status": {"const": "failed"}
         }
     })
 }
@@ -12874,10 +13015,12 @@ fn write_final_report(
     writer: &mut ArtifactRunWriter,
     report: &SupervisorFinalReport,
 ) -> Result<()> {
+    let mut normalized_report = report.clone();
+    enforce_supervisor_final_environment_failure_outcome(&mut normalized_report);
     write_artifact_json(
         writer,
         &RunArtifactFamily::Supervise.final_report_relative_path(),
-        report,
+        &normalized_report,
         MAX_SUPERVISOR_REPORT_BYTES,
         ArtifactFileDisposition::PrivateEvidence,
     )
@@ -13408,6 +13551,157 @@ mod tests {
         assert!(!serde_json::to_string(&report)
             .expect("serialize sanitized environment failure")
             .contains(marker));
+    }
+
+    #[test]
+    fn nested_command_environment_failures_are_recursively_sanitized_and_terminal() {
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let mut report = injected_child_report(&assignment);
+        let auditor_report = injected_auditor_report(&assignment, &report);
+        report.audit_reports.push(auditor_report);
+
+        let orchestrator_marker = "ORCHESTRATOR_COMMAND_SECRET_MARKER_31";
+        let worker_marker = "WORKER_COMMAND_SECRET_MARKER_31";
+        let auditor_marker = "AUDITOR_COMMAND_SECRET_MARKER_31";
+        let command_with_failure =
+            |marker: &str, category: EnvironmentFailureCategory| -> CommandRunRecord {
+                let mut command = injected_command_record();
+                command.environment_failures.push(EnvironmentFailure {
+                    category,
+                    requirement: None,
+                    summary: marker.to_string(),
+                    remediation: Vec::new(),
+                });
+                command
+            };
+        report.commands_run.push(command_with_failure(
+            orchestrator_marker,
+            EnvironmentFailureCategory::NetworkForbidden,
+        ));
+        report.worker_reports[0]
+            .commands_run
+            .push(command_with_failure(
+                worker_marker,
+                EnvironmentFailureCategory::MissingCredential,
+            ));
+        report.audit_reports[0]
+            .commands_run
+            .push(command_with_failure(
+                auditor_marker,
+                EnvironmentFailureCategory::SandboxUnavailable,
+            ));
+
+        let prompt = parent_review_auditor_prompt_with_field_guide(
+            ParentReviewAuditorPromptContext {
+                plan: &plan,
+                assignment: &assignment,
+                assignment_metadata: &AssignmentMetadata::new(),
+                run_dir: Path::new("/tmp/maco-nested-environment-failure"),
+                worktree_path: Path::new("/tmp/maco-nested-environment-failure/worktree"),
+                child_report_path: Path::new(
+                    "/tmp/maco-nested-environment-failure/reports/child-a.json",
+                ),
+                auditor_report_path: Path::new(
+                    "/tmp/maco-nested-environment-failure/incoming/auditor.json",
+                ),
+                schema_path: Path::new("/tmp/maco-nested-environment-failure/schemas/auditor.json"),
+                child_report: &report,
+            },
+            &SupervisorFieldGuidePrompt::empty().expect("empty field guide"),
+        )
+        .expect("render sanitized parent auditor prompt");
+        for marker in [orchestrator_marker, worker_marker, auditor_marker] {
+            assert!(!prompt.contains(marker));
+        }
+
+        enforce_orchestrator_environment_failure_outcome(&mut report);
+        assert_eq!(report.status, ReviewStatus::Failed);
+        assert!(!report.accepted);
+        assert!(report.rejected);
+        assert_eq!(report.commands_run[0].status, ReviewStatus::Failed);
+        assert_eq!(report.worker_reports[0].status, ReviewStatus::Failed);
+        assert_eq!(
+            report.worker_reports[0].commands_run[0].status,
+            ReviewStatus::Failed
+        );
+        assert_eq!(report.audit_reports[0].status, ReviewStatus::Failed);
+        assert_eq!(
+            report.audit_reports[0].commands_run[0].status,
+            ReviewStatus::Failed
+        );
+        let expected_categories = [
+            EnvironmentFailureCategory::MissingCredential,
+            EnvironmentFailureCategory::NetworkForbidden,
+            EnvironmentFailureCategory::SandboxUnavailable,
+        ];
+        for category in expected_categories {
+            assert!(report
+                .environment_failures
+                .iter()
+                .any(|failure| failure.category == category));
+        }
+        assert_eq!(report.environment_failures.len(), 3);
+        for failure in report
+            .environment_failures
+            .iter()
+            .chain(report.commands_run[0].environment_failures.iter())
+            .chain(report.worker_reports[0].environment_failures.iter())
+            .chain(
+                report.worker_reports[0].commands_run[0]
+                    .environment_failures
+                    .iter(),
+            )
+            .chain(report.audit_reports[0].environment_failures.iter())
+            .chain(
+                report.audit_reports[0].commands_run[0]
+                    .environment_failures
+                    .iter(),
+            )
+        {
+            assert!(failure
+                .summary
+                .starts_with("environment preflight reported "));
+            assert!(!failure.remediation.is_empty());
+            assert!(failure
+                .remediation
+                .iter()
+                .all(|remediation| !remediation.guidance.contains("SECRET_MARKER_31")));
+        }
+
+        let mut final_report = artifact_test_final_report(
+            &RunId::new("nested-environment-failure").expect("valid run id"),
+        );
+        final_report.orchestrator_reports = vec![report];
+        enforce_supervisor_final_environment_failure_outcome(&mut final_report);
+        assert!(!final_report.success);
+        assert!(!final_report.publishable);
+        assert!(!final_report.accepted);
+        assert!(final_report.rejected);
+        assert_eq!(final_report.status, ReviewStatus::Failed);
+        assert_eq!(final_report.environment_failures.len(), 3);
+        for category in expected_categories {
+            assert!(final_report
+                .environment_failures
+                .iter()
+                .any(|failure| failure.category == category));
+        }
+        let serialized =
+            serde_json::to_string(&final_report).expect("serialize normalized final report");
+        for marker in [orchestrator_marker, worker_marker, auditor_marker] {
+            assert!(!serialized.contains(marker));
+        }
+
+        assert_eq!(
+            command_run_record_schema_value()["allOf"][0]["then"]["properties"]["status"]["const"],
+            "failed"
+        );
+        assert_eq!(
+            orchestrator_report_schema_value()["allOf"][0]["if"]["anyOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
     }
 
     #[test]
