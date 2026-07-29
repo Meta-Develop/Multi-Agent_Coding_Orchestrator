@@ -2925,6 +2925,13 @@ fn apply_role_model_selection(
     command.with_model_selection(model, reasoning_effort)
 }
 
+fn apply_canonical_environment_requirements(
+    command: ExternalAgentCommand,
+    requirements: &[EnvironmentRequirement],
+) -> ExternalAgentCommand {
+    command.with_environment_requirements(requirements.iter().cloned())
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorktreeControlIdentity {
@@ -5005,8 +5012,7 @@ fn execute_supervisor_assignment_inner(
                 options.run_id.as_str(),
                 &assignment.id,
             );
-            command =
-                command.with_environment_requirements(environment_requirements.iter().cloned());
+            command = apply_canonical_environment_requirements(command, &environment_requirements);
             command = configure_writable_child_command(command, &assignment.assigned_paths)?;
 
             record_shared_orchestration_event(
@@ -5667,8 +5673,11 @@ fn execute_supervisor_assignment_inner(
                     AgentRole::Auditor.as_str(),
                     options.run_id.as_str(),
                     &auditor_id,
-                )
-                .with_environment_requirements(environment_requirements.iter().cloned());
+                );
+            auditor_command = apply_canonical_environment_requirements(
+                auditor_command,
+                &environment_requirements,
+            );
             record_shared_orchestration_event(
                 artifacts,
                 &auditor_id,
@@ -13257,8 +13266,8 @@ mod tests {
     use crate::{
         external_agent::{
             CapturedOutput, CodexPermissionEvidence, EnvironmentConfiguration,
-            EnvironmentNetworkAccess, SandboxDenialBoundary, SandboxDenialRetryability,
-            SandboxDeniedOperation,
+            EnvironmentNetworkAccess, EnvironmentPreflightStatus, SandboxDenialBoundary,
+            SandboxDenialRetryability, SandboxDeniedOperation,
         },
         field_guide::{encode_utf8_lower_hex, FIELD_GUIDE_PROMPT_ENTRY_PREFIX},
         orchestration_event::{
@@ -13390,6 +13399,107 @@ mod tests {
         assert_eq!(report.status, ReviewStatus::Failed);
         assert!(!serde_json::to_string(&report)
             .expect("serialize sanitized environment failure")
+            .contains(marker));
+    }
+
+    #[test]
+    fn environment_requirements_are_captured_for_child_and_auditor_commands() {
+        let temp = tempfile::tempdir().expect("temporary command capture");
+        let requirements = vec![
+            EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile),
+            EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled),
+        ];
+        let child = apply_canonical_environment_requirements(
+            control_test_command(temp.path(), temp.path()),
+            &requirements,
+        );
+        let auditor = apply_canonical_environment_requirements(
+            control_test_command(temp.path(), temp.path())
+                .with_workspace_access(WorkspaceAccess::ReadOnly),
+            &requirements,
+        );
+
+        assert_eq!(child.environment_requirements, requirements);
+        assert_eq!(auditor.environment_requirements, requirements);
+    }
+
+    #[test]
+    fn environment_preflight_refusal_is_typed_terminal_and_not_malformed_or_containment() {
+        let assignment = injected_assignment(true);
+        let command = control_test_command(Path::new("."), Path::new("."));
+        let requirement =
+            EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
+        let marker = "DO_NOT_PERSIST_PREFLIGHT_SECRET_MARKER";
+        let failure = EnvironmentFailure {
+            category: EnvironmentFailureCategory::MissingCredential,
+            requirement: Some(requirement.clone()),
+            summary: marker.to_string(),
+            remediation: Vec::new(),
+        };
+        let preflight = EnvironmentPreflightResult {
+            requirement,
+            status: EnvironmentPreflightStatus::Blocked,
+            observation: None,
+        };
+        let mut run_value = serde_json::to_value(injected_verified_run_without_journals(&command))
+            .expect("serialize injected run");
+        run_value["exit_code"] = Value::Null;
+        run_value["process_tree"] = Value::Null;
+        run_value["side_effects"] = Value::Null;
+        run_value["publishable"] = Value::Bool(false);
+        run_value["codex_permissions"] = Value::Null;
+        run_value["environment_preflight_results"] =
+            serde_json::to_value([preflight]).expect("serialize preflight result");
+        run_value["environment_failures"] =
+            serde_json::to_value([failure]).expect("serialize environment failure");
+        run_value["error"] =
+            Value::String("environment preflight blocked the assignment".to_string());
+        let run: ExternalAgentRun =
+            serde_json::from_value(run_value).expect("restore environment-blocked run");
+        assert!(run.environment_blocked());
+        assert!(!external_safety_verified(&run, SupervisorRuntime::Codex));
+
+        let child_base_head = injected_oid("environment-blocked-base");
+        let worker_journals = WorkerExecutionJournalEvidenceSet::default();
+        let (report, shape_problems) = collect_child_report(ChildReportCollectionContext {
+            assignment: &assignment,
+            assignment_metadata: &AssignmentMetadata::new(),
+            report_path: Path::new("environment-blocked.json"),
+            external_run: &run,
+            external_command: &command,
+            worktree_path: Path::new("."),
+            child_base_head: &child_base_head,
+            worker_journals: &worker_journals,
+        });
+
+        assert!(shape_problems.is_empty());
+        assert!(!should_retry_child_report(&report, &shape_problems, 1, 2));
+        assert_eq!(report.status, ReviewStatus::Failed);
+        assert!(!report.accepted);
+        assert!(report.rejected);
+        assert_eq!(report.worker_reports.len(), 1);
+        assert!(report
+            .worker_reports
+            .iter()
+            .all(|worker| !worker.environment_failures.is_empty()
+                && worker.status == ReviewStatus::Failed
+                && !worker.accepted));
+        assert!(report.gate_denials.is_empty());
+        let findings = finding_messages(&report);
+        assert!(findings.contains("environment preflight blocked"));
+        assert!(!findings.contains("missing or invalid"));
+        assert!(!findings.contains("containment"));
+        assert_eq!(report.commands_run.len(), 1);
+        assert_eq!(
+            report.commands_run[0].environment_preflight_results.len(),
+            1
+        );
+        assert_eq!(report.commands_run[0].environment_failures.len(), 1);
+        let aggregate =
+            aggregate_environment_failures(&report.commands_run, std::slice::from_ref(&report));
+        assert_eq!(aggregate.len(), 1);
+        assert!(!serde_json::to_string(&(report, aggregate))
+            .expect("serialize environment-blocked evidence")
             .contains(marker));
     }
 
