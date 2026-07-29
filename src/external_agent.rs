@@ -9,10 +9,11 @@ use crate::pre_action_review::{
 };
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, run_process_interactive,
-    CapturedBytes, EnvironmentMode, ExternalCodexProfile, InteractiveProcessOutput,
-    ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec, ProcessTreeEvidence,
-    SideEffectConfinementEvidence, SideEffectConfinementProfile, SideEffectConfinementProfileKind,
-    StdinMode, StreamCapture, StrictOfflineWorkspaceProfile, WorkspaceAccess,
+    CapturedBytes, ContainmentBackend, EnvironmentMode, ExternalCodexProfile,
+    InteractiveProcessOutput, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
+    ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
+    SideEffectConfinementProfileKind, StdinMode, StreamCapture, StrictOfflineWorkspaceProfile,
+    WorkspaceAccess,
 };
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
@@ -812,13 +813,21 @@ impl ExternalAgentRun {
     }
 
     /// Scratch output may be discarded only when the main target was never
-    /// released or its owned process tree is proven empty.
+    /// released and no preflight probe started, or every launched process is
+    /// proven empty with verified side-effect confinement.
     pub(crate) fn scratch_quiescence_verified(&self) -> bool {
-        !self.stdout.target_launch_attempted
+        let process_started = self.stdout.target_launch_attempted
             || self
+                .stdout
+                .run_metadata
+                .environment_preflight_process_started;
+        !process_started
+            || (self
                 .process_tree
-                .as_ref()
-                .is_some_and(|evidence| evidence.is_verified_empty())
+                .is_some_and(ProcessTreeEvidence::is_verified_empty)
+                && self
+                    .side_effects
+                    .is_some_and(SideEffectConfinementEvidence::is_verified))
     }
 }
 
@@ -1869,7 +1878,9 @@ fn run_external_agent_runtime(
                 | ProcessRunError::Wait { .. } => None,
             };
             if let Some((category, requirement)) = preparation_failure {
-                report.stdout.target_launch_attempted = false;
+                if process_run_error_definitely_before_process_start(&error) {
+                    report.stdout.target_launch_attempted = false;
+                }
                 record_environment_failure(
                     &mut report,
                     category,
@@ -2659,28 +2670,31 @@ impl EnvironmentPreflightProcessEvidence {
     }
 
     fn record_error(&mut self, error: &ProcessRunError) {
-        let evidence = match error {
+        match error {
             ProcessRunError::Wait { evidence, .. }
             | ProcessRunError::Cancelled {
                 evidence: Some(evidence),
                 ..
-            } => Some(evidence.as_ref()),
-            ProcessRunError::Cancelled { evidence: None, .. }
-            | ProcessRunError::OpenTee { .. }
-            | ProcessRunError::TeeConflict { .. }
-            | ProcessRunError::Spawn { .. }
-            | ProcessRunError::ContainmentUnavailable { .. }
-            | ProcessRunError::SetupTimeout { .. }
-            | ProcessRunError::ProcessOwnership { .. }
-            | ProcessRunError::IoSetup { .. }
-            | ProcessRunError::StdinTooLarge { .. } => None,
-        };
-        if let Some(evidence) = evidence {
-            self.record(
+            } => self.record(
                 evidence.process_tree,
                 evidence.side_effects,
                 evidence.process_tree.is_verified_empty() && evidence.side_effects.is_verified(),
-            );
+            ),
+            ProcessRunError::OpenTee { .. }
+            | ProcessRunError::TeeConflict { .. }
+            | ProcessRunError::Spawn { .. }
+            | ProcessRunError::SetupTimeout { .. }
+            | ProcessRunError::ProcessOwnership { .. }
+            | ProcessRunError::IoSetup { .. } => self.record(
+                ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+                SideEffectConfinementEvidence::Unverified(
+                    SideEffectConfinementProfileKind::ExternalCodex,
+                ),
+                false,
+            ),
+            ProcessRunError::Cancelled { evidence: None, .. }
+            | ProcessRunError::ContainmentUnavailable { .. }
+            | ProcessRunError::StdinTooLarge { .. } => {}
         }
     }
 
@@ -2702,6 +2716,15 @@ impl EnvironmentPreflightProcessEvidence {
         }
         self.started = true;
     }
+}
+
+fn process_run_error_definitely_before_process_start(error: &ProcessRunError) -> bool {
+    matches!(
+        error,
+        ProcessRunError::Cancelled { evidence: None, .. }
+            | ProcessRunError::ContainmentUnavailable { .. }
+            | ProcessRunError::StdinTooLarge { .. }
+    )
 }
 
 fn retain_environment_preflight_process_evidence(
@@ -6463,6 +6486,7 @@ else:
 
         let restored: ExternalAgentRun = serde_json::from_str(&serialized)?;
         assert!(restored.environment_blocked());
+        assert!(!restored.scratch_quiescence_verified());
         assert_eq!(
             restored.environment_preflight_results(),
             run.environment_preflight_results()
@@ -6478,6 +6502,29 @@ else:
             serde_json::from_value(legacy_process_state)?;
         assert!(restored_process_state.environment_blocked());
         assert!(!restored_process_state.environment_preflight_quiescence_verified());
+        assert!(!restored_process_state.scratch_quiescence_verified());
+
+        let mut verified_legacy_process_state = serde_json::to_value(&run)?;
+        let verified_legacy_object = verified_legacy_process_state
+            .as_object_mut()
+            .context("serialized external run must be an object")?;
+        verified_legacy_object.remove("environment_preflight_process_started");
+        verified_legacy_object.insert(
+            "process_tree".to_string(),
+            serde_json::to_value(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ))?,
+        );
+        verified_legacy_object.insert(
+            "side_effects".to_string(),
+            serde_json::to_value(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ))?,
+        );
+        let restored_verified_legacy: ExternalAgentRun =
+            serde_json::from_value(verified_legacy_process_state)?;
+        assert!(restored_verified_legacy.environment_preflight_quiescence_verified());
+        assert!(restored_verified_legacy.scratch_quiescence_verified());
 
         let mut legacy = serde_json::to_value(&run)?;
         let object = legacy
@@ -7323,6 +7370,28 @@ else:
         );
         assert!(report.scratch_quiescence_verified());
 
+        report
+            .stdout
+            .run_metadata
+            .environment_preflight_process_started = true;
+        report.process_tree = Some(ProcessTreeEvidence::Unverified(
+            ContainmentBackend::SystemdUserService,
+        ));
+        report.side_effects = Some(SideEffectConfinementEvidence::Unverified(
+            SideEffectConfinementProfileKind::ExternalCodex,
+        ));
+        assert!(!report.scratch_quiescence_verified());
+        report.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        assert!(!report.scratch_quiescence_verified());
+        report.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCodex,
+        ));
+        assert!(report.scratch_quiescence_verified());
+
+        report.process_tree = None;
+        report.side_effects = None;
         report.stdout.target_launch_attempted = true;
         assert!(!report.scratch_quiescence_verified());
         report.process_tree = Some(ProcessTreeEvidence::Unverified(
@@ -7331,6 +7400,10 @@ else:
         assert!(!report.scratch_quiescence_verified());
         report.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
             ContainmentBackend::SystemdUserService,
+        ));
+        assert!(!report.scratch_quiescence_verified());
+        report.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCodex,
         ));
         assert!(report.scratch_quiescence_verified());
     }
@@ -7352,7 +7425,7 @@ else:
             }
         }
 
-        let errors = [
+        let errors = vec![
             ProcessRunError::Wait {
                 label: "codex version preflight".to_string(),
                 command: "codex --version".to_string(),
@@ -7365,9 +7438,43 @@ else:
                 phase: "injected cancellation",
                 evidence: Some(Box::new(unverified_evidence())),
             },
+            ProcessRunError::OpenTee {
+                label: "codex version preflight".to_string(),
+                stream: "stdout",
+                path: PathBuf::from("injected-tee"),
+                source: std::io::Error::other("injected tee failure"),
+            },
+            ProcessRunError::TeeConflict {
+                label: "codex version preflight".to_string(),
+                stdout: PathBuf::from("injected-stdout"),
+                stderr: PathBuf::from("injected-stderr"),
+            },
+            ProcessRunError::Spawn {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                current_dir: PathBuf::from("."),
+                source: std::io::Error::other("injected ambiguous spawn failure"),
+            },
+            ProcessRunError::SetupTimeout {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                phase: "injected post-spawn setup",
+                source: std::io::Error::other("injected setup timeout"),
+            },
+            ProcessRunError::ProcessOwnership {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                source: std::io::Error::other("injected ownership failure"),
+            },
+            ProcessRunError::IoSetup {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                source: std::io::Error::other("injected post-spawn I/O failure"),
+            },
         ];
 
         for error in errors {
+            assert!(!process_run_error_definitely_before_process_start(&error));
             let mut evidence = EnvironmentPreflightProcessEvidence::default();
             evidence.record_error(&error);
             assert!(evidence.started);
@@ -7404,8 +7511,55 @@ else:
             assert!(!report.environment_preflight_quiescence_verified());
         }
 
+        let pre_spawn_errors = vec![
+            ProcessRunError::Cancelled {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                phase: "injected pre-spawn cancellation",
+                evidence: None,
+            },
+            ProcessRunError::ContainmentUnavailable {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                source: std::io::Error::other("injected containment setup failure"),
+            },
+            ProcessRunError::StdinTooLarge {
+                label: "codex version preflight".to_string(),
+                limit: 0,
+                actual: 1,
+            },
+        ];
+        for error in pre_spawn_errors {
+            assert!(process_run_error_definitely_before_process_start(&error));
+            let mut evidence = EnvironmentPreflightProcessEvidence::default();
+            evidence.record_error(&error);
+            assert!(!evidence.started);
+            assert!(evidence.process_tree.is_none());
+            assert!(evidence.side_effects.is_none());
+        }
+
         let mut verified = EnvironmentPreflightProcessEvidence::default();
         verified.record(
+            ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            true,
+        );
+        verified.record_error(&ProcessRunError::IoSetup {
+            label: "codex version preflight".to_string(),
+            command: "codex --version".to_string(),
+            source: std::io::Error::other("injected later unverified I/O failure"),
+        });
+        assert!(verified
+            .process_tree
+            .is_some_and(|process_tree| !process_tree.is_verified_empty()));
+        assert!(verified
+            .side_effects
+            .is_some_and(|side_effects| !side_effects.is_verified()));
+
+        let mut safely_verified = EnvironmentPreflightProcessEvidence::default();
+        safely_verified.record(
             ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
             SideEffectConfinementEvidence::Verified(
                 SideEffectConfinementProfileKind::ExternalCodex,
@@ -7427,7 +7581,7 @@ else:
             false,
             "credential missing".to_string(),
         );
-        retain_environment_preflight_process_evidence(&mut report, &verified);
+        retain_environment_preflight_process_evidence(&mut report, &safely_verified);
         record_environment_failure(
             &mut report,
             EnvironmentFailureCategory::MissingCredential,
