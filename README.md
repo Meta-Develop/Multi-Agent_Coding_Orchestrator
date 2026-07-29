@@ -1232,11 +1232,21 @@ turns a blocked merge into an apply.
 denial to correction consumers. It carries a typed reason family, derived
 retryability, canonical verified owner/path context, a typed `GateCheckSource`,
 a responsible route, and a typed non-executable next-safe operation. The public
-source discriminator distinguishes claim acquisition, auditor and future
-approval review, validation, primary drift, Git apply check, merge scope,
-validation binding and state, sandbox policy, containment, primary integrity,
-and external side effects without parsing prose. Reason/source mismatches are
-rejected by both constructors and validated deserialization.
+source discriminator distinguishes claim acquisition, budget admission, auditor
+and future approval review, validation, primary drift, Git apply check, merge
+scope, validation binding and state, sandbox policy, containment, primary
+integrity, and external side effects without parsing prose. Reason/source
+mismatches are rejected by both constructors and validated deserialization.
+
+The public budget-admission reason carries a `BudgetAdmissionDenial` drawn from
+a finite, value-free set: `new_dispatch_stopped`, `missing_cost_estimate`,
+`hard_token_ceiling`, or `hard_cost_ceiling`. Numeric limits, reservations, and
+consumption remain in the structured run-budget report instead of becoming part
+of the denial's stable identity. Every budget-admission denial is `not_retryable`,
+routes to the child or controller, and derives
+`NextSafeOperation::ReviewRunBudgetAndStartNewRun`
+(`review_run_budget_and_start_new_run` on the serialized surface). A new run
+may start only after the budget or scope is corrected.
 
 Sandbox denials carry the existing `SandboxDenialEvidence` type without a second
 schema. Its evidence-level retryability is reporting data, not execution
@@ -1258,6 +1268,7 @@ Routing is explicit and fixed:
 | Denial family | Responsible route |
 | --- | --- |
 | Pre-launch claim-acquisition conflict | Planner or parent |
+| Budget admission | Child or controller |
 | Auditor or validation repair | Child or controller |
 | Merge remediation, including `unclaimed_edits` | Integration controller |
 
