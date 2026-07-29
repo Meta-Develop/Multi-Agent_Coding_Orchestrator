@@ -5121,7 +5121,7 @@ fn execute_supervisor_assignment_inner(
                 ),
             )?;
             let attempt_containment_verified =
-                environment_blocked || external_safety_verified(&external_run, options.runtime);
+                external_containment_verified(&external_run, options.runtime);
             if !attempt_containment_verified {
                 outcome.external_containment_failed = true;
                 outcome.findings.push(Finding {
@@ -5767,8 +5767,8 @@ fn execute_supervisor_assignment_inner(
                     auditor_thread_id.as_deref(),
                 ),
             )?;
-            let auditor_containment_verified = auditor_environment_blocked
-                || external_safety_verified(&auditor_run, options.runtime);
+            let auditor_containment_verified =
+                external_containment_verified(&auditor_run, options.runtime);
             if !auditor_containment_verified {
                 assignment_containment_verified = false;
                 outcome.external_containment_failed = true;
@@ -11709,6 +11709,14 @@ fn external_safety_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) 
     }
 }
 
+fn external_containment_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) -> bool {
+    if run.environment_blocked() {
+        run.environment_preflight_quiescence_verified()
+    } else {
+        external_safety_verified(run, runtime)
+    }
+}
+
 fn external_process_completed(run: &ExternalAgentRun) -> bool {
     run.succeeded()
         || (run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom)
@@ -13458,6 +13466,31 @@ mod tests {
             serde_json::from_value(run_value).expect("restore environment-blocked run");
         assert!(run.environment_blocked());
         assert!(!external_safety_verified(&run, SupervisorRuntime::Codex));
+        assert!(external_containment_verified(
+            &run,
+            SupervisorRuntime::Codex
+        ));
+
+        let mut unverified_preflight =
+            serde_json::to_value(&run).expect("serialize environment-blocked run");
+        unverified_preflight["environment_preflight_process_started"] = Value::Bool(true);
+        unverified_preflight["process_tree"] = serde_json::to_value(
+            ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+        )
+        .expect("serialize unverified preflight process tree");
+        unverified_preflight["side_effects"] =
+            serde_json::to_value(SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ))
+            .expect("serialize unverified preflight side effects");
+        let unverified_preflight: ExternalAgentRun = serde_json::from_value(unverified_preflight)
+            .expect("restore unverified environment preflight");
+        assert!(unverified_preflight.environment_blocked());
+        assert!(!unverified_preflight.environment_preflight_quiescence_verified());
+        assert!(!external_containment_verified(
+            &unverified_preflight,
+            SupervisorRuntime::Codex
+        ));
 
         let child_base_head = injected_oid("environment-blocked-base");
         let worker_journals = WorkerExecutionJournalEvidenceSet::default();

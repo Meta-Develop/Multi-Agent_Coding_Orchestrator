@@ -689,6 +689,13 @@ impl std::fmt::Debug for ExternalAgentRun {
                 &self.environment_preflight_results(),
             )
             .field("environment_failures", &self.environment_failures())
+            .field(
+                "environment_preflight_process_started",
+                &self
+                    .stdout
+                    .run_metadata
+                    .environment_preflight_process_started,
+            )
             .field("sandbox_denials", &self.sandbox_denials())
             .field("stdout", &self.stdout)
             .field("stderr", &self.stderr)
@@ -717,6 +724,26 @@ impl ExternalAgentRun {
 
     pub fn environment_blocked(&self) -> bool {
         !self.environment_failures().is_empty()
+    }
+
+    /// Returns whether an environment refusal is safe to treat as terminal without a separate
+    /// containment failure.
+    ///
+    /// A static refusal may happen before any probe process starts. Once a probe starts, the
+    /// trusted runner must retain proof that both its owned process tree and side effects were
+    /// contained. Missing or unverified evidence therefore remains fail-closed.
+    pub(crate) fn environment_preflight_quiescence_verified(&self) -> bool {
+        self.environment_blocked()
+            && (!self
+                .stdout
+                .run_metadata
+                .environment_preflight_process_started
+                || (self
+                    .process_tree
+                    .is_some_and(ProcessTreeEvidence::is_verified_empty)
+                    && self
+                        .side_effects
+                        .is_some_and(SideEffectConfinementEvidence::is_verified)))
     }
 
     pub fn sandbox_denials(&self) -> &[SandboxDenialEvidence] {
@@ -815,6 +842,7 @@ struct ExternalAgentRunWireRef<'a> {
     environment_preflight_results: &'a Vec<EnvironmentPreflightResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     environment_failures: &'a Vec<EnvironmentFailure>,
+    environment_preflight_process_started: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     sandbox_denials: &'a Vec<SandboxDenialEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -846,6 +874,8 @@ struct ExternalAgentRunWireOwned {
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     #[serde(default)]
     environment_failures: Vec<EnvironmentFailure>,
+    #[serde(default = "default_environment_preflight_process_started")]
+    environment_preflight_process_started: bool,
     #[serde(default)]
     sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(default)]
@@ -876,6 +906,10 @@ impl Serialize for ExternalAgentRun {
             codex_permissions: &self.codex_permissions,
             environment_preflight_results: &self.stdout.run_metadata.environment_preflight_results,
             environment_failures: &self.stdout.run_metadata.environment_failures,
+            environment_preflight_process_started: self
+                .stdout
+                .run_metadata
+                .environment_preflight_process_started,
             sandbox_denials: &self.stdout.run_metadata.sandbox_denials,
             gate_denials: &self.stdout.run_metadata.gate_denials,
             pre_action_review_metrics: &self.stdout.run_metadata.pre_action_review_metrics,
@@ -896,6 +930,8 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
         let mut stdout = wire.stdout;
         stdout.run_metadata.environment_preflight_results = wire.environment_preflight_results;
         stdout.run_metadata.environment_failures = wire.environment_failures;
+        stdout.run_metadata.environment_preflight_process_started =
+            wire.environment_preflight_process_started;
         stdout.run_metadata.sandbox_denials = wire.sandbox_denials;
         stdout.run_metadata.gate_denials = wire.gate_denials;
         stdout.run_metadata.pre_action_review_metrics = wire.pre_action_review_metrics;
@@ -923,6 +959,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 struct ExternalAgentRunMetadata {
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
+    environment_preflight_process_started: bool,
     sandbox_denials: Vec<SandboxDenialEvidence>,
     gate_denials: Vec<GateDenial>,
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
@@ -960,6 +997,13 @@ impl std::fmt::Debug for CapturedOutput {
 }
 
 fn default_target_launch_attempted() -> bool {
+    true
+}
+
+fn default_environment_preflight_process_started() -> bool {
+    // Older serialized environment-blocked runs did not distinguish a static refusal from a
+    // launched probe whose evidence was lost. Treat absence as launched so they cannot bypass
+    // containment without retained evidence.
     true
 }
 
@@ -1223,6 +1267,7 @@ fn run_external_agent_runtime(
     };
 
     let mut codex_version = None;
+    let mut preflight_process_evidence = EnvironmentPreflightProcessEvidence::default();
     let agent_lifecycle = match &spec.agent_lifecycle {
         Some(identity) => match AgentLaunchMetadata::new(
             &identity.registry_repo,
@@ -1260,6 +1305,7 @@ fn run_external_agent_runtime(
             remaining,
             cancellation,
             agent_lifecycle.as_ref(),
+            &mut preflight_process_evidence,
         ) {
             Ok(probe) => {
                 codex_version = Some((
@@ -1267,6 +1313,10 @@ fn run_external_agent_runtime(
                     probe.version.minor,
                     probe.version.patch,
                 ));
+                retain_environment_preflight_process_evidence(
+                    &mut report,
+                    &preflight_process_evidence,
+                );
                 report
                     .stdout
                     .run_metadata
@@ -1283,6 +1333,10 @@ fn run_external_agent_runtime(
             Err(failure) => {
                 report.duration_ms = duration_millis(started.elapsed());
                 report.timed_out = failure.timed_out;
+                retain_environment_preflight_process_evidence(
+                    &mut report,
+                    &preflight_process_evidence,
+                );
                 report.error = Some(failure.failure.summary.clone());
                 report
                     .stdout
@@ -1550,6 +1604,7 @@ fn run_external_agent_runtime(
         report.timed_out = preflight.timed_out;
         report.stdout.run_metadata.environment_preflight_results = preflight.results;
         report.stdout.run_metadata.environment_failures = preflight.failures;
+        retain_environment_preflight_process_evidence(&mut report, &preflight.process_evidence);
         if report.environment_blocked() {
             report.duration_ms = duration_millis(started.elapsed());
             report.error = Some(environment_blocked_message(report.environment_failures()));
@@ -1665,6 +1720,11 @@ fn run_external_agent_runtime(
         return report;
     }
 
+    // Preflight evidence describes only the bounded probes. Once the main target is released it
+    // must earn fresh process-tree and side-effect evidence of its own; otherwise a target wait
+    // or cancellation failure could appear quiescent because an earlier probe was clean.
+    report.process_tree = None;
+    report.side_effects = None;
     report.stdout.target_launch_attempted = true;
     let completed_context = CompletedTargetContext {
         runtime,
@@ -2578,7 +2638,84 @@ struct EnvironmentPreflightReport {
     failures: Vec<EnvironmentFailure>,
     codex_version: Option<EnvironmentVersion>,
     verified_confinement: Option<SideEffectConfinementProfileKind>,
+    process_evidence: EnvironmentPreflightProcessEvidence,
     timed_out: bool,
+}
+
+#[derive(Debug, Default)]
+struct EnvironmentPreflightProcessEvidence {
+    started: bool,
+    process_tree: Option<ProcessTreeEvidence>,
+    side_effects: Option<SideEffectConfinementEvidence>,
+}
+
+impl EnvironmentPreflightProcessEvidence {
+    fn record_output(&mut self, output: &ProcessOutput) {
+        self.record(
+            output.process_tree,
+            output.side_effects,
+            output.safety_evidence_verified(),
+        );
+    }
+
+    fn record_error(&mut self, error: &ProcessRunError) {
+        let evidence = match error {
+            ProcessRunError::Wait { evidence, .. }
+            | ProcessRunError::Cancelled {
+                evidence: Some(evidence),
+                ..
+            } => Some(evidence.as_ref()),
+            ProcessRunError::Cancelled { evidence: None, .. }
+            | ProcessRunError::OpenTee { .. }
+            | ProcessRunError::TeeConflict { .. }
+            | ProcessRunError::Spawn { .. }
+            | ProcessRunError::ContainmentUnavailable { .. }
+            | ProcessRunError::SetupTimeout { .. }
+            | ProcessRunError::ProcessOwnership { .. }
+            | ProcessRunError::IoSetup { .. }
+            | ProcessRunError::StdinTooLarge { .. } => None,
+        };
+        if let Some(evidence) = evidence {
+            self.record(
+                evidence.process_tree,
+                evidence.side_effects,
+                evidence.process_tree.is_verified_empty() && evidence.side_effects.is_verified(),
+            );
+        }
+    }
+
+    fn record(
+        &mut self,
+        process_tree: ProcessTreeEvidence,
+        side_effects: SideEffectConfinementEvidence,
+        verified: bool,
+    ) {
+        let retained_verified = self
+            .process_tree
+            .is_some_and(ProcessTreeEvidence::is_verified_empty)
+            && self
+                .side_effects
+                .is_some_and(SideEffectConfinementEvidence::is_verified);
+        if !self.started || (retained_verified && !verified) {
+            self.process_tree = Some(process_tree);
+            self.side_effects = Some(side_effects);
+        }
+        self.started = true;
+    }
+}
+
+fn retain_environment_preflight_process_evidence(
+    report: &mut ExternalAgentRun,
+    evidence: &EnvironmentPreflightProcessEvidence,
+) {
+    report
+        .stdout
+        .run_metadata
+        .environment_preflight_process_started = evidence.started;
+    if evidence.started {
+        report.process_tree = evidence.process_tree;
+        report.side_effects = evidence.side_effects;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2597,6 +2734,7 @@ fn preflight_codex_version(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> std::result::Result<EnvironmentVersionProbe, CodexPreflightFailure> {
     let requirement = codex_environment_requirement();
     let version = run_fixed_version_probe(
@@ -2609,6 +2747,7 @@ fn preflight_codex_version(
         side_effect_profile,
         codex_auth,
         agent_lifecycle,
+        process_evidence,
     )
     .map_err(|probe| CodexPreflightFailure {
         timed_out: probe.timed_out,
@@ -2648,6 +2787,7 @@ fn preflight_custom_codex_version(
     timeout: Duration,
     cancellation: &ProcessCancellation,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> std::result::Result<EnvironmentVersionProbe, CodexPreflightFailure> {
     let program_parent = program.parent().ok_or_else(|| CodexPreflightFailure {
         failure: Box::new(environment_failure(
@@ -2673,6 +2813,7 @@ fn preflight_custom_codex_version(
         &profile,
         None,
         agent_lifecycle,
+        process_evidence,
     )
 }
 
@@ -2708,6 +2849,7 @@ fn run_environment_preflight(
         side_effect_profile,
         codex_auth,
         agent_lifecycle,
+        &mut report.process_evidence,
     );
     match codex_probe {
         Ok(probe) => {
@@ -2746,6 +2888,7 @@ fn run_environment_preflight(
             report.codex_version,
             report.verified_confinement,
             agent_lifecycle,
+            &mut report.process_evidence,
         );
         report.results.push(result);
         if let Some(failure) = failure {
@@ -2768,6 +2911,7 @@ fn evaluate_environment_requirement(
     observed_codex_version: Option<EnvironmentVersion>,
     verified_confinement: Option<SideEffectConfinementProfileKind>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> (EnvironmentPreflightResult, Option<EnvironmentFailure>, bool) {
     match requirement {
         EnvironmentRequirement::Executable {
@@ -2796,6 +2940,7 @@ fn evaluate_environment_requirement(
                         side_effect_profile,
                         codex_auth,
                         agent_lifecycle,
+                        process_evidence,
                     )
                     .map(|probe| probe.version)
                 })
@@ -3142,6 +3287,7 @@ fn run_fixed_version_probe(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> std::result::Result<EnvironmentVersionProbe, EnvironmentProbeFailure> {
     let label = format!("{} version preflight", executable.program_name());
     let process_spec = ProcessSpec::direct(
@@ -3160,32 +3306,39 @@ fn run_fixed_version_probe(
         codex_auth,
         agent_lifecycle,
     );
-    let output = run_process_cancellable(process_spec, cancellation).map_err(|error| {
-        let sandbox_unavailable = matches!(
-            error,
-            ProcessRunError::ContainmentUnavailable { .. }
-                | ProcessRunError::ProcessOwnership { .. }
-        );
-        EnvironmentProbeFailure {
-            category: if sandbox_unavailable {
-                EnvironmentFailureCategory::SandboxUnavailable
-            } else {
-                EnvironmentFailureCategory::ProbeFailed
-            },
-            timed_out: matches!(error, ProcessRunError::SetupTimeout { .. }),
-            summary: if sandbox_unavailable {
-                format!(
-                    "{} version preflight could not establish the fixed child sandbox",
-                    executable.program_name()
-                )
-            } else {
-                format!(
-                    "{} version preflight failed before target execution: {error}",
-                    executable.program_name()
-                )
-            },
+    let output = match run_process_cancellable(process_spec, cancellation) {
+        Ok(output) => {
+            process_evidence.record_output(&output);
+            output
         }
-    })?;
+        Err(error) => {
+            process_evidence.record_error(&error);
+            let sandbox_unavailable = matches!(
+                error,
+                ProcessRunError::ContainmentUnavailable { .. }
+                    | ProcessRunError::ProcessOwnership { .. }
+            );
+            return Err(EnvironmentProbeFailure {
+                category: if sandbox_unavailable {
+                    EnvironmentFailureCategory::SandboxUnavailable
+                } else {
+                    EnvironmentFailureCategory::ProbeFailed
+                },
+                timed_out: matches!(error, ProcessRunError::SetupTimeout { .. }),
+                summary: if sandbox_unavailable {
+                    format!(
+                        "{} version preflight could not establish the fixed child sandbox",
+                        executable.program_name()
+                    )
+                } else {
+                    format!(
+                        "{} version preflight failed before target execution: {error}",
+                        executable.program_name()
+                    )
+                },
+            });
+        }
+    };
     if !output.safety_sensitive_succeeded() {
         let sandbox_unavailable =
             !output.process_tree.is_verified_empty() || !output.side_effects.is_verified();
@@ -5517,7 +5670,9 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
-    use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
+    use crate::process_runner::{
+        ContainmentBackend, ProcessFailureEvidence, SideEffectConfinementProfileKind,
+    };
 
     #[derive(Default)]
     struct RecordingPreActionJournal {
@@ -6314,6 +6469,16 @@ else:
         );
         assert_eq!(restored.environment_failures(), run.environment_failures());
 
+        let mut legacy_process_state = serde_json::to_value(&run)?;
+        legacy_process_state
+            .as_object_mut()
+            .context("serialized external run must be an object")?
+            .remove("environment_preflight_process_started");
+        let restored_process_state: ExternalAgentRun =
+            serde_json::from_value(legacy_process_state)?;
+        assert!(restored_process_state.environment_blocked());
+        assert!(!restored_process_state.environment_preflight_quiescence_verified());
+
         let mut legacy = serde_json::to_value(&run)?;
         let object = legacy
             .as_object_mut()
@@ -6620,6 +6785,7 @@ else:
         ];
 
         for (requirement, codex_version, verified_confinement, expected_category) in cases {
+            let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
             let (result, failure, timed_out) = evaluate_environment_requirement(
                 &requirement,
                 Path::new("/workspace"),
@@ -6631,6 +6797,7 @@ else:
                 codex_version,
                 verified_confinement,
                 None,
+                &mut process_evidence,
             );
             assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
             assert_eq!(
@@ -6641,6 +6808,7 @@ else:
         }
 
         let disabled_network = EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled);
+        let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
         let (result, failure, _) = evaluate_environment_requirement(
             &disabled_network,
             Path::new("/workspace"),
@@ -6652,6 +6820,7 @@ else:
             Some(EnvironmentVersion::new(0, 142, 0)),
             None,
             None,
+            &mut process_evidence,
         );
         assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
         assert_eq!(
@@ -7164,6 +7333,110 @@ else:
             ContainmentBackend::SystemdUserService,
         ));
         assert!(report.scratch_quiescence_verified());
+    }
+
+    #[test]
+    fn environment_preflight_process_errors_retain_fail_closed_containment_evidence() {
+        fn unverified_evidence() -> ProcessFailureEvidence {
+            ProcessFailureEvidence {
+                stdout: CapturedBytes::default(),
+                stderr: CapturedBytes::default(),
+                process_tree: ProcessTreeEvidence::Unverified(
+                    ContainmentBackend::SystemdUserService,
+                ),
+                side_effects: SideEffectConfinementEvidence::Unverified(
+                    SideEffectConfinementProfileKind::ExternalCodex,
+                ),
+                process_error: Some("cleanup could not be verified".to_string()),
+                stdin_error: None,
+            }
+        }
+
+        let errors = [
+            ProcessRunError::Wait {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                evidence: Box::new(unverified_evidence()),
+                source: std::io::Error::other("injected wait failure"),
+            },
+            ProcessRunError::Cancelled {
+                label: "codex version preflight".to_string(),
+                command: "codex --version".to_string(),
+                phase: "injected cancellation",
+                evidence: Some(Box::new(unverified_evidence())),
+            },
+        ];
+
+        for error in errors {
+            let mut evidence = EnvironmentPreflightProcessEvidence::default();
+            evidence.record_error(&error);
+            assert!(evidence.started);
+            assert!(evidence
+                .process_tree
+                .is_some_and(|process_tree| !process_tree.is_verified_empty()));
+            assert!(evidence
+                .side_effects
+                .is_some_and(|side_effects| !side_effects.is_verified()));
+
+            let command = ExternalAgentCommand::codex(
+                "codex",
+                ".",
+                "prompt",
+                "log",
+                "output",
+                Duration::from_secs(1),
+            );
+            let mut report = failed_external_run(
+                &command,
+                Instant::now(),
+                vec!["codex".to_string(), "--version".to_string()],
+                false,
+                "environment preflight failed".to_string(),
+            );
+            retain_environment_preflight_process_evidence(&mut report, &evidence);
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                Some(codex_environment_requirement()),
+                "version probe failed".to_string(),
+            );
+            assert!(report.environment_blocked());
+            assert!(!report.environment_preflight_quiescence_verified());
+        }
+
+        let mut verified = EnvironmentPreflightProcessEvidence::default();
+        verified.record(
+            ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            true,
+        );
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        );
+        let mut report = failed_external_run(
+            &command,
+            Instant::now(),
+            vec!["codex".to_string(), "--version".to_string()],
+            false,
+            "credential missing".to_string(),
+        );
+        retain_environment_preflight_process_evidence(&mut report, &verified);
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::MissingCredential,
+            Some(EnvironmentRequirement::credential(
+                EnvironmentCredential::OpenAiApiKey,
+            )),
+            "required credential source is absent".to_string(),
+        );
+        assert!(report.environment_preflight_quiescence_verified());
     }
 
     #[test]
