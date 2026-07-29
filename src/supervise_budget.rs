@@ -1275,6 +1275,10 @@ mod tests {
             .report
             .reasons
             .contains(&BudgetReason::EstimatedProviderUsage));
+        let state = ledger
+            .lock_state()
+            .expect("inspect conservative estimated charge");
+        assert_eq!(state.consumed_cost_usd, 2.0);
     }
 
     #[test]

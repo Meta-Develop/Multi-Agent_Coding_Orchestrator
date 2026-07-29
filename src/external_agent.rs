@@ -3139,6 +3139,18 @@ pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
     command_argv_with_controls(spec, &controls)
 }
 
+#[cfg(test)]
+pub(crate) fn app_server_command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
+    let controls =
+        protected_worktree_controls(spec).unwrap_or_else(|_| ProtectedWorktreeControls {
+            writable_artifact_root: required_parent(&spec.output_last_message)
+                .ok()
+                .map(PathBuf::from),
+            ..ProtectedWorktreeControls::default()
+        });
+    codex_app_server_argv(spec, &controls)
+}
+
 fn command_argv_with_controls(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,

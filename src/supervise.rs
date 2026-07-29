@@ -17,8 +17,8 @@ use crate::{
         FieldGuideLimits, FieldGuideStore, ParentFieldGuideProvenance, FIELD_GUIDE_PROMPT_HEADER,
     },
     gate_denial::{
-        ExternalSideEffectState, GateApplyBlocker, GateCheckSource, GateDenial, GateDenialReason,
-        GateDenialRoute, GateRetryability, VerifiedGateContext,
+        BudgetAdmissionDenial, ExternalSideEffectState, GateApplyBlocker, GateCheckSource,
+        GateDenial, GateDenialReason, GateDenialRoute, GateRetryability, VerifiedGateContext,
     },
     llm::provider::{ModelPricing, Usage},
     merge::{
@@ -98,8 +98,9 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
     "selected provisionally from deterministic fake phase-A evidence over a hand-authored plan; \
      no real-provider or isolated-repository comparison was observed, so this profile is \
      production-ineligible and must not be represented as evidence-backed production economics; \
-     live role-scoped model availability is not currently observable, so command construction \
-     follows each role's explicit unknown-availability fallback";
+     live role-scoped model availability is not currently observable, so an explicit configured \
+     selection remains on the launched command until unavailability is actually known; only known \
+     unavailability applies the role's declared fallback";
 const DEFAULT_PROFILE_MODEL: &str = "gpt-5.6-sol";
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
@@ -351,9 +352,13 @@ impl RoleModelSelection {
         if self.model.is_none() || availability == RoleModelAvailability::Available {
             return Ok(self.clone());
         }
-        if availability == RoleModelAvailability::Unknown
-            && self.unavailable_model_fallback == UnavailableModelFallback::FailClosed
-        {
+        if availability == RoleModelAvailability::Unknown {
+            if runtime == SupervisorRuntime::Fake
+                && self.unavailable_model_fallback
+                    == UnavailableModelFallback::LocalDeterministicFake
+            {
+                return Ok(Self::default());
+            }
             return Ok(self.clone());
         }
         match self.unavailable_model_fallback {
@@ -4533,6 +4538,35 @@ struct DispatchBudgetReservation<'a> {
     state: DispatchBudgetReservationState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchUsageReliability {
+    Reliable,
+    Estimated,
+    Missing,
+    NotStarted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchUsageSettlement {
+    observed_usage: Option<Usage>,
+    reliability: DispatchUsageReliability,
+}
+
+impl DispatchUsageSettlement {
+    fn reliable_usage(self) -> Option<Usage> {
+        (self.reliability == DispatchUsageReliability::Reliable)
+            .then_some(self.observed_usage)
+            .flatten()
+    }
+
+    fn is_degraded(self) -> bool {
+        matches!(
+            self.reliability,
+            DispatchUsageReliability::Estimated | DispatchUsageReliability::Missing
+        )
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static DISPATCH_PRE_RUNNER_FAULT: Cell<Option<AgentRole>> = const { Cell::new(None) };
@@ -4578,32 +4612,57 @@ impl DispatchBudgetReservation<'_> {
         run: &ExternalAgentRun,
         runtime: SupervisorRuntime,
         command: &ExternalAgentCommand,
-    ) -> Result<Option<Usage>> {
+    ) -> Result<DispatchUsageSettlement> {
         let prior = std::mem::replace(&mut self.state, DispatchBudgetReservationState::Settled);
         if prior != DispatchBudgetReservationState::Invoked {
             bail!("budget reservation was settled before its dispatch was invoked");
         }
         let usage = complete_external_codex_usage(run, command);
         if external_dispatch_may_have_started(run, runtime) {
-            let measurement = match usage {
-                Some(usage) => UsageMeasurement::Reliable {
-                    tokens: usage.total_tokens,
-                    cost_usd: self
-                        .pricing
-                        .map(|pricing| pricing.cost_usd(usage))
-                        .filter(|cost| cost.is_finite()),
-                },
-                None => UsageMeasurement::Missing,
+            let (measurement, reliability) = match usage {
+                Some(usage)
+                    if external_process_completed(run)
+                        && external_safety_verified(run, runtime) =>
+                {
+                    (
+                        UsageMeasurement::Reliable {
+                            tokens: usage.total_tokens,
+                            cost_usd: self
+                                .pricing
+                                .map(|pricing| pricing.cost_usd(usage))
+                                .filter(|cost| cost.is_finite()),
+                        },
+                        DispatchUsageReliability::Reliable,
+                    )
+                }
+                Some(usage) => (
+                    UsageMeasurement::Estimated {
+                        tokens: usage.total_tokens,
+                        cost_usd: self
+                            .pricing
+                            .map(|pricing| pricing.cost_usd(usage))
+                            .filter(|cost| cost.is_finite()),
+                    },
+                    DispatchUsageReliability::Estimated,
+                ),
+                None => (UsageMeasurement::Missing, DispatchUsageReliability::Missing),
             };
             self.ledger
                 .reconcile(self.reservation.id, measurement)
                 .context("failed to reconcile started dispatch budget reservation")?;
+            Ok(DispatchUsageSettlement {
+                observed_usage: usage,
+                reliability,
+            })
         } else {
             self.ledger
                 .release(self.reservation.id)
                 .context("failed to release budget for a dispatch that never started")?;
+            Ok(DispatchUsageSettlement {
+                observed_usage: usage,
+                reliability: DispatchUsageReliability::NotStarted,
+            })
         }
-        Ok(usage)
     }
 }
 
@@ -4680,20 +4739,58 @@ fn external_dispatch_may_have_started(run: &ExternalAgentRun, runtime: Superviso
 fn record_budget_dispatch_refusal(
     outcome: &mut AssignmentExecutionOutcome,
     assignment: &OrchestratorAssignment,
+    owner: &str,
     role: AgentRole,
     refusal: &BudgetAdmissionRefusal,
-) {
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    journal_parent_id: &str,
+) -> Result<()> {
+    let denial = GateDenial::new(
+        outcome
+            .gate_tracker
+            .as_ref()
+            .context("gate correction tracker was not initialized")?
+            .correlation_id_for_observation(&assignment.id),
+        GateDenialReason::BudgetAdmission {
+            denial: match refusal {
+                BudgetAdmissionRefusal::NewDispatchStopped => {
+                    BudgetAdmissionDenial::NewDispatchStopped
+                }
+                BudgetAdmissionRefusal::MissingCostEstimate => {
+                    BudgetAdmissionDenial::MissingCostEstimate
+                }
+                BudgetAdmissionRefusal::HardTokenCeiling { .. } => {
+                    BudgetAdmissionDenial::HardTokenCeiling
+                }
+                BudgetAdmissionRefusal::HardCostCeiling { .. } => {
+                    BudgetAdmissionDenial::HardCostCeiling
+                }
+            },
+        },
+        VerifiedGateContext::new(
+            owner,
+            GateCheckSource::BudgetAdmission,
+            &assignment.assigned_paths,
+        )?,
+    )
+    .context("failed to construct budget-admission gate denial")?;
+    outcome
+        .gate_tracker
+        .as_mut()
+        .context("gate correction tracker was not initialized")?
+        .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
     outcome.assignment_failed = true;
     outcome.budget_dispatch_stopped = true;
     outcome.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: format!(
-            "run budget refused new '{}' dispatch for assignment '{}': {refusal:?}",
+            "run budget denied new '{}' dispatch for assignment '{}'; inspect the typed gate denial and run_budget report",
             role.as_str(),
             assignment.id
         ),
         paths: assignment.assigned_paths.clone(),
     });
+    Ok(())
 }
 
 #[derive(Default)]
@@ -5378,7 +5475,15 @@ fn execute_supervisor_assignment_inner(
                     with_supervisor_artifacts(artifacts, |writer, _| {
                         discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
                     })?;
-                    record_budget_dispatch_refusal(outcome, assignment, assignment.role, &refusal);
+                    record_budget_dispatch_refusal(
+                        outcome,
+                        assignment,
+                        &assignment.id,
+                        assignment.role,
+                        &refusal,
+                        artifacts,
+                        journal_parent_id,
+                    )?;
                     return Ok(());
                 }
             };
@@ -5499,13 +5604,16 @@ fn execute_supervisor_assignment_inner(
                     return Err(error).context("failed to produce deterministic child output");
                 }
             };
-            match budget_reservation.settle(&external_run, options.runtime, &command)? {
+            let usage_settlement =
+                budget_reservation.settle(&external_run, options.runtime, &command)?;
+            match usage_settlement.reliable_usage() {
                 Some(usage) => outcome.usage_samples.push(RoleUsageSample {
                     role: assignment.role,
                     model: command.model.clone(),
                     usage,
                 }),
-                None => outcome.usage_incomplete = true,
+                None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
+                None => {}
             }
             drop(incoming_output_root);
             drop(capture_output_root);
@@ -6093,19 +6201,21 @@ fn execute_supervisor_assignment_inner(
                     record_budget_dispatch_refusal(
                         outcome,
                         assignment,
+                        &auditor_id,
                         AgentRole::Auditor,
                         &refusal,
-                    );
+                        artifacts,
+                        journal_parent_id,
+                    )?;
                     child_report.status = ReviewStatus::Failed;
                     child_report.accepted = false;
                     child_report.rejected = true;
                     child_report.findings.push(Finding {
-                            severity: FindingSeverity::Error,
-                            message: format!(
-                                "parent review auditor was not dispatched because run budget admission refused it: {refusal:?}"
-                            ),
-                            paths: assignment.assigned_paths.clone(),
-                        });
+                        severity: FindingSeverity::Error,
+                        message: "parent review auditor was not dispatched because typed run-budget admission denied it; inspect gate_denials and run_budget"
+                            .to_string(),
+                        paths: assignment.assigned_paths.clone(),
+                    });
                     let tracker = outcome
                         .gate_tracker
                         .as_mut()
@@ -6200,17 +6310,19 @@ fn execute_supervisor_assignment_inner(
                         .context("failed to produce deterministic parent auditor output");
                 }
             };
-            match auditor_budget_reservation.settle(
+            let usage_settlement = auditor_budget_reservation.settle(
                 &auditor_run,
                 options.runtime,
                 &auditor_command,
-            )? {
+            )?;
+            match usage_settlement.reliable_usage() {
                 Some(usage) => outcome.usage_samples.push(RoleUsageSample {
                     role: AgentRole::Auditor,
                     model: auditor_command.model.clone(),
                     usage,
                 }),
-                None => outcome.usage_incomplete = true,
+                None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
+                None => {}
             }
             drop(auditor_incoming_root);
             drop(auditor_capture_root);
@@ -6842,6 +6954,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let mut primary_run_baseline = None;
     let mut assignment_execution_failed = false;
     let mut budget_prevented_dispatch = false;
+    let mut budget_denied_assignment_indices = BTreeSet::new();
     let mut external_containment_failed = false;
     let mut circuit_breaker_trip = None;
 
@@ -6961,6 +7074,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                         .new_dispatch_allowed
                     {
                         budget_prevented_dispatch = true;
+                        budget_denied_assignment_indices.extend(pending.iter().copied());
                         break;
                     }
                     let mut next = None;
@@ -7032,6 +7146,20 @@ fn run_supervisor_plan_with_runner_and_creation(
                     indexed_outcomes[index] = Some(outcome);
                     if abort || budget_stopped {
                         budget_prevented_dispatch |= budget_stopped;
+                        if !pending.is_empty()
+                            && !budget_ledger
+                                .report()
+                                .context(
+                                    "failed to inspect run budget after aborted serial dispatch",
+                                )?
+                                .new_dispatch_allowed
+                        {
+                            budget_prevented_dispatch = true;
+                            budget_denied_assignment_indices.extend(pending.iter().copied());
+                        }
+                        if budget_stopped {
+                            budget_denied_assignment_indices.extend(pending.iter().copied());
+                        }
                         break;
                     }
                     if !pending.is_empty()
@@ -7041,6 +7169,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                             .new_dispatch_allowed
                     {
                         budget_prevented_dispatch = true;
+                        budget_denied_assignment_indices.extend(pending.iter().copied());
                         break;
                     }
                 }
@@ -7089,6 +7218,8 @@ fn run_supervisor_plan_with_runner_and_creation(
                                     .new_dispatch_allowed
                                 {
                                     budget_prevented_dispatch |= !pending.is_empty();
+                                    budget_denied_assignment_indices
+                                        .extend(pending.iter().copied());
                                     stop_scheduling = true;
                                     break;
                                 }
@@ -7251,6 +7382,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                                         .new_dispatch_allowed)
                             {
                                 budget_prevented_dispatch = true;
+                                budget_denied_assignment_indices.extend(pending.iter().copied());
                                 stop_scheduling = true;
                             }
                         }
@@ -7419,21 +7551,36 @@ fn run_supervisor_plan_with_runner_and_creation(
     if usage_incomplete {
         findings.push(Finding {
             severity: FindingSeverity::Warning,
-            message: "process usage is incomplete because at least one external Codex JSONL capture was missing, truncated, malformed, or conservatively reconciled after an invoked dispatch did not return usage"
+            message: "process usage is incomplete because at least one external Codex JSONL capture was missing, truncated, or malformed, or conservatively reconciled because usage was observed but unreliable after its run failed, timed out, or lacked verified completion or containment"
                 .to_string(),
             paths: Vec::new(),
         });
     }
     if budget_prevented_dispatch {
+        for index in &budget_denied_assignment_indices {
+            let assignment = plan
+                .assignments
+                .get(*index)
+                .context("budget denial referenced an assignment outside the plan")?;
+            gate_denials.push(
+                GateDenial::new(
+                    gate_correlation_id(&assignment.id, 1),
+                    GateDenialReason::BudgetAdmission {
+                        denial: BudgetAdmissionDenial::NewDispatchStopped,
+                    },
+                    VerifiedGateContext::new(
+                        &assignment.id,
+                        GateCheckSource::BudgetAdmission,
+                        &assignment.assigned_paths,
+                    )?,
+                )
+                .context("failed to construct scheduler budget-admission gate denial")?,
+            );
+        }
         findings.push(Finding {
             severity: FindingSeverity::Error,
-            message: format!(
-                "run budget stopped one or more new dispatches and drained already-started work; reasons: {:?}",
-                run_budget_report
-                    .as_ref()
-                    .map(|report| report.reasons.as_slice())
-                    .unwrap_or_default()
-            ),
+            message: "run budget stopped one or more new dispatches and drained already-started work; inspect typed gate_denials and the structured run_budget report"
+                .to_string(),
             paths: Vec::new(),
         });
     }
@@ -12185,7 +12332,7 @@ fn finalize_supervisor_cost(
     if let Some(supervisor_usage) = role_usage.get_mut(&AgentRole::Supervisor) {
         supervisor_usage.cost_usd = None;
         supervisor_usage.unavailable_reason = Some(
-            "supervisor aggregate cost is unavailable because at least one MACO-launched process usage sample is missing"
+            "supervisor aggregate cost is unavailable because at least one MACO-launched process usage sample is missing, incomplete, or unreliable"
                 .to_string(),
         );
     }
@@ -15086,7 +15233,7 @@ mod tests {
     }
 
     #[test]
-    fn no_override_selects_named_provisional_hybrid_profile() {
+    fn no_override_selects_named_provisional_hybrid_profile_in_launched_argv() {
         let plan = parse_supervisor_plan_with_consultant(
             std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
         )
@@ -15123,6 +15270,55 @@ mod tests {
             profile.role_models[&AgentRole::Auditor].unavailable_model_fallback,
             UnavailableModelFallback::RuntimeDefault
         );
+
+        let base_command = || {
+            ExternalAgentCommand::codex(
+                "codex",
+                "/workspace",
+                "/run/prompt.md",
+                "/run/events.jsonl",
+                "/run/report.json",
+                Duration::from_secs(1),
+            )
+        };
+        let child = apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Codex,
+        )
+        .expect("apply no-override child selection");
+        let child_argv = crate::external_agent::app_server_command_argv(&child)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            child_argv
+                .windows(2)
+                .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-sol\""]),
+            "writable child app-server argv did not select the provisional model: {child_argv:?}"
+        );
+        assert!(child_argv
+            .windows(2)
+            .any(|arguments| arguments == ["-c", "model_reasoning_effort=\"xhigh\""]));
+
+        let auditor = apply_role_model_selection(
+            base_command(),
+            &plan,
+            AgentRole::Auditor,
+            SupervisorRuntime::Codex,
+        )
+        .expect("apply no-override auditor selection");
+        let auditor_argv = crate::external_agent::command_argv(&auditor)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(auditor_argv
+            .windows(2)
+            .any(|arguments| arguments == ["-m", DEFAULT_PROFILE_MODEL]));
+        assert!(auditor_argv
+            .windows(2)
+            .any(|arguments| arguments == ["-c", "model_reasoning_effort=\"xhigh\""]));
     }
 
     #[test]
@@ -15162,6 +15358,11 @@ mod tests {
             .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Fake)
             .expect("local fake fallback");
         assert_eq!(local_fake, RoleModelSelection::default());
+        let unknown_local_fake =
+            provisional_default_role_model_selection(AgentRole::GateClassifier)
+                .resolve_for_availability(RoleModelAvailability::Unknown, SupervisorRuntime::Fake)
+                .expect("known fake runtime uses local deterministic fallback");
+        assert_eq!(unknown_local_fake, RoleModelSelection::default());
         assert!(
             provisional_default_role_model_selection(AgentRole::GateClassifier)
                 .resolve_for_availability(
@@ -15206,8 +15407,11 @@ mod tests {
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
         )
-        .expect("unknown availability uses the configured runtime default");
-        assert_eq!(unknown_runtime_default.model, None);
+        .expect("unknown availability preserves the configured selection");
+        assert_eq!(
+            unknown_runtime_default.model.as_deref(),
+            Some("preferred-model")
+        );
         assert_eq!(
             unknown_runtime_default.reasoning_effort.as_deref(),
             Some("high")
@@ -15247,13 +15451,18 @@ mod tests {
         )
         .expect("the fake runtime may use its deterministic local fallback");
         assert_eq!(local_fake.model, None);
-        let invalid_runtime_error = apply_role_model_selection(
+        let unknown_codex = apply_role_model_selection(
             base_command(),
             &plan,
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
         )
-        .expect_err("Codex runtime cannot use the deterministic local fallback");
+        .expect("unknown Codex availability preserves the configured selection");
+        assert_eq!(unknown_codex.model.as_deref(), Some("preferred-model"));
+        assert_eq!(unknown_codex.reasoning_effort.as_deref(), Some("high"));
+        let invalid_runtime_error = plan.role_models[&AgentRole::ChildOrchestrator]
+            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex)
+            .expect_err("known-unavailable Codex cannot use the deterministic local fallback");
         assert!(format!("{invalid_runtime_error:#}").contains("valid only for the fake runtime"));
     }
 
@@ -22144,6 +22353,7 @@ mod tests {
         run_id: &str,
         started_worktree: &str,
         unstarted_worktrees: &[&str],
+        expected_scheduler_budget_denial: bool,
     ) {
         assert_eq!(report.released_claims.len(), 1);
         assert!(report.release_errors.is_empty());
@@ -22155,7 +22365,17 @@ mod tests {
         );
         assert!(report.semantic_release_errors.is_empty());
         assert!(report.breaker_trip.is_none());
-        assert!(report.gate_denials.is_empty());
+        if expected_scheduler_budget_denial {
+            assert_eq!(report.gate_denials.len(), 1);
+            assert!(matches!(
+                report.gate_denials[0].reason,
+                GateDenialReason::BudgetAdmission {
+                    denial: BudgetAdmissionDenial::NewDispatchStopped,
+                }
+            ));
+        } else {
+            assert!(report.gate_denials.is_empty());
+        }
         assert!(report.gate_correction_outcomes.is_empty());
         assert!(SyncStore::open(repo)
             .expect("reopen lifecycle sync store")
@@ -22360,6 +22580,77 @@ mod tests {
     }
 
     #[test]
+    fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_reports() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(15), None, None, 10, 10);
+        let options = injected_options(&repo_path, temp.path(), "budget-auditor-typed-denial");
+        let mut invocations = 0usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            assert!(
+                !command
+                    .output_last_message
+                    .to_string_lossy()
+                    .contains("review-auditor"),
+                "auditor must be refused before launch"
+            );
+            write_injected_assignment_report(command, &assignment);
+            write_injected_usage(command, 7, 3);
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("finalize typed auditor budget refusal");
+
+        assert!(!report.success);
+        assert_eq!(invocations, 1);
+        let budget = report.run_budget.as_ref().expect("auditor budget report");
+        assert_eq!(budget.consumed.tokens, 10);
+        assert!(!budget.new_dispatch_allowed);
+        assert!(budget
+            .reasons
+            .contains(&BudgetReason::HardTokenCeilingReached));
+        assert_eq!(report.gate_denials.len(), 1);
+        let denial = &report.gate_denials[0];
+        assert_eq!(
+            denial.reason,
+            GateDenialReason::BudgetAdmission {
+                denial: BudgetAdmissionDenial::HardTokenCeiling,
+            }
+        );
+        assert_eq!(denial.context.source, GateCheckSource::BudgetAdmission);
+        assert_eq!(denial.route, GateDenialRoute::ChildController);
+        assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+        let child = report
+            .orchestrator_reports
+            .first()
+            .expect("failed child report retained");
+        assert_eq!(child.gate_denials, report.gate_denials);
+        assert_eq!(
+            child.gate_correction_outcomes,
+            report.gate_correction_outcomes
+        );
+        assert!(child
+            .findings
+            .iter()
+            .all(|finding| !finding.message.contains("BudgetAdmissionRefusal")));
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| !finding.message.contains("BudgetAdmissionRefusal")));
+    }
+
+    #[test]
     fn budget_integration_cost_enforcement_refuses_missing_model_pricing_before_launch() {
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(false);
@@ -22402,6 +22693,25 @@ mod tests {
         assert_eq!(budget.action, BudgetAction::OwnerEscalation);
         assert_eq!(report.released_claims.len(), 1);
         assert!(report.release_errors.is_empty());
+        assert_eq!(report.gate_denials.len(), 1);
+        let denial = &report.gate_denials[0];
+        assert_eq!(
+            denial.reason,
+            GateDenialReason::BudgetAdmission {
+                denial: BudgetAdmissionDenial::MissingCostEstimate,
+            }
+        );
+        assert_eq!(denial.context.source, GateCheckSource::BudgetAdmission);
+        assert_eq!(denial.route, GateDenialRoute::ChildController);
+        assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+        assert_eq!(
+            denial.next_safe_operation,
+            crate::gate_denial::NextSafeOperation::ReviewRunBudgetAndStartNewRun
+        );
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| !finding.message.contains("BudgetAdmissionRefusal")));
     }
 
     #[test]
@@ -22477,6 +22787,132 @@ mod tests {
             .contains("run budget stopped one or more new dispatches")));
     }
 
+    #[derive(Clone, Copy)]
+    enum ParseablePartialRunOutcome {
+        Failed,
+        TimedOut,
+    }
+
+    fn assert_parseable_partial_usage_is_conservative(
+        run_id: &str,
+        partial_outcome: ParseablePartialRunOutcome,
+    ) {
+        let (temp, repo_path) = injected_repository();
+        let child_a = injected_named_assignment("child-a", "README.md");
+        let child_b = injected_named_assignment("child-b", "src/lib.rs");
+        let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(200), None, Some(1.0), 50, 50);
+        let options = injected_options(&repo_path, temp.path(), run_id);
+        let mut invocations = 0usize;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            assert_eq!(
+                injected_command_assignment_id(command),
+                "child-a",
+                "latched degraded settlement must prevent the later child dispatch"
+            );
+            write_injected_assignment_report(command, &child_a);
+            // The capture is syntactically complete and contains a genuine Codex usage event,
+            // but it is only a partial observation because the enclosing run does not complete.
+            write_injected_usage(command, 7, 3);
+            match partial_outcome {
+                ParseablePartialRunOutcome::Failed => injected_verified_nonzero_run(command, 23),
+                ParseablePartialRunOutcome::TimedOut => {
+                    let mut run = injected_verified_run(command);
+                    run.exit_code = None;
+                    run.timed_out = true;
+                    run.publishable = false;
+                    run.error = Some("external agent timed out after partial usage".to_string());
+                    run
+                }
+            }
+        };
+
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .expect("finalize partial-usage run");
+
+        assert!(!report.success);
+        assert_eq!(invocations, 1);
+        assert!(!report.usage_complete);
+        assert!(report.total_usage.is_none());
+        assert!(report.total_cost_usd.is_none());
+        assert!(report.role_usage[&AgentRole::Supervisor]
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("missing, incomplete, or unreliable")));
+        assert!(!report
+            .role_usage
+            .contains_key(&AgentRole::ChildOrchestrator));
+        let budget = report.run_budget.as_ref().expect("partial usage budget");
+        assert_eq!(budget.consumed.tokens, 50);
+        assert_eq!(budget.committed.tokens, 50);
+        assert_eq!(budget.consumed.cost_usd, None);
+        assert_eq!(budget.committed.cost_usd, None);
+        assert_eq!(budget.remaining.hard_cost_usd, None);
+        assert!(!budget.usage_complete);
+        assert!(!budget.new_dispatch_allowed);
+        assert_eq!(budget.action, BudgetAction::OwnerEscalation);
+        assert!(budget
+            .reasons
+            .contains(&BudgetReason::EstimatedProviderUsage));
+        assert_eq!(report.gate_denials.len(), 1);
+        let denial = &report.gate_denials[0];
+        assert_eq!(
+            denial.reason,
+            GateDenialReason::BudgetAdmission {
+                denial: BudgetAdmissionDenial::NewDispatchStopped,
+            }
+        );
+        assert_eq!(denial.context.owner, "child-b");
+        assert_eq!(denial.context.source, GateCheckSource::BudgetAdmission);
+        assert_eq!(denial.route, GateDenialRoute::ChildController);
+        assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("conservatively reconciled")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("observed but unreliable")));
+        assert!(report.findings.iter().any(|finding| finding
+            .message
+            .contains("run budget stopped one or more new dispatches")));
+        assert_injected_dispatch_cleanup(
+            &report,
+            &repo_path,
+            run_id,
+            "child-a",
+            &["child-b"],
+            true,
+        );
+    }
+
+    #[test]
+    fn budget_integration_parseable_partial_usage_from_failed_run_is_estimated_and_latched() {
+        assert_parseable_partial_usage_is_conservative(
+            "budget-partial-usage-failed",
+            ParseablePartialRunOutcome::Failed,
+        );
+    }
+
+    #[test]
+    fn budget_integration_parseable_partial_usage_from_timeout_is_estimated_and_latched() {
+        assert_parseable_partial_usage_is_conservative(
+            "budget-partial-usage-timeout",
+            ParseablePartialRunOutcome::TimedOut,
+        );
+    }
+
     #[test]
     fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pending() {
         let (temp, repo_path) = injected_repository();
@@ -22527,7 +22963,14 @@ mod tests {
                 .map(|role| (role.consumed.tokens, role.usage_complete)),
             Some((0, true))
         );
-        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+        assert_injected_dispatch_cleanup(
+            &report,
+            &repo_path,
+            run_id,
+            "child-a",
+            &["child-b"],
+            false,
+        );
     }
 
     #[test]
@@ -22592,7 +23035,14 @@ mod tests {
                 .map(|role| (role.consumed.tokens, role.usage_complete)),
             Some((0, true))
         );
-        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+        assert_injected_dispatch_cleanup(
+            &report,
+            &repo_path,
+            run_id,
+            "child-a",
+            &["child-b"],
+            false,
+        );
     }
 
     #[test]
@@ -22648,7 +23098,14 @@ mod tests {
                 .map(|role| (role.consumed.tokens, role.usage_complete)),
             Some((50, false))
         );
-        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+        assert_injected_dispatch_cleanup(
+            &report,
+            &repo_path,
+            run_id,
+            "child-a",
+            &["child-b"],
+            true,
+        );
     }
 
     #[test]
@@ -22715,7 +23172,14 @@ mod tests {
                 .map(|role| (role.consumed.tokens, role.usage_complete)),
             Some((50, false))
         );
-        assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"]);
+        assert_injected_dispatch_cleanup(
+            &report,
+            &repo_path,
+            run_id,
+            "child-a",
+            &["child-b"],
+            true,
+        );
     }
 
     #[test]
@@ -22747,6 +23211,7 @@ mod tests {
 
         assert!(!report.success);
         assert_eq!(invocations, 1);
+        assert!(report.usage_complete);
         let budget = report.run_budget.expect("never-started budget report");
         assert_eq!(budget.consumed.tokens, 0);
         assert_eq!(budget.reserved.tokens, 0);
@@ -22794,10 +23259,13 @@ mod tests {
         let mut run = injected_target_attempted(injected_verified_run_without_journals(&command));
         run.process_tree = None;
         assert!(!run.scratch_quiescence_verified());
-        assert!(reservation
-            .settle(&run, SupervisorRuntime::Codex, &command)
-            .expect("reconcile uncertain-start dispatch")
-            .is_none());
+        assert_eq!(
+            reservation
+                .settle(&run, SupervisorRuntime::Codex, &command)
+                .expect("reconcile uncertain-start dispatch")
+                .reliability,
+            DispatchUsageReliability::Missing
+        );
 
         let report = ledger.report().expect("uncertain-start budget report");
         assert_eq!(report.consumed.tokens, 50);
@@ -22808,6 +23276,75 @@ mod tests {
         assert!(!report.new_dispatch_allowed);
         assert!(report.reasons.contains(&BudgetReason::MissingProviderUsage));
         assert_eq!(report.action, BudgetAction::OwnerEscalation);
+    }
+
+    #[test]
+    fn budget_integration_parseable_usage_without_verified_containment_is_estimated() {
+        let assignment = injected_assignment(false);
+        let mut plan = injected_plan(assignment, 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
+        let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        let temp = tempfile::tempdir().expect("unverified containment command root");
+        let mut command = ExternalAgentCommand::codex(
+            "codex",
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("capture.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(1),
+        );
+        command.model = Some("priced-model".to_string());
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            AgentRole::ChildOrchestrator,
+            &command,
+        )
+        .expect("reserve unverified containment dispatch")
+        {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                panic!("unexpected budget refusal: {refusal:?}")
+            }
+        };
+        reservation
+            .mark_invoked()
+            .expect("mark unverified containment dispatch invoked");
+        write_injected_usage(&command, 7, 3);
+        let mut run = injected_verified_run_without_journals(&command);
+        run.side_effects = None;
+        let settlement = reservation
+            .settle(&run, SupervisorRuntime::Codex, &command)
+            .expect("reconcile unverified containment dispatch");
+        assert_eq!(
+            settlement.observed_usage.map(|usage| usage.total_tokens),
+            Some(10)
+        );
+        assert_eq!(settlement.reliability, DispatchUsageReliability::Estimated);
+
+        let report = ledger
+            .report()
+            .expect("unverified containment budget report");
+        assert_eq!(report.consumed.tokens, 50);
+        assert_eq!(report.consumed.cost_usd, None);
+        assert!(!report.usage_complete);
+        assert!(!report.new_dispatch_allowed);
+        assert!(report
+            .reasons
+            .contains(&BudgetReason::EstimatedProviderUsage));
+        assert!(matches!(
+            reserve_dispatch_budget(
+                &plan,
+                &budget,
+                &ledger,
+                AgentRole::ChildOrchestrator,
+                &command,
+            )
+            .expect("later admission result"),
+            DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::NewDispatchStopped)
+        ));
     }
 
     fn sample_child_report_json(id: &str) -> String {
