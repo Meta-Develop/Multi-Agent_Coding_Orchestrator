@@ -38,6 +38,14 @@ jobs:
               "Rust CI",
               "Supply-chain policy",
             ]);
+            const failureLikeConclusions = new Set([
+              "failure",
+              "timed_out",
+              "cancelled",
+              "action_required",
+              "startup_failure",
+              "stale",
+            ]);
 
             if (!run || !expectedWorkflows.has(run.name)) {
               core.notice("Ignoring an unexpected workflow_run payload.");
@@ -72,7 +80,10 @@ jobs:
               core.notice("Ignoring a non-default-branch workflow run.");
               return;
             }
-            if (!["failure", "success"].includes(run.conclusion)) {
+            if (
+              run.conclusion !== "success" &&
+              !failureLikeConclusions.has(run.conclusion)
+            ) {
               core.notice(`Ignoring non-lifecycle conclusion: ${run.conclusion}`);
               return;
             }
@@ -234,14 +245,6 @@ jobs:
               }
             }
 
-            const failureLikeConclusions = new Set([
-              "failure",
-              "timed_out",
-              "cancelled",
-              "action_required",
-              "startup_failure",
-              "stale",
-            ]);
             const failingJobs = jobs
               .filter((job) => failureLikeConclusions.has(job.conclusion))
               .map((job) => ({
