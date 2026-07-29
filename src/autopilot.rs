@@ -1188,8 +1188,10 @@ fn supervisor_plan_for_attempt(
                 semantic_symbols: plan.semantic_symbols.clone(),
                 semantic_modules: plan.semantic_modules.clone(),
                 task: Some(task),
+                environment_requirements: Vec::new(),
                 report_path: None,
             }],
+            environment_requirements: Vec::new(),
             notes: Some(format!("autopilot attempt {attempt}")),
         }],
     }
