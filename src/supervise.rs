@@ -5483,6 +5483,30 @@ fn execute_supervisor_assignment_inner(
                 )
             })?;
 
+            let mut command = ExternalAgentCommand::codex(
+                &options.codex_bin,
+                &worktree.path,
+                &attempt_artifacts.prompt_path,
+                &attempt_artifacts.log_path,
+                &attempt_artifacts.report_path,
+                Duration::from_secs(plan.child_timeout_seconds),
+            );
+            command = apply_role_model_selection(
+                command,
+                plan,
+                assignment.role,
+                options.runtime,
+                runtime_model_catalog,
+            )?;
+            command.output_schema = Some(schema_path.clone());
+            command = command.with_hidden_root(repo).with_agent_lifecycle(
+                repo,
+                assignment.role.as_str(),
+                options.run_id.as_str(),
+                &assignment.id,
+            );
+            command = configure_writable_child_command(command, &assignment.assigned_paths)?;
+
             let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
             if let Some(error) = primary_before.inspection_problem() {
                 bail!(
@@ -5529,29 +5553,6 @@ fn execute_supervisor_assignment_inner(
                 })?;
                 bail!("descriptor-held invocation scratch roots changed during setup");
             }
-            let mut command = ExternalAgentCommand::codex(
-                &options.codex_bin,
-                &worktree.path,
-                &attempt_artifacts.prompt_path,
-                &attempt_artifacts.log_path,
-                &attempt_artifacts.report_path,
-                Duration::from_secs(plan.child_timeout_seconds),
-            );
-            command = apply_role_model_selection(
-                command,
-                plan,
-                assignment.role,
-                options.runtime,
-                runtime_model_catalog,
-            )?;
-            command.output_schema = Some(schema_path.clone());
-            command = command.with_hidden_root(repo).with_agent_lifecycle(
-                repo,
-                assignment.role.as_str(),
-                options.run_id.as_str(),
-                &assignment.id,
-            );
-            command = configure_writable_child_command(command, &assignment.assigned_paths)?;
             let mut budget_reservation = match reserve_dispatch_budget(
                 plan,
                 budget_config,
@@ -6176,6 +6177,31 @@ fn execute_supervisor_assignment_inner(
                 )
             })?;
 
+            let mut auditor_command = ExternalAgentCommand::codex(
+                &options.codex_bin,
+                &worktree.path,
+                &auditor_prompt_path,
+                &auditor_log_path,
+                &auditor_report_path,
+                Duration::from_secs(plan.child_timeout_seconds),
+            );
+            auditor_command = apply_role_model_selection(
+                auditor_command,
+                plan,
+                AgentRole::Auditor,
+                options.runtime,
+                runtime_model_catalog,
+            )?;
+            auditor_command.output_schema = Some(auditor_schema_path);
+            auditor_command = configure_read_only_auditor_command(auditor_command)?
+                .with_hidden_root(repo)
+                .with_agent_lifecycle(
+                    repo,
+                    AgentRole::Auditor.as_str(),
+                    options.run_id.as_str(),
+                    &auditor_id,
+                );
+
             let primary_before_auditor = primary_worktree_snapshot(repo, *execution_runtime)?;
             if let Some(error) = primary_before_auditor.inspection_problem() {
                 bail!(
@@ -6247,31 +6273,6 @@ fn execute_supervisor_assignment_inner(
                 })?;
                 bail!("descriptor-held auditor scratch roots changed during setup");
             }
-
-            let mut auditor_command = ExternalAgentCommand::codex(
-                &options.codex_bin,
-                &worktree.path,
-                &auditor_prompt_path,
-                &auditor_log_path,
-                &auditor_report_path,
-                Duration::from_secs(plan.child_timeout_seconds),
-            );
-            auditor_command = apply_role_model_selection(
-                auditor_command,
-                plan,
-                AgentRole::Auditor,
-                options.runtime,
-                runtime_model_catalog,
-            )?;
-            auditor_command.output_schema = Some(auditor_schema_path);
-            auditor_command = configure_read_only_auditor_command(auditor_command)?
-                .with_hidden_root(repo)
-                .with_agent_lifecycle(
-                    repo,
-                    AgentRole::Auditor.as_str(),
-                    options.run_id.as_str(),
-                    &auditor_id,
-                );
             let mut auditor_budget_reservation = match reserve_dispatch_budget(
                 plan,
                 budget_config,
@@ -12162,6 +12163,9 @@ fn deterministic_fake_child_run(
     claim_token: u64,
     semantic_intent_token: Option<u64>,
 ) -> Result<ExternalAgentRun> {
+    if command.model.is_some() {
+        bail!("deterministic fake child command retained a provider model slug");
+    }
     write_deterministic_fake_worker_journals(command, assignment)?;
     let worker_reports = assignment
         .worker_assignments
@@ -12275,6 +12279,9 @@ fn deterministic_fake_auditor_run(
     assignment: &OrchestratorAssignment,
     child_report: &OrchestratorReviewReport,
 ) -> Result<ExternalAgentRun> {
+    if command.model.is_some() {
+        bail!("deterministic fake auditor command retained a provider model slug");
+    }
     let report = AuditorReport {
         id: parent_auditor_id(assignment),
         role: AgentRole::Auditor,
@@ -15819,6 +15826,115 @@ mod tests {
         assert!(report.success, "unexpected failed report: {report:#?}");
         assert!(child_seen);
         assert!(auditor_seen);
+        assert_eq!(
+            report
+                .role_economics_profile
+                .as_ref()
+                .map(|profile| profile.model_availability),
+            Some(RoleModelAvailability::Unavailable)
+        );
+    }
+
+    #[test]
+    fn known_unavailable_child_fail_closed_reaches_production_core_without_dispatch_or_scratch() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment, 0);
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("unavailable-child-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let run_id = "known-unavailable-child-fail-closed";
+        let options = injected_options(&repo_path, temp.path(), run_id);
+        let catalog = injected_codex_runtime_catalog(&["different-model"]);
+        let mut invocations = 0usize;
+        let mut runner = |_command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            panic!("known-unavailable fail_closed selection must prevent dispatch")
+        };
+
+        let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            Ok(catalog),
+            &mut runner,
+        )
+        .expect("fail_closed selection should produce a finalized rejection report");
+
+        drop(runner);
+        assert_eq!(invocations, 0);
+        assert!(!report.success);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("fallback is fail_closed")));
+        let run_root = repo_path
+            .join(RunArtifactFamily::Supervise.run_root())
+            .join(run_id);
+        let scratch_entries = fs::read_dir(&run_root)
+            .expect("read finalized fail_closed artifact root")
+            .map(|entry| {
+                entry
+                    .expect("read fail_closed artifact entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with("incoming") || name.starts_with("capture"))
+            .collect::<Vec<_>>();
+        assert!(
+            scratch_entries.is_empty(),
+            "fail_closed command construction leaked invocation scratch: {scratch_entries:?}"
+        );
+        assert!(run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());
+    }
+
+    #[test]
+    fn local_deterministic_fake_fallback_reaches_shared_supervisor_core_without_external_dispatch()
+    {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment, 0);
+        for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+            plan.role_models.insert(
+                role,
+                RoleModelSelection {
+                    model: Some("codex-only-model".to_string()),
+                    reasoning_effort: Some("high".to_string()),
+                    unavailable_model_fallback: UnavailableModelFallback::LocalDeterministicFake,
+                },
+            );
+        }
+        let mut options =
+            injected_options(&repo_path, temp.path(), "local-fake-fallback-shared-core");
+        options.runtime = SupervisorRuntime::Fake;
+        let mut invocations = 0usize;
+        let mut runner = |_command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            panic!("deterministic fake fallback must not invoke the external runner")
+        };
+
+        let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            Ok(RuntimeModelCatalog::LocalDeterministicFake),
+            &mut runner,
+        )
+        .expect("run deterministic fake fallback through the shared supervisor core");
+
+        drop(runner);
+        assert_eq!(invocations, 0);
+        assert!(report.success, "unexpected fake-core failure: {report:#?}");
+        assert!(!report.publishable);
+        assert_eq!(report.commands_run.len(), 2);
         assert_eq!(
             report
                 .role_economics_profile
