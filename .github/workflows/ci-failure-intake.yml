@@ -1,0 +1,356 @@
+name: Public Repository CI Failure Intake
+
+"on":
+  workflow_run:
+    workflows: ["Rust CI", "Supply-chain policy"]
+    types: [completed]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: >-
+    public-ci-failure-${{ github.event.workflow_run.workflow_id }}-${{
+    github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile the CI failure issue
+    if: >-
+      ${{
+        github.event.workflow_run.head_repository.full_name ==
+        github.repository
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Reconcile failure and recovery state
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const run = context.payload.workflow_run;
+            const { owner, repo } = context.repo;
+            const repositoryName = `${owner}/${repo}`;
+            const repository = context.payload.repository;
+            const expectedWorkflows = new Set([
+              "Rust CI",
+              "Supply-chain policy",
+            ]);
+            const failureLikeConclusions = new Set([
+              "failure",
+              "timed_out",
+              "cancelled",
+              "action_required",
+              "startup_failure",
+              "stale",
+            ]);
+
+            if (!run || !expectedWorkflows.has(run.name)) {
+              core.notice("Ignoring an unexpected workflow_run payload.");
+              return;
+            }
+            if (
+              run.repository?.full_name !== repositoryName ||
+              run.head_repository?.full_name !== repositoryName
+            ) {
+              core.notice("Ignoring a workflow run from a foreign repository.");
+              return;
+            }
+            if (
+              !Number.isSafeInteger(run.id) ||
+              !Number.isSafeInteger(run.workflow_id) ||
+              typeof run.head_branch !== "string" ||
+              run.head_branch.length === 0 ||
+              !/^[0-9a-f]{40}$/i.test(run.head_sha) ||
+              typeof run.jobs_url !== "string"
+            ) {
+              core.setFailed("The workflow_run identity is incomplete or invalid.");
+              return;
+            }
+            if (
+              typeof repository?.default_branch !== "string" ||
+              repository.default_branch.length === 0
+            ) {
+              core.setFailed("The repository default branch is missing or invalid.");
+              return;
+            }
+            if (run.head_branch !== repository.default_branch) {
+              core.notice("Ignoring a non-default-branch workflow run.");
+              return;
+            }
+            if (
+              run.conclusion !== "success" &&
+              !failureLikeConclusions.has(run.conclusion)
+            ) {
+              core.notice(`Ignoring non-lifecycle conclusion: ${run.conclusion}`);
+              return;
+            }
+
+            const serverUrl = new URL(context.serverUrl);
+            const safeUrl = (value) => {
+              const url = new URL(value);
+              if (url.protocol !== "https:" || url.host !== serverUrl.host) {
+                throw new Error("Refusing a non-GitHub URL in CI issue data.");
+              }
+              return url.toString();
+            };
+            const oneLine = (value) =>
+              String(value ?? "")
+                .replace(/[\u0000-\u001f\u007f]/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+            const markdown = (value) =>
+              oneLine(value)
+                .replace(/&/g, "&amp;")
+                .replace(/@/g, "&#64;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/([\\`*_{}[\]()#+\-.!|])/g, "\\$1");
+
+            const markerTuple = JSON.stringify([
+              "workflow_id",
+              run.workflow_id,
+              "branch",
+              run.head_branch,
+            ]);
+            const markerPayload = Buffer.from(markerTuple, "utf8").toString(
+              "base64url",
+            );
+            const marker = `<!-- public-repo-ci-failure:v1:${markerPayload} -->`;
+            const hasExactMarker = (issue) =>
+              String(issue.body ?? "")
+                .split(/\r?\n/)
+                .some((line) => line.trim() === marker);
+
+            const allItems = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: "all",
+                labels: "ci-failure",
+                per_page: 100,
+              },
+            );
+            const matches = allItems
+              .filter((item) => !item.pull_request && hasExactMarker(item))
+              .sort((left, right) => left.number - right.number);
+            let issue = matches[0];
+
+            const closeDuplicates = async () => {
+              for (const duplicate of matches.slice(1)) {
+                if (duplicate.state === "open") {
+                  await github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number: duplicate.number,
+                    state: "closed",
+                    state_reason: "completed",
+                  });
+                }
+              }
+            };
+
+            if (run.conclusion === "success") {
+              if (!issue) {
+                core.notice("No matching CI failure issue requires recovery.");
+                return;
+              }
+
+              await closeDuplicates();
+              if (issue.state === "open") {
+                const recoveryBody = [
+                  "CI recovered.",
+                  "",
+                  `- Workflow: ${markdown(run.name)}`,
+                  `- Branch: ${markdown(run.head_branch)}`,
+                  `- SHA: ${run.head_sha}`,
+                  `- Conclusion: ${markdown(run.conclusion)}`,
+                  `- Run URL: ${safeUrl(run.html_url)}`,
+                ].join("\n");
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  body: recoveryBody,
+                });
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: "closed",
+                  state_reason: "completed",
+                });
+              }
+              return;
+            }
+
+            const apiUrl = new URL(context.apiUrl);
+            const jobsUrl = new URL(run.jobs_url);
+            const expectedJobsPath =
+              `/repos/${owner}/${repo}/actions/runs/${run.id}/jobs`;
+            if (
+              jobsUrl.protocol !== "https:" ||
+              jobsUrl.origin !== apiUrl.origin ||
+              jobsUrl.pathname !== expectedJobsPath ||
+              jobsUrl.search !== "" ||
+              jobsUrl.hash !== "" ||
+              jobsUrl.username !== "" ||
+              jobsUrl.password !== ""
+            ) {
+              throw new Error("Refusing an unexpected workflow jobs URL.");
+            }
+
+            const jobs = [];
+            const maximumJobPages = 60;
+            for (let page = 1; page <= maximumJobPages; page += 1) {
+              const pageUrl = new URL(jobsUrl);
+              pageUrl.searchParams.set("filter", "latest");
+              pageUrl.searchParams.set("per_page", "100");
+              pageUrl.searchParams.set("page", String(page));
+              const response = await fetch(pageUrl, {
+                method: "GET",
+                redirect: "error",
+                headers: {
+                  Accept: "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2026-03-10",
+                },
+              });
+              if (!response.ok) {
+                throw new Error(
+                  `Public workflow jobs request failed with status ${response.status}.`,
+                );
+              }
+              const payload = await response.json();
+              if (
+                !payload ||
+                !Number.isSafeInteger(payload.total_count) ||
+                payload.total_count < 0 ||
+                !Array.isArray(payload.jobs)
+              ) {
+                throw new Error("Public workflow jobs response is invalid.");
+              }
+              jobs.push(...payload.jobs);
+              if (
+                payload.jobs.length === 0 ||
+                payload.jobs.length < 100 ||
+                jobs.length >= payload.total_count
+              ) {
+                break;
+              }
+              if (page === maximumJobPages) {
+                throw new Error("Public workflow jobs pagination exceeded its bound.");
+              }
+            }
+
+            const failingJobs = jobs
+              .filter((job) => failureLikeConclusions.has(job.conclusion))
+              .map((job) => ({
+                name: markdown(job.name),
+                conclusion: markdown(job.conclusion),
+                url: safeUrl(job.html_url),
+              }));
+            const failingJobLines =
+              failingJobs.length > 0
+                ? failingJobs.map(
+                    (job) =>
+                      `- ${job.name} — ${job.conclusion} — ${job.url}`,
+                  )
+                : [
+                    `- No failure-like job was returned by the public jobs API; workflow conclusion: ${markdown(run.conclusion)}.`,
+                  ];
+            const runUrl = safeUrl(run.html_url);
+            const title = oneLine(
+              `CI failure: ${run.name} on ${run.head_branch}`,
+            ).slice(0, 256);
+            const body = [
+              marker,
+              "",
+              "## CI failure",
+              "",
+              `- Workflow: ${markdown(run.name)}`,
+              `- Branch: ${markdown(run.head_branch)}`,
+              `- SHA: ${run.head_sha}`,
+              `- Conclusion: ${markdown(run.conclusion)}`,
+              `- Run URL: ${runUrl}`,
+              "",
+              "## Failing jobs",
+              ...failingJobLines,
+            ].join("\n");
+
+            const ensureLabel = async (name, color, description) => {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+                try {
+                  await github.rest.issues.createLabel({
+                    owner,
+                    repo,
+                    name,
+                    color,
+                    description,
+                  });
+                } catch (createError) {
+                  if (createError.status !== 422) {
+                    throw createError;
+                  }
+                }
+              }
+            };
+            const lifecycleLabels = ["agent:inbox", "ci-failure"];
+
+            if (!issue) {
+              await ensureLabel(
+                "agent:inbox",
+                "D4C5F9",
+                "Awaiting agent triage",
+              );
+              await ensureLabel(
+                "ci-failure",
+                "B60205",
+                "Tracked CI failure",
+              );
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body,
+                labels: lifecycleLabels,
+              });
+              issue = created.data;
+              return;
+            }
+
+            await closeDuplicates();
+            const reopening = issue.state !== "open";
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number: issue.number,
+              title,
+              body,
+              ...(reopening ? { state: "open" } : {}),
+            });
+            if (reopening) {
+              await ensureLabel(
+                "agent:inbox",
+                "D4C5F9",
+                "Awaiting agent triage",
+              );
+              await ensureLabel(
+                "ci-failure",
+                "B60205",
+                "Tracked CI failure",
+              );
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issue.number,
+                labels: lifecycleLabels,
+              });
+            }
