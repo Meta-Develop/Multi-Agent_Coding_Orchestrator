@@ -9,7 +9,7 @@ use crate::{
     llm::provider::Usage,
     supervise::{
         AgentRole, Finding, FindingSeverity, RoleModelSelection, RoleUsageObservation,
-        RoleUsageReport,
+        RoleUsageReport, UnavailableModelFallback,
     },
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -564,6 +564,8 @@ struct StrictRoleModelSelection {
     model: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    unavailable_model_fallback: UnavailableModelFallback,
 }
 
 impl From<StrictRoleModelSelection> for RoleModelSelection {
@@ -571,6 +573,7 @@ impl From<StrictRoleModelSelection> for RoleModelSelection {
         Self {
             model: selection.model,
             reasoning_effort: selection.reasoning_effort,
+            unavailable_model_fallback: selection.unavailable_model_fallback,
         }
     }
 }
@@ -1982,6 +1985,7 @@ fn role_name(role: AgentRole) -> &'static str {
         AgentRole::Supervisor => "supervisor",
         AgentRole::ChildOrchestrator => "child_orchestrator",
         AgentRole::Worker => "worker",
+        AgentRole::GateClassifier => "gate_classifier",
         AgentRole::Auditor => "auditor",
     }
 }
@@ -2042,6 +2046,7 @@ mod tests {
         RoleModelSelection {
             model: Some(model.to_string()),
             reasoning_effort: Some(reasoning_effort.to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         }
     }
 
@@ -2804,6 +2809,31 @@ mod tests {
             .validate()
             .expect_err("ambient model defaults are not reproducible");
         assert!(error.to_string().contains("explicitly name a model"));
+    }
+
+    #[test]
+    fn phase_a_profiles_account_for_gate_classifier_independently() {
+        let mut candidate = manifest();
+        candidate.profiles[0].role_models.insert(
+            AgentRole::GateClassifier,
+            model("classifier-balanced-v1", "high"),
+        );
+        candidate.profiles[1].role_models.insert(
+            AgentRole::GateClassifier,
+            model("classifier-economy-v1", "medium"),
+        );
+        candidate.validate().expect("classifier profiles validate");
+        let results = run_fake(&candidate, 34).expect("classifier fake results");
+        for run in &results.runs {
+            let classifier = &run.metrics.role_usage[&AgentRole::GateClassifier];
+            assert_eq!(classifier.observation, RoleUsageObservation::SyntheticFake);
+            assert!(classifier.usage.is_some());
+            assert!(classifier.cost_usd.is_some());
+            assert_eq!(
+                run.metrics.role_usage[&AgentRole::Worker].observation,
+                RoleUsageObservation::SyntheticFake
+            );
+        }
     }
 
     #[test]
