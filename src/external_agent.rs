@@ -35,6 +35,9 @@ const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const OUTPUT_TEE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const CODEX_MODEL_CATALOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CODEX_MODEL_CATALOG_MAX_MODELS: usize = 512;
+const CODEX_MODEL_SLUG_MAX_BYTES: usize = 256;
 const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
@@ -114,6 +117,39 @@ enum ExternalExecutionRuntime {
     Verified,
     #[cfg(test)]
     NonpublishableSimulation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexRuntimeModelCatalog {
+    slugs: BTreeSet<String>,
+}
+
+impl CodexRuntimeModelCatalog {
+    pub(crate) fn from_slugs(slugs: impl IntoIterator<Item = impl Into<String>>) -> Result<Self> {
+        let slugs = slugs.into_iter().map(Into::into).collect::<Vec<_>>();
+        if slugs.is_empty() {
+            bail!("Codex runtime model catalog must contain at least one model");
+        }
+        if slugs.len() > CODEX_MODEL_CATALOG_MAX_MODELS {
+            bail!(
+                "Codex runtime model catalog contains {} models, exceeding the {} model limit",
+                slugs.len(),
+                CODEX_MODEL_CATALOG_MAX_MODELS
+            );
+        }
+        let mut validated = BTreeSet::new();
+        for slug in slugs {
+            validate_codex_model_slug(&slug)?;
+            if !validated.insert(slug.clone()) {
+                bail!("Codex runtime model catalog contains duplicate slug '{slug}'");
+            }
+        }
+        Ok(Self { slugs: validated })
+    }
+
+    pub(crate) fn contains(&self, slug: &str) -> bool {
+        self.slugs.contains(slug)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1702,6 +1738,156 @@ fn parse_codex_version(text: &str) -> Option<(u64, u64, u64)> {
         let patch = components.next()?.parse().ok()?;
         components.next().is_none().then_some((major, minor, patch))
     })
+}
+
+pub(crate) fn load_codex_runtime_model_catalog(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<CodexRuntimeModelCatalog> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, cwd, timeout);
+        bail!("Codex runtime model catalog preflight is unsupported on this platform");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if program != Path::new("codex") {
+            bail!(
+                "Codex runtime model catalog preflight is restricted to the trusted system Codex executable; explicit custom executables receive no auth or provider network access"
+            );
+        }
+        if timeout.is_zero() {
+            bail!("Codex runtime model catalog preflight requires a positive timeout");
+        }
+        let resolved_program = resolve_external_program(program, cwd)
+            .context("failed to resolve trusted Codex for model catalog preflight")?;
+        let program_parent = resolved_program.parent().with_context(|| {
+            format!(
+                "trusted Codex executable has no parent: {}",
+                resolved_program.display()
+            )
+        })?;
+        let program_identity = external_program_identity(&resolved_program)
+            .context("failed to bind trusted Codex identity for model catalog preflight")?;
+        let auth = ValidatedCodexAuth::load()
+            .context("failed to validate Codex auth for model catalog preflight")?
+            .context(
+                "Codex runtime model catalog preflight requires a validated auth.json source",
+            )?;
+        auth.verify_source_unchanged()
+            .context("Codex auth changed before model catalog preflight")?;
+
+        let process_spec = ProcessSpec::direct(
+            "Codex runtime model catalog preflight",
+            &resolved_program,
+            ["debug", "models"],
+            cwd,
+            CODEX_MODEL_CATALOG_MAX_BYTES,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
+            ExternalAgentInvocation::CodexSupervisor,
+            ExternalProgramTrust::TrustedSystemCodex,
+        )))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(timeout))
+        .with_private_runtime_home(true)
+        .with_private_runtime_codex_home(true)
+        .with_private_runtime_file("auth.json", auth.bytes.clone())
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
+            ExternalCodexProfile::read_only(cwd).with_visible_read_only_root(program_parent),
+        ));
+
+        let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
+        let current_identity = external_program_identity(&resolved_program)
+            .context("failed to revalidate trusted Codex after model catalog preflight")?;
+        let auth_result = auth
+            .verify_source_unchanged()
+            .context("Codex auth changed during model catalog preflight");
+        if current_identity != program_identity {
+            bail!("trusted Codex executable changed during model catalog preflight");
+        }
+        auth_result?;
+        let output = process_result.context(
+            "Codex runtime model catalog preflight failed before a verified result was available",
+        )?;
+        if !output.safety_sensitive_succeeded() {
+            bail!(
+                "Codex runtime model catalog preflight failed closed: exit={:?}; timed_out={}; process_tree={:?}; side_effects={:?}; process_error_present={}",
+                output.status.and_then(|status| status.code()),
+                output.timed_out,
+                output.process_tree,
+                output.side_effects,
+                output.process_error.is_some()
+            );
+        }
+        if output.stdout.is_truncated() || output.stderr.is_truncated() {
+            bail!(
+                "Codex runtime model catalog preflight output exceeded the {} byte limit",
+                CODEX_MODEL_CATALOG_MAX_BYTES
+            );
+        }
+        parse_codex_runtime_model_catalog(output.stdout.as_bytes())
+    }
+}
+
+fn parse_codex_runtime_model_catalog(bytes: &[u8]) -> Result<CodexRuntimeModelCatalog> {
+    if bytes.is_empty() {
+        bail!("Codex runtime model catalog output was empty");
+    }
+    if bytes.len() > CODEX_MODEL_CATALOG_MAX_BYTES {
+        bail!(
+            "Codex runtime model catalog output exceeds the {} byte limit",
+            CODEX_MODEL_CATALOG_MAX_BYTES
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("Codex runtime model catalog is not valid JSON")?;
+    let object = value
+        .as_object()
+        .context("Codex runtime model catalog must be a JSON object")?;
+    let models = object
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .context("Codex runtime model catalog must contain a models array")?;
+    let mut slugs = Vec::with_capacity(models.len());
+    for (index, model) in models.iter().enumerate() {
+        let slug = model
+            .as_object()
+            .and_then(|model| model.get("slug"))
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| {
+                format!("Codex runtime model catalog entry {index} must contain a string slug")
+            })?;
+        slugs.push(slug.to_string());
+    }
+    CodexRuntimeModelCatalog::from_slugs(slugs)
+}
+
+fn validate_codex_model_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        bail!("Codex runtime model catalog contains an empty slug");
+    }
+    if slug.len() > CODEX_MODEL_SLUG_MAX_BYTES {
+        bail!(
+            "Codex runtime model slug exceeds the {} byte limit",
+            CODEX_MODEL_SLUG_MAX_BYTES
+        );
+    }
+    let mut bytes = slug.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !bytes.all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+        })
+    {
+        bail!(
+            "Codex runtime model slug must start with an ASCII alphanumeric character and contain only ASCII alphanumerics or - _ . / :"
+        );
+    }
+    Ok(())
 }
 
 fn external_program_trust(spec: &ExternalAgentCommand) -> ExternalProgramTrust {
@@ -3589,6 +3775,42 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
     use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
+
+    #[test]
+    fn codex_runtime_model_catalog_parser_is_bounded_unique_and_slug_strict() {
+        let catalog = parse_codex_runtime_model_catalog(
+            br#"{"models":[{"slug":"gpt-5.6-sol","visibility":"list"},{"slug":"provider/hidden:model_1","visibility":"hide"}]}"#,
+        )
+        .expect("valid runtime model catalog");
+        assert!(catalog.contains("gpt-5.6-sol"));
+        assert!(catalog.contains("provider/hidden:model_1"));
+        assert!(!catalog.contains("missing-model"));
+
+        for (fixture, expected) in [
+            (br#"{"models":[]}"#.as_slice(), "at least one model"),
+            (
+                br#"{"models":[{"slug":"same"},{"slug":"same"}]}"#.as_slice(),
+                "duplicate slug",
+            ),
+            (
+                br#"{"models":[{"slug":"bad slug"}]}"#.as_slice(),
+                "contain only ASCII",
+            ),
+            (
+                br#"{"models":[{"display_name":"missing"}]}"#.as_slice(),
+                "string slug",
+            ),
+            (br#"{"models":"not-an-array"}"#.as_slice(), "models array"),
+            (br#"not-json"#.as_slice(), "not valid JSON"),
+        ] {
+            let error =
+                parse_codex_runtime_model_catalog(fixture).expect_err("catalog must fail closed");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected error for {fixture:?}: {error:#}"
+            );
+        }
+    }
 
     #[derive(Default)]
     struct RecordingPreActionJournal {

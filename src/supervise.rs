@@ -8,7 +8,8 @@ use crate::{
         ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory, RunArtifactFamily,
     },
     external_agent::{
-        codex_usage_from_jsonl, run_external_agent_cancellable_reviewed, ExternalAgentCommand,
+        codex_usage_from_jsonl, load_codex_runtime_model_catalog,
+        run_external_agent_cancellable_reviewed, CodexRuntimeModelCatalog, ExternalAgentCommand,
         ExternalAgentRun, ExternalPreActionReviewRuntime, ExternalProgramTrust,
         PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
     },
@@ -98,10 +99,12 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
     "selected provisionally from deterministic fake phase-A evidence over a hand-authored plan; \
      no real-provider or isolated-repository comparison was observed, so this profile is \
      production-ineligible and must not be represented as evidence-backed production economics; \
-     live role-scoped model availability is not currently observable, so an explicit configured \
-     selection remains on the launched command until unavailability is actually known; only known \
-     unavailability applies the role's declared fallback";
+     before verified Codex dispatch, MACO resolves exact slug membership from one bounded, \
+     contained, authenticated runtime-advertised model catalog and applies each role's declared \
+     unavailable-model fallback; the upstream catalog may be cached when refresh fails, so \
+     membership is runtime-advertised availability rather than a fresh entitlement guarantee";
 const DEFAULT_PROFILE_MODEL: &str = "gpt-5.6-sol";
+const CODEX_MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
 const GITLINK_MODE: u32 = 0o160000;
 const PRIMARY_INDEX_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -328,6 +331,73 @@ pub enum RoleModelAvailability {
     Unknown,
     Available,
     Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeModelCatalog {
+    Codex(CodexRuntimeModelCatalog),
+    LocalDeterministicFake,
+}
+
+impl RuntimeModelCatalog {
+    fn for_supervisor(options: &SupervisorRunOptions, repo: &Path) -> Result<Self> {
+        match options.runtime {
+            SupervisorRuntime::Codex => load_codex_runtime_model_catalog(
+                &options.codex_bin,
+                repo,
+                CODEX_MODEL_CATALOG_TIMEOUT,
+            )
+            .map(Self::Codex)
+            .context(
+                "failed to acquire a verified runtime model catalog before supervisor dispatch",
+            ),
+            SupervisorRuntime::Fake => Ok(Self::LocalDeterministicFake),
+        }
+    }
+
+    fn availability(
+        &self,
+        model: Option<&str>,
+        runtime: SupervisorRuntime,
+    ) -> Result<RoleModelAvailability> {
+        let Some(model) = model else {
+            return Ok(RoleModelAvailability::Available);
+        };
+        match (self, runtime) {
+            (Self::Codex(catalog), SupervisorRuntime::Codex) => Ok(if catalog.contains(model) {
+                RoleModelAvailability::Available
+            } else {
+                RoleModelAvailability::Unavailable
+            }),
+            (Self::LocalDeterministicFake, SupervisorRuntime::Fake) => {
+                Ok(RoleModelAvailability::Unavailable)
+            }
+            (Self::Codex(_), SupervisorRuntime::Fake)
+            | (Self::LocalDeterministicFake, SupervisorRuntime::Codex) => {
+                bail!("runtime model catalog does not match the selected supervisor runtime")
+            }
+        }
+    }
+
+    fn profile_availability(
+        &self,
+        selections: impl IntoIterator<Item = RoleModelSelection>,
+    ) -> RoleModelAvailability {
+        match self {
+            Self::Codex(catalog) => {
+                if selections
+                    .into_iter()
+                    .filter_map(|selection| selection.model)
+                    .all(|model| catalog.contains(&model))
+                {
+                    RoleModelAvailability::Available
+                } else {
+                    RoleModelAvailability::Unavailable
+                }
+            }
+            Self::LocalDeterministicFake => RoleModelAvailability::Unavailable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1688,15 +1758,17 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
         );
     }
     let repo = discover_repo_root(&options.repo)?;
-    let manager = WorktreeManager::new(repo);
+    let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
     run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         max_concurrent_children,
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
         external_runner,
     )
 }
@@ -3087,6 +3159,16 @@ impl SupervisorPlan {
             role_models,
         }
     }
+
+    fn effective_role_economics_profile_for_runtime(
+        &self,
+        catalog: &RuntimeModelCatalog,
+    ) -> RoleEconomicsProfile {
+        let mut profile = self.effective_role_economics_profile();
+        profile.model_availability =
+            catalog.profile_availability(profile.role_models.values().cloned());
+        profile
+    }
 }
 
 fn apply_role_model_selection(
@@ -3094,11 +3176,11 @@ fn apply_role_model_selection(
     plan: &SupervisorPlan,
     role: AgentRole,
     runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
-    // The current runtime boundary does not expose a role-scoped, authenticated model catalog.
-    // Resolve conservatively from Unknown instead of treating a configured slug as observed.
-    let selection = effective_role_model_selection(plan, role)
-        .resolve_for_availability(RoleModelAvailability::Unknown, runtime)?;
+    let configured = effective_role_model_selection(plan, role);
+    let availability = catalog.availability(configured.model.as_deref(), runtime)?;
+    let selection = configured.resolve_for_availability(availability, runtime)?;
     Ok(command.with_model_selection(selection.model, selection.reasoning_effort))
 }
 
@@ -4515,6 +4597,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     semantic_block_gate: Option<&'a SemanticBlockGate>,
     artifacts: &'a Mutex<SharedSupervisorArtifacts<'writer>>,
     budget_ledger: &'a RunBudgetLedger,
+    runtime_model_catalog: &'a RuntimeModelCatalog,
     cancellation: ProcessCancellation,
     external_runner: &'a CancellableExternalRunner<'a>,
 }
@@ -4975,6 +5058,7 @@ fn execute_supervisor_assignment_inner(
         semantic_block_gate,
         artifacts,
         budget_ledger,
+        runtime_model_catalog,
         cancellation,
         external_runner,
     } = context;
@@ -5453,7 +5537,13 @@ fn execute_supervisor_assignment_inner(
                 &attempt_artifacts.report_path,
                 Duration::from_secs(plan.child_timeout_seconds),
             );
-            command = apply_role_model_selection(command, plan, assignment.role, options.runtime)?;
+            command = apply_role_model_selection(
+                command,
+                plan,
+                assignment.role,
+                options.runtime,
+                runtime_model_catalog,
+            )?;
             command.output_schema = Some(schema_path.clone());
             command = command.with_hidden_root(repo).with_agent_lifecycle(
                 repo,
@@ -6171,6 +6261,7 @@ fn execute_supervisor_assignment_inner(
                 plan,
                 AgentRole::Auditor,
                 options.runtime,
+                runtime_model_catalog,
             )?;
             auditor_command.output_schema = Some(auditor_schema_path);
             auditor_command = configure_read_only_auditor_command(auditor_command)?
@@ -6762,6 +6853,29 @@ fn prepare_semantic_warn_assignments(
 }
 
 #[cfg(test)]
+fn test_runtime_model_catalog(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+) -> Result<RuntimeModelCatalog> {
+    match runtime {
+        SupervisorRuntime::Codex => CodexRuntimeModelCatalog::from_slugs(
+            [
+                AgentRole::Supervisor,
+                AgentRole::ChildOrchestrator,
+                AgentRole::Worker,
+                AgentRole::GateClassifier,
+                AgentRole::Auditor,
+            ]
+            .into_iter()
+            .filter_map(|role| effective_role_model_selection(plan, role).model)
+            .collect::<BTreeSet<_>>(),
+        )
+        .map(RuntimeModelCatalog::Codex),
+        SupervisorRuntime::Fake => Ok(RuntimeModelCatalog::LocalDeterministicFake),
+    }
+}
+
+#[cfg(test)]
 fn run_supervisor_plan_with_runner(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
@@ -6788,6 +6902,48 @@ fn run_supervisor_plan_with_budget_and_runner(
     execution_runtime: SupervisorExecutionRuntime,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
+    let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
+    run_supervisor_plan_with_budget_catalog_and_runner(
+        plan,
+        consultant,
+        run_budget,
+        options,
+        execution_runtime,
+        Ok(runtime_model_catalog),
+        external_runner,
+    )
+}
+
+#[cfg(test)]
+fn run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    runtime_model_catalog: Result<RuntimeModelCatalog>,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    run_supervisor_plan_with_budget_catalog_and_runner(
+        plan,
+        consultant,
+        SupervisorBudgetConfig::default(),
+        options,
+        execution_runtime,
+        runtime_model_catalog,
+        external_runner,
+    )
+}
+
+#[cfg(test)]
+fn run_supervisor_plan_with_budget_catalog_and_runner(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    run_budget: SupervisorBudgetConfig,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    runtime_model_catalog: Result<RuntimeModelCatalog>,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
     let serialized_runner = Mutex::new(external_runner);
     run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
@@ -6803,6 +6959,7 @@ fn run_supervisor_plan_with_budget_and_runner(
         1,
         execution_runtime,
         SupervisorWorktreeCreation::TestOnly,
+        runtime_model_catalog,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
@@ -6837,6 +6994,7 @@ fn run_supervisor_plan_with_budget_and_concurrent_runner(
     max_concurrent_children: usize,
     external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
 ) -> Result<SupervisorFinalReport> {
+    let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
     run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
@@ -6851,6 +7009,7 @@ fn run_supervisor_plan_with_budget_and_concurrent_runner(
         max_concurrent_children,
         SupervisorExecutionRuntime::NonpublishableSimulation,
         SupervisorWorktreeCreation::TestOnly,
+        Ok(runtime_model_catalog),
         &|command, _cancellation, _review_runtime| external_runner(command),
     )
 }
@@ -6863,6 +7022,7 @@ fn run_supervisor_plan_with_concurrent_cancellable_runner(
     max_concurrent_children: usize,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
+    let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
     run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
@@ -6874,6 +7034,7 @@ fn run_supervisor_plan_with_concurrent_cancellable_runner(
         max_concurrent_children,
         SupervisorExecutionRuntime::NonpublishableSimulation,
         SupervisorWorktreeCreation::TestOnly,
+        Ok(runtime_model_catalog),
         external_runner,
     )
 }
@@ -6884,6 +7045,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
+    runtime_model_catalog: Result<RuntimeModelCatalog>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     let LoadedSupervisorPlan {
@@ -6892,6 +7054,9 @@ fn run_supervisor_plan_with_runner_and_creation(
         assignment_metadata,
         plan_metadata,
     } = loaded;
+    let runtime_model_catalog = runtime_model_catalog.context(
+        "runtime model availability could not be established; refusing supervisor dispatch",
+    )?;
     validate_max_concurrent_children(max_concurrent_children)?;
     let budget_ledger = RunBudgetLedger::new(plan_metadata.run_budget.limits)
         .context("failed to initialize the supervise run budget ledger")?;
@@ -7128,6 +7293,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                         semantic_block_gate: None,
                         artifacts: &shared_artifacts,
                         budget_ledger: &budget_ledger,
+                        runtime_model_catalog: &runtime_model_catalog,
                         cancellation: cancellation.clone(),
                         external_runner,
                     });
@@ -7191,6 +7357,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                     let semantic_block_gate_ref = &semantic_block_gate;
                     let artifacts_ref = &shared_artifacts;
                     let budget_ledger_ref = &budget_ledger;
+                    let runtime_model_catalog_ref = &runtime_model_catalog;
                     let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
                     let mut pending = (0..plan.assignments.len()).collect::<BTreeSet<_>>();
                     let mut active = BTreeMap::new();
@@ -7301,6 +7468,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                                                 .map(|_| semantic_block_gate_ref),
                                             artifacts: artifacts_ref,
                                             budget_ledger: budget_ledger_ref,
+                                            runtime_model_catalog: runtime_model_catalog_ref,
                                             cancellation: assignment_cancellation,
                                             external_runner,
                                         })
@@ -7696,7 +7864,9 @@ fn run_supervisor_plan_with_runner_and_creation(
             .iter()
             .map(|intent| intent.token.get())
             .collect(),
-        role_economics_profile: Some(plan.effective_role_economics_profile()),
+        role_economics_profile: Some(
+            plan.effective_role_economics_profile_for_runtime(&runtime_model_catalog),
+        ),
         run_budget: run_budget_report,
         role_usage,
         total_usage,
@@ -13652,6 +13822,13 @@ mod tests {
     };
     use std::time::Instant;
 
+    fn injected_codex_runtime_catalog(slugs: &[&str]) -> RuntimeModelCatalog {
+        RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(slugs.iter().copied())
+                .expect("valid injected Codex runtime model catalog"),
+        )
+    }
+
     #[cfg(unix)]
     fn mandatory_control_test_workspace() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().expect("temporary mandatory-control workspace");
@@ -15192,20 +15369,24 @@ mod tests {
                 Duration::from_secs(1),
             )
         };
+        let catalog =
+            injected_codex_runtime_catalog(&["planner-model", "worker-model", "auditor-model"]);
         let child = apply_role_model_selection(
             base_command(),
             &plan,
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
+            &catalog,
         )
-        .expect("unknown availability preserves the configured child selection");
+        .expect("runtime catalog contains the configured child selection");
         let auditor = apply_role_model_selection(
             base_command(),
             &plan,
             AgentRole::Auditor,
             SupervisorRuntime::Codex,
+            &catalog,
         )
-        .expect("unknown availability preserves the configured auditor selection");
+        .expect("runtime catalog contains the configured auditor selection");
         let child_argv = crate::external_agent::command_argv(&child)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -15282,11 +15463,18 @@ mod tests {
                 Duration::from_secs(1),
             )
         };
+        let catalog = injected_codex_runtime_catalog(&[DEFAULT_PROFILE_MODEL]);
+        let runtime_profile = plan.effective_role_economics_profile_for_runtime(&catalog);
+        assert_eq!(
+            runtime_profile.model_availability,
+            RoleModelAvailability::Available
+        );
         let child = apply_role_model_selection(
             base_command(),
             &plan,
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
+            &catalog,
         )
         .expect("apply no-override child selection");
         let child_argv = crate::external_agent::app_server_command_argv(&child)
@@ -15308,6 +15496,7 @@ mod tests {
             &plan,
             AgentRole::Auditor,
             SupervisorRuntime::Codex,
+            &catalog,
         )
         .expect("apply no-override auditor selection");
         let auditor_argv = crate::external_agent::command_argv(&auditor)
@@ -15401,43 +15590,31 @@ mod tests {
                 Duration::from_secs(1),
             )
         };
+        let missing_catalog = injected_codex_runtime_catalog(&["different-model"]);
 
-        let unknown_runtime_default = apply_role_model_selection(
+        let runtime_default = apply_role_model_selection(
             base_command(),
             &plan,
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
+            &missing_catalog,
         )
-        .expect("unknown availability preserves the configured selection");
-        assert_eq!(
-            unknown_runtime_default.model.as_deref(),
-            Some("preferred-model")
-        );
-        assert_eq!(
-            unknown_runtime_default.reasoning_effort.as_deref(),
-            Some("high")
-        );
-
-        let unavailable = plan.role_models[&AgentRole::ChildOrchestrator]
-            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex)
-            .expect("known unavailable model uses the configured runtime default");
-        assert_eq!(unavailable.model, None);
-        assert_eq!(unavailable.reasoning_effort.as_deref(), Some("high"));
+        .expect("known unavailable model uses the configured runtime default");
+        assert_eq!(runtime_default.model, None);
+        assert_eq!(runtime_default.reasoning_effort.as_deref(), Some("high"));
 
         plan.role_models
             .get_mut(&AgentRole::ChildOrchestrator)
             .expect("child selection")
             .unavailable_model_fallback = UnavailableModelFallback::FailClosed;
-        apply_role_model_selection(
+        let fail_closed_error = apply_role_model_selection(
             base_command(),
             &plan,
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
+            &missing_catalog,
         )
-        .expect("fail_closed does not reject unknown availability");
-        let fail_closed_error = plan.role_models[&AgentRole::ChildOrchestrator]
-            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex)
-            .expect_err("fail_closed rejects observed unavailability");
+        .expect_err("fail_closed rejects runtime-advertised unavailability");
         assert!(format!("{fail_closed_error:#}").contains("fallback is fail_closed"));
 
         plan.role_models
@@ -15449,22 +15626,239 @@ mod tests {
             &plan,
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Fake,
+            &RuntimeModelCatalog::LocalDeterministicFake,
         )
         .expect("the fake runtime may use its deterministic local fallback");
         assert_eq!(local_fake.model, None);
-        let unknown_codex = apply_role_model_selection(
+        let invalid_runtime_error = apply_role_model_selection(
             base_command(),
             &plan,
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
+            &missing_catalog,
         )
-        .expect("unknown Codex availability preserves the configured selection");
-        assert_eq!(unknown_codex.model.as_deref(), Some("preferred-model"));
-        assert_eq!(unknown_codex.reasoning_effort.as_deref(), Some("high"));
-        let invalid_runtime_error = plan.role_models[&AgentRole::ChildOrchestrator]
-            .resolve_for_availability(RoleModelAvailability::Unavailable, SupervisorRuntime::Codex)
-            .expect_err("known-unavailable Codex cannot use the deterministic local fallback");
+        .expect_err("known-unavailable Codex cannot use the deterministic local fallback");
         assert!(format!("{invalid_runtime_error:#}").contains("valid only for the fake runtime"));
+    }
+
+    #[test]
+    fn known_unavailable_child_runtime_default_reaches_production_app_server_argv_before_dispatch()
+    {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("unavailable-child-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            },
+        );
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            RoleModelSelection {
+                model: Some("available-auditor-model".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            },
+        );
+        let options = injected_options(
+            &repo_path,
+            temp.path(),
+            "known-unavailable-child-runtime-default",
+        );
+        let catalog = injected_codex_runtime_catalog(&["available-auditor-model"]);
+        let mut child_seen = false;
+        let mut auditor_seen = false;
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if name.contains("review-auditor") {
+                auditor_seen = true;
+                assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+                let argv = crate::external_agent::command_argv(command)
+                    .into_iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                assert!(argv
+                    .windows(2)
+                    .any(|arguments| arguments == ["-m", "available-auditor-model"]));
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+            } else {
+                child_seen = true;
+                assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
+                assert!(command.model.is_none());
+                let argv = crate::external_agent::app_server_command_argv(command)
+                    .into_iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !argv.iter().any(|argument| argument.starts_with("model=")),
+                    "known-unavailable child model remained pinned in app-server argv: {argv:?}"
+                );
+                assert!(argv
+                    .windows(2)
+                    .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"high\""] }));
+                write_injected_assignment_report(command, &assignment);
+            }
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            Ok(catalog),
+            &mut runner,
+        )
+        .expect("run production command path with unavailable child model");
+
+        drop(runner);
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert!(child_seen);
+        assert!(auditor_seen);
+        assert_eq!(
+            report
+                .role_economics_profile
+                .as_ref()
+                .map(|profile| profile.model_availability),
+            Some(RoleModelAvailability::Unavailable)
+        );
+    }
+
+    #[test]
+    fn known_unavailable_auditor_runtime_default_reaches_production_exec_argv_before_dispatch() {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("available-child-model".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            },
+        );
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            RoleModelSelection {
+                model: Some("unavailable-auditor-model".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+            },
+        );
+        let options = injected_options(
+            &repo_path,
+            temp.path(),
+            "known-unavailable-auditor-runtime-default",
+        );
+        let catalog = injected_codex_runtime_catalog(&["available-child-model"]);
+        let mut child_seen = false;
+        let mut auditor_seen = false;
+        let mut runner = |command: &ExternalAgentCommand| {
+            let name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if name.contains("review-auditor") {
+                auditor_seen = true;
+                assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+                assert!(command.model.is_none());
+                let argv = crate::external_agent::command_argv(command)
+                    .into_iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !argv.iter().any(|argument| argument == "-m"),
+                    "known-unavailable auditor model remained pinned in exec argv: {argv:?}"
+                );
+                assert!(argv
+                    .windows(2)
+                    .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+            } else {
+                child_seen = true;
+                assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
+                let argv = crate::external_agent::app_server_command_argv(command)
+                    .into_iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                assert!(argv
+                    .windows(2)
+                    .any(|arguments| { arguments == ["-c", "model=\"available-child-model\""] }));
+                write_injected_assignment_report(command, &assignment);
+            }
+            injected_verified_run(command)
+        };
+
+        let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            Ok(catalog),
+            &mut runner,
+        )
+        .expect("run production command path with unavailable auditor model");
+
+        drop(runner);
+        assert!(report.success, "unexpected failed report: {report:#?}");
+        assert!(child_seen);
+        assert!(auditor_seen);
+        assert_eq!(
+            report
+                .role_economics_profile
+                .as_ref()
+                .map(|profile| profile.model_availability),
+            Some(RoleModelAvailability::Unavailable)
+        );
+    }
+
+    #[test]
+    fn model_catalog_failure_fails_closed_before_any_production_dispatch() {
+        let (temp, repo_path) = injected_repository();
+        let plan = injected_plan(injected_assignment(true), 0);
+        let options = injected_options(
+            &repo_path,
+            temp.path(),
+            "model-catalog-failure-before-dispatch",
+        );
+        let mut invocations = 0usize;
+        let mut runner = |_command: &ExternalAgentCommand| {
+            invocations = invocations.saturating_add(1);
+            panic!("catalog acquisition failure must prevent assignment dispatch")
+        };
+
+        let error = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            Err(anyhow!("injected catalog acquisition failure")),
+            &mut runner,
+        )
+        .expect_err("missing catalog must fail closed");
+
+        drop(runner);
+        assert_eq!(invocations, 0);
+        assert!(
+            format!("{error:#}").contains("runtime model availability could not be established")
+        );
+        assert!(format!("{error:#}").contains("injected catalog acquisition failure"));
     }
 
     #[test]

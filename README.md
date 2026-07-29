@@ -929,18 +929,33 @@ the running supervisor launches itself. The `gate_classifier` entry currently
 has only the deterministic-fake evaluation boundary described above; Issue
 #28's writable production gate remains deferred.
 
-The current Codex runtime boundary has no authenticated role-scoped
-model-availability catalog, so availability is `unknown`. Unknown availability
-preserves the configured model and effort in command argv. An unsupported slug
-can therefore fail when Codex launches it; MACO does not silently clear the
-selection, retry with an ambient default, or cycle through model names.
-Fallbacks apply only after unavailability is actually known:
+Before a verified Codex run schedules any assignment, MACO invokes the trusted
+system Codex CLI's non-bundled `codex debug models` command exactly once. The
+preflight requires a validated `auth.json`, runs in the contained parent-Codex
+network profile with a private `HOME` and `CODEX_HOME`, bounds and validates the
+JSON catalog, and rechecks both the auth source and executable identity after
+the command. Explicit custom executables never receive auth or provider network
+access. Missing auth, a failed/nonzero command, unsafe containment, truncated or
+malformed output, an empty catalog, duplicate slugs, or invalid slug syntax
+fails closed before any child or auditor dispatch.
+
+Exact slug membership in that immutable per-run catalog determines availability
+for child and auditor command construction. A present slug remains explicit in
+argv. An absent slug is `unavailable`, so the configured fallback is applied
+before budget reservation and spawn-event dispatch:
 
 | Configured fallback | Known-unavailable behavior |
 | --- | --- |
 | `runtime_default` | Clear the explicit model while preserving the configured reasoning effort, allowing the runtime to choose its default model. |
 | `fail_closed` | Refuse the selection rather than dispatch with another model. |
 | `local_deterministic_fake` | Use the deterministic local fallback only with the Fake runtime; reject it for Codex. |
+
+The Fake runtime performs no catalog command and treats configured provider
+models as unavailable, so its declared local fallback remains local. The Codex
+CLI can return an in-memory or cached catalog when an online refresh fails;
+therefore membership is runtime-advertised availability at preflight time, not
+proof of a fresh entitlement check or a guarantee that a later provider launch
+will succeed. MACO does not retry by cycling model names.
 
 This default is operationally selected, but it is not an evidence-backed
 production recommendation. Its source remains provisional deterministic-fake
