@@ -1282,6 +1282,71 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_settlement_latch_survives_later_success_of_already_admitted_dispatch() {
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            soft_tokens: Some(500),
+            hard_tokens: Some(1_000),
+            soft_cost_usd: Some(5.0),
+            hard_cost_usd: Some(10.0),
+        })
+        .expect("ledger");
+        let uncertain =
+            admitted_reservation(ledger.reserve(request(200, Some(2.0))).expect("reserve A"));
+        let later_success =
+            admitted_reservation(ledger.reserve(request(200, Some(2.0))).expect("reserve B"));
+
+        let uncertain_reconciliation = ledger
+            .reconcile(
+                uncertain.id,
+                UsageMeasurement::Estimated {
+                    tokens: 100,
+                    cost_usd: Some(1.0),
+                },
+            )
+            .expect("reconcile A");
+        assert!(!uncertain_reconciliation.report.new_dispatch_allowed);
+        assert_eq!(
+            uncertain_reconciliation.report.action,
+            BudgetAction::OwnerEscalation
+        );
+
+        let successful_reconciliation = ledger
+            .reconcile(
+                later_success.id,
+                UsageMeasurement::Reliable {
+                    tokens: 100,
+                    cost_usd: Some(1.0),
+                },
+            )
+            .expect("reconcile B");
+        assert_eq!(successful_reconciliation.report.active_reservations, 0);
+        assert_eq!(
+            successful_reconciliation.report.reserved,
+            BudgetAmount {
+                tokens: 0,
+                cost_usd: Some(0.0),
+            }
+        );
+        assert!(!successful_reconciliation.report.new_dispatch_allowed);
+        assert_eq!(
+            successful_reconciliation.report.action,
+            BudgetAction::OwnerEscalation
+        );
+        assert!(successful_reconciliation
+            .report
+            .reasons
+            .contains(&BudgetReason::EstimatedProviderUsage));
+
+        assert!(matches!(
+            ledger.reserve(request(1, Some(0.01))).expect("refuse C"),
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::NewDispatchStopped,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn reliable_tokens_with_missing_actual_cost_stop_cost_enforcement() {
         let ledger = RunBudgetLedger::new(RunBudgetLimits {
             soft_tokens: Some(500),
