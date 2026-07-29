@@ -4622,7 +4622,8 @@ impl DispatchBudgetReservation<'_> {
             let (measurement, reliability) = match usage {
                 Some(usage)
                     if external_process_completed(run)
-                        && external_safety_verified(run, runtime) =>
+                        && external_safety_verified(run, runtime)
+                        && !run.stdout.truncated =>
                 {
                     (
                         UsageMeasurement::Reliable {
@@ -23331,6 +23332,82 @@ mod tests {
         assert_eq!(report.consumed.cost_usd, None);
         assert!(!report.usage_complete);
         assert!(!report.new_dispatch_allowed);
+        assert!(report
+            .reasons
+            .contains(&BudgetReason::EstimatedProviderUsage));
+        assert!(matches!(
+            reserve_dispatch_budget(
+                &plan,
+                &budget,
+                &ledger,
+                AgentRole::ChildOrchestrator,
+                &command,
+            )
+            .expect("later admission result"),
+            DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::NewDispatchStopped)
+        ));
+    }
+
+    #[test]
+    fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
+        let assignment = injected_assignment(false);
+        let mut plan = injected_plan(assignment, 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
+        let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        let temp = tempfile::tempdir().expect("truncated capture command root");
+        let mut command = ExternalAgentCommand::codex(
+            "codex",
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("capture.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(1),
+        );
+        command.model = Some("priced-model".to_string());
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            AgentRole::ChildOrchestrator,
+            &command,
+        )
+        .expect("reserve truncated-capture dispatch")
+        {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                panic!("unexpected budget refusal: {refusal:?}")
+            }
+        };
+        reservation
+            .mark_invoked()
+            .expect("mark truncated-capture dispatch invoked");
+        write_injected_usage(&command, 7, 3);
+        let mut run = injected_verified_run_without_journals(&command);
+        run.stdout.truncated = true;
+        assert!(external_process_completed(&run));
+        assert!(external_safety_verified(&run, SupervisorRuntime::Codex));
+        assert_eq!(
+            complete_external_codex_usage(&run, &command).map(|usage| usage.total_tokens),
+            Some(10)
+        );
+
+        let settlement = reservation
+            .settle(&run, SupervisorRuntime::Codex, &command)
+            .expect("reconcile truncated-capture dispatch");
+        assert_eq!(
+            settlement.observed_usage.map(|usage| usage.total_tokens),
+            Some(10)
+        );
+        assert_eq!(settlement.reliability, DispatchUsageReliability::Estimated);
+
+        let report = ledger.report().expect("truncated-capture budget report");
+        assert_eq!(report.consumed.tokens, 50);
+        assert_eq!(report.committed.tokens, 50);
+        assert_eq!(report.consumed.cost_usd, None);
+        assert!(!report.usage_complete);
+        assert!(!report.new_dispatch_allowed);
+        assert_eq!(report.action, BudgetAction::OwnerEscalation);
         assert!(report
             .reasons
             .contains(&BudgetReason::EstimatedProviderUsage));
