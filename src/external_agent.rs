@@ -1068,13 +1068,11 @@ fn run_external_agent_runtime(
 ) -> ExternalAgentRun {
     let started = Instant::now();
     if cancellation.is_cancelled() {
-        return failed_external_environment_run(
+        return failed_external_run(
             spec,
             started,
             command_display(&spec.program, &[]),
             false,
-            EnvironmentFailureCategory::ProbeFailed,
-            None,
             "external agent was cancelled before executable preflight".to_string(),
         );
     }
@@ -1149,13 +1147,11 @@ fn run_external_agent_runtime(
     if spec.workspace_access == WorkspaceAccess::ReadOnly
         && !spec.worktree_control_exceptions.is_empty()
     {
-        return failed_external_environment_run(
+        return failed_external_run(
             spec,
             started,
             command_display(&resolved_program, &[]),
             false,
-            EnvironmentFailureCategory::ProbeFailed,
-            None,
             "read-only external agents may not declare writable control exceptions".to_string(),
         );
     }
@@ -1178,13 +1174,11 @@ fn run_external_agent_runtime(
     let mut output_staging = match ExternalOutputStaging::create(&spec.cwd) {
         Ok(staging) => staging,
         Err(error) => {
-            return failed_external_environment_run(
+            return failed_external_run(
                 spec,
                 started,
                 command_display(&resolved_program, &[]),
                 false,
-                EnvironmentFailureCategory::ProbeFailed,
-                None,
                 format!("failed to prepare private external-agent output staging: {error}"),
             );
         }
@@ -1193,13 +1187,11 @@ fn run_external_agent_runtime(
     target_spec.output_last_message = match output_staging.path() {
         Ok(path) => path.to_path_buf(),
         Err(error) => {
-            return failed_external_environment_run(
+            return failed_external_run(
                 spec,
                 started,
                 command_display(&resolved_program, &[]),
                 false,
-                EnvironmentFailureCategory::ProbeFailed,
-                None,
                 format!("private external-agent output staging became unavailable: {error:#}"),
             );
         }
@@ -1245,13 +1237,11 @@ fn run_external_agent_runtime(
     let argv_digest = match argv_digest(&argv) {
         Ok(digest) => digest,
         Err(error) => {
-            return failed_external_environment_run(
+            return failed_external_run(
                 spec,
                 started,
                 command_display(&resolved_program, &argv),
                 false,
-                EnvironmentFailureCategory::ProbeFailed,
-                None,
                 format!("failed to bind external-agent permission evidence to argv: {error}"),
             );
         }
@@ -1287,10 +1277,8 @@ fn run_external_agent_runtime(
             Ok(metadata) => Some(metadata),
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
-                record_environment_failure(
+                record_external_error(
                     &mut report,
-                    EnvironmentFailureCategory::ProbeFailed,
-                    None,
                     format!("failed to prepare external-agent lifecycle identity: {error:#}"),
                 );
                 return report;
@@ -1368,10 +1356,8 @@ fn run_external_agent_runtime(
 
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
-        record_environment_failure(
+        record_external_error(
             &mut report,
-            EnvironmentFailureCategory::ProbeFailed,
-            None,
             "external agent was cancelled before target setup".to_string(),
         );
         return report;
@@ -1420,12 +1406,7 @@ fn run_external_agent_runtime(
         .and_then(|_| ensure_safe_read_target(&spec.prompt))
     {
         report.duration_ms = duration_millis(started.elapsed());
-        record_environment_failure(
-            &mut report,
-            EnvironmentFailureCategory::ProbeFailed,
-            None,
-            error.to_string(),
-        );
+        record_external_error(&mut report, error.to_string());
         return report;
     }
 
@@ -1433,10 +1414,8 @@ fn run_external_agent_runtime(
         Ok(reservation) => reservation,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
-            record_environment_failure(
+            record_external_error(
                 &mut report,
-                EnvironmentFailureCategory::ProbeFailed,
-                None,
                 format!("failed to reserve external-agent output: {error}"),
             );
             return report;
@@ -1447,10 +1426,8 @@ fn run_external_agent_runtime(
         Ok(prompt) => prompt,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
-            record_environment_failure(
+            record_external_error(
                 &mut report,
-                EnvironmentFailureCategory::ProbeFailed,
-                None,
                 format!(
                     "failed to read prompt file {}: {error}",
                     spec.prompt.display()
@@ -1464,10 +1441,8 @@ fn run_external_agent_runtime(
             Ok(prompt) => Some(prompt),
             Err(_) => {
                 report.duration_ms = duration_millis(started.elapsed());
-                record_environment_failure(
+                record_external_error(
                     &mut report,
-                    EnvironmentFailureCategory::ProbeFailed,
-                    None,
                     "writable Codex app-server prompt is not valid UTF-8".to_string(),
                 );
                 return report;
@@ -1562,12 +1537,8 @@ fn run_external_agent_runtime(
             Ok(redactor) => redactor,
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
-                record_environment_failure(
+                record_external_error(
                     &mut report,
-                    EnvironmentFailureCategory::ProbeFailed,
-                    Some(EnvironmentRequirement::configuration(
-                        EnvironmentConfiguration::CodexAuthFile,
-                    )),
                     format!("failed to prepare bounded credential redaction: {error:#}"),
                 );
                 return report;
@@ -1658,10 +1629,8 @@ fn run_external_agent_runtime(
         Ok(reservation) => reservation,
         Err(error) => {
             report.duration_ms = duration_millis(started.elapsed());
-            record_environment_failure(
+            record_external_error(
                 &mut report,
-                EnvironmentFailureCategory::ProbeFailed,
-                None,
                 format!("failed to reserve external-agent JSON log: {error}"),
             );
             return report;
@@ -1720,10 +1689,8 @@ fn run_external_agent_runtime(
 
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
-        record_environment_failure(
+        record_external_error(
             &mut report,
-            EnvironmentFailureCategory::ProbeFailed,
-            None,
             "external agent was cancelled before target start".to_string(),
         );
         return report;
@@ -1748,10 +1715,8 @@ fn run_external_agent_runtime(
     let process_result = if duplex_review_required {
         let Some(prompt) = duplex_prompt else {
             report.duration_ms = duration_millis(started.elapsed());
-            record_environment_failure(
+            record_external_error(
                 &mut report,
-                EnvironmentFailureCategory::ProbeFailed,
-                None,
                 "writable Codex duplex prompt was unavailable".to_string(),
             );
             return report;
@@ -1855,28 +1820,7 @@ fn run_external_agent_runtime(
         Ok(()) => {}
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
-            let preparation_failure = match &error {
-                ProcessRunError::ContainmentUnavailable { .. }
-                | ProcessRunError::ProcessOwnership { .. } => Some((
-                    EnvironmentFailureCategory::SandboxUnavailable,
-                    Some(EnvironmentRequirement::sandbox(
-                        EnvironmentSandboxCapability::VerifiedExternalCodex,
-                    )),
-                )),
-                ProcessRunError::OpenTee { .. }
-                | ProcessRunError::TeeConflict { .. }
-                | ProcessRunError::Spawn { .. }
-                | ProcessRunError::SetupTimeout { .. }
-                | ProcessRunError::IoSetup { .. }
-                | ProcessRunError::StdinTooLarge { .. }
-                | ProcessRunError::Cancelled { evidence: None, .. } => {
-                    Some((EnvironmentFailureCategory::ProbeFailed, None))
-                }
-                ProcessRunError::Cancelled {
-                    evidence: Some(_), ..
-                }
-                | ProcessRunError::Wait { .. } => None,
-            };
+            let preparation_failure = target_process_environment_failure(&error);
             if let Some((category, requirement)) = preparation_failure {
                 if process_run_error_definitely_before_process_start(&error) {
                     report.stdout.target_launch_attempted = false;
@@ -2727,6 +2671,28 @@ fn process_run_error_definitely_before_process_start(error: &ProcessRunError) ->
     )
 }
 
+fn target_process_environment_failure(
+    error: &ProcessRunError,
+) -> Option<(EnvironmentFailureCategory, Option<EnvironmentRequirement>)> {
+    match error {
+        ProcessRunError::ContainmentUnavailable { .. }
+        | ProcessRunError::ProcessOwnership { .. } => Some((
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(EnvironmentRequirement::sandbox(
+                EnvironmentSandboxCapability::VerifiedExternalCodex,
+            )),
+        )),
+        ProcessRunError::Cancelled { .. }
+        | ProcessRunError::OpenTee { .. }
+        | ProcessRunError::TeeConflict { .. }
+        | ProcessRunError::Spawn { .. }
+        | ProcessRunError::SetupTimeout { .. }
+        | ProcessRunError::Wait { .. }
+        | ProcessRunError::IoSetup { .. }
+        | ProcessRunError::StdinTooLarge { .. } => None,
+    }
+}
+
 fn retain_environment_preflight_process_evidence(
     report: &mut ExternalAgentRun,
     evidence: &EnvironmentPreflightProcessEvidence,
@@ -3519,6 +3485,10 @@ fn record_environment_failure(
         .run_metadata
         .environment_failures
         .push(environment_failure(category, requirement, summary));
+}
+
+fn record_external_error(report: &mut ExternalAgentRun, summary: String) {
+    report.error = Some(summary);
 }
 
 fn environment_blocked_message(failures: &[EnvironmentFailure]) -> String {
@@ -6426,6 +6396,39 @@ else:
     }
 
     #[test]
+    fn target_process_classification_types_only_environment_capability_failures() {
+        let setup_timeout = ProcessRunError::SetupTimeout {
+            label: "external agent".to_string(),
+            command: "codex exec".to_string(),
+            phase: "target setup",
+            source: std::io::Error::other("injected setup timeout"),
+        };
+        let cancellation = ProcessRunError::Cancelled {
+            label: "external agent".to_string(),
+            command: "codex exec".to_string(),
+            phase: "target runtime",
+            evidence: None,
+        };
+        let containment = ProcessRunError::ContainmentUnavailable {
+            label: "external agent".to_string(),
+            command: "codex exec".to_string(),
+            source: std::io::Error::other("injected containment refusal"),
+        };
+
+        assert_eq!(target_process_environment_failure(&setup_timeout), None);
+        assert_eq!(target_process_environment_failure(&cancellation), None);
+        assert_eq!(
+            target_process_environment_failure(&containment),
+            Some((
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalCodex,
+                )),
+            ))
+        );
+    }
+
+    #[test]
     fn environment_preflight_wire_is_presence_only_and_backward_compatible() -> Result<()> {
         let secret = "DO_NOT_SERIALIZE_environment_secret";
         let environment = BTreeMap::from([("OPENAI_API_KEY".to_string(), secret.to_string())]);
@@ -7348,6 +7351,7 @@ else:
         assert!(!report.publishable);
         assert!(!report.safely_executed());
         assert!(!report.succeeded());
+        assert!(!report.environment_blocked());
         Ok(())
     }
 
@@ -8588,7 +8592,7 @@ else:
 
     #[cfg(unix)]
     #[test]
-    fn setup_timeout_is_reported_as_timed_out_without_starting_external_agent() -> Result<()> {
+    fn version_preflight_setup_timeout_is_typed_and_retains_containment_evidence() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir()?;
@@ -8618,13 +8622,105 @@ else:
 
         assert!(report.timed_out);
         assert_eq!(report.exit_code, None);
-        assert_eq!(report.process_tree, None);
+        assert_eq!(
+            report.process_tree,
+            Some(ProcessTreeEvidence::Unverified(
+                ContainmentBackend::SystemdUserService
+            ))
+        );
+        assert_eq!(
+            report.side_effects,
+            Some(SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex
+            ))
+        );
+        assert!(report.environment_blocked());
+        assert_eq!(
+            report
+                .environment_failures()
+                .iter()
+                .map(|failure| failure.category)
+                .collect::<Vec<_>>(),
+            vec![EnvironmentFailureCategory::ProbeFailed]
+        );
+        assert!(
+            report
+                .stdout
+                .run_metadata
+                .environment_preflight_process_started
+        );
+        assert!(!report.stdout.target_launch_attempted);
         assert!(report
             .error
             .as_deref()
             .is_some_and(|error| error.contains("timed out before command start")));
         assert!(!marker.exists());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_setup_timeout_is_generic_and_does_not_start_target() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
+        let marker = temp.path().join("must-not-run");
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "do not start\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let spec = ExternalAgentCommand::codex(
+            agent,
+            temp.path(),
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::ZERO,
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly);
+
+        let report = run_external_agent_nonpublishable_simulation(&spec);
+
+        assert!(report.timed_out);
+        assert_eq!(report.exit_code, None);
+        assert!(!report.environment_blocked());
+        assert!(report.environment_failures().is_empty());
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out before command start")));
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn pre_cancelled_external_agent_is_generic() {
+        let spec = ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt",
+            "events",
+            "report",
+            Duration::from_secs(1),
+        );
+        let cancellation = ProcessCancellation::new();
+        cancellation.cancel();
+
+        let report = run_external_agent_nonpublishable_simulation_cancellable(&spec, &cancellation);
+
+        assert!(!report.timed_out);
+        assert!(!report.environment_blocked());
+        assert!(report.environment_failures().is_empty());
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled")));
     }
 
     #[cfg(unix)]
@@ -8905,6 +9001,8 @@ exit 0
             .error
             .as_deref()
             .is_some_and(|error| error.contains("cancelled")));
+        assert!(!report.environment_blocked());
+        assert!(report.environment_failures().is_empty());
         assert!(report.process_tree.is_some());
         thread::sleep(Duration::from_millis(400));
         assert!(!delayed.exists());
