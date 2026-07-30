@@ -1757,10 +1757,25 @@ fn run_supervisor_plan_file_with_runner(
     options: SupervisorRunOptions,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
+    validate_max_concurrent_children(1)?;
+    if options.runtime == SupervisorRuntime::Fake {
+        bail!(
+            "supervisor assignment creation is temporarily unsupported because managed worktree creation requires a capability-bound repository cleanliness input"
+        );
+    }
+    let repo = discover_repo_root(&options.repo)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime);
     let serialized_runner = Mutex::new(external_runner);
-    run_supervisor_plan_file_with_runner_and_max_concurrent_children(
+    run_supervisor_plan_with_runner_and_creation(
+        loaded,
         options,
         1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
