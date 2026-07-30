@@ -4,9 +4,12 @@ use crate::{
         ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory, RunArtifactFamily,
     },
     external_agent::{
-        codex_usage_from_jsonl, run_external_agent_cancellable_reviewed, ExternalAgentCommand,
-        ExternalAgentRun, ExternalPreActionReviewRuntime, ExternalProgramTrust,
-        PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
+        codex_usage_from_jsonl, run_external_agent_cancellable_reviewed,
+        validate_environment_requirements, EnvironmentFailure, EnvironmentFailureCategory,
+        EnvironmentPreflightResult, EnvironmentRemediation, EnvironmentRemediationScope,
+        EnvironmentRequirement, ExternalAgentCommand, ExternalAgentRun,
+        ExternalPreActionReviewRuntime, ExternalProgramTrust, PreActionJournalRecord,
+        PreActionJournalSink, SandboxDenialEvidence,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -330,6 +333,8 @@ pub struct OrchestratorAssignment {
     pub task: Option<String>,
     #[serde(default)]
     pub worker_assignments: Vec<WorkerAssignment>,
+    #[serde(default)]
+    pub environment_requirements: Vec<EnvironmentRequirement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
@@ -394,6 +399,8 @@ pub struct WorkerAssignment {
     pub semantic_modules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    #[serde(default)]
+    pub environment_requirements: Vec<EnvironmentRequirement>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -496,6 +503,8 @@ pub struct WorkerReport {
     pub semantic_intent_token: Option<u64>,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
+    #[serde(default)]
+    pub environment_failures: Vec<EnvironmentFailure>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub files_changed: Vec<PathBuf>,
     #[serde(default)]
@@ -530,6 +539,8 @@ pub struct AuditorReport {
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
     #[serde(default)]
+    pub environment_failures: Vec<EnvironmentFailure>,
+    #[serde(default)]
     pub validation_results: Vec<ValidationResult>,
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -562,6 +573,8 @@ pub struct OrchestratorReviewReport {
     pub semantic_intent_token: Option<u64>,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
+    #[serde(default)]
+    pub environment_failures: Vec<EnvironmentFailure>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub files_changed: Vec<PathBuf>,
     #[serde(default)]
@@ -629,6 +642,8 @@ pub struct SupervisorFinalReport {
     pub usage_complete: bool,
     #[serde(default)]
     pub commands_run: Vec<CommandRunRecord>,
+    #[serde(default)]
+    pub environment_failures: Vec<EnvironmentFailure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -733,6 +748,10 @@ pub struct CommandRunRecord {
     pub stderr: String,
     #[serde(default)]
     pub sandbox_denials: Vec<SandboxDenialEvidence>,
+    #[serde(default)]
+    pub environment_preflight_results: Vec<EnvironmentPreflightResult>,
+    #[serde(default)]
+    pub environment_failures: Vec<EnvironmentFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -920,6 +939,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
                 assignment.id, assignment.task
             )),
             worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
             notes: Some(
                 "MACO-visible read-only planning root; its execution child is parent-gated"
                     .to_string(),
@@ -941,6 +961,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             semantic_symbols: assignment.semantic_symbols.clone(),
             semantic_modules: assignment.semantic_modules.clone(),
             task: Some(assignment.task.clone()),
+            environment_requirements: Vec::new(),
             report_path: None,
         };
         assignment_metadata.insert(
@@ -956,6 +977,7 @@ fn supervisor_plan_and_consultant_from_goal_spec(
             semantic_modules: assignment.semantic_modules,
             task: Some(assignment.task),
             worker_assignments: vec![worker],
+            environment_requirements: Vec::new(),
             notes: Some(format!(
                 "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
             )),
@@ -1612,6 +1634,7 @@ pub fn collect_supervisor_run(
         total_cost_usd: None,
         usage_complete: false,
         commands_run: Vec::new(),
+        environment_failures: Vec::new(),
         sandbox_denials: Vec::new(),
         gate_denials: Vec::new(),
         pre_action_review_metrics: Vec::new(),
@@ -1937,6 +1960,8 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         stdout: String::new(),
         stderr: String::new(),
         sandbox_denials: Vec::new(),
+        environment_preflight_results: Vec::new(),
+        environment_failures: Vec::new(),
         error: None,
     };
     let worker = WorkerReport {
@@ -1950,6 +1975,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         claim_token: None,
         semantic_intent_token: None,
         commands_run: vec![command.clone()],
+        environment_failures: Vec::new(),
         files_changed: files_changed.clone(),
         validation_results: vec![validation.clone()],
         findings: Vec::new(),
@@ -1969,6 +1995,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         reviewed_worker_ids: vec![worker_id.to_string()],
         reviewed_paths: files_changed.clone(),
         commands_run: vec![command.clone()],
+        environment_failures: Vec::new(),
         validation_results: vec![validation.clone()],
         findings: Vec::new(),
         no_further_delegation: Some(true),
@@ -1988,6 +2015,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         claim_token: Some(1),
         semantic_intent_token: None,
         commands_run: vec![command.clone()],
+        environment_failures: Vec::new(),
         files_changed: files_changed.clone(),
         validation_results: vec![validation.clone()],
         findings: Vec::new(),
@@ -2028,6 +2056,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         total_cost_usd: None,
         usage_complete: true,
         commands_run: vec![command],
+        environment_failures: Vec::new(),
         sandbox_denials: Vec::new(),
         gate_denials: Vec::new(),
         pre_action_review_metrics: Vec::new(),
@@ -2409,6 +2438,7 @@ Required behavior:
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
 - If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
+- WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
 - Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
 - Each worker must also write its structured execution journal to the exact path in its worker prompt; that path is the only allowed non-source artifact write for a terminal worker. The journal is JSONL with one object per command containing command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent acceptance gate imports these journals from incoming/worker-journals/ and rejects worker evidence that the journal or Git diff does not support.
 - Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
@@ -2599,6 +2629,7 @@ Rules:
 - Before returning your WorkerReport, write a structured execution journal to the exact execution journal path above; this is the only allowed non-source artifact write for this worker. Create its parent directory if needed. Use JSONL: one JSON object per command, with fields "command" (array of strings), "cwd" (string), "start_timestamp" (string), "end_timestamp" (string), and "changed_paths" (array of repo-relative paths changed by that command, or [] when none). Do not write prose or Markdown to the journal.
 - Run validation or record why validation was not run.
 - Return WorkerReport JSON in your final response with assignment_kind, target_path, changed files, commands run, validation results, findings, bloated_file_flags, decomposition_completion, remaining risk, and next safe action.
+- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 - field_guide_entries is optional operational-memory input. Each item contains exactly finding and context; never include date, source_run, role text, policy, or other provenance. The trusted supervisor decides whether accepted audited suggestions are appended.
 - bloated_file_flags is bounded to at most {max_bloated_file_flags} unique objects of the form {{"path":"repo/relative/file"}}. Every path must be canonical, repository-relative, and inside this worker's assigned paths. Thresholds are intentionally not inferred by this report schema.
 - For a successful megafile_decomposition, include the exact target and every concrete replacement in files_changed, then set decomposition_completion to {{"target_path":"the exact canonical target path","replacement_paths":["one or more canonical newly created files"]}}. Otherwise set it to null. Renames, unrelated edits, and no-op target reports are not decomposition completion evidence. This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.
@@ -2716,6 +2747,7 @@ Rules:
 - For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
 - Do not edit files, create durable artifacts, apply patches, claim paths, or change Git state.
 - Produce structured AuditorReport JSON in your final response with reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining risk, and next safe action.
+- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
 - Include "read_only": true in AuditorReport JSON to attest this audit stayed read-only.
@@ -2780,6 +2812,7 @@ fn parent_review_auditor_prompt_with_field_guide(
         .map(|worker| (worker.id.clone(), worker.field_guide_entries.len()))
         .collect::<BTreeMap<_, _>>();
     let mut redacted_child_report = child_report.clone();
+    enforce_orchestrator_environment_failure_outcome(&mut redacted_child_report);
     redacted_child_report.field_guide_entries.clear();
     for worker in &mut redacted_child_report.worker_reports {
         worker.field_guide_entries.clear();
@@ -2829,6 +2862,7 @@ Review requirements:
 - Set role="auditor", no_further_delegation=true, read_only=true.
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 - Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
+- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 
 Child report JSON:
 {child_report_json}
@@ -2890,6 +2924,13 @@ fn apply_role_model_selection(
 ) -> ExternalAgentCommand {
     let (model, reasoning_effort) = role_model_selection(plan, role);
     command.with_model_selection(model, reasoning_effort)
+}
+
+fn apply_canonical_environment_requirements(
+    command: ExternalAgentCommand,
+    requirements: &[EnvironmentRequirement],
+) -> ExternalAgentCommand {
+    command.with_environment_requirements(requirements.iter().cloned())
 }
 
 #[cfg(unix)]
@@ -4796,6 +4837,7 @@ fn execute_supervisor_assignment_inner(
         }
     };
 
+    let environment_requirements = canonical_environment_requirements(assignment)?;
     let final_report_name = format!("{}.json", assignment.id);
     let final_report_relative = PathBuf::from("reports").join(&final_report_name);
     let final_report_path = dirs.reports.join(&final_report_name);
@@ -4971,6 +5013,7 @@ fn execute_supervisor_assignment_inner(
                 options.run_id.as_str(),
                 &assignment.id,
             );
+            command = apply_canonical_environment_requirements(command, &environment_requirements);
             command = configure_writable_child_command(command, &assignment.assigned_paths)?;
 
             record_shared_orchestration_event(
@@ -5048,13 +5091,16 @@ fn execute_supervisor_assignment_inner(
                     return Err(error).context("failed to produce deterministic child output");
                 }
             };
-            match complete_external_codex_usage(&external_run, &command) {
-                Some(usage) => outcome.usage_samples.push(RoleUsageSample {
-                    role: assignment.role,
-                    model: command.model.clone(),
-                    usage,
-                }),
-                None => outcome.usage_incomplete = true,
+            let environment_blocked = external_run.environment_blocked();
+            if !environment_blocked {
+                match complete_external_codex_usage(&external_run, &command) {
+                    Some(usage) => outcome.usage_samples.push(RoleUsageSample {
+                        role: assignment.role,
+                        model: command.model.clone(),
+                        usage,
+                    }),
+                    None => outcome.usage_incomplete = true,
+                }
             }
             drop(incoming_output_root);
             drop(capture_output_root);
@@ -5076,7 +5122,7 @@ fn execute_supervisor_assignment_inner(
                 ),
             )?;
             let attempt_containment_verified =
-                external_safety_verified(&external_run, options.runtime);
+                external_containment_verified(&external_run, options.runtime);
             if !attempt_containment_verified {
                 outcome.external_containment_failed = true;
                 outcome.findings.push(Finding {
@@ -5237,6 +5283,18 @@ fn execute_supervisor_assignment_inner(
                     attempt,
                     report_path: attempt_artifacts.raw_report_relative.clone(),
                     structural_problems: report_shape_problems,
+                    corrective_retry_used,
+                });
+                child_containment_verified = true;
+                child_gate_terminal = true;
+                child_report = Some(attempt_report);
+                break;
+            }
+            if environment_blocked {
+                attempt_history.push(ChildAttemptHistory {
+                    attempt,
+                    report_path: attempt_artifacts.raw_report_relative.clone(),
+                    structural_problems: Vec::new(),
                     corrective_retry_used,
                 });
                 child_containment_verified = true;
@@ -5453,6 +5511,7 @@ fn execute_supervisor_assignment_inner(
         let mut assignment_containment_verified = child_containment_verified;
         let mut auditor_primary_integrity_failed = false;
         let mut auditor_sandbox_denied = false;
+        let mut auditor_environment_blocked = false;
         if child_containment_verified
             && !child_gate_terminal
             && parent_auditor_required(assignment, &child_report)
@@ -5616,6 +5675,10 @@ fn execute_supervisor_assignment_inner(
                     options.run_id.as_str(),
                     &auditor_id,
                 );
+            auditor_command = apply_canonical_environment_requirements(
+                auditor_command,
+                &environment_requirements,
+            );
             record_shared_orchestration_event(
                 artifacts,
                 &auditor_id,
@@ -5675,13 +5738,16 @@ fn execute_supervisor_assignment_inner(
                         .context("failed to produce deterministic parent auditor output");
                 }
             };
-            match complete_external_codex_usage(&auditor_run, &auditor_command) {
-                Some(usage) => outcome.usage_samples.push(RoleUsageSample {
-                    role: AgentRole::Auditor,
-                    model: auditor_command.model.clone(),
-                    usage,
-                }),
-                None => outcome.usage_incomplete = true,
+            auditor_environment_blocked = auditor_run.environment_blocked();
+            if !auditor_environment_blocked {
+                match complete_external_codex_usage(&auditor_run, &auditor_command) {
+                    Some(usage) => outcome.usage_samples.push(RoleUsageSample {
+                        role: AgentRole::Auditor,
+                        model: auditor_command.model.clone(),
+                        usage,
+                    }),
+                    None => outcome.usage_incomplete = true,
+                }
             }
             drop(auditor_incoming_root);
             drop(auditor_capture_root);
@@ -5703,7 +5769,7 @@ fn execute_supervisor_assignment_inner(
                 ),
             )?;
             let auditor_containment_verified =
-                external_safety_verified(&auditor_run, options.runtime);
+                external_containment_verified(&auditor_run, options.runtime);
             if !auditor_containment_verified {
                 assignment_containment_verified = false;
                 outcome.external_containment_failed = true;
@@ -5736,7 +5802,7 @@ fn execute_supervisor_assignment_inner(
                 tracker.escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
             }
             let auditor_sandbox_denials = auditor_run.sandbox_denials().to_vec();
-            if !auditor_sandbox_denials.is_empty() {
+            if !auditor_environment_blocked && !auditor_sandbox_denials.is_empty() {
                 auditor_sandbox_denied = true;
                 let tracker = outcome
                     .gate_tracker
@@ -5812,8 +5878,12 @@ fn execute_supervisor_assignment_inner(
                 tracker.escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
             }
             child_report.audit_reports.push(auditor_report);
+            enforce_orchestrator_environment_failure_outcome(&mut child_report);
         }
-        if child_containment_verified {
+        if child_containment_verified
+            && child_report.environment_failures.is_empty()
+            && !auditor_environment_blocked
+        {
             validate_auditor_reports(assignment, &final_report_path, &mut child_report);
         }
         let parent_auditor_failed = child_report
@@ -5824,6 +5894,7 @@ fn execute_supervisor_assignment_inner(
             && assignment_containment_verified
             && !auditor_primary_integrity_failed
             && !auditor_sandbox_denied
+            && !auditor_environment_blocked
         {
             let correction_correlation_id = outcome
                 .gate_tracker
@@ -6803,6 +6874,8 @@ fn run_supervisor_plan_with_runner_and_creation(
             true
         }
     };
+    let environment_failures =
+        aggregate_environment_failures(&command_records, &orchestrator_reports);
     let failed = run_result.is_err()
         || !release_errors.is_empty()
         || !semantic_release_errors.is_empty()
@@ -6811,6 +6884,7 @@ fn run_supervisor_plan_with_runner_and_creation(
         || final_primary_integrity_failed
         || breaker_tripped
         || field_guide_mutation_failed
+        || !environment_failures.is_empty()
         || orchestrator_reports.iter().any(report_failed);
     let success = !failed;
     let publishable = success && runtime == SupervisorRuntime::Codex;
@@ -6846,7 +6920,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     let mut coverage_gaps = plan_metadata.coverage_gaps.clone();
     coverage_gaps.extend(runtime_coverage_gaps);
     let sandbox_denials = aggregate_sandbox_denials(&command_records);
-    let final_report = SupervisorFinalReport {
+    let mut final_report = SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: options.run_id,
         role: AgentRole::Supervisor,
@@ -6897,6 +6971,7 @@ fn run_supervisor_plan_with_runner_and_creation(
         total_cost_usd,
         usage_complete,
         commands_run: command_records,
+        environment_failures: environment_failures.clone(),
         sandbox_denials,
         gate_denials,
         pre_action_review_metrics,
@@ -6933,6 +7008,9 @@ fn run_supervisor_plan_with_runner_and_creation(
         } else if success {
             "no failed child orchestrator reports; worker changes remain isolated in child worktrees"
                 .to_string()
+        } else if !environment_failures.is_empty() {
+            "one or more assignments were blocked by unsatisfied structured environment requirements"
+                .to_string()
         } else if external_containment_failed {
             "one or more external agent process trees lacked verified-empty containment; delayed child activity cannot be ruled out"
                 .to_string()
@@ -6956,6 +7034,9 @@ fn run_supervisor_plan_with_runner_and_creation(
         } else if success {
             "review child worktree diffs before any separate merge preview or apply step"
                 .to_string()
+        } else if !environment_failures.is_empty() {
+            "apply the structured environment remediation without auto-installing software, injecting secrets, enabling networking, or broadening confinement, then rerun the blocked assignment"
+                .to_string()
         } else if external_containment_failed {
             "do not trust or merge child outputs; restore the primary worktree if needed, fix host containment support, and rerun supervise"
                 .to_string()
@@ -6971,6 +7052,7 @@ fn run_supervisor_plan_with_runner_and_creation(
                 .to_string()
         },
     };
+    enforce_supervisor_final_environment_failure_outcome(&mut final_report);
     record_orchestration_event(
         &mut orchestration_journal,
         &mut artifact_writer,
@@ -7002,7 +7084,7 @@ fn run_supervisor_plan_with_runner_and_creation(
     write_final_report(&mut artifact_writer, &final_report)?;
     artifact_writer.finalize(
         RunArtifactFamily::Supervise.final_report_relative_path(),
-        publishable,
+        final_report.publishable,
     )?;
     Ok(final_report)
 }
@@ -7265,7 +7347,16 @@ fn validate_supervisor_plan(
         }
         assignment.semantic_symbols = normalize_semantic_symbols(&assignment.semantic_symbols);
         assignment.semantic_modules = normalize_semantic_modules(&assignment.semantic_modules);
+        validate_environment_requirements(&assignment.environment_requirements).with_context(
+            || {
+                format!(
+                    "assignment '{}' has invalid environment requirements",
+                    assignment.id
+                )
+            },
+        )?;
         validate_worker_assignments(assignment)?;
+        canonical_environment_requirements(assignment)?;
 
         let schedule = &mut metadata.assignment_schedule[index];
         schedule.assignment_id = assignment.id.clone();
@@ -7562,6 +7653,31 @@ fn validate_consultant_plan(consultant: &SupervisorConsultantPlan) -> Result<()>
     Ok(())
 }
 
+fn canonical_environment_requirements(
+    assignment: &OrchestratorAssignment,
+) -> Result<Vec<EnvironmentRequirement>> {
+    let requirements = assignment
+        .environment_requirements
+        .iter()
+        .chain(
+            assignment
+                .worker_assignments
+                .iter()
+                .flat_map(|worker| worker.environment_requirements.iter()),
+        )
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    validate_environment_requirements(&requirements).with_context(|| {
+        format!(
+            "assignment '{}' has conflicting aggregate environment requirements",
+            assignment.id
+        )
+    })?;
+    Ok(requirements)
+}
+
 fn validate_worker_assignments(assignment: &mut OrchestratorAssignment) -> Result<()> {
     let mut seen = BTreeSet::new();
     let mut path_owners = Vec::<PathOwner>::new();
@@ -7615,6 +7731,12 @@ fn validate_worker_assignments(assignment: &mut OrchestratorAssignment) -> Resul
         }));
         worker.semantic_symbols = normalize_semantic_symbols(&worker.semantic_symbols);
         worker.semantic_modules = normalize_semantic_modules(&worker.semantic_modules);
+        validate_environment_requirements(&worker.environment_requirements).with_context(|| {
+            format!(
+                "worker '{}' under assignment '{}' has invalid environment requirements",
+                worker.id, assignment.id
+            )
+        })?;
     }
     for (left_index, left) in assignment.worker_assignments.iter().enumerate() {
         for right in assignment
@@ -7779,6 +7901,18 @@ fn collect_child_report(
         child_base_head,
         worker_journals,
     } = context;
+    if external_run.environment_blocked() {
+        return (
+            environment_blocked_child_report(
+                assignment,
+                assignment_metadata,
+                report_path,
+                external_run,
+                external_command,
+            ),
+            Vec::new(),
+        );
+    }
     let mut report_shape_problems = Vec::new();
     let mut report = match read_child_report(external_run.output_last_message(), report_path) {
         Ok(parsed) => {
@@ -7866,6 +8000,7 @@ fn collect_child_report(
         worker_journals,
         &mut report,
     );
+    enforce_orchestrator_environment_failure_outcome(&mut report);
     (report, report_shape_problems)
 }
 
@@ -7876,6 +8011,18 @@ fn collect_parent_auditor_report(
     external_command: &ExternalAgentCommand,
 ) -> AuditorReport {
     let expected_id = parent_auditor_id(assignment);
+    if external_run.environment_blocked() {
+        let mut report = missing_parent_auditor_report(
+            &expected_id,
+            report_path,
+            external_run,
+            anyhow!("parent-observed environment preflight blocked the auditor before launch"),
+        );
+        report
+            .commands_run
+            .push(command_record_from_external(external_run, external_command));
+        return report;
+    }
     let mut report = match read_auditor_report(external_run.output_last_message(), report_path) {
         Ok(parsed) => {
             let mut report = parsed.report;
@@ -7918,6 +8065,7 @@ fn collect_parent_auditor_report(
     report
         .commands_run
         .push(command_record_from_external(external_run, external_command));
+    enforce_auditor_environment_failure_outcome(&mut report);
     report
 }
 
@@ -10385,10 +10533,12 @@ fn write_child_report(
     relative: &Path,
     report: &OrchestratorReviewReport,
 ) -> Result<()> {
+    let mut normalized_report = report.clone();
+    enforce_orchestrator_environment_failure_outcome(&mut normalized_report);
     write_artifact_json(
         writer,
         relative,
-        report,
+        &normalized_report,
         MAX_SUPERVISOR_REPORT_BYTES,
         ArtifactFileDisposition::PrivateEvidence,
     )
@@ -10783,6 +10933,278 @@ fn last_top_level_json_object(contents: &str) -> Option<&str> {
     last_object
 }
 
+fn environment_failure_category_name(category: EnvironmentFailureCategory) -> &'static str {
+    match category {
+        EnvironmentFailureCategory::MissingExecutable => "missing_executable",
+        EnvironmentFailureCategory::VersionMismatch => "version_mismatch",
+        EnvironmentFailureCategory::MissingCredential => "missing_credential",
+        EnvironmentFailureCategory::NetworkForbidden => "network_forbidden",
+        EnvironmentFailureCategory::SandboxUnavailable => "sandbox_unavailable",
+        EnvironmentFailureCategory::ProbeFailed => "probe_failed",
+    }
+}
+
+fn environment_failure_categories(failures: &[EnvironmentFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| environment_failure_category_name(failure.category))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentFailure {
+    failure.summary = format!(
+        "environment preflight reported {}",
+        environment_failure_category_name(failure.category)
+    );
+    failure.remediation = match failure.category {
+        EnvironmentFailureCategory::MissingExecutable
+        | EnvironmentFailureCategory::VersionMismatch => vec![
+            EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::ProjectLocal,
+                guidance:
+                    "declare the required toolchain in the project environment and rerun preflight"
+                        .to_string(),
+            },
+            EnvironmentRemediation {
+                scope: EnvironmentRemediationScope::PersistentNixosHostSoftware,
+                guidance:
+                    "request persistent host software through the declarative NixOS workflow"
+                        .to_string(),
+            },
+        ],
+        EnvironmentFailureCategory::MissingCredential => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::CredentialConfiguration,
+            guidance:
+                "configure the named credential or configuration through an approved secret source; do not put secret values in the plan"
+                    .to_string(),
+        }],
+        EnvironmentFailureCategory::NetworkForbidden => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::CapabilityPolicy,
+            guidance:
+                "revise the assignment for offline execution or request an explicit policy change; do not enable networking automatically"
+                    .to_string(),
+        }],
+        EnvironmentFailureCategory::SandboxUnavailable => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::CapabilityPolicy,
+            guidance:
+                "restore the verified confinement capability before rerunning; do not broaden the sandbox automatically"
+                    .to_string(),
+        }],
+        EnvironmentFailureCategory::ProbeFailed => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::ProjectLocal,
+            guidance:
+                "inspect the fixed preflight probe evidence and correct the project or host environment before rerunning"
+                    .to_string(),
+        }],
+    };
+    failure
+}
+
+fn sanitized_environment_failures(
+    failures: impl IntoIterator<Item = EnvironmentFailure>,
+) -> Vec<EnvironmentFailure> {
+    let mut sanitized = Vec::new();
+    append_unique_environment_failures(
+        &mut sanitized,
+        failures.into_iter().map(sanitize_environment_failure),
+    );
+    sanitized
+}
+
+fn append_unique_environment_failures(
+    destination: &mut Vec<EnvironmentFailure>,
+    failures: impl IntoIterator<Item = EnvironmentFailure>,
+) {
+    for failure in failures {
+        if !destination.contains(&failure) {
+            destination.push(failure);
+        }
+    }
+}
+
+fn normalize_command_environment_failures(record: &mut CommandRunRecord) {
+    record.environment_failures =
+        sanitized_environment_failures(std::mem::take(&mut record.environment_failures));
+    if !record.environment_failures.is_empty() {
+        record.status = ReviewStatus::Failed;
+    }
+}
+
+fn normalize_command_records_environment_failures(
+    records: &mut [CommandRunRecord],
+) -> Vec<EnvironmentFailure> {
+    let mut failures = Vec::new();
+    for record in records {
+        normalize_command_environment_failures(record);
+        append_unique_environment_failures(&mut failures, record.environment_failures.clone());
+    }
+    failures
+}
+
+fn enforce_worker_environment_failure_outcome(report: &mut WorkerReport) {
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
+    report.environment_failures =
+        sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
+    append_unique_environment_failures(&mut report.environment_failures, command_failures);
+    if !report.environment_failures.is_empty() {
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+    }
+}
+
+fn enforce_auditor_environment_failure_outcome(report: &mut AuditorReport) {
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
+    report.environment_failures =
+        sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
+    append_unique_environment_failures(&mut report.environment_failures, command_failures);
+    if !report.environment_failures.is_empty() {
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+    }
+}
+
+fn enforce_orchestrator_environment_failure_outcome(report: &mut OrchestratorReviewReport) {
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
+    report.environment_failures =
+        sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
+    append_unique_environment_failures(&mut report.environment_failures, command_failures);
+    for worker in &mut report.worker_reports {
+        enforce_worker_environment_failure_outcome(worker);
+    }
+    for auditor in &mut report.audit_reports {
+        enforce_auditor_environment_failure_outcome(auditor);
+    }
+    let nested_failures = report
+        .worker_reports
+        .iter()
+        .flat_map(|worker| worker.environment_failures.iter())
+        .chain(
+            report
+                .audit_reports
+                .iter()
+                .flat_map(|auditor| auditor.environment_failures.iter()),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
+    append_unique_environment_failures(&mut report.environment_failures, nested_failures);
+    if !report.environment_failures.is_empty() {
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+    }
+}
+
+fn enforce_supervisor_final_environment_failure_outcome(report: &mut SupervisorFinalReport) {
+    let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
+    for child in &mut report.orchestrator_reports {
+        enforce_orchestrator_environment_failure_outcome(child);
+    }
+    let mut failures =
+        sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
+    append_unique_environment_failures(&mut failures, command_failures);
+    append_unique_environment_failures(
+        &mut failures,
+        aggregate_environment_failures(&report.commands_run, &report.orchestrator_reports),
+    );
+    report.environment_failures = failures;
+    if !report.environment_failures.is_empty() {
+        report.publishable = false;
+        report.success = false;
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+    }
+}
+
+fn environment_blocked_child_report(
+    assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
+    report_path: &Path,
+    external_run: &ExternalAgentRun,
+    external_command: &ExternalAgentCommand,
+) -> OrchestratorReviewReport {
+    let failures = sanitized_environment_failures(external_run.environment_failures().to_vec());
+    let categories = environment_failure_categories(&failures);
+    let worker_reports = assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| {
+            let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
+            WorkerReport {
+                id: worker.id.clone(),
+                role: AgentRole::Worker,
+                assignment_kind: metadata.kind,
+                target_path: metadata.target_path,
+                assigned_paths: worker.assigned_paths.clone(),
+                semantic_symbols: worker.semantic_symbols.clone(),
+                semantic_modules: worker.semantic_modules.clone(),
+                claim_token: None,
+                semantic_intent_token: None,
+                commands_run: Vec::new(),
+                environment_failures: failures.clone(),
+                files_changed: Vec::new(),
+                validation_results: Vec::new(),
+                findings: vec![Finding {
+                    severity: FindingSeverity::Error,
+                    message: format!(
+                        "worker was not launched because parent-observed environment preflight blocked the assignment: {categories}"
+                    ),
+                    paths: vec![report_path.to_path_buf()],
+                }],
+                field_guide_entries: Vec::new(),
+                bloated_file_flags: Vec::new(),
+                decomposition_completion: None,
+                no_further_delegation: Some(true),
+                accepted: false,
+                rejected: true,
+                status: ReviewStatus::Failed,
+                remaining_risk: "declared environment requirements were not satisfied".to_string(),
+                next_safe_action:
+                    "apply the structured environment remediation without broadening confinement, then rerun the assignment"
+                        .to_string(),
+            }
+        })
+        .collect();
+    OrchestratorReviewReport {
+        id: assignment.id.clone(),
+        role: AgentRole::ChildOrchestrator,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: None,
+        semantic_intent_token: None,
+        commands_run: vec![command_record_from_external(external_run, external_command)],
+        environment_failures: failures,
+        files_changed: Vec::new(),
+        validation_results: Vec::new(),
+        findings: vec![Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "parent-observed environment preflight blocked the child assignment before launch: {categories}"
+            ),
+            paths: vec![report_path.to_path_buf()],
+        }],
+        field_guide_entries: Vec::new(),
+        worker_reports,
+        audit_reports: Vec::new(),
+        decomposition_completions: Vec::new(),
+        gate_denials: Vec::new(),
+        gate_correction_outcomes: Vec::new(),
+        accepted: false,
+        rejected: true,
+        status: ReviewStatus::Failed,
+        remaining_risk: "declared environment requirements were not satisfied".to_string(),
+        next_safe_action:
+            "apply the structured environment remediation without broadening confinement, then rerun the assignment"
+                .to_string(),
+    }
+}
+
 fn missing_child_report(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
@@ -10799,6 +11221,9 @@ fn missing_child_report(
         claim_token: None,
         semantic_intent_token: None,
         commands_run: vec![command_record_from_external(external_run, external_command)],
+        environment_failures: sanitized_environment_failures(
+            external_run.environment_failures().to_vec(),
+        ),
         files_changed: Vec::new(),
         validation_results: Vec::new(),
         findings: vec![Finding {
@@ -10823,7 +11248,7 @@ fn missing_child_report(
 fn missing_parent_auditor_report(
     expected_id: &str,
     report_path: &Path,
-    _external_run: &ExternalAgentRun,
+    external_run: &ExternalAgentRun,
     error: anyhow::Error,
 ) -> AuditorReport {
     AuditorReport {
@@ -10832,6 +11257,9 @@ fn missing_parent_auditor_report(
         reviewed_worker_ids: Vec::new(),
         reviewed_paths: Vec::new(),
         commands_run: Vec::new(),
+        environment_failures: sanitized_environment_failures(
+            external_run.environment_failures().to_vec(),
+        ),
         validation_results: Vec::new(),
         findings: vec![Finding {
             severity: FindingSeverity::Error,
@@ -11168,6 +11596,7 @@ fn deterministic_fake_child_run(
                 claim_token: None,
                 semantic_intent_token: None,
                 commands_run: Vec::new(),
+                environment_failures: Vec::new(),
                 files_changed: Vec::new(),
                 validation_results: vec![ValidationResult {
                     name: "deterministic fake worker validation".to_string(),
@@ -11207,6 +11636,7 @@ fn deterministic_fake_child_run(
         claim_token: Some(claim_token),
         semantic_intent_token,
         commands_run: Vec::new(),
+        environment_failures: Vec::new(),
         files_changed: Vec::new(),
         validation_results: vec![ValidationResult {
             name: "deterministic fake child validation".to_string(),
@@ -11270,6 +11700,7 @@ fn deterministic_fake_auditor_run(
         reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child_report),
         reviewed_paths: required_auditor_review_paths(assignment, child_report),
         commands_run: Vec::new(),
+        environment_failures: Vec::new(),
         validation_results: vec![ValidationResult {
             name: "deterministic fake auditor validation".to_string(),
             status: ReviewStatus::Succeeded,
@@ -11324,6 +11755,14 @@ fn external_safety_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) 
         SupervisorRuntime::Fake => {
             run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom
         }
+    }
+}
+
+fn external_containment_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) -> bool {
+    if run.environment_blocked() {
+        run.environment_preflight_quiescence_verified()
+    } else {
+        external_safety_verified(run, runtime)
     }
 }
 
@@ -11504,6 +11943,8 @@ fn command_record_from_external(
         stdout: run.stdout.text.clone(),
         stderr: run.stderr.text.clone(),
         sandbox_denials: sandbox_denials_for_report(run.sandbox_denials()),
+        environment_preflight_results: run.environment_preflight_results().to_vec(),
+        environment_failures: sanitized_environment_failures(run.environment_failures().to_vec()),
         error: run.error.clone(),
     }
 }
@@ -11532,6 +11973,55 @@ fn aggregate_sandbox_denials(command_records: &[CommandRunRecord]) -> Vec<Sandbo
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn aggregate_environment_failures(
+    command_records: &[CommandRunRecord],
+    reports: &[OrchestratorReviewReport],
+) -> Vec<EnvironmentFailure> {
+    let failures = command_records
+        .iter()
+        .flat_map(|record| record.environment_failures.iter())
+        .chain(
+            reports
+                .iter()
+                .flat_map(|report| report.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
+                .flat_map(|report| report.commands_run.iter())
+                .flat_map(|record| record.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
+                .flat_map(|report| report.worker_reports.iter())
+                .flat_map(|report| report.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
+                .flat_map(|report| report.worker_reports.iter())
+                .flat_map(|report| report.commands_run.iter())
+                .flat_map(|record| record.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
+                .flat_map(|report| report.audit_reports.iter())
+                .flat_map(|report| report.environment_failures.iter()),
+        )
+        .chain(
+            reports
+                .iter()
+                .flat_map(|report| report.audit_reports.iter())
+                .flat_map(|report| report.commands_run.iter())
+                .flat_map(|record| record.environment_failures.iter()),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
+    sanitized_environment_failures(failures)
 }
 
 fn serializable_external_command(
@@ -11841,6 +12331,10 @@ fn supervisor_final_report_schema_value() -> serde_json::Value {
             "gate_correction_outcomes": {
                 "type": "array",
                 "items": gate_correction_outcome_schema_value()
+            },
+            "environment_failures": {
+                "type": "array",
+                "items": environment_failure_schema_value()
             }
         }
     })
@@ -11861,6 +12355,7 @@ fn orchestrator_report_schema_value() -> serde_json::Value {
             "claim_token",
             "semantic_intent_token",
             "commands_run",
+            "environment_failures",
             "files_changed",
             "validation_results",
             "findings",
@@ -11883,6 +12378,7 @@ fn orchestrator_report_schema_value() -> serde_json::Value {
             "claim_token": {"type": ["integer", "null"]},
             "semantic_intent_token": {"type": ["integer", "null"]},
             "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+            "environment_failures": {"type": "array", "items": environment_failure_schema_value()},
             "files_changed": {"type": "array", "items": {"type": "string"}},
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
             "findings": {"type": "array", "items": finding_schema_value()},
@@ -11904,7 +12400,8 @@ fn orchestrator_report_schema_value() -> serde_json::Value {
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
             "remaining_risk": {"type": "string"},
             "next_safe_action": {"type": "string"}
-        }
+        },
+        "allOf": [orchestrator_environment_failure_outcome_schema_value()]
     })
 }
 
@@ -12004,6 +12501,7 @@ fn auditor_report_schema_value() -> serde_json::Value {
             "reviewed_worker_ids",
             "reviewed_paths",
             "commands_run",
+            "environment_failures",
             "validation_results",
             "findings",
             "no_further_delegation",
@@ -12020,6 +12518,7 @@ fn auditor_report_schema_value() -> serde_json::Value {
             "reviewed_worker_ids": {"type": "array", "items": {"type": "string"}},
             "reviewed_paths": {"type": "array", "items": {"type": "string"}},
             "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+            "environment_failures": {"type": "array", "items": environment_failure_schema_value()},
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
             "findings": {"type": "array", "items": finding_schema_value()},
             "no_further_delegation": {"type": "boolean", "const": true},
@@ -12029,7 +12528,8 @@ fn auditor_report_schema_value() -> serde_json::Value {
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
             "remaining_risk": {"type": "string"},
             "next_safe_action": {"type": "string"}
-        }
+        },
+        "allOf": [environment_failure_outcome_schema_value()]
     })
 }
 
@@ -12050,6 +12550,7 @@ fn worker_report_schema_value() -> serde_json::Value {
             "claim_token",
             "semantic_intent_token",
             "commands_run",
+            "environment_failures",
             "files_changed",
             "validation_results",
             "findings",
@@ -12074,6 +12575,7 @@ fn worker_report_schema_value() -> serde_json::Value {
             "claim_token": {"type": ["integer", "null"]},
             "semantic_intent_token": {"type": ["integer", "null"]},
             "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+            "environment_failures": {"type": "array", "items": environment_failure_schema_value()},
             "files_changed": {"type": "array", "items": {"type": "string"}},
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
             "findings": {"type": "array", "items": finding_schema_value()},
@@ -12091,7 +12593,8 @@ fn worker_report_schema_value() -> serde_json::Value {
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
             "remaining_risk": {"type": "string"},
             "next_safe_action": {"type": "string"}
-        }
+        },
+        "allOf": [environment_failure_outcome_schema_value()]
     })
 }
 
@@ -12204,7 +12707,246 @@ fn command_run_record_schema_value() -> serde_json::Value {
                 "uniqueItems": true,
                 "items": sandbox_denial_evidence_schema_value()
             },
+            "environment_preflight_results": {
+                "type": "array",
+                "items": environment_preflight_result_schema_value()
+            },
+            "environment_failures": {
+                "type": "array",
+                "items": environment_failure_schema_value()
+            },
             "error": {"type": ["string", "null"]}
+        },
+        "allOf": [command_environment_failure_outcome_schema_value()]
+    })
+}
+
+fn command_environment_failure_outcome_schema_value() -> serde_json::Value {
+    json!({
+        "if": {
+            "properties": {
+                "environment_failures": {"minItems": 1}
+            },
+            "required": ["environment_failures"]
+        },
+        "then": {
+            "properties": {
+                "status": {"const": "failed"}
+            }
+        }
+    })
+}
+
+fn environment_failure_outcome_schema_value() -> serde_json::Value {
+    json!({
+        "if": environment_failure_source_schema_value(),
+        "then": failed_environment_outcome_schema_value()
+    })
+}
+
+fn orchestrator_environment_failure_outcome_schema_value() -> serde_json::Value {
+    json!({
+        "if": {
+            "anyOf": [
+                environment_failure_source_schema_value(),
+                {
+                    "properties": {
+                        "worker_reports": {
+                            "contains": environment_failure_source_schema_value(),
+                            "minContains": 1
+                        }
+                    },
+                    "required": ["worker_reports"]
+                },
+                {
+                    "properties": {
+                        "audit_reports": {
+                            "contains": environment_failure_source_schema_value(),
+                            "minContains": 1
+                        }
+                    },
+                    "required": ["audit_reports"]
+                }
+            ]
+        },
+        "then": failed_environment_outcome_schema_value()
+    })
+}
+
+fn environment_failure_source_schema_value() -> serde_json::Value {
+    json!({
+        "anyOf": [
+            {
+                "properties": {
+                    "environment_failures": {"minItems": 1}
+                },
+                "required": ["environment_failures"]
+            },
+            {
+                "properties": {
+                    "commands_run": {
+                        "contains": {
+                            "properties": {
+                                "environment_failures": {"minItems": 1}
+                            },
+                            "required": ["environment_failures"]
+                        },
+                        "minContains": 1
+                    }
+                },
+                "required": ["commands_run"]
+            }
+        ]
+    })
+}
+
+fn failed_environment_outcome_schema_value() -> serde_json::Value {
+    json!({
+        "properties": {
+            "accepted": {"const": false},
+            "rejected": {"const": true},
+            "status": {"const": "failed"}
+        }
+    })
+}
+
+fn environment_failure_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "summary", "remediation"],
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": [
+                    "missing_executable",
+                    "version_mismatch",
+                    "missing_credential",
+                    "network_forbidden",
+                    "sandbox_unavailable",
+                    "probe_failed"
+                ]
+            },
+            "requirement": environment_requirement_schema_value(),
+            "summary": {"type": "string"},
+            "remediation": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["scope", "guidance"],
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": [
+                                "project_local",
+                                "persistent_nixos_host_software",
+                                "credential_configuration",
+                                "capability_policy"
+                            ]
+                        },
+                        "guidance": {"type": "string"}
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn environment_preflight_result_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requirement", "status"],
+        "properties": {
+            "requirement": environment_requirement_schema_value(),
+            "status": {"type": "string", "enum": ["satisfied", "blocked"]},
+            "observation": {
+                "type": "object"
+            }
+        }
+    })
+}
+
+fn environment_requirement_schema_value() -> serde_json::Value {
+    let executable = [
+        "bash", "cargo", "cmake", "codex", "git", "nix", "node", "npm", "python3", "rustc",
+    ];
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "executable"],
+                "properties": {
+                    "kind": {"const": "executable"},
+                    "executable": {"type": "string", "enum": executable},
+                    "version": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "minimum_inclusive": environment_version_schema_value(),
+                            "maximum_exclusive": environment_version_schema_value()
+                        },
+                        "anyOf": [
+                            {"required": ["minimum_inclusive"]},
+                            {"required": ["maximum_exclusive"]}
+                        ]
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "credential"],
+                "properties": {
+                    "kind": {"const": "credential"},
+                    "credential": {
+                        "type": "string",
+                        "enum": ["codex_access_token", "codex_api_key", "open_ai_api_key"]
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "configuration"],
+                "properties": {
+                    "kind": {"const": "configuration"},
+                    "configuration": {"const": "codex_auth_file"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "access"],
+                "properties": {
+                    "kind": {"const": "network"},
+                    "access": {"type": "string", "enum": ["disabled", "enabled"]}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "capability"],
+                "properties": {
+                    "kind": {"const": "sandbox"},
+                    "capability": {"const": "verified_external_codex"}
+                }
+            }
+        ]
+    })
+}
+
+fn environment_version_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["major", "minor", "patch"],
+        "properties": {
+            "major": {"type": "integer", "minimum": 0},
+            "minor": {"type": "integer", "minimum": 0},
+            "patch": {"type": "integer", "minimum": 0}
         }
     })
 }
@@ -12273,10 +13015,12 @@ fn write_final_report(
     writer: &mut ArtifactRunWriter,
     report: &SupervisorFinalReport,
 ) -> Result<()> {
+    let mut normalized_report = report.clone();
+    enforce_supervisor_final_environment_failure_outcome(&mut normalized_report);
     write_artifact_json(
         writer,
         &RunArtifactFamily::Supervise.final_report_relative_path(),
-        report,
+        &normalized_report,
         MAX_SUPERVISOR_REPORT_BYTES,
         ArtifactFileDisposition::PrivateEvidence,
     )
@@ -12672,7 +13416,8 @@ mod tests {
     use super::*;
     use crate::{
         external_agent::{
-            CapturedOutput, CodexPermissionEvidence, SandboxDenialBoundary,
+            CapturedOutput, CodexPermissionEvidence, EnvironmentConfiguration,
+            EnvironmentNetworkAccess, EnvironmentPreflightStatus, SandboxDenialBoundary,
             SandboxDenialRetryability, SandboxDeniedOperation,
         },
         field_guide::{encode_utf8_lower_hex, FIELD_GUIDE_PROMPT_ENTRY_PREFIX},
@@ -12687,6 +13432,403 @@ mod tests {
         Arc, Condvar,
     };
     use std::time::Instant;
+
+    #[test]
+    fn environment_requirements_default_compatibly_and_aggregate_canonically() {
+        let legacy_plan = json!({
+            "version": 1,
+            "task": "legacy environment defaults",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "assignments": [{
+                "id": "child-a",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": [{
+                    "id": "worker-a",
+                    "assigned_paths": ["README.md"]
+                }]
+            }]
+        });
+        let loaded = parse_supervisor_plan_with_consultant(
+            &serde_json::to_string(&legacy_plan).expect("serialize legacy plan"),
+        )
+        .expect("legacy plan remains compatible");
+        assert!(loaded.plan.assignments[0]
+            .environment_requirements
+            .is_empty());
+        assert!(loaded.plan.assignments[0].worker_assignments[0]
+            .environment_requirements
+            .is_empty());
+
+        let requirement =
+            EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
+        let mut assignment = loaded.plan.assignments[0].clone();
+        assignment.environment_requirements = vec![requirement.clone()];
+        assignment.worker_assignments[0].environment_requirements = vec![requirement.clone()];
+        assert_eq!(
+            canonical_environment_requirements(&assignment)
+                .expect("identical cross-worker requirements deduplicate"),
+            vec![requirement]
+        );
+
+        assignment.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Disabled,
+        )];
+        assignment.worker_assignments[0].environment_requirements =
+            vec![EnvironmentRequirement::network(
+                EnvironmentNetworkAccess::Enabled,
+            )];
+        assert!(canonical_environment_requirements(&assignment)
+            .expect_err("conflicting aggregate requirements must fail")
+            .to_string()
+            .contains("conflicting aggregate environment requirements"));
+    }
+
+    #[test]
+    fn environment_requirement_bounds_and_report_defaults_fail_closed() {
+        let oversized = (0..=32)
+            .map(|_| EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled))
+            .collect::<Vec<_>>();
+        assert!(validate_environment_requirements(&oversized).is_err());
+
+        let assignment = injected_assignment(true);
+        let mut legacy = serde_json::to_value(injected_child_report(&assignment))
+            .expect("serialize report fixture");
+        legacy
+            .as_object_mut()
+            .expect("orchestrator report object")
+            .remove("environment_failures");
+        for worker in legacy["worker_reports"]
+            .as_array_mut()
+            .expect("worker reports")
+        {
+            worker
+                .as_object_mut()
+                .expect("worker report object")
+                .remove("environment_failures");
+        }
+        let restored: OrchestratorReviewReport =
+            serde_json::from_value(legacy).expect("legacy report remains compatible");
+        assert!(restored.environment_failures.is_empty());
+        assert!(restored
+            .worker_reports
+            .iter()
+            .all(|worker| worker.environment_failures.is_empty()));
+    }
+
+    #[test]
+    fn environment_failure_schemas_and_outcomes_are_typed_and_secret_free() {
+        for schema in [
+            orchestrator_report_schema_value(),
+            worker_report_schema_value(),
+            auditor_report_schema_value(),
+            supervisor_final_report_schema_value(),
+        ] {
+            assert!(schema["properties"].get("environment_failures").is_some());
+        }
+        let command_schema = command_run_record_schema_value();
+        assert!(command_schema["properties"]
+            .get("environment_preflight_results")
+            .is_some());
+        assert!(command_schema["properties"]
+            .get("environment_failures")
+            .is_some());
+
+        let marker = "DO_NOT_PERSIST_SECRET_MARKER";
+        let mut report = injected_child_report(&injected_assignment(false));
+        report.environment_failures.push(EnvironmentFailure {
+            category: EnvironmentFailureCategory::MissingCredential,
+            requirement: Some(EnvironmentRequirement::configuration(
+                EnvironmentConfiguration::CodexAuthFile,
+            )),
+            summary: marker.to_string(),
+            remediation: Vec::new(),
+        });
+        enforce_orchestrator_environment_failure_outcome(&mut report);
+        assert!(!report.accepted);
+        assert!(report.rejected);
+        assert_eq!(report.status, ReviewStatus::Failed);
+        assert!(!serde_json::to_string(&report)
+            .expect("serialize sanitized environment failure")
+            .contains(marker));
+    }
+
+    #[test]
+    fn nested_command_environment_failures_are_recursively_sanitized_and_terminal() {
+        let assignment = injected_assignment(true);
+        let plan = injected_plan(assignment.clone(), 0);
+        let mut report = injected_child_report(&assignment);
+        let auditor_report = injected_auditor_report(&assignment, &report);
+        report.audit_reports.push(auditor_report);
+
+        let orchestrator_marker = "ORCHESTRATOR_COMMAND_SECRET_MARKER_31";
+        let worker_marker = "WORKER_COMMAND_SECRET_MARKER_31";
+        let auditor_marker = "AUDITOR_COMMAND_SECRET_MARKER_31";
+        let command_with_failure =
+            |marker: &str, category: EnvironmentFailureCategory| -> CommandRunRecord {
+                let mut command = injected_command_record();
+                command.environment_failures.push(EnvironmentFailure {
+                    category,
+                    requirement: None,
+                    summary: marker.to_string(),
+                    remediation: Vec::new(),
+                });
+                command
+            };
+        report.commands_run.push(command_with_failure(
+            orchestrator_marker,
+            EnvironmentFailureCategory::NetworkForbidden,
+        ));
+        report.worker_reports[0]
+            .commands_run
+            .push(command_with_failure(
+                worker_marker,
+                EnvironmentFailureCategory::MissingCredential,
+            ));
+        report.audit_reports[0]
+            .commands_run
+            .push(command_with_failure(
+                auditor_marker,
+                EnvironmentFailureCategory::SandboxUnavailable,
+            ));
+
+        let prompt = parent_review_auditor_prompt_with_field_guide(
+            ParentReviewAuditorPromptContext {
+                plan: &plan,
+                assignment: &assignment,
+                assignment_metadata: &AssignmentMetadata::new(),
+                run_dir: Path::new("/tmp/maco-nested-environment-failure"),
+                worktree_path: Path::new("/tmp/maco-nested-environment-failure/worktree"),
+                child_report_path: Path::new(
+                    "/tmp/maco-nested-environment-failure/reports/child-a.json",
+                ),
+                auditor_report_path: Path::new(
+                    "/tmp/maco-nested-environment-failure/incoming/auditor.json",
+                ),
+                schema_path: Path::new("/tmp/maco-nested-environment-failure/schemas/auditor.json"),
+                child_report: &report,
+            },
+            &SupervisorFieldGuidePrompt::empty().expect("empty field guide"),
+        )
+        .expect("render sanitized parent auditor prompt");
+        for marker in [orchestrator_marker, worker_marker, auditor_marker] {
+            assert!(!prompt.contains(marker));
+        }
+
+        enforce_orchestrator_environment_failure_outcome(&mut report);
+        assert_eq!(report.status, ReviewStatus::Failed);
+        assert!(!report.accepted);
+        assert!(report.rejected);
+        assert_eq!(report.commands_run[0].status, ReviewStatus::Failed);
+        assert_eq!(report.worker_reports[0].status, ReviewStatus::Failed);
+        assert_eq!(
+            report.worker_reports[0].commands_run[0].status,
+            ReviewStatus::Failed
+        );
+        assert_eq!(report.audit_reports[0].status, ReviewStatus::Failed);
+        assert_eq!(
+            report.audit_reports[0].commands_run[0].status,
+            ReviewStatus::Failed
+        );
+        let expected_categories = [
+            EnvironmentFailureCategory::MissingCredential,
+            EnvironmentFailureCategory::NetworkForbidden,
+            EnvironmentFailureCategory::SandboxUnavailable,
+        ];
+        for category in expected_categories {
+            assert!(report
+                .environment_failures
+                .iter()
+                .any(|failure| failure.category == category));
+        }
+        assert_eq!(report.environment_failures.len(), 3);
+        for failure in report
+            .environment_failures
+            .iter()
+            .chain(report.commands_run[0].environment_failures.iter())
+            .chain(report.worker_reports[0].environment_failures.iter())
+            .chain(
+                report.worker_reports[0].commands_run[0]
+                    .environment_failures
+                    .iter(),
+            )
+            .chain(report.audit_reports[0].environment_failures.iter())
+            .chain(
+                report.audit_reports[0].commands_run[0]
+                    .environment_failures
+                    .iter(),
+            )
+        {
+            assert!(failure
+                .summary
+                .starts_with("environment preflight reported "));
+            assert!(!failure.remediation.is_empty());
+            assert!(failure
+                .remediation
+                .iter()
+                .all(|remediation| !remediation.guidance.contains("SECRET_MARKER_31")));
+        }
+
+        let mut final_report = artifact_test_final_report(
+            &RunId::new("nested-environment-failure").expect("valid run id"),
+        );
+        final_report.orchestrator_reports = vec![report];
+        enforce_supervisor_final_environment_failure_outcome(&mut final_report);
+        assert!(!final_report.success);
+        assert!(!final_report.publishable);
+        assert!(!final_report.accepted);
+        assert!(final_report.rejected);
+        assert_eq!(final_report.status, ReviewStatus::Failed);
+        assert_eq!(final_report.environment_failures.len(), 3);
+        for category in expected_categories {
+            assert!(final_report
+                .environment_failures
+                .iter()
+                .any(|failure| failure.category == category));
+        }
+        let serialized =
+            serde_json::to_string(&final_report).expect("serialize normalized final report");
+        for marker in [orchestrator_marker, worker_marker, auditor_marker] {
+            assert!(!serialized.contains(marker));
+        }
+
+        assert_eq!(
+            command_run_record_schema_value()["allOf"][0]["then"]["properties"]["status"]["const"],
+            "failed"
+        );
+        assert_eq!(
+            orchestrator_report_schema_value()["allOf"][0]["if"]["anyOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn environment_requirements_are_captured_for_child_and_auditor_commands() {
+        let temp = tempfile::tempdir().expect("temporary command capture");
+        let requirements = vec![
+            EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile),
+            EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled),
+        ];
+        let child = apply_canonical_environment_requirements(
+            control_test_command(temp.path(), temp.path()),
+            &requirements,
+        );
+        let auditor = apply_canonical_environment_requirements(
+            control_test_command(temp.path(), temp.path())
+                .with_workspace_access(WorkspaceAccess::ReadOnly),
+            &requirements,
+        );
+
+        assert_eq!(child.environment_requirements, requirements);
+        assert_eq!(auditor.environment_requirements, requirements);
+    }
+
+    #[test]
+    fn environment_preflight_refusal_is_typed_terminal_and_not_malformed_or_containment() {
+        let assignment = injected_assignment(true);
+        let command = control_test_command(Path::new("."), Path::new("."));
+        let requirement =
+            EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
+        let marker = "DO_NOT_PERSIST_PREFLIGHT_SECRET_MARKER";
+        let failure = EnvironmentFailure {
+            category: EnvironmentFailureCategory::MissingCredential,
+            requirement: Some(requirement.clone()),
+            summary: marker.to_string(),
+            remediation: Vec::new(),
+        };
+        let preflight = EnvironmentPreflightResult {
+            requirement,
+            status: EnvironmentPreflightStatus::Blocked,
+            observation: None,
+        };
+        let mut run_value = serde_json::to_value(injected_verified_run_without_journals(&command))
+            .expect("serialize injected run");
+        run_value["exit_code"] = Value::Null;
+        run_value["process_tree"] = Value::Null;
+        run_value["side_effects"] = Value::Null;
+        run_value["publishable"] = Value::Bool(false);
+        run_value["codex_permissions"] = Value::Null;
+        run_value["environment_preflight_results"] =
+            serde_json::to_value([preflight]).expect("serialize preflight result");
+        run_value["environment_failures"] =
+            serde_json::to_value([failure]).expect("serialize environment failure");
+        run_value["error"] =
+            Value::String("environment preflight blocked the assignment".to_string());
+        let run: ExternalAgentRun =
+            serde_json::from_value(run_value).expect("restore environment-blocked run");
+        assert!(run.environment_blocked());
+        assert!(!external_safety_verified(&run, SupervisorRuntime::Codex));
+        assert!(external_containment_verified(
+            &run,
+            SupervisorRuntime::Codex
+        ));
+
+        let mut unverified_preflight =
+            serde_json::to_value(&run).expect("serialize environment-blocked run");
+        unverified_preflight["environment_preflight_process_started"] = Value::Bool(true);
+        unverified_preflight["process_tree"] = serde_json::to_value(
+            ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+        )
+        .expect("serialize unverified preflight process tree");
+        unverified_preflight["side_effects"] =
+            serde_json::to_value(SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ))
+            .expect("serialize unverified preflight side effects");
+        let unverified_preflight: ExternalAgentRun = serde_json::from_value(unverified_preflight)
+            .expect("restore unverified environment preflight");
+        assert!(unverified_preflight.environment_blocked());
+        assert!(!unverified_preflight.environment_preflight_quiescence_verified());
+        assert!(!external_containment_verified(
+            &unverified_preflight,
+            SupervisorRuntime::Codex
+        ));
+
+        let child_base_head = injected_oid("environment-blocked-base");
+        let worker_journals = WorkerExecutionJournalEvidenceSet::default();
+        let (report, shape_problems) = collect_child_report(ChildReportCollectionContext {
+            assignment: &assignment,
+            assignment_metadata: &AssignmentMetadata::new(),
+            report_path: Path::new("environment-blocked.json"),
+            external_run: &run,
+            external_command: &command,
+            worktree_path: Path::new("."),
+            child_base_head: &child_base_head,
+            worker_journals: &worker_journals,
+        });
+
+        assert!(shape_problems.is_empty());
+        assert!(!should_retry_child_report(&report, &shape_problems, 1, 2));
+        assert_eq!(report.status, ReviewStatus::Failed);
+        assert!(!report.accepted);
+        assert!(report.rejected);
+        assert_eq!(report.worker_reports.len(), 1);
+        assert!(report
+            .worker_reports
+            .iter()
+            .all(|worker| !worker.environment_failures.is_empty()
+                && worker.status == ReviewStatus::Failed
+                && !worker.accepted));
+        assert!(report.gate_denials.is_empty());
+        let findings = finding_messages(&report);
+        assert!(findings.contains("environment preflight blocked"));
+        assert!(!findings.contains("missing or invalid"));
+        assert!(!findings.contains("containment"));
+        assert_eq!(report.commands_run.len(), 1);
+        assert_eq!(
+            report.commands_run[0].environment_preflight_results.len(),
+            1
+        );
+        assert_eq!(report.commands_run[0].environment_failures.len(), 1);
+        let aggregate =
+            aggregate_environment_failures(&report.commands_run, std::slice::from_ref(&report));
+        assert_eq!(aggregate.len(), 1);
+        assert!(!serde_json::to_string(&(report, aggregate))
+            .expect("serialize environment-blocked evidence")
+            .contains(marker));
+    }
 
     #[cfg(unix)]
     fn mandatory_control_test_workspace() -> (tempfile::TempDir, PathBuf) {
@@ -14069,6 +15211,7 @@ mod tests {
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
             task: Some("implement the nested execution task".to_string()),
+            environment_requirements: Vec::new(),
             report_path: None,
         });
         let mut plan = injected_multi_plan(vec![planning.clone(), execution.clone()], 0);
@@ -15380,8 +16523,10 @@ mod tests {
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
                     task: None,
+                    environment_requirements: Vec::new(),
                     report_path: None,
                 }],
+                environment_requirements: Vec::new(),
                 notes: None,
             }],
         };
@@ -15403,6 +16548,7 @@ mod tests {
             claim_token: None,
             semantic_intent_token: None,
             commands_run: Vec::new(),
+            environment_failures: Vec::new(),
             files_changed: Vec::new(),
             validation_results: Vec::new(),
             findings: Vec::new(),
@@ -15418,6 +16564,7 @@ mod tests {
                 claim_token: None,
                 semantic_intent_token: None,
                 commands_run: Vec::new(),
+                environment_failures: Vec::new(),
                 files_changed: Vec::new(),
                 validation_results: Vec::new(),
                 findings: Vec::new(),
@@ -15447,6 +16594,7 @@ mod tests {
             reviewed_worker_ids: vec![worker_id.to_string()],
             reviewed_paths: vec![PathBuf::from("README.md")],
             commands_run: Vec::new(),
+            environment_failures: Vec::new(),
             validation_results: Vec::new(),
             findings: Vec::new(),
             no_further_delegation: Some(true),
@@ -19001,8 +20149,10 @@ mod tests {
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
                     task: None,
+                    environment_requirements: Vec::new(),
                     report_path: Some(path.clone()),
                 }],
+                environment_requirements: Vec::new(),
                 notes: None,
             }],
         };
@@ -19025,6 +20175,8 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             sandbox_denials: Vec::new(),
+            environment_preflight_results: Vec::new(),
+            environment_failures: Vec::new(),
             error: None,
         };
         let value = serde_json::to_value(record).expect("serialize command cwd");
@@ -20609,10 +21761,12 @@ mod tests {
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
                     task: None,
+                    environment_requirements: Vec::new(),
                     report_path: None,
                 })
                 .into_iter()
                 .collect(),
+            environment_requirements: Vec::new(),
             notes: None,
         }
     }
@@ -20626,6 +21780,7 @@ mod tests {
             semantic_modules: Vec::new(),
             task: None,
             worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
             notes: None,
         }
     }
@@ -20727,6 +21882,7 @@ mod tests {
             total_cost_usd: None,
             usage_complete: false,
             commands_run: Vec::new(),
+            environment_failures: Vec::new(),
             sandbox_denials: Vec::new(),
             gate_denials: Vec::new(),
             pre_action_review_metrics: Vec::new(),
@@ -20764,6 +21920,7 @@ mod tests {
                 claim_token: None,
                 semantic_intent_token: None,
                 commands_run: Vec::new(),
+                environment_failures: Vec::new(),
                 files_changed: Vec::new(),
                 validation_results: vec![ValidationResult {
                     name: "injected worker validation".to_string(),
@@ -20792,6 +21949,7 @@ mod tests {
             claim_token: None,
             semantic_intent_token: None,
             commands_run: Vec::new(),
+            environment_failures: Vec::new(),
             files_changed: Vec::new(),
             validation_results: vec![ValidationResult {
                 name: "injected child validation".to_string(),
@@ -20824,6 +21982,7 @@ mod tests {
             reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child),
             reviewed_paths: required_auditor_review_paths(assignment, child),
             commands_run: Vec::new(),
+            environment_failures: Vec::new(),
             validation_results: vec![ValidationResult {
                 name: "injected auditor validation".to_string(),
                 status: ReviewStatus::Succeeded,
@@ -21034,6 +22193,8 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             sandbox_denials: Vec::new(),
+            environment_preflight_results: Vec::new(),
+            environment_failures: Vec::new(),
             error: None,
         }
     }
