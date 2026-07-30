@@ -1099,6 +1099,42 @@ impl BoundedRegularReader {
         }
     }
 
+    /// Reads a no-follow tree path while validating metadata from the exact opened descriptor
+    /// before and after the bounded read.
+    ///
+    /// The validator is intended for policy beyond the regular/single-link invariant, such as
+    /// current-user ownership and mode checks on security-sensitive configuration.
+    pub fn read_tree_no_follow_validated<F>(
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+        mut validate: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(&fs::Metadata) -> Result<()>,
+    {
+        let absolute = absolute_normalized(path.as_ref())?;
+        #[cfg(unix)]
+        {
+            let root = Path::new(std::path::MAIN_SEPARATOR_STR);
+            let relative = absolute.strip_prefix(root).with_context(|| {
+                format!("failed to make path root-relative: {}", absolute.display())
+            })?;
+            let mut file = open_relative_regular_unix_allow_mounts(root, relative)?;
+            read_bounded_file_with_validator_and_hook(
+                &mut file,
+                &absolute,
+                max_bytes,
+                &mut validate,
+                || {},
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (absolute, max_bytes, &mut validate);
+            bail!("component-wise validated no-follow reads are unsupported on this platform")
+        }
+    }
+
     /// Reads an arbitrary UTF-8 filesystem input without following symbolic
     /// links in any ancestor or in the final leaf.
     pub fn read_tree_no_follow_utf8(path: impl AsRef<Path>, max_bytes: u64) -> Result<String> {
@@ -2504,10 +2540,29 @@ fn read_bounded_file_with_hook(
     max_bytes: u64,
     after_initial_metadata: impl FnOnce(),
 ) -> Result<Vec<u8>> {
+    let mut validate = |_: &fs::Metadata| Ok(());
+    read_bounded_file_with_validator_and_hook(
+        file,
+        path,
+        max_bytes,
+        &mut validate,
+        after_initial_metadata,
+    )
+}
+
+fn read_bounded_file_with_validator_and_hook(
+    file: &mut File,
+    path: &Path,
+    max_bytes: u64,
+    validate: &mut impl FnMut(&fs::Metadata) -> Result<()>,
+    after_initial_metadata: impl FnOnce(),
+) -> Result<Vec<u8>> {
     let before = file
         .metadata()
         .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
     ensure_regular_single_link_metadata(path, &before)?;
+    validate(&before)
+        .with_context(|| format!("opened file metadata policy rejected {}", path.display()))?;
     if before.len() > max_bytes {
         bail!(
             "file exceeds bounded read limit of {} bytes (observed {}): {}",
@@ -2540,6 +2595,8 @@ fn read_bounded_file_with_hook(
         .metadata()
         .with_context(|| format!("failed to revalidate opened file {}", path.display()))?;
     ensure_regular_single_link_metadata(path, &after)?;
+    validate(&after)
+        .with_context(|| format!("opened file metadata policy changed for {}", path.display()))?;
     if !same_file_generation(&before, &after) {
         bail!(
             "file identity changed during bounded read: {}",
@@ -5044,6 +5101,48 @@ mod tests {
         })
         .expect_err("truncation during read must fail");
         assert!(truncated.to_string().contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_metadata_validator_is_bound_to_the_open_descriptor_generation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("validated-input");
+        fs::write(&path, b"reviewed").expect("write input");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private input mode");
+        let validator = |metadata: &fs::Metadata| -> Result<()> {
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+                bail!("unsafe descriptor metadata");
+            }
+            Ok(())
+        };
+        assert_eq!(
+            BoundedRegularReader::read_tree_no_follow_validated(&path, 32, validator)
+                .expect("validated read"),
+            b"reviewed"
+        );
+
+        let mut opened = open_regular_no_follow(&path, false).expect("open validated input");
+        let mut validator = |metadata: &fs::Metadata| -> Result<()> {
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+                bail!("unsafe descriptor metadata");
+            }
+            Ok(())
+        };
+        let changed = read_bounded_file_with_validator_and_hook(
+            &mut opened,
+            &path,
+            32,
+            &mut validator,
+            || {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o622))
+                    .expect("make descriptor unsafe");
+            },
+        )
+        .expect_err("permission change on the opened descriptor must fail");
+        assert!(changed.to_string().contains("metadata policy"));
     }
 
     #[cfg(unix)]

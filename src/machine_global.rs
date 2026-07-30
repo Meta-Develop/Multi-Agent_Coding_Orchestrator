@@ -283,13 +283,17 @@ impl MachineGlobalStore {
     pub fn open_config(path: impl AsRef<Path>) -> Result<Self> {
         let config_path = require_exact_canonical_regular_file(path.as_ref())
             .context("machine-global config path is not exact and canonical")?;
-        let bytes = BoundedRegularReader::read_tree_no_follow(&config_path, CONFIG_MAX_BYTES)
-            .with_context(|| {
-                format!(
-                    "failed to read machine-global config {}",
-                    config_path.display()
-                )
-            })?;
+        let bytes = BoundedRegularReader::read_tree_no_follow_validated(
+            &config_path,
+            CONFIG_MAX_BYTES,
+            validate_machine_global_config_metadata,
+        )
+        .with_context(|| {
+            format!(
+                "failed to read machine-global config {}",
+                config_path.display()
+            )
+        })?;
         let config: MachineGlobalConfig =
             serde_json::from_slice(&bytes).context("machine-global config is invalid JSON")?;
         if config.version != CONFIG_VERSION {
@@ -1474,6 +1478,25 @@ fn require_exact_canonical_regular_file(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+#[cfg(unix)]
+fn validate_machine_global_config_metadata(metadata: &fs::Metadata) -> Result<()> {
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("machine-global config must be owned by the current user");
+    }
+    if metadata.nlink() != 1 {
+        bail!("machine-global config must have exactly one hard link");
+    }
+    if metadata.mode() & 0o022 != 0 {
+        bail!("machine-global config must not be group- or world-writable");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_machine_global_config_metadata(_metadata: &fs::Metadata) -> Result<()> {
+    bail!("machine-global config metadata policy is unsupported on this platform")
+}
+
 fn require_exact_canonical_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!("path must be absolute");
@@ -1961,6 +1984,11 @@ mod tests {
         let config_link = fixture._temp.path().join("config-link.json");
         symlink(&fixture.config_path, &config_link).expect("config symlink");
         assert!(MachineGlobalStore::open_config(config_link).is_err());
+
+        let config_hardlink = fixture._temp.path().join("config-hardlink.json");
+        fs::hard_link(&fixture.config_path, &config_hardlink).expect("config hard link");
+        assert!(MachineGlobalStore::open_config(&fixture.config_path).is_err());
+        fs::remove_file(config_hardlink).expect("remove config hard link");
 
         fs::set_permissions(&fixture.config_path, fs::Permissions::from_mode(0o666))
             .expect("writable config");
