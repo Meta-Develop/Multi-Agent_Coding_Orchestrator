@@ -218,14 +218,26 @@ pub enum DestructiveTargetDenial {
 pub enum GateDenialReason {
     ClaimConflict,
     AuditorRepair,
-    ValidationRepair { blocker: ApplyBlocker },
-    MergeRemediation { blocker: ApplyBlocker },
+    ValidationRepair {
+        blocker: ApplyBlocker,
+    },
+    MergeRemediation {
+        blocker: ApplyBlocker,
+    },
     ContainmentFailure,
     PrimaryIntegrityFailure,
-    ExternalSideEffect { state: ExternalSideEffectState },
-    Sandbox { evidence: SandboxDenialEvidence },
-    DestructiveTarget { denial: DestructiveTargetDenial },
-    ApprovalReview { denial: ApprovalReviewDenial },
+    ExternalSideEffect {
+        state: ExternalSideEffectState,
+    },
+    Sandbox {
+        evidence: SandboxDenialEvidence,
+    },
+    DestructiveTarget {
+        denial: Box<DestructiveTargetDenial>,
+    },
+    ApprovalReview {
+        denial: ApprovalReviewDenial,
+    },
 }
 
 /// Whether the denied operation may be attempted again after correction.
@@ -470,7 +482,9 @@ impl GateDenial {
         )?;
         Self::new(
             correction_correlation_id,
-            GateDenialReason::DestructiveTarget { denial },
+            GateDenialReason::DestructiveTarget {
+                denial: Box::new(denial),
+            },
             context,
         )
     }
@@ -1040,20 +1054,18 @@ fn prompt_paths<'a>(
     paths
 }
 
-fn prompt_declared_coordinates<'a>(
-    reason: &'a GateDenialReason,
-) -> BTreeSet<&'a DeclaredPathCoordinate> {
+fn prompt_declared_coordinates(reason: &GateDenialReason) -> BTreeSet<&DeclaredPathCoordinate> {
     match reason {
-        GateDenialReason::DestructiveTarget {
-            denial:
-                DestructiveTargetDenial::ActiveClaimIntersection {
-                    target,
-                    active_claim,
-                },
-        } => BTreeSet::from([target, active_claim]),
-        GateDenialReason::DestructiveTarget {
-            denial: DestructiveTargetDenial::ProtectedPathIntersection { target, protected },
-        } => BTreeSet::from([target, protected.coordinate()]),
+        GateDenialReason::DestructiveTarget { denial } => match denial.as_ref() {
+            DestructiveTargetDenial::ActiveClaimIntersection {
+                target,
+                active_claim,
+            } => BTreeSet::from([target, active_claim]),
+            DestructiveTargetDenial::ProtectedPathIntersection { target, protected } => {
+                BTreeSet::from([target, protected.coordinate()])
+            }
+            DestructiveTargetDenial::UndeclaredTarget { .. } => BTreeSet::new(),
+        },
         _ => BTreeSet::new(),
     }
 }
@@ -1091,7 +1103,7 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
             }
             SandboxDenialRetryability::NotRetryable => "non-retryable sandbox denial",
         },
-        GateDenialReason::DestructiveTarget { denial } => match denial {
+        GateDenialReason::DestructiveTarget { denial } => match denial.as_ref() {
             DestructiveTargetDenial::ActiveClaimIntersection { .. } => {
                 "destructive target intersects an active claim"
             }
@@ -1535,10 +1547,10 @@ mod tests {
         assert_eq!(
             claim_denial.reason,
             GateDenialReason::DestructiveTarget {
-                denial: DestructiveTargetDenial::ActiveClaimIntersection {
+                denial: Box::new(DestructiveTargetDenial::ActiveClaimIntersection {
                     target: target.clone(),
                     active_claim,
-                }
+                })
             }
         );
 
@@ -1557,10 +1569,10 @@ mod tests {
         assert_eq!(
             protected_denial.reason,
             GateDenialReason::DestructiveTarget {
-                denial: DestructiveTargetDenial::ProtectedPathIntersection {
+                denial: Box::new(DestructiveTargetDenial::ProtectedPathIntersection {
                     target: protected_target,
                     protected,
-                }
+                })
             }
         );
 
@@ -1596,9 +1608,10 @@ mod tests {
             .corrective_prompt()
             .expect("protected correction prompt")
             .contains("\"session-store\""));
-        let GateDenialReason::DestructiveTarget {
-            denial: DestructiveTargetDenial::UndeclaredTarget { target_fingerprint },
-        } = &undeclared.reason
+        let GateDenialReason::DestructiveTarget { denial } = &undeclared.reason else {
+            panic!("expected undeclared-target denial");
+        };
+        let DestructiveTargetDenial::UndeclaredTarget { target_fingerprint } = denial.as_ref()
         else {
             panic!("expected undeclared-target denial");
         };
@@ -1812,9 +1825,9 @@ mod tests {
             ),
             (
                 GateDenialReason::DestructiveTarget {
-                    denial: DestructiveTargetDenial::UndeclaredTarget {
+                    denial: Box::new(DestructiveTargetDenial::UndeclaredTarget {
                         target_fingerprint: "0".repeat(64),
-                    },
+                    }),
                 },
                 GateCheckSource::DestructiveTargetPreflight,
             ),
