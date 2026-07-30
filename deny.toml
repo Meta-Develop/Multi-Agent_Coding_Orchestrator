@@ -1,0 +1,72 @@
+# Audit every package and target represented in Cargo.lock, including
+# development and build dependencies.
+[graph]
+targets = []
+exclude = []
+all-features = false
+no-default-features = false
+exclude-dev = false
+
+[advisories]
+# Security advisories must be fixed in the dependency graph rather than
+# suppressed. Add an ignore only for a documented, temporarily unfixable case.
+ignore = []
+
+[licenses]
+include-dev = true
+allow = [
+    # MIT is one of the public package's declared options. Every dependency in
+    # this graph that offers Apache-2.0 also offers MIT, so no Apache-only
+    # allowance is required.
+    "MIT",
+    # Unicode-3.0 covers Unicode data used by unicode-ident. Its permissive
+    # notice terms are compatible with this MIT OR Apache-2.0 distribution.
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # libz-sys ships stock zlib and may build it for static, Windows, or
+    # no-compatible-system-library fallbacks. Keep Zlib permission scoped to
+    # the exact locked crate.
+    { allow = ["Zlib"], crate = "libz-sys@1.1.28" },
+]
+
+[[licenses.clarify]]
+crate = "libz-sys@1.1.28"
+expression = "(MIT OR Apache-2.0) AND Zlib"
+license-files = [
+    { path = "LICENSE-APACHE", hash = 0x24b54f4b },
+    { path = "LICENSE-MIT", hash = 0x88396382 },
+    { path = "src/zlib/LICENSE", hash = 0xcbc15cd1 },
+]
+
+[bans]
+# Duplicate package versions increase patching and review burden. The current
+# lockfile needs no duplicate-version exceptions.
+multiple-versions = "deny"
+multiple-versions-include-dev = true
+# Every direct dependency must use an explicit semver requirement.
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+# Apply the same ban and wildcard rules to this workspace package; workspace
+# membership must not exempt a future direct dependency from review.
+allow-workspace = false
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# All dependencies must come from the canonical crates.io registry. Git and
+# alternate registry dependencies require a deliberate policy review.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
