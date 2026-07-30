@@ -1709,6 +1709,7 @@ fn run_before_recovery_mutation_hook() {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::gate_denial::{DestructiveTargetDenial, GateDenialReason};
     use std::{
         os::unix::{fs::symlink, fs::PermissionsExt},
         sync::mpsc,
@@ -1815,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn two_concurrent_agents_repair_claim_blocks_reclaimer_across_independent_stores() {
+    fn durable_repair_claim_blocks_later_reclaimer_across_independent_stores() {
         let fixture = Fixture::new(&[], 60);
         let session = fixture.directory("sessions/current");
         fs::write(session.join("irrecoverable"), "keep").expect("valuable data");
@@ -1866,6 +1867,92 @@ mod tests {
             .store()
             .release("repair-agent", claim.token)
             .expect("release");
+    }
+
+    #[test]
+    fn concurrent_repair_mutation_survives_reclaim_attempt_during_live_claim() {
+        let fixture = Fixture::new(&[], 60);
+        let session = fixture.directory("sessions/current");
+        let repair_data = session.join("irrecoverable");
+        fs::write(&repair_data, "damaged").expect("damaged data");
+        let config_for_repair = fixture.config_path.clone();
+        let config_for_reclaimer = fixture.config_path.clone();
+        let repair_data_for_thread = repair_data.clone();
+        let (repair_inside_tx, repair_inside_rx) = mpsc::channel();
+        let (reclaim_attempted_tx, reclaim_attempted_rx) = mpsc::channel();
+
+        let repair = thread::spawn(move || {
+            let store = MachineGlobalStore::open_config(config_for_repair).expect("repair store");
+            let claim = allowed_claim(
+                store
+                    .claim(
+                        "repair-agent",
+                        "repair-correlation",
+                        vec![coordinate("sessions")],
+                    )
+                    .expect("repair claim"),
+            );
+            fs::write(&repair_data_for_thread, "repair-in-progress")
+                .expect("start repair mutation");
+            repair_inside_tx
+                .send(())
+                .expect("signal protected repair section");
+            reclaim_attempted_rx
+                .recv()
+                .expect("wait for reclaim attempt");
+            assert_eq!(
+                fs::read_to_string(&repair_data_for_thread).expect("repair data survives"),
+                "repair-in-progress"
+            );
+            fs::write(&repair_data_for_thread, "repaired").expect("finish repair mutation");
+            assert_eq!(
+                fs::read_to_string(&repair_data_for_thread).expect("completed repair survives"),
+                "repaired"
+            );
+            store
+                .release("repair-agent", claim.token)
+                .expect("release repair claim");
+        });
+
+        let reclaim = thread::spawn(move || {
+            repair_inside_rx
+                .recv()
+                .expect("wait for protected repair section");
+            let outcome = MachineGlobalStore::open_config(config_for_reclaimer).and_then(|store| {
+                store.quarantine_at(
+                    "reclaim-agent",
+                    "reclaim-correlation",
+                    vec![declared("sessions/current")],
+                    100,
+                )
+            });
+            reclaim_attempted_tx
+                .send(())
+                .expect("acknowledge reclaim attempt");
+            outcome.expect("typed reclaim outcome")
+        });
+
+        let outcome = reclaim.join().expect("reclaim thread");
+        repair.join().expect("repair thread");
+        let GateOutcome::Denied(denial) = outcome else {
+            panic!("reclaimer must be denied while the repair mutation is protected");
+        };
+        let GateDenialReason::DestructiveTarget { denial } = denial.reason else {
+            panic!("reclaimer must receive a destructive-target denial");
+        };
+        let DestructiveTargetDenial::ActiveClaimIntersection {
+            target,
+            active_claim,
+        } = *denial
+        else {
+            panic!("reclaimer must receive an active-claim intersection denial");
+        };
+        assert_eq!(target, coordinate("sessions/current"));
+        assert_eq!(active_claim, coordinate("sessions"));
+        assert_eq!(
+            fs::read_to_string(repair_data).expect("repaired data survives"),
+            "repaired"
+        );
     }
 
     #[test]
