@@ -3660,7 +3660,7 @@ pub(crate) fn load_codex_runtime_model_catalog(
     {
         if program != Path::new("codex") {
             bail!(
-                "Codex runtime model catalog preflight is restricted to the trusted system Codex executable; explicit custom executables receive no auth or provider network access"
+                "Codex runtime model catalog preflight requires the trusted system Codex executable and verified process-tree ownership; explicit custom executables receive no auth or provider network access"
             );
         }
         if timeout.is_zero() {
