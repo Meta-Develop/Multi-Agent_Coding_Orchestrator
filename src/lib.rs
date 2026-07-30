@@ -17,6 +17,7 @@ pub mod gate_denial;
 pub mod inbox;
 pub mod live_claim;
 pub mod llm;
+pub mod machine_global;
 pub mod megafile;
 pub mod merge;
 pub(crate) mod merge_semantic;
