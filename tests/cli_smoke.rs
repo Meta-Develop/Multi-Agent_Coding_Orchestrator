@@ -3,6 +3,8 @@ use git2::{Oid, Repository, Signature};
 use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::{collections::BTreeMap, path::PathBuf};
 use std::{
     fs::{self, File},
     path::Path,
@@ -11,6 +13,13 @@ use std::{
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+#[cfg(unix)]
+const ISSUE33_PINNED_WRAPPER_ENV: &str = "MACO_ISSUE33_PINNED_WRAPPER";
+#[cfg(unix)]
+const ISSUE33_PINNED_WRAPPER_SHA256: &str =
+    "93b76ebff318fb75e44f8ce48b5b48b4bad5435045d9fe736c4e1fc587a0d814";
+#[cfg(unix)]
+const ISSUE33_PINNED_CHECKOUT_HEAD: &str = "66f59aa253868d1dd909b012e04c548e7b669d2f";
 const ISSUE33_CLAIMS_V1: &[u8] = include_bytes!("fixtures/issue33/agent-files-claims-v1.json");
 const ISSUE33_CLAIMS_V1_SHA256: &str =
     "85ca48c7b658a3f28b4d3758268a41319b86f9b9bef78637bda7069cc2b83111";
@@ -23,50 +32,20 @@ const ISSUE33_PHYSICAL_JOURNAL_MANIFEST: &str =
 #[test]
 fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
-    let repo_path = create_committed_repo(temp.path())?;
-    let repository = Repository::open(&repo_path).context("open repo")?;
-    let state_root = repository.commondir().join("maco/state");
-    fs::create_dir_all(&state_root).context("create temporary state root")?;
-    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
-        .context("make temporary state root owner-private")?;
-    write_private_test_state_file(
-        &state_root.join("artifact_finalization_hmac_v1.key"),
-        &[0x33; 32],
-    )?;
-    write_private_test_state_file(&state_root.join("repository_auth_epoch_v1"), &[0x34; 32])?;
-    fs::write(state_root.join("claims.json"), ISSUE33_CLAIMS_V1)
-        .context("write checksum-less claims-v1 fixture")?;
-    fs::set_permissions(
-        state_root.join("claims.json"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .context("make checksum-less claims-v1 fixture owner-private")?;
-
-    let journal_root = state_root.join("authenticated-claims-state-v1");
-    fs::create_dir(&journal_root).context("create temporary authenticated claims journal root")?;
-    fs::set_permissions(&journal_root, fs::Permissions::from_mode(0o700))
-        .context("make temporary claims journal root owner-private")?;
-    let physical_journal = journal_root.join(ISSUE33_PHYSICAL_JOURNAL_ID);
-    let verified_manifest_files = verify_issue33_physical_journal_fixture()?;
-    let copied_files = copy_issue33_physical_journal_fixture(&physical_journal)?;
-    assert_eq!(
-        copied_files, verified_manifest_files,
-        "the regression must install every captured physical-journal file"
-    );
+    let installed = install_issue33_unanchored_claim_state(&temp)?;
+    let repo_path = installed.repo_path;
+    let repository = installed.repository;
+    let journal_root = installed.journal_root;
 
     let repo = repo_path.to_str().context("repo path utf8")?;
-    let blocked = Command::new(BIN)
-        .args(["sync", "status", "--repo", repo, "--json"])
-        .output()
-        .context("run sync status against unanchored physical journal")?;
-    assert!(!blocked.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&blocked.stderr).trim(),
-        format!(
-            "Error: authenticated snapshot physical journal '{}' is not anchored by any signed logical state",
-            ISSUE33_PHYSICAL_JOURNAL_ID
-        )
-    );
+    assert_issue33_dev_unanchored_failure(
+        ["sync", "status", "--repo", repo, "--json"],
+        "run sync status against unanchored physical journal",
+    )?;
+    assert_issue33_dev_unanchored_failure(
+        ["worktree", "gc", "--repo", repo, "--dry-run", "--json"],
+        "run pre-recovery worktree gc dry-run against unanchored physical journal",
+    )?;
 
     let fixture_source = issue33_physical_journal_fixture();
     let quarantine_root = repository
@@ -114,6 +93,300 @@ fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> 
     assert_eq!(claims_entry["sha256"], ISSUE33_CLAIMS_V1_SHA256);
 
     let status = run_success_json(["sync", "status", "--repo", repo, "--json"])?;
+    assert_issue33_claim_status(&status)?;
+
+    let gc = run_success_json(["worktree", "gc", "--repo", repo, "--dry-run", "--json"])?;
+    assert_eq!(gc["dry_run"], true);
+    assert_eq!(gc["considered_count"], 0);
+    assert_eq!(gc["removed_count"], 0);
+    assert_eq!(gc["orphan_removed_count"], 0);
+    assert!(
+        quarantined_namespace.is_dir(),
+        "successful consumers must preserve the complete quarantined namespace"
+    );
+    assert!(
+        quarantined_journal.is_dir(),
+        "the captured physical journal must remain inside the quarantined namespace"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires MACO_ISSUE33_PINNED_WRAPPER to name an operator-provided registry-pinned wrapper"]
+fn cli_issue33_same_installed_state_proves_dev_pinned_asymmetry_and_gc_failure() -> Result<()> {
+    let pinned_package = issue33_pinned_package_from_env()?;
+    pinned_package
+        .verify_identity()
+        .context("verify registry-pinned package before invocation")?;
+    let temp = TempDir::new().context("tempdir")?;
+    let installed = install_issue33_unanchored_claim_state(&temp)?;
+    let repo = installed.repo_path.to_str().context("repo path utf8")?;
+    let claims_before =
+        fs::read(installed.state_root.join("claims.json")).context("read installed claims-v1")?;
+    let journal_before = issue33_journal_bytes(&installed.physical_journal)?;
+
+    let pinned = Command::new(&pinned_package.wrapper)
+        .args(["sync", "status", "--repo", repo, "--json"])
+        .env("CARGO_TARGET_DIR", temp.path().join("pinned-target"))
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_BUILD_JOBS", "1")
+        .env("CARGO_PROFILE_DEV_DEBUG", "0")
+        .output()
+        .with_context(|| {
+            format!(
+                "run registry-pinned wrapper {} against installed Issue 33 state",
+                pinned_package.wrapper.display()
+            )
+        })?;
+    pinned_package
+        .verify_identity()
+        .context("verify registry-pinned package after invocation")?;
+    assert!(
+        pinned.status.success(),
+        "registry-pinned sync status must succeed on the installed Issue 33 state; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&pinned.stdout),
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+    let pinned_status: Value =
+        serde_json::from_slice(&pinned.stdout).context("parse registry-pinned sync status JSON")?;
+    assert_issue33_claim_status(&pinned_status)?;
+    assert!(
+        !installed.state_root.join("claims.lock").exists(),
+        "registry-pinned sync status must release its transient legacy claims lock"
+    );
+
+    assert_issue33_dev_unanchored_failure(
+        ["sync", "status", "--repo", repo, "--json"],
+        "run development sync status against the pinned-observed installed state",
+    )?;
+    assert_issue33_dev_unanchored_failure(
+        [
+            "worktree", "gc", "--repo", repo, "--dry-run", "--json",
+        ],
+        "run pre-recovery development worktree gc dry-run against the pinned-observed installed state",
+    )?;
+
+    assert_eq!(
+        fs::read(installed.state_root.join("claims.json"))
+            .context("reread installed claims-v1 after all three observations")?,
+        claims_before,
+        "all three observations must use the same unchanged claims-v1 bytes"
+    );
+    assert_eq!(
+        issue33_journal_bytes(&installed.physical_journal)?,
+        journal_before,
+        "all three observations must use the same unchanged physical-journal bytes"
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+struct Issue33InstalledState {
+    repo_path: PathBuf,
+    repository: Repository,
+    state_root: PathBuf,
+    journal_root: PathBuf,
+    physical_journal: PathBuf,
+}
+
+#[cfg(unix)]
+fn install_issue33_unanchored_claim_state(temp: &TempDir) -> Result<Issue33InstalledState> {
+    let repo_path = create_committed_repo(temp.path())?;
+    let repository = Repository::open(&repo_path).context("open repo")?;
+    let state_root = repository.commondir().join("maco/state");
+    fs::create_dir_all(&state_root).context("create temporary state root")?;
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+        .context("make temporary state root owner-private")?;
+    write_private_test_state_file(
+        &state_root.join("artifact_finalization_hmac_v1.key"),
+        &[0x33; 32],
+    )?;
+    write_private_test_state_file(&state_root.join("repository_auth_epoch_v1"), &[0x34; 32])?;
+    fs::write(state_root.join("claims.json"), ISSUE33_CLAIMS_V1)
+        .context("write checksum-less claims-v1 fixture")?;
+    fs::set_permissions(
+        state_root.join("claims.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .context("make checksum-less claims-v1 fixture owner-private")?;
+
+    let journal_root = state_root.join("authenticated-claims-state-v1");
+    fs::create_dir(&journal_root).context("create temporary authenticated claims journal root")?;
+    fs::set_permissions(&journal_root, fs::Permissions::from_mode(0o700))
+        .context("make temporary claims journal root owner-private")?;
+    let physical_journal = journal_root.join(ISSUE33_PHYSICAL_JOURNAL_ID);
+    let verified_manifest_files = verify_issue33_physical_journal_fixture()?;
+    let copied_files = copy_issue33_physical_journal_fixture(&physical_journal)?;
+    assert_eq!(
+        copied_files, verified_manifest_files,
+        "the regression must install every captured physical-journal file"
+    );
+
+    Ok(Issue33InstalledState {
+        repo_path,
+        repository,
+        state_root,
+        journal_root,
+        physical_journal,
+    })
+}
+
+#[cfg(unix)]
+struct Issue33PinnedPackage {
+    wrapper: PathBuf,
+    checkout: PathBuf,
+}
+
+#[cfg(unix)]
+impl Issue33PinnedPackage {
+    fn verify_identity(&self) -> Result<()> {
+        anyhow::ensure!(
+            issue33_sha256sum(&self.wrapper)? == ISSUE33_PINNED_WRAPPER_SHA256,
+            "registry-pinned wrapper digest changed"
+        );
+        anyhow::ensure!(
+            issue33_git_stdout(&self.checkout, &["rev-parse", "--verify", "HEAD^{commit}"])?
+                == ISSUE33_PINNED_CHECKOUT_HEAD,
+            "registry-pinned checkout HEAD changed"
+        );
+        anyhow::ensure!(
+            issue33_git_stdout(
+                &self.checkout,
+                &["status", "--porcelain=v1", "--untracked-files=all"]
+            )?
+            .is_empty(),
+            "registry-pinned checkout must have a clean index and worktree"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn issue33_pinned_package_from_env() -> Result<Issue33PinnedPackage> {
+    let wrapper = std::env::var_os(ISSUE33_PINNED_WRAPPER_ENV).with_context(|| {
+        format!(
+            "{ISSUE33_PINNED_WRAPPER_ENV} is required; set it to the absolute registry-backed .agents/scripts/maco wrapper"
+        )
+    })?;
+    let wrapper = PathBuf::from(wrapper);
+    anyhow::ensure!(
+        wrapper.is_absolute(),
+        "{ISSUE33_PINNED_WRAPPER_ENV} must be an absolute path"
+    );
+    let metadata = fs::metadata(&wrapper)
+        .with_context(|| format!("inspect registry-pinned wrapper {}", wrapper.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{ISSUE33_PINNED_WRAPPER_ENV} is not a file: {}",
+        wrapper.display()
+    );
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o111 != 0,
+        "{ISSUE33_PINNED_WRAPPER_ENV} is not executable: {}",
+        wrapper.display()
+    );
+    let wrapper = fs::canonicalize(&wrapper)
+        .with_context(|| format!("resolve registry-pinned wrapper {}", wrapper.display()))?;
+    let scripts_dir = wrapper
+        .parent()
+        .context("registry-pinned wrapper has no scripts directory")?;
+    let project_root = fs::canonicalize(scripts_dir.join("../.."))
+        .context("resolve registry-pinned wrapper project root")?;
+    let expected_wrapper = fs::canonicalize(project_root.join(".agents/scripts/maco"))
+        .context("resolve expected project-local MACO wrapper")?;
+    anyhow::ensure!(
+        wrapper == expected_wrapper,
+        "{ISSUE33_PINNED_WRAPPER_ENV} must resolve to <project>/.agents/scripts/maco"
+    );
+    let manifest = fs::canonicalize(
+        project_root.join(".agents/external/multi-agent-coding-orchestrator/Cargo.toml"),
+    )
+    .context("resolve registry-pinned package manifest")?;
+    let checkout = manifest
+        .parent()
+        .context("registry-pinned package manifest has no checkout parent")?
+        .to_path_buf();
+    let git_toplevel = fs::canonicalize(issue33_git_stdout(
+        &checkout,
+        &["rev-parse", "--show-toplevel"],
+    )?)
+    .context("resolve registry-pinned Git toplevel")?;
+    anyhow::ensure!(
+        checkout == git_toplevel,
+        "registry-pinned manifest must resolve inside its Git checkout root"
+    );
+
+    Ok(Issue33PinnedPackage { wrapper, checkout })
+}
+
+#[cfg(unix)]
+fn issue33_sha256sum(path: &Path) -> Result<String> {
+    let output = Command::new("sha256sum")
+        .arg("--")
+        .arg(path)
+        .output()
+        .with_context(|| format!("hash {}", path.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "sha256sum failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let stdout = std::str::from_utf8(&output.stdout)
+        .with_context(|| format!("decode sha256sum output for {}", path.display()))?;
+    Ok(stdout
+        .split_ascii_whitespace()
+        .next()
+        .context("sha256sum returned no digest")?
+        .to_string())
+}
+
+#[cfg(unix)]
+fn issue33_git_stdout(checkout: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git in registry-pinned checkout {}", checkout.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git failed in registry-pinned checkout {}: {}",
+        checkout.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8(output.stdout)
+        .context("decode registry-pinned git output")?
+        .trim()
+        .to_string())
+}
+
+#[cfg(unix)]
+fn assert_issue33_dev_unanchored_failure<const N: usize>(
+    args: [&str; N],
+    context: &str,
+) -> Result<()> {
+    let blocked = Command::new(BIN)
+        .args(args)
+        .output()
+        .with_context(|| context.to_string())?;
+    assert!(!blocked.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&blocked.stderr).trim(),
+        format!(
+            "Error: authenticated snapshot physical journal '{}' is not anchored by any signed logical state",
+            ISSUE33_PHYSICAL_JOURNAL_ID
+        )
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_issue33_claim_status(status: &Value) -> Result<()> {
     let claims = status.as_array().context("status claims")?;
     assert_eq!(claims.len(), 3);
     assert_eq!(
@@ -138,22 +411,30 @@ fn cli_issue33_quarantine_then_attested_migration_restores_claim_consumers() -> 
         claims[2]["paths"],
         serde_json::json!(["machine-root/projects/example/other-repo"])
     );
-
-    let gc = run_success_json(["worktree", "gc", "--repo", repo, "--dry-run", "--json"])?;
-    assert_eq!(gc["dry_run"], true);
-    assert_eq!(gc["considered_count"], 0);
-    assert_eq!(gc["removed_count"], 0);
-    assert_eq!(gc["orphan_removed_count"], 0);
-    assert!(
-        quarantined_namespace.is_dir(),
-        "successful consumers must preserve the complete quarantined namespace"
-    );
-    assert!(
-        quarantined_journal.is_dir(),
-        "the captured physical journal must remain inside the quarantined namespace"
-    );
-
     Ok(())
+}
+
+#[cfg(unix)]
+fn issue33_journal_bytes(journal: &Path) -> Result<BTreeMap<std::ffi::OsString, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(journal)
+        .with_context(|| format!("enumerate installed journal {}", journal.display()))?
+    {
+        let entry = entry.context("inspect installed physical-journal entry")?;
+        let metadata = entry
+            .metadata()
+            .context("inspect installed physical-journal metadata")?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "installed physical-journal entry is not a regular file: {}",
+            entry.path().display()
+        );
+        files.insert(
+            entry.file_name(),
+            fs::read(entry.path()).context("read installed physical-journal entry")?,
+        );
+    }
+    Ok(files)
 }
 
 #[cfg(unix)]

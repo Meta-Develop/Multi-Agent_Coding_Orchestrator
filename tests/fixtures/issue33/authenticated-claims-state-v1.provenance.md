@@ -1,25 +1,71 @@
-# Issue 33 authenticated claims journal capture
+# Issue 33 synthetic authenticated claims journal
 
-Source: `.git/maco/state/authenticated-claims-state-v1/6ce2913c16ab9fe3388b4d29719afd3b2549aa6d90975b2cf8ddc4173d0999f4/`
+`generate_authenticated_claims_state_v1.py` deterministically writes the
+`authenticated-claims-state-v1/` tree and its SHA-256 manifest. Regenerate it
+from the repository root with:
 
-The six direct regular files in this live physical journal were copied on
-2026-07-26 without moving, deleting, changing permissions, acquiring a lock, or
-otherwise directing a write at the source state. The sorted live inventory was
-recorded immediately before and after the copy:
+```bash
+python3 tests/fixtures/issue33/generate_authenticated_claims_state_v1.py
+```
 
-| Name | Size (bytes) | SHA-256 before | SHA-256 after |
-| --- | ---: | --- | --- |
-| `.claims-snapshot.lock` | 0 | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
-| `.head-3148f5fe04ce377a2d203a52e1f8283dd70db8b328527d471eda85a6f24a74cd.tmp` | 745 | `a90a9774aef36608fd468787310ecb8ef6505f89edb861da04b92aa210936031` | `a90a9774aef36608fd468787310ecb8ef6505f89edb861da04b92aa210936031` |
-| `.record-00000000000000000004-0fe05baf5b349c6df936b9789c9ea34606c3a7df2a89e798c90b52486c0a1998.tmp` | 1590 | `ac6226aade23f8f3f7c8292e2e1350651af23abbe72038c813bac1ac3863274c` | `ac6226aade23f8f3f7c8292e2e1350651af23abbe72038c813bac1ac3863274c` |
-| `00000000000000000001.json` | 1164 | `55fcecff8fb014c4a6bb764af8af072630f914c78df4df2394354d1eafb165e9` | `55fcecff8fb014c4a6bb764af8af072630f914c78df4df2394354d1eafb165e9` |
-| `00000000000000000002.json` | 1402 | `71971090b0ee95a8653123c494cf5880b33f3a67e5f7a13ea19b3585cd26c263` | `71971090b0ee95a8653123c494cf5880b33f3a67e5f7a13ea19b3585cd26c263` |
-| `00000000000000000003.json` | 1164 | `285c231824965e08b235748d946e6e5dcad3a6250de707702b4f90832f52bcb9` | `285c231824965e08b235748d946e6e5dcad3a6250de707702b4f90832f52bcb9` |
+Every identity is fixture-only. The repository authentication key is 32 bytes
+of `0x33`; repository, run, journal, and temporary-file identifiers are SHA-256
+digests of labels beginning with `MACO Issue 33 synthetic fixture`; and the
+device/file values are the conspicuous reserved test constants `33333333` and
+`33000001` through `33000003`. They were not read from a filesystem, Git
+repository, MACO run, or operator environment.
 
-Every fixture file also matched its source byte-for-byte after capture.
-`authenticated-claims-state-v1.sha256` is the deterministic integrity manifest
-for the captured bytes.
+The generator implements the v1 repository-authentication frame and the
+authenticated-claims record/head domains. It constructs four canonical
+snapshot records, chains their HMAC-SHA-256 tags, and signs the matching head.
+Three records are durable fixture entries; the fourth record and head use the
+canonical temporary-file forms exercised by the original Issue 33 state shape.
+The generator verifies the complete chain and head before writing any output.
+`authenticated-claims-state-v1.sha256` binds the exact generated inventory and
+bytes.
 
-Exact-byte capture integrity is established, but the current attached pinned
-binary does not establish that it wrote or authenticated these journal bytes.
-The capture therefore does not establish writer provenance.
+The chosen proof property is independent of those contents: the fixture root
+contains the physical journal but deliberately contains no signed logical
+locator or initialization/rollover intent that anchors it. The development
+build inventories physical journals before it opens their records, so the
+expected result is exactly:
+
+```text
+authenticated snapshot physical journal 'd9741d2f810d605133ddfb24bca389e7f1e96fd2a3da1bc5ca236da56519306f' is not anchored by any signed logical state
+```
+
+The structurally valid HMAC chain prevents an unrelated integrity defect from
+being baked into the evidence even though the anchoring refusal occurs first.
+
+For the fail-capability neuter, pass `--anchor-synthetic-identity`. This adds a
+validly signed `claims` initialization intent for the synthetic run to the
+fixture namespace. That optional file is not part of the committed fixture;
+the Issue 33 test helper installs it only when present. With it present, root
+inventory recognizes the physical identity as logically anchored and the
+test's exact unanchored-error assertion must fail. Running the generator again
+without the flag restores the publishable fixture.
+
+## Same-state asymmetry regression
+
+The operator-provided registry-backed wrapper is deliberately not a default
+test dependency. Run the ignored effectful regression explicitly:
+
+```bash
+MACO_ISSUE33_PINNED_WRAPPER=/absolute/path/to/project/.agents/scripts/maco \
+  cargo test --test cli_smoke \
+  cli_issue33_same_installed_state_proves_dev_pinned_asymmetry_and_gc_failure \
+  -- --ignored --exact
+```
+
+The environment variable is mandatory: an absent, relative, non-file, or
+non-executable wrapper is a test failure, never a skip. The test installs the
+generated state once in a temporary repository, runs the pinned wrapper first,
+then asserts the development `sync status` and pre-recovery dry-run `worktree
+gc` failures against that same repository. It also asserts that the claims and
+physical-journal bytes remain unchanged across all three observations. The
+wrapper must have SHA-256
+`93b76ebff318fb75e44f8ce48b5b48b4bad5435045d9fe736c4e1fc587a0d814`
+and resolve its attached package to clean Git checkout
+`66f59aa253868d1dd909b012e04c548e7b669d2f`; both bindings are rechecked after
+the pinned invocation. Its nested Cargo build runs offline and writes its
+target only inside the test temporary directory.
