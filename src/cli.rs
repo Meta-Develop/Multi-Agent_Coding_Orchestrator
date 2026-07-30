@@ -2127,8 +2127,7 @@ impl MachineGlobalRetentionCommand {
             }
             MachineGlobalRetentionSubcommand::Restore(args) => {
                 let store = MachineGlobalStore::open_config(&args.config)?;
-                let outcome =
-                    store.restore(&args.owner, &args.correlation, args.operation_id)?;
+                let outcome = store.restore(&args.owner, &args.correlation, args.operation_id)?;
                 print_machine_global_gate_outcome(outcome, args.json)
             }
             MachineGlobalRetentionSubcommand::Purge(args) => {
