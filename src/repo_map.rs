@@ -119,9 +119,7 @@ fn collect_git_statuses(repo: &Repository) -> Result<BTreeMap<PathBuf, RepoGitSt
     let mut by_path = BTreeMap::new();
 
     for entry in statuses.iter() {
-        let Some(path) = entry.path() else {
-            continue;
-        };
+        let path = entry.path().context("git status path is not valid UTF-8")?;
         by_path.insert(PathBuf::from(path), classify_git_status(entry.status()));
     }
 
