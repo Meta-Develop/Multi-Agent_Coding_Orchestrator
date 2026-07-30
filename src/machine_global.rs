@@ -4,8 +4,9 @@
 //! Persisted claims, operation reports, and gate denials use [`DeclaredPathCoordinate`] instead.
 
 use crate::{
+    artifacts::state_auth::random_identifier,
     gate_denial::{CorrectionCorrelationId, GateDenial},
-    protected_path::{DeclaredPathCoordinate, ProtectedPathSpec},
+    protected_path::{DeclaredPathCoordinate, ProtectedPathSpec, SandboxDenialRetryability},
     safe_state::{
         identity_for_path, quarantine_direct_child_directory, remove_quarantined_direct_child_tree,
         restore_quarantined_direct_child_directory, stable_checksum, AtomicStateWriter,
@@ -17,11 +18,15 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     path::{Component, Path, PathBuf},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
 const CONFIG_VERSION: u32 = 1;
 const STATE_VERSION: u32 = 1;
@@ -64,20 +69,18 @@ pub enum GateOutcome<T> {
 }
 
 /// Opaque durable token for one machine-global claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
-pub struct MachineGlobalClaimToken(u64);
+pub struct MachineGlobalClaimToken(String);
 
 impl MachineGlobalClaimToken {
-    pub fn new(value: u64) -> Result<Self> {
-        if value == 0 {
-            bail!("machine-global claim token must be nonzero");
-        }
-        Ok(Self(value))
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        validate_bearer_token(value.as_ref(), "machine-global claim token")?;
+        Ok(Self(value.as_ref().to_string()))
     }
 
-    pub fn get(self) -> u64 {
-        self.0
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -85,15 +88,11 @@ impl FromStr for MachineGlobalClaimToken {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        Self::new(
-            value
-                .parse::<u64>()
-                .context("machine-global claim token must be an unsigned integer")?,
-        )
+        Self::new(value)
     }
 }
 
-/// Opaque durable identity for one retention operation.
+/// Public, auditable identity for one retention operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct RetentionOperationId(u64);
@@ -123,11 +122,43 @@ impl FromStr for RetentionOperationId {
     }
 }
 
+/// Secret bearer capability required for restore and purge.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct RetentionOperationToken(String);
+
+impl RetentionOperationToken {
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        validate_bearer_token(value.as_ref(), "retention operation token")?;
+        Ok(Self(value.as_ref().to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for RetentionOperationToken {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
 /// Public claim state. It contains no configured absolute host path.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineGlobalClaim {
     pub token: MachineGlobalClaimToken,
+    pub owner: String,
+    pub targets: Vec<DeclaredPathCoordinate>,
+}
+
+/// Redacted claim view used by status and ownership queries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineGlobalClaimSummary {
     pub owner: String,
     pub targets: Vec<DeclaredPathCoordinate>,
 }
@@ -167,6 +198,18 @@ pub struct RetentionTarget {
 #[serde(deny_unknown_fields)]
 pub struct RetentionOperation {
     pub id: RetentionOperationId,
+    pub token: RetentionOperationToken,
+    pub owner: String,
+    pub created_at_epoch_seconds: u64,
+    pub purge_after_epoch_seconds: u64,
+    pub targets: Vec<RetentionTarget>,
+}
+
+/// Redacted retention view. The bearer operation token is replaced by a non-authorizing digest.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionOperationSummary {
+    pub id: RetentionOperationId,
     pub owner: String,
     pub created_at_epoch_seconds: u64,
     pub purge_after_epoch_seconds: u64,
@@ -177,8 +220,8 @@ pub struct RetentionOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineGlobalStatus {
-    pub claims: Vec<MachineGlobalClaim>,
-    pub retention_operations: Vec<RetentionOperation>,
+    pub claims: Vec<MachineGlobalClaimSummary>,
+    pub retention_operations: Vec<RetentionOperationSummary>,
 }
 
 #[derive(Debug)]
@@ -200,7 +243,7 @@ pub struct MachineGlobalStore {
 #[serde(deny_unknown_fields)]
 struct StatePayload {
     config_fingerprint: String,
-    next_claim_token: u64,
+    root_identities: BTreeMap<String, FileIdentity>,
     next_operation_id: u64,
     claims: BTreeMap<MachineGlobalClaimToken, MachineGlobalClaim>,
     retention_operations: BTreeMap<RetentionOperationId, RetentionOperation>,
@@ -215,10 +258,13 @@ struct StateEnvelope {
 }
 
 impl StatePayload {
-    fn empty(config_fingerprint: String) -> Self {
+    fn empty(config_fingerprint: String, roots: &BTreeMap<String, ValidatedRoot>) -> StatePayload {
         Self {
             config_fingerprint,
-            next_claim_token: 1,
+            root_identities: roots
+                .iter()
+                .map(|(id, root)| (id.clone(), root.safe.identity().clone()))
+                .collect(),
             next_operation_id: 1,
             claims: BTreeMap::new(),
             retention_operations: BTreeMap::new(),
@@ -353,24 +399,48 @@ impl MachineGlobalStore {
                 return Ok(GateOutcome::Denied(denial));
             }
         }
+        for reservation in state
+            .retention_operations
+            .values()
+            .flat_map(operation_reserved_coordinates)
+        {
+            if targets.iter().any(|target| target.intersects(&reservation)) {
+                let denial = GateDenial::from_machine_global_claim_conflict(
+                    correction_correlation_id,
+                    &owner,
+                    &reservation,
+                )
+                .context("failed to construct retention-reservation claim denial")?;
+                return Ok(GateOutcome::Denied(denial));
+            }
+        }
         if state.claims.len() >= MAX_ACTIVE_CLAIMS {
             bail!("machine-global active-claim limit reached");
         }
-        let token = MachineGlobalClaimToken::new(take_next_id(&mut state.next_claim_token)?)?;
+        let token = MachineGlobalClaimToken::new(random_identifier()?)?;
         let claim = MachineGlobalClaim {
-            token,
+            token: token.clone(),
             owner,
             targets,
         };
-        state.claims.insert(token, claim.clone());
+        if state.claims.insert(token, claim.clone()).is_some() {
+            bail!("claim token unexpectedly replaced durable state");
+        }
         self.write_state(&lock, &state)?;
         Ok(GateOutcome::Allowed(claim))
     }
 
     /// Releases a claim token. Missing tokens are accepted idempotently.
-    pub fn release(&self, token: MachineGlobalClaimToken) -> Result<bool> {
+    pub fn release(&self, owner: impl AsRef<str>, token: MachineGlobalClaimToken) -> Result<bool> {
+        let owner =
+            normalize_agent_id(owner.as_ref()).context("machine-global owner is invalid")?;
         let lock = self.acquire_lock()?;
         let mut state = self.load_state(&lock)?;
+        if let Some(claim) = state.claims.get(&token) {
+            if claim.owner != owner {
+                bail!("claim token is owned by a different agent");
+            }
+        }
         let removed = state.claims.remove(&token).is_some();
         if removed {
             self.write_state(&lock, &state)?;
@@ -379,7 +449,7 @@ impl MachineGlobalStore {
     }
 
     /// Returns all claims intersecting one declared coordinate.
-    pub fn owner(&self, target: &DeclaredPathCoordinate) -> Result<Vec<MachineGlobalClaim>> {
+    pub fn owner(&self, target: &DeclaredPathCoordinate) -> Result<Vec<MachineGlobalClaimSummary>> {
         self.validate_coordinate(target, false)?;
         let lock = self.acquire_lock()?;
         let state = self.load_state(&lock)?;
@@ -392,7 +462,7 @@ impl MachineGlobalStore {
                     .iter()
                     .any(|claimed| claimed.intersects(target))
             })
-            .cloned()
+            .map(claim_summary)
             .collect())
     }
 
@@ -401,13 +471,31 @@ impl MachineGlobalStore {
         let lock = self.acquire_lock()?;
         let state = self.load_state(&lock)?;
         Ok(MachineGlobalStatus {
-            claims: state.claims.into_values().collect(),
-            retention_operations: state.retention_operations.into_values().collect(),
+            claims: state.claims.values().map(claim_summary).collect(),
+            retention_operations: state
+                .retention_operations
+                .values()
+                .map(retention_summary)
+                .collect(),
         })
     }
 
     /// Checks the complete declared target set before performing the first quarantine rename.
     pub fn quarantine(
+        &self,
+        owner: impl AsRef<str>,
+        correction_correlation_id: impl AsRef<str>,
+        targets: Vec<DestructiveTargetInput>,
+    ) -> Result<GateOutcome<RetentionOperation>> {
+        self.quarantine_at(
+            owner,
+            correction_correlation_id,
+            targets,
+            trusted_now_epoch_seconds()?,
+        )
+    }
+
+    fn quarantine_at(
         &self,
         owner: impl AsRef<str>,
         correction_correlation_id: impl AsRef<str>,
@@ -440,21 +528,14 @@ impl MachineGlobalStore {
         let lock = self.acquire_lock()?;
         let mut state = self.load_state(&lock)?;
 
-        if let Some(denial) = self.destructive_intersection_denial(
-            &state,
-            &owner,
-            correction_correlation_id.as_ref(),
-            &declared,
-        )? {
-            return Ok(GateOutcome::Denied(denial));
-        }
         if state.retention_operations.len() >= MAX_RETENTION_OPERATIONS {
             bail!("machine-global retention-operation limit reached");
         }
 
-        let operation_id = RetentionOperationId::new(take_next_id(&mut state.next_operation_id)?)?;
+        let operation_id = RetentionOperationId::new(state.next_operation_id)?;
         let mut purge_after = now_epoch_seconds;
         let mut operation_targets = Vec::with_capacity(declared.len());
+        let mut prepared_targets = Vec::with_capacity(declared.len());
         for coordinate in declared {
             let prepared = self.prepare_existing_directory(&coordinate)?;
             let grace = self
@@ -467,37 +548,64 @@ impl MachineGlobalStore {
                     .checked_add(grace)
                     .context("quarantine grace timestamp overflow")?,
             );
+            let quarantine_name = quarantine_name(operation_id, &coordinate);
+            prepared
+                .parent
+                .ensure_direct_child_absent(&quarantine_name)
+                .context("quarantine destination is unavailable")?;
             operation_targets.push(RetentionTarget {
-                quarantine_name: quarantine_name(operation_id, &coordinate),
+                quarantine_name,
                 coordinate,
-                identity: prepared.identity,
+                identity: prepared.identity.clone(),
                 state: RetentionTargetState::Planned,
             });
+            prepared_targets.push(prepared);
         }
         let mut operation = RetentionOperation {
             id: operation_id,
+            token: RetentionOperationToken::new(random_identifier()?)?,
             owner,
             created_at_epoch_seconds: now_epoch_seconds,
             purge_after_epoch_seconds: purge_after,
             targets: operation_targets,
         };
-        state
+        let mutation_coordinates = operation_mutation_coordinates(&operation)?;
+        validate_disjoint_coordinates(
+            &mutation_coordinates,
+            "retention source and quarantine coordinate",
+        )?;
+        if let Some(denial) = self.destructive_intersection_denial(
+            &state,
+            &operation.owner,
+            correction_correlation_id.as_ref(),
+            &mutation_coordinates,
+            None,
+        )? {
+            return Ok(GateOutcome::Denied(denial));
+        }
+        let allocated = RetentionOperationId::new(take_next_id(&mut state.next_operation_id)?)?;
+        if allocated != operation_id {
+            bail!("retention operation allocation changed during locked preflight");
+        }
+        if state
             .retention_operations
-            .insert(operation_id, operation.clone());
+            .insert(operation_id, operation.clone())
+            .is_some()
+        {
+            bail!("retention operation id unexpectedly replaced durable state");
+        }
         self.write_state(&lock, &state)?;
 
         run_after_retention_preflight_hook();
-        for index in 0..operation.targets.len() {
+        for (index, prepared) in prepared_targets.iter().enumerate() {
             let target = operation
                 .targets
                 .get(index)
                 .context("retention target index disappeared")?
                 .clone();
-            let parent = self.open_coordinate_parent(&target.coordinate)?;
-            let child = coordinate_basename(&target.coordinate)?;
             quarantine_direct_child_directory(
-                &parent,
-                child,
+                &prepared.parent,
+                &prepared.child,
                 &target.quarantine_name,
                 &target.identity,
             )
@@ -520,7 +628,14 @@ impl MachineGlobalStore {
     }
 
     /// Restores every non-purged target to its original coordinate using no-replace renames.
-    pub fn restore(&self, operation_id: RetentionOperationId) -> Result<RetentionOperation> {
+    pub fn restore(
+        &self,
+        owner: impl AsRef<str>,
+        correction_correlation_id: impl AsRef<str>,
+        operation_id: RetentionOperationId,
+    ) -> Result<GateOutcome<RetentionOperation>> {
+        let owner =
+            validate_owner_and_correlation(owner.as_ref(), correction_correlation_id.as_ref())?;
         let lock = self.acquire_lock()?;
         let mut state = self.load_state(&lock)?;
         let mut operation = state
@@ -528,6 +643,9 @@ impl MachineGlobalStore {
             .get(&operation_id)
             .cloned()
             .context("unknown retention operation")?;
+        if operation.owner != owner {
+            bail!("retention operation is owned by a different agent");
+        }
         if operation
             .targets
             .iter()
@@ -535,7 +653,18 @@ impl MachineGlobalStore {
         {
             bail!("purged retention operation cannot be restored");
         }
-        for index in 0..operation.targets.len() {
+        let mutation_coordinates = operation_mutation_coordinates(&operation)?;
+        if let Some(denial) = self.destructive_intersection_denial(
+            &state,
+            &owner,
+            correction_correlation_id.as_ref(),
+            &mutation_coordinates,
+            Some(operation_id),
+        )? {
+            return Ok(GateOutcome::Denied(denial));
+        }
+        let accesses = self.bind_operation_parents(&operation)?;
+        for (index, access) in accesses.iter().enumerate() {
             let target = operation
                 .targets
                 .get(index)
@@ -544,11 +673,9 @@ impl MachineGlobalStore {
             if target.state == RetentionTargetState::Restored {
                 continue;
             }
-            let parent = self.open_coordinate_parent(&target.coordinate)?;
-            let child = coordinate_basename(&target.coordinate)?;
             restore_quarantined_direct_child_directory(
-                &parent,
-                child,
+                &access.parent,
+                &access.child,
                 &target.quarantine_name,
                 &target.identity,
             )
@@ -567,7 +694,7 @@ impl MachineGlobalStore {
                 .insert(operation_id, operation.clone());
             self.write_state(&lock, &state)?;
         }
-        Ok(operation)
+        Ok(GateOutcome::Allowed(operation))
     }
 
     /// Permanently removes quarantined trees only after grace and a fresh full preflight.
@@ -576,6 +703,23 @@ impl MachineGlobalStore {
         owner: impl AsRef<str>,
         correction_correlation_id: impl AsRef<str>,
         operation_id: RetentionOperationId,
+        operation_token: &RetentionOperationToken,
+    ) -> Result<GateOutcome<RetentionOperation>> {
+        self.purge_at(
+            owner,
+            correction_correlation_id,
+            operation_id,
+            operation_token,
+            trusted_now_epoch_seconds()?,
+        )
+    }
+
+    fn purge_at(
+        &self,
+        owner: impl AsRef<str>,
+        correction_correlation_id: impl AsRef<str>,
+        operation_id: RetentionOperationId,
+        operation_token: &RetentionOperationToken,
         now_epoch_seconds: u64,
     ) -> Result<GateOutcome<RetentionOperation>> {
         let owner =
@@ -587,6 +731,12 @@ impl MachineGlobalStore {
             .get(&operation_id)
             .cloned()
             .context("unknown retention operation")?;
+        if operation.owner != owner {
+            bail!("retention operation is owned by a different agent");
+        }
+        if operation.token != *operation_token {
+            bail!("retention operation token does not match");
+        }
         if now_epoch_seconds < operation.purge_after_epoch_seconds {
             bail!(
                 "retention grace has not elapsed; purge becomes eligible at {}",
@@ -601,21 +751,18 @@ impl MachineGlobalStore {
         }) {
             bail!("retention operation is not fully quarantined; refusing purge");
         }
-        let coordinates = operation
-            .targets
-            .iter()
-            .filter(|target| target.state != RetentionTargetState::Purged)
-            .map(|target| target.coordinate.clone())
-            .collect::<Vec<_>>();
+        let coordinates = operation_mutation_coordinates(&operation)?;
         if let Some(denial) = self.destructive_intersection_denial(
             &state,
             &owner,
             correction_correlation_id.as_ref(),
             &coordinates,
+            Some(operation_id),
         )? {
             return Ok(GateOutcome::Denied(denial));
         }
-        for index in 0..operation.targets.len() {
+        let accesses = self.bind_operation_parents(&operation)?;
+        for (index, access) in accesses.iter().enumerate() {
             let target = operation
                 .targets
                 .get(index)
@@ -624,9 +771,8 @@ impl MachineGlobalStore {
             if target.state == RetentionTargetState::Purged {
                 continue;
             }
-            let parent = self.open_coordinate_parent(&target.coordinate)?;
             remove_quarantined_direct_child_tree(
-                &parent,
+                &access.parent,
                 &target.quarantine_name,
                 &target.identity,
                 TreeLinkPolicy::RejectLinksAndSpecialFiles,
@@ -658,7 +804,10 @@ impl MachineGlobalStore {
         lock.verify_direct_binding(&self.state_root)?;
         self.state_root.verify()?;
         if !self.state_root.direct_child_exists(STATE_FILE)? {
-            return Ok(StatePayload::empty(self.config_fingerprint.clone()));
+            return Ok(StatePayload::empty(
+                self.config_fingerprint.clone(),
+                &self.roots,
+            ));
         }
         let bytes =
             BoundedRegularReader::read_direct(&self.state_root, STATE_FILE, STATE_MAX_BYTES)?;
@@ -675,13 +824,13 @@ impl MachineGlobalStore {
         if envelope.payload.config_fingerprint != self.config_fingerprint {
             bail!("machine-global config changed; refusing to reinterpret durable state");
         }
-        validate_loaded_state(&envelope.payload)?;
+        validate_loaded_state(&envelope.payload, &self.roots)?;
         lock.verify_direct_binding(&self.state_root)?;
         Ok(envelope.payload)
     }
 
     fn write_state(&self, lock: &KernelStateLock, state: &StatePayload) -> Result<()> {
-        validate_loaded_state(state)?;
+        validate_loaded_state(state, &self.roots)?;
         lock.verify_direct_binding(&self.state_root)?;
         let payload_bytes =
             serde_json::to_vec(state).context("failed to serialize machine-global state")?;
@@ -784,7 +933,26 @@ impl MachineGlobalStore {
         let child = coordinate_basename(coordinate)?;
         let absolute = parent.direct_child(child)?;
         let identity = identity_for_path(&absolute)?;
-        Ok(PreparedTarget { identity })
+        Ok(PreparedTarget {
+            parent,
+            child: child.to_os_string(),
+            identity,
+        })
+    }
+
+    fn bind_operation_parents(
+        &self,
+        operation: &RetentionOperation,
+    ) -> Result<Vec<PreparedAccess>> {
+        operation
+            .targets
+            .iter()
+            .map(|target| {
+                let parent = self.open_coordinate_parent(&target.coordinate)?;
+                let child = coordinate_basename(&target.coordinate)?.to_os_string();
+                Ok(PreparedAccess { parent, child })
+            })
+            .collect()
     }
 
     fn open_coordinate_parent(&self, coordinate: &DeclaredPathCoordinate) -> Result<SafeRoot> {
@@ -815,6 +983,7 @@ impl MachineGlobalStore {
         owner: &str,
         correlation: &str,
         targets: &[DeclaredPathCoordinate],
+        skip_operation: Option<RetentionOperationId>,
     ) -> Result<Option<GateDenial>> {
         for target in targets {
             for claim in state.claims.values() {
@@ -830,6 +999,27 @@ impl MachineGlobalStore {
                         active.clone(),
                     )
                     .context("failed to construct active-claim intersection denial")
+                    .map(Some);
+                }
+            }
+            for reservation in state
+                .retention_operations
+                .values()
+                .filter(|operation| Some(operation.id) != skip_operation)
+                .flat_map(operation_reserved_coordinates)
+            {
+                if reservation.intersects(target) {
+                    let protected = ProtectedPathSpec::new(
+                        reservation,
+                        SandboxDenialRetryability::NotRetryable,
+                    );
+                    return GateDenial::from_protected_path_intersection(
+                        correlation,
+                        owner,
+                        target.clone(),
+                        protected,
+                    )
+                    .context("failed to construct retention-reservation denial")
                     .map(Some);
                 }
             }
@@ -858,7 +1048,15 @@ impl MachineGlobalStore {
 
 #[derive(Debug)]
 struct PreparedTarget {
+    parent: SafeRoot,
+    child: OsString,
     identity: FileIdentity,
+}
+
+#[derive(Debug)]
+struct PreparedAccess {
+    parent: SafeRoot,
+    child: OsString,
 }
 
 fn validate_owner_and_correlation(owner: &str, correlation: &str) -> Result<String> {
@@ -867,16 +1065,30 @@ fn validate_owner_and_correlation(owner: &str, correlation: &str) -> Result<Stri
     Ok(owner)
 }
 
-fn validate_loaded_state(state: &StatePayload) -> Result<()> {
-    if state.next_claim_token == 0 || state.next_operation_id == 0 {
-        bail!("machine-global state counters must be nonzero");
+fn validate_loaded_state(
+    state: &StatePayload,
+    roots: &BTreeMap<String, ValidatedRoot>,
+) -> Result<()> {
+    if state.root_identities.len() != roots.len() {
+        bail!("durable declared-root binding set does not match configuration");
+    }
+    for (id, root) in roots {
+        root.safe.verify()?;
+        if state.root_identities.get(id) != Some(root.safe.identity()) {
+            bail!("declared root identity changed for {id}");
+        }
+    }
+    if state.next_operation_id == 0 {
+        bail!("machine-global operation counter must be nonzero");
     }
     if state.claims.len() > MAX_ACTIVE_CLAIMS
         || state.retention_operations.len() > MAX_RETENTION_OPERATIONS
     {
         bail!("machine-global state exceeds collection bounds");
     }
+    let mut claims_seen = Vec::new();
     for (token, claim) in &state.claims {
+        validate_bearer_token(token.as_str(), "durable claim token")?;
         if *token != claim.token {
             bail!("machine-global claim key/token mismatch");
         }
@@ -884,29 +1096,117 @@ fn validate_loaded_state(state: &StatePayload) -> Result<()> {
         if claim.targets.is_empty() || claim.targets.len() > MAX_TARGETS_PER_OPERATION {
             bail!("durable claim target set is out of bounds");
         }
+        validate_sorted_disjoint(&claim.targets, "durable claim")?;
         for target in &claim.targets {
             target
                 .validate()
                 .context("durable claim coordinate is invalid")?;
+            if !roots.contains_key(target.root_id()) {
+                bail!("durable claim names an undeclared root");
+            }
+            if claims_seen
+                .iter()
+                .any(|seen: &DeclaredPathCoordinate| seen.intersects(target))
+            {
+                bail!("durable active claims intersect");
+            }
+            claims_seen.push(target.clone());
         }
     }
+    let mut maximum_operation_id = 0_u64;
+    let mut reservations = Vec::new();
     for (id, operation) in &state.retention_operations {
+        if id.get() == 0 {
+            bail!("retention operation map contains a zero id");
+        }
+        maximum_operation_id = maximum_operation_id.max(id.get());
         if *id != operation.id {
             bail!("retention operation key/id mismatch");
         }
+        validate_bearer_token(
+            operation.token.as_str(),
+            "durable retention operation token",
+        )?;
         normalize_agent_id(&operation.owner).context("retention owner is invalid")?;
         if operation.targets.is_empty() || operation.targets.len() > MAX_TARGETS_PER_OPERATION {
             bail!("durable retention target set is out of bounds");
         }
-        if operation.purge_after_epoch_seconds <= operation.created_at_epoch_seconds {
-            bail!("retention operation has an invalid grace window");
-        }
+        let mut expected_purge_after = operation.created_at_epoch_seconds;
+        let mut original_coordinates = Vec::with_capacity(operation.targets.len());
         for target in &operation.targets {
             target
                 .coordinate
                 .validate()
                 .context("durable retention coordinate is invalid")?;
+            let root = roots
+                .get(target.coordinate.root_id())
+                .context("durable retention target names an undeclared root")?;
+            expected_purge_after = expected_purge_after.max(
+                operation
+                    .created_at_epoch_seconds
+                    .checked_add(root.quarantine_grace_seconds)
+                    .context("durable retention grace timestamp overflow")?,
+            );
             validate_quarantine_name(&target.quarantine_name)?;
+            if target.quarantine_name != quarantine_name(operation.id, &target.coordinate) {
+                bail!("durable quarantine name does not match its operation and coordinate");
+            }
+            original_coordinates.push(target.coordinate.clone());
+        }
+        validate_sorted_disjoint(&original_coordinates, "durable retention operation")?;
+        if operation.purge_after_epoch_seconds != expected_purge_after {
+            bail!("retention operation has an invalid configured grace window");
+        }
+        let mutation_coordinates = operation_mutation_coordinates(operation)?;
+        validate_disjoint_coordinates(
+            &mutation_coordinates,
+            "durable retention mutation coordinate",
+        )?;
+        for coordinate in operation_reserved_coordinates(operation) {
+            if claims_seen
+                .iter()
+                .any(|claim| claim.intersects(&coordinate))
+            {
+                bail!("durable retention reservation intersects an active claim");
+            }
+            if reservations
+                .iter()
+                .any(|reserved: &DeclaredPathCoordinate| reserved.intersects(&coordinate))
+            {
+                bail!("durable retention reservations intersect");
+            }
+            reservations.push(coordinate);
+        }
+    }
+    if state.next_operation_id <= maximum_operation_id {
+        bail!("next retention operation id does not advance beyond durable operations");
+    }
+    Ok(())
+}
+
+fn validate_sorted_disjoint(coordinates: &[DeclaredPathCoordinate], label: &str) -> Result<()> {
+    for pair in coordinates.windows(2) {
+        if pair[0] >= pair[1] {
+            bail!("{label} coordinates are not strictly sorted");
+        }
+        if pair[0].intersects(&pair[1]) {
+            bail!("{label} coordinates intersect");
+        }
+    }
+    Ok(())
+}
+
+fn validate_disjoint_coordinates(
+    coordinates: &[DeclaredPathCoordinate],
+    label: &str,
+) -> Result<()> {
+    for (index, left) in coordinates.iter().enumerate() {
+        if coordinates
+            .iter()
+            .skip(index.saturating_add(1))
+            .any(|right| left.intersects(right))
+        {
+            bail!("{label} set intersects");
         }
     }
     Ok(())
@@ -931,6 +1231,71 @@ fn first_intersection<'a>(
         .find(|candidate| right.iter().any(|other| candidate.intersects(other)))
 }
 
+fn claim_summary(claim: &MachineGlobalClaim) -> MachineGlobalClaimSummary {
+    MachineGlobalClaimSummary {
+        owner: claim.owner.clone(),
+        targets: claim.targets.clone(),
+    }
+}
+
+fn retention_summary(operation: &RetentionOperation) -> RetentionOperationSummary {
+    RetentionOperationSummary {
+        id: operation.id,
+        owner: operation.owner.clone(),
+        created_at_epoch_seconds: operation.created_at_epoch_seconds,
+        purge_after_epoch_seconds: operation.purge_after_epoch_seconds,
+        targets: operation.targets.clone(),
+    }
+}
+
+fn operation_mutation_coordinates(
+    operation: &RetentionOperation,
+) -> Result<Vec<DeclaredPathCoordinate>> {
+    let mut coordinates = Vec::with_capacity(operation.targets.len().saturating_mul(2));
+    for target in &operation.targets {
+        if matches!(
+            target.state,
+            RetentionTargetState::Restored | RetentionTargetState::Purged
+        ) {
+            continue;
+        }
+        coordinates.push(target.coordinate.clone());
+        coordinates.push(quarantine_coordinate(target)?);
+    }
+    Ok(coordinates)
+}
+
+fn operation_reserved_coordinates(
+    operation: &RetentionOperation,
+) -> impl Iterator<Item = DeclaredPathCoordinate> + '_ {
+    operation.targets.iter().flat_map(|target| {
+        if matches!(
+            target.state,
+            RetentionTargetState::Restored | RetentionTargetState::Purged
+        ) {
+            return Vec::new().into_iter();
+        }
+        let mut coordinates = vec![target.coordinate.clone()];
+        if let Ok(quarantine) = quarantine_coordinate(target) {
+            coordinates.push(quarantine);
+        }
+        coordinates.into_iter()
+    })
+}
+
+fn quarantine_coordinate(target: &RetentionTarget) -> Result<DeclaredPathCoordinate> {
+    let parent = target
+        .coordinate
+        .relative()
+        .parent()
+        .context("retention coordinate must contain a basename")?;
+    DeclaredPathCoordinate::new(
+        target.coordinate.root_id(),
+        parent.join(&target.quarantine_name),
+    )
+    .context("derived quarantine coordinate is invalid")
+}
+
 fn coordinate_basename(coordinate: &DeclaredPathCoordinate) -> Result<&OsStr> {
     coordinate
         .relative()
@@ -948,6 +1313,17 @@ fn quarantine_name(
         operation_id.get(),
         fingerprint
     )
+}
+
+fn validate_bearer_token(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{label} must be 64 lowercase hexadecimal characters");
+    }
+    Ok(())
 }
 
 fn validate_quarantine_name(name: &str) -> Result<()> {
@@ -979,6 +1355,18 @@ fn require_exact_canonical_regular_file(path: &Path) -> Result<PathBuf> {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         bail!("configured path is not a regular file");
     }
+    #[cfg(unix)]
+    {
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("machine-global config must be owned by the current user");
+        }
+        if metadata.nlink() != 1 {
+            bail!("machine-global config must have exactly one hard link");
+        }
+        if metadata.mode() & 0o022 != 0 {
+            bail!("machine-global config must not be group- or world-writable");
+        }
+    }
     Ok(canonical)
 }
 
@@ -994,7 +1382,11 @@ fn require_exact_canonical_path(path: &Path) -> Result<PathBuf> {
     }
     let canonical = fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize directory {}", path.display()))?;
-    if canonical != path {
+    #[cfg(unix)]
+    let spelling_matches = canonical.as_os_str().as_bytes() == path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let spelling_matches = canonical == path;
+    if !spelling_matches {
         bail!(
             "configured spelling {} differs from canonical path {}",
             path.display(),
@@ -1006,6 +1398,13 @@ fn require_exact_canonical_path(path: &Path) -> Result<PathBuf> {
 
 fn paths_intersect(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn trusted_now_epoch_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
 }
 
 #[cfg(test)]
