@@ -648,7 +648,12 @@ single-link regular file that is not group- or world-writable. `state_root`
 must be an owner-private `0700` directory and must not intersect a declared
 root. Declared roots may not overlap one another. Unknown fields, `.` or `..`
 components, symbolic links, non-canonical spellings, and changed root
-identities fail closed.
+identities fail closed. On Linux, the state root and every declared root are
+also bound to their `statx` mount id. Duplicate filesystem identities are
+rejected. Two configured paths on the same device but different mounts are
+rejected conservatively as possible bind aliases; paths on one mount retain the
+component-aware overlap check. An existing coordinate whose parent or leaf
+crosses away from its declared root's mount is refused.
 
 ```json
 {
@@ -756,9 +761,12 @@ before the token was returned; the full live-claim and protected-path preflight
 still applies. Purge requires the operation owner and bearer token, uses MACO's
 trusted system clock, refuses before the configured positive grace period, and
 reruns the complete claim/protected-path preflight before permanent removal.
-Purge first moves the quarantine sibling to its recorded cleanup sibling, then
-deletes only the identity-bound tree. If a quarantine or cleanup pathname is
-unavailable, collides, cannot be renamed, is full, or cannot be safely
+Purge completes a mount-confined link/special-file audit while the tree still
+has its restorable quarantine name. It then moves the tree to its recorded
+cleanup sibling, repeats the identity- and mount-confined audit, and only then
+deletes the verified tree. Resuming an already-renamed cleanup residue starts
+with the same audit at that cleanup name. If a quarantine or cleanup pathname
+is unavailable, collides, cannot be renamed, is full, or cannot be safely
 inspected, the operation fails closed. MACO never falls back to direct deletion
 or a cross-filesystem copy. A multi-target I/O failure can leave an explicitly
 recorded partially quarantined operation. Quarantine does not resume such an
@@ -770,6 +778,10 @@ directory retention only on Linux. It does not transparently intercept an
 arbitrary shell command, the existing artifact/worktree cleanup commands, or an
 agent launched directly without registering and honoring a machine-global
 claim. Those directly launched agents remain a follow-up enforcement gap.
+Coordinate comparison currently assumes case-sensitive filesystem spelling;
+case-insensitive or casefolded alias behavior is not established as supported,
+so such roots should not be declared. The mount policy is intentionally
+conservative and does not claim to detect every conceivable physical alias.
 
 Default linked worktrees are created outside the repository at
 `../.maco/worktrees/<repo-name>/<agent-id>`. Completed task branches can be

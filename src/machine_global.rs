@@ -233,14 +233,24 @@ pub struct MachineGlobalStatus {
 #[derive(Debug)]
 struct ValidatedRoot {
     safe: SafeRoot,
+    mount_id: u64,
     protected_paths: Vec<ProtectedPathSpec>,
     quarantine_grace_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PhysicalRootBinding {
+    label: String,
+    path: PathBuf,
+    identity: FileIdentity,
+    mount_id: u64,
 }
 
 /// Shared store. Independent repositories coordinate when they open the same configured state root.
 #[derive(Debug)]
 pub struct MachineGlobalStore {
     state_root: SafeRoot,
+    state_root_mount_id: u64,
     roots: BTreeMap<String, ValidatedRoot>,
     config_fingerprint: String,
 }
@@ -310,9 +320,17 @@ impl MachineGlobalStore {
             .context("machine-global state_root is not an exact canonical directory")?;
         let state_root = SafeRoot::open_or_create(&state_root_path)
             .context("machine-global state_root must be owner-private")?;
+        let state_root_mount_id = state_root
+            .linux_mount_id()
+            .context("machine-global state_root mount identity is unavailable")?;
 
         let mut roots = BTreeMap::new();
-        let mut canonical_paths = Vec::new();
+        let mut physical_bindings = vec![PhysicalRootBinding {
+            label: "state_root".to_string(),
+            path: state_root_path,
+            identity: state_root.identity().clone(),
+            mount_id: state_root_mount_id,
+        }];
         for configured in &config.roots {
             let canonical =
                 require_exact_canonical_directory(&configured.path).with_context(|| {
@@ -323,6 +341,12 @@ impl MachineGlobalStore {
                 })?;
             let safe = SafeRoot::open_existing(&canonical).with_context(|| {
                 format!("declared machine-global root {} is unsafe", configured.id)
+            })?;
+            let mount_id = safe.linux_mount_id().with_context(|| {
+                format!(
+                    "declared machine-global root {} mount identity is unavailable",
+                    configured.id
+                )
             })?;
             if configured.quarantine_grace_seconds == 0
                 || configured.quarantine_grace_seconds > MAX_GRACE_SECONDS
@@ -356,6 +380,7 @@ impl MachineGlobalStore {
                 .insert(
                     configured.id.clone(),
                     ValidatedRoot {
+                        mount_id,
                         safe,
                         protected_paths: configured.protected_paths.clone(),
                         quarantine_grace_seconds: configured.quarantine_grace_seconds,
@@ -365,22 +390,22 @@ impl MachineGlobalStore {
             {
                 bail!("duplicate declared root id {}", configured.id);
             }
-            canonical_paths.push((configured.id.clone(), canonical));
+            let root = roots
+                .get(&configured.id)
+                .context("inserted declared root disappeared")?;
+            physical_bindings.push(PhysicalRootBinding {
+                label: format!("declared root {}", configured.id),
+                path: canonical,
+                identity: root.safe.identity().clone(),
+                mount_id,
+            });
         }
-        for (index, (left_id, left)) in canonical_paths.iter().enumerate() {
-            if paths_intersect(left, &state_root_path) {
-                bail!("declared root {left_id} intersects machine-global state_root");
-            }
-            for (right_id, right) in canonical_paths.iter().skip(index.saturating_add(1)) {
-                if paths_intersect(left, right) {
-                    bail!("declared roots {left_id} and {right_id} overlap");
-                }
-            }
-        }
+        validate_configured_physical_bindings(&physical_bindings)?;
 
         let config_fingerprint = stable_checksum(&bytes);
         Ok(Self {
             state_root,
+            state_root_mount_id,
             roots,
             config_fingerprint,
         })
@@ -622,6 +647,7 @@ impl MachineGlobalStore {
                 .get(index)
                 .context("retention target index disappeared")?
                 .clone();
+            prepared.parent.verify_linux_mount_id(prepared.mount_id)?;
             quarantine_direct_child_directory(
                 &prepared.parent,
                 &prepared.child,
@@ -693,6 +719,7 @@ impl MachineGlobalStore {
             if target.state == RetentionTargetState::Restored {
                 continue;
             }
+            access.parent.verify_linux_mount_id(access.mount_id)?;
             restore_quarantined_direct_child_directory(
                 &access.parent,
                 &access.child,
@@ -792,6 +819,7 @@ impl MachineGlobalStore {
             if target.state == RetentionTargetState::Purged {
                 continue;
             }
+            access.parent.verify_linux_mount_id(access.mount_id)?;
             remove_quarantined_direct_child_tree(
                 &access.parent,
                 &target.quarantine_name,
@@ -817,13 +845,19 @@ impl MachineGlobalStore {
     }
 
     fn acquire_lock(&self) -> Result<KernelStateLock> {
-        KernelStateLock::acquire_direct(&self.state_root, LOCK_FILE)
-            .context("failed to acquire machine-global kernel state lock")
+        self.state_root
+            .verify_linux_mount_id(self.state_root_mount_id)?;
+        let lock = KernelStateLock::acquire_direct(&self.state_root, LOCK_FILE)
+            .context("failed to acquire machine-global kernel state lock")?;
+        self.state_root
+            .verify_linux_mount_id(self.state_root_mount_id)?;
+        Ok(lock)
     }
 
     fn load_state(&self, lock: &KernelStateLock) -> Result<StatePayload> {
         lock.verify_direct_binding(&self.state_root)?;
-        self.state_root.verify()?;
+        self.state_root
+            .verify_linux_mount_id(self.state_root_mount_id)?;
         if !self.state_root.direct_child_exists(STATE_FILE)? {
             return Ok(StatePayload::empty(
                 self.config_fingerprint.clone(),
@@ -845,13 +879,23 @@ impl MachineGlobalStore {
         if envelope.payload.config_fingerprint != self.config_fingerprint {
             bail!("machine-global config changed; refusing to reinterpret durable state");
         }
-        validate_loaded_state(&envelope.payload, &self.roots)?;
+        validate_loaded_state(
+            &envelope.payload,
+            &self.state_root,
+            self.state_root_mount_id,
+            &self.roots,
+        )?;
         lock.verify_direct_binding(&self.state_root)?;
         Ok(envelope.payload)
     }
 
     fn write_state(&self, lock: &KernelStateLock, state: &StatePayload) -> Result<()> {
-        validate_loaded_state(state, &self.roots)?;
+        validate_loaded_state(
+            state,
+            &self.state_root,
+            self.state_root_mount_id,
+            &self.roots,
+        )?;
         lock.verify_direct_binding(&self.state_root)?;
         let payload_bytes =
             serde_json::to_vec(state).context("failed to serialize machine-global state")?;
@@ -902,12 +946,16 @@ impl MachineGlobalStore {
             .roots
             .get(coordinate.root_id())
             .with_context(|| format!("undeclared machine-global root {}", coordinate.root_id()))?;
-        root.safe.verify()?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
         let parent = self.open_coordinate_parent(coordinate)?;
         let child = coordinate_basename(coordinate)?;
         let absolute = parent.direct_child(child)?;
+        let initial_mount = parent.direct_child_linux_mount_id(child)?;
         match fs::symlink_metadata(&absolute) {
             Ok(metadata) => {
+                let observed_mount =
+                    initial_mount.context("existing declared coordinate has no mount identity")?;
+                require_same_mount(root.mount_id, observed_mount, "declared coordinate leaf")?;
                 if metadata.file_type().is_symlink() {
                     bail!(
                         "declared coordinate resolves through a symbolic link: {}:{}",
@@ -927,8 +975,19 @@ impl MachineGlobalStore {
                 if canonical != absolute {
                     bail!("declared coordinate is not canonically spelled");
                 }
+                let rebound_mount = parent
+                    .direct_child_linux_mount_id(child)?
+                    .context("declared coordinate disappeared during mount validation")?;
+                require_same_mount(
+                    root.mount_id,
+                    rebound_mount,
+                    "rebound declared coordinate leaf",
+                )?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if initial_mount.is_some() || parent.direct_child_linux_mount_id(child)?.is_some() {
+                    bail!("declared coordinate appeared or disappeared during mount validation");
+                }
                 if require_existing_directory {
                     bail!("destructive retention target does not exist");
                 }
@@ -954,10 +1013,16 @@ impl MachineGlobalStore {
         let child = coordinate_basename(coordinate)?;
         let absolute = parent.direct_child(child)?;
         let identity = identity_for_path(&absolute)?;
+        let mount_id = self
+            .roots
+            .get(coordinate.root_id())
+            .context("validated root disappeared")?
+            .mount_id;
         Ok(PreparedTarget {
             parent,
             child: child.to_os_string(),
             identity,
+            mount_id,
         })
     }
 
@@ -971,7 +1036,16 @@ impl MachineGlobalStore {
             .map(|target| {
                 let parent = self.open_coordinate_parent(&target.coordinate)?;
                 let child = coordinate_basename(&target.coordinate)?.to_os_string();
-                Ok(PreparedAccess { parent, child })
+                let mount_id = self
+                    .roots
+                    .get(target.coordinate.root_id())
+                    .context("validated root disappeared")?
+                    .mount_id;
+                Ok(PreparedAccess {
+                    parent,
+                    child,
+                    mount_id,
+                })
             })
             .collect()
     }
@@ -985,9 +1059,9 @@ impl MachineGlobalStore {
             .relative()
             .parent()
             .context("declared coordinate must contain a basename")?;
-        root.safe.verify()?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
         if parent_relative.as_os_str().is_empty() {
-            root.safe.verify()?;
+            root.safe.verify_linux_mount_id(root.mount_id)?;
             return Ok(root.safe.clone());
         }
         let parent =
@@ -998,8 +1072,16 @@ impl MachineGlobalStore {
                     parent_relative.display()
                 )
             })?;
-        root.safe.verify()?;
-        parent.verify()?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+        parent
+            .verify_linux_mount_id(root.mount_id)
+            .with_context(|| {
+                format!(
+                    "declared coordinate parent crosses root mount {}:{}",
+                    coordinate.root_id(),
+                    parent_relative.display()
+                )
+            })?;
         Ok(parent)
     }
 
@@ -1077,12 +1159,14 @@ struct PreparedTarget {
     parent: SafeRoot,
     child: OsString,
     identity: FileIdentity,
+    mount_id: u64,
 }
 
 #[derive(Debug)]
 struct PreparedAccess {
     parent: SafeRoot,
     child: OsString,
+    mount_id: u64,
 }
 
 fn validate_owner_and_correlation(owner: &str, correlation: &str) -> Result<String> {
@@ -1093,13 +1177,16 @@ fn validate_owner_and_correlation(owner: &str, correlation: &str) -> Result<Stri
 
 fn validate_loaded_state(
     state: &StatePayload,
+    state_root: &SafeRoot,
+    state_root_mount_id: u64,
     roots: &BTreeMap<String, ValidatedRoot>,
 ) -> Result<()> {
+    state_root.verify_linux_mount_id(state_root_mount_id)?;
     if state.root_identities.len() != roots.len() {
         bail!("durable declared-root binding set does not match configuration");
     }
     for (id, root) in roots {
-        root.safe.verify()?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
         if state.root_identities.get(id) != Some(root.safe.identity()) {
             bail!("declared root identity changed for {id}");
         }
@@ -1525,6 +1612,51 @@ fn require_exact_canonical_path(path: &Path) -> Result<PathBuf> {
 
 fn paths_intersect(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn validate_configured_physical_bindings(bindings: &[PhysicalRootBinding]) -> Result<()> {
+    for (index, left) in bindings.iter().enumerate() {
+        for right in bindings.iter().skip(index.saturating_add(1)) {
+            if paths_intersect(&left.path, &right.path) {
+                bail!(
+                    "{} and {} overlap by canonical path components",
+                    left.label,
+                    right.label
+                );
+            }
+            if left.identity == right.identity {
+                bail!(
+                    "{} and {} resolve to the same filesystem object",
+                    left.label,
+                    right.label
+                );
+            }
+            if left.mount_id == right.mount_id {
+                if left.identity.device != right.identity.device {
+                    bail!(
+                        "{} and {} report one mount id with inconsistent devices",
+                        left.label,
+                        right.label
+                    );
+                }
+            } else if left.identity.device == right.identity.device {
+                bail!(
+                    "{} and {} are ambiguous aliases on different mounts of device {}",
+                    left.label,
+                    right.label,
+                    left.identity.device
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_same_mount(expected: u64, observed: u64, label: &str) -> Result<()> {
+    if expected != observed {
+        bail!("{label} crosses the configured mount (expected {expected}, observed {observed})");
+    }
+    Ok(())
 }
 
 fn trusted_now_epoch_seconds() -> Result<u64> {
@@ -2020,6 +2152,60 @@ mod tests {
     }
 
     #[test]
+    fn configured_physical_binding_policy_rejects_mount_alias_ambiguity() {
+        let binding =
+            |label: &str, path: &str, device: u64, file: u64, mount_id: u64| PhysicalRootBinding {
+                label: label.to_string(),
+                path: PathBuf::from(path),
+                identity: FileIdentity { device, file },
+                mount_id,
+            };
+        assert!(validate_configured_physical_bindings(&[
+            binding("state", "/state", 1, 10, 7),
+            binding("root", "/root", 1, 11, 7),
+            binding("other-device", "/other", 2, 12, 8),
+        ])
+        .is_ok());
+        assert!(validate_configured_physical_bindings(&[
+            binding("left", "/left", 1, 10, 7),
+            binding("duplicate inode", "/alias", 1, 10, 8),
+        ])
+        .is_err());
+        assert!(validate_configured_physical_bindings(&[
+            binding("left", "/left", 1, 10, 7),
+            binding("same device bind", "/alias", 1, 11, 8),
+        ])
+        .is_err());
+        assert!(validate_configured_physical_bindings(&[
+            binding("root", "/root", 1, 10, 7),
+            binding("nested", "/root/nested", 1, 11, 7),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn runtime_mount_mismatches_fail_closed() {
+        let fixture = Fixture::new(&[], 60);
+        fixture.directory("victim");
+        let mut store = fixture.store();
+        let configured_state_mount = store.state_root_mount_id;
+        store.state_root_mount_id = configured_state_mount.saturating_add(1);
+        assert!(store.acquire_lock().is_err());
+        store.state_root_mount_id = configured_state_mount;
+
+        let configured = store.roots.get_mut("external").expect("configured root");
+        configured.mount_id = configured.mount_id.saturating_add(1);
+        assert!(store
+            .claim(
+                "repair-agent",
+                "fabricated-mount-crossing",
+                vec![coordinate("victim")],
+            )
+            .is_err());
+        assert!(require_same_mount(7, 8, "fabricated nested leaf").is_err());
+    }
+
+    #[test]
     fn traversal_noncanonical_and_symlink_targets_fail_closed() {
         let fixture = Fixture::new(&[], 60);
         let outside = fixture._temp.path().join("outside");
@@ -2192,7 +2378,7 @@ mod tests {
                 .expect("replacement data");
         });
 
-        let error = fixture
+        fixture
             .store()
             .quarantine_at(
                 "cleanup-agent",
@@ -2201,7 +2387,6 @@ mod tests {
                 100,
             )
             .expect_err("root replacement must fail");
-        assert!(error.to_string().contains("quarantining"));
         assert_eq!(
             fs::read_to_string(displaced_root.join("victim/valuable"))
                 .expect("original outside survives"),
