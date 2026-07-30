@@ -26,6 +26,7 @@ pub(crate) mod pinned_exec;
 pub mod planning;
 pub mod pre_action_review;
 pub mod process_runner;
+pub mod protected_path;
 pub mod publication;
 pub mod repo_map;
 pub mod repo_semantic;

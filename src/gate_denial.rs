@@ -14,6 +14,7 @@ use crate::{
     artifacts::state_auth::sha256_hex,
     external_agent::{SandboxDenialEvidence, SandboxDenialRetryability},
     merge::{ApplyBlocker, ApplyBlockerDetail, ApplyBlockerDisposition, SafetyCheckStatus},
+    protected_path::{DeclaredPathCoordinate, ProtectedPathSpec},
     sync::normalize_repo_relative_path,
     worktree::normalize_agent_id,
 };
@@ -28,6 +29,7 @@ use thiserror::Error;
 pub const GATE_DENIAL_VERSION: u32 = 1;
 
 const STABLE_ID_DOMAIN: &[u8] = b"maco-gate-denial-v1\0";
+const UNDECLARED_TARGET_FINGERPRINT_DOMAIN: &[u8] = b"maco-undeclared-destructive-target-v1\0";
 const MAX_CORRELATION_ID_BYTES: usize = 128;
 const MAX_POLICY_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4 * 1024;
@@ -172,6 +174,7 @@ pub enum ApprovalReviewDenial {
 #[serde(rename_all = "snake_case")]
 pub enum GateCheckSource {
     ClaimAcquisition,
+    DestructiveTargetPreflight,
     Auditor,
     Validation,
     PrimaryDrift,
@@ -184,6 +187,26 @@ pub enum GateCheckSource {
     PrimaryIntegrity,
     ExternalSideEffect,
     FutureApprovalReview,
+}
+
+/// Typed preflight failures for an operation that may remove or quarantine data.
+///
+/// All coordinates are relative to reviewed declared roots. Host-absolute paths are intentionally
+/// absent from this public correction surface.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestructiveTargetDenial {
+    ActiveClaimIntersection {
+        target: DeclaredPathCoordinate,
+        active_claim: DeclaredPathCoordinate,
+    },
+    ProtectedPathIntersection {
+        target: DeclaredPathCoordinate,
+        protected: ProtectedPathSpec,
+    },
+    UndeclaredTarget {
+        target_fingerprint: String,
+    },
 }
 
 /// Typed family explaining why a gate denied progress.
@@ -201,6 +224,7 @@ pub enum GateDenialReason {
     PrimaryIntegrityFailure,
     ExternalSideEffect { state: ExternalSideEffectState },
     Sandbox { evidence: SandboxDenialEvidence },
+    DestructiveTarget { denial: DestructiveTargetDenial },
     ApprovalReview { denial: ApprovalReviewDenial },
 }
 
@@ -239,6 +263,7 @@ pub enum NextSafeOperation {
     RestorePrimaryIntegrity,
     ReconcileExternalSideEffect,
     EscalateSandboxPolicy,
+    ReplanDestructiveTargets,
     NarrowActionOrChooseAnotherTool,
 }
 
@@ -365,6 +390,87 @@ impl GateDenial {
         Self::new(
             correction_correlation_id,
             GateDenialReason::ClaimConflict,
+            context,
+        )
+    }
+
+    /// Constructs a claim-conflict denial for a path under a declared machine-global root.
+    ///
+    /// The verified context contains a synthetic privacy-safe coordinate rather than a host path.
+    /// It is identity/reporting data only and must never be resolved as a repository path.
+    pub fn from_machine_global_claim_conflict(
+        correction_correlation_id: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        conflict: &DeclaredPathCoordinate,
+    ) -> Result<Self> {
+        conflict
+            .validate()
+            .map_err(|error| GateDenialError::Invalid(error.to_string()))?;
+        Self::from_claim_conflict(
+            correction_correlation_id,
+            owner,
+            [conflict.synthetic_gate_path()],
+        )
+    }
+
+    /// Refuses a destructive target that intersects an active claim before any mutation.
+    pub fn from_destructive_active_claim_intersection(
+        correction_correlation_id: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        target: DeclaredPathCoordinate,
+        active_claim: DeclaredPathCoordinate,
+    ) -> Result<Self> {
+        Self::from_destructive_target_denial(
+            correction_correlation_id,
+            owner,
+            DestructiveTargetDenial::ActiveClaimIntersection {
+                target,
+                active_claim,
+            },
+        )
+    }
+
+    /// Refuses a destructive target that intersects the shared Issue 32 protected-path policy.
+    pub fn from_protected_path_intersection(
+        correction_correlation_id: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        target: DeclaredPathCoordinate,
+        protected: ProtectedPathSpec,
+    ) -> Result<Self> {
+        Self::from_destructive_target_denial(
+            correction_correlation_id,
+            owner,
+            DestructiveTargetDenial::ProtectedPathIntersection { target, protected },
+        )
+    }
+
+    /// Refuses a destructive target that was not declared before the operation began.
+    pub fn from_undeclared_destructive_target(
+        correction_correlation_id: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        target: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let target_fingerprint = undeclared_target_fingerprint(target.as_ref())?;
+        Self::from_destructive_target_denial(
+            correction_correlation_id,
+            owner,
+            DestructiveTargetDenial::UndeclaredTarget { target_fingerprint },
+        )
+    }
+
+    fn from_destructive_target_denial(
+        correction_correlation_id: impl AsRef<str>,
+        owner: impl AsRef<str>,
+        denial: DestructiveTargetDenial,
+    ) -> Result<Self> {
+        let context = VerifiedGateContext::new(
+            owner,
+            GateCheckSource::DestructiveTargetPreflight,
+            std::iter::empty::<&Path>(),
+        )?;
+        Self::new(
+            correction_correlation_id,
+            GateDenialReason::DestructiveTarget { denial },
             context,
         )
     }
@@ -551,6 +657,22 @@ impl GateDenial {
                 prompt.push('\n');
             }
         }
+        let declared_coordinates = prompt_declared_coordinates(&self.reason);
+        if !declared_coordinates.is_empty() {
+            prompt.push_str("Verified declared-root paths:\n");
+            for coordinate in declared_coordinates {
+                prompt.push_str("- root_id=");
+                prompt.push_str(&serde_json::to_string(coordinate.root_id())?);
+                prompt.push_str(", relative=");
+                let relative = coordinate.relative().to_str().ok_or_else(|| {
+                    GateDenialError::Invalid(
+                        "declared-root relative path is not valid UTF-8".into(),
+                    )
+                })?;
+                prompt.push_str(&serde_json::to_string(relative)?);
+                prompt.push('\n');
+            }
+        }
 
         prompt.push_str("Next safe operation: ");
         prompt.push_str(next_safe_operation_instruction(self.next_safe_operation));
@@ -609,8 +731,74 @@ fn canonical_reason(reason: GateDenialReason) -> Result<GateDenialReason> {
             evidence.path = evidence.path.map(canonical_path).transpose()?;
             Ok(GateDenialReason::Sandbox { evidence })
         }
+        GateDenialReason::DestructiveTarget { denial } => {
+            validate_destructive_target_denial(&denial)?;
+            Ok(GateDenialReason::DestructiveTarget { denial })
+        }
         other => Ok(other),
     }
+}
+
+fn validate_destructive_target_denial(denial: &DestructiveTargetDenial) -> Result<()> {
+    let validate_coordinate = |coordinate: &DeclaredPathCoordinate| {
+        coordinate
+            .validate()
+            .map_err(|error| GateDenialError::Invalid(error.to_string()))
+    };
+    match denial {
+        DestructiveTargetDenial::ActiveClaimIntersection {
+            target,
+            active_claim,
+        } => {
+            validate_coordinate(target)?;
+            validate_coordinate(active_claim)?;
+            if !target.intersects(active_claim) {
+                return invalid(
+                    "destructive target and active claim do not intersect within one declared root",
+                );
+            }
+        }
+        DestructiveTargetDenial::ProtectedPathIntersection { target, protected } => {
+            validate_coordinate(target)?;
+            protected
+                .validate()
+                .map_err(|error| GateDenialError::Invalid(error.to_string()))?;
+            if !protected.intersects(target) {
+                return invalid(
+                    "destructive target and protected path do not intersect within one declared root",
+                );
+            }
+        }
+        DestructiveTargetDenial::UndeclaredTarget { target_fingerprint } => {
+            if !is_lower_hex_sha256(target_fingerprint) {
+                return invalid(
+                    "undeclared destructive target fingerprint must be lowercase SHA-256",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn undeclared_target_fingerprint(target: &Path) -> Result<String> {
+    if !target.is_absolute() {
+        return invalid("undeclared destructive target must be absolute");
+    }
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(UNDECLARED_TARGET_FINGERPRINT_DOMAIN);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        preimage.extend_from_slice(target.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        let target = target
+            .to_str()
+            .ok_or_else(|| GateDenialError::Invalid("target path is not valid UTF-8".into()))?;
+        preimage.extend_from_slice(target.as_bytes());
+    }
+    Ok(sha256_hex(&preimage))
 }
 
 fn canonical_paths<I>(paths: I) -> Result<Vec<PathBuf>>
@@ -689,6 +877,9 @@ fn reason_for_apply_blocker(blocker: ApplyBlocker) -> GateDenialReason {
 fn validate_context_source(reason: &GateDenialReason, source: GateCheckSource) -> Result<()> {
     let valid = match reason {
         GateDenialReason::ClaimConflict => source == GateCheckSource::ClaimAcquisition,
+        GateDenialReason::DestructiveTarget { .. } => {
+            source == GateCheckSource::DestructiveTargetPreflight
+        }
         GateDenialReason::AuditorRepair => {
             matches!(
                 source,
@@ -748,7 +939,8 @@ fn retryability_for(reason: &GateDenialReason) -> GateRetryability {
         GateDenialReason::ContainmentFailure
         | GateDenialReason::PrimaryIntegrityFailure
         | GateDenialReason::ExternalSideEffect { .. }
-        | GateDenialReason::Sandbox { .. } => GateRetryability::NotRetryable,
+        | GateDenialReason::Sandbox { .. }
+        | GateDenialReason::DestructiveTarget { .. } => GateRetryability::NotRetryable,
         _ => GateRetryability::RetryAfterCorrection,
     }
 }
@@ -760,6 +952,7 @@ fn is_non_retryable_safety_class(reason: &GateDenialReason) -> bool {
             | GateDenialReason::PrimaryIntegrityFailure
             | GateDenialReason::ExternalSideEffect { .. }
             | GateDenialReason::Sandbox { .. }
+            | GateDenialReason::DestructiveTarget { .. }
     )
 }
 
@@ -770,6 +963,7 @@ fn route_for(reason: &GateDenialReason) -> GateDenialRoute {
         | GateDenialReason::ValidationRepair { .. }
         | GateDenialReason::ContainmentFailure
         | GateDenialReason::Sandbox { .. }
+        | GateDenialReason::DestructiveTarget { .. }
         | GateDenialReason::ApprovalReview { .. } => GateDenialRoute::ChildController,
         GateDenialReason::MergeRemediation { .. }
         | GateDenialReason::PrimaryIntegrityFailure
@@ -796,6 +990,7 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
             NextSafeOperation::ReconcileExternalSideEffect
         }
         GateDenialReason::Sandbox { .. } => NextSafeOperation::EscalateSandboxPolicy,
+        GateDenialReason::DestructiveTarget { .. } => NextSafeOperation::ReplanDestructiveTargets,
         GateDenialReason::ApprovalReview { .. } => {
             NextSafeOperation::NarrowActionOrChooseAnotherTool
         }
@@ -845,6 +1040,24 @@ fn prompt_paths<'a>(
     paths
 }
 
+fn prompt_declared_coordinates<'a>(
+    reason: &'a GateDenialReason,
+) -> BTreeSet<&'a DeclaredPathCoordinate> {
+    match reason {
+        GateDenialReason::DestructiveTarget {
+            denial:
+                DestructiveTargetDenial::ActiveClaimIntersection {
+                    target,
+                    active_claim,
+                },
+        } => BTreeSet::from([target, active_claim]),
+        GateDenialReason::DestructiveTarget {
+            denial: DestructiveTargetDenial::ProtectedPathIntersection { target, protected },
+        } => BTreeSet::from([target, protected.coordinate()]),
+        _ => BTreeSet::new(),
+    }
+}
+
 fn reason_label(reason: &GateDenialReason) -> &'static str {
     match reason {
         GateDenialReason::ClaimConflict => "pre-launch claim conflict",
@@ -877,6 +1090,17 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
                 "sandbox denial requiring declared exception"
             }
             SandboxDenialRetryability::NotRetryable => "non-retryable sandbox denial",
+        },
+        GateDenialReason::DestructiveTarget { denial } => match denial {
+            DestructiveTargetDenial::ActiveClaimIntersection { .. } => {
+                "destructive target intersects an active claim"
+            }
+            DestructiveTargetDenial::ProtectedPathIntersection { .. } => {
+                "destructive target intersects a protected path"
+            }
+            DestructiveTargetDenial::UndeclaredTarget { .. } => {
+                "destructive target was not declared before preflight"
+            }
         },
         GateDenialReason::ApprovalReview { denial } => match denial {
             ApprovalReviewDenial::PermissionExpansion => {
@@ -928,6 +1152,7 @@ fn route_label(value: GateDenialRoute) -> &'static str {
 fn check_source_label(value: GateCheckSource) -> &'static str {
     match value {
         GateCheckSource::ClaimAcquisition => "claim acquisition",
+        GateCheckSource::DestructiveTargetPreflight => "destructive target preflight",
         GateCheckSource::Auditor => "auditor",
         GateCheckSource::Validation => "validation",
         GateCheckSource::PrimaryDrift => "primary drift",
@@ -981,6 +1206,9 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
         NextSafeOperation::EscalateSandboxPolicy => {
             "escalate the sandbox policy denial; do not retry this operation."
         }
+        NextSafeOperation::ReplanDestructiveTargets => {
+            "narrow or redeclare the complete destructive target set, then begin a new operation."
+        }
         NextSafeOperation::NarrowActionOrChooseAnotherTool => {
             "narrow the proposed action or choose another tool before requesting review again."
         }
@@ -1006,6 +1234,7 @@ mod tests {
             SandboxDenialBoundary, SandboxDenialRetryability, SandboxDeniedOperation,
         },
         merge::{ValidationReport, ValidationStatus},
+        protected_path::{DeclaredPathCoordinate, ProtectedPathSpec},
     };
 
     fn context(paths: &[&str]) -> VerifiedGateContext {
@@ -1037,6 +1266,10 @@ mod tests {
         }
     }
 
+    fn declared_coordinate(root_id: &str, relative: &str) -> DeclaredPathCoordinate {
+        DeclaredPathCoordinate::new(root_id, relative).expect("declared coordinate")
+    }
+
     #[test]
     fn stable_id_ignores_correction_lifecycle_and_canonicalizes_paths() {
         let first = validation_denial("correction-a", &["src/./lib.rs", "README.md"]);
@@ -1058,6 +1291,10 @@ mod tests {
         assert_ne!(
             first.denial_id,
             validation_denial("correction-c", &["src/lib.rs"]).denial_id
+        );
+        assert_eq!(
+            first.to_json().expect("legacy denial JSON"),
+            r#"{"version":1,"denial_id":"17449515831021ed4a41cd1a57502d34f6453fcce15da009b97ce1c2d8fa5adf","correction_correlation_id":"correction-a","reason":{"family":"validation_repair","blocker":"validation_failed"},"retryability":"retry_after_correction","context":{"owner":"worker-a","source":"validation_state","paths":["README.md","src/lib.rs"]},"route":"child_controller","next_safe_operation":"repair_validation"}"#
         );
     }
 
@@ -1266,6 +1503,145 @@ mod tests {
     }
 
     #[test]
+    fn machine_global_claim_conflict_reuses_claim_family_with_synthetic_coordinate() {
+        let conflict = declared_coordinate("session-store", "users/a");
+        let denial =
+            GateDenial::from_machine_global_claim_conflict("global-claim", "worker-a", &conflict)
+                .expect("machine-global claim denial");
+
+        assert_eq!(denial.reason, GateDenialReason::ClaimConflict);
+        assert_eq!(denial.context.source, GateCheckSource::ClaimAcquisition);
+        assert_eq!(
+            denial.context.paths,
+            vec![PathBuf::from("__machine_global__/session-store/users/a")]
+        );
+        assert!(!denial
+            .to_json()
+            .expect("denial JSON")
+            .contains("/srv/session-store"));
+    }
+
+    #[test]
+    fn destructive_target_denials_are_typed_nonretryable_and_privacy_safe() {
+        let target = declared_coordinate("session-store", "users/a/cache");
+        let active_claim = declared_coordinate("session-store", "users/a");
+        let claim_denial = GateDenial::from_destructive_active_claim_intersection(
+            "cleanup-claim",
+            "cleanup-agent",
+            target.clone(),
+            active_claim.clone(),
+        )
+        .expect("active-claim intersection");
+        assert_eq!(
+            claim_denial.reason,
+            GateDenialReason::DestructiveTarget {
+                denial: DestructiveTargetDenial::ActiveClaimIntersection {
+                    target: target.clone(),
+                    active_claim,
+                }
+            }
+        );
+
+        let protected = ProtectedPathSpec::new(
+            declared_coordinate("session-store", "users/a/important"),
+            SandboxDenialRetryability::RequiresDeclaredException,
+        );
+        let protected_target = declared_coordinate("session-store", "users/a");
+        let protected_denial = GateDenial::from_protected_path_intersection(
+            "cleanup-protected",
+            "cleanup-agent",
+            protected_target.clone(),
+            protected.clone(),
+        )
+        .expect("protected-path intersection");
+        assert_eq!(
+            protected_denial.reason,
+            GateDenialReason::DestructiveTarget {
+                denial: DestructiveTargetDenial::ProtectedPathIntersection {
+                    target: protected_target,
+                    protected,
+                }
+            }
+        );
+
+        let outside_target = Path::new("/srv/session-store-outside/private/session");
+        let undeclared = GateDenial::from_undeclared_destructive_target(
+            "cleanup-undeclared",
+            "cleanup-agent",
+            outside_target,
+        )
+        .expect("undeclared target");
+        for denial in [&claim_denial, &protected_denial, &undeclared] {
+            assert_eq!(
+                denial.context.source,
+                GateCheckSource::DestructiveTargetPreflight
+            );
+            assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+            assert_eq!(denial.route, GateDenialRoute::ChildController);
+            assert_eq!(
+                denial.next_safe_operation,
+                NextSafeOperation::ReplanDestructiveTargets
+            );
+            assert!(denial.context.paths.is_empty());
+            let json = denial.to_json().expect("destructive denial JSON");
+            assert!(!json.contains(&outside_target.display().to_string()));
+            let prompt = denial.corrective_prompt().expect("corrective prompt");
+            assert!(!prompt.contains(&outside_target.display().to_string()));
+        }
+        assert!(claim_denial
+            .corrective_prompt()
+            .expect("claim correction prompt")
+            .contains("Verified declared-root paths:"));
+        assert!(protected_denial
+            .corrective_prompt()
+            .expect("protected correction prompt")
+            .contains("\"session-store\""));
+        let GateDenialReason::DestructiveTarget {
+            denial: DestructiveTargetDenial::UndeclaredTarget { target_fingerprint },
+        } = &undeclared.reason
+        else {
+            panic!("expected undeclared-target denial");
+        };
+        assert!(is_lower_hex_sha256(target_fingerprint));
+    }
+
+    #[test]
+    fn destructive_intersection_constructors_reject_disjoint_coordinates_and_tampering() {
+        let target = declared_coordinate("state", "sessions/a");
+        let sibling = declared_coordinate("state", "sessions-old");
+        assert!(GateDenial::from_destructive_active_claim_intersection(
+            "cleanup-disjoint",
+            "cleanup-agent",
+            target.clone(),
+            sibling.clone(),
+        )
+        .is_err());
+        assert!(GateDenial::from_protected_path_intersection(
+            "cleanup-disjoint",
+            "cleanup-agent",
+            target.clone(),
+            ProtectedPathSpec::new(sibling, SandboxDenialRetryability::NotRetryable),
+        )
+        .is_err());
+
+        let denial = GateDenial::from_undeclared_destructive_target(
+            "cleanup-tamper",
+            "cleanup-agent",
+            "/outside/state/session",
+        )
+        .expect("undeclared target");
+        let mut value = serde_json::to_value(denial).expect("denial value");
+        value["reason"]["denial"]["target_fingerprint"] = serde_json::json!("not-a-digest");
+        assert!(serde_json::from_value::<GateDenial>(value).is_err());
+        assert!(GateDenial::from_undeclared_destructive_target(
+            "cleanup-relative",
+            "cleanup-agent",
+            "relative/target",
+        )
+        .is_err());
+    }
+
+    #[test]
     fn apply_blockers_map_to_validation_or_merge_routes() {
         let cases = [
             (
@@ -1363,6 +1739,7 @@ mod tests {
 
         let all_sources = [
             GateCheckSource::ClaimAcquisition,
+            GateCheckSource::DestructiveTargetPreflight,
             GateCheckSource::Auditor,
             GateCheckSource::Validation,
             GateCheckSource::PrimaryDrift,
@@ -1380,6 +1757,7 @@ mod tests {
             serde_json::to_value(all_sources).expect("serialize sources"),
             serde_json::json!([
                 "claim_acquisition",
+                "destructive_target_preflight",
                 "auditor",
                 "validation",
                 "primary_drift",
@@ -1431,6 +1809,14 @@ mod tests {
                     ),
                 },
                 GateCheckSource::SandboxPolicy,
+            ),
+            (
+                GateDenialReason::DestructiveTarget {
+                    denial: DestructiveTargetDenial::UndeclaredTarget {
+                        target_fingerprint: "0".repeat(64),
+                    },
+                },
+                GateCheckSource::DestructiveTargetPreflight,
             ),
         ];
 
