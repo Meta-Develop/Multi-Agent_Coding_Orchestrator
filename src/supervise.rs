@@ -16883,7 +16883,6 @@ mod tests {
         )
         .expect("run production command path with unavailable child model");
 
-        drop(runner);
         assert!(report.success, "unexpected failed report: {report:#?}");
         assert!(child_seen);
         assert!(auditor_seen);
@@ -16976,7 +16975,6 @@ mod tests {
         )
         .expect("run production command path with unavailable auditor model");
 
-        drop(runner);
         assert!(report.success, "unexpected failed report: {report:#?}");
         assert!(child_seen);
         assert!(auditor_seen);
@@ -17021,7 +17019,6 @@ mod tests {
         )
         .expect("fail_closed selection should produce a finalized rejection report");
 
-        drop(runner);
         assert_eq!(invocations, 0);
         assert!(!report.success);
         assert!(report
@@ -17084,7 +17081,6 @@ mod tests {
         )
         .expect("run deterministic fake fallback through the shared supervisor core");
 
-        drop(runner);
         assert_eq!(invocations, 0);
         assert!(report.success, "unexpected fake-core failure: {report:#?}");
         assert!(!report.publishable);
@@ -17123,7 +17119,6 @@ mod tests {
         )
         .expect_err("missing catalog must fail closed");
 
-        drop(runner);
         assert_eq!(invocations, 0);
         assert!(
             format!("{error:#}").contains("runtime model availability could not be established")
