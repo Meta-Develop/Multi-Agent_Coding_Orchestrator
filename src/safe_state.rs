@@ -1969,6 +1969,20 @@ pub fn remove_quarantined_direct_child_tree(
     }
 }
 
+/// Returns the deterministic direct-child name used while a durable quarantine tree is audited
+/// and removed.
+///
+/// Callers that gate destructive work must include this coordinate in their complete preflight
+/// and reservation set before invoking [`remove_quarantined_direct_child_tree`].
+pub fn quarantined_direct_child_cleanup_name(
+    quarantine_name: impl AsRef<OsStr>,
+    expected: &FileIdentity,
+) -> Result<OsString> {
+    let quarantine_name = quarantine_name.as_ref();
+    validate_single_component(quarantine_name)?;
+    Ok(deletion_quarantine_name(quarantine_name, expected))
+}
+
 /// Atomically replaces an empty reserved final directory with a verified
 /// staged directory. Both names are rebound to their opened inodes immediately
 /// before and after `renameat`.
@@ -4039,7 +4053,7 @@ fn remove_quarantined_direct_child_tree_linux(
     expected: &FileIdentity,
     policy: TreeLinkPolicy,
 ) -> Result<bool> {
-    let cleanup_name = deletion_quarantine_name(quarantine_name, expected);
+    let cleanup_name = quarantined_direct_child_cleanup_name(quarantine_name, expected)?;
     let quarantine = c_string(quarantine_name)?;
     let cleanup = c_string(&cleanup_name)?;
     let source_exists =

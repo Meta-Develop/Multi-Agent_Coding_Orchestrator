@@ -8,7 +8,8 @@ use crate::{
     gate_denial::{CorrectionCorrelationId, GateDenial},
     protected_path::{DeclaredPathCoordinate, ProtectedPathSpec, SandboxDenialRetryability},
     safe_state::{
-        identity_for_path, quarantine_direct_child_directory, remove_quarantined_direct_child_tree,
+        identity_for_path, quarantine_direct_child_directory,
+        quarantined_direct_child_cleanup_name, remove_quarantined_direct_child_tree,
         restore_quarantined_direct_child_directory, stable_checksum, AtomicStateWriter,
         BoundedRegularReader, FileIdentity, KernelStateLock, SafeRoot, TreeLinkPolicy,
     },
@@ -122,7 +123,11 @@ impl FromStr for RetentionOperationId {
     }
 }
 
-/// Secret bearer capability required for restore and purge.
+/// Secret bearer capability required only for irreversible purge.
+///
+/// Restore deliberately uses the public audit id so a crash after the durable rename but before
+/// command output cannot strand recoverable data. Restore still performs the complete current
+/// claim, protected-path, reservation, identity, and no-replace preflight.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct RetentionOperationToken(String);
@@ -189,6 +194,7 @@ pub enum RetentionTargetState {
 pub struct RetentionTarget {
     pub coordinate: DeclaredPathCoordinate,
     pub quarantine_name: String,
+    pub cleanup_name: String,
     pub identity: FileIdentity,
     pub state: RetentionTargetState,
 }
@@ -549,12 +555,21 @@ impl MachineGlobalStore {
                     .context("quarantine grace timestamp overflow")?,
             );
             let quarantine_name = quarantine_name(operation_id, &coordinate);
+            let cleanup_name =
+                quarantined_direct_child_cleanup_name(&quarantine_name, &prepared.identity)?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("derived cleanup name is not valid UTF-8"))?;
             prepared
                 .parent
                 .ensure_direct_child_absent(&quarantine_name)
                 .context("quarantine destination is unavailable")?;
+            prepared
+                .parent
+                .ensure_direct_child_absent(&cleanup_name)
+                .context("quarantine cleanup destination is unavailable")?;
             operation_targets.push(RetentionTarget {
                 quarantine_name,
+                cleanup_name,
                 coordinate,
                 identity: prepared.identity.clone(),
                 state: RetentionTargetState::Planned,
@@ -664,6 +679,7 @@ impl MachineGlobalStore {
             return Ok(GateOutcome::Denied(denial));
         }
         let accesses = self.bind_operation_parents(&operation)?;
+        run_before_recovery_mutation_hook();
         for (index, access) in accesses.iter().enumerate() {
             let target = operation
                 .targets
@@ -762,6 +778,7 @@ impl MachineGlobalStore {
             return Ok(GateOutcome::Denied(denial));
         }
         let accesses = self.bind_operation_parents(&operation)?;
+        run_before_recovery_mutation_hook();
         for (index, access) in accesses.iter().enumerate() {
             let target = operation
                 .targets
@@ -964,17 +981,22 @@ impl MachineGlobalStore {
             .relative()
             .parent()
             .context("declared coordinate must contain a basename")?;
+        root.safe.verify()?;
         if parent_relative.as_os_str().is_empty() {
             root.safe.verify()?;
             return Ok(root.safe.clone());
         }
-        SafeRoot::open_existing(root.safe.path().join(parent_relative)).with_context(|| {
-            format!(
-                "declared coordinate parent is unsafe or non-canonical: {}:{}",
-                coordinate.root_id(),
-                parent_relative.display()
-            )
-        })
+        let parent =
+            SafeRoot::open_existing(root.safe.path().join(parent_relative)).with_context(|| {
+                format!(
+                    "declared coordinate parent is unsafe or non-canonical: {}:{}",
+                    coordinate.root_id(),
+                    parent_relative.display()
+                )
+            })?;
+        root.safe.verify()?;
+        parent.verify()?;
+        Ok(parent)
     }
 
     fn destructive_intersection_denial(
@@ -1131,6 +1153,7 @@ fn validate_loaded_state(
         if operation.targets.is_empty() || operation.targets.len() > MAX_TARGETS_PER_OPERATION {
             bail!("durable retention target set is out of bounds");
         }
+        validate_retention_phases(&operation.targets)?;
         let mut expected_purge_after = operation.created_at_epoch_seconds;
         let mut original_coordinates = Vec::with_capacity(operation.targets.len());
         for target in &operation.targets {
@@ -1150,6 +1173,14 @@ fn validate_loaded_state(
             validate_quarantine_name(&target.quarantine_name)?;
             if target.quarantine_name != quarantine_name(operation.id, &target.coordinate) {
                 bail!("durable quarantine name does not match its operation and coordinate");
+            }
+            validate_cleanup_name(&target.cleanup_name)?;
+            let expected_cleanup =
+                quarantined_direct_child_cleanup_name(&target.quarantine_name, &target.identity)?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("derived cleanup name is not valid UTF-8"))?;
+            if target.cleanup_name != expected_cleanup {
+                bail!("durable cleanup name does not match its quarantine and identity");
             }
             original_coordinates.push(target.coordinate.clone());
         }
@@ -1212,6 +1243,51 @@ fn validate_disjoint_coordinates(
     Ok(())
 }
 
+fn validate_retention_phases(targets: &[RetentionTarget]) -> Result<()> {
+    let contains_purged = targets
+        .iter()
+        .any(|target| target.state == RetentionTargetState::Purged);
+    let contains_restored = targets
+        .iter()
+        .any(|target| target.state == RetentionTargetState::Restored);
+    if contains_purged && contains_restored {
+        bail!("durable retention operation mixes purged and restored phases");
+    }
+
+    let rank = |state| {
+        if contains_purged {
+            match state {
+                RetentionTargetState::Purged => Some(0_u8),
+                RetentionTargetState::Quarantined => Some(1),
+                RetentionTargetState::Planned | RetentionTargetState::Restored => None,
+            }
+        } else if contains_restored {
+            match state {
+                RetentionTargetState::Restored => Some(0),
+                RetentionTargetState::Quarantined => Some(1),
+                RetentionTargetState::Planned => Some(2),
+                RetentionTargetState::Purged => None,
+            }
+        } else {
+            match state {
+                RetentionTargetState::Quarantined => Some(0),
+                RetentionTargetState::Planned => Some(1),
+                RetentionTargetState::Restored | RetentionTargetState::Purged => None,
+            }
+        }
+    };
+    let mut previous = 0_u8;
+    for (index, target) in targets.iter().enumerate() {
+        let current =
+            rank(target.state).context("durable retention operation has an impossible phase")?;
+        if index > 0 && current < previous {
+            bail!("durable retention phases are not a valid resumable prefix");
+        }
+        previous = current;
+    }
+    Ok(())
+}
+
 fn take_next_id(next: &mut u64) -> Result<u64> {
     let current = *next;
     if current == 0 {
@@ -1251,7 +1327,7 @@ fn retention_summary(operation: &RetentionOperation) -> RetentionOperationSummar
 fn operation_mutation_coordinates(
     operation: &RetentionOperation,
 ) -> Result<Vec<DeclaredPathCoordinate>> {
-    let mut coordinates = Vec::with_capacity(operation.targets.len().saturating_mul(2));
+    let mut coordinates = Vec::with_capacity(operation.targets.len().saturating_mul(3));
     for target in &operation.targets {
         if matches!(
             target.state,
@@ -1261,6 +1337,7 @@ fn operation_mutation_coordinates(
         }
         coordinates.push(target.coordinate.clone());
         coordinates.push(quarantine_coordinate(target)?);
+        coordinates.push(cleanup_coordinate(target)?);
     }
     Ok(coordinates)
 }
@@ -1279,6 +1356,9 @@ fn operation_reserved_coordinates(
         if let Ok(quarantine) = quarantine_coordinate(target) {
             coordinates.push(quarantine);
         }
+        if let Ok(cleanup) = cleanup_coordinate(target) {
+            coordinates.push(cleanup);
+        }
         coordinates.into_iter()
     })
 }
@@ -1294,6 +1374,19 @@ fn quarantine_coordinate(target: &RetentionTarget) -> Result<DeclaredPathCoordin
         parent.join(&target.quarantine_name),
     )
     .context("derived quarantine coordinate is invalid")
+}
+
+fn cleanup_coordinate(target: &RetentionTarget) -> Result<DeclaredPathCoordinate> {
+    let parent = target
+        .coordinate
+        .relative()
+        .parent()
+        .context("retention coordinate must contain a basename")?;
+    DeclaredPathCoordinate::new(
+        target.coordinate.root_id(),
+        parent.join(&target.cleanup_name),
+    )
+    .context("derived cleanup coordinate is invalid")
 }
 
 fn coordinate_basename(coordinate: &DeclaredPathCoordinate) -> Result<&OsStr> {
@@ -1333,6 +1426,17 @@ fn validate_quarantine_name(name: &str) -> Result<()> {
         || Path::new(name).components().count() != 1
     {
         bail!("durable quarantine sibling name is invalid");
+    }
+    Ok(())
+}
+
+fn validate_cleanup_name(name: &str) -> Result<()> {
+    if !name.starts_with(".maco-delete-v2-")
+        || name.is_empty()
+        || name.len() > 240
+        || Path::new(name).components().count() != 1
+    {
+        bail!("durable quarantine cleanup sibling name is invalid");
     }
     Ok(())
 }
@@ -1411,11 +1515,20 @@ fn trusted_now_epoch_seconds() -> Result<u64> {
 thread_local! {
     static AFTER_RETENTION_PREFLIGHT_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static BEFORE_RECOVERY_MUTATION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
 fn set_after_retention_preflight_hook(hook: impl FnOnce() + 'static) {
     AFTER_RETENTION_PREFLIGHT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn set_before_recovery_mutation_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_RECOVERY_MUTATION_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
     });
 }
@@ -1427,4 +1540,880 @@ fn run_after_retention_preflight_hook() {
             hook();
         }
     });
+}
+
+fn run_before_recovery_mutation_hook() {
+    #[cfg(test)]
+    BEFORE_RECOVERY_MUTATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::{
+        os::unix::{fs::symlink, fs::PermissionsExt},
+        sync::mpsc,
+        thread,
+    };
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _temp: TempDir,
+        state_root: PathBuf,
+        external_root: PathBuf,
+        config_path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(protected_relative: &[&str], grace_seconds: u64) -> Self {
+            let temp = TempDir::new().expect("tempdir");
+            let state_root = temp.path().join("machine-state");
+            let external_root = temp.path().join("external-root");
+            fs::create_dir(&state_root).expect("state root");
+            fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+                .expect("private state root");
+            fs::create_dir(&external_root).expect("external root");
+            let config_path = temp.path().join("machine-global.json");
+            let protected_paths = protected_relative
+                .iter()
+                .map(|relative| {
+                    ProtectedPathSpec::new(
+                        coordinate(relative),
+                        SandboxDenialRetryability::NotRetryable,
+                    )
+                })
+                .collect();
+            write_config(
+                &config_path,
+                &state_root,
+                &external_root,
+                protected_paths,
+                grace_seconds,
+            );
+            Self {
+                _temp: temp,
+                state_root,
+                external_root,
+                config_path,
+            }
+        }
+
+        fn store(&self) -> MachineGlobalStore {
+            MachineGlobalStore::open_config(&self.config_path).expect("open store")
+        }
+
+        fn directory(&self, relative: &str) -> PathBuf {
+            let path = self.external_root.join(relative);
+            fs::create_dir_all(&path).expect("target directory");
+            path
+        }
+    }
+
+    fn coordinate(relative: &str) -> DeclaredPathCoordinate {
+        DeclaredPathCoordinate::new("external", relative).expect("coordinate")
+    }
+
+    fn declared(relative: &str) -> DestructiveTargetInput {
+        DestructiveTargetInput::Declared(coordinate(relative))
+    }
+
+    fn write_config(
+        config_path: &Path,
+        state_root: &Path,
+        external_root: &Path,
+        protected_paths: Vec<ProtectedPathSpec>,
+        grace_seconds: u64,
+    ) {
+        let config = MachineGlobalConfig {
+            version: CONFIG_VERSION,
+            state_root: state_root.to_path_buf(),
+            roots: vec![DeclaredGlobalRootConfig {
+                id: "external".to_string(),
+                path: external_root.to_path_buf(),
+                protected_paths,
+                quarantine_grace_seconds: grace_seconds,
+            }],
+        };
+        fs::write(
+            config_path,
+            serde_json::to_vec_pretty(&config).expect("config json"),
+        )
+        .expect("write config");
+    }
+
+    fn allowed_claim(outcome: GateOutcome<MachineGlobalClaim>) -> MachineGlobalClaim {
+        match outcome {
+            GateOutcome::Allowed(claim) => claim,
+            GateOutcome::Denied(denial) => panic!("unexpected denial: {denial:?}"),
+        }
+    }
+
+    fn allowed_operation(outcome: GateOutcome<RetentionOperation>) -> RetentionOperation {
+        match outcome {
+            GateOutcome::Allowed(operation) => operation,
+            GateOutcome::Denied(denial) => panic!("unexpected denial: {denial:?}"),
+        }
+    }
+
+    #[test]
+    fn two_concurrent_agents_repair_claim_blocks_reclaimer_across_independent_stores() {
+        let fixture = Fixture::new(&[], 60);
+        let session = fixture.directory("sessions/current");
+        fs::write(session.join("irrecoverable"), "keep").expect("valuable data");
+        let config_for_repair = fixture.config_path.clone();
+        let config_for_reclaimer = fixture.config_path.clone();
+        let (claimed_tx, claimed_rx) = mpsc::channel();
+        let repair = thread::spawn(move || {
+            let store = MachineGlobalStore::open_config(config_for_repair).expect("repair store");
+            let claim = allowed_claim(
+                store
+                    .claim(
+                        "repair-agent",
+                        "repair-correlation",
+                        vec![coordinate("sessions")],
+                    )
+                    .expect("repair claim"),
+            );
+            claimed_tx.send(()).expect("signal claim");
+            claim
+        });
+        let reclaim = thread::spawn(move || {
+            claimed_rx.recv().expect("wait for repair claim");
+            let store =
+                MachineGlobalStore::open_config(config_for_reclaimer).expect("reclaimer store");
+            store
+                .quarantine_at(
+                    "reclaim-agent",
+                    "reclaim-correlation",
+                    vec![declared("sessions/current")],
+                    100,
+                )
+                .expect("typed reclaim outcome")
+        });
+
+        let claim = repair.join().expect("repair thread");
+        let outcome = reclaim.join().expect("reclaim thread");
+        let GateOutcome::Denied(denial) = outcome else {
+            panic!("reclaimer must be denied by the concurrent repair claim");
+        };
+        assert!(serde_json::to_string(&denial)
+            .expect("denial json")
+            .contains("active_claim_intersection"));
+        assert_eq!(
+            fs::read_to_string(session.join("irrecoverable")).expect("data survives"),
+            "keep"
+        );
+        fixture
+            .store()
+            .release("repair-agent", claim.token)
+            .expect("release");
+    }
+
+    #[test]
+    fn destructive_full_preflight_reports_claim_and_protected_intersections_before_any_rename() {
+        let fixture = Fixture::new(&["protected"], 60);
+        let allowed = fixture.directory("allowed");
+        let claimed = fixture.directory("claimed");
+        let protected = fixture.directory("protected");
+        let store = fixture.store();
+        let _claim = allowed_claim(
+            store
+                .claim(
+                    "repair-agent",
+                    "claim-correlation",
+                    vec![coordinate("claimed")],
+                )
+                .expect("claim"),
+        );
+
+        let protected_outcome = store
+            .quarantine_at(
+                "cleanup-agent",
+                "protected-correlation",
+                vec![declared("allowed"), declared("protected")],
+                100,
+            )
+            .expect("protected outcome");
+        let GateOutcome::Denied(protected_denial) = protected_outcome else {
+            panic!("protected target must be denied");
+        };
+        assert!(serde_json::to_string(&protected_denial)
+            .expect("protected denial json")
+            .contains("protected_path_intersection"));
+        assert!(allowed.exists());
+        assert!(protected.exists());
+
+        let claim_outcome = store
+            .quarantine_at(
+                "cleanup-agent",
+                "claim-correlation-2",
+                vec![declared("allowed"), declared("claimed")],
+                100,
+            )
+            .expect("claim outcome");
+        let GateOutcome::Denied(claim_denial) = claim_outcome else {
+            panic!("claimed target must be denied");
+        };
+        assert!(serde_json::to_string(&claim_denial)
+            .expect("claim denial json")
+            .contains("active_claim_intersection"));
+        assert!(allowed.exists());
+        assert!(claimed.exists());
+    }
+
+    #[test]
+    fn quarantine_destination_claim_and_protection_are_preflighted() {
+        let source_coordinate = coordinate("victim");
+        let operation_id = RetentionOperationId::new(1).expect("operation id");
+        let quarantine = quarantine_name(operation_id, &source_coordinate);
+        let fixture = Fixture::new(&[&quarantine], 60);
+        let victim = fixture.directory("victim");
+        let protected_outcome = fixture
+            .store()
+            .quarantine_at(
+                "cleanup-agent",
+                "destination-protected",
+                vec![declared("victim")],
+                100,
+            )
+            .expect("protected destination outcome");
+        assert!(matches!(protected_outcome, GateOutcome::Denied(_)));
+        assert!(victim.exists());
+
+        let unprotected = Fixture::new(&[], 60);
+        let victim = unprotected.directory("victim");
+        let store = unprotected.store();
+        let _claim = allowed_claim(
+            store
+                .claim(
+                    "repair-agent",
+                    "destination-claim",
+                    vec![coordinate(&quarantine)],
+                )
+                .expect("destination claim"),
+        );
+        let claim_outcome = store
+            .quarantine_at(
+                "cleanup-agent",
+                "destination-claim-denial",
+                vec![declared("victim")],
+                100,
+            )
+            .expect("claimed destination outcome");
+        assert!(matches!(claim_outcome, GateOutcome::Denied(_)));
+        assert!(victim.exists());
+
+        let cleanup_protected = Fixture::new(&[], 60);
+        let victim = cleanup_protected.directory("victim");
+        let identity = identity_for_path(&victim).expect("victim identity");
+        let cleanup = quarantined_direct_child_cleanup_name(&quarantine, &identity)
+            .expect("cleanup name")
+            .into_string()
+            .expect("utf8 cleanup name");
+        write_config(
+            &cleanup_protected.config_path,
+            &cleanup_protected.state_root,
+            &cleanup_protected.external_root,
+            vec![ProtectedPathSpec::new(
+                coordinate(&cleanup),
+                SandboxDenialRetryability::NotRetryable,
+            )],
+            60,
+        );
+        let cleanup_outcome = cleanup_protected
+            .store()
+            .quarantine_at(
+                "cleanup-agent",
+                "cleanup-protected",
+                vec![declared("victim")],
+                100,
+            )
+            .expect("cleanup protected outcome");
+        assert!(matches!(cleanup_outcome, GateOutcome::Denied(_)));
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn active_retention_reserves_source_quarantine_and_cleanup_coordinates() {
+        let fixture = Fixture::new(&[], 60);
+        fixture.directory("victim");
+        let store = fixture.store();
+        let operation = allowed_operation(
+            store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "reserve-operation",
+                    vec![declared("victim")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+
+        let source_claim = store
+            .claim(
+                "repair-agent",
+                "reserved-source",
+                vec![coordinate("victim")],
+            )
+            .expect("source claim outcome");
+        assert!(matches!(source_claim, GateOutcome::Denied(_)));
+        for (index, reserved) in [
+            operation.targets[0].quarantine_name.as_str(),
+            operation.targets[0].cleanup_name.as_str(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let claim = store
+                .claim(
+                    "repair-agent",
+                    format!("reserved-coordinate-{index}"),
+                    vec![coordinate(reserved)],
+                )
+                .expect("reserved claim outcome");
+            assert!(matches!(claim, GateOutcome::Denied(_)));
+        }
+
+        let nested_cleanup = store
+            .quarantine_at(
+                "other-cleanup",
+                "reserved-quarantine-cleanup",
+                vec![declared(&operation.targets[0].quarantine_name)],
+                101,
+            )
+            .expect("reservation cleanup denial");
+        assert!(matches!(nested_cleanup, GateOutcome::Denied(_)));
+    }
+
+    #[test]
+    fn undeclared_absolute_and_component_prefix_paths_do_not_widen_declared_roots() {
+        let fixture = Fixture::new(&[], 60);
+        let state = fixture.directory("state");
+        let statefoo = fixture.directory("statefoo");
+        let outside = fixture._temp.path().join("external-root-old");
+        fs::create_dir(&outside).expect("outside directory");
+        let store = fixture.store();
+
+        let outside_outcome = store
+            .quarantine_at(
+                "cleanup-agent",
+                "outside-target",
+                vec![DestructiveTargetInput::UndeclaredAbsolute(outside.clone())],
+                100,
+            )
+            .expect("outside denial");
+        let GateOutcome::Denied(denial) = outside_outcome else {
+            panic!("outside target must be denied");
+        };
+        let denial_json = serde_json::to_string(&denial).expect("outside denial json");
+        assert!(denial_json.contains("undeclared_target"));
+        assert!(!denial_json.contains(outside.to_str().expect("utf8 outside")));
+        assert!(outside.exists());
+
+        let first = allowed_claim(
+            store
+                .claim("first-agent", "prefix-first", vec![coordinate("state")])
+                .expect("first claim"),
+        );
+        let second = allowed_claim(
+            store
+                .claim(
+                    "second-agent",
+                    "prefix-second",
+                    vec![coordinate("statefoo")],
+                )
+                .expect("component-distinct claim"),
+        );
+        assert!(state.exists());
+        assert!(statefoo.exists());
+        store
+            .release("first-agent", first.token)
+            .expect("release first");
+        store
+            .release("second-agent", second.token)
+            .expect("release second");
+        assert!(DeclaredPathCoordinate::new("external", &outside).is_err());
+    }
+
+    #[test]
+    fn config_spelling_symlink_and_permissions_fail_closed() {
+        let fixture = Fixture::new(&[], 60);
+        let noncanonical_config = PathBuf::from(format!(
+            "{}/./machine-global.json",
+            fixture._temp.path().display()
+        ));
+        assert!(MachineGlobalStore::open_config(noncanonical_config).is_err());
+        let repeated_separator = PathBuf::from(format!(
+            "{}//machine-global.json",
+            fixture._temp.path().display()
+        ));
+        assert!(MachineGlobalStore::open_config(repeated_separator).is_err());
+        let trailing_separator = PathBuf::from(format!(
+            "{}/machine-global.json/",
+            fixture._temp.path().display()
+        ));
+        assert!(MachineGlobalStore::open_config(trailing_separator).is_err());
+
+        let config_link = fixture._temp.path().join("config-link.json");
+        symlink(&fixture.config_path, &config_link).expect("config symlink");
+        assert!(MachineGlobalStore::open_config(config_link).is_err());
+
+        fs::set_permissions(&fixture.config_path, fs::Permissions::from_mode(0o666))
+            .expect("writable config");
+        assert!(MachineGlobalStore::open_config(&fixture.config_path).is_err());
+        fs::set_permissions(&fixture.config_path, fs::Permissions::from_mode(0o644))
+            .expect("restore config mode");
+
+        let root_alias = fixture._temp.path().join("root-alias");
+        symlink(&fixture.external_root, &root_alias).expect("root symlink");
+        let alias_config = fixture._temp.path().join("alias.json");
+        write_config(
+            &alias_config,
+            &fixture.state_root,
+            &root_alias,
+            Vec::new(),
+            60,
+        );
+        assert!(MachineGlobalStore::open_config(alias_config).is_err());
+
+        let dotted_config = fixture._temp.path().join("dotted.json");
+        write_config(
+            &dotted_config,
+            &fixture.state_root,
+            &fixture.external_root.join("."),
+            Vec::new(),
+            60,
+        );
+        assert!(MachineGlobalStore::open_config(dotted_config).is_err());
+    }
+
+    #[test]
+    fn traversal_noncanonical_and_symlink_targets_fail_closed() {
+        let fixture = Fixture::new(&[], 60);
+        let outside = fixture._temp.path().join("outside");
+        fs::create_dir(&outside).expect("outside");
+        fs::write(outside.join("valuable"), "keep").expect("outside data");
+        symlink(&outside, fixture.external_root.join("linked")).expect("target symlink");
+        fs::create_dir(fixture.external_root.join("nested")).expect("nested");
+        symlink(
+            &outside,
+            fixture.external_root.join("nested").join("linked-parent"),
+        )
+        .expect("parent symlink");
+        let store = fixture.store();
+
+        assert!(DeclaredPathCoordinate::new("external", "../outside").is_err());
+        assert!(DeclaredPathCoordinate::new("external", "nested/./child").is_err());
+        assert!(store
+            .claim("repair-agent", "leaf-symlink", vec![coordinate("linked")],)
+            .is_err());
+        assert!(store
+            .claim(
+                "repair-agent",
+                "parent-symlink",
+                vec![coordinate("nested/linked-parent/child")],
+            )
+            .is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("valuable")).expect("outside survives"),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn quarantine_restore_grace_and_token_gates_are_recoverable_and_auditable() {
+        let fixture = Fixture::new(&[], 30);
+        let victim = fixture.directory("victim");
+        fs::write(victim.join("valuable"), "keep").expect("valuable");
+        let store = fixture.store();
+
+        let operation = allowed_operation(
+            store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "quarantine-one",
+                    vec![declared("victim")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+        assert!(!victim.exists());
+        assert!(store
+            .purge_at(
+                "cleanup-agent",
+                "too-early",
+                operation.id,
+                &operation.token,
+                129,
+            )
+            .is_err());
+        let restored = allowed_operation(
+            store
+                .restore("cleanup-agent", "restore-one", operation.id)
+                .expect("restore"),
+        );
+        assert_eq!(restored.targets[0].state, RetentionTargetState::Restored);
+        assert_eq!(
+            fs::read_to_string(victim.join("valuable")).expect("restored data"),
+            "keep"
+        );
+
+        let second = allowed_operation(
+            store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "quarantine-two",
+                    vec![declared("victim")],
+                    200,
+                )
+                .expect("second quarantine"),
+        );
+        let wrong_token =
+            RetentionOperationToken::new("0".repeat(64)).expect("syntactically valid wrong token");
+        assert!(store
+            .purge_at("cleanup-agent", "wrong-token", second.id, &wrong_token, 230,)
+            .is_err());
+        let purged = allowed_operation(
+            store
+                .purge_at("cleanup-agent", "purge-two", second.id, &second.token, 230)
+                .expect("purge"),
+        );
+        assert_eq!(purged.targets[0].state, RetentionTargetState::Purged);
+        assert!(!victim.exists());
+        let status_json = serde_json::to_string(&store.status().expect("status")).expect("json");
+        assert!(status_json.contains(&format!("\"id\":{}", second.id.get())));
+        assert!(!status_json.contains(second.token.as_str()));
+    }
+
+    #[test]
+    fn unavailable_quarantine_destination_refuses_without_moving_source() {
+        let fixture = Fixture::new(&[], 60);
+        let victim = fixture.directory("victim");
+        fs::write(victim.join("valuable"), "keep").expect("valuable");
+        let operation_id = RetentionOperationId::new(1).expect("operation id");
+        let quarantine = quarantine_name(operation_id, &coordinate("victim"));
+        fs::create_dir(fixture.external_root.join(&quarantine)).expect("occupied destination");
+
+        let error = fixture
+            .store()
+            .quarantine_at(
+                "cleanup-agent",
+                "occupied-destination",
+                vec![declared("victim")],
+                100,
+            )
+            .expect_err("occupied destination must fail closed");
+        assert!(error.to_string().contains("destination"));
+        assert_eq!(
+            fs::read_to_string(victim.join("valuable")).expect("source survives"),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn post_preflight_target_replacement_is_refused_without_quarantine_mutation() {
+        let fixture = Fixture::new(&[], 60);
+        let victim = fixture.directory("victim");
+        fs::write(victim.join("valuable"), "original").expect("valuable");
+        let displaced = fixture.external_root.join("displaced");
+        let victim_for_hook = victim.clone();
+        let displaced_for_hook = displaced.clone();
+        set_after_retention_preflight_hook(move || {
+            fs::rename(&victim_for_hook, &displaced_for_hook).expect("displace original");
+            fs::create_dir(&victim_for_hook).expect("replacement");
+            fs::write(victim_for_hook.join("valuable"), "replacement").expect("replacement data");
+        });
+
+        let error = fixture
+            .store()
+            .quarantine_at(
+                "cleanup-agent",
+                "target-replacement",
+                vec![declared("victim")],
+                100,
+            )
+            .expect_err("identity replacement must fail");
+        assert!(error.to_string().contains("quarantining"));
+        assert_eq!(
+            fs::read_to_string(victim.join("valuable")).expect("replacement remains"),
+            "replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(displaced.join("valuable")).expect("original remains"),
+            "original"
+        );
+    }
+
+    #[test]
+    fn post_preflight_root_replacement_is_refused_without_outside_mutation() {
+        let fixture = Fixture::new(&[], 60);
+        let victim = fixture.directory("victim");
+        fs::write(victim.join("valuable"), "original").expect("valuable");
+        let displaced_root = fixture._temp.path().join("displaced-root");
+        let root_for_hook = fixture.external_root.clone();
+        let displaced_for_hook = displaced_root.clone();
+        set_after_retention_preflight_hook(move || {
+            fs::rename(&root_for_hook, &displaced_for_hook).expect("displace root");
+            fs::create_dir(&root_for_hook).expect("replacement root");
+            fs::create_dir(root_for_hook.join("victim")).expect("replacement victim");
+            fs::write(root_for_hook.join("victim/valuable"), "replacement")
+                .expect("replacement data");
+        });
+
+        let error = fixture
+            .store()
+            .quarantine_at(
+                "cleanup-agent",
+                "root-replacement",
+                vec![declared("victim")],
+                100,
+            )
+            .expect_err("root replacement must fail");
+        assert!(error.to_string().contains("quarantining"));
+        assert_eq!(
+            fs::read_to_string(displaced_root.join("victim/valuable"))
+                .expect("original outside survives"),
+            "original"
+        );
+        assert_eq!(
+            fs::read_to_string(victim.join("valuable")).expect("replacement survives"),
+            "replacement"
+        );
+    }
+
+    #[test]
+    fn planned_record_restores_after_post_rename_crash_state() {
+        let fixture = Fixture::new(&[], 60);
+        let victim = fixture.directory("victim");
+        fs::write(victim.join("valuable"), "keep").expect("valuable");
+        let store = fixture.store();
+        let operation = allowed_operation(
+            store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "crash-quarantine",
+                    vec![declared("victim")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+        let lock = store.acquire_lock().expect("state lock");
+        let mut state = store.load_state(&lock).expect("state");
+        let record = state
+            .retention_operations
+            .get_mut(&operation.id)
+            .expect("operation record");
+        record.targets[0].state = RetentionTargetState::Planned;
+        store.write_state(&lock, &state).expect("write crash state");
+        drop(lock);
+
+        let restored = allowed_operation(
+            store
+                .restore("cleanup-agent", "crash-restore", operation.id)
+                .expect("restore planned"),
+        );
+        assert_eq!(restored.targets[0].state, RetentionTargetState::Restored);
+        assert_eq!(
+            fs::read_to_string(victim.join("valuable")).expect("restored data"),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn restore_and_purge_recheck_live_protection_before_mutation() {
+        let fixture = Fixture::new(&[], 20);
+        fixture.directory("victim");
+        let mut store = fixture.store();
+        let operation = allowed_operation(
+            store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "protect-before-restore",
+                    vec![declared("victim")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+        let lock = store.acquire_lock().expect("state lock");
+        let mut active_claim_state = store.load_state(&lock).expect("state");
+        drop(lock);
+        let fabricated_token =
+            MachineGlobalClaimToken::new(random_identifier().expect("random token"))
+                .expect("claim token");
+        active_claim_state.claims.insert(
+            fabricated_token.clone(),
+            MachineGlobalClaim {
+                token: fabricated_token,
+                owner: "repair-agent".to_string(),
+                targets: vec![coordinate("victim")],
+            },
+        );
+        let active_claim_denial = store
+            .destructive_intersection_denial(
+                &active_claim_state,
+                "cleanup-agent",
+                "restore-claim-recheck",
+                &operation_mutation_coordinates(&operation).expect("mutation coordinates"),
+                Some(operation.id),
+            )
+            .expect("active claim preflight");
+        assert!(serde_json::to_string(&active_claim_denial)
+            .expect("active claim denial json")
+            .contains("active_claim_intersection"));
+        store
+            .roots
+            .get_mut("external")
+            .expect("root")
+            .protected_paths
+            .push(ProtectedPathSpec::new(
+                coordinate("victim"),
+                SandboxDenialRetryability::NotRetryable,
+            ));
+        let restore = store
+            .restore("cleanup-agent", "restore-recheck", operation.id)
+            .expect("restore outcome");
+        assert!(matches!(restore, GateOutcome::Denied(_)));
+        assert!(!fixture.external_root.join("victim").exists());
+        assert!(fixture
+            .external_root
+            .join(&operation.targets[0].quarantine_name)
+            .exists());
+
+        let purge_fixture = Fixture::new(&[], 20);
+        purge_fixture.directory("victim");
+        let mut purge_store = purge_fixture.store();
+        let purge_operation = allowed_operation(
+            purge_store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "protect-before-purge",
+                    vec![declared("victim")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+        purge_store
+            .roots
+            .get_mut("external")
+            .expect("root")
+            .protected_paths
+            .push(ProtectedPathSpec::new(
+                coordinate(&purge_operation.targets[0].cleanup_name),
+                SandboxDenialRetryability::NotRetryable,
+            ));
+        let purge = purge_store
+            .purge_at(
+                "cleanup-agent",
+                "purge-recheck",
+                purge_operation.id,
+                &purge_operation.token,
+                120,
+            )
+            .expect("purge outcome");
+        assert!(matches!(purge, GateOutcome::Denied(_)));
+        assert!(purge_fixture
+            .external_root
+            .join(&purge_operation.targets[0].quarantine_name)
+            .exists());
+    }
+
+    #[test]
+    fn recovery_parent_replacement_hooks_refuse_restore_and_purge() {
+        let restore_fixture = Fixture::new(&[], 20);
+        restore_fixture.directory("victim");
+        let restore_store = restore_fixture.store();
+        let restore_operation = allowed_operation(
+            restore_store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "restore-hook-quarantine",
+                    vec![declared("victim")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+        let displaced_restore_root = restore_fixture._temp.path().join("restore-displaced");
+        let restore_root = restore_fixture.external_root.clone();
+        let restore_displaced = displaced_restore_root.clone();
+        set_before_recovery_mutation_hook(move || {
+            fs::rename(&restore_root, &restore_displaced).expect("displace restore root");
+            fs::create_dir(&restore_root).expect("replacement restore root");
+            fs::create_dir(restore_root.join("victim")).expect("replacement restore victim");
+        });
+        assert!(restore_store
+            .restore(
+                "cleanup-agent",
+                "restore-parent-replacement",
+                restore_operation.id,
+            )
+            .is_err());
+        assert!(displaced_restore_root
+            .join(&restore_operation.targets[0].quarantine_name)
+            .exists());
+        assert!(restore_fixture.external_root.join("victim").exists());
+
+        let purge_fixture = Fixture::new(&[], 20);
+        purge_fixture.directory("victim");
+        let purge_store = purge_fixture.store();
+        let purge_operation = allowed_operation(
+            purge_store
+                .quarantine_at(
+                    "cleanup-agent",
+                    "purge-hook-quarantine",
+                    vec![declared("victim")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+        let displaced_purge_root = purge_fixture._temp.path().join("purge-displaced");
+        let purge_root = purge_fixture.external_root.clone();
+        let purge_displaced = displaced_purge_root.clone();
+        set_before_recovery_mutation_hook(move || {
+            fs::rename(&purge_root, &purge_displaced).expect("displace purge root");
+            fs::create_dir(&purge_root).expect("replacement purge root");
+            fs::create_dir(purge_root.join("victim")).expect("replacement purge victim");
+        });
+        assert!(purge_store
+            .purge_at(
+                "cleanup-agent",
+                "purge-parent-replacement",
+                purge_operation.id,
+                &purge_operation.token,
+                120,
+            )
+            .is_err());
+        assert!(displaced_purge_root
+            .join(&purge_operation.targets[0].quarantine_name)
+            .exists());
+        assert!(purge_fixture.external_root.join("victim").exists());
+    }
+
+    #[test]
+    fn impossible_mixed_retention_phases_are_rejected() {
+        let fixture = Fixture::new(&[], 20);
+        fixture.directory("first");
+        fixture.directory("second");
+        let operation = allowed_operation(
+            fixture
+                .store()
+                .quarantine_at(
+                    "cleanup-agent",
+                    "phase-fixture",
+                    vec![declared("first"), declared("second")],
+                    100,
+                )
+                .expect("quarantine"),
+        );
+        let mut invalid = operation.targets.clone();
+        invalid[0].state = RetentionTargetState::Planned;
+        invalid[1].state = RetentionTargetState::Quarantined;
+        assert!(validate_retention_phases(&invalid).is_err());
+        invalid[0].state = RetentionTargetState::Restored;
+        invalid[1].state = RetentionTargetState::Purged;
+        assert!(validate_retention_phases(&invalid).is_err());
+    }
 }
