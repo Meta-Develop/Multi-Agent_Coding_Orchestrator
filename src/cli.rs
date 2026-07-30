@@ -10,6 +10,10 @@ use crate::{
     inbox::{self, InboxPermissionMode, InboxScanOptions, InboxWorkspaceScanOptions},
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
+    machine_global::{
+        DestructiveTargetInput, GateOutcome, MachineGlobalClaimSummary, MachineGlobalClaimToken,
+        MachineGlobalStore, RetentionOperationId, RetentionOperationToken,
+    },
     megafile::{
         MegafileAssessment, MegafileReport, MegafileStore, MegafileThresholdCalibration,
         MegafileThresholds,
@@ -25,6 +29,7 @@ use crate::{
         OrchestrationRunOptions, OrchestrationSummary, RunId, SemanticCoordinationMode,
         WorktreeReusePolicy,
     },
+    protected_path::DeclaredPathCoordinate,
     publication::{
         self, ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
         PrPublicationStatus,
@@ -103,6 +108,7 @@ impl Cli {
             Command::Pr(command) => command.run(),
             Command::Issue(command) => command.run(),
             Command::Sync(command) => command.run(),
+            Command::MachineGlobal(command) => command.run(),
             Command::Coord(command) => command.run(),
             Command::Orchestrate(command) => command.run(),
             Command::Supervise(command) => command.run(),
@@ -138,6 +144,8 @@ enum Command {
     Issue(IssueCommand),
     /// Manage repository-local sync path claims.
     Sync(SyncCommand),
+    /// Manage claims and recoverable retention under explicitly declared machine-global roots.
+    MachineGlobal(MachineGlobalCommand),
     /// Manage repository-local semantic coordination intents.
     Coord(CoordCommand),
     /// Run local orchestration plans.
@@ -1983,6 +1991,291 @@ struct StatusSyncArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalCommand {
+    #[command(subcommand)]
+    command: MachineGlobalSubcommand,
+}
+
+impl MachineGlobalCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            MachineGlobalSubcommand::Claim(args) => {
+                let store = MachineGlobalStore::open_config(&args.config)?;
+                let targets = machine_global_declared_coordinates(&args.root_id, args.paths)?;
+                let outcome = store.claim(&args.owner, &args.correlation, targets)?;
+                print_machine_global_gate_outcome(outcome, args.json)
+            }
+            MachineGlobalSubcommand::Release(args) => {
+                let store = MachineGlobalStore::open_config(&args.config)?;
+                let released = store.release(&args.owner, args.token.clone())?;
+                print_query_report(
+                    &MachineGlobalReleaseReport {
+                        owner: &args.owner,
+                        released,
+                    },
+                    args.json,
+                )
+            }
+            MachineGlobalSubcommand::Owner(args) => {
+                let store = MachineGlobalStore::open_config(&args.config)?;
+                let target = DeclaredPathCoordinate::new(&args.root_id, &args.path)
+                    .context("invalid machine-global owner coordinate")?;
+                let claims = store.owner(&target)?;
+                print_query_report(&MachineGlobalOwnerReport { target, claims }, args.json)
+            }
+            MachineGlobalSubcommand::Status(args) => {
+                let store = MachineGlobalStore::open_config(&args.config)?;
+                print_query_report(&store.status()?, args.json)
+            }
+            MachineGlobalSubcommand::Retention(command) => command.run(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum MachineGlobalSubcommand {
+    /// Claim one or more paths beneath one configured machine-global root.
+    Claim(MachineGlobalClaimArgs),
+    /// Release one machine-global claim by token.
+    Release(MachineGlobalReleaseArgs),
+    /// Report claims intersecting one configured machine-global path.
+    Owner(MachineGlobalOwnerArgs),
+    /// List privacy-safe machine-global claims and retention operations.
+    Status(MachineGlobalStatusArgs),
+    /// Quarantine, restore, or purge declared external directories.
+    Retention(MachineGlobalRetentionCommand),
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalClaimArgs {
+    /// Stable owner id. Allowed characters: ASCII letters, digits, '.', '_' and '-'.
+    owner: String,
+    /// Reviewed root id from the explicit machine-global JSON config.
+    #[arg(long)]
+    root_id: String,
+    /// Root-relative paths to claim. Absolute and non-canonical paths are rejected.
+    #[arg(long = "path", required = true)]
+    paths: Vec<PathBuf>,
+    /// Identity of the correction lifecycle that will consume a typed denial.
+    #[arg(long)]
+    correlation: String,
+    /// Exact canonical path to the bounded, no-follow machine-global JSON config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalReleaseArgs {
+    /// Stable owner id recorded by the claim.
+    owner: String,
+    /// Claim token to release.
+    token: MachineGlobalClaimToken,
+    /// Exact canonical path to the bounded, no-follow machine-global JSON config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalOwnerArgs {
+    /// Reviewed root id from the explicit machine-global JSON config.
+    #[arg(long)]
+    root_id: String,
+    /// Root-relative path to inspect.
+    #[arg(long)]
+    path: PathBuf,
+    /// Exact canonical path to the bounded, no-follow machine-global JSON config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalStatusArgs {
+    /// Exact canonical path to the bounded, no-follow machine-global JSON config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalRetentionCommand {
+    #[command(subcommand)]
+    command: MachineGlobalRetentionSubcommand,
+}
+
+impl MachineGlobalRetentionCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            MachineGlobalRetentionSubcommand::Quarantine(args) => {
+                let store = MachineGlobalStore::open_config(&args.config)?;
+                let targets = machine_global_destructive_targets(&args.root_id, args.paths)?;
+                let outcome = store.quarantine(&args.owner, &args.correlation, targets)?;
+                print_machine_global_gate_outcome(outcome, args.json)
+            }
+            MachineGlobalRetentionSubcommand::Restore(args) => {
+                let store = MachineGlobalStore::open_config(&args.config)?;
+                let outcome =
+                    store.restore(&args.owner, &args.correlation, args.operation_id)?;
+                print_machine_global_gate_outcome(outcome, args.json)
+            }
+            MachineGlobalRetentionSubcommand::Purge(args) => {
+                let store = MachineGlobalStore::open_config(&args.config)?;
+                let outcome = store.purge(
+                    &args.owner,
+                    &args.correlation,
+                    args.operation_id,
+                    &args.token,
+                )?;
+                print_machine_global_gate_outcome(outcome, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum MachineGlobalRetentionSubcommand {
+    /// Atomically quarantine declared directories after a full target-set gate.
+    Quarantine(MachineGlobalQuarantineArgs),
+    /// Restore a quarantined operation before permanent purge.
+    Restore(MachineGlobalRestoreArgs),
+    /// Permanently remove a quarantined operation after its configured grace period.
+    Purge(MachineGlobalPurgeArgs),
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalQuarantineArgs {
+    /// Stable destructive-operation owner id.
+    owner: String,
+    /// Reviewed root id from the explicit machine-global JSON config.
+    #[arg(long)]
+    root_id: String,
+    /// Complete root-relative target set. Absolute values are refused through GateDenial.
+    #[arg(long = "path", required = true)]
+    paths: Vec<PathBuf>,
+    /// Identity of the correction lifecycle that will consume a typed denial.
+    #[arg(long)]
+    correlation: String,
+    /// Exact canonical path to the bounded, no-follow machine-global JSON config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalRestoreArgs {
+    /// Stable destructive-operation owner id.
+    owner: String,
+    /// Retention operation to restore.
+    operation_id: RetentionOperationId,
+    /// Identity of the correction lifecycle that will consume a typed denial.
+    #[arg(long)]
+    correlation: String,
+    /// Exact canonical path to the bounded, no-follow machine-global JSON config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MachineGlobalPurgeArgs {
+    /// Stable destructive-operation owner id.
+    owner: String,
+    /// Retention operation to purge.
+    operation_id: RetentionOperationId,
+    /// Secret bearer capability returned by the quarantine operation.
+    #[arg(long)]
+    token: RetentionOperationToken,
+    /// Identity of the correction lifecycle that will consume a typed denial.
+    #[arg(long)]
+    correlation: String,
+    /// Exact canonical path to the bounded, no-follow machine-global JSON config.
+    #[arg(long)]
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MachineGlobalReleaseReport<'a> {
+    owner: &'a str,
+    released: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MachineGlobalOwnerReport {
+    target: DeclaredPathCoordinate,
+    claims: Vec<MachineGlobalClaimSummary>,
+}
+
+fn machine_global_declared_coordinates(
+    root_id: &str,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<DeclaredPathCoordinate>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            DeclaredPathCoordinate::new(root_id, &path).with_context(|| {
+                format!(
+                    "invalid machine-global coordinate {root_id}:{}",
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
+
+fn machine_global_destructive_targets(
+    root_id: &str,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<DestructiveTargetInput>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            if path.is_absolute() {
+                Ok(DestructiveTargetInput::UndeclaredAbsolute(path))
+            } else {
+                DeclaredPathCoordinate::new(root_id, &path)
+                    .map(DestructiveTargetInput::Declared)
+                    .with_context(|| {
+                        format!(
+                            "invalid machine-global destructive target {root_id}:{}",
+                            path.display()
+                        )
+                    })
+            }
+        })
+        .collect()
+}
+
+fn print_machine_global_gate_outcome<T>(outcome: GateOutcome<T>, json: bool) -> Result<()>
+where
+    T: Serialize + std::fmt::Debug,
+{
+    match outcome {
+        GateOutcome::Allowed(value) => print_query_report(&value, json),
+        GateOutcome::Denied(denial) => {
+            print_query_report(&denial, json)?;
+            bail!("machine-global operation denied")
+        }
+    }
 }
 
 #[derive(Debug, Args)]
