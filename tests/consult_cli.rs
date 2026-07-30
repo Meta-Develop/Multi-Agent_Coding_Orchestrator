@@ -375,16 +375,33 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
     assert!(command
         .iter()
         .any(|arg| arg == "default_permissions=\"maco_external_codex\""));
-    assert!(
-        command.iter().any(|arg| {
-            arg
-                == "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\".agents\"=\"read\",\".codex\"=\"read\",\".git\"=\"read\",\".gitignore\"=\"read\",\".maco\"=\"read\",\".maco-cache\"=\"read\",\".maco/consult/runs/consult-codex/incoming\"=\"write\"}"
-        }),
-        "unexpected command: {command:?}"
-    );
     assert!(command
         .iter()
         .any(|arg| { arg == "permissions.maco_external_codex.network={enabled=false}" }));
+    assert!(
+        command_contains_sequence(
+            command,
+            &[
+                "-c",
+                "permissions.maco_external_codex.network={enabled=false}",
+                "-c",
+                "<redacted:local-path>",
+                "-c",
+                "shell_environment_policy.inherit=\"none\"",
+            ],
+        ),
+        "unexpected public confinement command: {command:?}"
+    );
+    assert!(!command.iter().any(|arg| {
+        arg.as_str()
+            .is_some_and(|text| text.starts_with("permissions.maco_external_codex.filesystem="))
+    }));
+    let repo_path_text = path_str(&repo_path)?;
+    let fake_codex_text = path_str(&fake_codex)?;
+    assert!(!command.iter().any(|arg| {
+        arg.as_str()
+            .is_some_and(|text| text.contains(repo_path_text) || text.contains(fake_codex_text))
+    }));
     assert!(command_contains_sequence(
         command,
         &["--output-last-message", "<redacted:local-path>"]

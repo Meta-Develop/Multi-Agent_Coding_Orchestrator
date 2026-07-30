@@ -1072,7 +1072,10 @@ mod tests {
     use crate::external_agent::{
         run_external_agent_nonpublishable_simulation, CapturedOutput, ExternalProgramTrust,
     };
-    use crate::process_runner::{ContainmentBackend, ProcessTreeEvidence};
+    use crate::process_runner::{
+        ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfileKind,
+    };
     use std::fs;
 
     #[test]
@@ -1226,6 +1229,10 @@ mod tests {
             run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
                 ContainmentBackend::SystemdUserService,
             ));
+            run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ));
+            assert!(run.scratch_quiescence_verified());
             run
         })?;
 
