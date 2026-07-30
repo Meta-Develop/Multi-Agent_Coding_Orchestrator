@@ -337,6 +337,84 @@ impl SafeRoot {
         &self.identity
     }
 
+    /// Returns the Linux mount id shared by the held directory descriptor and its current
+    /// pathname binding.
+    ///
+    /// Bind mounts can preserve device/inode identity while changing the kernel mount domain, so
+    /// callers that treat one configured path as a physical authority boundary must retain this
+    /// value for the lifetime of the live binding and recheck it as well as [`FileIdentity`].
+    pub fn linux_mount_id(&self) -> Result<u64> {
+        self.verify()?;
+        #[cfg(target_os = "linux")]
+        {
+            let held = linux_mount_identity_for_fd(self.directory.as_raw_fd())?.mount_id;
+            let rebound = open_existing_directory(&self.path).with_context(|| {
+                format!(
+                    "safe root path is no longer reachable for mount verification: {}",
+                    self.path.display()
+                )
+            })?;
+            let rebound_mount = linux_mount_identity_for_fd(rebound.as_raw_fd())?.mount_id;
+            if held != rebound_mount {
+                bail!(
+                    "safe root mount binding changed at {} (descriptor {}, pathname {})",
+                    self.path.display(),
+                    held,
+                    rebound_mount
+                );
+            }
+            self.verify()?;
+            Ok(held)
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!(
+            "safe-root mount identity verification requires Linux statx: {}",
+            self.path.display()
+        )
+    }
+
+    /// Verifies that both the held descriptor and rebound pathname remain on `expected_mount_id`.
+    pub fn verify_linux_mount_id(&self, expected_mount_id: u64) -> Result<()> {
+        let observed = self.linux_mount_id()?;
+        if observed != expected_mount_id {
+            bail!(
+                "safe root mount id changed at {} (expected {}, observed {})",
+                self.path.display(),
+                expected_mount_id,
+                observed
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns the mount id of an existing direct child without following a symbolic link.
+    ///
+    /// `None` denotes an absent child. The statx result is identity-checked against the same
+    /// descriptor-relative `fstatat` observation before it is returned.
+    pub fn direct_child_linux_mount_id(&self, name: impl AsRef<OsStr>) -> Result<Option<u64>> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let root_mount_id = self.linux_mount_id()?;
+        #[cfg(target_os = "linux")]
+        {
+            let name_c = c_string(name)?;
+            let Some(stat) = fstatat_optional_no_follow(self.directory.as_raw_fd(), &name_c)?
+            else {
+                self.verify_linux_mount_id(root_mount_id)?;
+                return Ok(None);
+            };
+            let mount =
+                linux_mount_identity_at(self.directory.as_raw_fd(), &name_c, &stat)?.mount_id;
+            self.verify_linux_mount_id(root_mount_id)?;
+            Ok(Some(mount))
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!(
+            "direct-child mount identity verification requires Linux statx: {}",
+            self.path.join(name).display()
+        )
+    }
+
     pub fn verify(&self) -> Result<()> {
         let handle_metadata = self.directory.metadata().with_context(|| {
             format!(
@@ -1099,6 +1177,42 @@ impl BoundedRegularReader {
         }
     }
 
+    /// Reads a no-follow tree path while validating metadata from the exact opened descriptor
+    /// before and after the bounded read.
+    ///
+    /// The validator is intended for policy beyond the regular/single-link invariant, such as
+    /// current-user ownership and mode checks on security-sensitive configuration.
+    pub fn read_tree_no_follow_validated<F>(
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+        mut validate: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(&fs::Metadata) -> Result<()>,
+    {
+        let absolute = absolute_normalized(path.as_ref())?;
+        #[cfg(unix)]
+        {
+            let root = Path::new(std::path::MAIN_SEPARATOR_STR);
+            let relative = absolute.strip_prefix(root).with_context(|| {
+                format!("failed to make path root-relative: {}", absolute.display())
+            })?;
+            let mut file = open_relative_regular_unix_allow_mounts(root, relative)?;
+            read_bounded_file_with_validator_and_hook(
+                &mut file,
+                &absolute,
+                max_bytes,
+                &mut validate,
+                || {},
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (absolute, max_bytes, &mut validate);
+            bail!("component-wise validated no-follow reads are unsupported on this platform")
+        }
+    }
+
     /// Reads an arbitrary UTF-8 filesystem input without following symbolic
     /// links in any ancestor or in the final leaf.
     pub fn read_tree_no_follow_utf8(path: impl AsRef<Path>, max_bytes: u64) -> Result<String> {
@@ -1415,7 +1529,7 @@ impl AtomicStateWriter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(target_os = "linux", test))]
 thread_local! {
     static TEMP_SCAVENGE_AFTER_QUARANTINE_FAULT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -1897,6 +2011,49 @@ pub fn quarantine_direct_child_directory(
     }
 }
 
+/// Restores an identity-bound direct-child directory from a caller-supplied
+/// quarantine name using an atomic no-replace rename.
+///
+/// Exactly one of `child_name` and `quarantine_name` must exist before the
+/// restore. An already-restored source with the expected identity is accepted
+/// idempotently. Both-present, both-absent, and identity-mismatch states fail
+/// closed. Linux provides the required `renameat2(RENAME_NOREPLACE)` primitive;
+/// other platforms refuse without mutating either name.
+pub fn restore_quarantined_direct_child_directory(
+    root: &SafeRoot,
+    child_name: impl AsRef<OsStr>,
+    quarantine_name: impl AsRef<OsStr>,
+    expected: &FileIdentity,
+) -> Result<FileIdentity> {
+    let child_name = child_name.as_ref();
+    let quarantine_name = quarantine_name.as_ref();
+    validate_single_component(child_name)?;
+    validate_single_component(quarantine_name)?;
+    if child_name == quarantine_name {
+        bail!("source and quarantine directory names must differ");
+    }
+    root.verify()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        restore_quarantined_direct_child_directory_linux(
+            root,
+            child_name,
+            quarantine_name,
+            expected,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = expected;
+        bail!(
+            "atomic no-replace directory restore is unsupported on this platform; refusing to mutate {}",
+            root.path().join(quarantine_name).display()
+        )
+    }
+}
+
 /// Resumably removes an already-durable quarantine directory. Absence of both
 /// the durable name and its deterministic cleanup name means cleanup already
 /// completed. The stopped-child/no-active-writer precondition from
@@ -1924,6 +2081,20 @@ pub fn remove_quarantined_direct_child_tree(
             root.path().join(quarantine_name).display()
         )
     }
+}
+
+/// Returns the deterministic direct-child name used while a durable quarantine tree is audited
+/// and removed.
+///
+/// Callers that gate destructive work must include this coordinate in their complete preflight
+/// and reservation set before invoking [`remove_quarantined_direct_child_tree`].
+pub fn quarantined_direct_child_cleanup_name(
+    quarantine_name: impl AsRef<OsStr>,
+    expected: &FileIdentity,
+) -> Result<OsString> {
+    let quarantine_name = quarantine_name.as_ref();
+    validate_single_component(quarantine_name)?;
+    Ok(deletion_quarantine_name(quarantine_name, expected))
 }
 
 /// Atomically replaces an empty reserved final directory with a verified
@@ -2447,10 +2618,29 @@ fn read_bounded_file_with_hook(
     max_bytes: u64,
     after_initial_metadata: impl FnOnce(),
 ) -> Result<Vec<u8>> {
+    let mut validate = |_: &fs::Metadata| Ok(());
+    read_bounded_file_with_validator_and_hook(
+        file,
+        path,
+        max_bytes,
+        &mut validate,
+        after_initial_metadata,
+    )
+}
+
+fn read_bounded_file_with_validator_and_hook(
+    file: &mut File,
+    path: &Path,
+    max_bytes: u64,
+    validate: &mut impl FnMut(&fs::Metadata) -> Result<()>,
+    after_initial_metadata: impl FnOnce(),
+) -> Result<Vec<u8>> {
     let before = file
         .metadata()
         .with_context(|| format!("failed to inspect opened file {}", path.display()))?;
     ensure_regular_single_link_metadata(path, &before)?;
+    validate(&before)
+        .with_context(|| format!("opened file metadata policy rejected {}", path.display()))?;
     if before.len() > max_bytes {
         bail!(
             "file exceeds bounded read limit of {} bytes (observed {}): {}",
@@ -2483,6 +2673,8 @@ fn read_bounded_file_with_hook(
         .metadata()
         .with_context(|| format!("failed to revalidate opened file {}", path.display()))?;
     ensure_regular_single_link_metadata(path, &after)?;
+    validate(&after)
+        .with_context(|| format!("opened file metadata policy changed for {}", path.display()))?;
     if !same_file_generation(&before, &after) {
         bail!(
             "file identity changed during bounded read: {}",
@@ -2643,6 +2835,9 @@ fn linux_mount_identity(
     if observed.stx_mask & libc::STATX_MNT_ID == 0 {
         bail!("statx did not report a filesystem mount identity");
     }
+    if observed.stx_mnt_id == 0 {
+        bail!("statx reported an invalid zero filesystem mount identity");
+    }
     if observed.stx_ino != unsigned_to_u64(expected.st_ino)
         || observed.stx_dev_major != libc::major(expected.st_dev)
         || observed.stx_dev_minor != libc::minor(expected.st_dev)
@@ -2652,6 +2847,65 @@ fn linux_mount_identity(
     Ok(LinuxMountIdentity {
         mount_id: observed.stx_mnt_id,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn require_linux_mount_id(expected: u64, observed: u64, subject: &str) -> Result<()> {
+    if observed != expected {
+        bail!(
+            "refusing filesystem mount crossing for {subject}: expected mount {expected}, observed {observed}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", test))]
+thread_local! {
+    static NEXT_LINUX_MOUNT_MISMATCH_SUBJECT: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn inject_next_linux_mount_mismatch(subject: &'static str) {
+    NEXT_LINUX_MOUNT_MISMATCH_SUBJECT.with(|slot| slot.set(Some(subject)));
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn apply_linux_mount_test_observation(subject: &str, observed: u64) -> u64 {
+    NEXT_LINUX_MOUNT_MISMATCH_SUBJECT.with(|slot| {
+        if slot.get().is_some_and(|requested| requested == subject) {
+            slot.set(None);
+            observed
+                .checked_add(1)
+                .unwrap_or(observed.saturating_sub(1))
+        } else {
+            observed
+        }
+    })
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn apply_linux_mount_test_observation(_subject: &str, observed: u64) -> u64 {
+    observed
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_mount_at(
+    directory_fd: RawFd,
+    name: &std::ffi::CStr,
+    stat: &libc::stat,
+    expected_mount_id: u64,
+    subject: &str,
+) -> Result<()> {
+    let observed = linux_mount_identity_at(directory_fd, name, stat)?.mount_id;
+    let observed = apply_linux_mount_test_observation(subject, observed);
+    require_linux_mount_id(expected_mount_id, observed, subject)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_mount_for_fd(fd: RawFd, expected_mount_id: u64, subject: &str) -> Result<()> {
+    let observed = linux_mount_identity_for_fd(fd)?.mount_id;
+    require_linux_mount_id(expected_mount_id, observed, subject)
 }
 
 #[cfg(target_os = "linux")]
@@ -3902,6 +4156,52 @@ fn quarantine_direct_child_directory_linux(
 }
 
 #[cfg(target_os = "linux")]
+fn restore_quarantined_direct_child_directory_linux(
+    root: &SafeRoot,
+    child_name: &OsStr,
+    quarantine_name: &OsStr,
+    expected: &FileIdentity,
+) -> Result<FileIdentity> {
+    let parent_fd = root.directory.as_raw_fd();
+    let source = c_string(child_name)?;
+    let quarantine = c_string(quarantine_name)?;
+    let source_stat = fstatat_optional_no_follow(parent_fd, &source)?;
+    let quarantine_stat = fstatat_optional_no_follow(parent_fd, &quarantine)?;
+    match (source_stat, quarantine_stat) {
+        (Some(_), Some(_)) => bail!(
+            "source and quarantine both exist; refusing ambiguous restore for {}",
+            root.path().join(child_name).display()
+        ),
+        (None, None) => bail!(
+            "source and quarantine are both absent; refusing ambiguous restore for {}",
+            root.path().join(child_name).display()
+        ),
+        (Some(stat), None) => {
+            validate_private_quarantine_directory(root, child_name, &stat, expected)?;
+            Ok(expected.clone())
+        }
+        (None, Some(stat)) => {
+            validate_private_quarantine_directory(root, quarantine_name, &stat, expected)?;
+            rename_noreplace_at(root, quarantine_name, child_name)?;
+            let rebound = fstatat_no_follow(parent_fd, &source)?;
+            if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || identity_from_stat(&rebound) != *expected
+            {
+                bail!(
+                    "restored directory identity mismatch after atomic rename for {}",
+                    root.path().join(child_name).display()
+                );
+            }
+            if fstatat_optional_no_follow(parent_fd, &quarantine)?.is_some() {
+                bail!("quarantine name reappeared during directory restore");
+            }
+            sync_directory(root)?;
+            Ok(expected.clone())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn validate_private_quarantine_directory(
     root: &SafeRoot,
     name: &OsStr,
@@ -3918,11 +4218,24 @@ fn validate_private_quarantine_directory(
         );
     }
     let cname = c_string(name)?;
+    let root_mount_id = linux_mount_identity_for_fd(root.directory.as_raw_fd())?.mount_id;
+    verify_linux_mount_at(
+        root.directory.as_raw_fd(),
+        &cname,
+        stat,
+        root_mount_id,
+        "quarantine directory entry",
+    )?;
     let directory = openat_directory(root.directory.as_raw_fd(), &cname)?;
     let opened = fstat(directory.as_raw_fd())?;
     if identity_from_stat(&opened) != *expected {
         bail!("quarantine directory changed while opening its handle");
     }
+    verify_linux_mount_for_fd(
+        directory.as_raw_fd(),
+        root_mount_id,
+        "opened quarantine directory",
+    )?;
     if opened.st_mode & 0o777 != 0o700 {
         if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
             return Err(std::io::Error::last_os_error()).with_context(|| {
@@ -3950,7 +4263,7 @@ fn remove_quarantined_direct_child_tree_linux(
     expected: &FileIdentity,
     policy: TreeLinkPolicy,
 ) -> Result<bool> {
-    let cleanup_name = deletion_quarantine_name(quarantine_name, expected);
+    let cleanup_name = quarantined_direct_child_cleanup_name(quarantine_name, expected)?;
     let quarantine = c_string(quarantine_name)?;
     let cleanup = c_string(&cleanup_name)?;
     let source_exists =
@@ -3960,6 +4273,26 @@ fn remove_quarantined_direct_child_tree_linux(
     if !source_exists && !cleanup_exists {
         return Ok(false);
     }
+    if source_exists && cleanup_exists {
+        bail!(
+            "quarantine and cleanup residue both exist; refusing ambiguous removal for {}",
+            root.path().join(quarantine_name).display()
+        );
+    }
+    let expected_mount_id = linux_mount_identity_for_fd(root.directory.as_raw_fd())?.mount_id;
+    let preaudit_name = if source_exists {
+        quarantine_name
+    } else {
+        cleanup_name.as_os_str()
+    };
+    audit_tree_at_name_linux_on_mount(
+        root,
+        preaudit_name,
+        expected,
+        policy,
+        None,
+        expected_mount_id,
+    )?;
     quarantine_direct_child_directory_linux(root, quarantine_name, &cleanup_name, expected)?;
     remove_tree_at_name_linux(root, &cleanup_name, expected, policy)?;
     Ok(true)
@@ -4003,10 +4336,100 @@ fn remove_tree_at_name_linux_with_deadline(
     policy: TreeLinkPolicy,
     deadline: Option<Instant>,
 ) -> Result<()> {
-    ensure_before_deadline(deadline, "before opening quarantined tree")?;
+    let expected_mount_id = linux_mount_identity_for_fd(root.directory.as_raw_fd())?.mount_id;
+    remove_tree_at_name_linux_with_deadline_on_mount(
+        root,
+        name,
+        expected,
+        policy,
+        deadline,
+        expected_mount_id,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn audit_tree_at_name_linux_on_mount(
+    root: &SafeRoot,
+    name: &OsStr,
+    expected: &FileIdentity,
+    policy: TreeLinkPolicy,
+    deadline: Option<Instant>,
+    expected_mount_id: u64,
+) -> Result<()> {
+    ensure_before_deadline(deadline, "before opening quarantine tree for audit")?;
     let directory = root.directory.as_ref();
+    verify_linux_mount_for_fd(
+        directory.as_raw_fd(),
+        expected_mount_id,
+        "quarantine audit root",
+    )?;
     let root_stat = fstat(directory.as_raw_fd())?;
     let cname = c_string(name)?;
+    let child_path_stat = fstatat_no_follow(directory.as_raw_fd(), &cname)?;
+    verify_linux_mount_at(
+        directory.as_raw_fd(),
+        &cname,
+        &child_path_stat,
+        expected_mount_id,
+        "top-level quarantine tree during pre-audit",
+    )?;
+    let child = openat_directory(directory.as_raw_fd(), &cname)?;
+    let child_stat = fstat(child.as_raw_fd())?;
+    if child_stat.st_dev != root_stat.st_dev {
+        bail!(
+            "refusing to cross a filesystem boundary while auditing {}",
+            root.path().join(name).display()
+        );
+    }
+    verify_linux_mount_for_fd(
+        child.as_raw_fd(),
+        expected_mount_id,
+        "opened top-level quarantine tree during pre-audit",
+    )?;
+    if identity_from_stat(&child_stat) != *expected {
+        bail!(
+            "directory identity changed before deletion audit at {}",
+            root.path().join(name).display()
+        );
+    }
+    let mut audit_budget = TreeBudget::new();
+    audit_directory_unix(
+        child.as_raw_fd(),
+        child_stat.st_dev,
+        expected_mount_id,
+        policy,
+        0,
+        &mut audit_budget,
+        deadline,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn remove_tree_at_name_linux_with_deadline_on_mount(
+    root: &SafeRoot,
+    name: &OsStr,
+    expected: &FileIdentity,
+    policy: TreeLinkPolicy,
+    deadline: Option<Instant>,
+    expected_mount_id: u64,
+) -> Result<()> {
+    ensure_before_deadline(deadline, "before opening quarantined tree")?;
+    let directory = root.directory.as_ref();
+    verify_linux_mount_for_fd(
+        directory.as_raw_fd(),
+        expected_mount_id,
+        "quarantine cleanup root",
+    )?;
+    let root_stat = fstat(directory.as_raw_fd())?;
+    let cname = c_string(name)?;
+    let child_path_stat = fstatat_no_follow(directory.as_raw_fd(), &cname)?;
+    verify_linux_mount_at(
+        directory.as_raw_fd(),
+        &cname,
+        &child_path_stat,
+        expected_mount_id,
+        "top-level quarantine tree",
+    )?;
     let child = openat_directory(directory.as_raw_fd(), &cname)?;
     let child_stat = fstat(child.as_raw_fd())?;
     if child_stat.st_dev != root_stat.st_dev {
@@ -4015,6 +4438,11 @@ fn remove_tree_at_name_linux_with_deadline(
             root.path().join(name).display()
         );
     }
+    verify_linux_mount_for_fd(
+        child.as_raw_fd(),
+        expected_mount_id,
+        "opened top-level quarantine tree",
+    )?;
     let observed = identity_from_stat(&child_stat);
     if expected != &observed {
         bail!(
@@ -4026,6 +4454,7 @@ fn remove_tree_at_name_linux_with_deadline(
     audit_directory_unix(
         child.as_raw_fd(),
         child_stat.st_dev,
+        expected_mount_id,
         policy,
         0,
         &mut audit_budget,
@@ -4035,6 +4464,7 @@ fn remove_tree_at_name_linux_with_deadline(
     remove_directory_contents_unix(
         child.as_raw_fd(),
         child_stat.st_dev,
+        expected_mount_id,
         policy,
         0,
         &mut removal_budget,
@@ -4049,6 +4479,13 @@ fn remove_tree_at_name_linux_with_deadline(
             root.path().join(name).display()
         );
     }
+    verify_linux_mount_at(
+        directory.as_raw_fd(),
+        &cname,
+        &rebound,
+        expected_mount_id,
+        "top-level quarantine tree before removal",
+    )?;
     if unsafe { libc::unlinkat(directory.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| {
             format!(
@@ -4397,12 +4834,14 @@ impl TreeBudget {
 fn audit_directory_unix(
     fd: RawFd,
     device: libc::dev_t,
+    expected_mount_id: u64,
     policy: TreeLinkPolicy,
     depth: usize,
     budget: &mut TreeBudget,
     deadline: Option<Instant>,
 ) -> Result<()> {
     ensure_before_deadline(deadline, "during recursive deletion audit")?;
+    verify_linux_mount_for_fd(fd, expected_mount_id, "audited quarantine directory")?;
     if depth > MAX_TREE_DEPTH {
         bail!("recursive deletion exceeded its maximum depth of {MAX_TREE_DEPTH}");
     }
@@ -4416,6 +4855,13 @@ fn audit_directory_unix(
                 name.to_string_lossy()
             );
         }
+        verify_linux_mount_at(
+            fd,
+            &cname,
+            &stat,
+            expected_mount_id,
+            "quarantine tree entry during deletion audit",
+        )?;
         let kind = stat.st_mode & libc::S_IFMT;
         if kind == libc::S_IFDIR {
             let child = openat_directory(fd, &cname)?;
@@ -4426,9 +4872,15 @@ fn audit_directory_unix(
                     name.to_string_lossy()
                 );
             }
+            verify_linux_mount_for_fd(
+                child.as_raw_fd(),
+                expected_mount_id,
+                "opened quarantine child during deletion audit",
+            )?;
             audit_directory_unix(
                 child.as_raw_fd(),
                 device,
+                expected_mount_id,
                 policy,
                 depth.saturating_add(1),
                 budget,
@@ -4462,12 +4914,14 @@ fn audit_directory_unix(
 fn remove_directory_contents_unix(
     fd: RawFd,
     device: libc::dev_t,
+    expected_mount_id: u64,
     policy: TreeLinkPolicy,
     depth: usize,
     budget: &mut TreeBudget,
     deadline: Option<Instant>,
 ) -> Result<()> {
     ensure_before_deadline(deadline, "during recursive deletion")?;
+    verify_linux_mount_for_fd(fd, expected_mount_id, "quarantine removal directory")?;
     if depth > MAX_TREE_DEPTH {
         bail!("recursive deletion exceeded its maximum depth of {MAX_TREE_DEPTH}");
     }
@@ -4481,6 +4935,13 @@ fn remove_directory_contents_unix(
                 name.to_string_lossy()
             );
         }
+        verify_linux_mount_at(
+            fd,
+            &source_name,
+            &stat,
+            expected_mount_id,
+            "quarantine tree entry before child rename",
+        )?;
         let expected = identity_from_stat(&stat);
         let quarantine_name = entry_quarantine_name(&name, &expected);
         let quarantine_c = c_string(&quarantine_name)?;
@@ -4499,6 +4960,13 @@ fn remove_directory_contents_unix(
                 name.to_string_lossy()
             );
         }
+        verify_linux_mount_at(
+            fd,
+            &quarantine_c,
+            &rebound,
+            expected_mount_id,
+            "quarantined child after rename",
+        )?;
         if fstatat_optional_no_follow(fd, &source_name)?.is_some() {
             bail!("child source name reappeared during quarantine");
         }
@@ -4507,6 +4975,13 @@ fn remove_directory_contents_unix(
         if identity_from_stat(&quarantined) != expected {
             bail!("quarantined child identity changed before deletion");
         }
+        verify_linux_mount_at(
+            fd,
+            &cname,
+            &quarantined,
+            expected_mount_id,
+            "quarantined child before deletion",
+        )?;
         let kind = quarantined.st_mode & libc::S_IFMT;
         if kind == libc::S_IFDIR {
             let child = openat_directory(fd, &cname)?;
@@ -4517,9 +4992,15 @@ fn remove_directory_contents_unix(
                     name.to_string_lossy()
                 );
             }
+            verify_linux_mount_for_fd(
+                child.as_raw_fd(),
+                expected_mount_id,
+                "opened quarantine child during deletion",
+            )?;
             remove_directory_contents_unix(
                 child.as_raw_fd(),
                 device,
+                expected_mount_id,
                 policy,
                 depth.saturating_add(1),
                 budget,
@@ -4536,6 +5017,13 @@ fn remove_directory_contents_unix(
                     name.to_string_lossy()
                 );
             }
+            verify_linux_mount_at(
+                fd,
+                &cname,
+                &rebound,
+                expected_mount_id,
+                "quarantine child directory before removal",
+            )?;
             if unsafe { libc::unlinkat(fd, cname.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
                 return Err(std::io::Error::last_os_error()).with_context(|| {
                     format!(
@@ -4560,6 +5048,13 @@ fn remove_directory_contents_unix(
                     name.to_string_lossy()
                 );
             }
+            verify_linux_mount_at(
+                fd,
+                &cname,
+                &rebound,
+                expected_mount_id,
+                "quarantine child entry before unlink",
+            )?;
             ensure_before_deadline(deadline, "before child unlink")?;
             if unsafe { libc::unlinkat(fd, cname.as_ptr(), 0) } != 0 {
                 return Err(std::io::Error::last_os_error())
@@ -4890,6 +5385,30 @@ mod tests {
             .expect("proc mount identity");
 
         assert_ne!(root_mount, proc_mount);
+        assert!(
+            require_linux_mount_id(root_mount.mount_id, proc_mount.mount_id, "procfs fixture",)
+                .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn safe_root_mount_identity_rechecks_path_and_direct_child() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("root")).expect("safe root");
+        fs::write(root.path().join("child"), b"bound").expect("child");
+        let mount_id = root.linux_mount_id().expect("root mount id");
+
+        root.verify_linux_mount_id(mount_id)
+            .expect("stable root mount");
+        assert_eq!(
+            root.direct_child_linux_mount_id("child")
+                .expect("child mount id"),
+            Some(mount_id)
+        );
+        assert!(root
+            .verify_linux_mount_id(mount_id.saturating_add(1))
+            .is_err());
     }
 
     #[cfg(unix)]
@@ -4941,6 +5460,48 @@ mod tests {
         })
         .expect_err("truncation during read must fail");
         assert!(truncated.to_string().contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_metadata_validator_is_bound_to_the_open_descriptor_generation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("validated-input");
+        fs::write(&path, b"reviewed").expect("write input");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private input mode");
+        let validator = |metadata: &fs::Metadata| -> Result<()> {
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+                bail!("unsafe descriptor metadata");
+            }
+            Ok(())
+        };
+        assert_eq!(
+            BoundedRegularReader::read_tree_no_follow_validated(&path, 32, validator)
+                .expect("validated read"),
+            b"reviewed"
+        );
+
+        let mut opened = open_regular_no_follow(&path, false).expect("open validated input");
+        let mut validator = |metadata: &fs::Metadata| -> Result<()> {
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+                bail!("unsafe descriptor metadata");
+            }
+            Ok(())
+        };
+        let changed = read_bounded_file_with_validator_and_hook(
+            &mut opened,
+            &path,
+            32,
+            &mut validator,
+            || {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o622))
+                    .expect("make descriptor unsafe");
+            },
+        )
+        .expect_err("permission change on the opened descriptor must fail");
+        assert!(changed.to_string().contains("metadata policy"));
     }
 
     #[cfg(unix)]
@@ -5076,6 +5637,44 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn directory_quarantine_restore_is_identity_bound_and_no_replace() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create_managed(temp.path().join("root")).expect("root");
+        let source = root.path().join("source");
+        let quarantine = root.path().join("quarantine");
+        fs::create_dir(&source).expect("source");
+        fs::write(source.join("valuable"), "keep").expect("valuable file");
+        let expected = identity_for_path(&source).expect("identity");
+
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("quarantine");
+        restore_quarantined_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("restore");
+        assert_eq!(
+            identity_for_path(&source).expect("restored identity"),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("valuable")).expect("restored content"),
+            "keep"
+        );
+        assert!(!quarantine.exists());
+        restore_quarantined_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("idempotent restore");
+
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("quarantine again");
+        fs::create_dir(&source).expect("replacement source");
+        let error =
+            restore_quarantined_direct_child_directory(&root, "source", "quarantine", &expected)
+                .expect_err("replacement must block restore");
+        assert!(error.to_string().contains("both exist"));
+        assert!(source.exists());
+        assert!(quarantine.join("valuable").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn quarantined_tree_cleanup_resumes_after_entry_rename_and_partial_delete() {
         let temp = TempDir::new().expect("tempdir");
         let root = SafeRoot::open_or_create_managed(temp.path().join("root")).expect("root");
@@ -5093,6 +5692,10 @@ mod tests {
         let entry_quarantine = entry_quarantine_name(OsStr::new("second"), &second_identity);
         fs::rename(&second, quarantine.join(&entry_quarantine))
             .expect("simulate crash after child quarantine rename");
+        let cleanup_name =
+            quarantined_direct_child_cleanup_name("quarantine", &expected).expect("cleanup name");
+        fs::rename(&quarantine, root.path().join(&cleanup_name))
+            .expect("simulate crash after top-level cleanup rename");
 
         assert!(remove_quarantined_direct_child_tree(
             &root,
@@ -5102,6 +5705,7 @@ mod tests {
         )
         .expect("resume cleanup"));
         assert!(!quarantine.exists());
+        assert!(!root.path().join(cleanup_name).exists());
         assert!(!remove_quarantined_direct_child_tree(
             &root,
             "quarantine",
@@ -5109,6 +5713,40 @@ mod tests {
             TreeLinkPolicy::UnlinkLinks,
         )
         .expect("idempotent completed cleanup"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quarantined_tree_cleanup_refuses_nested_mount_mismatch_without_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create_managed(temp.path().join("root")).expect("root");
+        let source = root.path().join("source");
+        fs::create_dir(&source).expect("source");
+        fs::write(source.join("valuable"), "keep").expect("valuable file");
+        let expected = identity_for_path(&source).expect("source identity");
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("durable quarantine");
+        let cleanup_name =
+            quarantined_direct_child_cleanup_name("quarantine", &expected).expect("cleanup name");
+
+        // Unprivileged test environments cannot create a same-device bind mount. Inject the
+        // otherwise statx-backed mismatch at the first nested audit entry instead.
+        inject_next_linux_mount_mismatch("quarantine tree entry during deletion audit");
+        let error = remove_quarantined_direct_child_tree(
+            &root,
+            "quarantine",
+            &expected,
+            TreeLinkPolicy::UnlinkLinks,
+        )
+        .expect_err("nested mount mismatch must fail closed");
+
+        assert!(error.to_string().contains("mount crossing"));
+        assert!(!root.path().join(cleanup_name).exists());
+        assert_eq!(
+            fs::read_to_string(root.path().join("quarantine").join("valuable"))
+                .expect("quarantined content survives"),
+            "keep"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

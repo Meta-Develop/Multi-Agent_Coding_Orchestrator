@@ -15,6 +15,7 @@ use crate::process_runner::{
     SideEffectConfinementProfileKind, StdinMode, StreamCapture, StrictOfflineWorkspaceProfile,
     WorkspaceAccess,
 };
+use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,8 @@ use std::{
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
 
+pub use crate::protected_path::SandboxDenialRetryability;
+
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_TEE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
@@ -46,6 +49,7 @@ const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
 const INNER_CODEX_POLICY_ID: &str = "maco_external_codex_inner_v1";
+const WORKTREE_DECLARED_ROOT_ID: &str = "worktree";
 const PERMANENT_CONTROL_ROOTS: &[&str] = &[".maco", ".maco-cache", ".codex"];
 const POLICY_CONTROL_ROOTS: &[&str] = &[".agents"];
 const POLICY_CONTROL_FILES: &[&str] = &[
@@ -486,13 +490,6 @@ pub enum SandboxDenialBoundary {
 pub enum SandboxDeniedOperation {
     EstablishBoundary,
     Write,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SandboxDenialRetryability {
-    RequiresDeclaredException,
-    NotRetryable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -3837,10 +3834,19 @@ struct ProtectedWorktreeControls {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProtectedWorktreeControl {
     absolute: PathBuf,
-    relative: PathBuf,
-    retryability: SandboxDenialRetryability,
+    protected: ProtectedPathSpec,
     #[cfg(unix)]
     held_file: Option<HeldWorktreeControlFile>,
+}
+
+impl ProtectedWorktreeControl {
+    fn relative(&self) -> &Path {
+        self.protected.coordinate().relative()
+    }
+
+    fn retryability(&self) -> SandboxDenialRetryability {
+        self.protected.retryability()
+    }
 }
 
 #[cfg(unix)]
@@ -3984,10 +3990,10 @@ fn protected_worktree_controls_for(
     for (relative, target) in normalized_exceptions {
         controls
             .read_only_roots
-            .retain(|control| control.relative != relative);
+            .retain(|control| control.relative() != relative);
         controls
             .read_only_files
-            .retain(|control| control.relative != relative);
+            .retain(|control| control.relative() != relative);
         collect_control_exception(workspace, &relative, target, &mut controls)?;
     }
     controls.read_only_roots.sort_by(control_path_order);
@@ -4038,8 +4044,11 @@ fn collect_protected_control(
     }
     let control = ProtectedWorktreeControl {
         absolute: path,
-        relative: relative.to_path_buf(),
-        retryability,
+        protected: ProtectedPathSpec::new(
+            DeclaredPathCoordinate::new(WORKTREE_DECLARED_ROOT_ID, relative)
+                .context("protected worktree control path is invalid")?,
+            retryability,
+        ),
         #[cfg(unix)]
         held_file: None,
     };
@@ -4050,7 +4059,7 @@ fn collect_protected_control(
     } else {
         bail!(
             "protected worktree control is not a regular file or directory: {}",
-            control.relative.display()
+            control.relative().display()
         );
     }
     Ok(())
@@ -4069,7 +4078,7 @@ fn validate_artifact_parent_disjoint(
         if !parent.starts_with(&protected) && !protected.starts_with(&parent) {
             continue;
         }
-        if control.relative == Path::new(".maco")
+        if control.relative() == Path::new(".maco")
             && matches!(
                 spec.invocation,
                 ExternalAgentInvocation::CodexConsultant
@@ -4368,8 +4377,11 @@ fn collect_control_exception(
     }
     let control = ProtectedWorktreeControl {
         absolute,
-        relative: relative.to_path_buf(),
-        retryability: SandboxDenialRetryability::NotRetryable,
+        protected: ProtectedPathSpec::new(
+            DeclaredPathCoordinate::new(WORKTREE_DECLARED_ROOT_ID, relative)
+                .context("worktree control exception path is invalid")?,
+            SandboxDenialRetryability::NotRetryable,
+        ),
         #[cfg(unix)]
         held_file,
     };
@@ -4718,11 +4730,11 @@ fn external_side_effect_profile(
             for control in &protected_controls.read_write_files {
                 #[cfg(target_os = "linux")]
                 if let Some(held) = &control.held_file {
-                    held.verify_path(&spec.cwd, &control.relative)
+                    held.verify_path(&spec.cwd, control.relative())
                         .with_context(|| {
                             format!(
                                 "held worktree control changed before sandbox admission: {}",
-                                control.relative.display()
+                                control.relative().display()
                             )
                         })?;
                     profile = profile
@@ -4733,18 +4745,18 @@ fn external_side_effect_profile(
                         .with_context(|| {
                             format!(
                                 "held worktree control capability is invalid: {}",
-                                control.relative.display()
+                                control.relative().display()
                             )
                         })?;
                     continue;
                 }
                 #[cfg(all(unix, not(target_os = "linux")))]
                 if let Some(held) = &control.held_file {
-                    held.verify_path(&spec.cwd, &control.relative)
+                    held.verify_path(&spec.cwd, control.relative())
                         .with_context(|| {
                             format!(
                                 "held worktree control changed before sandbox admission: {}",
-                                control.relative.display()
+                                control.relative().display()
                             )
                         })?;
                 }
@@ -4790,13 +4802,13 @@ fn sandbox_denials_from_codex_jsonl(
         let mut known = controls.iter().collect::<Vec<_>>();
         known.sort_by(|left, right| {
             right
-                .relative
+                .relative()
                 .as_os_str()
                 .len()
-                .cmp(&left.relative.as_os_str().len())
+                .cmp(&left.relative().as_os_str().len())
         });
         for control in known {
-            let Some(relative) = control.relative.to_str() else {
+            let Some(relative) = control.relative().to_str() else {
                 continue;
             };
             let Some(absolute) = control.absolute.to_str() else {
@@ -4809,8 +4821,8 @@ fn sandbox_denials_from_codex_jsonl(
                     boundary: SandboxDenialBoundary::InnerCodex,
                     policy_id: INNER_CODEX_POLICY_ID.to_string(),
                     operation: SandboxDeniedOperation::Write,
-                    path: Some(control.relative.clone()),
-                    retryability: control.retryability,
+                    path: Some(control.relative().to_path_buf()),
+                    retryability: control.retryability(),
                 });
                 break;
             }
@@ -5382,7 +5394,7 @@ fn codex_filesystem_permissions(
         .iter()
         .chain(&controls.read_only_files)
     {
-        if let Some(relative) = control.relative.to_str() {
+        if let Some(relative) = control.relative().to_str() {
             path_permissions.insert(relative.to_string(), "read");
         }
     }
@@ -5391,7 +5403,7 @@ fn codex_filesystem_permissions(
         .iter()
         .chain(&controls.read_write_files)
     {
-        if let Some(relative) = control.relative.to_str() {
+        if let Some(relative) = control.relative().to_str() {
             path_permissions.insert(relative.to_string(), "write");
         }
     }
@@ -7653,7 +7665,7 @@ else:
         assert!(controls.iter().all(|control| {
             !POLICY_CONTROL_FILES
                 .iter()
-                .any(|policy| control.relative == Path::new(policy))
+                .any(|policy| control.relative() == Path::new(policy))
         }));
         Ok(())
     }
@@ -7746,7 +7758,7 @@ else:
         assert!(controls
             .read_only_roots
             .iter()
-            .any(|control| control.relative == Path::new(".maco")));
+            .any(|control| control.relative() == Path::new(".maco")));
         let profile = external_side_effect_profile(
             &command,
             &workspace.join("codex"),
@@ -7813,12 +7825,12 @@ else:
         let roots = controls
             .read_only_roots
             .iter()
-            .map(|control| control.relative.as_path())
+            .map(ProtectedWorktreeControl::relative)
             .collect::<BTreeSet<_>>();
         let files = controls
             .read_only_files
             .iter()
-            .map(|control| control.relative.as_path())
+            .map(ProtectedWorktreeControl::relative)
             .collect::<BTreeSet<_>>();
         assert_eq!(
             roots,
@@ -7849,7 +7861,7 @@ else:
             controls
                 .read_write_files
                 .iter()
-                .map(|control| control.relative.as_path())
+                .map(ProtectedWorktreeControl::relative)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([Path::new(".agents/docs/worker.md")])
         );
@@ -7901,7 +7913,7 @@ else:
             controls
                 .read_write_files
                 .iter()
-                .map(|control| control.relative.clone())
+                .map(|control| control.relative().to_path_buf())
                 .collect::<BTreeSet<_>>(),
             exceptions.iter().cloned().collect()
         );
@@ -7922,7 +7934,7 @@ else:
             repeated
                 .read_write_files
                 .iter()
-                .map(|control| control.relative.clone())
+                .map(|control| control.relative().to_path_buf())
                 .collect::<BTreeSet<_>>(),
             exceptions.iter().cloned().collect()
         );
@@ -8215,7 +8227,7 @@ else:
             forward
                 .read_only_files
                 .iter()
-                .map(|control| control.relative.as_path())
+                .map(ProtectedWorktreeControl::relative)
                 .collect::<Vec<_>>(),
             vec![Path::new(".rgignore")]
         );
@@ -8223,7 +8235,7 @@ else:
             forward
                 .read_write_files
                 .iter()
-                .map(|control| control.relative.as_path())
+                .map(ProtectedWorktreeControl::relative)
                 .collect::<Vec<_>>(),
             vec![
                 Path::new(".agents/docs/policy.md"),

@@ -635,6 +635,154 @@ also depth-, entry-, path-, byte-, and time-bounded. Prompt excerpt paths must
 be repository-relative; a missing path or directory may still be named as a
 claim scope, but neither is read as prompt content.
 
+## Machine-global claims and recoverable retention
+
+`maco machine-global` coordinates paths outside Git repositories without making
+arbitrary absolute paths claimable. Every invocation requires an explicit
+`--config` file; MACO never infers a root from `HOME`, repository location,
+pathname spelling, or process environment. The config file is bounded, strict
+version-1 JSON opened without following links in any path component. Its own
+path, `state_root`, and every declared root must be existing, exact canonical
+absolute paths. The config file itself must be a current-user-owned,
+single-link regular file that is not group- or world-writable. `state_root`
+must be an owner-private `0700` directory and must not intersect a declared
+root. Declared roots may not overlap one another. Unknown fields, `.` or `..`
+components, symbolic links, non-canonical spellings, and changed root
+identities fail closed. On Linux, the state root and every declared root are
+also bound to their `statx` mount id. Duplicate filesystem identities are
+rejected. Two configured paths on the same device but different mounts are
+rejected conservatively as possible bind aliases; paths on one mount retain the
+component-aware overlap check. An existing coordinate whose parent or leaf
+crosses away from its declared root's mount is refused.
+
+```json
+{
+  "version": 1,
+  "state_root": "/srv/maco-machine-global-state",
+  "roots": [
+    {
+      "id": "runtime-sessions",
+      "path": "/srv/agent-runtime/sessions",
+      "protected_paths": [
+        {
+          "coordinate": {
+            "root_id": "runtime-sessions",
+            "relative": "active"
+          },
+          "retryability": "not_retryable"
+        }
+      ],
+      "quarantine_grace_seconds": 86400
+    }
+  ]
+}
+```
+
+The config is the reviewed authority ceiling. Commands carry a root id and a
+strict root-relative path. Privacy-safe structured success, status, and typed
+denial JSON omits configured absolute roots; local diagnostic errors may
+identify a configured path for operator repair. Containment uses path
+components, so `state` does not contain `state-backup`. An absolute value
+supplied to retention `--path` is refused as an undeclared destructive target
+and its `GateDenial` contains only a fingerprint. Claim conflicts and
+destructive intersections report privacy-safe root-id-relative coordinates. A
+denied `--json` command emits the typed `GateDenial` object on standard output
+and exits unsuccessfully.
+
+```bash
+maco machine-global claim repair-agent \
+  --root-id runtime-sessions \
+  --path active/session-42 \
+  --correlation repair-42 \
+  --config /etc/maco/machine-global.json \
+  --json
+
+maco machine-global owner \
+  --root-id runtime-sessions \
+  --path active/session-42/cache \
+  --config /etc/maco/machine-global.json \
+  --json
+
+maco machine-global status \
+  --config /etc/maco/machine-global.json \
+  --json
+
+maco machine-global release repair-agent <claim-token> \
+  --config /etc/maco/machine-global.json \
+  --json
+```
+
+Successful claim output contains a random bearer token needed for release.
+`status` and `owner` deliberately return redacted claim summaries without
+tokens. Keep the config bytes stable while durable state exists: changing the
+reviewed config causes the store to refuse reinterpretation of existing state.
+Independent repositories coordinate when they use the same config and
+`state_root`. The owner-private state envelope checksum detects accidental or
+partial corruption; it is not authentication against a hostile same-UID
+process that can rewrite the state and checksum coherently.
+
+Retention accepts the complete target set up front and checks every source and
+hidden quarantine sibling against active claims, configured protected paths,
+and other active retention reservations before the first rename. Current
+retention targets are existing directories on Linux. Each accepted target is
+atomically renamed beside its original pathname to a hidden
+`.maco-quarantine-v1-*` sibling, which keeps the move on the same filesystem.
+The returned operation records the root-relative source, hidden sibling name,
+deterministic `.maco-delete-v2-*` purge-cleanup sibling, inode identity,
+quarantine time, purge deadline, and a random operation token. The source,
+quarantine, and cleanup coordinates are all reserved and preflighted. Status
+reports omit the token.
+
+```bash
+maco machine-global retention quarantine cleanup-agent \
+  --root-id runtime-sessions \
+  --path expired/session-17 \
+  --path expired/session-18 \
+  --correlation retention-2026-07-30 \
+  --config /etc/maco/machine-global.json \
+  --json
+
+maco machine-global retention restore cleanup-agent <operation-id> \
+  --correlation restore-session-17 \
+  --config /etc/maco/machine-global.json \
+  --json
+
+maco machine-global retention purge cleanup-agent <operation-id> \
+  --token <operation-token> \
+  --correlation purge-session-17 \
+  --config /etc/maco/machine-global.json \
+  --json
+```
+
+Restore uses an atomic no-replace rename and refuses an occupied or rebound
+original path. Restore intentionally requires the recorded owner but not the
+purge bearer token, so an operator can recover after a crash that occurred
+before the token was returned; the full live-claim and protected-path preflight
+still applies. Purge requires the operation owner and bearer token, uses MACO's
+trusted system clock, refuses before the configured positive grace period, and
+reruns the complete claim/protected-path preflight before permanent removal.
+Purge completes a mount-confined link/special-file audit while the tree still
+has its restorable quarantine name. It then moves the tree to its recorded
+cleanup sibling, repeats the identity- and mount-confined audit, and only then
+deletes the verified tree. Resuming an already-renamed cleanup residue starts
+with the same audit at that cleanup name. If a quarantine or cleanup pathname
+is unavailable, collides, cannot be renamed, is full, or cannot be safely
+inspected, the operation fails closed. MACO never falls back to direct deletion
+or a cross-filesystem copy. A multi-target I/O failure can leave an explicitly
+recorded partially quarantined operation. Quarantine does not resume such an
+operation: restore it to a consistent source layout, then start a fresh
+quarantine attempt.
+
+This boundary is local-first and deliberately narrow. It currently supports
+directory retention only on Linux. It does not transparently intercept an
+arbitrary shell command, the existing artifact/worktree cleanup commands, or an
+agent launched directly without registering and honoring a machine-global
+claim. Those directly launched agents remain a follow-up enforcement gap.
+Coordinate comparison currently assumes case-sensitive filesystem spelling;
+case-insensitive or casefolded alias behavior is not established as supported,
+so such roots should not be declared. The mount policy is intentionally
+conservative and does not claim to detect every conceivable physical alias.
+
 Default linked worktrees are created outside the repository at
 `../.maco/worktrees/<repo-name>/<agent-id>`. Completed task branches can be
 cleaned with `maco worktree gc`; branch refs remain available for later
