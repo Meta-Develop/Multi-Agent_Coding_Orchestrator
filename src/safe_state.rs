@@ -1897,6 +1897,49 @@ pub fn quarantine_direct_child_directory(
     }
 }
 
+/// Restores an identity-bound direct-child directory from a caller-supplied
+/// quarantine name using an atomic no-replace rename.
+///
+/// Exactly one of `child_name` and `quarantine_name` must exist before the
+/// restore. An already-restored source with the expected identity is accepted
+/// idempotently. Both-present, both-absent, and identity-mismatch states fail
+/// closed. Linux provides the required `renameat2(RENAME_NOREPLACE)` primitive;
+/// other platforms refuse without mutating either name.
+pub fn restore_quarantined_direct_child_directory(
+    root: &SafeRoot,
+    child_name: impl AsRef<OsStr>,
+    quarantine_name: impl AsRef<OsStr>,
+    expected: &FileIdentity,
+) -> Result<FileIdentity> {
+    let child_name = child_name.as_ref();
+    let quarantine_name = quarantine_name.as_ref();
+    validate_single_component(child_name)?;
+    validate_single_component(quarantine_name)?;
+    if child_name == quarantine_name {
+        bail!("source and quarantine directory names must differ");
+    }
+    root.verify()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        restore_quarantined_direct_child_directory_linux(
+            root,
+            child_name,
+            quarantine_name,
+            expected,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = expected;
+        bail!(
+            "atomic no-replace directory restore is unsupported on this platform; refusing to mutate {}",
+            root.path().join(quarantine_name).display()
+        )
+    }
+}
+
 /// Resumably removes an already-durable quarantine directory. Absence of both
 /// the durable name and its deterministic cleanup name means cleanup already
 /// completed. The stopped-child/no-active-writer precondition from
@@ -3902,6 +3945,52 @@ fn quarantine_direct_child_directory_linux(
 }
 
 #[cfg(target_os = "linux")]
+fn restore_quarantined_direct_child_directory_linux(
+    root: &SafeRoot,
+    child_name: &OsStr,
+    quarantine_name: &OsStr,
+    expected: &FileIdentity,
+) -> Result<FileIdentity> {
+    let parent_fd = root.directory.as_raw_fd();
+    let source = c_string(child_name)?;
+    let quarantine = c_string(quarantine_name)?;
+    let source_stat = fstatat_optional_no_follow(parent_fd, &source)?;
+    let quarantine_stat = fstatat_optional_no_follow(parent_fd, &quarantine)?;
+    match (source_stat, quarantine_stat) {
+        (Some(_), Some(_)) => bail!(
+            "source and quarantine both exist; refusing ambiguous restore for {}",
+            root.path().join(child_name).display()
+        ),
+        (None, None) => bail!(
+            "source and quarantine are both absent; refusing ambiguous restore for {}",
+            root.path().join(child_name).display()
+        ),
+        (Some(stat), None) => {
+            validate_private_quarantine_directory(root, child_name, &stat, expected)?;
+            Ok(expected.clone())
+        }
+        (None, Some(stat)) => {
+            validate_private_quarantine_directory(root, quarantine_name, &stat, expected)?;
+            rename_noreplace_at(root, quarantine_name, child_name)?;
+            let rebound = fstatat_no_follow(parent_fd, &source)?;
+            if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || identity_from_stat(&rebound) != *expected
+            {
+                bail!(
+                    "restored directory identity mismatch after atomic rename for {}",
+                    root.path().join(child_name).display()
+                );
+            }
+            if fstatat_optional_no_follow(parent_fd, &quarantine)?.is_some() {
+                bail!("quarantine name reappeared during directory restore");
+            }
+            sync_directory(root)?;
+            Ok(expected.clone())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn validate_private_quarantine_directory(
     root: &SafeRoot,
     name: &OsStr,
@@ -5072,6 +5161,44 @@ mod tests {
         assert!(error.to_string().contains("both exist"));
         assert!(source.exists());
         assert!(quarantine.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_quarantine_restore_is_identity_bound_and_no_replace() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create_managed(temp.path().join("root")).expect("root");
+        let source = root.path().join("source");
+        let quarantine = root.path().join("quarantine");
+        fs::create_dir(&source).expect("source");
+        fs::write(source.join("valuable"), "keep").expect("valuable file");
+        let expected = identity_for_path(&source).expect("identity");
+
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("quarantine");
+        restore_quarantined_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("restore");
+        assert_eq!(
+            identity_for_path(&source).expect("restored identity"),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("valuable")).expect("restored content"),
+            "keep"
+        );
+        assert!(!quarantine.exists());
+        restore_quarantined_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("idempotent restore");
+
+        quarantine_direct_child_directory(&root, "source", "quarantine", &expected)
+            .expect("quarantine again");
+        fs::create_dir(&source).expect("replacement source");
+        let error =
+            restore_quarantined_direct_child_directory(&root, "source", "quarantine", &expected)
+                .expect_err("replacement must block restore");
+        assert!(error.to_string().contains("both exist"));
+        assert!(source.exists());
+        assert!(quarantine.join("valuable").exists());
     }
 
     #[cfg(target_os = "linux")]
