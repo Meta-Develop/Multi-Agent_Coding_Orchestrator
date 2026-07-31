@@ -985,7 +985,10 @@ fn normalize_bloated_file_flags(
     Ok(())
 }
 
-pub(super) fn normalize_report_target_path(value: Option<PathBuf>, field: &str) -> Result<Option<PathBuf>> {
+pub(super) fn normalize_report_target_path(
+    value: Option<PathBuf>,
+    field: &str,
+) -> Result<Option<PathBuf>> {
     value
         .map(|path| {
             let normalized = normalize_repo_relative_path(&path)

@@ -33,7 +33,10 @@ pub(super) fn worker_execution_journal_incoming_relative(worker: &WorkerAssignme
     PathBuf::from("worker-journals").join(worker_execution_journal_file_name(&worker.id))
 }
 
-pub(super) fn worker_execution_journal_evidence_relative(assignment_id: &str, worker_id: &str) -> PathBuf {
+pub(super) fn worker_execution_journal_evidence_relative(
+    assignment_id: &str,
+    worker_id: &str,
+) -> PathBuf {
     PathBuf::from("logs")
         .join("workers")
         .join(assignment_id)
@@ -257,7 +260,11 @@ pub(super) fn record_field_guide_prompt_injection_strict(
     })
 }
 
-pub(super) fn lifecycle_event_payload(status: &str, attempt: Option<usize>, thread_id: Option<&str>) -> Value {
+pub(super) fn lifecycle_event_payload(
+    status: &str,
+    attempt: Option<usize>,
+    thread_id: Option<&str>,
+) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert("status".to_string(), Value::String(status.to_string()));
     if let Some(attempt) = attempt {

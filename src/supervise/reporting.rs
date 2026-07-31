@@ -549,7 +549,9 @@ pub(super) fn enforce_auditor_environment_failure_outcome(report: &mut AuditorRe
     }
 }
 
-pub(super) fn enforce_orchestrator_environment_failure_outcome(report: &mut OrchestratorReviewReport) {
+pub(super) fn enforce_orchestrator_environment_failure_outcome(
+    report: &mut OrchestratorReviewReport,
+) {
     let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
     report.environment_failures =
         sanitized_environment_failures(std::mem::take(&mut report.environment_failures));
@@ -580,7 +582,9 @@ pub(super) fn enforce_orchestrator_environment_failure_outcome(report: &mut Orch
     }
 }
 
-pub(super) fn enforce_supervisor_final_environment_failure_outcome(report: &mut SupervisorFinalReport) {
+pub(super) fn enforce_supervisor_final_environment_failure_outcome(
+    report: &mut SupervisorFinalReport,
+) {
     let command_failures = normalize_command_records_environment_failures(&mut report.commands_run);
     for child in &mut report.orchestrator_reports {
         enforce_orchestrator_environment_failure_outcome(child);
@@ -764,7 +768,9 @@ pub(super) fn report_failed<T: ReportStatus>(report: &T) -> bool {
     !report.accepted() || report.rejected() || report.status() != ReviewStatus::Succeeded
 }
 
-pub(super) fn accepted_bloated_file_flags(reports: &[OrchestratorReviewReport]) -> Vec<BloatedFileFlag> {
+pub(super) fn accepted_bloated_file_flags(
+    reports: &[OrchestratorReviewReport],
+) -> Vec<BloatedFileFlag> {
     reports
         .iter()
         .filter(|report| !report_failed(*report))
@@ -1152,7 +1158,10 @@ pub(super) fn deterministic_fake_auditor_run(
     Ok(deterministic_fake_run(command, output))
 }
 
-pub(super) fn deterministic_fake_run(command: &ExternalAgentCommand, output: Vec<u8>) -> ExternalAgentRun {
+pub(super) fn deterministic_fake_run(
+    command: &ExternalAgentCommand,
+    output: Vec<u8>,
+) -> ExternalAgentRun {
     ExternalAgentRun {
         command: vec!["maco-internal-deterministic-fake".to_string()],
         cwd: command.cwd.clone(),
@@ -1189,7 +1198,10 @@ pub(super) fn external_safety_verified(run: &ExternalAgentRun, runtime: Supervis
     }
 }
 
-pub(super) fn external_containment_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) -> bool {
+pub(super) fn external_containment_verified(
+    run: &ExternalAgentRun,
+    runtime: SupervisorRuntime,
+) -> bool {
     if run.environment_blocked() {
         run.environment_preflight_quiescence_verified()
     } else {
@@ -1381,7 +1393,9 @@ pub(super) fn command_record_from_external(
     }
 }
 
-pub(super) fn sandbox_denials_for_report(denials: &[SandboxDenialEvidence]) -> Vec<SandboxDenialEvidence> {
+pub(super) fn sandbox_denials_for_report(
+    denials: &[SandboxDenialEvidence],
+) -> Vec<SandboxDenialEvidence> {
     denials
         .iter()
         .cloned()
@@ -1398,7 +1412,9 @@ pub(super) fn sandbox_denials_for_report(denials: &[SandboxDenialEvidence]) -> V
         .collect()
 }
 
-pub(super) fn aggregate_sandbox_denials(command_records: &[CommandRunRecord]) -> Vec<SandboxDenialEvidence> {
+pub(super) fn aggregate_sandbox_denials(
+    command_records: &[CommandRunRecord],
+) -> Vec<SandboxDenialEvidence> {
     command_records
         .iter()
         .flat_map(|record| record.sandbox_denials.iter().cloned())

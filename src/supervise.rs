@@ -130,7 +130,6 @@ pub use prompts::*;
 mod util;
 pub use util::*;
 
-
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_MAX_CHILD_ASSIGNMENTS: usize = 4;
 const DEFAULT_MAX_CHILD_RETRIES: u8 = 0;

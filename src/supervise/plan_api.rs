@@ -221,7 +221,9 @@ fn read_supervisor_input(path: &Path, label: &str) -> Result<String> {
         .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))
 }
 
-pub(super) fn parse_supervisor_plan_with_consultant(contents: &str) -> Result<LoadedSupervisorPlan> {
+pub(super) fn parse_supervisor_plan_with_consultant(
+    contents: &str,
+) -> Result<LoadedSupervisorPlan> {
     let value: Value = serde_json::from_str(contents).context("supervisor plan is not JSON")?;
     let consultant = consultant_from_plan_value(&value)?;
     let mut plan: SupervisorPlan =

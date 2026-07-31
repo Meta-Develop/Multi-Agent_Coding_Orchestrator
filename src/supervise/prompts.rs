@@ -691,7 +691,10 @@ pub(super) fn provisional_default_role_models() -> BTreeMap<AgentRole, RoleModel
     .collect()
 }
 
-pub(super) fn effective_role_model_selection(plan: &SupervisorPlan, role: AgentRole) -> RoleModelSelection {
+pub(super) fn effective_role_model_selection(
+    plan: &SupervisorPlan,
+    role: AgentRole,
+) -> RoleModelSelection {
     plan.role_models
         .get(&role)
         .cloned()

@@ -1,7 +1,9 @@
 use super::*;
 
 #[cfg(unix)]
-pub(super) fn worktree_control_identity_from_metadata(metadata: &fs::Metadata) -> WorktreeControlIdentity {
+pub(super) fn worktree_control_identity_from_metadata(
+    metadata: &fs::Metadata,
+) -> WorktreeControlIdentity {
     WorktreeControlIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
@@ -152,7 +154,9 @@ pub(super) fn provision_mandatory_worktree_controls(
     bail!("mandatory worktree control provisioning is unsupported on this platform")
 }
 
-pub(super) fn assignment_worktree_control_exceptions(assigned_paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+pub(super) fn assignment_worktree_control_exceptions(
+    assigned_paths: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let mut exceptions = BTreeSet::new();
     for assigned in assigned_paths {
         let normalized = normalize_repo_relative_path(assigned).with_context(|| {

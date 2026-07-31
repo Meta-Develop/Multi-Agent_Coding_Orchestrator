@@ -47,7 +47,10 @@ pub(super) fn reserve_dispatch_budget<'a>(
     }
 }
 
-pub(super) fn external_dispatch_may_have_started(run: &ExternalAgentRun, runtime: SupervisorRuntime) -> bool {
+pub(super) fn external_dispatch_may_have_started(
+    run: &ExternalAgentRun,
+    runtime: SupervisorRuntime,
+) -> bool {
     runtime == SupervisorRuntime::Fake
         || run.process_tree.is_some()
         || !run.scratch_quiescence_verified()

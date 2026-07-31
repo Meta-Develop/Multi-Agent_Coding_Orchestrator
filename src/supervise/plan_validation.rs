@@ -773,7 +773,9 @@ pub(super) fn coordinate_semantic_assignment(
     )))
 }
 
-pub(super) fn semantic_assignment_request(assignment: &OrchestratorAssignment) -> SemanticIntentRequest {
+pub(super) fn semantic_assignment_request(
+    assignment: &OrchestratorAssignment,
+) -> SemanticIntentRequest {
     SemanticIntentRequest {
         agent_id: assignment.id.clone(),
         paths: assignment.assigned_paths.clone(),

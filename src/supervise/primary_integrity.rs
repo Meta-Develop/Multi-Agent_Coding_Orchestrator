@@ -712,7 +712,10 @@ where
     serializer.serialize_str(&serializable_path(path))
 }
 
-pub(super) fn serialize_optional_path<S>(path: &Option<PathBuf>, serializer: S) -> Result<S::Ok, S::Error>
+pub(super) fn serialize_optional_path<S>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

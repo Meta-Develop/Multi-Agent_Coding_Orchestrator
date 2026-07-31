@@ -19,11 +19,17 @@ pub(super) fn write_plan_snapshot(
     .with_context(|| format!("failed to write plan snapshot {}", relative.display()))
 }
 
-pub(super) fn write_orchestrator_schema(writer: &mut ArtifactRunWriter, relative: &Path) -> Result<()> {
+pub(super) fn write_orchestrator_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
     write_schema(writer, relative, orchestrator_report_schema_value())
 }
 
-pub(super) fn write_supervisor_final_schema(writer: &mut ArtifactRunWriter, relative: &Path) -> Result<()> {
+pub(super) fn write_supervisor_final_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
     write_schema(writer, relative, supervisor_final_report_schema_value())
 }
 
@@ -845,7 +851,9 @@ pub(super) fn write_final_report(
     .context("failed to write normalized supervisor final report")
 }
 
-pub(super) fn read_supervisor_final_report(reader: &ArtifactRunReader) -> Result<SupervisorFinalReport> {
+pub(super) fn read_supervisor_final_report(
+    reader: &ArtifactRunReader,
+) -> Result<SupervisorFinalReport> {
     let relative = RunArtifactFamily::Supervise.final_report_relative_path();
     let contents = reader.read(&relative).with_context(|| {
         format!(

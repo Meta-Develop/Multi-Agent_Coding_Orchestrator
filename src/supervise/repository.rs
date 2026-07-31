@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn release_claims(store: &SyncStore, tokens: Vec<ClaimToken>) -> (Vec<PathClaim>, Vec<String>) {
+pub(super) fn release_claims(
+    store: &SyncStore,
+    tokens: Vec<ClaimToken>,
+) -> (Vec<PathClaim>, Vec<String>) {
     let mut released = Vec::new();
     let mut errors = Vec::new();
     for token in tokens {
@@ -61,7 +64,10 @@ fn primary_is_dirty(repo: &Path, runtime: SupervisorExecutionRuntime) -> Result<
     Ok(!primary_status_snapshot(repo, runtime)?.is_empty())
 }
 
-pub(super) fn ensure_reusable_child_worktree(record: &WorktreeRecord, primary_head: &Oid) -> Result<()> {
+pub(super) fn ensure_reusable_child_worktree(
+    record: &WorktreeRecord,
+    primary_head: &Oid,
+) -> Result<()> {
     let repo = Repository::open(&record.path).with_context(|| {
         format!(
             "failed to inspect existing child worktree '{}' at {}",
@@ -173,7 +179,10 @@ fn head_oid(repo: &Repository) -> Result<Oid> {
     Ok(commit.id())
 }
 
-pub(super) fn collect_paths_changed_since_base(worktree_path: &Path, base_oid: &Oid) -> Result<Vec<PathBuf>> {
+pub(super) fn collect_paths_changed_since_base(
+    worktree_path: &Path,
+    base_oid: &Oid,
+) -> Result<Vec<PathBuf>> {
     let repo = Repository::open(worktree_path)
         .with_context(|| format!("failed to open child worktree {}", worktree_path.display()))?;
     let base_commit = repo
