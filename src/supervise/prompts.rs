@@ -6,6 +6,10 @@ const WORKER_PROMPT_FIXTURE_CEILING_BYTES: usize = 6 * 1024;
 const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 20 * 1024;
 #[cfg(test)]
 const REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 4 * 1024;
+const TOOL_CALL_BATCHING_GUIDANCE: &str = "\
+Tool-call batching:
+- Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
+- Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
 
 pub(super) fn fresh_field_guide_frame_nonce(
     entries: &[DecodedFieldGuidePromptEntry],
@@ -164,6 +168,7 @@ pub(super) fn child_orchestrator_prompt_with_incoming_root_and_field_guide(
     let consultation_section = consultation_prompt_section(consultant);
     Ok(format!(
         r#"{role_prefix}{field_guide_section}
+{tool_call_batching_guidance}
 You are a child orchestrator in an opt-in local Codex CLI supervisor run.
 You are not the top supervisor. You are not alone in the repository.
 Primary worktree mutation is forbidden. Work only in this assigned child worktree:
@@ -251,6 +256,7 @@ Review auditor prompt template:
 "#,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
         decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
@@ -365,6 +371,7 @@ pub(super) fn worker_prompt_with_field_guide(
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     Ok(format!(
         r#"{role_prefix}{field_guide_section}
+{tool_call_batching_guidance}
 You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 Your parent is child orchestrator `{orchestrator_id}`. You are not the supervisor.
@@ -410,6 +417,7 @@ Worker assignment JSON:
 "#,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         orchestrator_id = orchestrator.id,
         worker_id = worker.id,
         assignment_kind = metadata.kind.as_str(),
@@ -491,6 +499,7 @@ pub(super) fn review_auditor_prompt_with_metadata_and_field_guide(
     let task = assignment_task(plan, orchestrator);
     Ok(format!(
         r#"{role_prefix}{field_guide_section}
+{tool_call_batching_guidance}
 You are a terminal read-only review auditor in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
 Your parent is child orchestrator `{orchestrator_id}`. You are not an O1 child orchestrator, O2 supervisor, worker, or peer coordinator.
@@ -522,6 +531,7 @@ Supervisor task:
 "#,
         role_prefix = role_prefix,
         field_guide_section = field_guide.section,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         orchestrator_id = orchestrator.id,
         auditor_id = auditor_id,
         worker_ids = if worker_ids.is_empty() {
@@ -885,5 +895,23 @@ mod regression_tests {
         assert!(error
             .to_string()
             .contains(&WORKER_PROMPT_FIXTURE_CEILING_BYTES.to_string()));
+    }
+
+    #[test]
+    fn rendered_role_prompts_carry_bounded_tool_call_batching_contract() {
+        let (worker, child, auditor) =
+            fixed_prompt_fixture().expect("render the fixed prompt fixture");
+
+        for rendered in [&worker, &child, &auditor] {
+            assert!(rendered.contains(
+                "Batch independent, side-effect-free inspections in one tool call when the runtime supports it."
+            ));
+            assert!(rendered.contains(
+                "Keep dependent steps, approval-sensitive actions, and mutations ordered."
+            ));
+            assert!(rendered.contains(
+                "Batching never relaxes ownership, journaling, validation, or audit requirements."
+            ));
+        }
     }
 }
