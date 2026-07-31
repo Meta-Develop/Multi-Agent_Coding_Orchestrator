@@ -3,8 +3,8 @@ use crate::artifacts::state_auth::sha256_hex;
 use crate::gate_denial::{ExternalSideEffectState, GateDenial};
 use crate::llm::provider::Usage;
 use crate::machine_global::{
-    DestructiveTargetInput, GateOutcome, MachineGlobalStore, RetentionOperation,
-    RetentionOperationId,
+    DestructiveTargetInput, GateOutcome, MachineGlobalRetentionBinding, MachineGlobalStore,
+    RetentionOperation, RetentionOperationId,
 };
 use crate::pre_action_review::{
     ActionDescriptor, ApprovalReviewRequest, BlastRadius, CommandClass, CommandInvocation,
@@ -203,13 +203,7 @@ pub struct ExternalAgentCommand {
     pub machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalMachineGlobalRetentionBinding {
-    pub config: PathBuf,
-    pub root_id: String,
-    pub owner: String,
-    pub correction_correlation_id: String,
-}
+pub type ExternalMachineGlobalRetentionBinding = MachineGlobalRetentionBinding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAgentLifecycleIdentity {

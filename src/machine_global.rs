@@ -61,6 +61,19 @@ pub struct DeclaredGlobalRootConfig {
     pub quarantine_grace_seconds: u64,
 }
 
+/// Explicit caller binding for one cooperative machine-global retention path.
+///
+/// This is deliberately configuration-bound rather than inferred from an
+/// absolute target. Callers that cannot supply this binding must either refuse
+/// destructive work or identify their operation as a known bypass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineGlobalRetentionBinding {
+    pub config: PathBuf,
+    pub root_id: String,
+    pub owner: String,
+    pub correction_correlation_id: String,
+}
+
 /// A gate operation either completed or was refused through the typed Issue 29 envelope.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "outcome", content = "value", rename_all = "snake_case")]

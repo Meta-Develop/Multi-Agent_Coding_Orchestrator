@@ -28,7 +28,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
-- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and prunes unregistered leftover directories under the managed worktree root.
+- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
 - `maco sync release <token>` releases one durable claim.
@@ -791,10 +791,33 @@ the retention operation ID, while the purge token remains in a mode-0600 private
 receipt beside the JSON log. This is a launch-time obligation for that orchestrator
 path, not protection against commands launched outside it.
 
+`worktree gc` accepts `--machine-global-config`,
+`--machine-global-worktree-root-id`, and `--machine-global-correlation` as one
+all-or-none binding. A destructive run that discovers unregistered directories refuses
+before touching those directories when the binding is absent. With the binding, GC
+collects the complete orphan set and sends it through one machine-global quarantine
+preflight before the first directory moves. A denial leaves every orphan in place and
+is returned in the existing typed `GateDenial` envelope. The GC report carries the
+public retention operation ID only; it does not serialize the bearer purge token.
+
+The audit was performed from mutation sinks outward, rather than from cleanup command
+names inward. It enumerated direct filesystem removal, descriptor-relative unlink,
+rename/replacement, truncating/open-for-write operations, the safe-state recursive
+removal and quarantine wrappers, Git worktree/reference mutation, and spawned command
+or systemd cleanup. Each production caller's target was then traced to one of:
+repository worktree, separate Git common directory, managed external worktree root,
+private runtime/temp root, user-selected output root, or machine-global state/config
+root. Finally, CLI path-bearing arguments and generic child-process destinations were
+cross-checked against that sink inventory. Test-only mutation fixtures were excluded
+only after locating their enclosing test module, rather than by filename or keyword.
+
 The current cleanup/retention audit is:
 
 | Path | Gate status | Reason and attribution boundary |
 | --- | --- | --- |
+| Unregistered direct-child directories found by `worktree gc` | Routed | These may be nonempty arbitrary external directories and therefore match the destructive incident shape; treating routing as optional would be unjustified. GC requires an explicit reviewed binding when such targets exist, preflights the complete orphan set, quarantines allowed targets, and reports a typed denial plus logical actor `maco-worktree-gc` when refused. |
+| Pre-worktree final reservation and staging setup rollback/recovery/finalization | Known transactional bypass, attributed | These paths exist before the child is a repository worktree, but they are not adopted retention targets: MACO creates the exclusive reservation and authenticated create intent, binds the exact inode, removes only a still-empty reservation/staging root, and preserves changed, nonempty, or unbound paths for manual recovery. Final replacement accepts only the verified clean staged worktree. Routing these transaction-internal names into retention quarantine would break the idempotent create protocol rather than protect pre-existing data. While retained, the authenticated operation records agent, phase, root/path identity, and branch; each direct mutation also emits its fixed operation label with `process_attribution=not_process_observable`. |
+| Machine-global state-root lock/state/temp maintenance | Known infrastructure bypass | The state root is deliberately disjoint from declared data roots: the gate must lock and replace its own bounded authenticated state before it can evaluate a claim, so recursively gating that state is ill-founded. State writes and temp cleanup are identity-bound, bounded, and lock-fenced. The fixed private state root and filenames identify the machine-global subsystem, but successful bootstrap/temp cleanup is not durably process-observable. Retention purge is not included in this bypass: it rechecks the gate and retains its owner, operation ID, coordinates, identities, and final `purged` phase. |
 | External-agent output staging used by `merge arbitrate` | Routed | The exact existing staging directory is resolved beneath the explicitly declared root ID and revalidated. Refusals use `GateDenial`; allowed operations use the existing retention record. |
 | External-agent output staging used without a machine-global binding | Known bypass, attributed | Completed cleanup records `actor=maco-external-agent`, `operation=delete_private_output_staging`, the reason, and `process_attribution=not_process_observable` in the serialized run; early `Drop` cleanup emits the same actor/operation marker before deletion. This identifies the cooperative bypass without claiming process-level observation. |
 | External-agent staging setup rollback | Known empty-directory bypass, attributed | If exclusive output reservation fails, setup emits `actor=maco-external-agent`, `operation=delete_empty_output_staging_setup_rollback`, and `process_attribution=not_process_observable` before removing only the newly created, still-empty staging directory. No external data was accepted into that directory. |
@@ -1215,8 +1238,16 @@ artifacts:
 
 ```bash
 cargo run -- worktree gc --repo . --dry-run --json
-cargo run -- worktree gc --repo . --max-count 10 --max-age-seconds 604800 --json
-cargo run -- worktree gc --repo . --keep-targets
+cargo run -- worktree gc --repo . \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-worktree-root-id worktrees \
+  --machine-global-correlation scheduled-worktree-gc \
+  --max-count 10 --max-age-seconds 604800 --json
+cargo run -- worktree gc --repo . \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-worktree-root-id worktrees \
+  --machine-global-correlation manual-worktree-gc \
+  --keep-targets
 ```
 
 GC keeps worktrees with uncommitted changes, active MACO execution leases, or
@@ -1224,9 +1255,11 @@ active path claims for the same agent id. Without retention filters, every clean
 inactive managed worktree is eligible for removal; with `--max-count` and/or
 `--max-age-seconds`, retained clean worktrees keep the checkout but lose their
 `target/` directory unless `--keep-targets` is set. A second pass prunes
-unregistered direct-child directories left under the managed worktree root, which
-covers the NTFS/DrvFS case where Git deregisters a worktree but leaves a partial
-directory behind.
+unregistered direct-child directories left under the managed worktree root. A
+destructive second pass requires the three-part machine-global binding above, treats
+all discovered orphans as one preflight set, and uses recoverable quarantine rather
+than direct deletion. Dry-run discovery remains non-mutating and does not require the
+binding.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 

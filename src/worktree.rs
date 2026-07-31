@@ -6,6 +6,11 @@ use crate::{
         state_auth::{random_identifier, AuthenticationDomain, RepositoryAuthBinding},
     },
     authenticated_snapshot::{AuthenticatedSnapshot, AuthenticatedSnapshotStore, SnapshotSpec},
+    gate_denial::GateDenial,
+    machine_global::{
+        DestructiveTargetInput, GateOutcome, MachineGlobalRetentionBinding, MachineGlobalStore,
+        RetentionOperationId,
+    },
     process_runner::{
         run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessSpec,
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
@@ -157,6 +162,7 @@ pub struct WorktreeGcOptions {
     pub remove_targets: bool,
     pub retention: WorktreeRetentionPolicy,
     pub exclude_agent_id: Option<String>,
+    pub machine_global_retention: Option<MachineGlobalRetentionBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -182,6 +188,10 @@ pub struct WorktreeGcEntry {
     pub status: WorktreeGcStatus,
     pub reason: WorktreeGcReason,
     pub target_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_denial: Option<GateDenial>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_operation_id: Option<RetentionOperationId>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -192,6 +202,7 @@ pub enum WorktreeGcStatus {
     Retained,
     Protected,
     OrphanPruned,
+    OrphanQuarantined,
     OrphanWouldPrune,
 }
 
@@ -208,6 +219,7 @@ pub enum WorktreeGcReason {
     TargetWouldRemove,
     NoTarget,
     UnregisteredOrphan,
+    MachineGlobalGate,
 }
 
 #[derive(Debug, Clone)]
@@ -966,6 +978,7 @@ impl WorktreeManager {
                 remove_targets: true,
                 retention,
                 exclude_agent_id,
+                machine_global_retention: None,
             })?;
             cleanliness.require_clean_for_manager(self)?;
         }
@@ -1034,6 +1047,7 @@ impl WorktreeManager {
                 remove_targets: true,
                 retention,
                 exclude_agent_id,
+                machine_global_retention: None,
             })?;
         }
         Ok(record)
@@ -1205,6 +1219,11 @@ impl WorktreeManager {
         let staging_reserved = match root.reserve_direct_child_directory(&staging_name) {
             Ok(reserved) => reserved,
             Err(error) => {
+                record_pre_worktree_bypass(
+                    &name,
+                    "delete_empty_pre_worktree_reservation_setup_rollback",
+                    reserved.path(),
+                );
                 remove_direct_child_tree(
                     &root,
                     &name,
@@ -1239,6 +1258,11 @@ impl WorktreeManager {
             registry_store.save(&registry_lock, &mut registry)
         })();
         if let Err(error) = prepared_save {
+            record_pre_worktree_bypass(
+                &name,
+                "delete_empty_pre_worktree_staging_setup_rollback",
+                staging_reserved.path(),
+            );
             remove_direct_child_tree(
                 &root,
                 staging_reserved
@@ -1248,6 +1272,11 @@ impl WorktreeManager {
                 Some(staging_reserved.identity()),
                 TreeLinkPolicy::UnlinkLinks,
             )?;
+            record_pre_worktree_bypass(
+                &name,
+                "delete_empty_pre_worktree_reservation_setup_rollback",
+                reserved.path(),
+            );
             let cleanup = remove_direct_child_tree(
                 &root,
                 &name,
@@ -1597,6 +1626,8 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Retained,
                     reason: WorktreeGcReason::ExcludedCurrentWorktree,
                     target_path: None,
+                    gate_denial: None,
+                    retention_operation_id: None,
                 });
                 continue;
             }
@@ -1612,6 +1643,8 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Protected,
                     reason: WorktreeGcReason::ActiveClaim,
                     target_path: None,
+                    gate_denial: None,
+                    retention_operation_id: None,
                 });
                 continue;
             }
@@ -1636,6 +1669,8 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::Protected,
                         reason: WorktreeGcReason::ActiveLease,
                         target_path: None,
+                        gate_denial: None,
+                        retention_operation_id: None,
                     });
                     continue;
                 }
@@ -1657,6 +1692,8 @@ impl WorktreeManager {
                             status: WorktreeGcStatus::Protected,
                             reason: WorktreeGcReason::ActiveLease,
                             target_path: None,
+                            gate_denial: None,
+                            retention_operation_id: None,
                         });
                         continue;
                     }
@@ -1677,6 +1714,8 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Protected,
                     reason: WorktreeGcReason::Dirty,
                     target_path: None,
+                    gate_denial: None,
+                    retention_operation_id: None,
                 });
                 continue;
             }
@@ -1710,6 +1749,8 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::WouldRemove,
                         reason: WorktreeGcReason::FinishedBranch,
                         target_path,
+                        gate_denial: None,
+                        retention_operation_id: None,
                     });
                     continue;
                 }
@@ -1732,6 +1773,8 @@ impl WorktreeManager {
                     status: WorktreeGcStatus::Removed,
                     reason: WorktreeGcReason::FinishedBranch,
                     target_path,
+                    gate_denial: None,
+                    retention_operation_id: None,
                 });
                 continue;
             }
@@ -1760,6 +1803,8 @@ impl WorktreeManager {
                         status: WorktreeGcStatus::Retained,
                         reason,
                         target_path: Some(target_path),
+                        gate_denial: None,
+                        retention_operation_id: None,
                     });
                     continue;
                 }
@@ -1779,6 +1824,8 @@ impl WorktreeManager {
                     WorktreeGcReason::RetentionKeep
                 },
                 target_path: None,
+                gate_denial: None,
+                retention_operation_id: None,
             });
         }
 
@@ -1787,6 +1834,7 @@ impl WorktreeManager {
             &worktree_root,
             &registered_names,
             options.dry_run,
+            options.machine_global_retention.as_ref(),
             &mut report,
         )?;
         Ok(report)
@@ -2123,6 +2171,7 @@ fn prune_unregistered_worktree_directories(
     worktree_root: &Path,
     registered_names: &BTreeSet<String>,
     dry_run: bool,
+    machine_global_retention: Option<&MachineGlobalRetentionBinding>,
     report: &mut WorktreeGcReport,
 ) -> Result<()> {
     if !path_entry_exists(worktree_root)? {
@@ -2130,6 +2179,7 @@ fn prune_unregistered_worktree_directories(
     }
     let root = SafeRoot::open_existing(worktree_root)?;
     let git_registered = git_registered_worktree_names(repo, root.path())?;
+    let mut orphans = Vec::new();
     for child_name in root.direct_child_names_bounded(MAX_MANAGED_RECORDS)? {
         if child_name.to_string_lossy().starts_with(".maco-") {
             continue;
@@ -2144,34 +2194,83 @@ fn prune_unregistered_worktree_directories(
             continue;
         }
         let path = root.direct_child(&child_name)?;
-        if dry_run {
+        orphans.push((name.to_string(), path));
+    }
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    if dry_run {
+        for (name, path) in orphans {
             report.orphan_removed_count = report
                 .orphan_removed_count
                 .checked_add(1)
                 .context("worktree GC orphan count overflowed")?;
             report.entries.push(WorktreeGcEntry {
-                name: name.to_string(),
+                name,
                 branch: None,
                 path,
                 status: WorktreeGcStatus::OrphanWouldPrune,
                 reason: WorktreeGcReason::UnregisteredOrphan,
                 target_path: None,
+                gate_denial: None,
+                retention_operation_id: None,
             });
-            continue;
         }
-        remove_direct_child_tree(&root, &child_name, None, TreeLinkPolicy::UnlinkLinks)?;
-        report.orphan_removed_count = report
-            .orphan_removed_count
-            .checked_add(1)
-            .context("worktree GC orphan count overflowed")?;
-        report.entries.push(WorktreeGcEntry {
-            name: name.to_string(),
-            branch: None,
-            path,
-            status: WorktreeGcStatus::OrphanPruned,
-            reason: WorktreeGcReason::UnregisteredOrphan,
-            target_path: None,
-        });
+        return Ok(());
+    }
+
+    let binding = machine_global_retention.context(
+        "destructive worktree orphan GC requires an explicit machine-global config/root binding",
+    )?;
+    let store = MachineGlobalStore::open_config(&binding.config)
+        .context("failed to open machine-global binding for worktree orphan GC")?;
+    let targets = orphans
+        .iter()
+        .map(|(_, path)| {
+            store
+                .coordinate_for_existing_directory(&binding.root_id, path)
+                .map(DestructiveTargetInput::Declared)
+        })
+        .collect::<Result<Vec<_>>>()
+        .context("worktree orphan GC target is outside the reviewed machine-global root")?;
+    match store.quarantine(&binding.owner, &binding.correction_correlation_id, targets)? {
+        GateOutcome::Allowed(operation) => {
+            let operation_id = operation.id;
+            report.orphan_removed_count = report
+                .orphan_removed_count
+                .checked_add(orphans.len())
+                .context("worktree GC orphan count overflowed")?;
+            for (name, path) in orphans {
+                report.entries.push(WorktreeGcEntry {
+                    name,
+                    branch: None,
+                    path,
+                    status: WorktreeGcStatus::OrphanQuarantined,
+                    reason: WorktreeGcReason::UnregisteredOrphan,
+                    target_path: None,
+                    gate_denial: None,
+                    retention_operation_id: Some(operation_id),
+                });
+            }
+        }
+        GateOutcome::Denied(denial) => {
+            report.protected_count = report
+                .protected_count
+                .checked_add(orphans.len())
+                .context("worktree GC protected count overflowed")?;
+            for (name, path) in orphans {
+                report.entries.push(WorktreeGcEntry {
+                    name,
+                    branch: None,
+                    path,
+                    status: WorktreeGcStatus::Protected,
+                    reason: WorktreeGcReason::MachineGlobalGate,
+                    target_path: None,
+                    gate_denial: Some(denial.clone()),
+                    retention_operation_id: None,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -3313,6 +3412,11 @@ fn recover_create_operation(
                         operation.name
                     );
                 }
+                record_pre_worktree_bypass(
+                    &operation.name,
+                    "delete_empty_pre_worktree_reservation_recovery",
+                    reserved.path(),
+                );
                 remove_direct_child_tree(
                     &root,
                     &operation.name,
@@ -3320,7 +3424,12 @@ fn recover_create_operation(
                     TreeLinkPolicy::UnlinkLinks,
                 )?;
             }
-            remove_staging_root_if_empty(&root, &staging_root, &staging_root_identity)?;
+            remove_staging_root_if_empty(
+                &root,
+                &staging_root,
+                &staging_root_identity,
+                &operation.name,
+            )?;
             cleanup_create_branch_if_owned(repo, &operation)?;
             registry.operations.remove(&operation.name);
             store.save(lock, registry)?;
@@ -3446,6 +3555,11 @@ fn recover_create_operation(
                 &metadata_gitdir_file,
                 &staging_path,
             )?;
+            record_pre_worktree_bypass(
+                &operation.name,
+                "replace_empty_pre_worktree_reservation_with_staged_worktree",
+                final_reserved.path(),
+            );
             let moved_identity =
                 replace_reserved_directory_from(&root, &final_reserved, &staging_root, &staged)?;
             if &moved_identity != staged_identity {
@@ -3545,7 +3659,12 @@ fn recover_create_operation(
                 if staging_root.identity() != staging_root_identity {
                     bail!("create-observed staging root identity changed before cleanup");
                 }
-                remove_staging_root_if_empty(&root, &staging_root, staging_root_identity)?;
+                remove_staging_root_if_empty(
+                    &root,
+                    &staging_root,
+                    staging_root_identity,
+                    &operation.name,
+                )?;
             }
         }
         if let Some(existing) = registry.records.get(&operation.name) {
@@ -3605,6 +3724,7 @@ fn remove_staging_root_if_empty(
     managed_root: &SafeRoot,
     staging_root: &SafeRoot,
     expected: &FileIdentity,
+    actor: &str,
 ) -> Result<()> {
     if !staging_root.is_empty()? {
         bail!(
@@ -3616,12 +3736,27 @@ fn remove_staging_root_if_empty(
         .path()
         .file_name()
         .context("staging root has no final component")?;
+    record_pre_worktree_bypass(
+        actor,
+        "delete_empty_pre_worktree_staging_recovery_or_finalize",
+        staging_root.path(),
+    );
     remove_direct_child_tree(
         managed_root,
         name,
         Some(expected),
         TreeLinkPolicy::UnlinkLinks,
     )
+}
+
+fn record_pre_worktree_bypass(actor: &str, operation: &str, path: &Path) {
+    tracing::warn!(
+        actor,
+        operation,
+        target = %path.display(),
+        process_attribution = "not_process_observable",
+        "machine-global cleanup bypass"
+    );
 }
 
 #[cfg(unix)]
@@ -7389,6 +7524,7 @@ mod tests {
                     max_count: Some(1),
                 },
                 exclude_agent_id: None,
+                machine_global_retention: None,
             })
             .expect("gc with retention");
 
@@ -7449,18 +7585,124 @@ mod tests {
         fs::create_dir_all(orphan.join("target/debug")).expect("orphan directory");
         fs::write(orphan.join("leftover.txt"), "partial delete residue\n").expect("orphan file");
         let manager = WorktreeManager::new(&repo_path);
+        let mut options = gc_options(Some(worktree_root.clone()), false);
+        options.machine_global_retention = Some(machine_global_gc_binding(
+            temp.path(),
+            &worktree_root,
+            "orphan-quarantine",
+        ));
 
-        let report = manager
-            .gc(gc_options(Some(worktree_root), false))
-            .expect("gc orphan");
+        let report = manager.gc(options).expect("gc orphan");
 
         assert_eq!(report.orphan_removed_count, 1);
         assert!(report.entries.iter().any(|entry| {
             entry.name == "agent-orphan-gc"
-                && entry.status == WorktreeGcStatus::OrphanPruned
+                && entry.status == WorktreeGcStatus::OrphanQuarantined
                 && entry.reason == WorktreeGcReason::UnregisteredOrphan
+                && entry.retention_operation_id.is_some()
         }));
+        let public_wire = serde_json::to_string(&report).expect("serialize public GC report");
+        assert!(public_wire.contains("retention_operation_id"));
+        assert!(
+            !public_wire.contains("\"token\""),
+            "public GC report must not expose the bearer purge token"
+        );
         assert!(!orphan.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn machine_global_claim_refuses_unregistered_worktree_gc_before_any_orphan_moves() {
+        use crate::gate_denial::{DestructiveTargetDenial, GateDenialReason};
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let first = worktree_root.join("agent-orphan-first");
+        let second = worktree_root.join("agent-orphan-second");
+        for orphan in [&first, &second] {
+            fs::create_dir_all(orphan).expect("orphan directory");
+            fs::write(orphan.join("sentinel"), b"must survive").expect("orphan sentinel");
+        }
+        let binding = machine_global_gc_binding(temp.path(), &worktree_root, "claimed-orphan-gc");
+        let store =
+            MachineGlobalStore::open_config(&binding.config).expect("open machine-global config");
+        let claimed = store
+            .coordinate_for_existing_directory(&binding.root_id, &second)
+            .expect("second orphan coordinate");
+        let claim = store
+            .claim("repair-agent", "repairing-orphan", vec![claimed.clone()])
+            .expect("claim orphan");
+        assert!(matches!(claim, GateOutcome::Allowed(_)));
+
+        let manager = WorktreeManager::new(&repo_path);
+        let mut options = gc_options(Some(worktree_root), false);
+        options.machine_global_retention = Some(binding);
+        let report = manager.gc(options).expect("refused orphan GC report");
+
+        assert_eq!(report.orphan_removed_count, 0);
+        assert_eq!(report.protected_count, 2);
+        assert!(report.entries.iter().all(|entry| {
+            entry.status == WorktreeGcStatus::Protected
+                && entry.reason == WorktreeGcReason::MachineGlobalGate
+        }));
+        let denial = report
+            .entries
+            .first()
+            .and_then(|entry| entry.gate_denial.as_ref())
+            .expect("typed gate denial");
+        assert!(matches!(
+            denial.reason,
+            GateDenialReason::DestructiveTarget {
+                denial: ref target_denial
+            } if matches!(
+                target_denial.as_ref(),
+                DestructiveTargetDenial::ActiveClaimIntersection {
+                    target,
+                    active_claim
+                } if target == &claimed && active_claim == &claimed
+            )
+        ));
+        for orphan in [&first, &second] {
+            assert_eq!(
+                fs::read(orphan.join("sentinel")).expect("read preserved sentinel"),
+                b"must survive"
+            );
+        }
+        assert!(store
+            .status()
+            .expect("machine-global status")
+            .retention_operations
+            .is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn destructive_unregistered_worktree_gc_refuses_without_machine_global_binding() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = Repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let orphan = worktree_root.join("agent-unbound-orphan");
+        fs::create_dir_all(&orphan).expect("orphan directory");
+        fs::write(orphan.join("sentinel"), b"must survive").expect("orphan sentinel");
+
+        let error = WorktreeManager::new(&repo_path)
+            .gc(gc_options(Some(worktree_root), false))
+            .expect_err("unbound destructive orphan GC must fail closed");
+
+        assert!(error.to_string().contains(
+            "destructive worktree orphan GC requires an explicit machine-global config/root binding"
+        ));
+        assert_eq!(
+            fs::read(orphan.join("sentinel")).expect("read preserved sentinel"),
+            b"must survive"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -10148,6 +10390,45 @@ mod tests {
             remove_targets: true,
             retention: WorktreeRetentionPolicy::default(),
             exclude_agent_id: None,
+            machine_global_retention: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn machine_global_gc_binding(
+        test_root: &Path,
+        worktree_root: &Path,
+        correlation: &str,
+    ) -> MachineGlobalRetentionBinding {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_root = test_root.join(format!("machine-global-state-{correlation}"));
+        fs::create_dir(&state_root).expect("machine-global state root");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+            .expect("private machine-global state root");
+        let config = test_root.join(format!("machine-global-{correlation}.json"));
+        fs::write(
+            &config,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "state_root": state_root,
+                "roots": [{
+                    "id": "worktrees",
+                    "path": worktree_root,
+                    "protected_paths": [],
+                    "quarantine_grace_seconds": 60
+                }]
+            }))
+            .expect("serialize machine-global config"),
+        )
+        .expect("write machine-global config");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600))
+            .expect("private machine-global config");
+        MachineGlobalRetentionBinding {
+            config,
+            root_id: "worktrees".to_string(),
+            owner: "maco-worktree-gc".to_string(),
+            correction_correlation_id: correlation.to_string(),
         }
     }
 
