@@ -395,22 +395,21 @@ pub struct ReviewLensConfig {
 
 /// The execution source for a review lens.
 ///
-/// Model-backed lenses retain the existing reviewer configuration while making
-/// model selection a parent-owned field. Precomputed lenses let independently
-/// verified evidence, such as future process evidence, participate in the same
-/// aggregation without pretending that it was produced by a model invocation.
+/// Model-backed lenses are dispatched by the supervisor's model runtime, with
+/// every executable selection represented directly on the variant. The
+/// autopilot-oriented [`ReviewerConfig`] is deliberately absent: its fake and
+/// direct-program modes are not executable through this boundary. Precomputed
+/// lenses let independently verified evidence, such as future process evidence,
+/// participate in the same aggregation without pretending that it was produced
+/// by a model invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
-// Keep the public construction and serialized shape source-compatible: boxing
-// the model reviewer solely for enum layout would force callers to change.
-#[allow(clippy::large_enum_variant)]
 pub enum ReviewLensBackendConfig {
     Model {
         backend_id: String,
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        reviewer: ReviewerConfig,
     },
     Precomputed {
         backend_id: String,
@@ -601,15 +600,14 @@ fn validate_review_lens_selected_input(
 }
 
 /// Cheap local scope templates. Neither lens receives the full child
-/// transcript, but both use the same deterministic fake reviewer and are not
-/// independent production authorities. Integrations must replace their
+/// transcript, but both use the same deterministic local backend label and are
+/// not independent production authorities. Integrations must replace their
 /// backend/model selections before treating them as authoritative lenses.
 pub fn cheap_default_review_lenses() -> Vec<ReviewLensConfig> {
     let backend = || ReviewLensBackendConfig::Model {
         backend_id: "deterministic-local-reviewer".to_string(),
         model: "deterministic-local-reviewer".to_string(),
         reasoning_effort: None,
-        reviewer: ReviewerConfig::default(),
     };
     vec![
         ReviewLensConfig {
@@ -1271,7 +1269,7 @@ fn validate_review_lens_config(lens: &ReviewLensConfig) -> Result<()> {
     {
         bail!("review lens model selection contains unsafe private or external evidence");
     }
-    if let ReviewLensBackendConfig::Model { reviewer, .. } = &lens.backend {
+    if matches!(lens.backend, ReviewLensBackendConfig::Model { .. }) {
         if let Some(reasoning_effort) = lens.backend.reasoning_effort() {
             validate_bounded_scalar(
                 reasoning_effort,
@@ -1280,14 +1278,6 @@ fn validate_review_lens_config(lens: &ReviewLensConfig) -> Result<()> {
                 false,
             )?;
         }
-        validate_review_options(&ReviewPrOptions {
-            repo: PathBuf::from("."),
-            target: "review-lens-config".to_string(),
-            reviewer: reviewer.clone(),
-            attempt: 1,
-            changed_paths: Vec::new(),
-            diff_summary: None,
-        })?;
     }
     Ok(())
 }
@@ -5557,7 +5547,6 @@ mod tests {
                 backend_id: backend_id.to_string(),
                 model: model.to_string(),
                 reasoning_effort: None,
-                reviewer: ReviewerConfig::default(),
             },
             information_scope,
         }
@@ -5946,16 +5935,9 @@ mod tests {
                 && !lens.backend.model().is_empty()
         }));
         assert_eq!(lenses[0].backend, lenses[1].backend);
-        assert!(lenses.iter().all(|lens| matches!(
-            &lens.backend,
-            ReviewLensBackendConfig::Model {
-                reviewer: ReviewerConfig {
-                    mode: ReviewerMode::Fake,
-                    ..
-                },
-                ..
-            }
-        )));
+        assert!(lenses
+            .iter()
+            .all(|lens| matches!(&lens.backend, ReviewLensBackendConfig::Model { .. })));
     }
 
     #[test]
@@ -5967,16 +5949,6 @@ mod tests {
                     backend_id: "fake-local".to_string(),
                     model: "fake-model".to_string(),
                     reasoning_effort: None,
-                    reviewer: ReviewerConfig {
-                        blocking_attempts: 1,
-                        finding: Some(FakeReviewFindingTemplate {
-                            severity: "warning".to_string(),
-                            path: None,
-                            summary: "PRIVATE_FAKE_SUMMARY_MARKER".to_string(),
-                            suggested_fix: "PRIVATE_FAKE_FIX_MARKER".to_string(),
-                        }),
-                        ..ReviewerConfig::default()
-                    },
                 },
                 information_scope: ReviewInformationScope::OutputReportOnly,
             },
@@ -5986,13 +5958,6 @@ mod tests {
                     backend_id: "external-direct".to_string(),
                     model: "external-model".to_string(),
                     reasoning_effort: None,
-                    reviewer: ReviewerConfig {
-                        mode: ReviewerMode::ExternalCommand,
-                        program: Some(PathBuf::from("tools/PRIVATE_PROGRAM_MARKER")),
-                        args: vec!["PRIVATE_ARG_MARKER".to_string()],
-                        timeout_seconds: Some(30),
-                        ..ReviewerConfig::default()
-                    },
                 },
                 information_scope: ReviewInformationScope::DiffOnly,
             },
@@ -6029,6 +5994,34 @@ mod tests {
         assert!(serialized.contains("\"backend_id\":\"external-direct\""));
         assert!(serialized.contains("\"model\":\"external-model\""));
         Ok(())
+    }
+
+    #[test]
+    fn review_lens_model_backend_rejects_inert_reviewer_execution_fields() {
+        let config = serde_json::json!({
+            "id": "no-inert-dispatch-config",
+            "backend": {
+                "kind": "model",
+                "backend_id": "openai",
+                "model": "gpt-5",
+                "reasoning_effort": "high",
+                "reviewer": {
+                    "version": 1,
+                    "mode": "external_command",
+                    "program": "tools/PRIVATE_PROGRAM_MARKER",
+                    "args": ["PRIVATE_ARG_MARKER"],
+                    "timeout_seconds": 30
+                }
+            },
+            "information_scope": "diff_only"
+        });
+
+        let error = serde_json::from_value::<ReviewLensConfig>(config)
+            .expect_err("model lenses must reject unsupported reviewer execution settings");
+        assert!(
+            error.to_string().contains("unknown field `reviewer`"),
+            "unexpected rejection: {error}"
+        );
     }
 
     #[test]

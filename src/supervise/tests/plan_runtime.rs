@@ -137,8 +137,7 @@ fn supervisor_plan_loads_executable_stacked_review_lens_configuration() {
                     "kind": "model",
                     "backend_id": "provider-alpha",
                     "model": "model-alpha",
-                    "reasoning_effort": "high",
-                    "reviewer": {}
+                    "reasoning_effort": "high"
                 },
                 "information_scope": "diff_only"
             },
@@ -148,8 +147,7 @@ fn supervisor_plan_loads_executable_stacked_review_lens_configuration() {
                     "kind": "model",
                     "backend_id": "provider-beta",
                     "model": "model-beta",
-                    "reasoning_effort": "xhigh",
-                    "reviewer": {}
+                    "reasoning_effort": "xhigh"
                 },
                 "information_scope": "output_report_only"
             }
@@ -2042,7 +2040,6 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
                 backend_id: "provider-alpha".to_string(),
                 model: "model-alpha".to_string(),
                 reasoning_effort: Some("high".to_string()),
-                reviewer: ReviewerConfig::default(),
             },
             information_scope: ReviewInformationScope::DiffOnly,
         },
@@ -2052,7 +2049,6 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
                 backend_id: "provider-beta".to_string(),
                 model: "model-beta".to_string(),
                 reasoning_effort: Some("xhigh".to_string()),
-                reviewer: ReviewerConfig::default(),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
         },

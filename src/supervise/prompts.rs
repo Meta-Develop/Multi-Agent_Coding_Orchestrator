@@ -1568,7 +1568,6 @@ mod regression_tests {
                 backend_id: "provider-alpha".to_string(),
                 model: "model-alpha".to_string(),
                 reasoning_effort: Some("high".to_string()),
-                reviewer: ReviewerConfig::default(),
             },
             information_scope: ReviewInformationScope::DiffOnly,
         };
@@ -1578,7 +1577,6 @@ mod regression_tests {
                 backend_id: "provider-beta".to_string(),
                 model: "model-beta".to_string(),
                 reasoning_effort: Some("xhigh".to_string()),
-                reviewer: ReviewerConfig::default(),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
         };

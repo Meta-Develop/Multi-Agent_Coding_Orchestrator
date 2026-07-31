@@ -47,8 +47,7 @@ use crate::{
         ReviewCoverageRequirement, ReviewInformationScope, ReviewLensAggregate,
         ReviewLensAggregateAuthority, ReviewLensBackendConfig, ReviewLensConfig,
         ReviewLensCoverage, ReviewLensEvidenceKind, ReviewLensRequest, ReviewLensRequestSources,
-        ReviewLensVerdict, ReviewLensVerdictStatus, ReviewerConfig,
-        REVIEW_LENS_REQUEST_LIMIT_BYTES,
+        ReviewLensVerdict, ReviewLensVerdictStatus, REVIEW_LENS_REQUEST_LIMIT_BYTES,
     },
     safe_state::BoundedRegularReader,
     secure_output::SecureOutputRoot,
@@ -295,7 +294,6 @@ pub(crate) fn default_supervisor_review_lenses() -> Vec<ReviewLensConfig> {
             backend_id: "openai".to_string(),
             model: DEFAULT_PROFILE_MODEL.to_string(),
             reasoning_effort: Some("xhigh".to_string()),
-            reviewer: ReviewerConfig::default(),
         },
         information_scope: ReviewInformationScope::FullChildTranscript,
     }]
