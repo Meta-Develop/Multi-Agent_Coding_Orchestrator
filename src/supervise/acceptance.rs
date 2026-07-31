@@ -314,7 +314,7 @@ pub(super) fn validate_auditor_reports(
             valid = false;
             messages.push("auditor report was not accepted as succeeded".to_string());
         }
-        if audit_report.id == required_parent_auditor_id {
+        if is_parent_auditor_id(assignment, &audit_report.id) {
             let coverage = auditor_review_path_coverage(audit_report, &required_reviewed_paths);
             if !coverage.excluded_paths.is_empty() {
                 audit_report.findings.push(Finding {
@@ -336,7 +336,7 @@ pub(super) fn validate_auditor_reports(
         }
 
         if valid {
-            if audit_report.id == required_parent_auditor_id {
+            if is_parent_auditor_id(assignment, &audit_report.id) {
                 parent_auditor_accepted = true;
             }
             covered_review_subject_ids.extend(

@@ -819,6 +819,13 @@ pub(super) fn accepted_field_guide_drafts(
             .is_some_and(|aggregate| {
                 aggregate.authority() == ReviewLensAggregateAuthority::ParentComputed
                     && aggregate.decision == ReviewAggregationDecision::Accept
+            })
+            && report.audit_reports.iter().any(|auditor| {
+                is_parent_auditor_id(assignment, &auditor.id)
+                    && !report_failed(auditor)
+                    && auditor.role == AgentRole::Auditor
+                    && auditor.read_only
+                    && auditor.no_further_delegation == Some(true)
             });
         if report_has_field_guide_suggestions(report) && !parent_audited {
             bail!(
@@ -1131,6 +1138,7 @@ fn write_deterministic_fake_worker_journals(
 
 pub(super) fn deterministic_fake_auditor_run(
     command: &ExternalAgentCommand,
+    expected_id: &str,
     assignment: &OrchestratorAssignment,
     child_report: &OrchestratorReviewReport,
 ) -> Result<ExternalAgentRun> {
@@ -1138,7 +1146,7 @@ pub(super) fn deterministic_fake_auditor_run(
         bail!("deterministic fake auditor command retained a provider model slug");
     }
     let report = AuditorReport {
-        id: parent_auditor_id(assignment),
+        id: expected_id.to_string(),
         role: AgentRole::Auditor,
         reviewed_worker_ids: required_auditor_prompt_subject_ids(assignment, child_report),
         reviewed_paths: required_auditor_review_paths(assignment, child_report),

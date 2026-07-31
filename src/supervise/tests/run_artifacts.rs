@@ -427,7 +427,7 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
                         .expect("serialize injection event kind")
         })
         .collect::<Vec<_>>();
-    assert_eq!(injection_events.len(), 4);
+    assert_eq!(injection_events.len(), 3);
     for event in injection_events {
         assert_eq!(event.payload["entry_count"], 1);
         assert!(event.payload["line_count"].as_u64().is_some());
@@ -528,21 +528,26 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
             "repeated before/after runs of the same fixture",
         ]
     );
+    let expected_auditor_id = review_lens_auditor_id(&assignment, 0);
     let parent_prompt = String::from_utf8(
         reader
-            .read("assignments/child-a-review-auditor.prompt.md")
+            .read("assignments/child-a-review-auditor-lens-0.prompt.md")
             .expect("read parent auditor prompt"),
     )
     .expect("UTF-8 parent auditor prompt");
     assert!(parent_prompt.starts_with(&format!(
-        "{}ROLE: REVIEW_AUDITOR\nAGENT_KIND: auditor\nAGENT_LABEL: child-a-review-auditor\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n{FIELD_GUIDE_SECTION_NOTICE}\n",
+        "{}ROLE: REVIEW_AUDITOR\nAGENT_KIND: auditor\nAGENT_LABEL: {expected_auditor_id}\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 2\nNO_FURTHER_DELEGATION: true\n",
         parent_review_auditor_cacheable_prefix()
     )));
-    assert_eq!(parent_prompt.matches(seed_finding).count(), 1);
-    assert_eq!(parent_prompt.matches(seed_context).count(), 1);
+    assert!(parent_prompt.contains("Review-lens execution contract:\n"));
+    assert!(!parent_prompt.contains(FIELD_GUIDE_SECTION_NOTICE));
+    assert!(!parent_prompt.contains(seed_finding));
+    assert!(!parent_prompt.contains(seed_context));
+    assert!(parent_prompt.contains("- Lens id: parent-acceptance\n"));
+    assert!(parent_prompt.contains("REVIEW_LENS_REQUEST_JSON:\n"));
     let parent_measurements: PromptMeasurementsArtifact = serde_json::from_slice(
         &reader
-            .read("assignments/child-a-review-auditor.prompt.md.measurements.json")
+            .read("assignments/child-a-review-auditor-lens-0.prompt.md.measurements.json")
             .expect("read parent auditor prompt measurements"),
     )
     .expect("parse typed parent auditor prompt measurements");
@@ -553,7 +558,7 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
     );
     assert_eq!(
         parent_measurements.prompts[0].agent_label,
-        "child-a-review-auditor"
+        expected_auditor_id
     );
     assert_eq!(
         parent_measurements.prompts[0].invariant_bytes,
@@ -588,7 +593,6 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
             && event.kind == OrchestrationEventKind::Journal
             && event.payload["status"] == "loaded"
     }));
-    let expected_auditor_id = parent_auditor_id(&assignment);
     assert!(events.iter().any(|event| {
         event.node == expected_auditor_id
             && event.parent.as_deref() == Some(assignment.id.as_str())
@@ -689,6 +693,7 @@ fn accepted_audited_suggestions_append_with_trusted_provenance_and_redacted_jour
         );
     let auditor = injected_auditor_report(&assignment, &child);
     child.audit_reports.push(auditor);
+    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut child);
     let store = FieldGuideStore::open(&repo_path, FieldGuideLimits::default()).expect("open store");
     let authenticator =
         repository_authenticator_key_only(&repo_path).expect("open repository authenticator");
@@ -885,6 +890,7 @@ fn rejected_and_unaudited_suggestions_are_not_collectable() {
     child.worker_reports[0].status = ReviewStatus::Rejected;
     let auditor = injected_auditor_report(&assignment, &child);
     child.audit_reports.push(auditor);
+    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut child);
 
     let drafts = accepted_field_guide_drafts(&plan, std::slice::from_ref(&child))
         .expect("collect accepted suggestions");
@@ -907,6 +913,7 @@ fn strict_journal_failure_blocks_field_guide_mutation() {
     });
     let auditor = injected_auditor_report(&assignment, &child);
     child.audit_reports.push(auditor);
+    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut child);
     let run_id = RunId::new("field-guide-journal-failure").expect("valid run id");
     let store = FieldGuideStore::open(&repo_path, FieldGuideLimits::default()).expect("open store");
     let authenticator =

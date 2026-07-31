@@ -1787,7 +1787,7 @@ fn dispatch_and_collect_parent_auditor(
                 })?;
                 return Err(error);
             }
-            deterministic_fake_auditor_run(&auditor_command, assignment, child_report)
+            deterministic_fake_auditor_run(&auditor_command, &auditor_id, assignment, child_report)
         }
     };
     let auditor_run = match auditor_run_result {
@@ -2033,7 +2033,8 @@ fn decide_parent_auditor_gate(
         auditor_primary_integrity_failed,
         auditor_sandbox_denied,
         auditor_environment_blocked,
-    ) {
+    ) && child_report.gate_denials.is_empty()
+    {
         let correction_correlation_id = outcome
             .gate_tracker
             .as_ref()

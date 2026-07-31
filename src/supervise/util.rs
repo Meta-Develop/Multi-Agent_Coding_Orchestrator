@@ -133,6 +133,14 @@ pub(super) fn review_lens_auditor_id(
     format!("{}-review-auditor-lens-{lens_index}", assignment.id)
 }
 
+pub(super) fn is_parent_auditor_id(assignment: &OrchestratorAssignment, id: &str) -> bool {
+    if id == parent_auditor_id(assignment) {
+        return true;
+    }
+    id.strip_prefix(&format!("{}-review-auditor-lens-", assignment.id))
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 pub(super) fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
     path == claim || path.starts_with(claim)
 }
