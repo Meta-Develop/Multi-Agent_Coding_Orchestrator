@@ -1400,6 +1400,13 @@ struct PreparedParentAuditor<'a> {
     scope_workspace: tempfile::TempDir,
 }
 
+struct ParentAuditorLensExecution<'a> {
+    lens: &'a ReviewLensConfig,
+    lens_index: usize,
+    expected_request: &'a ReviewLensRequest,
+    required_coverage: &'a ReviewCoverageRequirement,
+}
+
 pub(super) fn create_review_lens_scope_workspace() -> Result<tempfile::TempDir> {
     let workspace = tempfile::Builder::new()
         .prefix("maco-review-lens-")
@@ -1422,11 +1429,14 @@ fn prepare_parent_auditor<'a>(
     journal_parent_id: &str,
     child_report: &mut OrchestratorReviewReport,
     auditor_attempt: &mut usize,
-    lens: &ReviewLensConfig,
-    lens_index: usize,
-    expected_request: &ReviewLensRequest,
-    required_coverage: &ReviewCoverageRequirement,
+    execution: ParentAuditorLensExecution<'_>,
 ) -> Result<ParentAuditorPreparation<'a>> {
+    let ParentAuditorLensExecution {
+        lens,
+        lens_index,
+        expected_request,
+        required_coverage,
+    } = execution;
     let AssignmentExecutionContext {
         index,
         concurrent_mode,
@@ -2449,10 +2459,12 @@ fn execute_supervisor_assignment_inner(
                     journal_parent_id,
                     &mut child_report,
                     &mut auditor_attempt,
-                    lens,
-                    lens_index,
-                    &expected_request,
-                    &required_coverage,
+                    ParentAuditorLensExecution {
+                        lens,
+                        lens_index,
+                        expected_request: &expected_request,
+                        required_coverage: &required_coverage,
+                    },
                 )? {
                     ParentAuditorPreparation::Ready(prepared) => prepared,
                     ParentAuditorPreparation::AssignmentComplete => return Ok(()),
@@ -2807,10 +2819,12 @@ mod decomposition_tests {
             options.run_id.as_str(),
             &mut child_report,
             &mut auditor_attempt,
-            &lens,
-            0,
-            &expected_request,
-            &required_coverage,
+            ParentAuditorLensExecution {
+                lens: &lens,
+                lens_index: 0,
+                expected_request: &expected_request,
+                required_coverage: &required_coverage,
+            },
         )
         .expect("direct auditor preparation invocation")
         {

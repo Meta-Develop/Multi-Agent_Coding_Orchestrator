@@ -401,6 +401,9 @@ pub struct ReviewLensConfig {
 /// aggregation without pretending that it was produced by a model invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+// Keep the public construction and serialized shape source-compatible: boxing
+// the model reviewer solely for enum layout would force callers to change.
+#[allow(clippy::large_enum_variant)]
 pub enum ReviewLensBackendConfig {
     Model {
         backend_id: String,
@@ -852,17 +855,14 @@ impl ReviewLensVerdict {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ReviewAggregationPolicy {
+    #[default]
     AllMustAccept,
-    ValidatedQuorum { minimum_accepts: usize },
-}
-
-impl Default for ReviewAggregationPolicy {
-    fn default() -> Self {
-        Self::AllMustAccept
-    }
+    ValidatedQuorum {
+        minimum_accepts: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
