@@ -1,5 +1,12 @@
 use super::*;
 
+#[cfg(test)]
+const WORKER_PROMPT_FIXTURE_CEILING_BYTES: usize = 6 * 1024;
+#[cfg(test)]
+const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 20 * 1024;
+#[cfg(test)]
+const REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 4 * 1024;
+
 pub(super) fn fresh_field_guide_frame_nonce(
     entries: &[DecodedFieldGuidePromptEntry],
     nonce_source: &mut dyn FnMut() -> Result<String>,
@@ -719,4 +726,164 @@ pub(super) fn apply_canonical_environment_requirements(
     requirements: &[EnvironmentRequirement],
 ) -> ExternalAgentCommand {
     command.with_environment_requirements(requirements.iter().cloned())
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn fixed_prompt_fixture() -> Result<(String, String, String)> {
+        let worker = WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: vec!["worker_prompt_with_field_guide".to_string()],
+            semantic_modules: vec!["supervise::prompts".to_string()],
+            task: Some("implement the assigned prompt change".to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let assignment = OrchestratorAssignment {
+            id: "child-a".to_string(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: vec!["worker_prompt_with_field_guide".to_string()],
+            semantic_modules: vec!["supervise::prompts".to_string()],
+            task: Some("complete the bounded prompt-chain assignment".to_string()),
+            worker_assignments: vec![worker],
+            environment_requirements: Vec::new(),
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "fixed rendered-prompt regression fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            assignments: vec![assignment.clone()],
+        };
+        let run_dir = Path::new("/tmp/maco-prompt-regression");
+        let incoming_root = run_dir.join("incoming");
+        let worker_schema_path = run_dir.join("schemas/worker-report.schema.json");
+        let auditor_schema_path = run_dir.join("schemas/auditor-report.schema.json");
+        let field_guide = SupervisorFieldGuidePrompt::empty()?;
+        let assignment_metadata = AssignmentMetadata::new();
+        let worker_metadata = WorkerAssignmentMetadata::default();
+        let worker_prompt = worker_prompt_with_field_guide(
+            WorkerPromptRenderContext {
+                plan: &plan,
+                orchestrator: &assignment,
+                worker: &assignment.worker_assignments[0],
+                metadata: &worker_metadata,
+                run_dir,
+                incoming_root: &incoming_root,
+                schema_path: &worker_schema_path,
+            },
+            &field_guide,
+        )?;
+        let auditor_prompt = review_auditor_prompt_with_metadata_and_field_guide(
+            &plan,
+            &assignment,
+            &assignment_metadata,
+            run_dir,
+            &auditor_schema_path,
+            &field_guide,
+        )?;
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: PathBuf::from("/tmp/maco-prompt-regression/worktree"),
+            branch: "maco/prompt-regression-child".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let consultant = SupervisorConsultantPlan::default();
+        let child_prompt = child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                assignment: &assignment,
+                run_dir,
+                worktree: &worktree,
+                report_path: &incoming_root.join("child-a.json"),
+                schema_path: &run_dir.join("schemas/orchestrator-review-report.schema.json"),
+                worker_schema_path: &worker_schema_path,
+                auditor_schema_path: &auditor_schema_path,
+                consultant: &consultant,
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            &incoming_root,
+            &assignment_metadata,
+            &field_guide,
+        )?;
+        Ok((worker_prompt, child_prompt, auditor_prompt))
+    }
+
+    fn enforce_fixture_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
+        if rendered.len() > ceiling {
+            bail!(
+                "rendered {role} prompt grew to {} bytes, above its declared {ceiling}-byte fixture ceiling",
+                rendered.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_role_prompts_stay_within_declared_fixture_ceilings() {
+        let (worker, child, auditor) =
+            fixed_prompt_fixture().expect("render the fixed prompt fixture");
+        let measurements = [
+            (
+                "terminal worker",
+                worker.as_str(),
+                WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+            (
+                "child orchestrator",
+                child.as_str(),
+                CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+            (
+                "review auditor",
+                auditor.as_str(),
+                REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+            ),
+        ];
+
+        for (role, rendered, ceiling) in measurements {
+            eprintln!(
+                "{role}: {} rendered bytes (ceiling {ceiling})",
+                rendered.len()
+            );
+            enforce_fixture_ceiling(role, rendered, ceiling)
+                .unwrap_or_else(|error| panic!("{error:#}"));
+        }
+    }
+
+    #[test]
+    fn rendered_role_prompt_ceiling_guard_rejects_growth() {
+        let oversized = "x".repeat(WORKER_PROMPT_FIXTURE_CEILING_BYTES.saturating_add(1));
+        let error = enforce_fixture_ceiling(
+            "terminal worker",
+            &oversized,
+            WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+        )
+        .expect_err("one byte beyond the declared ceiling must fail");
+
+        assert!(error.to_string().contains("above its declared"));
+        assert!(error
+            .to_string()
+            .contains(&WORKER_PROMPT_FIXTURE_CEILING_BYTES.to_string()));
+    }
 }
