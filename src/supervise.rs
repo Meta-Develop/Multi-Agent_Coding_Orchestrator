@@ -85,6 +85,9 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+mod util;
+pub use util::*;
+
 
 const DEFAULT_CHILD_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_MAX_CHILD_ASSIGNMENTS: usize = 4;
@@ -14305,25 +14308,6 @@ fn write_private_prompt(
     Ok(())
 }
 
-fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(repo_path)
-        .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
-    repo.workdir()
-        .map(Path::to_path_buf)
-        .context("repository command requires a non-bare repository")
-}
-
-fn run_dir(repo: &Path, run_id: &RunId) -> PathBuf {
-    repo.join(".maco")
-        .join("o2")
-        .join("runs")
-        .join(run_id.as_str())
-}
-
-fn supervisor_final_report_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("reports").join("supervisor-final.json")
-}
-
 #[derive(Debug)]
 struct RunDirs {
     run_dir: PathBuf,
@@ -14356,211 +14340,10 @@ impl RunDirs {
     }
 }
 
-fn normalize_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    let paths = paths
-        .into_iter()
-        .map(normalize_repo_relative_path)
-        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-    Ok(collapse_covered_paths(paths))
-}
-
-fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
-    let mut collapsed: Vec<PathBuf> = Vec::new();
-    for path in paths {
-        if collapsed.iter().any(|existing| path.starts_with(existing)) {
-            continue;
-        }
-        collapsed.retain(|existing| !existing.starts_with(&path));
-        collapsed.push(path);
-    }
-    collapsed
-}
-
-fn normalize_agent_id(value: &str) -> Result<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        bail!("agent id cannot be empty");
-    }
-    if matches!(value, "." | "..") {
-        bail!("agent id cannot be '.' or '..'");
-    }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        bail!("agent id may only contain ASCII letters, digits, '.', '_' and '-'");
-    }
-    Ok(value.to_string())
-}
-
-fn normalize_semantic_symbols(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .filter_map(|value| canonical_semantic_path(value, false))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn normalize_semantic_modules(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .filter_map(|value| canonical_semantic_path(value, true))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn canonical_semantic_path(value: &str, require_crate_root: bool) -> Option<String> {
-    let mut parts = value
-        .trim()
-        .split("::")
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return None;
-    }
-    if require_crate_root && parts.first().is_some_and(|part| part != "crate") {
-        parts.insert(0, "crate".to_string());
-    }
-    Some(parts.join("::"))
-}
-
-fn normalize_spec_fragment_ids(values: Vec<String>) -> Result<Vec<String>> {
-    if values.len() > MAX_SPEC_FRAGMENT_IDS {
-        bail!(
-            "spec fragment id count {} exceeds limit {}",
-            values.len(),
-            MAX_SPEC_FRAGMENT_IDS
-        );
-    }
-    values
-        .into_iter()
-        .map(|value| {
-            let value = value.trim();
-            if value.is_empty() {
-                bail!("spec fragment id cannot be empty");
-            }
-            if value.len() > MAX_SPEC_FRAGMENT_ID_BYTES {
-                bail!(
-                    "spec fragment id exceeds {} bytes",
-                    MAX_SPEC_FRAGMENT_ID_BYTES
-                );
-            }
-            if value.chars().any(char::is_control) {
-                bail!("spec fragment id must not contain control characters");
-            }
-            Ok(value.to_string())
-        })
-        .collect::<Result<BTreeSet<_>>>()
-        .map(BTreeSet::into_iter)
-        .map(Iterator::collect)
-}
-
-fn parent_auditor_id(assignment: &OrchestratorAssignment) -> String {
-    format!("{}-review-auditor", assignment.id)
-}
-
-fn path_is_covered_by_claim(path: &Path, claim: &Path) -> bool {
-    path == claim || path.starts_with(claim)
-}
-
-pub(crate) fn validate_max_concurrent_children(max_concurrent_children: usize) -> Result<()> {
-    if max_concurrent_children == 0 {
-        bail!("--max-concurrent-children must be at least 1");
-    }
-    Ok(())
-}
-
-fn display_paths(paths: &[PathBuf]) -> String {
-    if paths.is_empty() {
-        return "<none>".to_string();
-    }
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn display_strings(values: &[String]) -> String {
-    if values.is_empty() {
-        return "<none>".to_string();
-    }
-    values.join(", ")
-}
-
-fn display_command_identities(commands: &[(Vec<String>, PathBuf)]) -> String {
-    if commands.is_empty() {
-        return "<none>".to_string();
-    }
-    commands
-        .iter()
-        .map(|(command, cwd)| format!("{} @ {}", display_strings(command), cwd.display()))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn path_relative_to(repo: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(repo)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn default_schema_version() -> u32 {
-    SUPERVISOR_SCHEMA_VERSION
-}
-
-fn default_max_depth() -> u8 {
-    2
-}
-
-fn default_max_child_assignments() -> usize {
-    DEFAULT_MAX_CHILD_ASSIGNMENTS
-}
-
-fn default_max_child_retries() -> u8 {
-    DEFAULT_MAX_CHILD_RETRIES
-}
-
-fn default_max_gate_corrections() -> u8 {
-    DEFAULT_MAX_GATE_CORRECTIONS
-}
-
-fn default_child_timeout_seconds() -> u64 {
-    DEFAULT_CHILD_TIMEOUT_SECONDS
-}
-
-fn default_consultant_runtime() -> String {
-    "fake".to_string()
-}
-
-fn default_max_consultations() -> u32 {
-    2
-}
-
-fn child_orchestrator_role() -> AgentRole {
-    AgentRole::ChildOrchestrator
-}
-
-fn worker_role() -> AgentRole {
-    AgentRole::Worker
-}
-
 #[derive(Debug, Clone)]
 struct PathOwner {
     id: String,
     path: PathBuf,
-}
-
-pub fn generated_run_id() -> Result<RunId> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX epoch")?
-        .as_secs();
-    RunId::new(format!("o2-{now}"))
 }
 
 #[cfg(test)]
