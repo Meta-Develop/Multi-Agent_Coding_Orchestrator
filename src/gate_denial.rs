@@ -164,6 +164,8 @@ pub enum ApprovalReviewDenial {
     ClassifierMalformedResponse,
     ClassifierProtocolError,
     HumanReviewRequired,
+    LatencyBudgetExceeded,
+    DuplexFallbackRequired,
 }
 
 /// Trusted source check that produced a denial.
@@ -296,6 +298,7 @@ pub enum NextSafeOperation {
     EscalateSandboxPolicy,
     ReplanDestructiveTargets,
     NarrowActionOrChooseAnotherTool,
+    RestorePreActionReviewService,
 }
 
 /// Verified canonical context used to identify and route a denial.
@@ -975,7 +978,12 @@ fn retryability_for(reason: &GateDenialReason) -> GateRetryability {
         | GateDenialReason::PrimaryIntegrityFailure
         | GateDenialReason::ExternalSideEffect { .. }
         | GateDenialReason::Sandbox { .. }
-        | GateDenialReason::DestructiveTarget { .. } => GateRetryability::NotRetryable,
+        | GateDenialReason::DestructiveTarget { .. }
+        | GateDenialReason::ApprovalReview {
+            denial:
+                ApprovalReviewDenial::LatencyBudgetExceeded
+                | ApprovalReviewDenial::DuplexFallbackRequired,
+        } => GateRetryability::NotRetryable,
         _ => GateRetryability::RetryAfterCorrection,
     }
 }
@@ -988,6 +996,10 @@ fn is_non_retryable_safety_class(reason: &GateDenialReason) -> bool {
             | GateDenialReason::ExternalSideEffect { .. }
             | GateDenialReason::Sandbox { .. }
             | GateDenialReason::DestructiveTarget { .. }
+            | GateDenialReason::ApprovalReview {
+                denial: ApprovalReviewDenial::LatencyBudgetExceeded
+                    | ApprovalReviewDenial::DuplexFallbackRequired,
+            }
     )
 }
 
@@ -1030,9 +1042,13 @@ fn next_safe_operation_for(reason: &GateDenialReason) -> NextSafeOperation {
         }
         GateDenialReason::Sandbox { .. } => NextSafeOperation::EscalateSandboxPolicy,
         GateDenialReason::DestructiveTarget { .. } => NextSafeOperation::ReplanDestructiveTargets,
-        GateDenialReason::ApprovalReview { .. } => {
-            NextSafeOperation::NarrowActionOrChooseAnotherTool
-        }
+        GateDenialReason::ApprovalReview { denial } => match denial {
+            ApprovalReviewDenial::LatencyBudgetExceeded
+            | ApprovalReviewDenial::DuplexFallbackRequired => {
+                NextSafeOperation::RestorePreActionReviewService
+            }
+            _ => NextSafeOperation::NarrowActionOrChooseAnotherTool,
+        },
     }
 }
 
@@ -1179,6 +1195,12 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
             ApprovalReviewDenial::HumanReviewRequired => {
                 "approval classifier required human review"
             }
+            ApprovalReviewDenial::LatencyBudgetExceeded => {
+                "pre-action review latency budget was exceeded"
+            }
+            ApprovalReviewDenial::DuplexFallbackRequired => {
+                "mandatory duplex pre-action fallback was required"
+            }
         },
     }
 }
@@ -1264,6 +1286,9 @@ fn next_safe_operation_instruction(value: NextSafeOperation) -> &'static str {
         }
         NextSafeOperation::NarrowActionOrChooseAnotherTool => {
             "narrow the proposed action or choose another tool before requesting review again."
+        }
+        NextSafeOperation::RestorePreActionReviewService => {
+            "restore and verify the mandatory pre-action review service before beginning a new child operation."
         }
     }
 }

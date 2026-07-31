@@ -104,6 +104,8 @@ pub(crate) enum PreActionJournalRationale {
     ClassifierAllow,
     ClassifierFailClosed,
     HumanInterventionRequired,
+    LatencyBudgetExceeded,
+    DuplexFallbackRequired,
     TerminalEvidence,
 }
 
@@ -2069,28 +2071,49 @@ impl codex_app_server::ApprovalReviewer for DuplexApprovalReviewer<'_> {
             .review(self.context, &review_request, None)
             .map_err(|error| format!("pre-action policy failed: {error}"))?;
         let (source, allowed, denial, rationale, response) = match outcome {
-            ReviewOutcome::Allowed { source } => (
-                source,
-                true,
-                None,
-                if source == DecisionSource::Classifier {
-                    PreActionJournalRationale::ClassifierAllow
-                } else {
-                    PreActionJournalRationale::DeterministicPolicyAllow
-                },
-                codex_app_server::ApprovalReview::accept(),
-            ),
-            ReviewOutcome::Denied { source, denial } => (
-                source,
-                false,
-                Some(denial.clone()),
-                if source == DecisionSource::Classifier {
-                    PreActionJournalRationale::ClassifierFailClosed
-                } else {
-                    PreActionJournalRationale::DeterministicPolicyDeny
-                },
-                codex_app_server::ApprovalReview::decline(denial),
-            ),
+            ReviewOutcome::Allowed { source } => {
+                let rationale = match source {
+                    DecisionSource::Classifier => PreActionJournalRationale::ClassifierAllow,
+                    DecisionSource::DeterministicAllow => {
+                        PreActionJournalRationale::DeterministicPolicyAllow
+                    }
+                    DecisionSource::DeterministicDeny | DecisionSource::LatencyBudget => {
+                        return Err(
+                            "pre-action policy returned an invalid allow source".to_string()
+                        );
+                    }
+                };
+                (
+                    source,
+                    true,
+                    None,
+                    rationale,
+                    codex_app_server::ApprovalReview::accept(),
+                )
+            }
+            ReviewOutcome::Denied { source, denial } => {
+                let rationale = match source {
+                    DecisionSource::Classifier => PreActionJournalRationale::ClassifierFailClosed,
+                    DecisionSource::DeterministicDeny => {
+                        PreActionJournalRationale::DeterministicPolicyDeny
+                    }
+                    DecisionSource::LatencyBudget => {
+                        PreActionJournalRationale::LatencyBudgetExceeded
+                    }
+                    DecisionSource::DeterministicAllow => {
+                        return Err(
+                            "pre-action policy returned an invalid denial source".to_string()
+                        );
+                    }
+                };
+                (
+                    source,
+                    false,
+                    Some(denial.clone()),
+                    rationale,
+                    codex_app_server::ApprovalReview::decline(denial),
+                )
+            }
             ReviewOutcome::HumanInterventionRequired { source, denial } => (
                 source,
                 false,
@@ -2313,14 +2336,24 @@ fn run_duplex_app_server_process(
             || cancellation.is_cancelled(),
         )
         .map_err(|error| error.to_string())?;
+        let fallback_denial = duplex_fallback_denial(runtime.context, &review_session_id, &outcome)
+            .map_err(|error| format!("failed to construct duplex fallback refusal: {error:#}"))?;
         reviewer
             .journal
             .append(&terminal_turn_journal_record(
                 runtime.context.run_id(),
                 &review_session_id,
                 &outcome,
+                fallback_denial.as_ref(),
             ))
             .map_err(|error| format!("strict turn-terminal journal append failed: {error:#}"))?;
+        if let Some(denial) = fallback_denial {
+            reviewer.observed_denials.push(denial);
+            return Err(
+                "child refused because mandatory duplex pre-action fallback was required"
+                    .to_string(),
+            );
+        }
         Ok(outcome)
     });
     if let Ok(result) = &mut process {
@@ -2354,10 +2387,30 @@ fn duplex_review_session_id(context: &ReviewContext, spec: &ExternalAgentCommand
     format!("review-{}", sha256_hex(&material))
 }
 
+fn duplex_fallback_denial(
+    context: &ReviewContext,
+    review_session_id: &str,
+    outcome: &codex_app_server::AppServerOutcome,
+) -> Result<Option<GateDenial>> {
+    if !outcome.duplex_fallback_required {
+        return Ok(None);
+    }
+    let paths = context.claims().iter().map(|claim| claim.path());
+    GateDenial::from_approval_review(
+        format!("{review_session_id}-fallback"),
+        context.owner(),
+        crate::gate_denial::ApprovalReviewDenial::DuplexFallbackRequired,
+        paths,
+    )
+    .map(Some)
+    .map_err(Into::into)
+}
+
 fn terminal_turn_journal_record(
     run_id: &str,
     review_session_id: &str,
     outcome: &codex_app_server::AppServerOutcome,
+    fallback_denial: Option<&GateDenial>,
 ) -> PreActionJournalRecord {
     PreActionJournalRecord {
         version: PRE_ACTION_JOURNAL_VERSION,
@@ -2370,9 +2423,13 @@ fn terminal_turn_journal_record(
         request: None,
         decision_source: None,
         decision_latency_ms: None,
-        rationale: PreActionJournalRationale::TerminalEvidence,
-        allowed: None,
-        denial: None,
+        rationale: if fallback_denial.is_some() {
+            PreActionJournalRationale::DuplexFallbackRequired
+        } else {
+            PreActionJournalRationale::TerminalEvidence
+        },
+        allowed: fallback_denial.map(|_| false),
+        denial: fallback_denial.cloned(),
         turn_status: Some(outcome.status),
         item_outcomes: outcome.item_outcomes.clone(),
         process_exit_code: None,
@@ -6283,6 +6340,55 @@ mod tests {
             .contains("does not guarantee a blocking MACO callback"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn production_writable_path_refuses_before_starting_any_child_process() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
+        let marker = temp.path().join("child-process-started");
+        let agent = temp.path().join("must-not-start.sh");
+        fs::write(&agent, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.md");
+        fs::write(&prompt, "writable child must remain disabled\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        );
+        let context = test_review_context();
+        let mut journal = RecordingPreActionJournal::default();
+
+        let report = run_external_agent_cancellable_reviewed(
+            &spec,
+            &ProcessCancellation::new(),
+            Some(ExternalPreActionReviewRuntime {
+                context: &context,
+                journal: &mut journal,
+            }),
+        );
+
+        assert!(!marker.exists());
+        assert!(!report.stdout.target_launch_attempted);
+        assert_eq!(report.process_tree, None);
+        assert_eq!(report.side_effects, None);
+        assert!(report.environment_blocked());
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("writable Codex failed closed before launch")));
+        assert!(journal.records.is_empty());
+        Ok(())
+    }
+
     fn contained_fake_app_server(
         mode: &str,
         journal: &mut RecordingPreActionJournal,
@@ -6342,7 +6448,7 @@ send({"method": "turn/started", "params": {
     "turn": {"id": "turn-contained", "status": "inProgress"}
 }})
 item = {"id": "item-contained", "type": "fileChange", "status": "inProgress"}
-if mode == "accept":
+if mode in ("accept", "fallback_required"):
     item["changes"] = [{
         "path": "README.md",
         "kind": {"type": "update"},
@@ -6361,6 +6467,32 @@ send({"id": 77, "method": "item/fileChange/requestApproval", "params": {
     "reason": "incomplete manifest"
 }})
 first = receive()
+def send_auto_review(status):
+    send({"method": "item/autoApprovalReview/started", "params": {
+        "threadId": "thread-contained",
+        "turnId": "turn-contained",
+        "reviewId": "review-contained",
+        "targetItemId": "item-contained",
+        "startedAtMs": 1,
+        "action": {"type": "applyPatch"},
+        "review": {"status": "inProgress"}
+    }})
+    send({"method": "item/autoApprovalReview/completed", "params": {
+        "threadId": "thread-contained",
+        "turnId": "turn-contained",
+        "reviewId": "review-contained",
+        "targetItemId": "item-contained",
+        "startedAtMs": 1,
+        "completedAtMs": 2,
+        "action": {"type": "applyPatch"},
+        "decisionSource": "agent",
+        "review": {
+            "status": status,
+            "rationale": "bounded fixture decision",
+            "riskLevel": "low",
+            "userAuthorization": "low"
+        }
+    }})
 if mode in ("decline", "protocol_loss"):
     assert first["method"] == "turn/steer"
     assert first["params"]["threadId"] == "thread-contained"
@@ -6375,6 +6507,7 @@ if mode in ("decline", "protocol_loss"):
         marker.touch()
     if mode == "protocol_loss":
         sys.exit(0)
+    send_auto_review("denied")
     send({"method": "item/completed", "params": {
         "threadId": "thread-contained",
         "turnId": "turn-contained",
@@ -6385,10 +6518,12 @@ if mode in ("decline", "protocol_loss"):
         "threadId": "thread-contained",
         "turn": {"id": "turn-contained", "status": "completed", "items": []}
     }})
-elif mode == "accept":
+elif mode in ("accept", "fallback_required"):
     assert first["id"] == 77
     assert first["result"]["decision"] == "accept"
     marker.touch()
+    if mode == "accept":
+        send_auto_review("approved")
     send({"method": "item/completed", "params": {
         "threadId": "thread-contained",
         "turnId": "turn-contained",
@@ -6545,6 +6680,45 @@ else:
         assert!(journal.records[0].decision_latency_ms.is_some());
         assert_eq!(metrics.reviewed_action_denials.denominator, 1);
         assert_eq!(metrics.reviewed_action_denials.numerator, 0);
+    }
+
+    #[test]
+    fn production_duplex_consumer_refuses_fallback_required_child_with_typed_denial() {
+        let mut journal = RecordingPreActionJournal::default();
+        let (result, metrics, gate_denials, marker) =
+            nonpublishable_trusted_compatibility_fake_app_server("fallback_required", &mut journal);
+
+        assert!(result.interaction.as_ref().is_err_and(
+            |error| error.contains("mandatory duplex pre-action fallback was required")
+        ));
+        assert!(
+            marker.exists(),
+            "fixture must prove the child path was exercised"
+        );
+        assert!(result.process.status.is_some_and(|status| status.success()));
+        assert_eq!(gate_denials.len(), 1);
+        assert!(matches!(
+            gate_denials[0].reason,
+            crate::gate_denial::GateDenialReason::ApprovalReview {
+                denial: crate::gate_denial::ApprovalReviewDenial::DuplexFallbackRequired
+            }
+        ));
+        assert_eq!(
+            gate_denials[0].retryability,
+            crate::gate_denial::GateRetryability::NotRetryable
+        );
+        assert_eq!(
+            gate_denials[0].next_safe_operation,
+            crate::gate_denial::NextSafeOperation::RestorePreActionReviewService
+        );
+        assert_eq!(journal.records.len(), 3);
+        assert_eq!(
+            journal.records[1].rationale,
+            PreActionJournalRationale::DuplexFallbackRequired
+        );
+        assert_eq!(journal.records[1].allowed, Some(false));
+        assert_eq!(journal.records[1].denial.as_ref(), Some(&gate_denials[0]));
+        assert_eq!(metrics.reviewed_action_denials.denominator, 1);
     }
 
     #[test]
