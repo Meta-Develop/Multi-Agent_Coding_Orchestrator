@@ -9,7 +9,9 @@ use crate::{
     artifacts::{
         state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
     },
-    external_agent::{run_external_agent, ExternalAgentCommand},
+    external_agent::{
+        run_external_agent, ExternalAgentCommand, ExternalMachineGlobalRetentionBinding,
+    },
     gate_denial::{GateCheckSource, GateDenial},
     llm::Redactor,
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
@@ -143,6 +145,8 @@ pub struct MergeArbitrationOptions {
     pub codex_bin: PathBuf,
     pub timeout: Duration,
     pub worktree_root: Option<PathBuf>,
+    pub machine_global_config: PathBuf,
+    pub machine_global_runtime_root_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +275,8 @@ trait ArbitrationRunner {
 struct ExternalArbitrationRunner {
     codex_bin: PathBuf,
     timeout: Duration,
+    machine_global_config: PathBuf,
+    machine_global_runtime_root_id: String,
 }
 
 #[cfg(test)]
@@ -366,7 +372,13 @@ impl ArbitrationRunner for ExternalArbitrationRunner {
             "arbiter",
             &request.run_id,
             &request.arbiter_id,
-        );
+        )
+        .with_machine_global_retention(ExternalMachineGlobalRetentionBinding {
+            config: self.machine_global_config.clone(),
+            root_id: self.machine_global_runtime_root_id.clone(),
+            owner: request.arbiter_id.clone(),
+            correction_correlation_id: request.run_id.clone(),
+        });
         command.output_schema = Some(request.output_schema_path.clone());
         let run = run_external_agent(&command);
         let execution = ArbitrationRunnerExecution {
@@ -514,6 +526,8 @@ pub fn arbitrate_merge(options: MergeArbitrationOptions) -> Result<MergeArbitrat
     let runner = ExternalArbitrationRunner {
         codex_bin: options.codex_bin.clone(),
         timeout: options.timeout,
+        machine_global_config: options.machine_global_config.clone(),
+        machine_global_runtime_root_id: options.machine_global_runtime_root_id.clone(),
     };
     arbitrate_merge_with_runner(options, &runner)
 }
@@ -8559,6 +8573,8 @@ mod tests {
             codex_bin: PathBuf::from("unused"),
             timeout: Duration::from_secs(1),
             worktree_root: None,
+            machine_global_config: repo.join("unused-machine-global.json"),
+            machine_global_runtime_root_id: "runtime".to_string(),
         }
     }
 

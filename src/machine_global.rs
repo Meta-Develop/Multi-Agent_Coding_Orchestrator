@@ -61,6 +61,19 @@ pub struct DeclaredGlobalRootConfig {
     pub quarantine_grace_seconds: u64,
 }
 
+/// Explicit caller binding for one cooperative machine-global retention path.
+///
+/// This is deliberately configuration-bound rather than inferred from an
+/// absolute target. Callers that cannot supply this binding must either refuse
+/// destructive work or identify their operation as a known bypass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineGlobalRetentionBinding {
+    pub config: PathBuf,
+    pub root_id: String,
+    pub owner: String,
+    pub correction_correlation_id: String,
+}
+
 /// A gate operation either completed or was refused through the typed Issue 29 envelope.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "outcome", content = "value", rename_all = "snake_case")]
@@ -409,6 +422,42 @@ impl MachineGlobalStore {
             roots,
             config_fingerprint,
         })
+    }
+
+    /// Resolves one already-existing directory beneath a reviewed root into the
+    /// privacy-safe coordinate used by claims and destructive preflight.
+    ///
+    /// Callers must still supply the exact config and reviewed root id. This
+    /// helper does not discover configs or reinterpret arbitrary absolute paths.
+    pub fn coordinate_for_existing_directory(
+        &self,
+        root_id: impl AsRef<str>,
+        path: impl AsRef<Path>,
+    ) -> Result<DeclaredPathCoordinate> {
+        let root_id = root_id.as_ref();
+        let root = self
+            .roots
+            .get(root_id)
+            .with_context(|| format!("undeclared machine-global root {root_id}"))?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            bail!("machine-global directory path must be absolute");
+        }
+        let canonical =
+            fs::canonicalize(path).context("failed to canonicalize machine-global directory")?;
+        if canonical != path {
+            bail!("machine-global directory path is not exact and canonical");
+        }
+        let relative = path.strip_prefix(root.safe.path()).with_context(|| {
+            format!("machine-global directory is outside reviewed root {root_id}")
+        })?;
+        let coordinate = DeclaredPathCoordinate::new(root_id, relative)
+            .context("machine-global directory is the root itself or has an invalid coordinate")?;
+        self.validate_coordinate(&coordinate, true)?;
+        root.safe.verify_linux_mount_id(root.mount_id)?;
+        Ok(coordinate)
     }
 
     /// Acquires all declared targets atomically against the shared cross-repository state.

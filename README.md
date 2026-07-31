@@ -28,7 +28,7 @@ The current implementation covers a local-first command-line slice:
 - `maco worktree create <agent-id>` is temporarily disabled at its public entry point pending capability-bound repository cleanliness input.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
 - `maco worktree remove <agent-id> --force` performs explicitly authorized cleanup of authenticated managed state; non-force removal is temporarily disabled.
-- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and prunes unregistered leftover directories under the managed worktree root.
+- `maco worktree gc` removes clean, inactive managed worktrees while retaining branch refs, protects dirty worktrees and active leases/claims, removes retained `target/` build artifacts by default, supports dry-run and max-age/max-count retention filters, and routes unregistered leftover directories through recoverable machine-global quarantine.
 - `SyncCoordinator` provides an in-memory exclusive path-claim layer for local agent coordination.
 - `maco sync claim <agent-id> <path>...` records durable exclusive path claims.
 - `maco sync release <token>` releases one durable claim.
@@ -773,15 +773,74 @@ recorded partially quarantined operation. Quarantine does not resume such an
 operation: restore it to a consistent source layout, then start a fresh
 quarantine attempt.
 
-This boundary is local-first and deliberately narrow. It currently supports
-directory retention only on Linux. It does not transparently intercept an
-arbitrary shell command, the existing artifact/worktree cleanup commands, or an
-agent launched directly without registering and honoring a machine-global
-claim. Those directly launched agents remain a follow-up enforcement gap.
-Coordinate comparison currently assumes case-sensitive filesystem spelling;
-case-insensitive or casefolded alias behavior is not established as supported,
-so such roots should not be declared. The mount policy is intentionally
-conservative and does not claim to detect every conceivable physical alias.
+### Cooperative enforcement and known bypasses
+
+Machine-global enforcement is cooperative. A destructive path is protected only when
+the caller opens the same reviewed configuration and state root, declares the target
+under the correct root ID, and performs the mutation through the gate. This is not
+syscall interposition and is not a host-wide guarantee: a hand-run shell command, a
+directly launched agent, or an arbitrary child process can still modify or delete data
+without consulting MACO.
+
+`merge arbitrate` requires `--machine-global-config` and
+`--machine-global-runtime-root-id`. Its external-agent output staging cleanup is routed
+through the machine-global gate. An intersecting active claim produces the existing
+typed `GateDenial`, leaves the staging directory in place, and makes the run
+non-publishable. An allowed cleanup is quarantined; the public run record carries only
+the retention operation ID, while the purge token remains in a mode-0600 private
+receipt beside the JSON log. This is a launch-time obligation for that orchestrator
+path, not protection against commands launched outside it.
+
+`worktree gc` accepts `--machine-global-config`,
+`--machine-global-worktree-root-id`, and `--machine-global-correlation` as one
+all-or-none binding. A destructive run that discovers unregistered directories refuses
+before touching those directories when the binding is absent. With the binding, GC
+collects the complete orphan set and sends it through one machine-global quarantine
+preflight before the first directory moves. A denial leaves every orphan in place and
+is returned in the existing typed `GateDenial` envelope. The GC report carries the
+public retention operation ID only; it does not serialize the bearer purge token.
+
+The audit was performed from mutation sinks outward, rather than from cleanup command
+names inward. It enumerated direct filesystem removal, descriptor-relative unlink,
+rename/replacement, truncating/open-for-write operations, the safe-state recursive
+removal and quarantine wrappers, Git worktree/reference mutation, and spawned command
+or systemd cleanup. Each production caller's target was then traced to one of:
+repository worktree, separate Git common directory, managed external worktree root,
+private runtime/temp root, user-selected output root, or machine-global state/config
+root. Finally, CLI path-bearing arguments and generic child-process destinations were
+cross-checked against that sink inventory. Test-only mutation fixtures were excluded
+only after locating their enclosing test module, rather than by filename or keyword.
+
+The current cleanup/retention audit is:
+
+| Path | Gate status | Reason and attribution boundary |
+| --- | --- | --- |
+| Unregistered direct-child directories found by `worktree gc` | Routed | These may be nonempty arbitrary external directories and therefore match the destructive incident shape; treating routing as optional would be unjustified. GC requires an explicit reviewed binding when such targets exist, preflights the complete orphan set, quarantines allowed targets, and reports a typed denial plus logical actor `maco-worktree-gc` when refused. |
+| Pre-worktree final reservation and staging setup rollback/recovery/finalization | Known transactional bypass, attributed | These paths exist before the child is a repository worktree, but they are not adopted retention targets: MACO creates the exclusive reservation and authenticated create intent, binds the exact inode, removes only a still-empty reservation/staging root, and preserves changed, nonempty, or unbound paths for manual recovery. Final replacement accepts only the verified clean staged worktree. Routing these transaction-internal names into retention quarantine would break the idempotent create protocol rather than protect pre-existing data. While retained, the authenticated operation records agent, phase, root/path identity, and branch; each direct mutation also emits its fixed operation label with `process_attribution=not_process_observable`. |
+| Machine-global state-root lock/state/temp maintenance | Known infrastructure bypass | The state root is deliberately disjoint from declared data roots: the gate must lock and replace its own bounded authenticated state before it can evaluate a claim, so recursively gating that state is ill-founded. State writes and temp cleanup are identity-bound, bounded, and lock-fenced. The fixed private state root and filenames identify the machine-global subsystem, but successful bootstrap/temp cleanup is not durably process-observable. Retention purge is not included in this bypass: it rechecks the gate and retains its owner, operation ID, coordinates, identities, and final `purged` phase. |
+| External-agent output staging used by `merge arbitrate` | Routed | The exact existing staging directory is resolved beneath the explicitly declared root ID and revalidated. Refusals use `GateDenial`; allowed operations use the existing retention record. |
+| External-agent output staging used without a machine-global binding | Known bypass, attributed | Completed cleanup records `actor=maco-external-agent`, `operation=delete_private_output_staging`, the reason, and `process_attribution=not_process_observable` in the serialized run; early `Drop` cleanup emits the same actor/operation marker before deletion. This identifies the cooperative bypass without claiming process-level observation. |
+| External-agent staging setup rollback | Known empty-directory bypass, attributed | If exclusive output reservation fails, setup emits `actor=maco-external-agent`, `operation=delete_empty_output_staging_setup_rollback`, and `process_attribution=not_process_observable` before removing only the newly created, still-empty staging directory. No external data was accepted into that directory. |
+| Bounded worktree-status crash scavenging under `/tmp/maco-worktree-status-<uid>` | Known bypass | It removes only identity-bound, bounded files from MACO's per-user status root, but no reviewed root configuration is available at that call site. The call site and per-user root identify the subsystem; the deleting process is not durably observed. |
+| Merge private-runtime orphan scavenging and close cleanup under `/run/user/<uid>` or `/tmp/maco-runtime-<uid>` | Known bypass | Runtime teardown and orphan recovery must also work before a repository/configuration is available. Owner records carry PID, process start time, boot ID, and runtime kind while present, but successful deletion removes those records; this is not durable deletion attribution. |
+| Orchestrator cleanup of user-selected `--patch-dir` and `--checkpoint-dir` reservations | Known bypass | Exclusive leaf reservation prevents overwrite, but cleanup is still direct because these optional roots are not declared machine-global roots. The enclosing run, agent, and reservation identify the logical actor while present; process-level deletion attribution is not durable. |
+| Reviewer program/view cleanup in the private runtime root | Known bypass | These are current-run private runtime files and cleanup must work without a reviewed machine-global configuration. The run/reviewer context identifies the logical actor while records remain; successful `Drop` cleanup is not durably attributed. |
+| Process-runner and pinned-exec systemd unit/runtime/descriptor cleanup | Known bypass | systemd can remove `RuntimeDirectory` content outside the Rust cleanup path, so the machine-global API cannot wrap every deletion without changing the runtime ceiling. Unit, runtime, and actor metadata provide operational context, not universal process-observable attribution. |
+| Publication secret-buffer zeroing in the private runtime root | Known intentional overwrite | The overwrite is identity-checked secret erasure, not retention. Publication/run context identifies the logical actor, but the erasure is not process-observable after the fact. |
+| Repository Git-common maintenance: authenticated snapshots, state migration/journals and effect ledgers, repository lock records, and managed-worktree metadata | Known bypass | A separate Git directory can place this authenticated repository state physically outside a worktree. Cleanup and overwrite are bounded to identity-checked leaves under repository-bound locks, but these paths must also work before a machine-global config is supplied. Signed intents, journals, repository identity, and run/operation IDs provide logical attribution where retained; successful temp/intent cleanup is not durable process attribution. |
+| Process-runner tee destinations | Conditional capability surface | Current production callers use repository/run-local destinations. Any future caller that supplies an external destination must route it through the gate or add it here as a reasoned, attributable bypass. |
+
+Repository-local retention is outside this machine-global audit: artifact pruning under
+`.maco`, live-claim cleanup under `.agents`, supervise reporting artifacts, and deletion
+of a managed worktree's own files operate inside a repository worktree. Git-common
+metadata for those operations is covered separately above because it may use a separate
+Git directory.
+
+The retention API currently supports directory retention only on Linux. Coordinate
+comparison assumes case-sensitive filesystem spelling; case-insensitive or casefolded
+alias behavior is not established as supported, so such roots should not be declared.
+The mount policy is intentionally conservative and does not claim to detect every
+conceivable physical alias.
 
 Default linked worktrees are created outside the repository at
 `../.maco/worktrees/<repo-name>/<agent-id>`. Completed task branches can be
@@ -1179,8 +1238,16 @@ artifacts:
 
 ```bash
 cargo run -- worktree gc --repo . --dry-run --json
-cargo run -- worktree gc --repo . --max-count 10 --max-age-seconds 604800 --json
-cargo run -- worktree gc --repo . --keep-targets
+cargo run -- worktree gc --repo . \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-worktree-root-id worktrees \
+  --machine-global-correlation scheduled-worktree-gc \
+  --max-count 10 --max-age-seconds 604800 --json
+cargo run -- worktree gc --repo . \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-worktree-root-id worktrees \
+  --machine-global-correlation manual-worktree-gc \
+  --keep-targets
 ```
 
 GC keeps worktrees with uncommitted changes, active MACO execution leases, or
@@ -1188,9 +1255,11 @@ active path claims for the same agent id. Without retention filters, every clean
 inactive managed worktree is eligible for removal; with `--max-count` and/or
 `--max-age-seconds`, retained clean worktrees keep the checkout but lose their
 `target/` directory unless `--keep-targets` is set. A second pass prunes
-unregistered direct-child directories left under the managed worktree root, which
-covers the NTFS/DrvFS case where Git deregisters a worktree but leaves a partial
-directory behind.
+unregistered direct-child directories left under the managed worktree root. A
+destructive second pass requires the three-part machine-global binding above, treats
+all discovered orphans as one preflight set, and uses recoverable quarantine rather
+than direct deletion. Dry-run discovery remains non-mutating and does not require the
+binding.
 
 Perform explicitly authorized force cleanup and delete a MACO-owned branch:
 
