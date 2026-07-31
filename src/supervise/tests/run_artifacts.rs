@@ -427,7 +427,8 @@ fn fake_supervise_run_finalizes_manifested_report_tree_events() {
             .expect("read child prompt"),
     )
     .expect("UTF-8 child prompt");
-    assert!(child_prompt.starts_with(
+    assert!(child_prompt.starts_with(&child_orchestrator_cacheable_prefix()));
+    assert!(child_prompt.contains(
             "ROLE: O1_CHILD_ORCHESTRATOR\nAGENT_KIND: child_orchestrator\nAGENT_LABEL: child-a\nPARENT_THREAD_ID: none\nTHREAD_DEPTH: 1\nNO_FURTHER_DELEGATION: false\n"
         ));
     assert_eq!(child_prompt.matches(seed_finding).count(), 3);
@@ -630,7 +631,8 @@ fn accepted_audited_suggestions_append_with_trusted_provenance_and_redacted_jour
     )
     .expect("render actual worker role prompt");
     let role_prefix = supervise_role_prefix(SupervisePromptRole::TerminalWorker, &worker.id, None);
-    assert!(worker_prompt.starts_with(&format!("{role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n")));
+    assert!(worker_prompt.starts_with(&worker_cacheable_prefix()));
+    assert!(worker_prompt.contains(&format!("{role_prefix}{FIELD_GUIDE_SECTION_NOTICE}\n")));
     let (opening_token, closing_token) = single_field_guide_frame_tokens(&worker_prompt);
     let final_nonce = opening_token
         .strip_prefix(FIELD_GUIDE_FRAME_BEGIN_PREFIX)
