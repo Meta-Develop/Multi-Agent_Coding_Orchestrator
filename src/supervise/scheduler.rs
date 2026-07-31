@@ -1,5 +1,52 @@
 use super::*;
 
+/// Admission policy for concurrently runnable supervisor children.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SupervisorConcurrencyPolicy {
+    /// Use the same measured, cgroup-aware process capacity as strict systemd containment.
+    ///
+    /// The issue #24 swarm-health circuit breaker remains the admission safety backstop: higher
+    /// default fan-out never bypasses its pre-dispatch check or active-child drain behavior.
+    #[default]
+    Auto,
+    /// Run at most this explicit positive number of children.
+    Fixed(NonZeroUsize),
+}
+
+impl SupervisorConcurrencyPolicy {
+    pub(crate) const fn resolve(self, capacity: HostProcessCapacity) -> usize {
+        match self {
+            Self::Auto => capacity.supervisor_children(),
+            Self::Fixed(limit) => limit.get(),
+        }
+    }
+}
+
+impl fmt::Display for SupervisorConcurrencyPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str("auto"),
+            Self::Fixed(limit) => write!(formatter, "{limit}"),
+        }
+    }
+}
+
+impl FromStr for SupervisorConcurrencyPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value == "auto" {
+            return Ok(Self::Auto);
+        }
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| "--max-concurrent-children must be at least 1 or 'auto'".to_string())?;
+        NonZeroUsize::new(parsed)
+            .map(Self::Fixed)
+            .ok_or_else(|| "--max-concurrent-children must be at least 1 or 'auto'".to_string())
+    }
+}
+
 fn assignments_overlap(left: &OrchestratorAssignment, right: &OrchestratorAssignment) -> bool {
     left.assigned_paths.iter().any(|left_path| {
         right
