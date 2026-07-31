@@ -24,6 +24,8 @@ pub const PRE_ACTION_REVIEW_VERSION: u32 = 1;
 pub const DEFAULT_CLASSIFIER_P50_BUDGET_MS: u64 = 50;
 pub const DEFAULT_CLASSIFIER_P95_BUDGET_MS: u64 = 200;
 pub const DEFAULT_CLASSIFIER_TIMEOUT_MS: u64 = 500;
+/// A 100-sample nearest-rank window gives p50 and p95 exact integer ranks 50 and 95.
+pub const LATENCY_BUDGET_ENFORCEMENT_MIN_SAMPLES: usize = 100;
 
 const MAX_IDENTIFIER_BYTES: usize = 128;
 const MAX_INTENT_BYTES: usize = 8 * 1024;
@@ -624,6 +626,7 @@ pub enum DecisionSource {
     DeterministicAllow,
     DeterministicDeny,
     Classifier,
+    LatencyBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,6 +734,14 @@ impl LatencySeries {
         self.samples_ms.push_back(duration_millis(elapsed));
     }
 
+    fn observation_ceiling_exceeded(&self, elapsed: Duration) -> bool {
+        // Percentiles need the exact 100-sample window below, but production children often end
+        // before reaching it and each child receives fresh reviewer state. Treat the p95 budget as
+        // the maximum tolerable latency of any individual observation so a short run cannot pass
+        // an egregious review delay merely because its distribution is not yet meaningful.
+        elapsed > Duration::from_millis(self.budget.p95_ms)
+    }
+
     fn report(&self) -> LatencyReport {
         let mut sorted = self.samples_ms.iter().copied().collect::<Vec<_>>();
         sorted.sort_unstable();
@@ -744,6 +755,14 @@ impl LatencySeries {
             p50_within_budget: measured_p50_ms.map(|value| value <= self.budget.p50_ms),
             p95_within_budget: measured_p95_ms.map(|value| value <= self.budget.p95_ms),
         }
+    }
+
+    fn budget_exceeded(&self) -> bool {
+        if self.samples_ms.len() < LATENCY_BUDGET_ENFORCEMENT_MIN_SAMPLES {
+            return false;
+        }
+        let report = self.report();
+        report.p50_within_budget == Some(false) || report.p95_within_budget == Some(false)
     }
 }
 
@@ -760,6 +779,8 @@ pub struct ReviewMetricSnapshot {
     pub classifier_invocations: u64,
     pub review_latency: LatencyReport,
     pub classifier_latency: LatencyReport,
+    #[serde(default)]
+    pub latency_budget_latched: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -786,14 +807,27 @@ impl ReviewMetrics {
         }
     }
 
-    fn record(
+    fn observe_latency(
         &mut self,
-        run_id: &str,
-        denied: bool,
-        human_interrupted: bool,
         review_elapsed: Duration,
         classifier_elapsed: Option<Duration>,
-    ) {
+    ) -> bool {
+        let observation_ceiling_exceeded = self
+            .review_latency
+            .observation_ceiling_exceeded(review_elapsed)
+            || classifier_elapsed.is_some_and(|elapsed| {
+                self.classifier_latency
+                    .observation_ceiling_exceeded(elapsed)
+            });
+        self.review_latency.observe(review_elapsed);
+        if let Some(elapsed) = classifier_elapsed {
+            self.classifier_invocations = self.classifier_invocations.saturating_add(1);
+            self.classifier_latency.observe(elapsed);
+        }
+        observation_ceiling_exceeded
+    }
+
+    fn record_outcome(&mut self, run_id: &str, denied: bool, human_interrupted: bool) {
         self.reviewed_actions = self.reviewed_actions.saturating_add(1);
         if denied {
             self.denied_actions = self.denied_actions.saturating_add(1);
@@ -802,14 +836,13 @@ impl ReviewMetrics {
         if human_interrupted {
             self.human_interrupted_runs.insert(run_id.to_string());
         }
-        self.review_latency.observe(review_elapsed);
-        if let Some(elapsed) = classifier_elapsed {
-            self.classifier_invocations = self.classifier_invocations.saturating_add(1);
-            self.classifier_latency.observe(elapsed);
-        }
     }
 
-    fn snapshot(&self) -> ReviewMetricSnapshot {
+    fn latency_budget_exceeded(&self) -> bool {
+        self.review_latency.budget_exceeded() || self.classifier_latency.budget_exceeded()
+    }
+
+    fn snapshot(&self, latency_budget_latched: bool) -> ReviewMetricSnapshot {
         ReviewMetricSnapshot {
             reviewed_action_denials: RatioMetric {
                 numerator: self.denied_actions,
@@ -822,6 +855,7 @@ impl ReviewMetrics {
             classifier_invocations: self.classifier_invocations,
             review_latency: self.review_latency.report(),
             classifier_latency: self.classifier_latency.report(),
+            latency_budget_latched,
         }
     }
 }
@@ -832,6 +866,11 @@ pub struct PreActionReviewer {
     ceiling: CapabilityCeiling,
     latency_budget: LatencyBudget,
     metrics: ReviewMetrics,
+    latency_budget_latched: bool,
+    #[cfg(test)]
+    synthetic_review_latencies: VecDeque<Duration>,
+    #[cfg(test)]
+    synthetic_classifier_latencies: VecDeque<Duration>,
 }
 
 impl PreActionReviewer {
@@ -840,6 +879,11 @@ impl PreActionReviewer {
             ceiling: CapabilityCeiling::hardened_child(),
             latency_budget,
             metrics: ReviewMetrics::new(latency_budget),
+            latency_budget_latched: false,
+            #[cfg(test)]
+            synthetic_review_latencies: VecDeque::new(),
+            #[cfg(test)]
+            synthetic_classifier_latencies: VecDeque::new(),
         }
     }
 
@@ -848,7 +892,41 @@ impl PreActionReviewer {
     }
 
     pub fn metrics(&self) -> ReviewMetricSnapshot {
-        self.metrics.snapshot()
+        self.metrics.snapshot(self.latency_budget_latched)
+    }
+
+    #[cfg(test)]
+    fn with_synthetic_review_latencies(
+        mut self,
+        latencies: impl IntoIterator<Item = Duration>,
+    ) -> Self {
+        self.synthetic_review_latencies = latencies.into_iter().collect();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_synthetic_classifier_latencies(
+        mut self,
+        latencies: impl IntoIterator<Item = Duration>,
+    ) -> Self {
+        self.synthetic_classifier_latencies = latencies.into_iter().collect();
+        self
+    }
+
+    fn measured_review_elapsed(&mut self, started: Instant) -> Duration {
+        #[cfg(test)]
+        if let Some(elapsed) = self.synthetic_review_latencies.pop_front() {
+            return elapsed;
+        }
+        started.elapsed()
+    }
+
+    fn measured_classifier_elapsed(&mut self, started: Instant, reported: Duration) -> Duration {
+        #[cfg(test)]
+        if let Some(elapsed) = self.synthetic_classifier_latencies.pop_front() {
+            return elapsed;
+        }
+        reported.max(started.elapsed())
     }
 
     pub fn redacted_classifier_request(
@@ -865,10 +943,23 @@ impl PreActionReviewer {
         request: &ApprovalReviewRequest,
         classifier: Option<&mut dyn AmbiguousActionClassifier>,
     ) -> Result<ReviewOutcome> {
+        if self.latency_budget_latched {
+            let denial = GateDenial::from_approval_review(
+                &request.correction_correlation_id,
+                &context.owner,
+                ApprovalReviewDenial::LatencyBudgetExceeded,
+                action_paths(&request.action),
+            )?;
+            self.metrics.record_outcome(&context.run_id, true, false);
+            return Ok(ReviewOutcome::Denied {
+                source: DecisionSource::LatencyBudget,
+                denial,
+            });
+        }
         let started = Instant::now();
         let fast_path = deterministic_decision(context, request);
         let mut classifier_elapsed = None;
-        let (source, disposition) = match fast_path {
+        let (mut source, mut disposition) = match fast_path {
             PolicyDisposition::Allow => {
                 (DecisionSource::DeterministicAllow, PolicyDisposition::Allow)
             }
@@ -891,7 +982,7 @@ impl PreActionReviewer {
                         elapsed: Duration::ZERO,
                     },
                 };
-                call.elapsed = call.elapsed.max(classifier_started.elapsed());
+                call.elapsed = self.measured_classifier_elapsed(classifier_started, call.elapsed);
                 classifier_elapsed = Some(call.elapsed);
                 (
                     DecisionSource::Classifier,
@@ -900,11 +991,24 @@ impl PreActionReviewer {
             }
         };
 
-        let measured = started.elapsed();
+        let measured = self.measured_review_elapsed(started);
         let review_elapsed = match classifier_elapsed {
             Some(elapsed) => elapsed.max(measured),
             None => measured,
         };
+        let observation_ceiling_exceeded = self
+            .metrics
+            .observe_latency(review_elapsed, classifier_elapsed);
+        if observation_ceiling_exceeded || self.metrics.latency_budget_exceeded() {
+            self.latency_budget_latched = true;
+            if matches!(disposition, PolicyDisposition::Allow) {
+                source = DecisionSource::LatencyBudget;
+                disposition = PolicyDisposition::Deny {
+                    denial: ApprovalReviewDenial::LatencyBudgetExceeded,
+                    paths: action_paths(&request.action),
+                };
+            }
+        }
         let (outcome, denied, human_interrupted) = match disposition {
             PolicyDisposition::Allow => (ReviewOutcome::Allowed { source }, false, false),
             PolicyDisposition::Deny { denial, paths } => {
@@ -933,13 +1037,8 @@ impl PreActionReviewer {
                 return invalid("ambiguous review disposition was not resolved");
             }
         };
-        self.metrics.record(
-            &context.run_id,
-            denied,
-            human_interrupted,
-            review_elapsed,
-            classifier_elapsed,
-        );
+        self.metrics
+            .record_outcome(&context.run_id, denied, human_interrupted);
         Ok(outcome)
     }
 }
@@ -1660,10 +1759,6 @@ mod tests {
         let calls = [
             response("deny", 10),
             ClassifierCall {
-                response: Ok(r#"{"version":1,"verdict":"allow"}"#.to_string()),
-                elapsed: Duration::from_millis(DEFAULT_CLASSIFIER_TIMEOUT_MS + 1),
-            },
-            ClassifierCall {
                 response: Ok(r#"{"version":1,"verdict":"allow","extra":true}"#.to_string()),
                 elapsed: Duration::from_millis(5),
             },
@@ -1671,12 +1766,16 @@ mod tests {
                 response: Err(ClassifierCallFailure::ProtocolError),
                 elapsed: Duration::from_millis(3),
             },
+            ClassifierCall {
+                response: Ok(r#"{"version":1,"verdict":"allow"}"#.to_string()),
+                elapsed: Duration::from_millis(DEFAULT_CLASSIFIER_TIMEOUT_MS + 1),
+            },
         ];
         let expected = [
             ApprovalReviewDenial::ClassifierDenied,
-            ApprovalReviewDenial::ClassifierTimeout,
             ApprovalReviewDenial::ClassifierMalformedResponse,
             ApprovalReviewDenial::ClassifierProtocolError,
+            ApprovalReviewDenial::ClassifierTimeout,
         ];
         let mut classifier = FakeClassifier::new(calls);
         let mut reviewer = PreActionReviewer::default();
@@ -1820,6 +1919,305 @@ mod tests {
         assert_eq!(metrics.classifier_latency.budget.p50_ms(), 15);
         assert_eq!(metrics.classifier_latency.budget.p95_ms(), 25);
         assert_eq!(metrics.classifier_latency.budget.timeout_ms(), 100);
+    }
+
+    #[test]
+    fn short_safe_fast_path_p95_observation_breach_denies_and_latches_immediately() {
+        let mut reviewer = PreActionReviewer::new(
+            LatencyBudget::new(10, 20, 100).expect("valid deterministic budget"),
+        )
+        .with_synthetic_review_latencies([Duration::from_millis(21)]);
+        let context = context("run-short-safe-ceiling");
+        let mut classifier = FakeClassifier::new([]);
+        let breach = command_request(
+            "short-safe-ceiling",
+            CommandClass::ReadOnly,
+            BlastRadius::WorkspaceWide,
+            vec![PathAccess::read("README.md").expect("read")],
+            true,
+            &["inspect"],
+        );
+        let outcome = reviewer
+            .review(&context, &breach, Some(&mut classifier))
+            .expect("latency refusal");
+        assert!(matches!(
+            outcome,
+            ReviewOutcome::Denied {
+                source: DecisionSource::LatencyBudget,
+                ..
+            }
+        ));
+        assert_eq!(
+            denial_kind(&outcome),
+            ApprovalReviewDenial::LatencyBudgetExceeded
+        );
+        let denial = outcome.denial().expect("typed latency denial");
+        assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+        assert_eq!(
+            denial.next_safe_operation,
+            NextSafeOperation::RestorePreActionReviewService
+        );
+        assert_eq!(classifier.calls, 0, "safe fast path must be exercised");
+
+        let metrics = reviewer.metrics();
+        assert_eq!(metrics.review_latency.sample_count, 1);
+        assert_eq!(metrics.review_latency.measured_p50_ms, Some(21));
+        assert_eq!(metrics.review_latency.measured_p95_ms, Some(21));
+        assert_eq!(metrics.review_latency.p50_within_budget, Some(false));
+        assert_eq!(metrics.review_latency.p95_within_budget, Some(false));
+        assert!(metrics.latency_budget_latched);
+        assert_eq!(metrics.reviewed_action_denials.numerator, 1);
+        assert_eq!(metrics.reviewed_action_denials.denominator, 1);
+    }
+
+    #[test]
+    fn safe_fast_path_p50_breach_denies_at_exact_100_sample_rank() {
+        let latencies = std::iter::repeat_n(Duration::from_millis(10), 49)
+            .chain(std::iter::repeat_n(Duration::from_millis(11), 51));
+        let mut reviewer = PreActionReviewer::new(
+            LatencyBudget::new(10, 20, 100).expect("valid deterministic budget"),
+        )
+        .with_synthetic_review_latencies(latencies);
+        let context = context("run-safe-percentile");
+        let mut classifier = FakeClassifier::new([]);
+
+        for sample in 0..99 {
+            let request = command_request(
+                &format!("safe-percentile-{sample}"),
+                CommandClass::ReadOnly,
+                BlastRadius::WorkspaceWide,
+                vec![PathAccess::read("README.md").expect("read")],
+                true,
+                &["inspect"],
+            );
+            assert_eq!(
+                reviewer
+                    .review(&context, &request, Some(&mut classifier))
+                    .expect("safe fast-path review"),
+                ReviewOutcome::Allowed {
+                    source: DecisionSource::DeterministicAllow
+                }
+            );
+        }
+
+        let breach = command_request(
+            "safe-percentile-99",
+            CommandClass::ReadOnly,
+            BlastRadius::WorkspaceWide,
+            vec![PathAccess::read("README.md").expect("read")],
+            true,
+            &["inspect"],
+        );
+        let outcome = reviewer
+            .review(&context, &breach, Some(&mut classifier))
+            .expect("latency refusal");
+        assert!(matches!(
+            outcome,
+            ReviewOutcome::Denied {
+                source: DecisionSource::LatencyBudget,
+                ..
+            }
+        ));
+        assert_eq!(
+            denial_kind(&outcome),
+            ApprovalReviewDenial::LatencyBudgetExceeded
+        );
+        assert_eq!(classifier.calls, 0, "safe fast path must be exercised");
+
+        let metrics = reviewer.metrics();
+        assert_eq!(metrics.review_latency.sample_count, 100);
+        assert_eq!(metrics.review_latency.measured_p50_ms, Some(11));
+        assert_eq!(metrics.review_latency.measured_p95_ms, Some(11));
+        assert_eq!(metrics.review_latency.p50_within_budget, Some(false));
+        assert_eq!(metrics.review_latency.p95_within_budget, Some(true));
+        assert!(metrics.latency_budget_latched);
+        assert_eq!(metrics.reviewed_action_denials.numerator, 1);
+        assert_eq!(metrics.reviewed_action_denials.denominator, 100);
+    }
+
+    #[test]
+    fn forbidden_fast_path_p50_breach_latches_before_the_next_safe_action() {
+        let latencies = std::iter::repeat_n(Duration::from_millis(10), 49)
+            .chain(std::iter::repeat_n(Duration::from_millis(11), 51));
+        let mut reviewer = PreActionReviewer::new(
+            LatencyBudget::new(10, 20, 100).expect("valid deterministic budget"),
+        )
+        .with_synthetic_review_latencies(latencies);
+        let context = context("run-forbidden-percentile");
+        let mut classifier = FakeClassifier::new([]);
+
+        for sample in 0..100 {
+            let forbidden = command_request(
+                &format!("forbidden-percentile-{sample}"),
+                CommandClass::ReadOnly,
+                BlastRadius::WorkspaceWide,
+                vec![PathAccess::read("private/token.txt").expect("sensitive read")],
+                true,
+                &["inspect"],
+            );
+            let outcome = reviewer
+                .review(&context, &forbidden, Some(&mut classifier))
+                .expect("forbidden fast-path review");
+            assert!(matches!(
+                outcome,
+                ReviewOutcome::Denied {
+                    source: DecisionSource::DeterministicDeny,
+                    ..
+                }
+            ));
+            assert_eq!(denial_kind(&outcome), ApprovalReviewDenial::SensitiveRead);
+        }
+
+        let safe_after_breach = command_request(
+            "safe-after-forbidden-percentile",
+            CommandClass::ReadOnly,
+            BlastRadius::WorkspaceWide,
+            vec![PathAccess::read("README.md").expect("read")],
+            true,
+            &["inspect"],
+        );
+        let outcome = reviewer
+            .review(&context, &safe_after_breach, Some(&mut classifier))
+            .expect("latched refusal");
+        assert!(matches!(
+            outcome,
+            ReviewOutcome::Denied {
+                source: DecisionSource::LatencyBudget,
+                ..
+            }
+        ));
+        assert_eq!(
+            denial_kind(&outcome),
+            ApprovalReviewDenial::LatencyBudgetExceeded
+        );
+        assert_eq!(
+            classifier.calls, 0,
+            "forbidden fast path and latched refusal must bypass the classifier"
+        );
+
+        let metrics = reviewer.metrics();
+        assert_eq!(metrics.review_latency.sample_count, 100);
+        assert_eq!(metrics.review_latency.measured_p50_ms, Some(11));
+        assert_eq!(metrics.review_latency.measured_p95_ms, Some(11));
+        assert_eq!(metrics.review_latency.p50_within_budget, Some(false));
+        assert_eq!(metrics.review_latency.p95_within_budget, Some(true));
+        assert!(metrics.latency_budget_latched);
+        assert_eq!(metrics.reviewed_action_denials.numerator, 101);
+        assert_eq!(metrics.reviewed_action_denials.denominator, 101);
+    }
+
+    #[test]
+    fn classifier_p50_breach_is_enforced_when_fast_paths_dilute_overall_percentile() {
+        let classifier_latencies = std::iter::repeat_n(Duration::from_millis(10), 49)
+            .chain(std::iter::repeat_n(Duration::from_millis(11), 51));
+        let mut reviewer = PreActionReviewer::new(
+            LatencyBudget::new(10, 20, 100).expect("valid deterministic budget"),
+        )
+        .with_synthetic_review_latencies(std::iter::repeat_n(Duration::from_millis(1), 2_000))
+        .with_synthetic_classifier_latencies(classifier_latencies);
+        let context = context("run-classifier-percentile");
+        let mut classifier = FakeClassifier::new(std::iter::repeat_n(response("allow", 1), 100));
+        let safe = command_request(
+            "classifier-dilution-safe",
+            CommandClass::ReadOnly,
+            BlastRadius::WorkspaceWide,
+            vec![PathAccess::read("README.md").expect("read")],
+            true,
+            &["inspect"],
+        );
+        for _ in 0..1_900 {
+            assert!(reviewer
+                .review(&context, &safe, Some(&mut classifier))
+                .expect("safe fast path")
+                .is_allowed());
+        }
+
+        let ambiguous = command_request(
+            "classifier-percentile",
+            CommandClass::Unknown,
+            BlastRadius::WorkspaceWide,
+            vec![PathAccess::read("README.md").expect("read")],
+            false,
+            &["inspect"],
+        );
+        for _ in 0..99 {
+            assert_eq!(
+                reviewer
+                    .review(&context, &ambiguous, Some(&mut classifier))
+                    .expect("classifier review"),
+                ReviewOutcome::Allowed {
+                    source: DecisionSource::Classifier
+                }
+            );
+        }
+        let outcome = reviewer
+            .review(&context, &ambiguous, Some(&mut classifier))
+            .expect("classifier latency refusal");
+        assert!(matches!(
+            outcome,
+            ReviewOutcome::Denied {
+                source: DecisionSource::LatencyBudget,
+                ..
+            }
+        ));
+        assert_eq!(
+            denial_kind(&outcome),
+            ApprovalReviewDenial::LatencyBudgetExceeded
+        );
+        assert_eq!(classifier.calls, 100);
+
+        let metrics = reviewer.metrics();
+        assert_eq!(metrics.review_latency.sample_count, 2_000);
+        assert_eq!(metrics.review_latency.measured_p95_ms, Some(1));
+        assert_eq!(metrics.review_latency.p95_within_budget, Some(true));
+        assert_eq!(metrics.classifier_latency.sample_count, 100);
+        assert_eq!(metrics.classifier_latency.measured_p50_ms, Some(11));
+        assert_eq!(metrics.classifier_latency.measured_p95_ms, Some(11));
+        assert_eq!(metrics.classifier_latency.p50_within_budget, Some(false));
+        assert_eq!(metrics.classifier_latency.p95_within_budget, Some(true));
+        assert!(metrics.latency_budget_latched);
+    }
+
+    #[test]
+    fn short_classifier_p95_observation_breach_denies_on_first_callback() {
+        let mut reviewer = PreActionReviewer::new(
+            LatencyBudget::new(10, 20, 100).expect("valid deterministic budget"),
+        )
+        .with_synthetic_review_latencies([Duration::from_millis(1)])
+        .with_synthetic_classifier_latencies([Duration::from_millis(21)]);
+        let context = context("run-short-classifier-ceiling");
+        let mut classifier = FakeClassifier::new([response("allow", 1)]);
+        let ambiguous = command_request(
+            "short-classifier-ceiling",
+            CommandClass::Unknown,
+            BlastRadius::WorkspaceWide,
+            vec![PathAccess::read("README.md").expect("read")],
+            false,
+            &["inspect"],
+        );
+
+        let outcome = reviewer
+            .review(&context, &ambiguous, Some(&mut classifier))
+            .expect("first-callback latency refusal");
+        assert!(matches!(
+            outcome,
+            ReviewOutcome::Denied {
+                source: DecisionSource::LatencyBudget,
+                ..
+            }
+        ));
+        assert_eq!(
+            denial_kind(&outcome),
+            ApprovalReviewDenial::LatencyBudgetExceeded
+        );
+        assert_eq!(classifier.calls, 1, "classifier path must be exercised");
+
+        let metrics = reviewer.metrics();
+        assert_eq!(metrics.review_latency.sample_count, 1);
+        assert_eq!(metrics.review_latency.measured_p95_ms, Some(21));
+        assert_eq!(metrics.classifier_latency.sample_count, 1);
+        assert_eq!(metrics.classifier_latency.measured_p95_ms, Some(21));
+        assert!(metrics.latency_budget_latched);
     }
 
     #[test]

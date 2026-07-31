@@ -684,6 +684,7 @@ struct CollectedChildAttempt<'a> {
     report_shape_problems: Vec<String>,
     primary_changes: PrimaryIntegrityChanges,
     sandbox_denials: Vec<SandboxDenialEvidence>,
+    pre_action_refusals: Vec<GateDenial>,
     external_side_effect_state: Option<ExternalSideEffectState>,
     environment_blocked: bool,
     attempt_containment_verified: bool,
@@ -908,9 +909,12 @@ fn dispatch_and_collect_child_attempt<'a>(
     let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
     let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
     let sandbox_denials = external_run.sandbox_denials().to_vec();
-    outcome
-        .gate_denials
-        .extend(external_run.gate_denials().iter().cloned());
+    let (pre_action_refusals, retryable_gate_denials): (Vec<_>, Vec<_>) = external_run
+        .gate_denials()
+        .iter()
+        .cloned()
+        .partition(is_child_pre_action_refusal);
+    outcome.gate_denials.extend(retryable_gate_denials);
     if let Some(metrics) = external_run.pre_action_review_metrics() {
         outcome.pre_action_review_metrics.push(metrics.clone());
     }
@@ -931,6 +935,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         report_shape_problems,
         primary_changes,
         sandbox_denials,
+        pre_action_refusals,
         external_side_effect_state,
         environment_blocked,
         attempt_containment_verified,
@@ -963,7 +968,18 @@ enum ChildGateTerminalReason {
     Sandbox,
     PrimaryIntegrity,
     Environment,
+    PreActionReview,
     ExternalSideEffect,
+}
+
+fn is_child_pre_action_refusal(denial: &GateDenial) -> bool {
+    matches!(
+        denial.reason,
+        GateDenialReason::ApprovalReview {
+            denial: crate::gate_denial::ApprovalReviewDenial::LatencyBudgetExceeded
+                | crate::gate_denial::ApprovalReviewDenial::DuplexFallbackRequired,
+        }
+    )
 }
 
 fn child_gate_terminal_reason(
@@ -971,6 +987,7 @@ fn child_gate_terminal_reason(
     sandbox_denied: bool,
     primary_integrity_failed: bool,
     environment_blocked: bool,
+    pre_action_refused: bool,
     external_side_effect_observed: bool,
 ) -> Option<ChildGateTerminalReason> {
     if !containment_verified {
@@ -981,6 +998,8 @@ fn child_gate_terminal_reason(
         Some(ChildGateTerminalReason::PrimaryIntegrity)
     } else if environment_blocked {
         Some(ChildGateTerminalReason::Environment)
+    } else if pre_action_refused {
+        Some(ChildGateTerminalReason::PreActionReview)
     } else if external_side_effect_observed {
         Some(ChildGateTerminalReason::ExternalSideEffect)
     } else {
@@ -1009,6 +1028,7 @@ fn decide_child_attempt(
         report_shape_problems,
         primary_changes,
         sandbox_denials,
+        pre_action_refusals,
         external_side_effect_state,
         environment_blocked,
         attempt_containment_verified,
@@ -1023,6 +1043,26 @@ fn decide_child_attempt(
         _primary_before,
         _command,
     } = collected;
+    let pre_action_refused = !pre_action_refusals.is_empty();
+    if pre_action_refused {
+        let tracker = outcome
+            .gate_tracker
+            .as_mut()
+            .context("gate correction tracker was not initialized")?;
+        tracker.escalate_active(artifacts, &assignment.id, journal_parent_id)?;
+        for denial in pre_action_refusals {
+            tracker.escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
+        }
+        attempt_report.status = ReviewStatus::Failed;
+        attempt_report.accepted = false;
+        attempt_report.rejected = true;
+        attempt_report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: "pre-action review refused the child result; restore the review service before beginning a new child operation"
+                .to_string(),
+            paths: assignment.assigned_paths.clone(),
+        });
+    }
     let primary_integrity_failed = !primary_changes.is_empty();
     if primary_integrity_failed {
         mark_primary_integrity_violation(assignment, &primary_changes, &mut attempt_report);
@@ -1076,6 +1116,7 @@ fn decide_child_attempt(
         sandbox_denied,
         primary_integrity_failed,
         environment_blocked,
+        pre_action_refused,
         external_side_effect_state.is_some(),
     );
     if terminal_reason == Some(ChildGateTerminalReason::Containment) {
@@ -1146,6 +1187,19 @@ fn decide_child_attempt(
             attempt,
             report_path: attempt_artifacts.raw_report_relative.clone(),
             structural_problems: Vec::new(),
+            corrective_retry_used,
+        });
+        return Ok(ChildAttemptDisposition::Finish {
+            report: attempt_report,
+            containment_verified: true,
+            gate_terminal: true,
+        });
+    }
+    if terminal_reason == Some(ChildGateTerminalReason::PreActionReview) {
+        attempt_history.push(ChildAttemptHistory {
+            attempt,
+            report_path: attempt_artifacts.raw_report_relative.clone(),
+            structural_problems: report_shape_problems,
             corrective_retry_used,
         });
         return Ok(ChildAttemptDisposition::Finish {
@@ -2630,28 +2684,66 @@ mod decomposition_tests {
     #[test]
     fn child_gate_terminal_reason_preserves_exact_precedence() {
         assert_eq!(
-            child_gate_terminal_reason(false, true, true, true, true),
+            child_gate_terminal_reason(false, true, true, true, true, true),
             Some(ChildGateTerminalReason::Containment)
         );
         assert_eq!(
-            child_gate_terminal_reason(true, true, true, true, true),
+            child_gate_terminal_reason(true, true, true, true, true, true),
             Some(ChildGateTerminalReason::Sandbox)
         );
         assert_eq!(
-            child_gate_terminal_reason(true, false, true, true, true),
+            child_gate_terminal_reason(true, false, true, true, true, true),
             Some(ChildGateTerminalReason::PrimaryIntegrity)
         );
         assert_eq!(
-            child_gate_terminal_reason(true, false, false, true, true),
+            child_gate_terminal_reason(true, false, false, true, true, true),
             Some(ChildGateTerminalReason::Environment)
         );
         assert_eq!(
-            child_gate_terminal_reason(true, false, false, false, true),
+            child_gate_terminal_reason(true, false, false, false, true, true),
+            Some(ChildGateTerminalReason::PreActionReview)
+        );
+        assert_eq!(
+            child_gate_terminal_reason(true, false, false, false, false, true),
             Some(ChildGateTerminalReason::ExternalSideEffect)
         );
         assert_eq!(
-            child_gate_terminal_reason(true, false, false, false, false),
+            child_gate_terminal_reason(true, false, false, false, false, false),
             None
+        );
+    }
+
+    #[test]
+    fn latency_and_fallback_denials_are_terminal_child_refusals() {
+        for (index, denial) in [
+            crate::gate_denial::ApprovalReviewDenial::LatencyBudgetExceeded,
+            crate::gate_denial::ApprovalReviewDenial::DuplexFallbackRequired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let denial = GateDenial::from_approval_review(
+                format!("pre-action-refusal-{index}"),
+                "child-a",
+                denial,
+                ["src/lib.rs"],
+            )
+            .expect("typed pre-action refusal");
+            assert!(is_child_pre_action_refusal(&denial));
+            assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+        }
+
+        let correctable = GateDenial::from_approval_review(
+            "pre-action-correctable",
+            "child-a",
+            crate::gate_denial::ApprovalReviewDenial::SensitiveRead,
+            ["private/token.txt"],
+        )
+        .expect("typed correctable denial");
+        assert!(!is_child_pre_action_refusal(&correctable));
+        assert_eq!(
+            correctable.retryability,
+            GateRetryability::RetryAfterCorrection
         );
     }
 
