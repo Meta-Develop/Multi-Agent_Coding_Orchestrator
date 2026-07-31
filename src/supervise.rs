@@ -86,7 +86,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 mod worktree_controls;
-pub use worktree_controls::*;
+use worktree_controls::*;
 
 mod prompts;
 pub use prompts::*;
